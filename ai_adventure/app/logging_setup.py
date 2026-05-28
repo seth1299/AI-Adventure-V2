@@ -21,7 +21,7 @@ def configure_logging(log_file: Path) -> None:
     # Avoid duplicate handlers when restarting from an interactive environment.
     root_logger.handlers.clear()
 
-    file_handler = logging.FileHandler(log_file, encoding="utf-8")
+    file_handler = logging.FileHandler(log_file, mode="w", encoding="utf-8")
     file_handler.setLevel(logging.DEBUG)
 
     formatter = logging.Formatter(

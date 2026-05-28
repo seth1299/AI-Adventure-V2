@@ -1,0 +1,1538 @@
+{
+  "schema_version": 1,
+  "source": "legacy alchemy_rules.md",
+  "stages": [
+    {
+      "id": "preparation",
+      "name": "Preparation",
+      "summary": "Identify, clean, sort, measure, and ready raw materials."
+    },
+    {
+      "id": "refinement",
+      "name": "Refinement",
+      "summary": "Turn raw materials into predictable reagents."
+    },
+    {
+      "id": "synthesis",
+      "name": "Synthesis",
+      "summary": "Combine refined reagents into a desired preparation."
+    },
+    {
+      "id": "proving",
+      "name": "Proving",
+      "summary": "Test quality, stability, strength, and safety."
+    }
+  ],
+  "product_types": [
+    {
+      "id": "potion",
+      "name": "Potion",
+      "summary": "Forceful liquid preparation for sudden noticeable effects."
+    },
+    {
+      "id": "draught",
+      "name": "Draught",
+      "summary": "Milder larger-volume preparation that supports natural processes."
+    },
+    {
+      "id": "elixir",
+      "name": "Elixir",
+      "summary": "Highly refined concentrated stable preparation often taken in drops."
+    },
+    {
+      "id": "tincture",
+      "name": "Tincture",
+      "summary": "Extraction of virtue into a carrier, often used as an ingredient."
+    },
+    {
+      "id": "salve",
+      "name": "Salve",
+      "summary": "Preparation worked into fat, wax, resin, or balm for skin use."
+    },
+    {
+      "id": "powder",
+      "name": "Powder",
+      "summary": "Dry preparation for swallowing, scattering, burning, adding to liquid, or ritual use."
+    },
+    {
+      "id": "incense",
+      "name": "Incense",
+      "summary": "Preparation that releases virtue through smoke."
+    },
+    {
+      "id": "philtre",
+      "name": "Philtre",
+      "summary": "Potion affecting emotion, desire, courage, fear, loyalty, or perception."
+    }
+  ],
+  "qualities": [
+    {
+      "id": "warm",
+      "name": "Warm",
+      "behaviors": [
+        "awakens",
+        "expands",
+        "stimulates",
+        "ripens",
+        "drives outward"
+      ]
+    },
+    {
+      "id": "cool",
+      "name": "Cool",
+      "behaviors": [
+        "calms",
+        "contracts",
+        "preserves",
+        "clarifies",
+        "draws inward"
+      ]
+    },
+    {
+      "id": "dry",
+      "name": "Dry",
+      "behaviors": [
+        "separates",
+        "hardens",
+        "sharpens",
+        "fixes",
+        "preserves"
+      ]
+    },
+    {
+      "id": "moist",
+      "name": "Moist",
+      "behaviors": [
+        "joins",
+        "softens",
+        "carries",
+        "nourishes",
+        "dissolves"
+      ]
+    }
+  ],
+  "motions": [
+    {
+      "id": "rising",
+      "name": "Rising",
+      "behaviors": [
+        "lifts",
+        "lightens",
+        "vaporizes",
+        "inspires",
+        "carries effects toward breath and mind"
+      ]
+    },
+    {
+      "id": "sinking",
+      "name": "Sinking",
+      "behaviors": [
+        "grounds",
+        "sedates",
+        "stabilizes",
+        "carries effects toward bones and belly"
+      ]
+    },
+    {
+      "id": "opening",
+      "name": "Opening",
+      "behaviors": [
+        "unlocks",
+        "reveals",
+        "softens barriers",
+        "begins processes"
+      ]
+    },
+    {
+      "id": "closing",
+      "name": "Closing",
+      "behaviors": [
+        "seals",
+        "protects",
+        "finishes",
+        "preserves"
+      ]
+    },
+    {
+      "id": "quickening",
+      "name": "Quickening",
+      "behaviors": [
+        "speeds reactions",
+        "speeds bodily responses"
+      ]
+    },
+    {
+      "id": "stilling",
+      "name": "Stilling",
+      "behaviors": [
+        "slows",
+        "calms",
+        "quiets",
+        "suspends"
+      ]
+    },
+    {
+      "id": "turning",
+      "name": "Turning",
+      "behaviors": [
+        "changes direction",
+        "reverses a tendency",
+        "transforms one quality into another"
+      ]
+    }
+  ],
+  "material_families": [
+    "Botanical",
+    "Botanical-Fungal",
+    "Geological",
+    "Elemental",
+    "Animal",
+    "Animal-Magical",
+    "Animal-Botanical",
+    "Fungal",
+    "Alchemical"
+  ],
+  "gathering_rules": [
+    "correct identification",
+    "proper timing",
+    "cleanliness",
+    "restraint",
+    "separation"
+  ],
+  "preparation_principles": [
+    "inspection",
+    "washing",
+    "drying",
+    "cutting and bruising",
+    "sorting by part",
+    "proper storage"
+  ],
+  "refinement_methods": [
+    "grinding",
+    "infusion",
+    "decoction",
+    "maceration",
+    "distillation",
+    "calcination",
+    "dissolution",
+    "crystallization",
+    "fermentation",
+    "clarification",
+    "fixation"
+  ],
+  "example_reagents": [
+    {
+      "name": "Silverleaf",
+      "material_type": "Botanical",
+      "description": "Pale, narrow-leaved plant with silver veins; sharpens perception.",
+      "common_uses": [
+        "Clear-sight elixirs",
+        "focus drops",
+        "and truth-seeing washes."
+      ],
+      "virtues": [
+        "clarity"
+      ],
+      "qualities": [
+        "cool",
+        "dry"
+      ],
+      "motions": [
+        "opening"
+      ],
+      "locations": [
+        "Hills",
+        "cliffs",
+        "groves",
+        "and forest edges"
+      ]
+    },
+    {
+      "name": "Glass-Sand",
+      "material_type": "Geological",
+      "description": "Pale glittering mineral sand; organizes sight and light.",
+      "common_uses": [
+        "Clear-sight elixirs",
+        "lens washes",
+        "and truth inks."
+      ],
+      "virtues": [
+        "clarity",
+        "structure"
+      ],
+      "qualities": [
+        "cool",
+        "dry"
+      ],
+      "motions": [
+        "opening",
+        "closing"
+      ],
+      "locations": [
+        "Riverbeds",
+        "beaches",
+        "and caves"
+      ]
+    },
+    {
+      "name": "Dawnmoss",
+      "material_type": "Botanical",
+      "description": "Golden moss that supports recovery and tissue mending.",
+      "common_uses": [
+        "Mending draughts",
+        "fatigue restoratives",
+        "and growth pastes."
+      ],
+      "virtues": [
+        "renewal"
+      ],
+      "qualities": [
+        "warm",
+        "moist"
+      ],
+      "motions": [
+        "opening",
+        "quickening"
+      ],
+      "locations": [
+        "Ruins",
+        "stones",
+        "and tree roots"
+      ]
+    },
+    {
+      "name": "Spring Water",
+      "material_type": "Elemental",
+      "description": "Fresh water rising from earth; lively and clean.",
+      "common_uses": [
+        "Restorative draughts",
+        "renewal elixirs",
+        "and medicines."
+      ],
+      "virtues": [
+        "renewal",
+        "natural flow"
+      ],
+      "qualities": [
+        "cool",
+        "moist"
+      ],
+      "motions": [
+        "rising",
+        "opening"
+      ],
+      "locations": [
+        "Springs",
+        "hills",
+        "and woodland"
+      ]
+    },
+    {
+      "name": "Phoenix Down",
+      "material_type": "Animal-Magical",
+      "description": "Shed fiery-gold feather-floss for serious restoration.",
+      "common_uses": [
+        "High restoratives",
+        "revival incense",
+        "and fatigue elixirs."
+      ],
+      "virtues": [
+        "rekindling",
+        "renewal"
+      ],
+      "qualities": [
+        "warm",
+        "moist"
+      ],
+      "motions": [
+        "rising",
+        "quickening"
+      ],
+      "locations": [
+        "Phoenix roosts and volcanic sites"
+      ]
+    },
+    {
+      "name": "Lionroot",
+      "material_type": "Botanical",
+      "description": "Tawny root resembling a mane; strengthens resolve.",
+      "common_uses": [
+        "Courage draughts",
+        "battle cordials",
+        "and endurance tonics."
+      ],
+      "virtues": [
+        "courage",
+        "vigor"
+      ],
+      "qualities": [
+        "warm",
+        "dry"
+      ],
+      "motions": [
+        "rising",
+        "quickening"
+      ],
+      "locations": [
+        "Grasslands",
+        "hills",
+        "and meadows"
+      ]
+    },
+    {
+      "name": "Sun-Copper",
+      "material_type": "Geological",
+      "description": "Warm golden metal carrying solar force and brightness.",
+      "common_uses": [
+        "Sun elixirs",
+        "courage draughts",
+        "and anti-gloom preparations."
+      ],
+      "virtues": [
+        "solar vigor"
+      ],
+      "qualities": [
+        "warm",
+        "dry"
+      ],
+      "motions": [
+        "rising",
+        "quickening"
+      ],
+      "locations": [
+        "Cliffs",
+        "mines",
+        "river gravels",
+        "and ruins"
+      ]
+    },
+    {
+      "name": "Griffin Down",
+      "material_type": "Animal-Magical",
+      "description": "Shed feathers carrying courage and noble alertness.",
+      "common_uses": [
+        "Courage draughts",
+        "scout's elixirs",
+        "and anti-fear incense."
+      ],
+      "virtues": [
+        "noble courage",
+        "alertness"
+      ],
+      "qualities": [
+        "warm",
+        "dry"
+      ],
+      "motions": [
+        "rising",
+        "quickening"
+      ],
+      "locations": [
+        "High cliffs and mountains"
+      ]
+    },
+    {
+      "name": "Lanternweed",
+      "material_type": "Botanical",
+      "description": "Translucent plant with a faint glow; reveals edges.",
+      "common_uses": [
+        "Night-sight potions",
+        "lamp oils",
+        "and wayfinder drops."
+      ],
+      "virtues": [
+        "illumination"
+      ],
+      "qualities": [
+        "warm",
+        "dry"
+      ],
+      "motions": [
+        "opening",
+        "rising"
+      ],
+      "locations": [
+        "Marshes",
+        "ruins",
+        "and roads"
+      ]
+    },
+    {
+      "name": "Shadebloom",
+      "material_type": "Botanical",
+      "description": "Dark violet flower; helps one pass unnoticed.",
+      "common_uses": [
+        "Stealth draughts",
+        "muffling salves",
+        "and escape philtres."
+      ],
+      "virtues": [
+        "concealment"
+      ],
+      "qualities": [
+        "cool",
+        "moist"
+      ],
+      "motions": [
+        "closing",
+        "sinking"
+      ],
+      "locations": [
+        "Deep",
+        "Dark Forest",
+        "cliffs",
+        "and gardens"
+      ]
+    },
+    {
+      "name": "Shadow Resin",
+      "material_type": "Botanical",
+      "description": "Dark glossy resin that obscures attention.",
+      "common_uses": [
+        "Stealth oils",
+        "vanishing inks",
+        "and muffling salves."
+      ],
+      "virtues": [
+        "concealment",
+        "quieting"
+      ],
+      "qualities": [
+        "cool",
+        "dry"
+      ],
+      "motions": [
+        "closing",
+        "sinking"
+      ],
+      "locations": [
+        "Deep",
+        "Dark Forest and caves"
+      ]
+    },
+    {
+      "name": "Bitterstar Lichen",
+      "material_type": "Botanical-Fungal",
+      "description": "Gray-green lichen used to reject harmful substances.",
+      "common_uses": [
+        "Antitoxin draughts",
+        "cleansing tinctures",
+        "and stomach bitters."
+      ],
+      "virtues": [
+        "purging",
+        "correction"
+      ],
+      "qualities": [
+        "cool",
+        "dry"
+      ],
+      "motions": [
+        "turning",
+        "opening"
+      ],
+      "locations": [
+        "Rocks",
+        "caves",
+        "and tree bark"
+      ]
+    },
+    {
+      "name": "Vinegar Spirit",
+      "material_type": "Alchemical",
+      "description": "Sharp alchemical vinegar used to cut and extract.",
+      "common_uses": [
+        "Cleansing tinctures",
+        "antitoxin bases",
+        "and purging."
+      ],
+      "virtues": [
+        "separation",
+        "cleansing"
+      ],
+      "qualities": [
+        "cool",
+        "dry"
+      ],
+      "motions": [
+        "opening",
+        "turning"
+      ],
+      "locations": [
+        "Prepared via fermentation"
+      ]
+    },
+    {
+      "name": "Charcoal Cloth",
+      "material_type": "Alchemical",
+      "description": "Dark filtering cloth that removes corruption.",
+      "common_uses": [
+        "Clarifying tinctures and antitoxin preparations."
+      ],
+      "virtues": [
+        "purification"
+      ],
+      "qualities": [
+        "dry"
+      ],
+      "motions": [
+        "turning",
+        "closing"
+      ],
+      "locations": [
+        "Prepared from cloth and charcoal"
+      ]
+    },
+    {
+      "name": "Bloodvine",
+      "material_type": "Botanical",
+      "description": "Red-veined vine that encourages pulse and breath.",
+      "common_uses": [
+        "Vigor tonics",
+        "wakefulness draughts",
+        "and warrior's salves."
+      ],
+      "virtues": [
+        "vital motion"
+      ],
+      "qualities": [
+        "warm",
+        "moist"
+      ],
+      "motions": [
+        "quickening",
+        "rising"
+      ],
+      "locations": [
+        "Thickets",
+        "battlegrounds",
+        "and predator paths"
+      ]
+    },
+    {
+      "name": "Thunderstone",
+      "material_type": "Geological",
+      "description": "Dark stone holding a charge; awakens force suddenly.",
+      "common_uses": [
+        "Emergency waking draughts",
+        "storm inks",
+        "and charm-breakers."
+      ],
+      "virtues": [
+        "shock",
+        "awakening"
+      ],
+      "qualities": [
+        "warm",
+        "dry"
+      ],
+      "motions": [
+        "quickening",
+        "opening"
+      ],
+      "locations": [
+        "Storm-lashed ridges and moors"
+      ]
+    },
+    {
+      "name": "Stormwater",
+      "material_type": "Elemental",
+      "description": "Rain gathered during thunder; carries agitation.",
+      "common_uses": [
+        "Charm-breaking washes and emergency waking draughts."
+      ],
+      "virtues": [
+        "disruption",
+        "awakening"
+      ],
+      "qualities": [
+        "warm",
+        "moist"
+      ],
+      "motions": [
+        "quickening",
+        "turning"
+      ],
+      "locations": [
+        "Gathered during thunderstorms"
+      ]
+    },
+    {
+      "name": "Glass Orchid Nectar",
+      "material_type": "Botanical",
+      "description": "Clear thick nectar; preserves memory and reflection.",
+      "common_uses": [
+        "Memory tinctures",
+        "scholar's elixirs",
+        "and reflective inks."
+      ],
+      "virtues": [
+        "memory",
+        "reflection"
+      ],
+      "qualities": [
+        "cool",
+        "moist"
+      ],
+      "motions": [
+        "turning",
+        "opening"
+      ],
+      "locations": [
+        "Caves",
+        "cliffs",
+        "and grottos"
+      ]
+    },
+    {
+      "name": "Deep-Well Water",
+      "material_type": "Elemental",
+      "description": "Water from deep stone sources carrying memory.",
+      "common_uses": [
+        "Dream draughts",
+        "memory tinctures",
+        "and quieting washes."
+      ],
+      "virtues": [
+        "memory",
+        "depth"
+      ],
+      "qualities": [
+        "cool",
+        "moist"
+      ],
+      "motions": [
+        "sinking",
+        "stilling"
+      ],
+      "locations": [
+        "Wells",
+        "cisterns",
+        "and springs"
+      ]
+    },
+    {
+      "name": "Mooncap Fungus",
+      "material_type": "Fungal",
+      "description": "Gray-white fungus used for sleep and dreams.",
+      "common_uses": [
+        "Sleep draughts",
+        "dream tinctures",
+        "and trance incense."
+      ],
+      "virtues": [
+        "sleep",
+        "dream passage"
+      ],
+      "qualities": [
+        "cool",
+        "moist"
+      ],
+      "motions": [
+        "stilling",
+        "opening"
+      ],
+      "locations": [
+        "Deep",
+        "Dark Forest and damp stones"
+      ]
+    },
+    {
+      "name": "Moonstone",
+      "material_type": "Geological",
+      "description": "Milky mineral that reflects and orders lunar work.",
+      "common_uses": [
+        "Dream elixirs",
+        "sleep draughts",
+        "and stabilizers."
+      ],
+      "virtues": [
+        "reflection",
+        "dream-ordering"
+      ],
+      "qualities": [
+        "cool",
+        "moist"
+      ],
+      "motions": [
+        "stilling",
+        "turning"
+      ],
+      "locations": [
+        "Caves",
+        "cliffs",
+        "and springs"
+      ]
+    },
+    {
+      "name": "Moonwater",
+      "material_type": "Elemental",
+      "description": "Water exposed to moonlight; carries dream virtues.",
+      "common_uses": [
+        "Sleep draughts",
+        "moon elixirs",
+        "and gentle washes."
+      ],
+      "virtues": [
+        "reception",
+        "softening"
+      ],
+      "qualities": [
+        "cool",
+        "moist"
+      ],
+      "motions": [
+        "stilling",
+        "opening"
+      ],
+      "locations": [
+        "Prepared under moonlight"
+      ]
+    },
+    {
+      "name": "Winterbark",
+      "material_type": "Botanical",
+      "description": "Pale bark providing steadiness and slow endurance.",
+      "common_uses": [
+        "Warming draughts and endurance bases."
+      ],
+      "virtues": [
+        "endurance",
+        "slow warmth"
+      ],
+      "qualities": [
+        "warm",
+        "dry"
+      ],
+      "motions": [
+        "sinking",
+        "closing"
+      ],
+      "locations": [
+        "Cold forests and highlands"
+      ]
+    },
+    {
+      "name": "Ironthorn Ore",
+      "material_type": "Geological",
+      "description": "Dark spiky ore that resists enchantment.",
+      "common_uses": [
+        "Courage draughts and protective salves."
+      ],
+      "virtues": [
+        "resistance",
+        "boundary"
+      ],
+      "qualities": [
+        "warm",
+        "dry"
+      ],
+      "motions": [
+        "closing",
+        "sinking"
+      ],
+      "locations": [
+        "Mountains",
+        "ridges",
+        "and uplands"
+      ]
+    },
+    {
+      "name": "Emberseed",
+      "material_type": "Botanical",
+      "description": "Small red seed that restores warmth and inner fire.",
+      "common_uses": [
+        "Warming draughts",
+        "cordials",
+        "and hearth tonics."
+      ],
+      "virtues": [
+        "gentle inner warmth"
+      ],
+      "qualities": [
+        "warm",
+        "dry"
+      ],
+      "motions": [
+        "quickening"
+      ],
+      "locations": [
+        "Hills",
+        "scrubland",
+        "and hearth-sites"
+      ]
+    },
+    {
+      "name": "Red Hearth Salt",
+      "material_type": "Geological",
+      "description": "Red-orange salt associated with domestic fire.",
+      "common_uses": [
+        "Warming draughts and hearth tonics."
+      ],
+      "virtues": [
+        "preserved warmth"
+      ],
+      "qualities": [
+        "warm",
+        "dry"
+      ],
+      "motions": [
+        "closing",
+        "quickening"
+      ],
+      "locations": [
+        "Prepared from ash and clay"
+      ]
+    },
+    {
+      "name": "Frostmint",
+      "material_type": "Botanical",
+      "description": "Blue-green herb that calms heat and agitation.",
+      "common_uses": [
+        "Fever draughts",
+        "cooling washes",
+        "and anti-rage philtres."
+      ],
+      "virtues": [
+        "cooling",
+        "calming"
+      ],
+      "qualities": [
+        "cool",
+        "moist"
+      ],
+      "motions": [
+        "stilling",
+        "sinking"
+      ],
+      "locations": [
+        "Springs",
+        "streams",
+        "and meadows"
+      ]
+    },
+    {
+      "name": "Blue Cave Salt",
+      "material_type": "Geological",
+      "description": "Pale blue salt that cools and steadies.",
+      "common_uses": [
+        "Sleep draughts",
+        "fever remedies",
+        "and cooling tinctures."
+      ],
+      "virtues": [
+        "cooling steadiness"
+      ],
+      "qualities": [
+        "cool",
+        "dry"
+      ],
+      "motions": [
+        "stilling",
+        "closing"
+      ],
+      "locations": [
+        "Caves",
+        "springs",
+        "and grottos"
+      ]
+    },
+    {
+      "name": "Amber Salt",
+      "material_type": "Alchemical",
+      "description": "Golden salt that preserves warmth and fixes mixtures.",
+      "common_uses": [
+        "Warming draughts and preservation syrups."
+      ],
+      "virtues": [
+        "preservation",
+        "warm binding"
+      ],
+      "qualities": [
+        "warm",
+        "dry"
+      ],
+      "motions": [
+        "closing"
+      ],
+      "locations": [
+        "Forests",
+        "salt flats",
+        "and springs"
+      ]
+    },
+    {
+      "name": "Grave Salt",
+      "material_type": "Geological",
+      "description": "Gray-white salt associated with silence and stasis.",
+      "common_uses": [
+        "Stasis powders and preservation seals."
+      ],
+      "virtues": [
+        "stillness",
+        "arrest"
+      ],
+      "qualities": [
+        "cool",
+        "dry"
+      ],
+      "motions": [
+        "stilling",
+        "closing"
+      ],
+      "locations": [
+        "Caves and underground pockets"
+      ]
+    },
+    {
+      "name": "Black Granite Dust",
+      "material_type": "Geological",
+      "description": "Grounding powder that keeps forces from rising.",
+      "common_uses": [
+        "Warding powders",
+        "stabilizers",
+        "and containment seals."
+      ],
+      "virtues": [
+        "weight",
+        "containment"
+      ],
+      "qualities": [
+        "cool",
+        "dry"
+      ],
+      "motions": [
+        "sinking",
+        "closing"
+      ],
+      "locations": [
+        "Mountains",
+        "ravines",
+        "and riverbeds"
+      ]
+    },
+    {
+      "name": "Star Quartz",
+      "material_type": "Geological",
+      "description": "Clear crystal that aligns and focuses purpose.",
+      "common_uses": [
+        "Wayfinder elixirs and navigation tinctures."
+      ],
+      "virtues": [
+        "guidance",
+        "alignment"
+      ],
+      "qualities": [
+        "warm",
+        "dry"
+      ],
+      "motions": [
+        "rising",
+        "opening"
+      ],
+      "locations": [
+        "Mountains",
+        "deserts",
+        "and caves"
+      ]
+    },
+    {
+      "name": "Pearl Ash",
+      "material_type": "Alchemical",
+      "description": "Smooth white ash that softens and harmonizes.",
+      "common_uses": [
+        "Clear-sight elixirs and stomach-soothing draughts."
+      ],
+      "virtues": [
+        "smoothing",
+        "harmonizing"
+      ],
+      "qualities": [
+        "cool",
+        "moist"
+      ],
+      "motions": [
+        "turning",
+        "closing"
+      ],
+      "locations": [
+        "Coasts",
+        "shores",
+        "and coral beds"
+      ]
+    },
+    {
+      "name": "Amber Honey",
+      "material_type": "Animal-Botanical",
+      "description": "Thick golden honey that nourishes and preserves.",
+      "common_uses": [
+        "Restorative draughts",
+        "cordials",
+        "and tonics."
+      ],
+      "virtues": [
+        "harmony",
+        "nourishment"
+      ],
+      "qualities": [
+        "warm",
+        "moist"
+      ],
+      "motions": [
+        "closing",
+        "opening"
+      ],
+      "locations": [
+        "Forests",
+        "groves",
+        "and meadows"
+      ]
+    },
+    {
+      "name": "Pale Honey",
+      "material_type": "Animal-Botanical",
+      "description": "Gentle honey from spring flowers.",
+      "common_uses": [
+        "Cooling draughts and mild restoratives."
+      ],
+      "virtues": [
+        "gentle harmony"
+      ],
+      "qualities": [
+        "moist"
+      ],
+      "motions": [
+        "closing",
+        "stilling"
+      ],
+      "locations": [
+        "Meadows",
+        "orchards",
+        "and gardens"
+      ]
+    },
+    {
+      "name": "Dragon-Coal Cinder",
+      "material_type": "Geological",
+      "description": "Black-red cinder that ignites transformation.",
+      "common_uses": [
+        "Forge elixirs and mineral refinement."
+      ],
+      "virtues": [
+        "fierce ignition",
+        "transformation"
+      ],
+      "qualities": [
+        "warm",
+        "dry"
+      ],
+      "motions": [
+        "quickening",
+        "turning"
+      ],
+      "locations": [
+        "Mines",
+        "volcanic seams",
+        "and caves"
+      ]
+    },
+    {
+      "name": "Binding Clay",
+      "material_type": "Geological",
+      "description": "Smooth clay that gathers forces and gives form.",
+      "common_uses": [
+        "Poultices",
+        "sealing plugs",
+        "and salves."
+      ],
+      "virtues": [
+        "cohesion",
+        "containment"
+      ],
+      "qualities": [
+        "moist",
+        "dry"
+      ],
+      "motions": [
+        "closing",
+        "sinking"
+      ],
+      "locations": [
+        "Riverbanks",
+        "marshes",
+        "and fields"
+      ]
+    },
+    {
+      "name": "Basilisk Scale Flake",
+      "material_type": "Animal-Magical",
+      "description": "Shed scale that arrests and hardens motion.",
+      "common_uses": [
+        "Petrification antidotes and warding lacquers."
+      ],
+      "virtues": [
+        "arrest",
+        "hardening"
+      ],
+      "qualities": [
+        "cool",
+        "dry"
+      ],
+      "motions": [
+        "stilling",
+        "closing"
+      ],
+      "locations": [
+        "Caves",
+        "ruins",
+        "and deserts"
+      ]
+    },
+    {
+      "name": "Stag Velvet",
+      "material_type": "Animal",
+      "description": "Shed antler covering; encourages strength and growth.",
+      "common_uses": [
+        "Mending draughts",
+        "growth elixirs",
+        "and endurance tonics."
+      ],
+      "virtues": [
+        "growth",
+        "noble vigor"
+      ],
+      "qualities": [
+        "warm",
+        "moist"
+      ],
+      "motions": [
+        "opening",
+        "quickening"
+      ],
+      "locations": [
+        "Deep",
+        "Dark Forest and meadows"
+      ]
+    },
+    {
+      "name": "Silverworm Silk",
+      "material_type": "Animal",
+      "description": "Fine pale silk that binds and preserves continuity.",
+      "common_uses": [
+        "Mending salves and dream nets."
+      ],
+      "virtues": [
+        "binding",
+        "continuity"
+      ],
+      "qualities": [
+        "moist"
+      ],
+      "motions": [
+        "closing"
+      ],
+      "locations": [
+        "Caves",
+        "ruins",
+        "and wells"
+      ]
+    },
+    {
+      "name": "Owlshade Feather",
+      "material_type": "Animal",
+      "description": "Shed nocturnal feather carrying silence.",
+      "common_uses": [
+        "Night-sight potions",
+        "stealth draughts",
+        "and focus tinctures."
+      ],
+      "virtues": [
+        "night perception",
+        "silence"
+      ],
+      "qualities": [
+        "cool",
+        "dry"
+      ],
+      "motions": [
+        "stilling",
+        "opening"
+      ],
+      "locations": [
+        "Deep",
+        "Dark Forest and barns"
+      ]
+    },
+    {
+      "name": "Mothwing Scale",
+      "material_type": "Animal",
+      "description": "Dust from lunar moths; softens perception.",
+      "common_uses": [
+        "Night-sight potions",
+        "dream lamps",
+        "and calming incense."
+      ],
+      "virtues": [
+        "soft light",
+        "delicate perception"
+      ],
+      "qualities": [
+        "cool",
+        "moist"
+      ],
+      "motions": [
+        "rising",
+        "opening"
+      ],
+      "locations": [
+        "Orchards",
+        "clearings",
+        "and gardens"
+      ]
+    },
+    {
+      "name": "Deep-Eel Oil",
+      "material_type": "Animal",
+      "description": "Oil from subterranean eels; aids passage.",
+      "common_uses": [
+        "Joint salves",
+        "water-breathing oils",
+        "and escape draughts."
+      ],
+      "virtues": [
+        "passage",
+        "slipperiness"
+      ],
+      "qualities": [
+        "cool",
+        "moist"
+      ],
+      "motions": [
+        "opening",
+        "sinking"
+      ],
+      "locations": [
+        "Underground rivers",
+        "wells",
+        "and pools"
+      ]
+    },
+    {
+      "name": "Ghostwax",
+      "material_type": "Animal-Botanical",
+      "description": "Pale wax from spirit-touched bees; seals quietly.",
+      "common_uses": [
+        "Dream candles and slow-release potions."
+      ],
+      "virtues": [
+        "sealing",
+        "slow release"
+      ],
+      "qualities": [
+        "cool",
+        "moist"
+      ],
+      "motions": [
+        "closing",
+        "stilling"
+      ],
+      "locations": [
+        "Ruins",
+        "orchards",
+        "and fields"
+      ]
+    },
+    {
+      "name": "Sunwater",
+      "material_type": "Elemental",
+      "description": "Water exposed to sunlight; carries outward force.",
+      "common_uses": [
+        "Courage draughts",
+        "light elixirs",
+        "and anti-gloom cordials."
+      ],
+      "virtues": [
+        "brightness",
+        "awakening"
+      ],
+      "qualities": [
+        "warm",
+        "moist"
+      ],
+      "motions": [
+        "rising",
+        "quickening"
+      ],
+      "locations": [
+        "Hilltops",
+        "windows",
+        "and fields"
+      ]
+    },
+    {
+      "name": "Dew Water",
+      "material_type": "Elemental",
+      "description": "Morning moisture; receptive and clarifying.",
+      "common_uses": [
+        "Clear-sight elixirs and perception tinctures."
+      ],
+      "virtues": [
+        "fresh reception",
+        "clarity"
+      ],
+      "qualities": [
+        "cool",
+        "moist"
+      ],
+      "motions": [
+        "opening",
+        "rising"
+      ],
+      "locations": [
+        "Meadows",
+        "gardens",
+        "and leaves"
+      ]
+    },
+    {
+      "name": "Pale Resin",
+      "material_type": "Botanical",
+      "description": "Light resin that burns with soft smoke.",
+      "common_uses": [
+        "Incense cones and dream-room preparations."
+      ],
+      "virtues": [
+        "calm preservation"
+      ],
+      "qualities": [
+        "cool",
+        "dry"
+      ],
+      "motions": [
+        "stilling",
+        "closing"
+      ],
+      "locations": [
+        "Forests",
+        "groves",
+        "and orchards"
+      ]
+    },
+    {
+      "name": "Soot Ink Base",
+      "material_type": "Alchemical",
+      "description": "Dark liquid base that holds written intention.",
+      "common_uses": [
+        "Vanishing inks and charm scripts."
+      ],
+      "virtues": [
+        "inscription",
+        "retention"
+      ],
+      "qualities": [
+        "dry",
+        "moist"
+      ],
+      "motions": [
+        "closing"
+      ],
+      "locations": [
+        "Prepared from soot and binder"
+      ]
+    },
+    {
+      "name": "Balm-Fat",
+      "material_type": "Alchemical",
+      "description": "Soft base used to carry virtues through the skin.",
+      "common_uses": [
+        "Protective salves and mending salves."
+      ],
+      "virtues": [
+        "carrying",
+        "softening"
+      ],
+      "qualities": [
+        "moist"
+      ],
+      "motions": [
+        "sinking",
+        "closing"
+      ],
+      "locations": [
+        "Prepared from fat and wax"
+      ]
+    },
+    {
+      "name": "White Balm",
+      "material_type": "Alchemical",
+      "description": "Pale salve base for delicate skin.",
+      "common_uses": [
+        "Mending salves and beauty salves."
+      ],
+      "virtues": [
+        "soft restoration"
+      ],
+      "qualities": [
+        "cool",
+        "moist"
+      ],
+      "motions": [
+        "closing",
+        "stilling"
+      ],
+      "locations": [
+        "Prepared from waxes and roots"
+      ]
+    },
+    {
+      "name": "Fruit Syrup Base",
+      "material_type": "Botanical",
+      "description": "Sweetened base providing nourishment.",
+      "common_uses": [
+        "Cordials",
+        "draughts",
+        "and travel tonics."
+      ],
+      "virtues": [
+        "nourishment",
+        "carrying"
+      ],
+      "qualities": [
+        "warm",
+        "moist"
+      ],
+      "motions": [
+        "opening",
+        "closing"
+      ],
+      "locations": [
+        "Prepared from fruit and berries"
+      ]
+    },
+    {
+      "name": "Mild Clear Spirit",
+      "material_type": "Alchemical",
+      "description": "Purified spirit used to extract volatile virtues.",
+      "common_uses": [
+        "Tinctures",
+        "elixirs",
+        "and resin solutions."
+      ],
+      "virtues": [
+        "extraction",
+        "preservation"
+      ],
+      "qualities": [
+        "warm",
+        "dry"
+      ],
+      "motions": [
+        "opening",
+        "rising"
+      ],
+      "locations": [
+        "Prepared in distilleries"
+      ]
+    }
+  ]
+}
