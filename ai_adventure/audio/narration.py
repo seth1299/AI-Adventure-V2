@@ -4,6 +4,8 @@ import logging
 import queue
 import re
 import threading
+from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -13,7 +15,23 @@ from ai_adventure.audio.tts.tts_manager import TTSManager, TTSRequest
 LOGGER = logging.getLogger(__name__)
 
 TTS_CHANNEL_INDEX = 1
-MAX_CHUNK_LENGTH = 420
+MAX_CHUNK_LENGTH = 260
+
+
+@dataclass(frozen=True)
+class NarrationChunk:
+    """Paired display and TTS text for one narration segment."""
+
+    display_text: str
+    tts_text: str
+
+
+@dataclass(frozen=True)
+class GeneratedNarrationChunk:
+    """A generated audio file and the display text it speaks."""
+
+    audio_path: Path
+    display_text: str
 
 
 class NarrationPlayer:
@@ -80,21 +98,26 @@ class NarrationPlayer:
             except Exception as error:
                 LOGGER.warning("Failed to update active narrator volume: %s", error)
 
-    def narrate(self, text: str) -> None:
+    def narrate(
+        self,
+        text: str,
+        *,
+        on_chunk_start: Callable[[str], None] | None = None,
+        on_complete: Callable[[], None] | None = None,
+    ) -> bool:
         """Starts narrating text in generated chunks."""
 
         if not self.enabled or not self.tts_manager.is_available:
-            return
+            return False
 
-        clean_text = sanitize_tts_text(text)
-        chunks = chunk_tts_text(clean_text)
+        chunks = build_narration_chunks(text)
 
         if not chunks:
-            return
+            return False
 
         if not self._initialized or self._pygame is None:
             LOGGER.warning("Cannot narrate because audio playback is unavailable.")
-            return
+            return False
 
         self.stop()
 
@@ -102,7 +125,7 @@ class NarrationPlayer:
             self._session_id += 1
             session_id = self._session_id
 
-        audio_queue: queue.Queue[Path | None] = queue.Queue(maxsize=2)
+        audio_queue: queue.Queue[GeneratedNarrationChunk | None] = queue.Queue(maxsize=2)
         producer = threading.Thread(
             target=self._produce_chunks,
             args=(session_id, chunks, audio_queue),
@@ -110,11 +133,12 @@ class NarrationPlayer:
         )
         consumer = threading.Thread(
             target=self._play_chunks,
-            args=(session_id, audio_queue),
+            args=(session_id, audio_queue, on_chunk_start, on_complete),
             daemon=True,
         )
         producer.start()
         consumer.start()
+        return True
 
     def stop(self) -> None:
         """Stops active narration and invalidates pending generated chunks."""
@@ -131,8 +155,8 @@ class NarrationPlayer:
     def _produce_chunks(
         self,
         session_id: int,
-        chunks: list[str],
-        audio_queue: queue.Queue[Path | None],
+        chunks: list[NarrationChunk],
+        audio_queue: queue.Queue[GeneratedNarrationChunk | None],
     ) -> None:
         """Generates audio files while earlier chunks are being played."""
 
@@ -147,7 +171,7 @@ class NarrationPlayer:
 
                     audio_path = self.tts_manager.synthesize_to_file(
                         TTSRequest(
-                            text=chunk,
+                            text=chunk.tts_text,
                             voice=self.voice,
                             speed=self.speed,
                         )
@@ -156,7 +180,12 @@ class NarrationPlayer:
                 if audio_path is None:
                     continue
 
-                if not self._put_queue_item(session_id, audio_queue, audio_path):
+                queue_item = GeneratedNarrationChunk(
+                    audio_path=audio_path,
+                    display_text=chunk.display_text,
+                )
+
+                if not self._put_queue_item(session_id, audio_queue, queue_item):
                     _delete_file(audio_path)
                     return
         finally:
@@ -165,23 +194,29 @@ class NarrationPlayer:
     def _play_chunks(
         self,
         session_id: int,
-        audio_queue: queue.Queue[Path | None],
+        audio_queue: queue.Queue[GeneratedNarrationChunk | None],
+        on_chunk_start: Callable[[str], None] | None,
+        on_complete: Callable[[], None] | None,
     ) -> None:
         """Plays generated chunks in order."""
 
         while self._is_active_session(session_id):
             try:
-                audio_path = audio_queue.get(timeout=0.25)
+                queue_item = audio_queue.get(timeout=0.25)
             except queue.Empty:
                 continue
 
-            if audio_path is None:
+            if queue_item is None:
+                if self._is_active_session(session_id) and on_complete is not None:
+                    on_complete()
                 return
 
             try:
-                self._play_file_blocking(audio_path, session_id)
+                if on_chunk_start is not None:
+                    on_chunk_start(queue_item.display_text)
+                self._play_file_blocking(queue_item.audio_path, session_id)
             finally:
-                _delete_file(audio_path)
+                _delete_file(queue_item.audio_path)
 
     def _play_file_blocking(self, audio_path: Path, session_id: int) -> None:
         """Plays one generated narration file and waits for it to finish."""
@@ -209,8 +244,8 @@ class NarrationPlayer:
     def _put_queue_item(
         self,
         session_id: int,
-        audio_queue: queue.Queue[Path | None],
-        item: Path | None,
+        audio_queue: queue.Queue[GeneratedNarrationChunk | None],
+        item: GeneratedNarrationChunk | None,
     ) -> bool:
         """Puts a queue item while allowing disabled sessions to exit."""
 
@@ -226,6 +261,13 @@ class NarrationPlayer:
 
 def sanitize_tts_text(text: str) -> str:
     """Removes prompt artifacts and UI-only suggestions before TTS synthesis."""
+
+    clean_text = sanitize_narration_display_text(text)
+    return normalize_tts_time_text(clean_text).strip()
+
+
+def sanitize_narration_display_text(text: str) -> str:
+    """Returns visible prose that should be revealed while narration plays."""
 
     clean_text = re.sub(r"\[\[[^\]]+\]\]", " ", str(text or ""))
     clean_text = re.sub(r"`([^`]+)`", r"\1", clean_text)
@@ -249,17 +291,37 @@ def sanitize_tts_text(text: str) -> str:
     return clean_text.strip()
 
 
+def build_narration_chunks(
+    text: str,
+    *,
+    max_length: int = MAX_CHUNK_LENGTH,
+) -> list[NarrationChunk]:
+    """Builds display/TTS chunk pairs from one story response."""
+
+    display_chunks = chunk_tts_text(
+        sanitize_narration_display_text(text),
+        max_length=max_length,
+    )
+
+    return [
+        NarrationChunk(
+            display_text=display_chunk,
+            tts_text=normalize_tts_time_text(display_chunk),
+        )
+        for display_chunk in display_chunks
+    ]
+
+
 def chunk_tts_text(text: str, *, max_length: int = MAX_CHUNK_LENGTH) -> list[str]:
-    """Splits sanitized text into narration chunks."""
+    """Splits sanitized text into small ordered narration chunks."""
 
     clean_text = str(text or "").strip()
 
     if not clean_text:
         return []
 
-    sentences = re.split(r"(?<=[.!?])\s+", clean_text)
+    sentences = re.split(r"(?<=[.!?])\s+|\n+", clean_text)
     chunks: list[str] = []
-    current = ""
 
     for sentence in sentences:
         sentence = sentence.strip()
@@ -268,26 +330,124 @@ def chunk_tts_text(text: str, *, max_length: int = MAX_CHUNK_LENGTH) -> list[str
             continue
 
         if len(sentence) > max_length:
-            if current:
-                chunks.append(current)
-                current = ""
-
             chunks.extend(_split_long_text(sentence, max_length=max_length))
             continue
 
-        proposed = f"{current} {sentence}".strip()
-
-        if len(proposed) <= max_length:
-            current = proposed
-        else:
-            if current:
-                chunks.append(current)
-            current = sentence
-
-    if current:
-        chunks.append(current)
+        chunks.append(sentence)
 
     return chunks
+
+
+def normalize_tts_time_text(text: str) -> str:
+    """Converts clock-style times into text that TTS engines pronounce naturally."""
+
+    clean_text = str(text or "")
+    clean_text = _TWELVE_HOUR_TIME_RE.sub(_replace_12_hour_time, clean_text)
+    clean_text = _TWENTY_FOUR_HOUR_TIME_RE.sub(_replace_24_hour_time, clean_text)
+    return clean_text
+
+
+_TWELVE_HOUR_TIME_RE = re.compile(
+    r"\b(1[0-2]|0?[1-9]):([0-5]\d)\s*([AaPp])\.?\s*[Mm]\.?(?=$|[^A-Za-z0-9_])"
+)
+_TWENTY_FOUR_HOUR_TIME_RE = re.compile(r"\b([01]?\d|2[0-3]):([0-5]\d)\b")
+_NUMBER_WORDS_0_TO_59 = {
+    0: "zero",
+    1: "one",
+    2: "two",
+    3: "three",
+    4: "four",
+    5: "five",
+    6: "six",
+    7: "seven",
+    8: "eight",
+    9: "nine",
+    10: "ten",
+    11: "eleven",
+    12: "twelve",
+    13: "thirteen",
+    14: "fourteen",
+    15: "fifteen",
+    16: "sixteen",
+    17: "seventeen",
+    18: "eighteen",
+    19: "nineteen",
+    20: "twenty",
+    30: "thirty",
+    40: "forty",
+    50: "fifty",
+}
+
+
+def _replace_12_hour_time(match: re.Match[str]) -> str:
+    """Returns spoken text for one 12-hour clock match."""
+
+    hour = int(match.group(1))
+    minute = int(match.group(2))
+    suffix = match.group(3).lower()
+    period = "morning" if suffix == "a" else "afternoon"
+
+    if suffix == "p":
+        if hour == 12:
+            period = "afternoon"
+        elif 5 <= hour <= 11:
+            period = "evening"
+
+    if suffix == "a" and hour == 12:
+        period = "at night"
+        return _spoken_time(hour, minute, period)
+
+    return _spoken_time(hour, minute, f"in the {period}")
+
+
+def _replace_24_hour_time(match: re.Match[str]) -> str:
+    """Returns spoken text for one 24-hour clock match."""
+
+    hour_24 = int(match.group(1))
+    minute = int(match.group(2))
+    display_hour = hour_24 % 12 or 12
+
+    if 5 <= hour_24 < 12:
+        period = "in the morning"
+    elif 12 <= hour_24 < 17:
+        period = "in the afternoon"
+    elif 17 <= hour_24 < 22:
+        period = "in the evening"
+    else:
+        period = "at night"
+
+    return _spoken_time(display_hour, minute, period)
+
+
+def _spoken_time(hour: int, minute: int, period: str) -> str:
+    """Formats an already-parsed clock time for speech."""
+
+    if hour == 12 and minute == 0 and period == "at night":
+        return "midnight"
+
+    if hour == 12 and minute == 0 and period == "in the afternoon":
+        return "noon"
+
+    hour_text = _number_word(hour)
+
+    if minute == 0:
+        return f"{hour_text} {period}"
+
+    if minute < 10:
+        return f"{hour_text} oh {_number_word(minute)} {period}"
+
+    return f"{hour_text} {_number_word(minute)} {period}"
+
+
+def _number_word(number: int) -> str:
+    """Returns a plain English word for numbers from 0 through 59."""
+
+    if number in _NUMBER_WORDS_0_TO_59:
+        return _NUMBER_WORDS_0_TO_59[number]
+
+    tens = number - (number % 10)
+    ones = number % 10
+    return f"{_NUMBER_WORDS_0_TO_59[tens]} {_NUMBER_WORDS_0_TO_59[ones]}"
 
 
 def _split_long_text(text: str, *, max_length: int) -> list[str]:

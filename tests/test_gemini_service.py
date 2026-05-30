@@ -136,7 +136,7 @@ class GeminiServiceTests(unittest.TestCase):
                     },
                     "Economy": {"Crowns": "Crowns dominate official trade."},
                 },
-                "start_location": "Rainmarket Station",
+                "start_location": "Rainmarket Station, beneath the old canal clock",
                 "starting_calendar": {
                     "season_hint": "autumn",
                     "day_of_month": 1,
@@ -223,6 +223,8 @@ class GeminiServiceTests(unittest.TestCase):
         self.assertIn("every institution being coin-themed", prompt)
         self.assertIn("MusicChangedEvent", prompt)
         self.assertIn("start_location", prompt)
+        self.assertIn("short and broad", prompt)
+        self.assertIn("Y/N's Office", prompt)
         self.assertIn("does not need to start in a tavern", prompt)
         self.assertIn("starting_items must contain at least five", prompt)
         self.assertIn("currency_denominations must", prompt)

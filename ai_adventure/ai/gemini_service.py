@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from ai_adventure.currency import normalize_currency_denominations
+from ai_adventure.locations import clean_player_location_name
 
 
 LOGGER = logging.getLogger(__name__)
@@ -369,7 +370,12 @@ def build_gemini_new_game_prompt(setup_packet: dict[str, Any]) -> str:
         "to start in a tavern; a frozen sea, deserted island, ruined store, crime "
         "scene, crashed ship, wilderness trail, city checkpoint, or similar premise "
         "is valid when it fits. Use the same start_location consistently in "
-        "introductory_message and events.\n"
+        "introductory_message and events. Keep start_location short and broad: "
+        "use the room, building, street, district, ship, campsite, or landmark "
+        "name only. Put scenic details such as floor, view, nearby landmarks, "
+        "weather, and exact position in introductory_message instead. Example: "
+        "use \"Y/N's Office\", not \"Y/N's Office, high up near the penthouse, "
+        "overlooking the Hudson River\".\n"
         "- character must finalize the player character profile. If character name, "
         "appearance, backstory, or notes are blank/default placeholders, replace "
         "them with coherent player-facing details suitable for the world. Preserve "
@@ -431,7 +437,7 @@ def build_gemini_new_game_prompt(setup_packet: dict[str, Any]) -> str:
         '    "Economy": {"Coinage": "Known player-facing economy facts."},\n'
         '    "Culture and Laws": {"Local Law": "Known player-facing culture or law facts."}\n'
         "  },\n"
-        '  "start_location": "Specific starting location name.",\n'
+        '  "start_location": "Short broad starting location name.",\n'
         '  "starting_calendar": {\n'
         '    "season_name": "Autumn",\n'
         '    "season_hint": "autumn",\n'
@@ -570,7 +576,7 @@ def parse_gemini_new_game_response(raw_text: str) -> AiWorldSetupResult:
     selected_genre = str(
         data.get("selected_genre", data.get("genre", ""))
     ).strip()
-    start_location = str(data.get("start_location", "")).strip()
+    start_location = clean_player_location_name(data.get("start_location", ""))
     starting_calendar = _parse_new_game_starting_calendar(
         data.get("starting_calendar", data.get("calendar"))
     )

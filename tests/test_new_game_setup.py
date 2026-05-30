@@ -13,6 +13,10 @@ from ai_adventure.new_game_setup import (
     normalize_new_game_setup,
     parse_starter_items_text,
 )
+from ai_adventure.new_game_templates import (
+    load_new_game_template,
+    save_new_game_template,
+)
 from ai_adventure.core.state_manager import StateManager
 from ai_adventure.persistence.save_repository import SaveRepository
 
@@ -153,6 +157,51 @@ class NewGameSetupTests(unittest.TestCase):
         self.assertIn("at least one and at most four", packet["requirements"]["currency_generation"])
         self.assertIn("value=1", packet["requirements"]["currency_generation"])
 
+    def test_new_game_template_round_trips_normalized_setup(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            template_path = Path(temp_dir) / "new_game_template.json"
+            setup = normalize_new_game_setup(
+                {
+                    "title": "Template Test",
+                    "character": {
+                        "name": "Iris Vale",
+                        "appearance": "Rain-dark coat.",
+                    },
+                    "skills": [{"name": f"Skill {index}"} for index in range(15)],
+                    "starter_items": [
+                        {
+                            "name": "Notebook",
+                            "category": "Tool",
+                            "quantity": 1,
+                            "description": "Case notes.",
+                            "value_base_units": 4,
+                        }
+                    ],
+                    "calendar": {"calendar_type": "gregorian", "time_display": "24_hour"},
+                    "currency_denominations": [
+                        {"name": "Bit", "plural_name": "Bits", "value": 1},
+                        {"name": "Crown", "plural_name": "Crowns", "value": 12},
+                    ],
+                    "currency_description": "Crowns dominate city trade.",
+                    "specified_genre": "Realistic detective mystery",
+                    "game_style": "Quiet investigation.",
+                    "start_location": "Rainmarket Station",
+                    "world_context": "Canal guilds control the docks.",
+                }
+            )
+
+            self.assertTrue(save_new_game_template(template_path, setup))
+
+            loaded = load_new_game_template(template_path)
+
+            self.assertIsNotNone(loaded)
+            self.assertEqual(loaded["title"], "Template Test")
+            self.assertEqual(loaded["character"]["name"], "Iris Vale")
+            self.assertEqual(loaded["starter_items"][0]["name"], "Notebook")
+            self.assertEqual(loaded["calendar"]["time_display"], "24_hour")
+            self.assertEqual(loaded["currency_denominations"][1]["name"], "Crown")
+            self.assertEqual(loaded["specified_genre"], "Realistic detective mystery")
+
     def test_repository_can_replace_setup_inventory_with_ai_items(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             setup = normalize_new_game_setup(
@@ -230,6 +279,7 @@ class NewGameSetupTests(unittest.TestCase):
         self.assertIn("Do not default to fantasy", packet["requirements"]["genre_generation"])
         self.assertIn("starting_location", packet["requirements"])
         self.assertIn("does not need to start in a tavern", packet["requirements"]["starting_location"])
+        self.assertIn("short, broad place name", packet["requirements"]["starting_location"])
         self.assertIn("skill_generation", packet["requirements"])
         self.assertIn("requires_ai_invention=true", packet["requirements"]["skill_generation"])
         self.assertIn("generalized gameplay capabilities", packet["requirements"]["skill_generation"])

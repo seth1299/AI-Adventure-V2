@@ -249,6 +249,7 @@
           "Every in-game response must include in structured event data exactly one StatusUpdatedEvent event.",
           "This must be the final structured event in an in-game response.",
           "`Location` is the player's current or new location. Use `AUTO` for `Location` if the player remains in the same location.",
+          "`Location` must be a short, broad place name such as a room, building, street, district, ship, campsite, or landmark. Do not include scenic clauses, exact position, floor, view, weather, or nearby landmark details in `Location`; put those details in visible narration instead. Example: use \"Y/N's Office\", not \"Y/N's Office, high up near the penthouse, overlooking the Hudson River\".",
           "`MinutesPassed` must be an integer number of minutes or `AUTO`. Use `0` if no meaningful time passed. Use `AUTO` if the engine should keep time unchanged.",
           "`Weather` is the current weather at the player's location. Use `AUTO` for `Weather` if the weather does not change.",
           "Use the provided calendar settings and current calendar snapshot for date, day, month, season, and time labels.",

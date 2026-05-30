@@ -263,7 +263,11 @@ def build_new_game_setup_packet(
                 "starting location for the selected genre and character. The player "
                 "does not need to start in a tavern; they can start on a frozen sea, "
                 "a deserted island, a crashed ship, a crime scene, a ruined store, "
-                "a city checkpoint, a wilderness trail, or anywhere else coherent."
+                "a city checkpoint, a wilderness trail, or anywhere else coherent. "
+                "Return a short, broad place name only, such as a room, building, "
+                "street, district, ship, campsite, or landmark. Put scenic details "
+                "like floor, view, nearby landmarks, weather, and exact position in "
+                "the opening scene instead of start_location."
             ),
             "skill_generation": (
                 "If a setup.skills entry has blank name, blank description, or "

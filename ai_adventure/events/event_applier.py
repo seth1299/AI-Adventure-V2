@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from ai_adventure.calendar_system import DEFAULT_START_ELAPSED_MINUTES
+from ai_adventure.locations import clean_player_location_name
 from ai_adventure.persistence.save_repository import SaveRepository
 from ai_adventure.skills.rules import bonus_for_level, dc_for_difficulty
 
@@ -377,7 +378,7 @@ class EventApplier:
         minutes_passed = _optional_int(payload, "minutes_passed", "minutes", "time")
 
         if location and location.upper() not in {"AUTO", "SAME", "SKIP"}:
-            self.repository.set_state_value("location", location)
+            self.repository.set_state_value("location", clean_player_location_name(location))
 
         if weather and weather.upper() not in {"AUTO", "SAME", "SKIP"}:
             self.repository.set_state_value("weather", weather)

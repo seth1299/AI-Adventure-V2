@@ -5,7 +5,12 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from ai_adventure.app.app_paths import AppPaths
-from ai_adventure.audio.narration import chunk_tts_text, sanitize_tts_text
+from ai_adventure.audio.narration import (
+    build_narration_chunks,
+    chunk_tts_text,
+    normalize_tts_time_text,
+    sanitize_tts_text,
+)
 from ai_adventure.audio.sound_manager import prepare_sound_directory
 
 
@@ -27,6 +32,31 @@ class AudioTests(unittest.TestCase):
 
         self.assertGreater(len(chunks), 1)
         self.assertEqual(chunks[0], "First sentence.")
+
+    def test_sanitize_tts_text_converts_clock_times_for_speech(self) -> None:
+        text = sanitize_tts_text(
+            "The bell rings at 7:00 A.M. The gates close at 18:05."
+        )
+
+        self.assertIn("seven in the morning", text)
+        self.assertIn("six oh five in the evening", text)
+        self.assertNotIn(":", text)
+        self.assertNotIn("A.M.", text)
+
+    def test_normalize_tts_time_text_handles_midnight_noon_and_minutes(self) -> None:
+        text = normalize_tts_time_text(
+            "Meet at 12:00 A.M., return by 12:00 P.M., and report at 8:30 P.M."
+        )
+
+        self.assertIn("midnight", text)
+        self.assertIn("noon", text)
+        self.assertIn("eight thirty in the evening", text)
+
+    def test_narration_chunks_keep_display_text_separate_from_tts_text(self) -> None:
+        chunks = build_narration_chunks("The bell rings at 7:00 A.M. What do you do now?")
+
+        self.assertEqual(chunks[0].display_text, "The bell rings at 7:00 A.M.")
+        self.assertEqual(chunks[0].tts_text, "The bell rings at seven in the morning")
 
     def test_packaged_audio_paths_resolve_to_current_folder_layout(self) -> None:
         with TemporaryDirectory() as temp_dir:

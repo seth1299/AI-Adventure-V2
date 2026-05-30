@@ -90,6 +90,27 @@ class EventApplierTests(unittest.TestCase):
             self.assertEqual(snapshot["flag.met_gate_guard"], "True")
             self.assertEqual(snapshot["currency.balance"], "25")
 
+    def test_location_changed_event_stores_short_broad_location_name(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = SaveRepository.create_new_save(Path(temp_dir), "Location Test")
+
+            EventApplier(repository).apply_event(
+                {
+                    "type": "LocationChangedEvent",
+                    "payload": {
+                        "location": (
+                            "Y/N's Office, high up near the penthouse, overlooking "
+                            "the Hudson River"
+                        )
+                    },
+                }
+            )
+
+            self.assertEqual(
+                repository.get_state_snapshot()["location"],
+                "Y/N's Office",
+            )
+
     def test_applies_music_changed_event(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             repository = SaveRepository.create_new_save(Path(temp_dir), "Music Test")

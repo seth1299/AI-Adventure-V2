@@ -4,7 +4,7 @@ import logging
 from pathlib import Path
 from typing import Any, Protocol
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QColor, QPalette
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -20,6 +20,9 @@ from PySide6.QtWidgets import (
     QSlider,
     QSpinBox,
     QStackedWidget,
+    QStyle,
+    QStyledItemDelegate,
+    QStyleOptionViewItem,
     QTabWidget,
     QTableWidget,
     QTableWidgetItem,
@@ -64,16 +67,36 @@ from ai_adventure.new_game_setup import (
     normalize_new_game_setup,
     parse_starter_items_text,
 )
+from ai_adventure.new_game_templates import (
+    load_new_game_template,
+    save_new_game_template,
+)
 from ai_adventure.persistence.save_repository import SaveRepository, SaveSummary
 
 
 LOGGER = logging.getLogger(__name__)
 
 
+class _NoCellFocusDelegate(QStyledItemDelegate):
+    """Draws selected table cells without Qt's per-cell focus marker."""
+
+    def paint(self, painter, option, index) -> None:
+        clean_option = QStyleOptionViewItem(option)
+        clean_option.state &= ~QStyle.StateFlag.State_HasFocus
+        super().paint(painter, clean_option, index)
+
+
+def _use_soft_table_selection(table: QTableWidget) -> None:
+    """Keeps table selection while hiding the gaudy per-cell focus cursor."""
+
+    table.setItemDelegate(_NoCellFocusDelegate(table))
+
+
 def _table_item(text: Any, sort_value: Any | None = None) -> QTableWidgetItem:
     """Builds a read-only table item with an optional hidden sort value."""
 
     item = QTableWidgetItem(str(text))
+    item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
 
     if sort_value is not None:
         item.setData(Qt.ItemDataRole.UserRole, sort_value)
@@ -84,6 +107,7 @@ def _table_item(text: Any, sort_value: Any | None = None) -> QTableWidgetItem:
 def _enable_table_sorting(table: QTableWidget, on_section_clicked) -> None:
     """Makes a data table sortable by clicking its column headers."""
 
+    _use_soft_table_selection(table)
     header = table.horizontalHeader()
     header.setSectionsClickable(True)
     header.setSortIndicatorShown(True)
@@ -214,7 +238,10 @@ class MainWindow(QMainWindow):
     def start_new_game_wizard(self) -> None:
         """Opens the New Game Wizard."""
 
-        wizard = NewGameWizard(self)
+        wizard = NewGameWizard(
+            self,
+            template_setup=load_new_game_template(self.app_paths.new_game_template_path),
+        )
 
         if wizard.exec() != QDialog.DialogCode.Accepted:
             return
@@ -242,6 +269,7 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "New Game Failed", "Could not create a new game.")
             return
 
+        save_new_game_template(self.app_paths.new_game_template_path, clean_setup)
         self._synthesize_new_game_world(repository, clean_setup)
         self.open_repository(repository)
         self.game_shell.story_screen.narrate_latest_story()
@@ -544,7 +572,12 @@ class MainMenuScreen(QWidget):
 class NewGameWizard(QWizard):
     """Multi-step new-game setup flow."""
 
-    def __init__(self, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        parent: QWidget | None = None,
+        *,
+        template_setup: dict[str, Any] | None = None,
+    ) -> None:
         super().__init__(parent)
 
         self.setWindowTitle("New Game Wizard")
@@ -556,6 +589,9 @@ class NewGameWizard(QWizard):
         self._build_skills_page()
         self._build_inventory_currency_page()
         self._build_calendar_page()
+
+        if template_setup is not None:
+            self.load_setup(template_setup)
 
     def _apply_theme(self) -> None:
         """Applies a cohesive local theme to the new-game wizard."""
@@ -734,6 +770,59 @@ class NewGameWizard(QWizard):
         }
 
         return normalize_new_game_setup(setup)
+
+    def load_setup(self, setup: dict[str, Any]) -> None:
+        """Populates wizard fields from a reusable setup template."""
+
+        clean_setup = normalize_new_game_setup(setup)
+        character = clean_setup["character"]
+        calendar = clean_setup["calendar"]
+
+        self.title_input.setText(clean_setup["title"])
+        self.genre_input.setText(clean_setup["specified_genre"])
+        self.game_style_input.setPlainText(clean_setup["game_style"])
+        self.start_location_input.setText(clean_setup["start_location"])
+        self.world_context_input.setPlainText(clean_setup["world_context"])
+
+        self.character_name_input.setText(character["name"])
+        self.appearance_input.setPlainText(character["appearance"])
+        self.backstory_input.setPlainText(character["backstory"])
+        self.character_notes_input.setPlainText(character["notes"])
+
+        for index, (_, skill_input) in enumerate(self.skill_inputs):
+            skill = clean_setup["skills"][index] if index < len(clean_setup["skills"]) else {}
+            skill_input.setText(str(skill.get("name", "")))
+
+        self.starter_items_input.setPlainText(
+            _format_starter_items_for_template(clean_setup["starter_items"])
+        )
+        self.currency_table.setRowCount(0)
+
+        for denomination in clean_setup["currency_denominations"]:
+            self._append_currency_row(denomination)
+
+        self.currency_description_input.setPlainText(clean_setup["currency_description"])
+
+        _set_combo_to_data(
+            self.calendar_type_combo,
+            _calendar_type_from_settings(calendar),
+        )
+        _set_combo_to_data(
+            self.time_format_combo,
+            str(calendar.get("time_display", "12_hour")),
+        )
+        self.days_per_week_input.setValue(int(calendar["days_per_week"]))
+        self.weeks_per_month_input.setValue(int(calendar["weeks_per_month"]))
+        self.months_per_year_input.setValue(int(calendar["months_per_year"]))
+        self.seasons_per_year_input.setValue(int(calendar["seasons_per_year"]))
+        self.day_names_input.setText(", ".join(str(name) for name in calendar["day_names"]))
+        self.month_names_input.setText(", ".join(str(name) for name in calendar["month_names"]))
+        self.season_names_input.setText(
+            ", ".join(str(season["name"]) for season in calendar["seasons"])
+        )
+        self.season_hints_input.setText(
+            ", ".join(str(season["weather_hint"]) for season in calendar["seasons"])
+        )
 
     def _build_adventure_page(self) -> None:
         """Builds the adventure/world setup page."""
@@ -1101,6 +1190,9 @@ class GameShell(QWidget):
 class StoryScreen(RepositoryBackedWidget):
     """Story screen for player input and narrative output."""
 
+    _narration_chunk_ready = Signal(int, str)
+    _narration_complete = Signal(int)
+
     def __init__(
         self,
         *,
@@ -1111,6 +1203,10 @@ class StoryScreen(RepositoryBackedWidget):
 
         self.sound_manager = sound_manager
         self.narration_player = narration_player
+        self._revealing_story_id: int | None = None
+        self._revealed_story_chunks: list[str] = []
+        self._narration_chunk_ready.connect(self._append_revealed_story_chunk)
+        self._narration_complete.connect(self._complete_revealed_story)
         self.location_value = QLabel("-")
         self.day_value = QLabel("-")
         self.time_value = QLabel("-")
@@ -1173,7 +1269,13 @@ class StoryScreen(RepositoryBackedWidget):
             if kind == "player":
                 story_lines.append(f"You: {content}")
             elif kind == "story":
-                story_lines.append(format_story_message(content))
+                entry_id = _safe_int(entry.get("id"), -1)
+
+                if entry_id == self._revealing_story_id:
+                    if self._revealed_story_chunks:
+                        story_lines.append("\n\n".join(self._revealed_story_chunks))
+                else:
+                    story_lines.append(format_story_message(content))
 
         self.story_output.setPlainText("\n\n".join(story_lines))
         self.story_output.moveCursor(self.story_output.textCursor().MoveOperation.End)
@@ -1231,7 +1333,6 @@ class StoryScreen(RepositoryBackedWidget):
             )
         else:
             repository.append_history("story", result.narrative_text)
-            self._narrate_text(result.narrative_text)
 
             if result.suggested_events:
                 event_results = EventApplier(repository).apply_events(result.suggested_events)
@@ -1251,6 +1352,15 @@ class StoryScreen(RepositoryBackedWidget):
                 )
 
         self.player_input.clear()
+
+        if "result" in locals():
+            latest_story = self._latest_story_entry()
+            if latest_story is not None and self._reveal_story_with_narration(
+                int(latest_story["id"]),
+                result.narrative_text,
+            ):
+                return
+
         self.refresh()
 
     def narrate_latest_story(self) -> None:
@@ -1270,16 +1380,87 @@ class StoryScreen(RepositoryBackedWidget):
                     sound_manager=self.sound_manager,
                     narration_player=self.narration_player,
                 )
-                self._narrate_text(str(entry.get("content", "")))
+                if not self._reveal_story_with_narration(
+                    int(entry.get("id", -1)),
+                    str(entry.get("content", "")),
+                ):
+                    self.refresh()
                 return
 
-    def _narrate_text(self, text: str) -> None:
+    def _narrate_text(
+        self,
+        text: str,
+        *,
+        story_id: int | None = None,
+    ) -> bool:
         """Sends text to the narration player if available."""
 
         if self.narration_player is None:
+            return False
+
+        if story_id is None:
+            return self.narration_player.narrate(text)
+
+        return self.narration_player.narrate(
+            text,
+            on_chunk_start=lambda chunk: self._narration_chunk_ready.emit(
+                story_id,
+                chunk,
+            ),
+            on_complete=lambda: self._narration_complete.emit(story_id),
+        )
+
+    def _reveal_story_with_narration(self, story_id: int, text: str) -> bool:
+        """Displays the latest story progressively as TTS starts each chunk."""
+
+        self._revealing_story_id = story_id
+        self._revealed_story_chunks = []
+        self.refresh()
+
+        if self._narrate_text(text, story_id=story_id):
+            return True
+
+        self._revealing_story_id = None
+        self._revealed_story_chunks = []
+        return False
+
+    def _append_revealed_story_chunk(self, story_id: int, chunk: str) -> None:
+        """Appends one just-started narration chunk to the story output."""
+
+        if story_id != self._revealing_story_id:
             return
 
-        self.narration_player.narrate(text)
+        clean_chunk = str(chunk or "").strip()
+
+        if not clean_chunk:
+            return
+
+        self._revealed_story_chunks.append(clean_chunk)
+        self.refresh()
+
+    def _complete_revealed_story(self, story_id: int) -> None:
+        """Restores normal full-history rendering after chunked narration."""
+
+        if story_id != self._revealing_story_id:
+            return
+
+        self._revealing_story_id = None
+        self._revealed_story_chunks = []
+        self.refresh()
+
+    def _latest_story_entry(self) -> dict[str, Any] | None:
+        """Returns the most recent saved story entry."""
+
+        repository = self.repository()
+
+        if repository is None:
+            return None
+
+        for entry in reversed(repository.list_history()):
+            if str(entry.get("kind", "")).casefold() == "story":
+                return entry
+
+        return None
 
 
 class CharacterScreen(RepositoryBackedWidget):
@@ -1431,6 +1612,7 @@ class CalendarScreen(RepositoryBackedWidget):
         self.table = QTableWidget(0, 0)
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
+        _use_soft_table_selection(self.table)
         self.table.horizontalHeader().setStretchLastSection(True)
         self.table.verticalHeader().setVisible(False)
 
@@ -1883,6 +2065,8 @@ class AlchemyNotebookScreen(RepositoryBackedWidget):
         super().__init__()
 
         self.tabs = QTabWidget()
+        self._reagent_rows: list[dict[str, Any]] = []
+        self._refreshing_reagents = False
 
         self._setup_reagents_tab()
         self._setup_recipes_tab()
@@ -1912,7 +2096,12 @@ class AlchemyNotebookScreen(RepositoryBackedWidget):
         self.reagent_table.setHorizontalHeaderLabels(
             ["Name", "Qualities", "Motions", "Virtues", "Uses", "Notes"]
         )
+        self.reagent_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.reagent_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.reagent_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        _use_soft_table_selection(self.reagent_table)
         self.reagent_table.horizontalHeader().setStretchLastSection(True)
+        self.reagent_table.itemSelectionChanged.connect(self._load_selected_reagent)
 
         self.reagent_name_input = QLineEdit()
         self.reagent_name_input.setPlaceholderText("Reagent name")
@@ -1927,8 +2116,15 @@ class AlchemyNotebookScreen(RepositoryBackedWidget):
         self.reagent_notes_input = QTextEdit()
         self.reagent_notes_input.setPlaceholderText("Reagent notes")
 
-        add_button = QPushButton("Save Reagent")
-        add_button.clicked.connect(self._add_reagent)
+        save_button = QPushButton("Save Reagent")
+        save_button.clicked.connect(self._save_reagent)
+        new_button = QPushButton("New Reagent")
+        new_button.clicked.connect(self._clear_reagent_form)
+
+        button_row = QHBoxLayout()
+        button_row.addWidget(save_button)
+        button_row.addWidget(new_button)
+        button_row.addStretch()
 
         form = QFormLayout()
         form.addRow("Name:", self.reagent_name_input)
@@ -1937,7 +2133,7 @@ class AlchemyNotebookScreen(RepositoryBackedWidget):
         form.addRow("Virtues:", self.reagent_virtues_input)
         form.addRow("Uses:", self.reagent_uses_input)
         form.addRow("Notes:", self.reagent_notes_input)
-        form.addRow(add_button)
+        form.addRow(button_row)
 
         layout = QVBoxLayout()
         layout.addLayout(form)
@@ -1954,6 +2150,8 @@ class AlchemyNotebookScreen(RepositoryBackedWidget):
         self.recipe_table.setHorizontalHeaderLabels(
             ["Name", "Ingredients", "Result", "Motions", "Virtues", "Notes"]
         )
+        self.recipe_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        _use_soft_table_selection(self.recipe_table)
         self.recipe_table.horizontalHeader().setStretchLastSection(True)
 
         self.recipe_name_input = QLineEdit()
@@ -1993,17 +2191,28 @@ class AlchemyNotebookScreen(RepositoryBackedWidget):
         """Reloads the reagent table."""
 
         reagents = repository.list_alchemy_reagents()
+        selected_name = self.reagent_name_input.text().strip()
+        self._reagent_rows = reagents
+        self._refreshing_reagents = True
+        self.reagent_table.clearSelection()
         self.reagent_table.setRowCount(len(reagents))
 
         for row_index, reagent in enumerate(reagents):
-            self.reagent_table.setItem(row_index, 0, QTableWidgetItem(str(reagent.get("name", ""))))
-            self.reagent_table.setItem(row_index, 1, QTableWidgetItem(_join_list(reagent.get("qualities", []))))
-            self.reagent_table.setItem(row_index, 2, QTableWidgetItem(_join_list(reagent.get("motions", []))))
-            self.reagent_table.setItem(row_index, 3, QTableWidgetItem(_join_list(reagent.get("virtues", []))))
-            self.reagent_table.setItem(row_index, 4, QTableWidgetItem(_join_list(reagent.get("uses", []))))
-            self.reagent_table.setItem(row_index, 5, QTableWidgetItem(str(reagent.get("notes", ""))))
+            self.reagent_table.setItem(row_index, 0, _table_item(str(reagent.get("name", ""))))
+            self.reagent_table.setItem(row_index, 1, _table_item(_join_list(reagent.get("qualities", []))))
+            self.reagent_table.setItem(row_index, 2, _table_item(_join_list(reagent.get("motions", []))))
+            self.reagent_table.setItem(row_index, 3, _table_item(_join_list(reagent.get("virtues", []))))
+            self.reagent_table.setItem(row_index, 4, _table_item(_join_list(reagent.get("uses", []))))
+            self.reagent_table.setItem(row_index, 5, _table_item(str(reagent.get("notes", ""))))
 
         self.reagent_table.resizeColumnsToContents()
+        self._refreshing_reagents = False
+
+        if selected_name:
+            for row_index, reagent in enumerate(reagents):
+                if str(reagent.get("name", "")).casefold() == selected_name.casefold():
+                    self.reagent_table.selectRow(row_index)
+                    break
 
     def _refresh_recipes(self, repository: SaveRepository) -> None:
         """Reloads the recipe table."""
@@ -2012,16 +2221,16 @@ class AlchemyNotebookScreen(RepositoryBackedWidget):
         self.recipe_table.setRowCount(len(recipes))
 
         for row_index, recipe in enumerate(recipes):
-            self.recipe_table.setItem(row_index, 0, QTableWidgetItem(str(recipe.get("name", ""))))
-            self.recipe_table.setItem(row_index, 1, QTableWidgetItem(_join_list(recipe.get("ingredients", []))))
-            self.recipe_table.setItem(row_index, 2, QTableWidgetItem(str(recipe.get("result", ""))))
-            self.recipe_table.setItem(row_index, 3, QTableWidgetItem(_join_list(recipe.get("motions", []))))
-            self.recipe_table.setItem(row_index, 4, QTableWidgetItem(_join_list(recipe.get("virtues", []))))
-            self.recipe_table.setItem(row_index, 5, QTableWidgetItem(str(recipe.get("notes", ""))))
+            self.recipe_table.setItem(row_index, 0, _table_item(str(recipe.get("name", ""))))
+            self.recipe_table.setItem(row_index, 1, _table_item(_join_list(recipe.get("ingredients", []))))
+            self.recipe_table.setItem(row_index, 2, _table_item(str(recipe.get("result", ""))))
+            self.recipe_table.setItem(row_index, 3, _table_item(_join_list(recipe.get("motions", []))))
+            self.recipe_table.setItem(row_index, 4, _table_item(_join_list(recipe.get("virtues", []))))
+            self.recipe_table.setItem(row_index, 5, _table_item(str(recipe.get("notes", ""))))
 
         self.recipe_table.resizeColumnsToContents()
 
-    def _add_reagent(self) -> None:
+    def _save_reagent(self) -> None:
         """Adds or updates a known reagent."""
 
         repository = self.repository()
@@ -2052,6 +2261,39 @@ class AlchemyNotebookScreen(RepositoryBackedWidget):
         self.reagent_notes_input.clear()
 
         self.refresh()
+
+    def _load_selected_reagent(self) -> None:
+        """Loads the selected reagent row into the edit controls."""
+
+        if self._refreshing_reagents:
+            return
+
+        if not self.reagent_table.selectedItems():
+            return
+
+        row_index = self.reagent_table.currentRow()
+
+        if row_index < 0 or row_index >= len(self._reagent_rows):
+            return
+
+        reagent = self._reagent_rows[row_index]
+        self.reagent_name_input.setText(str(reagent.get("name", "")))
+        self.reagent_qualities_input.setText(_join_list(reagent.get("qualities", [])))
+        self.reagent_motions_input.setText(_join_list(reagent.get("motions", [])))
+        self.reagent_virtues_input.setText(_join_list(reagent.get("virtues", [])))
+        self.reagent_uses_input.setText(_join_list(reagent.get("uses", [])))
+        self.reagent_notes_input.setPlainText(str(reagent.get("notes", "")))
+
+    def _clear_reagent_form(self) -> None:
+        """Clears reagent edit controls and table selection."""
+
+        self.reagent_table.clearSelection()
+        self.reagent_name_input.clear()
+        self.reagent_qualities_input.clear()
+        self.reagent_motions_input.clear()
+        self.reagent_virtues_input.clear()
+        self.reagent_uses_input.clear()
+        self.reagent_notes_input.clear()
 
     def _add_recipe(self) -> None:
         """Adds or updates a known recipe."""
@@ -2498,6 +2740,42 @@ def _append_ai_context_line(existing_context: str, line: str) -> str:
         return f"{clean_existing}\n\n{clean_line}"
 
     return clean_line
+
+
+def _format_starter_items_for_template(items: list[dict[str, Any]]) -> str:
+    """Formats starter item dictionaries back into wizard text lines."""
+
+    lines: list[str] = []
+
+    for item in items:
+        name = str(item.get("name", "")).strip()
+
+        if not name:
+            continue
+
+        parts = [
+            name,
+            str(item.get("category", "Item")).strip() or "Item",
+            str(_safe_int(item.get("quantity"), 1)),
+            str(item.get("description", "")).strip(),
+            str(_safe_int(item.get("value_base_units"), 0)),
+        ]
+        lines.append(" | ".join(parts))
+
+    return "\n".join(lines)
+
+
+def _calendar_type_from_settings(settings: dict[str, Any]) -> str:
+    """Infers which calendar option should be selected for saved settings."""
+
+    for key, value in GREGORIAN_CALENDAR_SETTINGS.items():
+        if key == "time_display":
+            continue
+
+        if settings.get(key) != value:
+            return "custom"
+
+    return "gregorian"
 
 
 def _build_season_settings(

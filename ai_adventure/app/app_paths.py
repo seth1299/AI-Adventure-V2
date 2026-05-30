@@ -71,6 +71,12 @@ class AppPaths:
         return self.app_data_dir / "models" / "tts"
 
     @property
+    def new_game_template_path(self) -> Path:
+        """Returns the reusable new-game wizard template path."""
+
+        return self.app_data_dir / "new_game_template.json"
+
+    @property
     def kokoro_model_path(self) -> Path:
         """Returns the best known Kokoro ONNX model path."""
 
