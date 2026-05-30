@@ -53,6 +53,38 @@ class SkillSystemTests(unittest.TestCase):
             self.assertEqual(skill["xp"], 10)
             self.assertEqual(skill["bonus"], 4)
 
+    def test_replace_skills_removes_new_game_placeholders(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = SaveRepository.create_new_save(Path(temp_dir), "Skill Test")
+            repository.upsert_skill(
+                "Signature Expertise",
+                "Player-selected level 5 starting skill.",
+                5,
+            )
+
+            repository.replace_skills(
+                [
+                    {
+                        "name": "Canal Investigation",
+                        "description": "Reading wet footprints, dock ledgers, and canal-side clues.",
+                        "level": 5,
+                    },
+                    {
+                        "name": "Quiet Leverage",
+                        "description": "Getting cooperation through careful pressure and timing.",
+                        "level": 4,
+                    },
+                ]
+            )
+
+            skills = repository.list_skills()
+
+            self.assertEqual([skill["name"] for skill in skills], ["Canal Investigation", "Quiet Leverage"])
+            self.assertNotIn(
+                "Player-selected",
+                " ".join(str(skill["description"]) for skill in skills),
+            )
+
     def test_skill_check_event_rolls_and_records_result(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             repository = SaveRepository.create_new_save(Path(temp_dir), "Skill Test")

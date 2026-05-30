@@ -90,6 +90,83 @@ class EventApplierTests(unittest.TestCase):
             self.assertEqual(snapshot["flag.met_gate_guard"], "True")
             self.assertEqual(snapshot["currency.balance"], "25")
 
+    def test_applies_music_changed_event(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = SaveRepository.create_new_save(Path(temp_dir), "Music Test")
+
+            result = EventApplier(repository).apply_events(
+                [
+                    {
+                        "type": "MusicChangedEvent",
+                        "payload": {"filename": "Town Village City.mp3"},
+                    }
+                ]
+            )[0]
+
+            self.assertEqual(result.status, "applied")
+            self.assertEqual(
+                repository.get_setting("audio.current_music"),
+                "Town Village City.mp3",
+            )
+
+    def test_normalizes_event_type_alias_from_new_game_events(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = SaveRepository.create_new_save(Path(temp_dir), "Alias Test")
+
+            results = EventApplier(repository).apply_events(
+                [
+                    {
+                        "event_type": "MusicChangedEvent",
+                        "filename": "Boss_Fight.mp3",
+                    },
+                    {
+                        "event_type": "NpcUpsertedEvent",
+                        "display_name": "Bartender",
+                        "location": "The Gilded Tankard",
+                        "player_facing_information": "A tired bartender polishes cloudy glasses.",
+                    },
+                ]
+            )
+            visible_npcs = repository.list_player_visible_npcs()
+
+            self.assertEqual([result.status for result in results], ["applied", "applied"])
+            self.assertEqual(repository.get_setting("audio.current_music"), "Boss_Fight.mp3")
+            self.assertEqual(visible_npcs[0]["display_name"], "Bartender")
+
+    def test_world_lore_events_update_player_lore_store(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = SaveRepository.create_new_save(Path(temp_dir), "Lore Test")
+
+            results = EventApplier(repository).apply_events(
+                [
+                    {
+                        "type": "WorldLoreAddedEvent",
+                        "payload": {
+                            "section": "Locations",
+                            "key": "The Gilded Tankard",
+                            "text": "The Gilded Tankard is a smoky tavern in Amberfell.",
+                        },
+                    },
+                    {
+                        "type": "WorldLoreChangedEvent",
+                        "payload": {
+                            "section": "Locations",
+                            "key": "The Gilded Tankard",
+                            "replacement_lore": (
+                                "The Gilded Tankard is a smoky tavern in Amberfell "
+                                "known for discreet contract work."
+                            ),
+                        },
+                    }
+                ]
+            )
+
+            self.assertEqual([result.status for result in results], ["applied", "applied"])
+            self.assertEqual(
+                repository.get_world_lore()["Locations"]["The Gilded Tankard"],
+                "The Gilded Tankard is a smoky tavern in Amberfell known for discreet contract work.",
+            )
+
     def test_applies_alchemy_discovery_events(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             repository = SaveRepository.create_new_save(Path(temp_dir), "Event Test")
@@ -179,10 +256,85 @@ class EventApplierTests(unittest.TestCase):
             self.assertIn("Mira knows which regulars water their ale.", npcs[0]["known_facts"])
             self.assertIn("The player asked about the north road.", npcs[0]["known_facts"])
             self.assertEqual(visible_npcs[0]["display_name"], "Bartender")
+            self.assertEqual(
+                visible_npcs[0]["description"],
+                "A tired bartender polishing cloudy glasses.",
+            )
+            self.assertEqual(visible_npcs[0]["location"], "Tavern")
+            self.assertEqual(
+                visible_npcs[0]["notes"],
+                "Mira Coppercup tends bar at the tavern and hears local gossip.",
+            )
             self.assertNotIn("name", visible_npcs[0])
             self.assertNotIn("role", visible_npcs[0])
             self.assertNotIn("known_facts", visible_npcs[0])
             self.assertNotIn("knowledge_scope", visible_npcs[0])
+            self.assertNotIn("updated_at", visible_npcs[0])
+
+    def test_applies_active_task_and_quest_events(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = SaveRepository.create_new_save(Path(temp_dir), "Task Test")
+
+            results = EventApplier(repository).apply_events(
+                [
+                    {
+                        "type": "QuestAddedEvent",
+                        "payload": {
+                            "name": "Find the Missing Ledger",
+                            "giver": "Mira Coppercup",
+                            "description": "Recover the missing tavern ledger.",
+                            "turn_in": "Tavern",
+                            "reward": "Free room and board.",
+                        },
+                    },
+                    {
+                        "type": "ActiveTaskUpsertedEvent",
+                        "payload": {
+                            "name": "Silver Ring Commission",
+                            "category": "Commission",
+                            "status": "Waiting",
+                            "description": "Pick up the engraved silver ring.",
+                            "requester": "Silversmith Orren",
+                            "location": "Market Lane",
+                            "reward": "Paid in advance.",
+                            "due_date": "Month 1 3",
+                        },
+                    },
+                ]
+            )
+
+            tasks = repository.list_active_tasks()
+            task_names = {task["name"] for task in tasks}
+
+            self.assertEqual([result.status for result in results], ["applied", "applied"])
+            self.assertIn("Find the Missing Ledger", task_names)
+            self.assertIn("Silver Ring Commission", task_names)
+
+            ledger_task = repository.get_active_task("Find the Missing Ledger")
+            self.assertIsNotNone(ledger_task)
+            self.assertEqual(ledger_task["category"], "Quest")
+            self.assertEqual(ledger_task["requester"], "Mira Coppercup")
+
+            complete_result = EventApplier(repository).apply_event(
+                {
+                    "type": "ActiveTaskCompletedEvent",
+                    "payload": {
+                        "name": "Silver Ring Commission",
+                        "notes": "The ring was collected.",
+                    },
+                }
+            )
+
+            self.assertEqual(complete_result.status, "applied")
+            self.assertNotIn(
+                "Silver Ring Commission",
+                {task["name"] for task in repository.list_active_tasks()},
+            )
+
+            completed_task = repository.get_active_task("Silver Ring Commission")
+            self.assertIsNotNone(completed_task)
+            self.assertEqual(completed_task["status"], "Completed")
+            self.assertEqual(completed_task["notes"], "The ring was collected.")
 
     def test_npc_upsert_allows_display_name_without_known_name(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -207,6 +359,30 @@ class EventApplierTests(unittest.TestCase):
             self.assertEqual(result.status, "applied")
             self.assertEqual(visible_npcs[0]["display_name"], "Shady Character")
             self.assertNotIn("name", visible_npcs[0])
+
+    def test_npc_upsert_uses_name_as_visible_fallback_before_role(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = SaveRepository.create_new_save(Path(temp_dir), "NPC Test")
+
+            result = EventApplier(repository).apply_event(
+                {
+                    "type": "NpcUpsertedEvent",
+                    "payload": {
+                        "name": "Barmaid Elina",
+                        "role": "Tavern server and local gossip source",
+                    },
+                }
+            )
+
+            visible_npcs = repository.list_player_visible_npcs()
+
+            self.assertEqual(result.status, "applied")
+            self.assertEqual(visible_npcs[0]["display_name"], "Barmaid Elina")
+            self.assertEqual(
+                visible_npcs[0]["notes"],
+                "Tavern server and local gossip source",
+            )
+            self.assertEqual(visible_npcs[0]["description"], "")
 
     def test_applies_multiple_npc_upsert_events_in_one_turn(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

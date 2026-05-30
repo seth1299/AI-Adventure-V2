@@ -2,20 +2,22 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QColor
+from PySide6.QtGui import QColor, QPalette
 from PySide6.QtWidgets import (
+    QCheckBox,
     QComboBox,
+    QDialog,
     QFormLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
-    QListWidget,
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QSlider,
     QSpinBox,
     QStackedWidget,
     QTabWidget,
@@ -24,27 +26,96 @@ from PySide6.QtWidgets import (
     QTextEdit,
     QVBoxLayout,
     QWidget,
+    QWizard,
+    QWizardPage,
 )
 
 from ai_adventure.app.app_paths import AppPaths
 from ai_adventure.ai.gemini_service import (
     GeminiConfigurationError,
     GeminiNarrationService,
+    format_story_message,
 )
+from ai_adventure.audio.narration import NarrationPlayer
+from ai_adventure.audio.sound_manager import SoundManager, prepare_sound_directory
+from ai_adventure.audio.tts.tts_manager import create_tts_manager
 from ai_adventure.calendar_system import (
     DEFAULT_CALENDAR_SETTINGS,
     DEFAULT_START_ELAPSED_MINUTES,
     build_calendar_snapshot,
     build_month_grid,
+    resolve_starting_elapsed_minutes,
 )
 from ai_adventure.context.context_builder import AiContextBuilder
-from ai_adventure.currency import DEFAULT_CURRENCY_DENOMINATIONS, format_currency_amount
+from ai_adventure.currency import (
+    DEFAULT_CURRENCY_DENOMINATIONS,
+    FALLBACK_CURRENCY_DENOMINATIONS,
+    describe_currency_denominations,
+    format_currency_amount,
+)
 from ai_adventure.core.state_manager import StateManager
 from ai_adventure.events.event_applier import EventApplier
+from ai_adventure.new_game_setup import (
+    GREGORIAN_CALENDAR_SETTINGS,
+    SKILL_LEVEL_PLAN,
+    build_new_game_setup_packet,
+    fallback_introductory_message,
+    fallback_world_summary,
+    normalize_new_game_setup,
+    parse_starter_items_text,
+)
 from ai_adventure.persistence.save_repository import SaveRepository, SaveSummary
 
 
 LOGGER = logging.getLogger(__name__)
+
+
+def _table_item(text: Any, sort_value: Any | None = None) -> QTableWidgetItem:
+    """Builds a read-only table item with an optional hidden sort value."""
+
+    item = QTableWidgetItem(str(text))
+
+    if sort_value is not None:
+        item.setData(Qt.ItemDataRole.UserRole, sort_value)
+
+    return item
+
+
+def _enable_table_sorting(table: QTableWidget, on_section_clicked) -> None:
+    """Makes a data table sortable by clicking its column headers."""
+
+    header = table.horizontalHeader()
+    header.setSectionsClickable(True)
+    header.setSortIndicatorShown(True)
+    header.sectionClicked.connect(on_section_clicked)
+    table.setSortingEnabled(False)
+
+
+def _update_sort_state(
+    table: QTableWidget,
+    current_column: int,
+    current_order: Qt.SortOrder,
+    clicked_column: int,
+) -> tuple[int, Qt.SortOrder]:
+    """Returns the next sort column/order and updates the header indicator."""
+
+    if clicked_column == current_column:
+        next_order = (
+            Qt.SortOrder.DescendingOrder
+            if current_order == Qt.SortOrder.AscendingOrder
+            else Qt.SortOrder.AscendingOrder
+        )
+    else:
+        next_order = Qt.SortOrder.AscendingOrder
+
+    table.horizontalHeader().setSortIndicator(clicked_column, next_order)
+    return clicked_column, next_order
+
+
+def _sort_descending(order: Qt.SortOrder) -> bool:
+    """Returns True when table data should be sorted descending."""
+
+    return order == Qt.SortOrder.DescendingOrder
 
 
 class RefreshableScreen(Protocol):
@@ -108,6 +179,14 @@ class MainWindow(QMainWindow):
 
         self.app_paths = app_paths
         self.active_repository: SaveRepository | None = None
+        self.sound_manager = SoundManager(prepare_sound_directory(self.app_paths))
+        self.narration_player = NarrationPlayer(
+            create_tts_manager(
+                model_path=self.app_paths.kokoro_model_path,
+                voices_path=self.app_paths.kokoro_voices_path,
+                output_directory=self.app_paths.tts_output_dir,
+            )
+        )
 
         self.setWindowTitle("AI Adventure")
         self.resize(1100, 750)
@@ -117,33 +196,199 @@ class MainWindow(QMainWindow):
 
         self.main_menu = MainMenuScreen(
             saves_dir=self.app_paths.saves_dir,
-            on_new_game=self.create_new_game,
+            on_new_game=self.start_new_game_wizard,
             on_load_game=self.load_game_from_path,
         )
 
-        self.game_shell = GameShell(on_return_to_menu=self.return_to_menu)
+        self.game_shell = GameShell(
+            on_return_to_menu=self.return_to_menu,
+            sound_manager=self.sound_manager,
+            narration_player=self.narration_player,
+        )
 
         self.stack.addWidget(self.main_menu)
         self.stack.addWidget(self.game_shell)
 
         self.return_to_menu()
 
-    def create_new_game(self, title: str) -> None:
+    def start_new_game_wizard(self) -> None:
+        """Opens the New Game Wizard."""
+
+        wizard = NewGameWizard(self)
+
+        if wizard.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        self.create_new_game(wizard.build_setup())
+
+    def create_new_game(self, setup: dict[str, Any]) -> None:
         """
         Creates a new save and opens it.
 
         Args:
-            title: Player-facing adventure title.
+            setup: New-game wizard setup dictionary.
         """
 
+        clean_setup = normalize_new_game_setup(setup)
+
         try:
-            repository = SaveRepository.create_new_save(self.app_paths.saves_dir, title)
+            repository = SaveRepository.create_new_save(
+                self.app_paths.saves_dir,
+                clean_setup["title"],
+                setup=clean_setup,
+            )
         except Exception:
             LOGGER.exception("Failed to create new game.")
             QMessageBox.critical(self, "New Game Failed", "Could not create a new game.")
             return
 
+        self._synthesize_new_game_world(repository, clean_setup)
         self.open_repository(repository)
+        self.game_shell.story_screen.narrate_latest_story()
+
+    def _synthesize_new_game_world(
+        self,
+        repository: SaveRepository,
+        setup: dict[str, Any],
+    ) -> None:
+        """Uses Gemini to synthesize the initial world and opening scene."""
+
+        try:
+            result = GeminiNarrationService().generate_new_game_world(
+                build_new_game_setup_packet(
+                    setup,
+                    valid_music_tracks=self.sound_manager.get_valid_track_names(),
+                )
+            )
+        except GeminiConfigurationError as error:
+            LOGGER.warning("Gemini new-game synthesis skipped: %s", error)
+            self._apply_fallback_currency_if_needed(repository, setup)
+            repository.set_world_summary(fallback_world_summary(setup))
+            repository.append_history("story", fallback_introductory_message(setup))
+            return
+        except Exception:
+            LOGGER.exception("Gemini new-game synthesis failed.")
+            self._apply_fallback_currency_if_needed(repository, setup)
+            repository.set_world_summary(fallback_world_summary(setup))
+            repository.append_history("story", fallback_introductory_message(setup))
+            return
+
+        self._apply_new_game_ai_state(repository, setup, result)
+        repository.set_world_summary(result.world_summary)
+        repository.set_world_lore(result.world_lore)
+        repository.append_history("story", result.introductory_message)
+
+        if result.suggested_events:
+            event_results = EventApplier(repository).apply_events(result.suggested_events)
+            applied_count = sum(
+                1 for event_result in event_results if event_result.status == "applied"
+            )
+            skipped_count = len(event_results) - applied_count
+            LOGGER.info(
+                "Applied %s new-game event(s); skipped %s.",
+                applied_count,
+                skipped_count,
+            )
+
+    def _apply_new_game_ai_state(
+        self,
+        repository: SaveRepository,
+        setup: dict[str, Any],
+        result,
+    ) -> None:
+        """Persists AI-finalized new-game character, skills, and start location."""
+
+        if result.start_location:
+            repository.set_state_value("location", result.start_location)
+
+        if result.starting_calendar:
+            elapsed_minutes = resolve_starting_elapsed_minutes(
+                result.starting_calendar,
+                repository.get_calendar_settings(),
+                default_elapsed_minutes=DEFAULT_START_ELAPSED_MINUTES,
+            )
+            calendar_snapshot = build_calendar_snapshot(
+                elapsed_minutes,
+                repository.get_calendar_settings(),
+            )
+            repository.set_state_value("elapsed_minutes", str(elapsed_minutes))
+            repository.set_state_value("time", calendar_snapshot["display_label"])
+
+        if result.start_weather:
+            repository.set_state_value("weather", result.start_weather)
+
+        if not setup.get("currency_denominations"):
+            if result.finalized_currency_denominations:
+                repository.set_currency_denominations(result.finalized_currency_denominations)
+                repository.set_setting(
+                    "currency.description",
+                    result.finalized_currency_description
+                    or describe_currency_denominations(
+                        result.finalized_currency_denominations,
+                        fallback_denominations=[],
+                    ),
+                )
+            else:
+                LOGGER.warning("AI new-game setup omitted generated currency denominations.")
+                self._apply_fallback_currency_if_needed(repository, setup)
+
+        if result.selected_genre:
+            repository.set_setting("world.genre", result.selected_genre)
+            repository.set_setting(
+                "ai.additional_context",
+                _append_ai_context_line(
+                    str(repository.get_setting("ai.additional_context", "")),
+                    f"Selected genre: {result.selected_genre}",
+                ),
+            )
+
+        character = result.finalized_character
+
+        if character:
+            if character.get("name"):
+                repository.set_setting("player_name", character["name"])
+            if character.get("appearance"):
+                repository.set_setting("player.appearance", character["appearance"])
+            if character.get("backstory"):
+                repository.set_setting("player.backstory", character["backstory"])
+            if character.get("notes"):
+                repository.set_setting("player.notes", character["notes"])
+
+        if _ai_skills_match_setup(result.finalized_skills, setup.get("skills", [])):
+            repository.replace_skills(result.finalized_skills)
+        elif result.finalized_skills:
+            LOGGER.warning(
+                "Skipped AI-finalized skills because they did not match the starting skill plan."
+            )
+
+        minimum_item_count = max(5, len(setup.get("starter_items", [])))
+
+        if len(result.finalized_starter_items) >= minimum_item_count:
+            repository.replace_inventory_items(result.finalized_starter_items)
+        elif result.finalized_starter_items:
+            LOGGER.warning(
+                "Skipped AI-finalized starter inventory because it had fewer than %s items.",
+                minimum_item_count,
+            )
+
+    def _apply_fallback_currency_if_needed(
+        self,
+        repository: SaveRepository,
+        setup: dict[str, Any],
+    ) -> None:
+        """Stores a neutral currency when AI generation cannot run."""
+
+        if setup.get("currency_denominations"):
+            return
+
+        repository.set_currency_denominations(FALLBACK_CURRENCY_DENOMINATIONS)
+        repository.set_setting(
+            "currency.description",
+            describe_currency_denominations(
+                FALLBACK_CURRENCY_DENOMINATIONS,
+                fallback_denominations=[],
+            ),
+        )
 
     def load_game_from_path(self, db_path: Path) -> None:
         """
@@ -221,9 +466,6 @@ class MainMenuScreen(QWidget):
         title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         title_label.setStyleSheet("font-size: 32px; font-weight: bold;")
 
-        self.new_game_name = QLineEdit()
-        self.new_game_name.setPlaceholderText("Adventure name")
-
         new_game_button = QPushButton("New Game")
         new_game_button.clicked.connect(self._handle_new_game)
 
@@ -237,9 +479,6 @@ class MainMenuScreen(QWidget):
         layout.addWidget(title_label)
         layout.addSpacing(30)
 
-        form = QFormLayout()
-        form.addRow("New Adventure:", self.new_game_name)
-        layout.addLayout(form)
         layout.addWidget(new_game_button)
 
         layout.addSpacing(30)
@@ -274,8 +513,7 @@ class MainMenuScreen(QWidget):
     def _handle_new_game(self) -> None:
         """Handles the New Game button."""
 
-        title = self.new_game_name.text().strip() or "New Adventure"
-        self.on_new_game(title)
+        self.on_new_game()
 
     def _handle_load_game(self) -> None:
         """Handles the Load Game button."""
@@ -303,10 +541,446 @@ class MainMenuScreen(QWidget):
         return f"{summary.title} - {modified}"
 
 
+class NewGameWizard(QWizard):
+    """Multi-step new-game setup flow."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+
+        self.setWindowTitle("New Game Wizard")
+        self.resize(780, 620)
+        self._apply_theme()
+
+        self._build_adventure_page()
+        self._build_character_page()
+        self._build_skills_page()
+        self._build_inventory_currency_page()
+        self._build_calendar_page()
+
+    def _apply_theme(self) -> None:
+        """Applies a cohesive local theme to the new-game wizard."""
+
+        self.setObjectName("newGameWizard")
+        self.setWizardStyle(QWizard.WizardStyle.ModernStyle)
+
+        palette = self.palette()
+        palette.setColor(QPalette.ColorRole.Window, QColor("#20242b"))
+        palette.setColor(QPalette.ColorRole.WindowText, QColor("#f3f4f6"))
+        palette.setColor(QPalette.ColorRole.Base, QColor("#11151b"))
+        palette.setColor(QPalette.ColorRole.AlternateBase, QColor("#242a33"))
+        palette.setColor(QPalette.ColorRole.Text, QColor("#f3f4f6"))
+        palette.setColor(QPalette.ColorRole.PlaceholderText, QColor("#96a0ad"))
+        palette.setColor(QPalette.ColorRole.Button, QColor("#2d3642"))
+        palette.setColor(QPalette.ColorRole.ButtonText, QColor("#f3f4f6"))
+        palette.setColor(QPalette.ColorRole.Highlight, QColor("#2f7dd3"))
+        palette.setColor(QPalette.ColorRole.HighlightedText, QColor("#ffffff"))
+        self.setPalette(palette)
+
+        self.setStyleSheet(
+            """
+            QWizard#newGameWizard {
+                background-color: #20242b;
+                color: #f3f4f6;
+            }
+
+            QWizard#newGameWizard QWizardPage {
+                background-color: #20242b;
+                color: #f3f4f6;
+            }
+
+            QWizard#newGameWizard QLabel {
+                color: #f3f4f6;
+                font-size: 13px;
+            }
+
+            QWizard#newGameWizard QLineEdit,
+            QWizard#newGameWizard QTextEdit,
+            QWizard#newGameWizard QComboBox,
+            QWizard#newGameWizard QSpinBox {
+                background-color: #11151b;
+                border: 1px solid #3a4250;
+                border-radius: 5px;
+                color: #f3f4f6;
+                padding: 6px;
+                selection-background-color: #2f7dd3;
+                selection-color: #ffffff;
+            }
+
+            QWizard#newGameWizard QTextEdit {
+                padding: 8px;
+            }
+
+            QWizard#newGameWizard QLineEdit:focus,
+            QWizard#newGameWizard QTextEdit:focus,
+            QWizard#newGameWizard QComboBox:focus,
+            QWizard#newGameWizard QSpinBox:focus {
+                border-color: #6aa6ff;
+            }
+
+            QWizard#newGameWizard QComboBox::drop-down,
+            QWizard#newGameWizard QSpinBox::up-button,
+            QWizard#newGameWizard QSpinBox::down-button {
+                background-color: #242a33;
+                border: 0;
+                width: 22px;
+            }
+
+            QWizard#newGameWizard QTableWidget {
+                background-color: #11151b;
+                alternate-background-color: #171c24;
+                border: 1px solid #3a4250;
+                border-radius: 5px;
+                color: #f3f4f6;
+                gridline-color: #303845;
+                selection-background-color: #2f7dd3;
+                selection-color: #ffffff;
+            }
+
+            QWizard#newGameWizard QHeaderView::section {
+                background-color: #242a33;
+                border: 0;
+                border-right: 1px solid #303845;
+                color: #dbe3ee;
+                font-weight: 600;
+                padding: 7px;
+            }
+
+            QWizard#newGameWizard QPushButton {
+                background-color: #2d3642;
+                border: 1px solid #465163;
+                border-radius: 5px;
+                color: #f3f4f6;
+                min-width: 76px;
+                padding: 6px 14px;
+            }
+
+            QWizard#newGameWizard QPushButton:hover {
+                background-color: #374353;
+                border-color: #5b6a80;
+            }
+
+            QWizard#newGameWizard QPushButton:pressed {
+                background-color: #25303c;
+            }
+
+            QWizard#newGameWizard QPushButton:default {
+                background-color: #2f7dd3;
+                border-color: #6aa6ff;
+                color: #ffffff;
+            }
+
+            QWizard#newGameWizard QPushButton:disabled {
+                background-color: #252a32;
+                border-color: #303640;
+                color: #737d8c;
+            }
+            """
+        )
+
+    def build_setup(self) -> dict[str, Any]:
+        """Builds a normalized setup dictionary from wizard fields."""
+
+        calendar_type = self.calendar_type_combo.currentData() or "gregorian"
+        calendar_settings: dict[str, Any] = {
+            "calendar_type": calendar_type,
+            "time_display": self.time_format_combo.currentData() or "12_hour",
+        }
+
+        if calendar_type == "custom":
+            calendar_settings.update(
+                {
+                    "days_per_week": self.days_per_week_input.value(),
+                    "weeks_per_month": self.weeks_per_month_input.value(),
+                    "months_per_year": self.months_per_year_input.value(),
+                    "seasons_per_year": self.seasons_per_year_input.value(),
+                    "day_names": _split_list(self.day_names_input.text()),
+                    "month_names": _split_list(self.month_names_input.text()),
+                    "seasons": _build_season_settings(
+                        names=_split_list(self.season_names_input.text()),
+                        hints=_split_list(self.season_hints_input.text()),
+                        count=self.seasons_per_year_input.value(),
+                    ),
+                }
+            )
+
+        skills = [
+            {
+                "name": skill_input.text(),
+                "description": "",
+                "level": level,
+                "requires_ai_invention": not skill_input.text().strip(),
+            }
+            for level, skill_input in self.skill_inputs
+        ]
+        setup = {
+            "title": self.title_input.text(),
+            "character": {
+                "name": self.character_name_input.text(),
+                "appearance": self.appearance_input.toPlainText(),
+                "backstory": self.backstory_input.toPlainText(),
+                "notes": self.character_notes_input.toPlainText(),
+            },
+            "skills": skills,
+            "starter_items": parse_starter_items_text(
+                self.starter_items_input.toPlainText()
+            ),
+            "calendar": calendar_settings,
+            "currency_denominations": self._currency_denominations_from_table(),
+            "currency_description": self.currency_description_input.toPlainText(),
+            "specified_genre": self.genre_input.text(),
+            "game_style": self.game_style_input.toPlainText(),
+            "start_location": self.start_location_input.text(),
+            "world_context": self.world_context_input.toPlainText(),
+        }
+
+        return normalize_new_game_setup(setup)
+
+    def _build_adventure_page(self) -> None:
+        """Builds the adventure/world setup page."""
+
+        page = QWizardPage()
+        page.setTitle("Adventure")
+        page.setSubTitle("Name the save and describe the kind of game you want.")
+
+        self.title_input = QLineEdit()
+        self.title_input.setText("New Adventure")
+
+        self.game_style_input = QTextEdit()
+        self.game_style_input.setPlaceholderText(
+            "Tone, realism, pacing, themes, or playstyle preferences..."
+        )
+
+        self.genre_input = QLineEdit()
+        self.genre_input.setPlaceholderText(
+            "Optional: survival, detective mystery, post-apocalyptic, space frontier..."
+        )
+
+        self.start_location_input = QLineEdit()
+        self.start_location_input.setPlaceholderText(
+            "Optional: deserted island, frozen sea, crime scene, ruined store..."
+        )
+
+        self.world_context_input = QTextEdit()
+        self.world_context_input.setPlaceholderText(
+            "Named locations, factions, guilds, religions, political tensions, tone, themes..."
+        )
+
+        layout = QFormLayout()
+        layout.addRow("Game Name:", self.title_input)
+        layout.addRow("Genre:", self.genre_input)
+        layout.addRow("Game Style:", self.game_style_input)
+        layout.addRow("Starting Location:", self.start_location_input)
+        layout.addRow("World Details:", self.world_context_input)
+        page.setLayout(layout)
+
+        self.addPage(page)
+
+    def _build_character_page(self) -> None:
+        """Builds the character page."""
+
+        page = QWizardPage()
+        page.setTitle("Character")
+        page.setSubTitle("Describe the player character.")
+
+        self.character_name_input = QLineEdit()
+        self.character_name_input.setText("Player Name")
+
+        self.appearance_input = QTextEdit()
+        self.backstory_input = QTextEdit()
+        self.character_notes_input = QTextEdit()
+
+        self.appearance_input.setPlaceholderText("Appearance, clothing, visible traits, voice...")
+        self.backstory_input.setPlaceholderText("Origin, history, goals, relationships...")
+        self.character_notes_input.setPlaceholderText("Other character notes the AI should know...")
+
+        layout = QFormLayout()
+        layout.addRow("Name:", self.character_name_input)
+        layout.addRow("Appearance:", self.appearance_input)
+        layout.addRow("Backstory:", self.backstory_input)
+        layout.addRow("Notes:", self.character_notes_input)
+        page.setLayout(layout)
+
+        self.addPage(page)
+
+    def _build_skills_page(self) -> None:
+        """Builds the starting skills page."""
+
+        page = QWizardPage()
+        page.setTitle("Skills")
+        page.setSubTitle(
+            "Choose one level 5 skill, two level 4 skills, three level 3 skills, "
+            "four level 2 skills, and five level 1 skills."
+        )
+
+        self.skill_inputs: list[tuple[int, QLineEdit]] = []
+        layout = QFormLayout()
+        level_counts: dict[int, int] = {}
+
+        for level in SKILL_LEVEL_PLAN:
+            level_counts[level] = level_counts.get(level, 0) + 1
+            skill_input = QLineEdit()
+            skill_input.setPlaceholderText(f"Level {level} skill")
+            self.skill_inputs.append((level, skill_input))
+            layout.addRow(f"Level {level} Skill {level_counts[level]}:", skill_input)
+
+        page.setLayout(layout)
+        self.addPage(page)
+
+    def _build_inventory_currency_page(self) -> None:
+        """Builds the starter inventory and currency page."""
+
+        page = QWizardPage()
+        page.setTitle("Inventory and Currency")
+        page.setSubTitle("Add requested starter items and describe the world's money.")
+
+        self.starter_items_input = QTextEdit()
+        self.starter_items_input.setPlaceholderText(
+            "One item per line. Example: Lantern | Tool | 2 | Hooded brass lantern | 15"
+        )
+
+        self.currency_table = QTableWidget(0, 3)
+        self.currency_table.setHorizontalHeaderLabels(["Name", "Plural Name", "Base Value"])
+        self.currency_table.setMinimumHeight(180)
+        self.currency_table.verticalHeader().setVisible(False)
+        self.currency_table.horizontalHeader().setStretchLastSection(True)
+        self.currency_table.setAlternatingRowColors(True)
+
+        add_currency_button = QPushButton("Add Currency")
+        add_currency_button.clicked.connect(lambda: self._append_currency_row({}))
+
+        self.currency_description_input = QTextEdit()
+        self.currency_description_input.setPlaceholderText(
+            "Optional economy notes. Leave currencies blank for AI-generated money."
+        )
+
+        layout = QFormLayout()
+        layout.addRow("Starter Items:", self.starter_items_input)
+        layout.addRow("Currencies:", self.currency_table)
+        layout.addRow("", add_currency_button)
+        layout.addRow("Economy Notes:", self.currency_description_input)
+        page.setLayout(layout)
+
+        self.addPage(page)
+
+    def _append_currency_row(self, denomination: dict[str, Any]) -> None:
+        """Adds a currency denomination row to the wizard table."""
+
+        row = self.currency_table.rowCount()
+        self.currency_table.insertRow(row)
+
+        name = str(denomination.get("name", ""))
+        plural_name = str(denomination.get("plural_name", ""))
+        value = _safe_int(denomination.get("value", 1), 1)
+        value_input = QSpinBox()
+        value_input.setMinimum(1)
+        value_input.setMaximum(1_000_000_000)
+        value_input.setValue(value)
+        value_input.setEnabled(row != 0)
+
+        self.currency_table.setItem(row, 0, QTableWidgetItem(name))
+        self.currency_table.setItem(row, 1, QTableWidgetItem(plural_name))
+        self.currency_table.setCellWidget(row, 2, value_input)
+
+    def _currency_denominations_from_table(self) -> list[dict[str, Any]]:
+        """Reads currency denomination rows from the wizard table."""
+
+        denominations: list[dict[str, Any]] = []
+
+        for row in range(self.currency_table.rowCount()):
+            name_item = self.currency_table.item(row, 0)
+            plural_item = self.currency_table.item(row, 1)
+            value_widget = self.currency_table.cellWidget(row, 2)
+
+            denominations.append(
+                {
+                    "name": name_item.text() if name_item is not None else "",
+                    "plural_name": plural_item.text() if plural_item is not None else "",
+                    "value": (
+                        value_widget.value()
+                        if isinstance(value_widget, QSpinBox)
+                        else 1
+                    ),
+                }
+            )
+
+        return denominations
+
+    def _build_calendar_page(self) -> None:
+        """Builds the calendar and time page."""
+
+        page = QWizardPage()
+        page.setTitle("Calendar and Time")
+        page.setSubTitle("Choose the calendar and displayed time format.")
+
+        self.calendar_type_combo = QComboBox()
+        self.calendar_type_combo.addItem("Default Gregorian Calendar", "gregorian")
+        self.calendar_type_combo.addItem("Custom Calendar", "custom")
+
+        self.time_format_combo = QComboBox()
+        self.time_format_combo.addItem("12-hour A.M./P.M.", "12_hour")
+        self.time_format_combo.addItem("24-hour", "24_hour")
+        self.time_format_combo.addItem("Narrative", "narrative")
+
+        self.days_per_week_input = QSpinBox()
+        self.days_per_week_input.setRange(1, 14)
+        self.days_per_week_input.setValue(int(GREGORIAN_CALENDAR_SETTINGS["days_per_week"]))
+
+        self.weeks_per_month_input = QSpinBox()
+        self.weeks_per_month_input.setRange(1, 12)
+        self.weeks_per_month_input.setValue(int(GREGORIAN_CALENDAR_SETTINGS["weeks_per_month"]))
+
+        self.months_per_year_input = QSpinBox()
+        self.months_per_year_input.setRange(1, 24)
+        self.months_per_year_input.setValue(int(GREGORIAN_CALENDAR_SETTINGS["months_per_year"]))
+
+        self.seasons_per_year_input = QSpinBox()
+        self.seasons_per_year_input.setRange(1, 12)
+        self.seasons_per_year_input.setValue(int(GREGORIAN_CALENDAR_SETTINGS["seasons_per_year"]))
+
+        self.day_names_input = QLineEdit()
+        self.day_names_input.setText(", ".join(GREGORIAN_CALENDAR_SETTINGS["day_names"]))
+
+        self.month_names_input = QLineEdit()
+        self.month_names_input.setText(", ".join(GREGORIAN_CALENDAR_SETTINGS["month_names"]))
+
+        self.season_names_input = QLineEdit()
+        self.season_names_input.setText(
+            ", ".join(season["name"] for season in GREGORIAN_CALENDAR_SETTINGS["seasons"])
+        )
+
+        self.season_hints_input = QLineEdit()
+        self.season_hints_input.setText(
+            ", ".join(
+                season["weather_hint"] for season in GREGORIAN_CALENDAR_SETTINGS["seasons"]
+            )
+        )
+
+        layout = QFormLayout()
+        layout.addRow("Calendar:", self.calendar_type_combo)
+        layout.addRow("Time Format:", self.time_format_combo)
+        layout.addRow("Days Per Week:", self.days_per_week_input)
+        layout.addRow("Weeks Per Month:", self.weeks_per_month_input)
+        layout.addRow("Months Per Year:", self.months_per_year_input)
+        layout.addRow("Seasons Per Year:", self.seasons_per_year_input)
+        layout.addRow("Day Names:", self.day_names_input)
+        layout.addRow("Month Names:", self.month_names_input)
+        layout.addRow("Season Names:", self.season_names_input)
+        layout.addRow("Season Weather Hints:", self.season_hints_input)
+        page.setLayout(layout)
+
+        self.addPage(page)
+
+
 class GameShell(QWidget):
     """In-game shell containing the core play screens."""
 
-    def __init__(self, on_return_to_menu) -> None:
+    def __init__(
+        self,
+        on_return_to_menu,
+        *,
+        sound_manager: SoundManager | None = None,
+        narration_player: NarrationPlayer | None = None,
+    ) -> None:
         """
         Args:
             on_return_to_menu: Callback for returning to the Main Menu.
@@ -315,6 +989,8 @@ class GameShell(QWidget):
         super().__init__()
 
         self.on_return_to_menu = on_return_to_menu
+        self.sound_manager = sound_manager
+        self.narration_player = narration_player
         self.repository: SaveRepository | None = None
 
         self.title_label = QLabel("No Save Loaded")
@@ -330,20 +1006,29 @@ class GameShell(QWidget):
 
         self.tabs = QTabWidget()
 
-        self.story_screen = StoryScreen()
+        self.story_screen = StoryScreen(
+            sound_manager=self.sound_manager,
+            narration_player=self.narration_player,
+        )
+        self.character_screen = CharacterScreen()
+        self.world_screen = WorldScreen()
         self.calendar_screen = CalendarScreen()
         self.inventory_screen = InventoryScreen()
         self.npcs_screen = NpcsScreen()
+        self.active_tasks_screen = ActiveTasksScreen()
         self.skills_screen = SkillsScreen()
         self.alchemy_screen = AlchemyNotebookScreen()
         self.history_screen = HistoryScreen()
-        self.settings_screen = SettingsScreen()
+        self.settings_screen = SettingsScreen(on_audio_settings_changed=self._apply_audio_settings)
 
         self.screens: list[RepositoryBackedWidget] = [
             self.story_screen,
+            self.character_screen,
+            self.world_screen,
             self.calendar_screen,
             self.inventory_screen,
             self.npcs_screen,
+            self.active_tasks_screen,
             self.skills_screen,
             self.alchemy_screen,
             self.history_screen,
@@ -351,9 +1036,12 @@ class GameShell(QWidget):
         ]
 
         self.tabs.addTab(self.story_screen, "Story")
+        self.tabs.addTab(self.character_screen, "Character")
+        self.tabs.addTab(self.world_screen, "World")
         self.tabs.addTab(self.calendar_screen, "Calendar")
         self.tabs.addTab(self.inventory_screen, "Inventory")
         self.tabs.addTab(self.npcs_screen, "NPCs")
+        self.tabs.addTab(self.active_tasks_screen, "Active Tasks")
         self.tabs.addTab(self.skills_screen, "Skills")
         self.tabs.addTab(self.alchemy_screen, "Alchemy Notebook")
         self.tabs.addTab(self.history_screen, "Journal")
@@ -385,19 +1073,44 @@ class GameShell(QWidget):
         for screen in self.screens:
             screen.set_repository(repository)
 
+        self._apply_audio_settings()
+
     def _handle_tab_changed(self, index: int) -> None:
         """Resets the calendar view to the current month when opened."""
 
         if self.tabs.widget(index) == self.calendar_screen:
             self.calendar_screen.return_to_current_month()
 
+    def _apply_audio_settings(self) -> None:
+        """Applies saved audio settings to the active audio managers."""
+
+        if self.repository is None:
+            if self.sound_manager is not None:
+                self.sound_manager.stop_music()
+            if self.narration_player is not None:
+                self.narration_player.stop()
+            return
+
+        _apply_audio_settings_to_managers(
+            self.repository,
+            sound_manager=self.sound_manager,
+            narration_player=self.narration_player,
+        )
+
 
 class StoryScreen(RepositoryBackedWidget):
     """Story screen for player input and narrative output."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        sound_manager: SoundManager | None = None,
+        narration_player: NarrationPlayer | None = None,
+    ) -> None:
         super().__init__()
 
+        self.sound_manager = sound_manager
+        self.narration_player = narration_player
         self.location_value = QLabel("-")
         self.day_value = QLabel("-")
         self.time_value = QLabel("-")
@@ -460,7 +1173,7 @@ class StoryScreen(RepositoryBackedWidget):
             if kind == "player":
                 story_lines.append(f"You: {content}")
             elif kind == "story":
-                story_lines.append(content)
+                story_lines.append(format_story_message(content))
 
         self.story_output.setPlainText("\n\n".join(story_lines))
         self.story_output.moveCursor(self.story_output.textCursor().MoveOperation.End)
@@ -484,10 +1197,17 @@ class StoryScreen(RepositoryBackedWidget):
             location=state.world.location,
             query_text=player_text,
         )
+        valid_music_tracks = (
+            self.sound_manager.get_valid_track_names()
+            if self.sound_manager is not None
+            else []
+        )
         context_packet = AiContextBuilder.from_default_library().build_story_context(
             state,
             player_command=player_text,
             relevant_npcs=relevant_npcs,
+            valid_music_tracks=valid_music_tracks,
+            current_music=str(repository.get_setting("audio.current_music", "")),
         )
 
         repository.append_history("player", player_text)
@@ -511,6 +1231,7 @@ class StoryScreen(RepositoryBackedWidget):
             )
         else:
             repository.append_history("story", result.narrative_text)
+            self._narrate_text(result.narrative_text)
 
             if result.suggested_events:
                 event_results = EventApplier(repository).apply_events(result.suggested_events)
@@ -523,9 +1244,157 @@ class StoryScreen(RepositoryBackedWidget):
                     applied_count,
                     skipped_count,
                 )
+                _apply_audio_settings_to_managers(
+                    repository,
+                    sound_manager=self.sound_manager,
+                    narration_player=self.narration_player,
+                )
 
         self.player_input.clear()
         self.refresh()
+
+    def narrate_latest_story(self) -> None:
+        """Narrates the latest story history entry when narrator is enabled."""
+
+        repository = self.repository()
+
+        if repository is None:
+            return
+
+        entries = repository.list_history()
+
+        for entry in reversed(entries):
+            if str(entry.get("kind", "")).casefold() == "story":
+                _apply_audio_settings_to_managers(
+                    repository,
+                    sound_manager=self.sound_manager,
+                    narration_player=self.narration_player,
+                )
+                self._narrate_text(str(entry.get("content", "")))
+                return
+
+    def _narrate_text(self, text: str) -> None:
+        """Sends text to the narration player if available."""
+
+        if self.narration_player is None:
+            return
+
+        self.narration_player.narrate(text)
+
+
+class CharacterScreen(RepositoryBackedWidget):
+    """Editable player character profile."""
+
+    def __init__(self) -> None:
+        super().__init__()
+
+        self.name_input = QLineEdit()
+        self.appearance_input = QTextEdit()
+        self.backstory_input = QTextEdit()
+        self.notes_input = QTextEdit()
+
+        self.appearance_input.setPlaceholderText("Visible traits, clothing, manner, scars, voice...")
+        self.backstory_input.setPlaceholderText("Origin, important history, relationships, goals...")
+        self.notes_input.setPlaceholderText("Player notes about this character...")
+
+        save_button = QPushButton("Save Character")
+        save_button.clicked.connect(self._save_character)
+
+        layout = QFormLayout()
+        layout.addRow("Name:", self.name_input)
+        layout.addRow("Appearance:", self.appearance_input)
+        layout.addRow("Backstory:", self.backstory_input)
+        layout.addRow("Notes:", self.notes_input)
+        layout.addRow(save_button)
+
+        self.setLayout(layout)
+
+    def refresh(self) -> None:
+        """Reloads the character profile."""
+
+        repository = self.repository()
+
+        if repository is None:
+            self.name_input.clear()
+            self.appearance_input.clear()
+            self.backstory_input.clear()
+            self.notes_input.clear()
+            return
+
+        state = StateManager(repository).load_state()
+        self.name_input.setText(state.player.name)
+        self.appearance_input.setPlainText(state.player.appearance)
+        self.backstory_input.setPlainText(state.player.backstory)
+        self.notes_input.setPlainText(state.player.notes)
+
+    def _save_character(self) -> None:
+        """Persists the editable character profile."""
+
+        repository = self.repository()
+
+        if repository is None:
+            return
+
+        repository.set_setting("player_name", self.name_input.text().strip())
+        repository.set_setting("player.appearance", self.appearance_input.toPlainText().strip())
+        repository.set_setting("player.backstory", self.backstory_input.toPlainText().strip())
+        repository.set_setting("player.notes", self.notes_input.toPlainText().strip())
+        repository.append_history("system", "Character profile updated.")
+
+        QMessageBox.information(self, "Character Saved", "Character profile was saved.")
+
+
+class WorldScreen(RepositoryBackedWidget):
+    """Read-only player-facing world information."""
+
+    def __init__(self) -> None:
+        super().__init__()
+
+        self.world_output = QTextEdit()
+        self.world_output.setReadOnly(True)
+
+        refresh_button = QPushButton("Refresh")
+        refresh_button.clicked.connect(self.refresh)
+
+        layout = QVBoxLayout()
+        layout.addWidget(refresh_button)
+        layout.addWidget(self.world_output)
+
+        self.setLayout(layout)
+
+    def refresh(self) -> None:
+        """Reloads player-known world lore."""
+
+        repository = self.repository()
+
+        if repository is None:
+            self.world_output.clear()
+            return
+
+        sections: list[str] = []
+        summary = repository.get_world_summary().strip()
+
+        if summary:
+            sections.append(f"World Overview\n\n{summary}")
+
+        lore = repository.get_world_lore()
+
+        for category in sorted(lore):
+            entries = lore[category]
+
+            if not entries:
+                continue
+
+            body = "\n".join(
+                f"- {key}: {text}"
+                for key, text in sorted(entries.items())
+            )
+            sections.append(f"{category}\n\n{body}")
+
+        if not sections:
+            sections.append("No world information has been recorded yet.")
+
+        self.world_output.setPlainText("\n\n".join(sections))
 
 
 class CalendarScreen(RepositoryBackedWidget):
@@ -649,12 +1518,16 @@ class InventoryScreen(RepositoryBackedWidget):
     def __init__(self) -> None:
         super().__init__()
 
+        self._sort_column = 0
+        self._sort_order = Qt.SortOrder.AscendingOrder
         self.table = QTableWidget(0, 5)
         self.table.setHorizontalHeaderLabels(
             ["Name", "Category", "Qty", "Value", "Description"]
         )
         self.table.horizontalHeader().setStretchLastSection(True)
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        _enable_table_sorting(self.table, self._sort_by_column)
+        self.table.horizontalHeader().setSortIndicator(self._sort_column, self._sort_order)
 
         layout = QVBoxLayout()
         layout.addWidget(QLabel("Inventory"))
@@ -673,25 +1546,62 @@ class InventoryScreen(RepositoryBackedWidget):
 
         items = repository.list_inventory_items()
         denominations = repository.get_currency_denominations()
+        items.sort(
+            key=self._sort_key,
+            reverse=_sort_descending(self._sort_order),
+        )
         self.table.setRowCount(len(items))
 
         for row_index, item in enumerate(items):
-            self.table.setItem(row_index, 0, QTableWidgetItem(str(item.get("name", ""))))
-            self.table.setItem(row_index, 1, QTableWidgetItem(str(item.get("category", ""))))
-            self.table.setItem(row_index, 2, QTableWidgetItem(str(item.get("quantity", ""))))
+            self.table.setItem(row_index, 0, _table_item(str(item.get("name", ""))))
+            self.table.setItem(row_index, 1, _table_item(str(item.get("category", ""))))
+            quantity = int(item.get("quantity", 0))
+            value_base_units = int(item.get("value_base_units", 0))
+            self.table.setItem(row_index, 2, _table_item(str(quantity), quantity))
             self.table.setItem(
                 row_index,
                 3,
-                QTableWidgetItem(
+                _table_item(
                     format_currency_amount(
-                        int(item.get("value_base_units", 0)),
+                        value_base_units,
                         denominations,
-                    )
+                    ),
+                    value_base_units,
                 ),
             )
-            self.table.setItem(row_index, 4, QTableWidgetItem(str(item.get("description", ""))))
+            self.table.setItem(row_index, 4, _table_item(str(item.get("description", ""))))
 
         self.table.resizeColumnsToContents()
+
+    def _sort_by_column(self, column_index: int) -> None:
+        """Sorts inventory by a clicked header column."""
+
+        self._sort_column, self._sort_order = _update_sort_state(
+            self.table,
+            self._sort_column,
+            self._sort_order,
+            column_index,
+        )
+        self.refresh()
+
+    def _sort_key(self, item: dict[str, Any]) -> tuple[Any, str]:
+        """Returns the active inventory sort key."""
+
+        name = str(item.get("name", "")).casefold()
+
+        if self._sort_column == 1:
+            return str(item.get("category", "")).casefold(), name
+
+        if self._sort_column == 2:
+            return _safe_int(item.get("quantity", 0), 0), name
+
+        if self._sort_column == 3:
+            return _safe_int(item.get("value_base_units", 0), 0), name
+
+        if self._sort_column == 4:
+            return str(item.get("description", "")).casefold(), name
+
+        return name, name
 
 
 class NpcsScreen(RepositoryBackedWidget):
@@ -700,12 +1610,16 @@ class NpcsScreen(RepositoryBackedWidget):
     def __init__(self) -> None:
         super().__init__()
 
-        self.table = QTableWidget(0, 4)
+        self._sort_column = 0
+        self._sort_order = Qt.SortOrder.AscendingOrder
+        self.table = QTableWidget(0, 3)
         self.table.setHorizontalHeaderLabels(
-            ["Name", "Location", "Player-Facing Information", "Last Updated"]
+            ["Name", "Location", "Notes"]
         )
         self.table.horizontalHeader().setStretchLastSection(True)
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        _enable_table_sorting(self.table, self._sort_by_column)
+        self.table.horizontalHeader().setSortIndicator(self._sort_column, self._sort_order)
 
         refresh_button = QPushButton("Refresh")
         refresh_button.clicked.connect(self.refresh)
@@ -726,23 +1640,157 @@ class NpcsScreen(RepositoryBackedWidget):
             return
 
         npcs = repository.list_player_visible_npcs()
+        npcs.sort(
+            key=self._sort_key,
+            reverse=_sort_descending(self._sort_order),
+        )
         self.table.setRowCount(len(npcs))
 
         for row_index, npc in enumerate(npcs):
-            player_info = str(
-                npc.get("player_facing_information")
-                or ""
-            )
             self.table.setItem(
                 row_index,
                 0,
-                QTableWidgetItem(str(npc.get("display_name", "Unknown NPC"))),
+                _table_item(str(npc.get("display_name", "Unknown NPC"))),
             )
-            self.table.setItem(row_index, 1, QTableWidgetItem(str(npc.get("location", ""))))
-            self.table.setItem(row_index, 2, QTableWidgetItem(player_info))
-            self.table.setItem(row_index, 3, QTableWidgetItem(str(npc.get("updated_at", ""))))
+            self.table.setItem(row_index, 1, _table_item(str(npc.get("location", ""))))
+            self.table.setItem(row_index, 2, _table_item(str(npc.get("notes", ""))))
 
         self.table.resizeColumnsToContents()
+
+    def _sort_by_column(self, column_index: int) -> None:
+        """Sorts NPCs by a clicked header column."""
+
+        self._sort_column, self._sort_order = _update_sort_state(
+            self.table,
+            self._sort_column,
+            self._sort_order,
+            column_index,
+        )
+        self.refresh()
+
+    def _sort_key(self, npc: dict[str, Any]) -> tuple[str, str]:
+        """Returns the active NPC sort key."""
+
+        name = str(npc.get("display_name", "Unknown NPC")).casefold()
+
+        if self._sort_column == 1:
+            return str(npc.get("location", "")).casefold(), name
+
+        if self._sort_column == 2:
+            return str(npc.get("notes", "")).casefold(), name
+
+        return name, name
+
+
+class ActiveTasksScreen(RepositoryBackedWidget):
+    """Player-facing list of current quests, commissions, and obligations."""
+
+    def __init__(self) -> None:
+        super().__init__()
+
+        self._sort_column = 0
+        self._sort_order = Qt.SortOrder.AscendingOrder
+        self.table = QTableWidget(0, 8)
+        self.table.setHorizontalHeaderLabels(
+            [
+                "Task",
+                "Type",
+                "Status",
+                "Details",
+                "Contact",
+                "Location",
+                "Reward",
+                "Due",
+            ]
+        )
+        self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        _enable_table_sorting(self.table, self._sort_by_column)
+        self.table.horizontalHeader().setSortIndicator(self._sort_column, self._sort_order)
+
+        refresh_button = QPushButton("Refresh")
+        refresh_button.clicked.connect(self.refresh)
+
+        layout = QVBoxLayout()
+        layout.addWidget(refresh_button)
+        layout.addWidget(self.table)
+
+        self.setLayout(layout)
+
+    def refresh(self) -> None:
+        """Reloads active tasks."""
+
+        repository = self.repository()
+
+        if repository is None:
+            self.table.setRowCount(0)
+            return
+
+        tasks = repository.list_active_tasks()
+        tasks.sort(
+            key=self._sort_key,
+            reverse=_sort_descending(self._sort_order),
+        )
+        self.table.setRowCount(len(tasks))
+
+        for row_index, task in enumerate(tasks):
+            details = str(task.get("description", ""))
+            notes = str(task.get("notes", ""))
+
+            if notes:
+                details = f"{details}\n\n{notes}" if details else notes
+
+            self.table.setItem(row_index, 0, _table_item(str(task.get("name", ""))))
+            self.table.setItem(row_index, 1, _table_item(str(task.get("category", ""))))
+            self.table.setItem(row_index, 2, _table_item(str(task.get("status", ""))))
+            self.table.setItem(row_index, 3, _table_item(details))
+            self.table.setItem(row_index, 4, _table_item(str(task.get("requester", ""))))
+            self.table.setItem(row_index, 5, _table_item(str(task.get("location", ""))))
+            self.table.setItem(row_index, 6, _table_item(str(task.get("reward", ""))))
+            self.table.setItem(row_index, 7, _table_item(str(task.get("due_date", ""))))
+
+        self.table.resizeColumnsToContents()
+
+    def _sort_by_column(self, column_index: int) -> None:
+        """Sorts active tasks by a clicked header column."""
+
+        self._sort_column, self._sort_order = _update_sort_state(
+            self.table,
+            self._sort_column,
+            self._sort_order,
+            column_index,
+        )
+        self.refresh()
+
+    def _sort_key(self, task: dict[str, Any]) -> tuple[str, str]:
+        """Returns the active task sort key."""
+
+        name = str(task.get("name", "")).casefold()
+
+        if self._sort_column == 1:
+            return str(task.get("category", "")).casefold(), name
+
+        if self._sort_column == 2:
+            return str(task.get("status", "")).casefold(), name
+
+        if self._sort_column == 3:
+            details = str(task.get("description", ""))
+            notes = str(task.get("notes", ""))
+            return f"{details}\n\n{notes}".casefold(), name
+
+        if self._sort_column == 4:
+            return str(task.get("requester", "")).casefold(), name
+
+        if self._sort_column == 5:
+            return str(task.get("location", "")).casefold(), name
+
+        if self._sort_column == 6:
+            return str(task.get("reward", "")).casefold(), name
+
+        if self._sort_column == 7:
+            return str(task.get("due_date", "")).casefold(), name
+
+        return name, name
 
 
 class SkillsScreen(RepositoryBackedWidget):
@@ -751,12 +1799,19 @@ class SkillsScreen(RepositoryBackedWidget):
     def __init__(self) -> None:
         super().__init__()
 
+        self._sort_column = 0
+        self._sort_order = Qt.SortOrder.AscendingOrder
         self.skills_table = QTableWidget(0, 3)
         self.skills_table.setHorizontalHeaderLabels(
             ["Skill", "Training", "Description"]
         )
         self.skills_table.horizontalHeader().setStretchLastSection(True)
         self.skills_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        _enable_table_sorting(self.skills_table, self._sort_by_column)
+        self.skills_table.horizontalHeader().setSortIndicator(
+            self._sort_column,
+            self._sort_order,
+        )
 
         layout = QVBoxLayout()
         layout.addWidget(QLabel("Known Skills"))
@@ -774,27 +1829,61 @@ class SkillsScreen(RepositoryBackedWidget):
             return
 
         skills = repository.list_skills()
+        skills.sort(
+            key=self._sort_key,
+            reverse=_sort_descending(self._sort_order),
+        )
         self.skills_table.setRowCount(len(skills))
 
         for row_index, skill in enumerate(skills):
             level = int(skill.get("level", 1))
-            self.skills_table.setItem(row_index, 0, QTableWidgetItem(str(skill.get("name", ""))))
-            self.skills_table.setItem(row_index, 1, QTableWidgetItem(_skill_level_label(level)))
-            self.skills_table.setItem(row_index, 2, QTableWidgetItem(str(skill.get("description", ""))))
+            self.skills_table.setItem(row_index, 0, _table_item(str(skill.get("name", ""))))
+            self.skills_table.setItem(
+                row_index,
+                1,
+                _table_item(_skill_level_label(level), level),
+            )
+            self.skills_table.setItem(
+                row_index,
+                2,
+                _table_item(str(skill.get("description", ""))),
+            )
 
         self.skills_table.resizeColumnsToContents()
 
+    def _sort_by_column(self, column_index: int) -> None:
+        """Sorts skills by a clicked header column."""
+
+        self._sort_column, self._sort_order = _update_sort_state(
+            self.skills_table,
+            self._sort_column,
+            self._sort_order,
+            column_index,
+        )
+        self.refresh()
+
+    def _sort_key(self, skill: dict[str, Any]) -> tuple[Any, str]:
+        """Returns the active skill sort key."""
+
+        name = str(skill.get("name", "")).casefold()
+
+        if self._sort_column == 1:
+            return _safe_int(skill.get("level", 1), 1), name
+
+        if self._sort_column == 2:
+            return str(skill.get("description", "")).casefold(), name
+
+        return name, name
+
 
 class AlchemyNotebookScreen(RepositoryBackedWidget):
-    """Alchemy notebook screen for notes, reagents, and recipes."""
+    """Alchemy notebook screen for reagents and recipes."""
 
     def __init__(self) -> None:
         super().__init__()
 
         self.tabs = QTabWidget()
 
-        self._notes: list[dict] = []
-        self._setup_notes_tab()
         self._setup_reagents_tab()
         self._setup_recipes_tab()
 
@@ -809,51 +1898,12 @@ class AlchemyNotebookScreen(RepositoryBackedWidget):
         repository = self.repository()
 
         if repository is None:
-            self.note_list.clear()
-            self.body_input.clear()
-            self._notes = []
             self.reagent_table.setRowCount(0)
             self.recipe_table.setRowCount(0)
             return
 
-        self._refresh_notes(repository)
         self._refresh_reagents(repository)
         self._refresh_recipes(repository)
-
-    def _setup_notes_tab(self) -> None:
-        """Builds the freeform notes tab."""
-
-        self.note_list = QListWidget()
-        self.note_list.currentRowChanged.connect(self._display_selected_note)
-
-        self.title_input = QLineEdit()
-        self.title_input.setPlaceholderText("Note title")
-
-        self.body_input = QTextEdit()
-        self.body_input.setPlaceholderText("Alchemy observations, recipes, reagent notes...")
-
-        add_button = QPushButton("Add Note")
-        add_button.clicked.connect(self._add_note)
-
-        layout = QHBoxLayout()
-
-        left = QVBoxLayout()
-        left.addWidget(QLabel("Notes:"))
-        left.addWidget(self.note_list)
-
-        right = QVBoxLayout()
-        right.addWidget(QLabel("Title:"))
-        right.addWidget(self.title_input)
-        right.addWidget(QLabel("Body:"))
-        right.addWidget(self.body_input)
-        right.addWidget(add_button)
-
-        layout.addLayout(left, stretch=1)
-        layout.addLayout(right, stretch=2)
-
-        wrapper = QWidget()
-        wrapper.setLayout(layout)
-        self.tabs.addTab(wrapper, "Notes")
 
     def _setup_reagents_tab(self) -> None:
         """Builds the structured reagent discovery tab."""
@@ -939,17 +1989,6 @@ class AlchemyNotebookScreen(RepositoryBackedWidget):
         wrapper.setLayout(layout)
         self.tabs.addTab(wrapper, "Recipes")
 
-    def _refresh_notes(self, repository: SaveRepository) -> None:
-        """Reloads alchemy notes."""
-
-        self._notes = repository.list_alchemy_notes()
-        self.note_list.clear()
-
-        for note in self._notes:
-            title = str(note.get("title", "Untitled Note"))
-            created_at = str(note.get("created_at", ""))
-            self.note_list.addItem(f"{title} - {created_at}")
-
     def _refresh_reagents(self, repository: SaveRepository) -> None:
         """Reloads the reagent table."""
 
@@ -981,27 +2020,6 @@ class AlchemyNotebookScreen(RepositoryBackedWidget):
             self.recipe_table.setItem(row_index, 5, QTableWidgetItem(str(recipe.get("notes", ""))))
 
         self.recipe_table.resizeColumnsToContents()
-
-    def _add_note(self) -> None:
-        """Adds an alchemy note."""
-
-        repository = self.repository()
-
-        if repository is None:
-            return
-
-        title = self.title_input.text().strip()
-
-        if not title:
-            QMessageBox.warning(self, "Missing Title", "Alchemy note title is required.")
-            return
-
-        repository.add_alchemy_note(title=title, body=self.body_input.toPlainText())
-
-        self.title_input.clear()
-        self.body_input.clear()
-
-        self.refresh()
 
     def _add_reagent(self) -> None:
         """Adds or updates a known reagent."""
@@ -1067,75 +2085,79 @@ class AlchemyNotebookScreen(RepositoryBackedWidget):
 
         self.refresh()
 
-    def _display_selected_note(self, row_index: int) -> None:
-        """
-        Displays the selected note body.
-
-        Args:
-            row_index: Selected row index.
-        """
-
-        if row_index < 0 or row_index >= len(self._notes):
-            return
-
-        note = self._notes[row_index]
-        self.title_input.setText(str(note.get("title", "")))
-        self.body_input.setPlainText(str(note.get("body", "")))
-
-
 class HistoryScreen(RepositoryBackedWidget):
-    """Player-facing adventure journal."""
+    """Private player journal that is never sent to the AI."""
 
     def __init__(self) -> None:
         super().__init__()
 
-        self.history_output = QTextEdit()
-        self.history_output.setReadOnly(True)
+        self.journal_input = QTextEdit()
+        self.journal_input.setPlaceholderText("Write private notes here. These are not sent to the AI.")
 
-        refresh_button = QPushButton("Refresh")
-        refresh_button.clicked.connect(self.refresh)
+        save_button = QPushButton("Save Journal")
+        save_button.clicked.connect(self._save_journal)
 
         layout = QVBoxLayout()
-        layout.addWidget(refresh_button)
-        layout.addWidget(self.history_output)
+        layout.addWidget(self.journal_input)
+        layout.addWidget(save_button)
 
         self.setLayout(layout)
 
     def refresh(self) -> None:
-        """Reloads player-facing adventure history."""
+        """Reloads private journal notes."""
 
         repository = self.repository()
 
         if repository is None:
-            self.history_output.clear()
+            self.journal_input.clear()
             return
 
-        entries = repository.list_history()
-        lines: list[str] = []
+        self.journal_input.setPlainText(repository.get_journal_notes())
 
-        for entry in entries:
-            created_at = str(entry.get("created_at", ""))
-            kind = str(entry.get("kind", "misc")).casefold()
-            content = str(entry.get("content", ""))
+    def _save_journal(self) -> None:
+        """Persists private journal notes without touching AI context."""
 
-            if kind == "player":
-                lines.append(f"{created_at} | You | {content}")
-            elif kind in {"story", "quest", "world", "note", "spell"}:
-                lines.append(f"{created_at} | {content}")
+        repository = self.repository()
 
-        self.history_output.setPlainText("\n\n".join(lines))
+        if repository is None:
+            return
+
+        repository.set_journal_notes(self.journal_input.toPlainText())
+        QMessageBox.information(self, "Journal Saved", "Journal notes were saved.")
 
 
 class SettingsScreen(RepositoryBackedWidget):
     """Basic save-specific settings screen."""
 
-    def __init__(self) -> None:
+    def __init__(self, on_audio_settings_changed=None) -> None:
         super().__init__()
 
-        self.player_name_input = QLineEdit()
+        self.on_audio_settings_changed = on_audio_settings_changed
 
         self.theme_combo = QComboBox()
         self.theme_combo.addItems(["System", "Light", "Dark"])
+
+        self.music_enabled_checkbox = QCheckBox("Music enabled")
+        self.music_enabled_checkbox.setChecked(True)
+
+        self.narrator_enabled_checkbox = QCheckBox("Narrator enabled")
+        self.narrator_enabled_checkbox.setChecked(True)
+
+        self.music_volume_slider = QSlider(Qt.Orientation.Horizontal)
+        self.music_volume_slider.setRange(0, 100)
+        self.music_volume_slider.setValue(25)
+        self.music_volume_label = QLabel("25%")
+        self.music_volume_slider.valueChanged.connect(
+            lambda value: self.music_volume_label.setText(f"{value}%")
+        )
+
+        self.tts_volume_slider = QSlider(Qt.Orientation.Horizontal)
+        self.tts_volume_slider.setRange(0, 100)
+        self.tts_volume_slider.setValue(90)
+        self.tts_volume_label = QLabel("90%")
+        self.tts_volume_slider.valueChanged.connect(
+            lambda value: self.tts_volume_label.setText(f"{value}%")
+        )
 
         self.days_per_week_input = QSpinBox()
         self.days_per_week_input.setRange(1, 14)
@@ -1158,6 +2180,11 @@ class SettingsScreen(RepositoryBackedWidget):
         self.season_names_input = QLineEdit()
         self.season_hints_input = QLineEdit()
 
+        self.additional_ai_context_input = QTextEdit()
+        self.additional_ai_context_input.setPlaceholderText(
+            "Optional AI-facing guidance, style preferences, boundaries, or reminders..."
+        )
+
         self.time_display_combo = QComboBox()
         self.time_display_combo.addItem("Narrative", "narrative")
         self.time_display_combo.addItem("12-hour", "12_hour")
@@ -1171,8 +2198,11 @@ class SettingsScreen(RepositoryBackedWidget):
         save_button.clicked.connect(self._save_settings)
 
         layout = QFormLayout()
-        layout.addRow("Player Name:", self.player_name_input)
         layout.addRow("Theme Preference:", self.theme_combo)
+        layout.addRow("Background Music:", self.music_enabled_checkbox)
+        layout.addRow("Music Volume:", _slider_row(self.music_volume_slider, self.music_volume_label))
+        layout.addRow("Narrator:", self.narrator_enabled_checkbox)
+        layout.addRow("Narrator Volume:", _slider_row(self.tts_volume_slider, self.tts_volume_label))
         layout.addRow("Days Per Week:", self.days_per_week_input)
         layout.addRow("Weeks Per Month:", self.weeks_per_month_input)
         layout.addRow("Months Per Year:", self.months_per_year_input)
@@ -1182,6 +2212,7 @@ class SettingsScreen(RepositoryBackedWidget):
         layout.addRow("Season Names:", self.season_names_input)
         layout.addRow("Season Weather Hints:", self.season_hints_input)
         layout.addRow("Time Display:", self.time_display_combo)
+        layout.addRow("Additional AI Context:", self.additional_ai_context_input)
 
         for index, denomination in enumerate(DEFAULT_CURRENCY_DENOMINATIONS):
             name_input = QLineEdit()
@@ -1213,7 +2244,6 @@ class SettingsScreen(RepositoryBackedWidget):
         repository = self.repository()
 
         if repository is None:
-            self.player_name_input.clear()
             self.theme_combo.setCurrentText("System")
             self.days_per_week_input.setValue(int(DEFAULT_CALENDAR_SETTINGS["days_per_week"]))
             self.weeks_per_month_input.setValue(int(DEFAULT_CALENDAR_SETTINGS["weeks_per_month"]))
@@ -1223,15 +2253,18 @@ class SettingsScreen(RepositoryBackedWidget):
             self.month_names_input.clear()
             self.season_names_input.clear()
             self.season_hints_input.clear()
+            self.additional_ai_context_input.clear()
             self.time_display_combo.setCurrentIndex(0)
+            self.music_enabled_checkbox.setChecked(True)
+            self.narrator_enabled_checkbox.setChecked(True)
+            self.music_volume_slider.setValue(25)
+            self.tts_volume_slider.setValue(90)
             return
 
-        player_name = repository.get_setting("player_name", "")
         theme = repository.get_setting("theme", "System")
+        additional_ai_context = repository.get_setting("ai.additional_context", "")
         denominations = repository.get_currency_denominations()
         calendar_settings = repository.get_calendar_settings()
-
-        self.player_name_input.setText(str(player_name))
 
         if theme in ["System", "Light", "Dark"]:
             self.theme_combo.setCurrentText(str(theme))
@@ -1259,6 +2292,19 @@ class SettingsScreen(RepositoryBackedWidget):
             ", ".join(str(season["weather_hint"]) for season in calendar_settings["seasons"])
         )
         _set_combo_to_data(self.time_display_combo, str(calendar_settings["time_display"]))
+        self.additional_ai_context_input.setPlainText(str(additional_ai_context))
+        self.music_enabled_checkbox.setChecked(
+            _bool_setting(repository.get_setting("audio.music_enabled", True), True)
+        )
+        self.narrator_enabled_checkbox.setChecked(
+            _bool_setting(repository.get_setting("audio.narrator_enabled", True), True)
+        )
+        self.music_volume_slider.setValue(
+            _clamped_int(repository.get_setting("audio.music_volume", 25), 25, 0, 100)
+        )
+        self.tts_volume_slider.setValue(
+            _clamped_int(repository.get_setting("audio.tts_volume", 90), 90, 0, 100)
+        )
 
     def _save_settings(self) -> None:
         """Saves settings to the active save."""
@@ -1268,8 +2314,15 @@ class SettingsScreen(RepositoryBackedWidget):
         if repository is None:
             return
 
-        repository.set_setting("player_name", self.player_name_input.text().strip())
         repository.set_setting("theme", self.theme_combo.currentText())
+        repository.set_setting(
+            "ai.additional_context",
+            self.additional_ai_context_input.toPlainText().strip(),
+        )
+        repository.set_setting("audio.music_enabled", self.music_enabled_checkbox.isChecked())
+        repository.set_setting("audio.narrator_enabled", self.narrator_enabled_checkbox.isChecked())
+        repository.set_setting("audio.music_volume", self.music_volume_slider.value())
+        repository.set_setting("audio.tts_volume", self.tts_volume_slider.value())
         repository.set_currency_denominations(
             [
                 {
@@ -1316,7 +2369,135 @@ class SettingsScreen(RepositoryBackedWidget):
         repository.set_state_value("time", calendar_snapshot["display_label"])
         repository.append_history("system", "Settings updated.")
 
+        if self.on_audio_settings_changed is not None:
+            self.on_audio_settings_changed()
+
         QMessageBox.information(self, "Settings Saved", "Settings were saved.")
+
+
+def _apply_audio_settings_to_managers(
+    repository: SaveRepository,
+    *,
+    sound_manager: SoundManager | None,
+    narration_player: NarrationPlayer | None,
+) -> None:
+    """Applies saved music and narrator settings to runtime audio managers."""
+
+    music_enabled = _bool_setting(repository.get_setting("audio.music_enabled", True), True)
+    narrator_enabled = _bool_setting(
+        repository.get_setting("audio.narrator_enabled", True),
+        True,
+    )
+    music_volume = _clamped_int(repository.get_setting("audio.music_volume", 25), 25, 0, 100)
+    tts_volume = _clamped_int(repository.get_setting("audio.tts_volume", 90), 90, 0, 100)
+
+    if sound_manager is not None:
+        sound_manager.set_music_volume(music_volume)
+        sound_manager.set_music_enabled(music_enabled)
+
+        current_music = str(repository.get_setting("audio.current_music", "") or "").strip()
+
+        if music_enabled and current_music:
+            sound_manager.play_music(current_music)
+        elif not music_enabled:
+            sound_manager.stop_music(clear_current=False)
+
+    if narration_player is not None:
+        narration_player.set_volume(tts_volume)
+        narration_player.set_enabled(narrator_enabled)
+
+
+def _slider_row(slider: QSlider, value_label: QLabel) -> QWidget:
+    """Builds a compact slider row with a fixed-width value label."""
+
+    value_label.setFixedWidth(42)
+    row = QHBoxLayout()
+    row.addWidget(slider)
+    row.addWidget(value_label)
+
+    widget = QWidget()
+    widget.setLayout(row)
+    return widget
+
+
+def _bool_setting(value: Any, default: bool) -> bool:
+    """Reads a flexible boolean setting."""
+
+    if isinstance(value, bool):
+        return value
+
+    if isinstance(value, str):
+        normalized = value.strip().casefold()
+
+        if normalized in {"true", "1", "yes", "on"}:
+            return True
+
+        if normalized in {"false", "0", "no", "off"}:
+            return False
+
+    return default
+
+
+def _clamped_int(value: Any, default: int, minimum: int, maximum: int) -> int:
+    """Returns an integer clamped to the provided range."""
+
+    try:
+        parsed_value = int(value)
+    except (TypeError, ValueError):
+        parsed_value = default
+
+    return max(minimum, min(maximum, parsed_value))
+
+
+def _ai_skills_match_setup(
+    ai_skills: list[dict[str, Any]],
+    setup_skills: Any,
+) -> bool:
+    """Returns True when AI-finalized skills preserve the setup level spread."""
+
+    if not isinstance(setup_skills, list):
+        return False
+
+    if len(ai_skills) != len(setup_skills):
+        return False
+
+    try:
+        ai_levels = sorted(int(skill.get("level", 0)) for skill in ai_skills)
+        setup_levels = sorted(int(skill.get("level", 0)) for skill in setup_skills)
+    except (AttributeError, TypeError, ValueError):
+        return False
+
+    if ai_levels != setup_levels:
+        return False
+
+    skill_names = [str(skill.get("name", "")).strip().casefold() for skill in ai_skills]
+
+    if len(skill_names) != len(set(skill_names)):
+        return False
+
+    return all(
+        str(skill.get("name", "")).strip()
+        and str(skill.get("description", "")).strip()
+        for skill in ai_skills
+    )
+
+
+def _append_ai_context_line(existing_context: str, line: str) -> str:
+    """Appends an AI-facing setup context line if it is not already present."""
+
+    clean_existing = str(existing_context or "").strip()
+    clean_line = str(line or "").strip()
+
+    if not clean_line:
+        return clean_existing
+
+    if clean_line in clean_existing.splitlines():
+        return clean_existing
+
+    if clean_existing:
+        return f"{clean_existing}\n\n{clean_line}"
+
+    return clean_line
 
 
 def _build_season_settings(

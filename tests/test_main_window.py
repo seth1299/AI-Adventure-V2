@@ -38,6 +38,54 @@ class MainWindowTests(unittest.TestCase):
             with self.assertNoLogs(logger, level="ERROR"):
                 window = MainWindow(app_paths=app_paths)
                 window.return_to_menu()
+                tab_names = [
+                    window.game_shell.tabs.tabText(index)
+                    for index in range(window.game_shell.tabs.count())
+                ]
+                self.assertIn("Character", tab_names)
+                self.assertIn("World", tab_names)
+                self.assertIn("Active Tasks", tab_names)
+                npc_headers = [
+                    window.game_shell.npcs_screen.table.horizontalHeaderItem(index).text()
+                    for index in range(window.game_shell.npcs_screen.table.columnCount())
+                ]
+                task_headers = [
+                    window.game_shell.active_tasks_screen.table.horizontalHeaderItem(index).text()
+                    for index in range(window.game_shell.active_tasks_screen.table.columnCount())
+                ]
+                alchemy_tabs = [
+                    window.game_shell.alchemy_screen.tabs.tabText(index)
+                    for index in range(window.game_shell.alchemy_screen.tabs.count())
+                ]
+                self.assertEqual(npc_headers, ["Name", "Location", "Notes"])
+
+                sortable_tables = [
+                    window.game_shell.inventory_screen.table,
+                    window.game_shell.npcs_screen.table,
+                    window.game_shell.active_tasks_screen.table,
+                    window.game_shell.skills_screen.skills_table,
+                ]
+
+                for table in sortable_tables:
+                    self.assertFalse(table.isSortingEnabled())
+                    self.assertTrue(table.horizontalHeader().sectionsClickable())
+                    self.assertTrue(table.horizontalHeader().isSortIndicatorShown())
+
+                self.assertFalse(window.game_shell.calendar_screen.table.isSortingEnabled())
+                self.assertEqual(
+                    task_headers,
+                    [
+                        "Task",
+                        "Type",
+                        "Status",
+                        "Details",
+                        "Contact",
+                        "Location",
+                        "Reward",
+                        "Due",
+                    ],
+                )
+                self.assertEqual(alchemy_tabs, ["Reagents", "Recipes"])
                 window.close()
 
 

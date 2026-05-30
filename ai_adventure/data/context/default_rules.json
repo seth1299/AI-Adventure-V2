@@ -50,6 +50,7 @@
           "Do not repeat the player's prompt back to them.",
           "Do not speak for the player character or decide what the player character says in response to NPCs, unless the Player specifically requests that.",
           "The player character is important, but the world does not revolve entirely around them.",
+          "The player character's class, profession, backstory, and skills are not global world-theme instructions. Use them to inform personal opportunities, contacts, equipment, and checks, but do not make every new location, religion, faction, political conflict, NPC, mystery, or economy detail revolve around the player's specialty unless the player explicitly asked for that focused premise.",
           "NPCs have their own goals and act even when the player does not directly interact with them.",
           "If the player has companions or teammates, those NPCs should take reasonable actions during the scene instead of waiting passively forever.",
           "You MUST avoid using the em-dash (\"--\") character.",
@@ -97,7 +98,8 @@
           "Do not use real people or real-world settings unless the player explicitly requests them.",
           "Do not enclose normal item names in quotation marks.",
           "Only use quotation marks around an item name if it is a unique brand name, title, inscription, nickname, or personalized object name.",
-          "When inventing new proper nouns, avoid common AI fantasy defaults such as Kaelan, Bram, Elara, Oakhaven, Ravenswood, Silverbrook, and generic \u201cElder-\u201d names unless already established.",
+          "When inventing new proper nouns, treat creative_ideas as the preferred naming source and avoid broad training-data fantasy defaults.",
+          "Never use creative_ideas.banned_terms, close spelling variants, hyphenation variants, or obvious reskins for newly invented people, places, factions, religions, taverns, regions, shops, guilds, or landmarks unless already established.",
           "Prefer culturally distinct names with varied roots. For settlements, use geography, trade, history, climate, or local superstition as inspiration.",
           "Do not reuse a proper noun for a new character, settlement, faction, or landmark unless it is intentionally the same entity."
         ]
@@ -310,7 +312,10 @@
         "purpose": "Creates or updates a skill when the player learns or reveals a new capability.",
         "rules": [
           "Suggest SkillUpsertedEvent when the player attempts, learns, trains, or reveals a skill that is not already known.",
-          "`Skill Name` should be short and specific.",
+          "`Skill Name` should be short, generalized, and useful across many checks.",
+          "Avoid one-off proper-noun skills, tiny item-maintenance tasks, and narrow lore phrases as skill names.",
+          "Put local flavor, culture, equipment, and backstory specifics in `Skill Description` instead of the skill name.",
+          "For specific lore domains, use the shape `Lore (Specific Domain)`, such as `Lore (Syndicate)` or `Lore (Merchant Law)`, rather than `Syndicate Lore`.",
           "`Skill Description` should explain what the skill is used for.",
           "`Level` must be an integer from 1 to 5.",
           "Use Level 1 for newly learned skills unless the player's backstory or setup clearly justifies a higher level.",
@@ -741,6 +746,7 @@
         "event_type": "WorldLoreAddedEvent",
         "payload_fields": [
           "section",
+          "key",
           "text"
         ],
         "purpose": "Adds factual player-known world knowledge to the World panel under the correct section.",
@@ -751,21 +757,22 @@
           "Do not skip a useful visible world update merely because the player has not learned every detail about the entity yet.",
           "If a fact contains both player-known information and hidden information, split it. Put only the visible/player-known part in WorldLoreAddedEvent, and put hidden details in SecretAddedEvent.",
           "The text should be concise, factual, and encyclopedia-like.",
-          "Prefer this entry style: `Entity Name: Durable fact.`",
+          "`Key` is the stable entry name, such as a location, faction, religion, law, custom, currency, or concept name.",
+          "`Text` is the full player-facing lore text for that key.",
           "Use one WorldLoreAddedEvent event per newly learned entity or concept when multiple distinct facts are learned in the same response.",
           "Do not include in structured event data hidden secrets the player has not learned. Use SecretAddedEvent for GM-only information.",
           "Avoid time-relative wording such as tonight, tomorrow, yesterday, earlier today, or currently.",
           "Write durable and consistent facts that will still make sense later.",
           "If the section is unclear, use Uncategorized.",
-          "Before using WorldLoreAddedEvent, check whether the fact belongs to an existing World entry. If the entity, creature, hazard, location, faction, NPC, spell, custom, or concept already exists in World.md, use WorldLoreUpdatedEvent instead.",
-          "Do not create parenthetical sub-entries such as `Glass-Gales (Survival Tactics)`, `Mirror-Wards (Dismantling)`, or `Stone-Strider Goat (Behavior)`. Use WorldLoreUpdatedEvent for that, adding on that information to the already-existing information for that topic (while following the rules for the WorldLoreUpdatedEvent event as well.)",
+          "Before using WorldLoreAddedEvent, check whether the fact belongs to an existing World entry. If the entity, creature, hazard, location, faction, NPC, spell, custom, or concept already exists in the World tab, use WorldLoreChangedEvent instead.",
+          "Do not create parenthetical sub-entries such as `Glass-Gales (Survival Tactics)`, `Mirror-Wards (Dismantling)`, or `Stone-Strider Goat (Behavior)`. Use WorldLoreChangedEvent for that, adding that information to the already-existing entry.",
           "Research topics, survival tactics, warning signs, uses, weaknesses, behaviors, and other subtopics must be folded into the existing entry's lore text."
         ]
       }
     },
     {
       "id": "event.upsert_world",
-      "title": "WorldLoreUpdatedEvent Contract",
+      "title": "WorldLoreChangedEvent Contract",
       "category": "event_contract",
       "tags": [
         "events",
@@ -776,23 +783,23 @@
       "content": {
         "legacy_tag": "UPSERT_WORLD",
         "do_not_emit_legacy_tag": true,
-        "event_type": "WorldLoreUpdatedEvent",
+        "event_type": "WorldLoreChangedEvent",
         "payload_fields": [
           "section",
-          "anchor",
+          "key",
           "replacement_lore"
         ],
         "purpose": "Updates one existing World panel entry under the correct section.",
         "rules": [
-          "Suggest WorldLoreUpdatedEvent when a known NPC, location, faction, shop, landmark, custom, or world fact needs to be corrected, clarified, or updated based on what the player learned in the current turn.",
+          "Suggest WorldLoreChangedEvent when a known NPC, location, faction, shop, landmark, custom, or world fact needs to be corrected, clarified, or changed based on what the player learned in the current turn.",
+          "WorldLoreUpdatedEvent is accepted as a legacy alias, but prefer WorldLoreChangedEvent.",
           "Section must be one of the allowed World sections.",
-          "Anchor must be the plain entity key to find, usually the name before the colon in the existing World entry.",
+          "Key must exactly match the existing World tab entry key whenever possible.",
           "Replacement Lore must be the full updated encyclopedia-style entry.",
-          "Do not pair WorldLoreUpdatedEvent with WorldLoreAddedEvent for the same fact in the same response.",
+          "Do not pair WorldLoreChangedEvent with WorldLoreAddedEvent for the same fact in the same response.",
           "Do not include in structured event data hidden secrets the player has not learned. Use SecretAddedEvent for GM-only information.",
-          "Anchor must exactly match the existing World.md entry key before the colon whenever possible.",
-          "Do not add labels, categories, parentheticals, or research subtopics to the anchor.",
-          "If the existing entry is `Glass-Gales: ...`, the anchor must be `Glass-Gales`, not `Glass-Gales (Survival Tactics)`.",
+          "Do not add labels, categories, parentheticals, or research subtopics to the key.",
+          "If the existing entry key is `Glass-Gales`, the key must be `Glass-Gales`, not `Glass-Gales (Survival Tactics)`.",
           "Replacement Lore must keep the same entity key and incorporate the new facts into the full updated entry."
         ]
       }
@@ -911,6 +918,76 @@
       }
     },
     {
+      "id": "event.active_task",
+      "title": "ActiveTaskUpsertedEvent Contract",
+      "category": "event_contract",
+      "tags": [
+        "events",
+        "quest",
+        "task",
+        "merchant"
+      ],
+      "priority": 72,
+      "content": {
+        "legacy_tag": null,
+        "do_not_emit_legacy_tag": true,
+        "event_type": "ActiveTaskUpsertedEvent",
+        "payload_fields": [
+          "name",
+          "category",
+          "status",
+          "description",
+          "requester",
+          "location",
+          "reward",
+          "due_date",
+          "notes"
+        ],
+        "purpose": "Creates or updates an active task, including quests, custom orders, commissions, pending purchases, deliveries, promises, and other ongoing obligations.",
+        "rules": [
+          "Suggest ActiveTaskUpsertedEvent when the player gains a new ongoing task that the AI should remember across turns.",
+          "Use this for commissions the player accepts, custom orders the player places, pending work from NPCs, deliveries, debts, favors, promises, and other obligations that are not cleanly represented as a quest.",
+          "Use QuestAddedEvent for classic quests. QuestAddedEvent will also create an active task automatically.",
+          "`Name` should be short, distinct, and stable.",
+          "`Category` should be a plain label such as Quest, Commission, Order, Delivery, Favor, Debt, Research, or Task.",
+          "`Status` should be concise, such as Active, Waiting, In Progress, Ready for Pickup, or Pending.",
+          "`Description` should summarize what needs to happen.",
+          "`Requester` may be an NPC, faction, shop, customer, or Self.",
+          "`Location` should be where the task is relevant, picked up, completed, or turned in.",
+          "`Reward` may describe payment, promised reward, cost already paid, or Unknown.",
+          "`Due Date` may be empty if there is no known deadline.",
+          "`Notes` must contain only player-known information."
+        ]
+      }
+    },
+    {
+      "id": "event.complete_active_task",
+      "title": "ActiveTaskCompletedEvent Contract",
+      "category": "event_contract",
+      "tags": [
+        "events",
+        "quest",
+        "task"
+      ],
+      "priority": 72,
+      "content": {
+        "legacy_tag": null,
+        "do_not_emit_legacy_tag": true,
+        "event_type": "ActiveTaskCompletedEvent",
+        "payload_fields": [
+          "name",
+          "notes"
+        ],
+        "purpose": "Marks an active task as completed or otherwise no longer active.",
+        "rules": [
+          "Suggest ActiveTaskCompletedEvent when a commission, order, delivery, favor, pending purchase, promise, or other active task is fulfilled, cancelled, resolved, collected, delivered, or no longer relevant.",
+          "Use QuestCompletedEvent for classic quests. QuestCompletedEvent will also complete the matching active task automatically.",
+          "`Name` should match an existing active task exactly or as closely as possible.",
+          "`Notes` may summarize the player-known resolution."
+        ]
+      }
+    },
+    {
       "id": "event.music",
       "title": "MusicChangedEvent Contract",
       "category": "event_contract",
@@ -931,7 +1008,7 @@
         "rules": [
           "Suggest MusicChangedEvent when the scene mood, location, danger level, or environment changes enough to justify new background music.",
           "The filename must exactly match one of the valid sound files.",
-          "Valid sound file names are: `{VALID_SOUND_FILE_NAMES}`.",
+          "Valid sound file names are listed in state.audio.valid_music_tracks.",
           "Do not invent filenames.",
           "Do not overuse this event for every minor action, however, do check and make sure that the currently playing music is appropriate for the location and the mood, even if the \"Location\" didn't actually change from one action to another. For example, if an ally suddenly turns traitor, you can start a fight song track, even if the Player is still in a \"Forest\" location."
         ]

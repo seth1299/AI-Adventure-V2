@@ -22,6 +22,80 @@ class AppPaths:
     logs_dir: Path
     log_file: Path
 
+    @property
+    def repo_root(self) -> Path:
+        """Returns the local project root when running from source."""
+
+        return Path(__file__).resolve().parents[2]
+
+    @property
+    def legacy_app_dir(self) -> Path:
+        """Returns the sibling legacy app directory used for local asset migration."""
+
+        return self.repo_root.parent / "AI-Adventure"
+
+    @property
+    def sounds_dir(self) -> Path:
+        """Returns the app-managed sound asset directory."""
+
+        return self.app_data_dir / "sounds"
+
+    @property
+    def package_audio_dir(self) -> Path:
+        """Returns the packaged source-tree audio asset directory."""
+
+        return self.repo_root / "ai_adventure" / "audio"
+
+    @property
+    def package_music_tracks_dir(self) -> Path:
+        """Returns the packaged music-track directory."""
+
+        return self.package_audio_dir / "music_tracks"
+
+    @property
+    def package_tts_dir(self) -> Path:
+        """Returns the packaged TTS asset directory."""
+
+        return self.package_audio_dir / "tts"
+
+    @property
+    def tts_output_dir(self) -> Path:
+        """Returns the temporary app-managed narration output directory."""
+
+        return self.app_data_dir / "tts_cache"
+
+    @property
+    def tts_models_dir(self) -> Path:
+        """Returns the app-managed TTS model directory."""
+
+        return self.app_data_dir / "models" / "tts"
+
+    @property
+    def kokoro_model_path(self) -> Path:
+        """Returns the best known Kokoro ONNX model path."""
+
+        return self._first_existing_path(
+            os.getenv("AI_ADVENTURE_KOKORO_MODEL_PATH"),
+            self.package_tts_dir / "kokoro-v1.0.onnx",
+            self.tts_models_dir / "kokoro" / "kokoro-v1.0.onnx",
+            self.repo_root / "models" / "tts" / "kokoro" / "kokoro-v1.0.onnx",
+            self.legacy_app_dir / "models" / "tts" / "kokoro" / "kokoro-v1.0.onnx",
+            fallback=self.tts_models_dir / "kokoro" / "kokoro-v1.0.onnx",
+        )
+
+    @property
+    def kokoro_voices_path(self) -> Path:
+        """Returns the best known Kokoro voices file path."""
+
+        return self._first_existing_path(
+            os.getenv("AI_ADVENTURE_KOKORO_VOICES_PATH"),
+            self.package_tts_dir / "voices-v1.0.bin",
+            self.tts_models_dir / "kokoro" / "voices-v1.0.bin",
+            self.repo_root / "models" / "tts" / "kokoro" / "voices-v1.0.bin",
+            self.legacy_app_dir / "models" / "tts" / "kokoro" / "voices-v1.0.bin",
+            fallback=self.tts_models_dir / "kokoro" / "voices-v1.0.bin",
+        )
+
     @classmethod
     def create(cls) -> "AppPaths":
         """
@@ -40,10 +114,14 @@ class AppPaths:
 
         saves_dir = app_data_dir / "saves"
         logs_dir = app_data_dir / "logs"
+        sounds_dir = app_data_dir / "sounds"
+        tts_output_dir = app_data_dir / "tts_cache"
         log_file = logs_dir / "ai_adventure.log"
 
         saves_dir.mkdir(parents=True, exist_ok=True)
         logs_dir.mkdir(parents=True, exist_ok=True)
+        sounds_dir.mkdir(parents=True, exist_ok=True)
+        tts_output_dir.mkdir(parents=True, exist_ok=True)
 
         return cls(
             app_data_dir=app_data_dir,
@@ -51,3 +129,21 @@ class AppPaths:
             logs_dir=logs_dir,
             log_file=log_file,
         )
+
+    def _first_existing_path(
+        self,
+        *candidates: str | Path | None,
+        fallback: Path,
+    ) -> Path:
+        """Returns the first existing candidate path, otherwise a fallback."""
+
+        for candidate in candidates:
+            if candidate is None:
+                continue
+
+            candidate_path = Path(candidate).expanduser()
+
+            if candidate_path.exists():
+                return candidate_path
+
+        return fallback

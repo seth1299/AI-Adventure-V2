@@ -114,11 +114,21 @@ class EventApplier:
             if event_type == "CurrencyDefinedEvent":
                 return self._apply_currency_defined(event_type, payload)
 
-            if event_type in {"WorldLoreAddedEvent", "WorldLoreUpdatedEvent"}:
+            if event_type in {
+                "WorldLoreAddedEvent",
+                "WorldLoreChangedEvent",
+                "WorldLoreUpdatedEvent",
+            }:
                 return self._apply_world_lore_event(event_type, payload)
 
             if event_type in {"QuestAddedEvent", "QuestCompletedEvent"}:
                 return self._apply_quest_event(event_type, payload)
+
+            if event_type in {"ActiveTaskUpsertedEvent", "ActiveTaskUpdatedEvent"}:
+                return self._apply_active_task_upserted(event_type, payload)
+
+            if event_type == "ActiveTaskCompletedEvent":
+                return self._apply_active_task_completed(event_type, payload)
 
             if event_type == "SpellLearnedEvent":
                 return self._apply_spell_learned(event_type, payload)
@@ -128,6 +138,9 @@ class EventApplier:
 
             if event_type == "NpcKnowledgeAddedEvent":
                 return self._apply_npc_knowledge_added(event_type, payload)
+
+            if event_type == "MusicChangedEvent":
+                return self._apply_music_changed(event_type, payload)
 
             message = f"Unsupported event type: {event_type}"
             LOGGER.warning(message)
@@ -406,6 +419,34 @@ class EventApplier:
 
         return AppliedEventResult(event_type, "applied", f"Set flag: {key}.", payload)
 
+    def _apply_music_changed(
+        self,
+        event_type: str,
+        payload: dict[str, Any],
+    ) -> AppliedEventResult:
+        """Applies MusicChangedEvent."""
+
+        filename = _first_text(
+            payload,
+            "filename",
+            "file_name",
+            "track",
+            "track_name",
+            "music",
+        )
+
+        if not filename:
+            return _invalid(event_type, payload, "Music filename is required.")
+
+        self.repository.set_setting("audio.current_music", filename)
+
+        return AppliedEventResult(
+            event_type,
+            "applied",
+            f"Changed background music to: {filename}.",
+            payload,
+        )
+
     def _apply_recipe_discovered(
         self,
         event_type: str,
@@ -550,15 +591,25 @@ class EventApplier:
         event_type: str,
         payload: dict[str, Any],
     ) -> AppliedEventResult:
-        """Applies world-lore events as durable history entries for now."""
+        """Applies keyed world-lore events."""
 
         section = _first_text(payload, "section")
+        key = _first_text(payload, "key", "anchor", "name", "title")
         text = _first_text(payload, "text", "replacement_lore", "lore")
 
         if not text:
             return _invalid(event_type, payload, "World lore text is required.")
 
-        self.repository.append_history("world", f"{section}: {text}" if section else text)
+        if event_type in {"WorldLoreChangedEvent", "WorldLoreUpdatedEvent"}:
+            if not key:
+                return _invalid(event_type, payload, "World lore key is required.")
+
+            self.repository.change_world_lore_entry(section or "World", key, text)
+        else:
+            self.repository.add_world_lore_entry(section or "World", key, text)
+
+        label = f"{section}: {key}: {text}" if section and key else f"{section}: {text}" if section else text
+        self.repository.append_history("world", label)
         return AppliedEventResult(event_type, "applied", "Recorded world lore.", payload)
 
     def _apply_quest_event(
@@ -566,7 +617,7 @@ class EventApplier:
         event_type: str,
         payload: dict[str, Any],
     ) -> AppliedEventResult:
-        """Applies quest events as durable state/history entries for now."""
+        """Applies quest events as durable active tasks."""
 
         name = _first_text(payload, "name")
 
@@ -575,15 +626,98 @@ class EventApplier:
 
         if event_type == "QuestCompletedEvent":
             self.repository.set_state_value(f"quest.{name}.status", "completed")
+            task = self.repository.complete_active_task(
+                name,
+                _first_text(payload, "notes", "resolution", "outcome"),
+            )
             self.repository.append_history("quest", f"Completed quest: {name}.")
+            if task is None:
+                return AppliedEventResult(
+                    event_type,
+                    "applied",
+                    f"Completed quest flag: {name}.",
+                    payload,
+                )
             return AppliedEventResult(event_type, "applied", f"Completed quest: {name}.", payload)
 
         self.repository.set_state_value(f"quest.{name}.status", "active")
+        self.repository.upsert_active_task(
+            name=name,
+            category="Quest",
+            status="Active",
+            description=_first_text(payload, "description"),
+            requester=_first_text(payload, "giver", "quest_giver", "requester"),
+            location=_first_text(payload, "turn_in", "location"),
+            reward=_first_text(payload, "reward"),
+            due_date=_first_text(payload, "due_date", "deadline"),
+            notes=_first_text(payload, "notes"),
+        )
         self.repository.append_history(
             "quest",
             f"Added quest: {name}. {_first_text(payload, 'description')}",
         )
         return AppliedEventResult(event_type, "applied", f"Added quest: {name}.", payload)
+
+    def _apply_active_task_upserted(
+        self,
+        event_type: str,
+        payload: dict[str, Any],
+    ) -> AppliedEventResult:
+        """Applies ActiveTaskUpsertedEvent or ActiveTaskUpdatedEvent."""
+
+        name = _first_text(payload, "name", "title", "task_name")
+
+        if not name:
+            return _invalid(event_type, payload, "Active task name is required.")
+
+        task = self.repository.upsert_active_task(
+            name=name,
+            category=_first_text(payload, "category", "type") or "Task",
+            status=_first_text(payload, "status") or "Active",
+            description=_first_text(payload, "description", "objective", "summary"),
+            requester=_first_text(payload, "requester", "giver", "client", "npc"),
+            location=_first_text(payload, "location", "turn_in"),
+            reward=_first_text(payload, "reward", "payment"),
+            due_date=_first_text(payload, "due_date", "deadline", "due"),
+            notes=_first_text(payload, "notes"),
+        )
+
+        if task is None:
+            return _invalid(event_type, payload, "Active task could not be stored.")
+
+        return AppliedEventResult(
+            event_type,
+            "applied",
+            f"Stored active task: {name}.",
+            payload,
+        )
+
+    def _apply_active_task_completed(
+        self,
+        event_type: str,
+        payload: dict[str, Any],
+    ) -> AppliedEventResult:
+        """Applies ActiveTaskCompletedEvent."""
+
+        name = _first_text(payload, "name", "title", "task_name")
+
+        if not name:
+            return _invalid(event_type, payload, "Active task name is required.")
+
+        task = self.repository.complete_active_task(
+            name,
+            _first_text(payload, "notes", "resolution", "outcome"),
+        )
+
+        if task is None:
+            return _invalid(event_type, payload, f"Active task does not exist: {name}.")
+
+        return AppliedEventResult(
+            event_type,
+            "applied",
+            f"Completed active task: {name}.",
+            payload,
+        )
 
     def _apply_spell_learned(
         self,
@@ -695,7 +829,7 @@ def normalize_event(raw_event: dict[str, Any]) -> tuple[str, dict[str, Any]]:
     Supports both {"type": "...", "payload": {...}} and flat event objects.
     """
 
-    event_type = str(raw_event.get("type", "")).strip()
+    event_type = _event_type_from_raw_event(raw_event)
 
     if not event_type:
         event_type = "UnknownEvent"
@@ -708,10 +842,22 @@ def normalize_event(raw_event: dict[str, Any]) -> tuple[str, dict[str, Any]]:
         payload = {}
 
     for key, value in raw_event.items():
-        if key not in {"type", "payload"} and key not in payload:
+        if key not in {"type", "event_type", "eventType", "payload"} and key not in payload:
             payload[key] = value
 
     return event_type, payload
+
+
+def _event_type_from_raw_event(raw_event: dict[str, Any]) -> str:
+    """Reads a Gemini event type from supported event-type keys."""
+
+    for key in ["type", "event_type", "eventType"]:
+        event_type = str(raw_event.get(key, "")).strip()
+
+        if event_type:
+            return event_type
+
+    return ""
 
 
 def _invalid(

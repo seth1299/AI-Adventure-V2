@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "source": "Converted from ai_adventure/data/old_banned_terms_example_list.txt with Alden added from current user preference.",
+  "usage": {
+    "purpose": "Terms that the AI must not newly invent for player characters, NPCs, locations, factions, religions, taverns, regions, or similar proper nouns.",
+    "rule": "Never use these terms, close spelling variants, hyphenation variants, or obvious reskins for newly generated names. They may appear only when already established in saved state or explicitly provided by the player."
+  },
+  "terms": [
+    "Alden",
+    "Aethelgard",
+    "Whisperwood",
+    "Whisper-Wood",
+    "Vaelan",
+    "Vaelen",
+    "Caelan",
+    "Kaelan",
+    "Bram",
+    "Elara",
+    "Oakhaven",
+    "Ravenswood",
+    "Silverbrook",
+    "Silas",
+    "Sylas",
+    "Verdant Green",
+    "Verdant"
+  ]
+}

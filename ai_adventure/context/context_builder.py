@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from ai_adventure.alchemy.rulebook import AlchemyRulebook, AlchemyRulebookLoader
+from ai_adventure.context.creative_ideas import CreativeIdeasLibrary
 from ai_adventure.context.models import ContextLibrary
 from ai_adventure.context.reference_loader import ContextReferenceLoader
 from ai_adventure.core.models import AdventureState
@@ -78,11 +79,15 @@ KEYWORD_TAGS: dict[str, set[str]] = {
     },
     "merchant": {
         "buy",
+        "drink",
+        "food",
         "merchant",
+        "menu",
         "price",
         "purchase",
         "sell",
         "shop",
+        "tavern",
         "trade",
     },
     "quest": {
@@ -102,6 +107,7 @@ KEYWORD_TAGS: dict[str, set[str]] = {
     },
     "world": {
         "calendar",
+        "country",
         "date",
         "day",
         "faction",
@@ -109,14 +115,30 @@ KEYWORD_TAGS: dict[str, set[str]] = {
         "lore",
         "month",
         "npc",
+        "race",
+        "region",
+        "religion",
         "rumor",
         "season",
+        "settlement",
+        "species",
         "time",
         "weather",
         "world",
     },
+    "music": {
+        "ambience",
+        "background",
+        "mood",
+        "music",
+        "scene",
+        "song",
+        "soundtrack",
+        "track",
+    },
     "dialogue": {
         "ask",
+        "name",
         "say",
         "speak",
         "talk",
@@ -138,6 +160,7 @@ class AiContextBuilder:
         library: ContextLibrary,
         *,
         alchemy_rulebook: AlchemyRulebook | None = None,
+        creative_ideas: CreativeIdeasLibrary | None = None,
         max_history_entries: int = 8,
         max_reference_sections: int = 14,
         max_rulebook_reagents: int = 8,
@@ -146,6 +169,7 @@ class AiContextBuilder:
         Args:
             library: Validated reference context library.
             alchemy_rulebook: Optional structured alchemy rules.
+            creative_ideas: Optional creative seed library.
             max_history_entries: Recent history entries to include.
             max_reference_sections: Maximum reference sections to include.
             max_rulebook_reagents: Maximum example rulebook reagents to include.
@@ -153,6 +177,7 @@ class AiContextBuilder:
 
         self.library = library
         self.alchemy_rulebook = alchemy_rulebook
+        self.creative_ideas = creative_ideas
         self.max_history_entries = max_history_entries
         self.max_reference_sections = max_reference_sections
         self.max_rulebook_reagents = max_rulebook_reagents
@@ -164,6 +189,7 @@ class AiContextBuilder:
         return cls(
             ContextReferenceLoader().load_default_library(),
             alchemy_rulebook=AlchemyRulebookLoader().load_default_rulebook(),
+            creative_ideas=CreativeIdeasLibrary.load_default(),
         )
 
     def build_story_context(
@@ -172,6 +198,8 @@ class AiContextBuilder:
         *,
         player_command: str,
         relevant_npcs: list[dict[str, Any]] | None = None,
+        valid_music_tracks: list[str] | None = None,
+        current_music: str | None = None,
     ) -> dict[str, Any]:
         """
         Builds the context packet for one story turn.
@@ -180,6 +208,8 @@ class AiContextBuilder:
             state: Current composed adventure state.
             player_command: The player's pending command.
             relevant_npcs: NPC memory profiles likely relevant this turn.
+            valid_music_tracks: Playable background music filenames.
+            current_music: Currently selected background music filename.
 
         Returns:
             JSON-serializable context packet.
@@ -187,6 +217,15 @@ class AiContextBuilder:
 
         clean_command = player_command.strip()
         selected_tags = infer_context_tags(clean_command)
+        clean_music_tracks = [
+            str(track).strip()
+            for track in (valid_music_tracks or [])
+            if str(track).strip()
+        ]
+
+        if clean_music_tracks:
+            selected_tags.add("music")
+
         reference_sections = self.library.select_sections(
             selected_tags,
             max_sections=self.max_reference_sections,
@@ -205,13 +244,33 @@ class AiContextBuilder:
                 "adventure_title": state.metadata.title,
                 "player": {
                     "name": state.player.name,
+                    "appearance": state.player.appearance,
+                    "backstory": state.player.backstory,
                     "condition": state.player.condition,
+                    "notes": state.player.notes,
+                },
+                "player_ai_preferences": {
+                    "additional_context": str(
+                        state.settings.values.get("ai.additional_context", "")
+                    ),
+                    "rules": (
+                        "These are player-provided instructions and preferences "
+                        "for the AI to remember across turns. Follow them unless "
+                        "they conflict with higher-priority system, safety, or "
+                        "structured response rules."
+                    ),
                 },
                 "scene": {
                     "location": state.world.location,
                     "time": state.calendar.display_label,
                     "weather": state.world.weather,
                     "flags": state.world.flags,
+                },
+                "world_profile": {
+                    "summary": str(state.settings.values.get("world.summary", "")),
+                    "genre": str(state.settings.values.get("world.genre", "")),
+                    "game_style": str(state.settings.values.get("world.game_style", "")),
+                    "setup_context": str(state.settings.values.get("world.setup_context", "")),
                 },
                 "calendar": {
                     "current": state.calendar.to_dict(),
@@ -246,10 +305,13 @@ class AiContextBuilder:
                 "currency": {
                     "balance_base_units": state.currency.balance_base_units,
                     "denominations": state.currency.denominations,
+                    "world_description": str(
+                        state.settings.values.get("currency.description", "")
+                    ),
                     "baseline_unit": (
                         state.currency.denominations[0]["name"]
                         if state.currency.denominations
-                        else "Copper Piece"
+                        else "base currency unit"
                     ),
                     "item_value_rule": (
                         "Inventory item value_base_units is an integer measured "
@@ -257,7 +319,6 @@ class AiContextBuilder:
                     ),
                 },
                 "alchemy": {
-                    "note_titles": [note.title for note in state.alchemy.notes],
                     "known_reagents": [
                         reagent.to_dict() for reagent in state.alchemy.known_reagents
                     ],
@@ -288,6 +349,48 @@ class AiContextBuilder:
                         check.to_dict() for check in state.skills.recent_checks
                     ],
                 },
+                "active_tasks": {
+                    "rules": {
+                        "purpose": (
+                            "Active tasks are durable player-visible obligations, "
+                            "quests, commissions, custom orders, pending purchases, "
+                            "and promises that the AI should remember across turns."
+                        ),
+                        "upsert_rule": (
+                            "Suggest ActiveTaskUpsertedEvent when a new task appears "
+                            "or an existing task changes status, description, reward, "
+                            "requester, location, due date, or notes."
+                        ),
+                        "completion_rule": (
+                            "Suggest ActiveTaskCompletedEvent or QuestCompletedEvent "
+                            "when a task is fulfilled, cancelled, resolved, delivered, "
+                            "or otherwise no longer active."
+                        ),
+                    },
+                    "tasks": [
+                        task.to_dict() for task in state.active_tasks.tasks
+                    ],
+                },
+                "audio": {
+                    "current_music": str(
+                        current_music
+                        or state.settings.values.get("audio.current_music", "")
+                        or ""
+                    ),
+                    "valid_music_tracks": clean_music_tracks,
+                    "rules": {
+                        "music_change_rule": (
+                            "When scene mood, location, danger level, or environment "
+                            "changes enough that the current track no longer fits, "
+                            "suggest MusicChangedEvent."
+                        ),
+                        "filename_rule": (
+                            "MusicChangedEvent.filename must exactly match one entry "
+                            "from valid_music_tracks. If valid_music_tracks is empty, "
+                            "do not suggest MusicChangedEvent."
+                        ),
+                    },
+                },
                 "npcs": {
                     "rules": {
                         "dialogue_knowledge_boundary": (
@@ -304,8 +407,10 @@ class AiContextBuilder:
                         "new_npc_rule": (
                             "When introducing a meaningful new NPC, suggest "
                             "NpcUpsertedEvent with internal name, player-visible "
-                            "display_name, role, location, public description, "
-                            "player-facing information, and plausible knowledge scope."
+                            "display_name, internal role, location, public "
+                            "description, player-facing information, and plausible "
+                            "knowledge scope. role is for AI memory and should not "
+                            "replace player_facing_information."
                         ),
                         "multiple_npc_rule": (
                             "If one turn introduces multiple distinct meaningful NPCs, "
@@ -320,10 +425,12 @@ class AiContextBuilder:
                         ),
                         "player_facing_information_rule": (
                             "player_facing_information is displayed directly to the "
-                            "player in the NPCs tab. It must contain only information "
-                            "the player has observed, heard, learned, or reasonably "
-                            "deduced. Never put secrets, hidden motives, mystery "
-                            "solutions, private NPC plans, or GM-only facts there."
+                            "player in the NPCs tab under Notes. It must contain only "
+                            "information the player has observed, heard, learned, or "
+                            "reasonably deduced. Write it as information about a "
+                            "person, not as a mechanical service role. Never put "
+                            "secrets, hidden motives, mystery solutions, private NPC "
+                            "plans, or GM-only facts there."
                         ),
                     },
                     "relevant": relevant_npcs or [],
@@ -333,6 +440,7 @@ class AiContextBuilder:
                 selected_tags,
                 player_command=clean_command,
             ),
+            "creative_ideas": self._build_creative_ideas_context(selected_tags),
             "recent_history": [
                 entry.to_dict()
                 for entry in state.history.entries[-self.max_history_entries :]
@@ -366,6 +474,53 @@ class AiContextBuilder:
                     "StatusUpdatedEvent.minutes_passed; do not hand-write or guess "
                     "new date labels."
                 ),
+                "character_profile": (
+                    "Use state.player.name, appearance, backstory, and notes as "
+                    "player-authored character context. Treat it as true for the "
+                    "player character, but do not let NPCs know private profile "
+                    "details unless they have observed them, been told, or have a "
+                    "clear in-world reason to know."
+                ),
+                "character_scope": (
+                    "The player character's class, profession, backstory, inventory, "
+                    "and skills are facts about the player character, not proof that "
+                    "the whole world shares that theme. Use them for personal "
+                    "opportunities, plausible contacts, skill checks, and inventory, "
+                    "but do not make every new location, religion, faction, political "
+                    "conflict, NPC, mystery, or economy detail revolve around the "
+                    "player's specialty unless the player explicitly requested that "
+                    "focused premise."
+                ),
+                "player_ai_preferences": (
+                    "Use state.player_ai_preferences.additional_context as persistent "
+                    "player-provided guidance for narration style, boundaries, and "
+                    "miscellaneous preferences. This is intentionally AI-facing, "
+                    "unlike the private Journal."
+                ),
+                "active_tasks": (
+                    "Use state.active_tasks.tasks to remember current quests, "
+                    "commissions, custom orders, pending purchases, and other "
+                    "ongoing obligations. Suggest ActiveTaskUpsertedEvent for new "
+                    "or changed tasks and ActiveTaskCompletedEvent when one is no "
+                    "longer active."
+                ),
+                "background_music": (
+                    "Use state.audio.valid_music_tracks for scene-aware background "
+                    "music. Suggest MusicChangedEvent when a meaningful scene, mood, "
+                    "location, environment, or danger shift calls for a different "
+                    "track. The filename must exactly match a valid track."
+                ),
+                "creative_ideas": (
+                    "Treat creative_ideas as the preferred source of style seeds "
+                    "when the current turn calls for names, locations, cultures, "
+                    "food, drinks, magic, alchemy ingredients, species, or similar "
+                    "invented details. Prefer the provided examples or close "
+                    "stylistic relatives over generic training-data fantasy "
+                    "defaults. Never use creative_ideas.banned_terms or obvious "
+                    "spelling, hyphenation, or reskin variants for newly invented "
+                    "proper nouns. These examples are not established canon and "
+                    "must not override player-provided or saved world facts."
+                ),
                 "npc_memory": (
                     "Use NpcUpsertedEvent when a new meaningful NPC appears or an "
                     "existing NPC profile needs correction. Use NpcKnowledgeAddedEvent "
@@ -392,14 +547,19 @@ class AiContextBuilder:
                     "ReagentDiscoveredEvent",
                     "CurrencyChangedEvent",
                     "CurrencyDefinedEvent",
+                    "MusicChangedEvent",
                     "FlagSetEvent",
                     "LocationChangedEvent",
                     "PlayerNoteAddedEvent",
                     "WorldLoreAddedEvent",
+                    "WorldLoreChangedEvent",
                     "WorldLoreUpdatedEvent",
                     "SecretAddedEvent",
                     "QuestAddedEvent",
                     "QuestCompletedEvent",
+                    "ActiveTaskUpsertedEvent",
+                    "ActiveTaskUpdatedEvent",
+                    "ActiveTaskCompletedEvent",
                     "MerchantInterfaceRequestedEvent",
                     "SpellLearnedEvent",
                     "NpcUpsertedEvent",
@@ -425,6 +585,14 @@ class AiContextBuilder:
             )
 
         return rulebooks
+
+    def _build_creative_ideas_context(self, selected_tags: set[str]) -> dict[str, Any]:
+        """Builds creative idea context for relevant story turns."""
+
+        if self.creative_ideas is None:
+            return {"categories": []}
+
+        return self.creative_ideas.select_for_tags(selected_tags)
 
 
 def infer_context_tags(player_command: str) -> set[str]:

@@ -10,12 +10,21 @@ DEFAULT_CURRENCY_DENOMINATIONS: list[dict[str, Any]] = [
     {"name": "Platinum Piece", "plural_name": "Platinum Pieces", "value": 1000},
 ]
 
+FALLBACK_CURRENCY_DENOMINATIONS: list[dict[str, Any]] = [
+    {"name": "Coin", "plural_name": "Coins", "value": 1},
+]
 
-def normalize_currency_denominations(raw_denominations: Any) -> list[dict[str, Any]]:
+
+def normalize_currency_denominations(
+    raw_denominations: Any,
+    *,
+    fallback_denominations: list[dict[str, Any]] | None = DEFAULT_CURRENCY_DENOMINATIONS,
+    max_denominations: int | None = None,
+) -> list[dict[str, Any]]:
     """Returns clean positive currency denominations sorted by value."""
 
     if not isinstance(raw_denominations, list):
-        raw_denominations = DEFAULT_CURRENCY_DENOMINATIONS
+        raw_denominations = fallback_denominations or []
 
     clean_denominations: list[dict[str, Any]] = []
     seen_values: set[int] = set()
@@ -41,14 +50,35 @@ def normalize_currency_denominations(raw_denominations: Any) -> list[dict[str, A
         seen_values.add(value)
 
     if not clean_denominations:
-        return list(DEFAULT_CURRENCY_DENOMINATIONS)
+        return [dict(denomination) for denomination in (fallback_denominations or [])]
 
     clean_denominations.sort(key=lambda denomination: int(denomination["value"]))
 
-    if int(clean_denominations[0]["value"]) != 1:
-        clean_denominations.insert(0, dict(DEFAULT_CURRENCY_DENOMINATIONS[0]))
+    if max_denominations is not None:
+        clean_denominations = clean_denominations[: max(1, max_denominations)]
 
     return clean_denominations
+
+
+def describe_currency_denominations(
+    denominations: Any,
+    *,
+    fallback_denominations: list[dict[str, Any]] | None = DEFAULT_CURRENCY_DENOMINATIONS,
+) -> str:
+    """Returns a readable description of the world's currency denominations."""
+
+    clean_denominations = normalize_currency_denominations(
+        denominations,
+        fallback_denominations=fallback_denominations,
+    )
+    if not clean_denominations:
+        return ""
+
+    parts = [
+        f"{denomination['name']} ({denomination['value']} base units)"
+        for denomination in clean_denominations
+    ]
+    return "Currency denominations: " + "; ".join(parts) + "."
 
 
 def format_currency_amount(

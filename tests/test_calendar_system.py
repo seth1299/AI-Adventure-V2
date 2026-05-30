@@ -10,6 +10,7 @@ from ai_adventure.calendar_system import (
     build_month_grid,
     format_time_of_day,
     normalize_calendar_settings,
+    resolve_starting_elapsed_minutes,
 )
 from ai_adventure.core.state_manager import StateManager
 from ai_adventure.persistence.save_repository import SaveRepository
@@ -27,6 +28,21 @@ class CalendarSystemTests(unittest.TestCase):
     def test_formats_12_and_24_hour_time(self) -> None:
         self.assertEqual(format_time_of_day(13 * 60, "24_hour"), "13:00")
         self.assertEqual(format_time_of_day(7 * 60, "12_hour"), "7:00 A.M.")
+
+    def test_resolves_ai_selected_starting_season(self) -> None:
+        elapsed_minutes = resolve_starting_elapsed_minutes(
+            {
+                "season_hint": "autumn",
+                "day_of_month": 1,
+                "time_of_day_minutes": 20 * 60,
+            }
+        )
+        snapshot = build_calendar_snapshot(elapsed_minutes)
+
+        self.assertEqual(snapshot["season_hint"], "autumn")
+        self.assertEqual(snapshot["month_name"], "Month 7")
+        self.assertEqual(snapshot["day_of_month"], 1)
+        self.assertEqual(snapshot["time_label"], "Evening")
 
     def test_normalizes_custom_calendar_settings(self) -> None:
         settings = normalize_calendar_settings(

@@ -21,6 +21,7 @@ from ai_adventure.currency import (
     DEFAULT_CURRENCY_DENOMINATIONS,
     normalize_currency_denominations,
 )
+from ai_adventure.new_game_setup import normalize_new_game_setup
 from ai_adventure.skills.rules import bonus_for_level, clamp_skill_level, level_for_xp
 
 
@@ -64,7 +65,12 @@ class SaveRepository:
         self._initialize_schema()
 
     @classmethod
-    def create_new_save(cls, saves_dir: Path, title: str) -> "SaveRepository":
+    def create_new_save(
+        cls,
+        saves_dir: Path,
+        title: str,
+        setup: dict[str, Any] | None = None,
+    ) -> "SaveRepository":
         """
         Creates a new save directory and SQLite database.
 
@@ -83,7 +89,23 @@ class SaveRepository:
 
         repository = cls(db_path)
         repository.set_meta("title", title.strip() or "New Adventure")
+
+        if setup is not None:
+            repository.apply_new_game_setup(setup)
+            LOGGER.info("Created new configured save at %s.", db_path)
+            return repository
+
         repository.set_setting("player_name", "Player Name")
+        repository.set_setting("player.appearance", "")
+        repository.set_setting("player.backstory", "")
+        repository.set_setting("player.notes", "")
+        repository.set_setting("ai.additional_context", "")
+        repository.set_setting("audio.music_enabled", True)
+        repository.set_setting("audio.narrator_enabled", True)
+        repository.set_setting("audio.music_volume", 25)
+        repository.set_setting("audio.tts_volume", 90)
+        repository.set_setting("audio.current_music", "")
+        repository.set_journal_notes("")
         repository.set_currency_denominations(DEFAULT_CURRENCY_DENOMINATIONS)
         repository.set_calendar_settings(DEFAULT_CALENDAR_SETTINGS)
         repository.set_state_value("elapsed_minutes", str(DEFAULT_START_ELAPSED_MINUTES))
@@ -119,6 +141,12 @@ class SaveRepository:
             3,
             "Dried bread, hard cheese, and smoked fruit wrapped for travel.",
         )
+        repository.add_inventory_item(
+            "Waterskin",
+            "Tool",
+            1,
+            "A sealed waterskin suitable for a day's travel.",
+        )
         repository.upsert_skill(
             "Alchemy",
             "Preparing reagents, identifying virtues, and brewing simple preparations.",
@@ -149,6 +177,68 @@ class SaveRepository:
         LOGGER.info("Created new save at %s.", db_path)
 
         return repository
+
+    def apply_new_game_setup(self, setup: dict[str, Any]) -> None:
+        """
+        Applies player-authored new-game wizard setup to a fresh save.
+
+        Args:
+            setup: Raw setup dictionary from the New Game Wizard.
+        """
+
+        clean_setup = normalize_new_game_setup(setup)
+        character = clean_setup["character"]
+        title = clean_setup["title"]
+        start_location = clean_setup["start_location"]
+        calendar_settings = clean_setup["calendar"]
+        calendar_snapshot = build_calendar_snapshot(
+            DEFAULT_START_ELAPSED_MINUTES,
+            calendar_settings,
+        )
+
+        self.set_meta("title", title)
+        self.set_setting("player_name", character["name"])
+        self.set_setting("player.appearance", character["appearance"])
+        self.set_setting("player.backstory", character["backstory"])
+        self.set_setting("player.notes", character["notes"])
+        self.set_setting("ai.additional_context", clean_setup["ai_additional_context"])
+        self.set_setting("audio.music_enabled", True)
+        self.set_setting("audio.narrator_enabled", True)
+        self.set_setting("audio.music_volume", 25)
+        self.set_setting("audio.tts_volume", 90)
+        self.set_setting("audio.current_music", "")
+        self.set_setting("new_game.setup", clean_setup)
+        self.set_setting("world.setup_context", clean_setup["world_context"])
+        self.set_setting("world.genre", clean_setup["specified_genre"])
+        self.set_setting("world.game_style", clean_setup["game_style"])
+        self.set_setting("currency.description", clean_setup["currency_description"])
+        self.set_journal_notes("")
+        self.set_currency_denominations(clean_setup["currency_denominations"])
+        self.set_calendar_settings(calendar_settings)
+        self.set_state_value("elapsed_minutes", str(DEFAULT_START_ELAPSED_MINUTES))
+        self.set_state_value("location", start_location)
+        self.set_state_value("time", calendar_snapshot["display_label"])
+        self.set_state_value("weather", "Clear")
+        self.set_state_value("condition", "Healthy")
+
+        for item in clean_setup["starter_items"]:
+            self.add_inventory_item(
+                name=item["name"],
+                category=item["category"],
+                quantity=int(item["quantity"]),
+                description=item["description"],
+                value_base_units=int(item["value_base_units"]),
+            )
+
+        for skill in clean_setup["skills"]:
+            if str(skill.get("name", "")).strip():
+                self.upsert_skill(
+                    skill["name"],
+                    skill["description"],
+                    int(skill["level"]),
+                )
+
+        self.append_history("system", "New adventure created from wizard setup.")
 
     @classmethod
     def list_saves(cls, saves_dir: Path) -> list[SaveSummary]:
@@ -377,6 +467,83 @@ class SaveRepository:
             ).fetchall()
 
         return [dict(row) for row in rows]
+
+    def replace_inventory_items(self, items: list[dict[str, Any]]) -> None:
+        """
+        Replaces the player's starting inventory list.
+
+        This is intended for new-game synthesis, where AI-finalized starter items
+        should replace blank/default setup inventory instead of being appended.
+        """
+
+        clean_items: list[dict[str, Any]] = []
+        seen_names: set[str] = set()
+
+        for raw_item in items:
+            if not isinstance(raw_item, dict):
+                continue
+
+            name = str(raw_item.get("name", raw_item.get("item_name", ""))).strip()
+
+            if not name or name.casefold() in seen_names:
+                continue
+
+            try:
+                quantity = int(raw_item.get("quantity", raw_item.get("amount", 1)))
+            except (TypeError, ValueError):
+                quantity = 1
+
+            try:
+                value_base_units = int(
+                    raw_item.get(
+                        "value_base_units",
+                        raw_item.get("base_unit_value", raw_item.get("value", 0)),
+                    )
+                )
+            except (TypeError, ValueError):
+                value_base_units = 0
+
+            clean_items.append(
+                {
+                    "name": name,
+                    "category": str(raw_item.get("category", "Item")).strip() or "Item",
+                    "quantity": max(1, quantity),
+                    "description": str(raw_item.get("description", "")).strip(),
+                    "value_base_units": max(0, value_base_units),
+                }
+            )
+            seen_names.add(name.casefold())
+
+        if not clean_items:
+            LOGGER.warning("Skipped replace_inventory_items because no valid items were provided.")
+            return
+
+        with self._connect() as connection:
+            connection.execute("DELETE FROM inventory_items")
+            connection.executemany(
+                """
+                INSERT INTO inventory_items (
+                    name,
+                    category,
+                    quantity,
+                    description,
+                    value_base_units
+                )
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        item["name"],
+                        item["category"],
+                        item["quantity"],
+                        item["description"],
+                        item["value_base_units"],
+                    )
+                    for item in clean_items
+                ],
+            )
+
+        self.append_history("inventory", "Starting inventory finalized.")
 
     def add_alchemy_note(self, title: str, body: str) -> None:
         """
@@ -811,6 +978,71 @@ class SaveRepository:
 
         self.append_history("skill", f"Skill updated: {clean_name} Level {clean_level}.")
 
+    def replace_skills(self, skills: list[dict[str, Any]]) -> None:
+        """
+        Replaces the player's starting skill list.
+
+        This is intended for new-game synthesis, where AI-finalized skill names and
+        descriptions should replace wizard placeholders instead of being appended.
+        """
+
+        clean_skills: list[dict[str, Any]] = []
+        seen_names: set[str] = set()
+
+        for raw_skill in skills:
+            if not isinstance(raw_skill, dict):
+                continue
+
+            name = str(raw_skill.get("name", "")).strip()
+            description = str(raw_skill.get("description", "")).strip()
+
+            try:
+                level = int(raw_skill.get("level", 0))
+            except (TypeError, ValueError):
+                level = 0
+
+            if not name or not description or level <= 0:
+                continue
+
+            if name.casefold() in seen_names:
+                LOGGER.warning("Skipped duplicate skill during replace_skills: %s", name)
+                continue
+
+            clean_level = clamp_skill_level(level)
+            clean_skills.append(
+                {
+                    "name": name,
+                    "description": description,
+                    "level": clean_level,
+                    "bonus": bonus_for_level(clean_level),
+                }
+            )
+            seen_names.add(name.casefold())
+
+        if not clean_skills:
+            LOGGER.warning("Skipped replace_skills because no valid skills were provided.")
+            return
+
+        with self._connect() as connection:
+            connection.execute("DELETE FROM skills")
+            connection.executemany(
+                """
+                INSERT INTO skills (name, description, level, xp, bonus)
+                VALUES (?, ?, ?, 0, ?)
+                """,
+                [
+                    (
+                        skill["name"],
+                        skill["description"],
+                        skill["level"],
+                        skill["bonus"],
+                    )
+                    for skill in clean_skills
+                ],
+            )
+
+        self.append_history("skill", "Starting skills finalized.")
+
     def add_skill_xp(self, name: str, xp_amount: int) -> dict[str, Any] | None:
         """
         Adds XP to a skill and levels it up if thresholds are met.
@@ -1030,10 +1262,12 @@ class SaveRepository:
 
         clean_role = role.strip()
         clean_location = location.strip()
-        clean_display_name = display_name.strip() or clean_role or "Unknown NPC"
+        clean_display_name = display_name.strip() or clean_name or "Unknown NPC"
         clean_public_description = public_description.strip()
         clean_player_facing_information = (
-            player_facing_information.strip() or clean_public_description
+            player_facing_information.strip()
+            or clean_public_description
+            or clean_role
         )
         clean_npc_id = npc_id.strip() or _npc_id_from_parts(
             clean_name,
@@ -1337,16 +1571,25 @@ class SaveRepository:
         visible_npcs: list[dict[str, Any]] = []
 
         for npc in self.list_npcs(limit=limit):
+            description = str(npc.get("public_description") or "").strip()
+            notes = str(
+                npc.get("player_facing_information")
+                or npc.get("public_description")
+                or npc.get("role")
+                or ""
+            ).strip()
+
             visible_npcs.append(
                 {
                     "npc_id": npc["npc_id"],
                     "display_name": (
                         npc.get("display_name")
+                        or npc.get("name")
                         or "Unknown NPC"
                     ),
+                    "description": description,
                     "location": npc["location"],
-                    "player_facing_information": npc["player_facing_information"],
-                    "updated_at": npc["updated_at"],
+                    "notes": notes,
                 }
             )
 
@@ -1530,6 +1773,355 @@ class SaveRepository:
 
         return [dict(row) for row in rows]
 
+    def upsert_active_task(
+        self,
+        *,
+        name: str,
+        category: str = "Task",
+        status: str = "Active",
+        description: str = "",
+        requester: str = "",
+        location: str = "",
+        reward: str = "",
+        due_date: str = "",
+        notes: str = "",
+    ) -> dict[str, Any] | None:
+        """
+        Creates or updates a visible active task.
+
+        Args:
+            name: Task name.
+            category: Task category such as Quest, Commission, or Order.
+            status: Current task status.
+            description: What needs to happen.
+            requester: Person or faction associated with the task.
+            location: Relevant location.
+            reward: Expected reward, cost, or exchange.
+            due_date: In-world due date or timing note.
+            notes: Additional player-visible task notes.
+
+        Returns:
+            Stored task dictionary, or None if the task name is blank.
+        """
+
+        clean_name = name.strip()
+
+        if not clean_name:
+            LOGGER.error("Attempted to upsert active task with blank name.")
+            return None
+
+        clean_category = category.strip() or "Task"
+        clean_status = status.strip() or "Active"
+        timestamp = datetime.now().isoformat(timespec="seconds")
+
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO active_tasks (
+                    name,
+                    category,
+                    status,
+                    description,
+                    requester,
+                    location,
+                    reward,
+                    due_date,
+                    notes,
+                    created_at,
+                    updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(name) DO UPDATE SET
+                    category = excluded.category,
+                    status = excluded.status,
+                    description = CASE
+                        WHEN excluded.description != '' THEN excluded.description
+                        ELSE active_tasks.description
+                    END,
+                    requester = CASE
+                        WHEN excluded.requester != '' THEN excluded.requester
+                        ELSE active_tasks.requester
+                    END,
+                    location = CASE
+                        WHEN excluded.location != '' THEN excluded.location
+                        ELSE active_tasks.location
+                    END,
+                    reward = CASE
+                        WHEN excluded.reward != '' THEN excluded.reward
+                        ELSE active_tasks.reward
+                    END,
+                    due_date = CASE
+                        WHEN excluded.due_date != '' THEN excluded.due_date
+                        ELSE active_tasks.due_date
+                    END,
+                    notes = CASE
+                        WHEN excluded.notes != '' THEN excluded.notes
+                        ELSE active_tasks.notes
+                    END,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    clean_name,
+                    clean_category,
+                    clean_status,
+                    description.strip(),
+                    requester.strip(),
+                    location.strip(),
+                    reward.strip(),
+                    due_date.strip(),
+                    notes.strip(),
+                    timestamp,
+                    timestamp,
+                ),
+            )
+
+        return self.get_active_task(clean_name)
+
+    def complete_active_task(self, name: str, notes: str = "") -> dict[str, Any] | None:
+        """
+        Marks an active task as completed.
+
+        Args:
+            name: Task name.
+            notes: Optional completion notes.
+
+        Returns:
+            Updated task dictionary, or None when no matching task exists.
+        """
+
+        clean_name = name.strip()
+
+        if not clean_name:
+            LOGGER.error("Attempted to complete active task with blank name.")
+            return None
+
+        timestamp = datetime.now().isoformat(timespec="seconds")
+
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT notes
+                FROM active_tasks
+                WHERE name = ?
+                """,
+                (clean_name,),
+            ).fetchone()
+
+            if row is None:
+                LOGGER.warning("Attempted to complete missing active task: %s", clean_name)
+                return None
+
+            updated_notes = notes.strip() or str(row["notes"])
+            connection.execute(
+                """
+                UPDATE active_tasks
+                SET status = 'Completed',
+                    notes = ?,
+                    completed_at = ?,
+                    updated_at = ?
+                WHERE name = ?
+                """,
+                (updated_notes, timestamp, timestamp, clean_name),
+            )
+
+        return self.get_active_task(clean_name)
+
+    def get_active_task(self, name: str) -> dict[str, Any] | None:
+        """
+        Reads one task by exact name.
+
+        Args:
+            name: Task name.
+
+        Returns:
+            Task dictionary, or None when missing.
+        """
+
+        clean_name = name.strip()
+
+        if not clean_name:
+            return None
+
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT
+                    id,
+                    name,
+                    category,
+                    status,
+                    description,
+                    requester,
+                    location,
+                    reward,
+                    due_date,
+                    notes,
+                    created_at,
+                    updated_at,
+                    completed_at
+                FROM active_tasks
+                WHERE name = ?
+                """,
+                (clean_name,),
+            ).fetchone()
+
+        if row is None:
+            return None
+
+        return dict(row)
+
+    def list_active_tasks(
+        self,
+        *,
+        include_completed: bool = False,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """
+        Lists current active tasks.
+
+        Args:
+            include_completed: Whether completed tasks should be included.
+            limit: Maximum tasks to return.
+
+        Returns:
+            Task dictionaries.
+        """
+
+        where_clause = "" if include_completed else "WHERE status != 'Completed'"
+
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT
+                    id,
+                    name,
+                    category,
+                    status,
+                    description,
+                    requester,
+                    location,
+                    reward,
+                    due_date,
+                    notes,
+                    created_at,
+                    updated_at,
+                    completed_at
+                FROM active_tasks
+                {where_clause}
+                ORDER BY updated_at DESC, name COLLATE NOCASE
+                LIMIT ?
+                """,
+                (max(1, limit),),
+            ).fetchall()
+
+        return [dict(row) for row in rows]
+
+    def set_journal_notes(self, notes: str) -> None:
+        """
+        Stores the player's private journal notes.
+
+        These notes are intentionally not included in AdventureState or AI context.
+        """
+
+        self.set_setting("journal.private_notes", str(notes))
+
+    def get_journal_notes(self) -> str:
+        """
+        Reads the player's private journal notes.
+
+        Returns:
+            Private journal text.
+        """
+
+        return str(self.get_setting("journal.private_notes", ""))
+
+    def set_world_summary(self, summary: str) -> None:
+        """
+        Stores the AI-synthesized world summary for this save.
+
+        Args:
+            summary: Player-known world summary.
+        """
+
+        self.set_setting("world.summary", str(summary).strip())
+
+    def get_world_summary(self) -> str:
+        """
+        Reads the stored world summary.
+
+        Returns:
+            Player-known world summary.
+        """
+
+        return str(self.get_setting("world.summary", ""))
+
+    def set_world_lore(self, lore: Any) -> None:
+        """
+        Stores grouped player-facing world lore.
+
+        Args:
+            lore: Mapping of category names to lore entry strings.
+        """
+
+        self.set_setting("world.lore", _normalize_world_lore(lore))
+
+    def get_world_lore(self) -> dict[str, dict[str, str]]:
+        """
+        Reads grouped player-facing world lore.
+
+        Returns:
+            Mapping of category names to keyed lore entry strings.
+        """
+
+        return _normalize_world_lore(self.get_setting("world.lore", {}))
+
+    def add_world_lore_entry(self, category: str, key: str, text: str) -> None:
+        """
+        Adds a player-facing world lore entry to a category.
+
+        Args:
+            category: Player-facing lore category.
+            key: Stable entry key, such as a location/faction/religion name.
+            text: Lore text.
+        """
+
+        clean_category = str(category or "World").strip() or "World"
+        clean_key = str(key or "").strip() or _derive_world_lore_key(text)
+        clean_text = str(text or "").strip()
+
+        if not clean_key or not clean_text:
+            LOGGER.warning("Skipped incomplete world lore entry.")
+            return
+
+        lore = self.get_world_lore()
+        entries = lore.setdefault(clean_category, {})
+        entries.setdefault(clean_key, clean_text)
+        self.set_world_lore(lore)
+
+    def change_world_lore_entry(self, category: str, key: str, text: str) -> None:
+        """
+        Changes one existing keyed player-facing world lore entry.
+
+        Args:
+            category: Player-facing lore category.
+            key: Existing entry key to change.
+            text: Full replacement lore text.
+        """
+
+        clean_category = str(category or "World").strip() or "World"
+        clean_key = str(key or "").strip()
+        clean_text = str(text or "").strip()
+
+        if not clean_key or not clean_text:
+            LOGGER.warning("Skipped incomplete changed world lore entry.")
+            return
+
+        lore = self.get_world_lore()
+        entries = lore.setdefault(clean_category, {})
+        entries[clean_key] = clean_text
+
+        self.set_world_lore(lore)
+
     def set_setting(self, key: str, value: Any) -> None:
         """
         Stores a user setting as JSON.
@@ -1625,7 +2217,10 @@ class SaveRepository:
 
         self.set_setting(
             "currency.denominations",
-            normalize_currency_denominations(denominations),
+            normalize_currency_denominations(
+                denominations,
+                fallback_denominations=[],
+            ),
         )
 
     def get_currency_denominations(self) -> list[dict[str, Any]]:
@@ -1636,11 +2231,14 @@ class SaveRepository:
             Clean denomination dictionaries sorted from smallest to largest.
         """
 
+        stored_denominations = self.get_setting("currency.denominations", None)
+
+        if stored_denominations is None:
+            return normalize_currency_denominations(DEFAULT_CURRENCY_DENOMINATIONS)
+
         return normalize_currency_denominations(
-            self.get_setting(
-                "currency.denominations",
-                DEFAULT_CURRENCY_DENOMINATIONS,
-            )
+            stored_denominations,
+            fallback_denominations=[],
         )
 
     def set_calendar_settings(self, settings: Any) -> None:
@@ -1765,6 +2363,22 @@ class SaveRepository:
                     dc INTEGER NOT NULL,
                     outcome TEXT NOT NULL,
                     created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS active_tasks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL UNIQUE,
+                    category TEXT NOT NULL DEFAULT 'Task',
+                    status TEXT NOT NULL DEFAULT 'Active',
+                    description TEXT NOT NULL DEFAULT '',
+                    requester TEXT NOT NULL DEFAULT '',
+                    location TEXT NOT NULL DEFAULT '',
+                    reward TEXT NOT NULL DEFAULT '',
+                    due_date TEXT NOT NULL DEFAULT '',
+                    notes TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    completed_at TEXT NOT NULL DEFAULT ''
                 );
 
                 CREATE TABLE IF NOT EXISTS npcs (
@@ -1966,3 +2580,63 @@ def _decode_string_list(raw_json: Any, label: str) -> list[str]:
         for value in values
         if str(value).strip()
     ]
+
+
+def _normalize_world_lore(raw_lore: Any) -> dict[str, dict[str, str]]:
+    """Normalizes grouped player-facing world lore."""
+
+    if not isinstance(raw_lore, dict):
+        return {}
+
+    lore: dict[str, dict[str, str]] = {}
+
+    for raw_category, raw_entries in raw_lore.items():
+        category = str(raw_category).strip()
+
+        if not category:
+            continue
+
+        if isinstance(raw_entries, dict):
+            entries = {
+                str(key).strip(): str(value).strip()
+                for key, value in raw_entries.items()
+                if str(key).strip() and str(value).strip()
+            }
+        elif isinstance(raw_entries, str):
+            clean_entry = raw_entries.strip()
+            entries = (
+                {_derive_world_lore_key(clean_entry): clean_entry}
+                if clean_entry
+                else {}
+            )
+        elif isinstance(raw_entries, list):
+            entries = {}
+
+            for entry in raw_entries:
+                clean_entry = str(entry).strip()
+
+                if clean_entry:
+                    entries[_derive_world_lore_key(clean_entry)] = clean_entry
+        else:
+            entries = {}
+
+        if entries:
+            lore[category] = entries
+
+    return lore
+
+
+def _derive_world_lore_key(text: Any) -> str:
+    """Derives a stable-ish lore key from text when older data lacks one."""
+
+    clean_text = str(text or "").strip()
+
+    if not clean_text:
+        return ""
+
+    key = clean_text.split(":", 1)[0].strip()
+
+    if key:
+        return key[:80]
+
+    return clean_text[:80]

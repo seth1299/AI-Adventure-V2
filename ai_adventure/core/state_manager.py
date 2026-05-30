@@ -10,6 +10,8 @@ from ai_adventure.calendar_system import (
 from ai_adventure.core.models import (
     AdventureMetadata,
     AdventureState,
+    ActiveTask,
+    ActiveTasksState,
     AlchemyNote,
     AlchemyNotebookState,
     CalendarState,
@@ -71,7 +73,10 @@ class StateManager:
             ),
             player=PlayerState(
                 name=str(settings.values.get("player_name", "")),
+                appearance=str(settings.values.get("player.appearance", "")),
+                backstory=str(settings.values.get("player.backstory", "")),
                 condition=_read_string(state_snapshot, "condition", "Healthy"),
+                notes=str(settings.values.get("player.notes", "")),
             ),
             world=WorldState(
                 location=_read_string(state_snapshot, "location", "Tavern"),
@@ -87,6 +92,7 @@ class StateManager:
             calendar=CalendarState(**calendar_snapshot),
             alchemy=self._load_alchemy(),
             skills=self._load_skills(),
+            active_tasks=self._load_active_tasks(),
             history=self._load_history(),
             settings=settings,
         )
@@ -226,6 +232,31 @@ class StateManager:
             )
 
         return SkillsState(skills=skills, recent_checks=recent_checks)
+
+    def _load_active_tasks(self) -> ActiveTasksState:
+        """Loads visible active tasks."""
+
+        tasks: list[ActiveTask] = []
+
+        for row in self.repository.list_active_tasks():
+            tasks.append(
+                ActiveTask(
+                    id=_read_optional_int(row, "id"),
+                    name=_read_string(row, "name", ""),
+                    category=_read_string(row, "category", "Task"),
+                    status=_read_string(row, "status", "Active"),
+                    description=_read_string(row, "description", ""),
+                    requester=_read_string(row, "requester", ""),
+                    location=_read_string(row, "location", ""),
+                    reward=_read_string(row, "reward", ""),
+                    due_date=_read_string(row, "due_date", ""),
+                    notes=_read_string(row, "notes", ""),
+                    created_at=_read_string(row, "created_at", ""),
+                    updated_at=_read_string(row, "updated_at", ""),
+                )
+            )
+
+        return ActiveTasksState(tasks=tasks)
 
     def _load_history(self) -> HistoryState:
         """Loads typed history state."""

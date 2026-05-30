@@ -21,8 +21,10 @@ class PlayerState:
     """State that belongs directly to the player character."""
 
     name: str = ""
+    appearance: str = ""
+    backstory: str = ""
     condition: str = "Healthy"
-    notes: list[str] = field(default_factory=list)
+    notes: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         """Returns a JSON-serializable player-state dictionary."""
@@ -275,6 +277,41 @@ class SkillsState:
 
 
 @dataclass
+class ActiveTask:
+    """A visible ongoing quest, commission, order, or other obligation."""
+
+    id: int | None = None
+    name: str = ""
+    category: str = "Task"
+    status: str = "Active"
+    description: str = ""
+    requester: str = ""
+    location: str = ""
+    reward: str = ""
+    due_date: str = ""
+    notes: str = ""
+    created_at: str = ""
+    updated_at: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        """Returns a JSON-serializable active-task dictionary."""
+
+        return asdict(self)
+
+
+@dataclass
+class ActiveTasksState:
+    """The player's current active tasks and pending obligations."""
+
+    tasks: list[ActiveTask] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Returns a JSON-serializable active-tasks dictionary."""
+
+        return {"tasks": [task.to_dict() for task in self.tasks]}
+
+
+@dataclass
 class SettingsState:
     """Save-specific settings that affect the adventure runtime."""
 
@@ -300,6 +337,7 @@ class AdventureState:
     calendar: CalendarState = field(default_factory=CalendarState)
     alchemy: AlchemyNotebookState = field(default_factory=AlchemyNotebookState)
     skills: SkillsState = field(default_factory=SkillsState)
+    active_tasks: ActiveTasksState = field(default_factory=ActiveTasksState)
     history: HistoryState = field(default_factory=HistoryState)
     settings: SettingsState = field(default_factory=SettingsState)
 
@@ -315,6 +353,7 @@ class AdventureState:
             "calendar": self.calendar.to_dict(),
             "alchemy": self.alchemy.to_dict(),
             "skills": self.skills.to_dict(),
+            "active_tasks": self.active_tasks.to_dict(),
             "history": self.history.to_dict(),
             "settings": self.settings.to_dict(),
         }

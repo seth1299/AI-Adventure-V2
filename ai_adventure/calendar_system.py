@@ -148,6 +148,129 @@ def build_calendar_snapshot(
     }
 
 
+def resolve_starting_elapsed_minutes(
+    raw_starting_calendar: Any,
+    settings: dict[str, Any] | None = None,
+    *,
+    default_elapsed_minutes: int = DEFAULT_START_ELAPSED_MINUTES,
+) -> int:
+    """
+    Resolves AI-provided starting calendar hints to elapsed minutes.
+
+    The AI may provide an exact elapsed_minutes value, or softer fields such as
+    season_name, season_hint, month_name, month_number, day_of_month, and
+    time_of_day_minutes. This keeps opening prose and the displayed calendar in
+    sync without requiring the model to perform calendar math perfectly.
+    """
+
+    if not isinstance(raw_starting_calendar, dict):
+        return default_elapsed_minutes
+
+    explicit_elapsed = raw_starting_calendar.get("elapsed_minutes")
+
+    if explicit_elapsed is not None:
+        return max(0, _safe_int(explicit_elapsed, default_elapsed_minutes))
+
+    clean_settings = normalize_calendar_settings(settings)
+    days_per_month = int(clean_settings["days_per_week"]) * int(clean_settings["weeks_per_month"])
+    months_per_year = int(clean_settings["months_per_year"])
+    month_index = _resolve_month_index(raw_starting_calendar, clean_settings)
+
+    if month_index is None:
+        month_index = _resolve_month_index_for_season(raw_starting_calendar, clean_settings)
+
+    if month_index is None:
+        return default_elapsed_minutes
+
+    day_of_month = _bounded_int(
+        raw_starting_calendar.get("day_of_month"),
+        1,
+        1,
+        days_per_month,
+    )
+    year = _bounded_int(raw_starting_calendar.get("year"), 1, 1, 9999)
+    time_of_day_minutes = _bounded_int(
+        raw_starting_calendar.get("time_of_day_minutes"),
+        DEFAULT_START_ELAPSED_MINUTES,
+        0,
+        MINUTES_PER_DAY - 1,
+    )
+    absolute_day_index = (
+        (year - 1) * months_per_year * days_per_month
+        + month_index * days_per_month
+        + day_of_month
+        - 1
+    )
+
+    return absolute_day_index * MINUTES_PER_DAY + time_of_day_minutes
+
+
+def _resolve_month_index(
+    raw_starting_calendar: dict[str, Any],
+    settings: dict[str, Any],
+) -> int | None:
+    """Resolves month_name/month_number hints to a zero-based month index."""
+
+    months_per_year = int(settings["months_per_year"])
+    month_number = raw_starting_calendar.get("month_number")
+
+    if month_number is not None:
+        clean_month_number = _bounded_int(month_number, 1, 1, months_per_year)
+        return clean_month_number - 1
+
+    month_name = str(raw_starting_calendar.get("month_name", "")).strip().casefold()
+
+    if not month_name:
+        return None
+
+    for index, name in enumerate(settings["month_names"]):
+        if str(name).strip().casefold() == month_name:
+            return index
+
+    return None
+
+
+def _resolve_month_index_for_season(
+    raw_starting_calendar: dict[str, Any],
+    settings: dict[str, Any],
+) -> int | None:
+    """Resolves season_name/season_hint to the first month in that season."""
+
+    season_name = str(raw_starting_calendar.get("season_name", "")).strip().casefold()
+    season_hint = str(raw_starting_calendar.get("season_hint", "")).strip().casefold()
+
+    if not season_name and not season_hint:
+        return None
+
+    target_season_index: int | None = None
+
+    for index, season in enumerate(settings["seasons"]):
+        if season_name and str(season["name"]).strip().casefold() == season_name:
+            target_season_index = index
+            break
+
+        if season_hint and str(season["weather_hint"]).strip().casefold() == season_hint:
+            target_season_index = index
+            break
+
+    if target_season_index is None:
+        return None
+
+    months_per_year = int(settings["months_per_year"])
+    seasons_per_year = int(settings["seasons_per_year"])
+
+    for month_index in range(months_per_year):
+        season_index = min(
+            int(month_index * seasons_per_year / months_per_year),
+            seasons_per_year - 1,
+        )
+
+        if season_index == target_season_index:
+            return month_index
+
+    return None
+
+
 def build_month_grid(
     calendar_snapshot: dict[str, Any],
     month_offset: int = 0,
