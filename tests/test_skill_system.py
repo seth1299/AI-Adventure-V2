@@ -157,6 +157,10 @@ class SkillSystemTests(unittest.TestCase):
                 "SkillCheckRequestedEvent",
                 packet["state"]["skills"]["rules"]["uncertain_action_rule"],
             )
+            self.assertIn(
+                "foraging",
+                packet["state"]["skills"]["rules"]["uncertain_action_rule"],
+            )
 
 
 if __name__ == "__main__":

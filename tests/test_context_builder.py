@@ -126,7 +126,21 @@ class ContextBuilderTests(unittest.TestCase):
         self.assertEqual(packet["state"]["world_profile"]["summary"], "Rainmarket is a canal city.")
         self.assertEqual(packet["state"]["world_profile"]["genre"], "Realistic detective mystery")
         self.assertEqual(packet["state"]["currency"]["world_description"], "Crowns and half-crowns.")
+        self.assertEqual(packet["state"]["currency"]["balance"], 0)
+        self.assertEqual(packet["state"]["currency"]["game_state_key"], "currency.balance")
+        self.assertEqual(
+            packet["state"]["currency"]["game_state_path"],
+            "game_state/currency.balance",
+        )
         self.assertIn("display_balance", packet["state"]["currency"])
+        self.assertIn(
+            "state.currency.balance",
+            packet["state"]["currency"]["transaction_rule"],
+        )
+        self.assertIn(
+            "game_state/currency.balance",
+            packet["response_contract"]["currency_transactions"],
+        )
         self.assertIn("Currency is not an inventory item", packet["state"]["currency"]["transaction_rule"])
         self.assertEqual(
             packet["state"]["scene"]["time"],
@@ -145,6 +159,12 @@ class ContextBuilderTests(unittest.TestCase):
         self.assertIn("background_music", packet["response_contract"])
         self.assertIn("MusicChangedEvent", packet["response_contract"]["known_event_types"])
         self.assertIn("WorldLoreChangedEvent", packet["response_contract"]["known_event_types"])
+        self.assertNotIn("StoryAdvancedEvent", packet["response_contract"]["known_event_types"])
+        self.assertNotIn("SecretAddedEvent", packet["response_contract"]["known_event_types"])
+        self.assertNotIn(
+            "MerchantInterfaceRequestedEvent",
+            packet["response_contract"]["known_event_types"],
+        )
         self.assertEqual(
             packet["state"]["audio"]["valid_music_tracks"][0],
             "Town Village City.mp3",

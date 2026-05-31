@@ -15,6 +15,18 @@ from ai_adventure.skills.rules import bonus_for_level, dc_for_difficulty
 
 LOGGER = logging.getLogger(__name__)
 _BANNED_CREATIVE_TERMS: set[str] | None = None
+_SKILL_CHECK_GATED_EVENT_TYPES = {
+    "ActiveTaskCompletedEvent",
+    "CurrencyChangedEvent",
+    "InventoryItemAddedEvent",
+    "InventoryItemModifiedEvent",
+    "ItemAddedEvent",
+    "QuestCompletedEvent",
+    "ReagentDiscoveredEvent",
+    "RecipeDiscoveredEvent",
+    "SkillXpAddedEvent",
+    "SpellLearnedEvent",
+}
 
 
 @dataclass(frozen=True)
@@ -52,9 +64,34 @@ class EventApplier:
         """
 
         results: list[AppliedEventResult] = []
+        blocking_failure: AppliedEventResult | None = None
 
         for raw_event in raw_events:
-            result = self.apply_event(raw_event)
+            event_type, payload = normalize_event(raw_event)
+
+            if (
+                blocking_failure is not None
+                and event_type in _SKILL_CHECK_GATED_EVENT_TYPES
+            ):
+                result = AppliedEventResult(
+                    event_type,
+                    "skipped",
+                    (
+                        "Skipped because a previous skill check failed: "
+                        f"{blocking_failure.message}"
+                    ),
+                    payload,
+                )
+            else:
+                result = self.apply_event(raw_event)
+
+            if (
+                result.event_type == "SkillCheckRequestedEvent"
+                and result.status == "applied"
+                and str(result.payload.get("outcome", "")).casefold() == "failure"
+            ):
+                blocking_failure = result
+
             self.repository.append_mechanical_event(
                 result.event_type,
                 result.payload,
@@ -168,12 +205,15 @@ class EventApplier:
         quantity = _first_int(payload, 1, "amount", "quantity")
         category = _first_text(payload, "item_type", "category")
         description = _first_text(payload, "description", "desc")
-        value_base_units = _first_int(
-            payload,
-            0,
-            "value_base_units",
-            "base_unit_value",
-            "value",
+        value_base_units = max(
+            1,
+            _first_int(
+                payload,
+                1,
+                "value_base_units",
+                "base_unit_value",
+                "value",
+            ),
         )
 
         self.repository.add_inventory_item(
@@ -496,6 +536,7 @@ class EventApplier:
 
         self.repository.add_alchemy_reagent(
             name=name,
+            material_type=_first_text(payload, "material_type"),
             qualities=_as_string_list(payload.get("qualities", [])),
             motions=_as_string_list(payload.get("motions", [])),
             virtues=_as_string_list(payload.get("virtues", [])),

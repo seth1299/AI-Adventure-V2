@@ -49,6 +49,12 @@ class AlchemyRulebookTests(unittest.TestCase):
             for reagent in packet["rulebooks"]["alchemy"]["example_reagents"]
         }
         self.assertIn("Moonwater", reagent_names)
+        moonwater = next(
+            reagent
+            for reagent in packet["rulebooks"]["alchemy"]["example_reagents"]
+            if reagent["name"] == "Moonwater"
+        )
+        self.assertIn("material_type", moonwater)
 
     def test_context_builder_omits_rulebook_for_non_alchemy_commands(self) -> None:
         builder = AiContextBuilder(

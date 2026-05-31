@@ -427,25 +427,69 @@ class SaveRepository:
         clean_value = max(0, _safe_int(value_base_units, default=0) or 0)
 
         with self._connect() as connection:
-            connection.execute(
+            rows = connection.execute(
                 """
-                INSERT INTO inventory_items (
-                    name,
-                    category,
-                    quantity,
-                    description,
-                    value_base_units
-                )
-                VALUES (?, ?, ?, ?, ?)
+                SELECT id, category, quantity, description, value_base_units
+                FROM inventory_items
+                WHERE name = ? COLLATE NOCASE
+                ORDER BY id ASC
                 """,
-                (
-                    clean_name,
-                    category.strip(),
-                    quantity,
-                    description.strip(),
-                    clean_value,
-                ),
-            )
+                (clean_name,),
+            ).fetchall()
+
+            if rows:
+                primary_row = rows[0]
+                duplicate_ids = [row["id"] for row in rows[1:]]
+                existing_quantity = sum(int(row["quantity"]) for row in rows)
+                existing_value = max(int(row["value_base_units"]) for row in rows)
+                updated_category = category.strip() or str(primary_row["category"])
+                updated_description = description.strip() or str(primary_row["description"])
+                updated_quantity = existing_quantity + quantity
+                updated_value = clean_value if clean_value > 0 else existing_value
+                connection.execute(
+                    """
+                    UPDATE inventory_items
+                    SET category = ?,
+                        quantity = ?,
+                        description = ?,
+                        value_base_units = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        updated_category,
+                        updated_quantity,
+                        updated_description,
+                        updated_value,
+                        primary_row["id"],
+                    ),
+                )
+
+                if duplicate_ids:
+                    placeholders = ", ".join("?" for _ in duplicate_ids)
+                    connection.execute(
+                        f"DELETE FROM inventory_items WHERE id IN ({placeholders})",
+                        duplicate_ids,
+                    )
+            else:
+                connection.execute(
+                    """
+                    INSERT INTO inventory_items (
+                        name,
+                        category,
+                        quantity,
+                        description,
+                        value_base_units
+                    )
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        clean_name,
+                        category.strip(),
+                        quantity,
+                        description.strip(),
+                        clean_value,
+                    ),
+                )
 
         self.append_history("inventory", f"Added {quantity} x {clean_name}.")
 
@@ -738,12 +782,14 @@ class SaveRepository:
         virtues: list[str],
         uses: list[str],
         notes: str,
+        material_type: str = "",
     ) -> None:
         """
         Adds or updates a discovered alchemical reagent.
 
         Args:
             name: Reagent name.
+            material_type: Broad reagent material category.
             qualities: Discovered reagent qualities.
             motions: Discovered alchemical motions.
             virtues: Discovered alchemical virtues.
@@ -764,6 +810,7 @@ class SaveRepository:
                 """
                 INSERT INTO alchemy_reagents (
                     name,
+                    material_type,
                     qualities_json,
                     motions_json,
                     virtues_json,
@@ -771,8 +818,9 @@ class SaveRepository:
                     notes,
                     discovered_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(name) DO UPDATE SET
+                    material_type = excluded.material_type,
                     qualities_json = excluded.qualities_json,
                     motions_json = excluded.motions_json,
                     virtues_json = excluded.virtues_json,
@@ -781,6 +829,7 @@ class SaveRepository:
                 """,
                 (
                     clean_name,
+                    material_type.strip(),
                     _encode_string_list(qualities),
                     _encode_string_list(motions),
                     _encode_string_list(virtues),
@@ -806,6 +855,7 @@ class SaveRepository:
                 SELECT
                     id,
                     name,
+                    material_type,
                     qualities_json,
                     motions_json,
                     virtues_json,
@@ -824,6 +874,7 @@ class SaveRepository:
                 {
                     "id": row["id"],
                     "name": row["name"],
+                    "material_type": row["material_type"],
                     "qualities": _decode_string_list(row["qualities_json"], "qualities"),
                     "motions": _decode_string_list(row["motions_json"], "motions"),
                     "virtues": _decode_string_list(row["virtues_json"], "virtues"),
@@ -2429,6 +2480,7 @@ class SaveRepository:
                 CREATE TABLE IF NOT EXISTS alchemy_reagents (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     name TEXT NOT NULL UNIQUE,
+                    material_type TEXT NOT NULL DEFAULT '',
                     qualities_json TEXT NOT NULL DEFAULT '[]',
                     motions_json TEXT NOT NULL DEFAULT '[]',
                     virtues_json TEXT NOT NULL DEFAULT '[]',
@@ -2540,6 +2592,75 @@ class SaveRepository:
                 "npcs",
                 "player_facing_information",
                 "TEXT NOT NULL DEFAULT ''",
+            )
+            _ensure_column(
+                connection,
+                "alchemy_reagents",
+                "material_type",
+                "TEXT NOT NULL DEFAULT ''",
+            )
+            self._coalesce_inventory_stacks(connection)
+
+    def _coalesce_inventory_stacks(self, connection: sqlite3.Connection) -> None:
+        """Merges duplicate inventory rows by case-insensitive item name."""
+
+        rows = connection.execute(
+            """
+            SELECT id, name, category, quantity, description, value_base_units
+            FROM inventory_items
+            ORDER BY name COLLATE NOCASE, id ASC
+            """
+        ).fetchall()
+        groups: dict[str, list[sqlite3.Row]] = {}
+
+        for row in rows:
+            groups.setdefault(str(row["name"]).casefold(), []).append(row)
+
+        for matching_rows in groups.values():
+            if len(matching_rows) <= 1:
+                continue
+
+            primary_row = matching_rows[0]
+            duplicate_ids = [row["id"] for row in matching_rows[1:]]
+            merged_quantity = sum(int(row["quantity"]) for row in matching_rows)
+            merged_category = next(
+                (
+                    str(row["category"]).strip()
+                    for row in matching_rows
+                    if str(row["category"]).strip()
+                ),
+                "",
+            )
+            merged_description = next(
+                (
+                    str(row["description"]).strip()
+                    for row in matching_rows
+                    if str(row["description"]).strip()
+                ),
+                "",
+            )
+            merged_value = max(int(row["value_base_units"]) for row in matching_rows)
+            connection.execute(
+                """
+                UPDATE inventory_items
+                SET category = ?,
+                    quantity = ?,
+                    description = ?,
+                    value_base_units = ?
+                WHERE id = ?
+                """,
+                (
+                    merged_category,
+                    merged_quantity,
+                    merged_description,
+                    merged_value,
+                    primary_row["id"],
+                ),
+            )
+            placeholders = ", ".join("?" for _ in duplicate_ids)
+            connection.execute(
+                f"DELETE FROM inventory_items WHERE id IN ({placeholders})",
+                duplicate_ids,
             )
 
 

@@ -29,7 +29,10 @@ if not exist "%TTS_VOICES%" (
 )
 
 %PYTHON% -m PyInstaller ^
+    --log-level ERROR ^
     --noconfirm ^
+    --noconsole ^
+    --onefile ^
     --clean ^
     --windowed ^
     --name "%APP_NAME%" ^
@@ -38,14 +41,14 @@ if not exist "%TTS_VOICES%" (
     --add-data "ai_adventure\audio\music_tracks;ai_adventure\audio\music_tracks" ^
     --add-data "%TTS_MODEL%;ai_adventure\audio\tts" ^
     --add-data "%TTS_VOICES%;ai_adventure\audio\tts" ^
-    --add-data "%APP_ICON%;ai_adventure\data" ^
-    --collect-all kokoro_onnx ^
-    --collect-all onnxruntime ^
-    --collect-all soundfile ^
-    --hidden-import google.genai ^
-    --hidden-import PySide6.QtCore ^
-    --hidden-import PySide6.QtGui ^
-    --hidden-import PySide6.QtWidgets ^
+    --icon "%APP_ICON%" ^
+    --collect-all "kokoro_onnx" ^
+    --collect-all "onnxruntime" ^
+    --collect-all "soundfile" ^
+    --hidden-import "google.genai" ^
+    --hidden-import "PySide6.QtCore" ^
+    --hidden-import "PySide6.QtGui" ^
+    --hidden-import "PySide6.QtWidgets" ^
     "%ENTRYPOINT%"
 
 if errorlevel 1 (

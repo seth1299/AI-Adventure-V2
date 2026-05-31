@@ -4,7 +4,7 @@ import logging
 from pathlib import Path
 from typing import Any, Callable, Protocol
 
-from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtCore import QObject, Qt, QThread, QTimer, Signal, Slot
 from PySide6.QtGui import QColor, QIcon, QPalette
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -76,6 +76,7 @@ from ai_adventure.persistence.save_repository import SaveRepository, SaveSummary
 
 
 LOGGER = logging.getLogger(__name__)
+GM_THINKING_TEXT = "GM is thinking..."
 
 
 class _NoCellFocusDelegate(QStyledItemDelegate):
@@ -192,6 +193,38 @@ class RepositoryBackedWidget(QWidget):
 
         if self.on_repository_changed is not None:
             self.on_repository_changed(self)
+
+
+class _GeminiStoryWorker(QObject):
+    """Runs one Gemini story request away from the Qt UI thread."""
+
+    completed = Signal(object)
+    configuration_error = Signal(str)
+    failed = Signal()
+    finished = Signal()
+
+    def __init__(self, context_packet: dict[str, Any]) -> None:
+        super().__init__()
+        self._context_packet = context_packet
+
+    @Slot()
+    def run(self) -> None:
+        """Generates one story response and emits the result on completion."""
+
+        try:
+            result = GeminiNarrationService().generate_story_response(
+                self._context_packet
+            )
+        except GeminiConfigurationError as error:
+            LOGGER.warning("Gemini narration skipped: %s", error)
+            self.configuration_error.emit(str(error))
+        except Exception:
+            LOGGER.exception("Gemini narration request failed.")
+            self.failed.emit()
+        else:
+            self.completed.emit(result)
+        finally:
+            self.finished.emit()
 
 
 class MainWindow(QMainWindow):
@@ -429,6 +462,12 @@ class MainWindow(QMainWindow):
 
         if result.start_weather:
             repository.set_state_value("weather", result.start_weather)
+
+        if result.finalized_starting_currency_balance_base_units is not None:
+            repository.set_state_value(
+                "currency.balance",
+                str(result.finalized_starting_currency_balance_base_units),
+            )
 
         if not setup.get("currency_denominations"):
             if result.finalized_currency_denominations:
@@ -1314,6 +1353,10 @@ class StoryScreen(RepositoryBackedWidget):
         self.narration_player = narration_player
         self._revealing_story_id: int | None = None
         self._revealed_story_chunks: list[str] = []
+        self._gemini_thread: QThread | None = None
+        self._gemini_worker: _GeminiStoryWorker | None = None
+        self._waiting_for_gm = False
+        self._default_input_placeholder = "Enter a player action..."
         self._narration_chunk_ready.connect(self._append_revealed_story_chunk)
         self._narration_complete.connect(self._complete_revealed_story)
         self.location_value = QLabel("-")
@@ -1332,15 +1375,15 @@ class StoryScreen(RepositoryBackedWidget):
         self.story_output.setReadOnly(True)
 
         self.player_input = QLineEdit()
-        self.player_input.setPlaceholderText("Enter a player action...")
+        self.player_input.setPlaceholderText(self._default_input_placeholder)
 
-        submit_button = QPushButton("Submit")
-        submit_button.clicked.connect(self._submit_player_action)
+        self.submit_button = QPushButton("Submit")
+        self.submit_button.clicked.connect(self._submit_player_action)
         self.player_input.returnPressed.connect(self._submit_player_action)
 
         input_row = QHBoxLayout()
         input_row.addWidget(self.player_input)
-        input_row.addWidget(submit_button)
+        input_row.addWidget(self.submit_button)
 
         layout = QVBoxLayout()
         layout.addLayout(status_row)
@@ -1394,6 +1437,9 @@ class StoryScreen(RepositoryBackedWidget):
     def _submit_player_action(self) -> None:
         """Records a player action and requests AI narration when configured."""
 
+        if self._waiting_for_gm:
+            return
+
         repository = self.repository()
 
         if repository is None:
@@ -1404,6 +1450,11 @@ class StoryScreen(RepositoryBackedWidget):
         if not player_text:
             LOGGER.warning("Skipped blank player action.")
             return
+
+        repository.append_history("player", player_text)
+        self.player_input.clear()
+        self._set_waiting_for_gm(True)
+        self.refresh()
 
         state = StateManager(repository).load_state()
         relevant_npcs = repository.list_relevant_npcs(
@@ -1423,12 +1474,76 @@ class StoryScreen(RepositoryBackedWidget):
             current_music=str(repository.get_setting("audio.current_music", "")),
         )
 
-        repository.append_history("player", player_text)
+        self._start_gemini_story_request(context_packet)
 
-        try:
-            result = GeminiNarrationService().generate_story_response(context_packet)
-        except GeminiConfigurationError as error:
-            LOGGER.warning("Gemini narration skipped: %s", error)
+    def _start_gemini_story_request(self, context_packet: dict[str, Any]) -> None:
+        """Starts one background Gemini story request."""
+
+        thread = QThread(self)
+        worker = _GeminiStoryWorker(context_packet)
+        worker.moveToThread(thread)
+
+        thread.started.connect(worker.run)
+        worker.completed.connect(self._handle_gemini_story_result)
+        worker.configuration_error.connect(self._handle_gemini_configuration_error)
+        worker.failed.connect(self._handle_gemini_story_failure)
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._clear_gemini_worker)
+
+        self._gemini_thread = thread
+        self._gemini_worker = worker
+        thread.start()
+
+    @Slot(object)
+    def _handle_gemini_story_result(self, result: Any) -> None:
+        """Stores and displays a completed Gemini narration result."""
+
+        repository = self.repository()
+
+        if repository is None:
+            self._set_waiting_for_gm(False)
+            return
+
+        repository.append_history("story", result.narrative_text)
+
+        if result.suggested_events:
+            event_results = EventApplier(repository).apply_events(result.suggested_events)
+            applied_count = sum(
+                1 for event_result in event_results if event_result.status == "applied"
+            )
+            skipped_count = len(event_results) - applied_count
+            LOGGER.info(
+                "Applied %s Gemini event(s); skipped %s.",
+                applied_count,
+                skipped_count,
+            )
+            _apply_audio_settings_to_managers(
+                repository,
+                sound_manager=self.sound_manager,
+                narration_player=self.narration_player,
+            )
+            self.notify_repository_changed()
+
+        latest_story = self._latest_story_entry()
+
+        if latest_story is not None and self._reveal_story_with_narration(
+            int(latest_story["id"]),
+            result.narrative_text,
+        ):
+            return
+
+        self.refresh()
+        self._set_waiting_for_gm(False)
+
+    @Slot(str)
+    def _handle_gemini_configuration_error(self, _message: str) -> None:
+        """Displays the configured-no-key fallback after a recorded player action."""
+
+        repository = self.repository()
+
+        if repository is not None:
             repository.append_history(
                 "story",
                 (
@@ -1436,44 +1551,47 @@ class StoryScreen(RepositoryBackedWidget):
                     "This action was recorded successfully."
                 ),
             )
-        except Exception:
-            LOGGER.exception("Gemini narration request failed.")
+
+        self.refresh()
+        self._set_waiting_for_gm(False)
+
+    @Slot()
+    def _handle_gemini_story_failure(self) -> None:
+        """Displays the generic Gemini failure fallback."""
+
+        repository = self.repository()
+
+        if repository is not None:
             repository.append_history(
                 "story",
                 "The narration falters for a moment. Check the application log for details.",
             )
-        else:
-            repository.append_history("story", result.narrative_text)
-
-            if result.suggested_events:
-                event_results = EventApplier(repository).apply_events(result.suggested_events)
-                applied_count = sum(
-                    1 for event_result in event_results if event_result.status == "applied"
-                )
-                skipped_count = len(event_results) - applied_count
-                LOGGER.info(
-                    "Applied %s Gemini event(s); skipped %s.",
-                    applied_count,
-                    skipped_count,
-                )
-                _apply_audio_settings_to_managers(
-                    repository,
-                    sound_manager=self.sound_manager,
-                    narration_player=self.narration_player,
-                )
-                self.notify_repository_changed()
-
-        self.player_input.clear()
-
-        if "result" in locals():
-            latest_story = self._latest_story_entry()
-            if latest_story is not None and self._reveal_story_with_narration(
-                int(latest_story["id"]),
-                result.narrative_text,
-            ):
-                return
 
         self.refresh()
+        self._set_waiting_for_gm(False)
+
+    @Slot()
+    def _clear_gemini_worker(self) -> None:
+        """Drops references after the Gemini request thread exits."""
+
+        self._gemini_thread = None
+        self._gemini_worker = None
+
+    def _set_waiting_for_gm(self, waiting: bool) -> None:
+        """Toggles player input while Gemini or narration is still working."""
+
+        self._waiting_for_gm = waiting
+        self.player_input.setEnabled(not waiting)
+        self.submit_button.setEnabled(not waiting)
+
+        if waiting:
+            self.player_input.setPlaceholderText(GM_THINKING_TEXT)
+            self.player_input.setToolTip(GM_THINKING_TEXT)
+            self.submit_button.setToolTip(GM_THINKING_TEXT)
+        else:
+            self.player_input.setPlaceholderText(self._default_input_placeholder)
+            self.player_input.setToolTip("")
+            self.submit_button.setToolTip("")
 
     def narrate_latest_story(self) -> None:
         """Narrates the latest story history entry when narrator is enabled."""
@@ -1559,6 +1677,7 @@ class StoryScreen(RepositoryBackedWidget):
         self._revealing_story_id = None
         self._revealed_story_chunks = []
         self.refresh()
+        self._set_waiting_for_gm(False)
 
     def _latest_story_entry(self) -> dict[str, Any] | None:
         """Returns the most recent saved story entry."""
@@ -2219,9 +2338,9 @@ class AlchemyNotebookScreen(RepositoryBackedWidget):
     def _setup_reagents_tab(self) -> None:
         """Builds the structured reagent discovery tab."""
 
-        self.reagent_table = QTableWidget(0, 6)
+        self.reagent_table = QTableWidget(0, 7)
         self.reagent_table.setHorizontalHeaderLabels(
-            ["Name", "Qualities", "Motions", "Virtues", "Uses", "Notes"]
+            ["Name", "Material Type", "Qualities", "Motions", "Virtues", "Uses", "Notes"]
         )
         self.reagent_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.reagent_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
@@ -2236,6 +2355,8 @@ class AlchemyNotebookScreen(RepositoryBackedWidget):
 
         self.reagent_name_input = QLineEdit()
         self.reagent_name_input.setPlaceholderText("Reagent name")
+        self.reagent_material_type_input = QLineEdit()
+        self.reagent_material_type_input.setPlaceholderText("Botanical, Geological, Animal, Elemental...")
         self.reagent_qualities_input = QLineEdit()
         self.reagent_qualities_input.setPlaceholderText("Comma-separated qualities")
         self.reagent_motions_input = QLineEdit()
@@ -2259,6 +2380,7 @@ class AlchemyNotebookScreen(RepositoryBackedWidget):
 
         form = QFormLayout()
         form.addRow("Name:", self.reagent_name_input)
+        form.addRow("Material Type:", self.reagent_material_type_input)
         form.addRow("Qualities:", self.reagent_qualities_input)
         form.addRow("Motions:", self.reagent_motions_input)
         form.addRow("Virtues:", self.reagent_virtues_input)
@@ -2338,11 +2460,12 @@ class AlchemyNotebookScreen(RepositoryBackedWidget):
 
         for row_index, reagent in enumerate(reagents):
             self.reagent_table.setItem(row_index, 0, _table_item(str(reagent.get("name", ""))))
-            self.reagent_table.setItem(row_index, 1, _table_item(_join_list(reagent.get("qualities", []))))
-            self.reagent_table.setItem(row_index, 2, _table_item(_join_list(reagent.get("motions", []))))
-            self.reagent_table.setItem(row_index, 3, _table_item(_join_list(reagent.get("virtues", []))))
-            self.reagent_table.setItem(row_index, 4, _table_item(_join_list(reagent.get("uses", []))))
-            self.reagent_table.setItem(row_index, 5, _table_item(str(reagent.get("notes", ""))))
+            self.reagent_table.setItem(row_index, 1, _table_item(str(reagent.get("material_type", ""))))
+            self.reagent_table.setItem(row_index, 2, _table_item(_join_list(reagent.get("qualities", []))))
+            self.reagent_table.setItem(row_index, 3, _table_item(_join_list(reagent.get("motions", []))))
+            self.reagent_table.setItem(row_index, 4, _table_item(_join_list(reagent.get("virtues", []))))
+            self.reagent_table.setItem(row_index, 5, _table_item(_join_list(reagent.get("uses", []))))
+            self.reagent_table.setItem(row_index, 6, _table_item(str(reagent.get("notes", ""))))
 
         self.reagent_table.resizeColumnsToContents()
         self._refreshing_reagents = False
@@ -2389,6 +2512,7 @@ class AlchemyNotebookScreen(RepositoryBackedWidget):
 
         repository.add_alchemy_reagent(
             name=name,
+            material_type=self.reagent_material_type_input.text(),
             qualities=_split_list(self.reagent_qualities_input.text()),
             motions=_split_list(self.reagent_motions_input.text()),
             virtues=_split_list(self.reagent_virtues_input.text()),
@@ -2397,6 +2521,7 @@ class AlchemyNotebookScreen(RepositoryBackedWidget):
         )
 
         self.reagent_name_input.clear()
+        self.reagent_material_type_input.clear()
         self.reagent_qualities_input.clear()
         self.reagent_motions_input.clear()
         self.reagent_virtues_input.clear()
@@ -2422,6 +2547,7 @@ class AlchemyNotebookScreen(RepositoryBackedWidget):
 
         reagent = self._reagent_rows[row_index]
         self.reagent_name_input.setText(str(reagent.get("name", "")))
+        self.reagent_material_type_input.setText(str(reagent.get("material_type", "")))
         self.reagent_qualities_input.setText(_join_list(reagent.get("qualities", [])))
         self.reagent_motions_input.setText(_join_list(reagent.get("motions", [])))
         self.reagent_virtues_input.setText(_join_list(reagent.get("virtues", [])))
@@ -2433,6 +2559,7 @@ class AlchemyNotebookScreen(RepositoryBackedWidget):
 
         self.reagent_table.clearSelection()
         self.reagent_name_input.clear()
+        self.reagent_material_type_input.clear()
         self.reagent_qualities_input.clear()
         self.reagent_motions_input.clear()
         self.reagent_virtues_input.clear()
@@ -2500,18 +2627,21 @@ class AlchemyNotebookScreen(RepositoryBackedWidget):
         name = str(reagent.get("name", "")).casefold()
 
         if self._reagent_sort_column == 1:
-            return _join_list(reagent.get("qualities", [])).casefold(), name
+            return str(reagent.get("material_type", "")).casefold(), name
 
         if self._reagent_sort_column == 2:
-            return _join_list(reagent.get("motions", [])).casefold(), name
+            return _join_list(reagent.get("qualities", [])).casefold(), name
 
         if self._reagent_sort_column == 3:
-            return _join_list(reagent.get("virtues", [])).casefold(), name
+            return _join_list(reagent.get("motions", [])).casefold(), name
 
         if self._reagent_sort_column == 4:
-            return _join_list(reagent.get("uses", [])).casefold(), name
+            return _join_list(reagent.get("virtues", [])).casefold(), name
 
         if self._reagent_sort_column == 5:
+            return _join_list(reagent.get("uses", [])).casefold(), name
+
+        if self._reagent_sort_column == 6:
             return str(reagent.get("notes", "")).casefold(), name
 
         return name, name

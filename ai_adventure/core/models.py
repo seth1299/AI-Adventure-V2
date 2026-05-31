@@ -131,6 +131,7 @@ class ReagentKnowledge:
 
     id: int | None = None
     name: str = ""
+    material_type: str = ""
     qualities: list[str] = field(default_factory=list)
     motions: list[str] = field(default_factory=list)
     virtues: list[str] = field(default_factory=list)

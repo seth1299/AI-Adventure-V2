@@ -304,7 +304,10 @@ class AiContextBuilder:
                     ],
                 },
                 "currency": {
+                    "balance": state.currency.balance_base_units,
                     "balance_base_units": state.currency.balance_base_units,
+                    "game_state_key": "currency.balance",
+                    "game_state_path": "game_state/currency.balance",
                     "display_balance": format_currency_amount(
                         state.currency.balance_base_units,
                         state.currency.denominations,
@@ -323,9 +326,13 @@ class AiContextBuilder:
                         "in the baseline currency unit."
                     ),
                     "transaction_rule": (
-                        "Currency is not an inventory item. For purchases, sales, "
-                        "rewards, fees, refunds, change, or other money movement, "
-                        "suggest CurrencyChangedEvent with one net base_unit_amount. "
+                        "The player's current money is state.currency.balance, "
+                        "also shown as state.currency.balance_base_units, loaded "
+                        "from game_state/currency.balance. Currency is not an "
+                        "inventory item. For purchases, sales, rewards, fees, "
+                        "refunds, change, or other money movement, suggest "
+                        "CurrencyChangedEvent with payload.base_unit_amount as "
+                        "the one net money change. Never use net_base_unit_amount. "
                         "For example, buying a 35-base-unit item while paying with "
                         "one 100-base-unit coin is still base_unit_amount -35; the "
                         "application displays the remaining 65 base units as the "
@@ -346,9 +353,14 @@ class AiContextBuilder:
                         "bonus_formula": "level * 2",
                         "levels": "1-5",
                         "uncertain_action_rule": (
-                            "When success, failure, speed, quality, or consequences "
-                            "are uncertain, suggest SkillCheckRequestedEvent. The "
-                            "Python application resolves the roll."
+                            "When success, failure, speed, quality, consequences, "
+                            "resource cost, or discovery quality are uncertain, "
+                            "suggest SkillCheckRequestedEvent before narrating a "
+                            "final outcome. This is required for foraging, harvesting, "
+                            "searching, researching, identifying, crafting, alchemy "
+                            "experiments, persuasion, stealth, combat, and any named "
+                            "skill use unless the action is trivial and risk-free. "
+                            "The Python application resolves the roll."
                         ),
                         "xp_rule": (
                             "Suggest SkillXpAddedEvent only after meaningful use, "
@@ -480,8 +492,10 @@ class AiContextBuilder:
                 ),
                 "skill_checks": (
                     "For uncertain actions, suggest SkillCheckRequestedEvent with "
-                    "skill_name and either dc or difficulty. Do not narrate final "
-                    "success or failure until the application has resolved the check."
+                    "skill_name and either dc or difficulty before any outcome event. "
+                    "Do not narrate final success, failure, discoveries, harvested "
+                    "items, crafted products, persuaded NPC outcomes, stealth results, "
+                    "or combat results until the application has resolved the check."
                 ),
                 "calendar_time": (
                     "Use state.calendar.current for date, day names, seasons, and "
@@ -547,12 +561,14 @@ class AiContextBuilder:
                     "one NpcUpsertedEvent per distinct meaningful NPC introduced."
                 ),
                 "currency_transactions": (
-                    "The player's money is state.currency.balance_base_units, not "
-                    "inventory coin items. When a purchase succeeds, include both "
-                    "the inventory event for the item and a CurrencyChangedEvent "
-                    "for the net price as a negative base_unit_amount. Do not model "
-                    "making change as separate coin items; the application formats "
-                    "the resulting integer balance into coin denominations."
+                    "The player's money is state.currency.balance, also shown as "
+                    "state.currency.balance_base_units, and is stored in "
+                    "game_state/currency.balance. It is not inventory coin items. "
+                    "When a purchase succeeds, include both the inventory event for "
+                    "the item and a CurrencyChangedEvent with payload.base_unit_amount "
+                    "as the negative net price. Never use net_base_unit_amount. Do "
+                    "not model making change as separate coin items; the application "
+                    "formats the resulting integer balance into coin denominations."
                 ),
                 "out_of_game": "Boolean. True only for fully out-of-game answers.",
                 "event_shape": {
@@ -560,7 +576,6 @@ class AiContextBuilder:
                     "payload": "Object containing event-specific data.",
                 },
                 "known_event_types": [
-                    "StoryAdvancedEvent",
                     "StatusUpdatedEvent",
                     "SkillCheckRequestedEvent",
                     "SkillUpsertedEvent",
@@ -579,13 +594,11 @@ class AiContextBuilder:
                     "WorldLoreAddedEvent",
                     "WorldLoreChangedEvent",
                     "WorldLoreUpdatedEvent",
-                    "SecretAddedEvent",
                     "QuestAddedEvent",
                     "QuestCompletedEvent",
                     "ActiveTaskUpsertedEvent",
                     "ActiveTaskUpdatedEvent",
                     "ActiveTaskCompletedEvent",
-                    "MerchantInterfaceRequestedEvent",
                     "SpellLearnedEvent",
                     "NpcUpsertedEvent",
                     "NpcKnowledgeAddedEvent",

@@ -157,6 +157,15 @@ class NewGameSetupTests(unittest.TestCase):
         self.assertIn("currency_generation", packet["requirements"])
         self.assertIn("at least one and at most four", packet["requirements"]["currency_generation"])
         self.assertIn("value=1", packet["requirements"]["currency_generation"])
+        self.assertIn("starting_currency_balance", packet["requirements"])
+        self.assertIn(
+            "starting_currency_balance_base_units",
+            packet["requirements"]["starting_currency_balance"],
+        )
+        self.assertIn(
+            "game_state/currency.balance",
+            packet["requirements"]["starting_currency_balance"],
+        )
 
     def test_new_game_templates_round_trip_multiple_normalized_setups(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -330,6 +339,11 @@ class NewGameSetupTests(unittest.TestCase):
         self.assertIn("rather than Syndicate Lore", packet["requirements"]["skill_generation"])
         self.assertIn("currency_generation", packet["requirements"])
         self.assertIn("at least one and at most four", packet["requirements"]["currency_generation"])
+        self.assertIn("starting_currency_balance", packet["requirements"])
+        self.assertIn(
+            "game_state/currency.balance",
+            packet["requirements"]["starting_currency_balance"],
+        )
         self.assertIn("creative_ideas", packet["requirements"])
         self.assertIn("high-priority style seeds", packet["requirements"]["creative_ideas"])
         self.assertIn("creative_ideas", packet)

@@ -310,6 +310,15 @@ def build_new_game_setup_packet(
                 "10. Preserve explicit player-provided setup.currency_denominations "
                 "instead of replacing them."
             ),
+            "starting_currency_balance": (
+                "Return starting_currency_balance_base_units as the player "
+                "character's actual starting money. It will be written to "
+                "game_state/currency.balance as one integer in the baseline "
+                "currency unit. Choose an amount that fits the finalized "
+                "character, genre, starting situation, and economy. Do not create "
+                "coin, purse, cash, wallet, or credit inventory items to represent "
+                "spendable money."
+            ),
             "creative_ideas": (
                 "Treat creative_ideas as high-priority style seeds when inventing "
                 "names, locations, cultures, religions, foods, drinks, species, "

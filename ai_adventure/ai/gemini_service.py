@@ -24,6 +24,614 @@ KNOWN_TEXT_MODELS = {
     "gemini-2.5-pro",
 }
 
+KNOWN_EVENT_TYPE_NAMES = [
+    "StatusUpdatedEvent",
+    "SkillCheckRequestedEvent",
+    "SkillUpsertedEvent",
+    "SkillXpAddedEvent",
+    "InventoryItemAddedEvent",
+    "InventoryItemRemovedEvent",
+    "InventoryItemModifiedEvent",
+    "RecipeDiscoveredEvent",
+    "ReagentDiscoveredEvent",
+    "CurrencyChangedEvent",
+    "CurrencyDefinedEvent",
+    "MusicChangedEvent",
+    "FlagSetEvent",
+    "LocationChangedEvent",
+    "PlayerNoteAddedEvent",
+    "WorldLoreAddedEvent",
+    "WorldLoreChangedEvent",
+    "WorldLoreUpdatedEvent",
+    "QuestAddedEvent",
+    "QuestCompletedEvent",
+    "ActiveTaskUpsertedEvent",
+    "ActiveTaskUpdatedEvent",
+    "ActiveTaskCompletedEvent",
+    "SpellLearnedEvent",
+    "NpcUpsertedEvent",
+    "NpcKnowledgeAddedEvent",
+]
+STRING_LIST_SCHEMA: dict[str, Any] = {
+    "type": "array",
+    "items": {"type": "string"},
+}
+NONEMPTY_STRING_LIST_SCHEMA: dict[str, Any] = {
+    "type": "array",
+    "items": {"type": "string"},
+    "minItems": 1,
+}
+INT_OR_AUTO_SCHEMA: dict[str, Any] = {
+    "anyOf": [
+        {"type": "integer"},
+        {"type": "string", "enum": ["AUTO", "SAME", "SKIP"]},
+    ]
+}
+INT_OR_SKIP_SCHEMA: dict[str, Any] = {
+    "anyOf": [
+        {"type": "integer"},
+        {"type": "string", "enum": ["SAME", "SKIP"]},
+    ]
+}
+JSON_PRIMITIVE_SCHEMA: dict[str, Any] = {
+    "anyOf": [
+        {"type": "string"},
+        {"type": "integer"},
+        {"type": "number"},
+        {"type": "boolean"},
+    ]
+}
+
+
+def _event_response_schema(
+    event_type: str,
+    properties: dict[str, Any],
+    required: list[str],
+    *,
+    description: str = "",
+) -> dict[str, Any]:
+    """Builds one strict event schema branch."""
+
+    return {
+        "type": "object",
+        "properties": {
+            "type": {
+                "type": "string",
+                "enum": [event_type],
+                "description": description or event_type,
+            },
+            "payload": {
+                "type": "object",
+                "properties": properties,
+                "required": required,
+                "additionalProperties": False,
+            },
+        },
+        "required": ["type", "payload"],
+        "additionalProperties": False,
+    }
+
+
+EVENT_RESPONSE_SCHEMA: dict[str, Any] = {
+    "anyOf": [
+        _event_response_schema(
+            "StatusUpdatedEvent",
+            {
+                "location": {"type": "string"},
+                "minutes_passed": INT_OR_AUTO_SCHEMA,
+                "weather": {"type": "string"},
+            },
+            ["location", "minutes_passed", "weather"],
+            description="Updates location, weather, and elapsed time.",
+        ),
+        _event_response_schema(
+            "LocationChangedEvent",
+            {
+                "location": {"type": "string"},
+                "minutes_passed": INT_OR_AUTO_SCHEMA,
+                "weather": {"type": "string"},
+            },
+            ["location"],
+            description="Legacy-compatible status update focused on location.",
+        ),
+        _event_response_schema(
+            "SkillCheckRequestedEvent",
+            {
+                "skill_name": {"type": "string"},
+                "dc": {"type": "integer", "minimum": 1},
+                "difficulty": {"type": "string"},
+            },
+            ["skill_name"],
+        ),
+        _event_response_schema(
+            "SkillUpsertedEvent",
+            {
+                "name": {"type": "string"},
+                "description": {"type": "string"},
+                "level": {"type": "integer", "minimum": 1, "maximum": 5},
+            },
+            ["name", "description", "level"],
+        ),
+        _event_response_schema(
+            "SkillXpAddedEvent",
+            {
+                "skill_name": {"type": "string"},
+                "xp_amount": {"type": "integer", "minimum": 1},
+            },
+            ["skill_name", "xp_amount"],
+            description="Awards XP to an existing skill. Do not use skill_id.",
+        ),
+        _event_response_schema(
+            "InventoryItemAddedEvent",
+            {
+                "item_type": {"type": "string"},
+                "item_name": {"type": "string"},
+                "description": {"type": "string"},
+                "amount": {"type": "integer", "minimum": 1},
+                "value_base_units": {"type": "integer", "minimum": 1},
+            },
+            ["item_type", "item_name", "description", "amount", "value_base_units"],
+        ),
+        _event_response_schema(
+            "InventoryItemRemovedEvent",
+            {
+                "item_name": {"type": "string"},
+                "amount": {"type": "integer", "minimum": 1},
+            },
+            ["item_name", "amount"],
+        ),
+        _event_response_schema(
+            "InventoryItemModifiedEvent",
+            {
+                "target_name": {"type": "string"},
+                "new_name": {"type": "string"},
+                "new_description": {"type": "string"},
+                "new_amount": INT_OR_SKIP_SCHEMA,
+                "new_value_base_units": INT_OR_SKIP_SCHEMA,
+            },
+            ["target_name"],
+        ),
+        _event_response_schema(
+            "RecipeDiscoveredEvent",
+            {
+                "name": {"type": "string"},
+                "ingredients": NONEMPTY_STRING_LIST_SCHEMA,
+                "result": {"type": "string"},
+                "motions": STRING_LIST_SCHEMA,
+                "virtues": STRING_LIST_SCHEMA,
+                "notes": {"type": "string"},
+            },
+            ["name", "ingredients", "result"],
+        ),
+        _event_response_schema(
+            "ReagentDiscoveredEvent",
+            {
+                "name": {"type": "string"},
+                "material_type": {"type": "string"},
+                "qualities": NONEMPTY_STRING_LIST_SCHEMA,
+                "motions": NONEMPTY_STRING_LIST_SCHEMA,
+                "virtues": NONEMPTY_STRING_LIST_SCHEMA,
+                "uses": NONEMPTY_STRING_LIST_SCHEMA,
+                "notes": {"type": "string"},
+            },
+            ["name", "material_type", "qualities", "motions", "virtues", "uses", "notes"],
+            description="Stores a structured alchemy reagent; name-only payloads are incomplete.",
+        ),
+        _event_response_schema(
+            "CurrencyChangedEvent",
+            {
+                "base_unit_amount": {
+                    "type": "integer",
+                    "description": (
+                        "Required net money change in the world's smallest currency "
+                        "unit. Negative for spending, positive for gains."
+                    ),
+                }
+            },
+            ["base_unit_amount"],
+        ),
+        _event_response_schema(
+            "CurrencyDefinedEvent",
+            {
+                "name": {"type": "string"},
+                "plural_name": {"type": "string"},
+                "base_unit_value": {"type": "integer", "minimum": 1},
+            },
+            ["name", "base_unit_value"],
+        ),
+        _event_response_schema(
+            "MusicChangedEvent",
+            {"filename": {"type": "string"}},
+            ["filename"],
+        ),
+        _event_response_schema(
+            "FlagSetEvent",
+            {
+                "key": {"type": "string"},
+                "value": JSON_PRIMITIVE_SCHEMA,
+            },
+            ["key", "value"],
+        ),
+        _event_response_schema(
+            "PlayerNoteAddedEvent",
+            {"content": {"type": "string"}},
+            ["content"],
+        ),
+        _event_response_schema(
+            "WorldLoreAddedEvent",
+            {
+                "section": {"type": "string"},
+                "key": {"type": "string"},
+                "text": {"type": "string"},
+            },
+            ["section", "key", "text"],
+        ),
+        _event_response_schema(
+            "WorldLoreChangedEvent",
+            {
+                "section": {"type": "string"},
+                "key": {"type": "string"},
+                "replacement_lore": {"type": "string"},
+            },
+            ["section", "key", "replacement_lore"],
+        ),
+        _event_response_schema(
+            "WorldLoreUpdatedEvent",
+            {
+                "section": {"type": "string"},
+                "key": {"type": "string"},
+                "replacement_lore": {"type": "string"},
+            },
+            ["section", "key", "replacement_lore"],
+        ),
+        _event_response_schema(
+            "QuestAddedEvent",
+            {
+                "name": {"type": "string"},
+                "giver": {"type": "string"},
+                "description": {"type": "string"},
+                "turn_in": {"type": "string"},
+                "reward": {"type": "string"},
+                "notes": {"type": "string"},
+            },
+            ["name", "description"],
+        ),
+        _event_response_schema(
+            "QuestCompletedEvent",
+            {
+                "name": {"type": "string"},
+                "notes": {"type": "string"},
+                "resolution": {"type": "string"},
+                "outcome": {"type": "string"},
+            },
+            ["name"],
+        ),
+        _event_response_schema(
+            "ActiveTaskUpsertedEvent",
+            {
+                "name": {"type": "string"},
+                "category": {"type": "string"},
+                "status": {"type": "string"},
+                "description": {"type": "string"},
+                "requester": {"type": "string"},
+                "location": {"type": "string"},
+                "reward": {"type": "string"},
+                "due_date": {"type": "string"},
+                "notes": {"type": "string"},
+            },
+            ["name", "description"],
+        ),
+        _event_response_schema(
+            "ActiveTaskUpdatedEvent",
+            {
+                "name": {"type": "string"},
+                "category": {"type": "string"},
+                "status": {"type": "string"},
+                "description": {"type": "string"},
+                "requester": {"type": "string"},
+                "location": {"type": "string"},
+                "reward": {"type": "string"},
+                "due_date": {"type": "string"},
+                "notes": {"type": "string"},
+            },
+            ["name"],
+        ),
+        _event_response_schema(
+            "ActiveTaskCompletedEvent",
+            {
+                "name": {"type": "string"},
+                "notes": {"type": "string"},
+            },
+            ["name"],
+        ),
+        _event_response_schema(
+            "SpellLearnedEvent",
+            {
+                "name": {"type": "string"},
+                "level": {"type": "integer", "minimum": 0, "maximum": 9},
+                "school": {"type": "string"},
+                "description": {"type": "string"},
+            },
+            ["name"],
+        ),
+        _event_response_schema(
+            "NpcUpsertedEvent",
+            {
+                "npc_id": {"type": "string"},
+                "name": {"type": "string"},
+                "display_name": {"type": "string"},
+                "role": {"type": "string"},
+                "location": {"type": "string"},
+                "public_description": {"type": "string"},
+                "player_facing_information": {"type": "string"},
+                "knowledge_scope": STRING_LIST_SCHEMA,
+                "known_facts": STRING_LIST_SCHEMA,
+                "disposition": {"type": "string"},
+            },
+            ["display_name", "player_facing_information"],
+        ),
+        _event_response_schema(
+            "NpcKnowledgeAddedEvent",
+            {
+                "npc_id": {"type": "string"},
+                "name": {"type": "string"},
+                "facts": NONEMPTY_STRING_LIST_SCHEMA,
+                "role": {"type": "string"},
+                "location": {"type": "string"},
+            },
+            ["facts"],
+        ),
+    ]
+}
+STORY_RESPONSE_JSON_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "response": {
+            "type": "string",
+            "description": "Player-facing narration only, with no legacy tags.",
+        },
+        "suggested_actions": {
+            "type": "array",
+            "description": "Three or four short player-facing action options, or empty for out-of-game answers.",
+            "items": {"type": "string"},
+            "maxItems": 4,
+        },
+        "events": {
+            "type": "array",
+            "description": "Structured event suggestions. Empty when no state change is proposed.",
+            "items": EVENT_RESPONSE_SCHEMA,
+        },
+        "out_of_game": {
+            "type": "boolean",
+            "description": "True only when the response is fully out-of-game.",
+        },
+    },
+    "required": ["response", "suggested_actions", "events", "out_of_game"],
+    "additionalProperties": False,
+}
+NEW_GAME_RESPONSE_JSON_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "selected_genre": {"type": "string"},
+        "world_summary": {"type": "string"},
+        "world_lore": {
+            "type": "object",
+            "description": "Player-known lore grouped by category and durable entry name.",
+            "additionalProperties": {
+                "type": "object",
+                "additionalProperties": {"type": "string"},
+            },
+        },
+        "start_location": {"type": "string"},
+        "starting_calendar": {
+            "type": "object",
+            "properties": {
+                "elapsed_minutes": {"type": "integer"},
+                "year": {"type": "integer"},
+                "month_name": {"type": "string"},
+                "month_number": {"type": "integer"},
+                "season_name": {"type": "string"},
+                "season_hint": {"type": "string"},
+                "day_of_month": {"type": "integer"},
+                "time_of_day_minutes": {"type": "integer"},
+            },
+            "additionalProperties": False,
+        },
+        "weather": {"type": "string"},
+        "character": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "appearance": {"type": "string"},
+                "backstory": {"type": "string"},
+                "notes": {"type": "string"},
+            },
+            "required": ["name", "appearance", "backstory", "notes"],
+            "additionalProperties": False,
+        },
+        "skills": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "description": {"type": "string"},
+                    "level": {"type": "integer", "minimum": 1},
+                },
+                "required": ["name", "description", "level"],
+                "additionalProperties": False,
+            },
+        },
+        "starting_items": {
+            "type": "array",
+            "minItems": 5,
+            "items": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "category": {"type": "string"},
+                    "quantity": {"type": "integer", "minimum": 1},
+                    "description": {"type": "string"},
+                    "value_base_units": {"type": "integer", "minimum": 0},
+                },
+                "required": [
+                    "name",
+                    "category",
+                    "quantity",
+                    "description",
+                    "value_base_units",
+                ],
+                "additionalProperties": False,
+            },
+        },
+        "currency_denominations": {
+            "type": "array",
+            "maxItems": 4,
+            "items": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "plural_name": {"type": "string"},
+                    "value": {"type": "integer", "minimum": 1},
+                },
+                "required": ["name", "plural_name", "value"],
+                "additionalProperties": False,
+            },
+        },
+        "currency_description": {"type": "string"},
+        "starting_currency_balance_base_units": {
+            "type": "integer",
+            "minimum": 0,
+            "description": (
+                "Player character's starting money, stored in game_state/currency.balance "
+                "as base currency units."
+            ),
+        },
+        "introductory_message": {"type": "string"},
+        "events": {"type": "array", "items": EVENT_RESPONSE_SCHEMA},
+    },
+    "required": [
+        "selected_genre",
+        "world_summary",
+        "world_lore",
+        "start_location",
+        "starting_calendar",
+        "weather",
+        "character",
+        "skills",
+        "starting_items",
+        "currency_denominations",
+        "currency_description",
+        "starting_currency_balance_base_units",
+        "introductory_message",
+        "events",
+    ],
+    "additionalProperties": False,
+}
+
+UNCERTAIN_ACTION_KEYWORDS: dict[str, tuple[str, ...]] = {
+    "Alchemy": (
+        "alchemy",
+        "brew",
+        "distill",
+        "elixir",
+        "experiment",
+        "identify reagent",
+        "mix",
+        "potion",
+        "prepare",
+        "recipe",
+        "reagent",
+        "tincture",
+    ),
+    "Foraging": (
+        "basket",
+        "bounty",
+        "brimming",
+        "collection",
+        "forage",
+        "gather",
+        "geological find",
+        "harvest",
+        "herb",
+        "mushroom",
+        "plant",
+        "search for",
+        "specimen",
+    ),
+    "Fieldcraft": (
+        "camp",
+        "flora",
+        "forage",
+        "harvest",
+        "hunt",
+        "scout",
+        "track",
+        "trail",
+        "wild",
+    ),
+    "Investigation": (
+        "clue",
+        "examine",
+        "inspect",
+        "investigate",
+        "research",
+        "search",
+        "study",
+    ),
+    "Awareness": (
+        "listen",
+        "look for",
+        "notice",
+        "observe",
+        "scan",
+        "spot",
+        "watch",
+    ),
+    "Persuasion": (
+        "ask",
+        "bargain",
+        "convince",
+        "haggle",
+        "negotiate",
+        "persuade",
+    ),
+    "Stealth": (
+        "hide",
+        "sneak",
+        "stealth",
+        "steal",
+    ),
+    "Athletics": (
+        "balance",
+        "climb",
+        "jump",
+        "lift",
+        "run",
+        "swim",
+    ),
+    "Melee": (
+        "attack",
+        "block",
+        "duel",
+        "fight",
+        "parry",
+        "strike",
+    ),
+}
+TRIVIAL_ACTION_KEYWORDS = {
+    "close",
+    "go",
+    "head",
+    "leave",
+    "look around",
+    "move",
+    "open",
+    "return",
+    "talk",
+    "walk",
+}
+
 
 @dataclass(frozen=True)
 class GeminiSettings:
@@ -66,6 +674,7 @@ class AiWorldSetupResult:
     finalized_starter_items: list[dict[str, Any]] = field(default_factory=list)
     finalized_currency_denominations: list[dict[str, Any]] = field(default_factory=list)
     finalized_currency_description: str = ""
+    finalized_starting_currency_balance_base_units: int | None = None
     suggested_events: list[dict[str, Any]] = field(default_factory=list)
     raw_text: str = ""
 
@@ -118,6 +727,7 @@ class GeminiNarrationService:
         response = client.models.generate_content(
             model=self.settings.model,
             contents=prompt,
+            config=_structured_output_config(STORY_RESPONSE_JSON_SCHEMA),  # type: ignore[arg-type]
         )
         raw_text = str(getattr(response, "text", "") or "").strip()
         LOGGER.info("Gemini raw story response:\n%s", raw_text)
@@ -129,7 +739,10 @@ class GeminiNarrationService:
                 raw_text=raw_text,
             )
 
-        return parse_gemini_story_response(raw_text)
+        result = parse_gemini_story_response(raw_text)
+        result = _ensure_skill_check_for_uncertain_player_command(result, context_packet)
+        result = _ensure_inventory_for_collected_reagents(result, context_packet)
+        return _ensure_inventory_for_narrated_collection(result, context_packet)
 
     def generate_new_game_world(
         self,
@@ -164,6 +777,7 @@ class GeminiNarrationService:
         response = client.models.generate_content(
             model=self.settings.model,
             contents=prompt,
+            config=_structured_output_config(NEW_GAME_RESPONSE_JSON_SCHEMA),  # type: ignore[arg-type]
         )
         raw_text = str(getattr(response, "text", "") or "").strip()
         LOGGER.info("Gemini raw new-game response:\n%s", raw_text)
@@ -264,8 +878,8 @@ def build_gemini_story_prompt(context_packet: dict[str, Any]) -> str:
         "tab under Notes. Write it as player-known information about a person, not "
         "as a mechanical service role. Never put secret identities, hidden motives, "
         "mystery solutions, private plans, or GM-only facts in "
-        "player_facing_information. Store hidden NPC or mystery information with "
-        "private fields or SecretAddedEvent instead.\n\n"
+        "player_facing_information. Do not put hidden NPC or mystery information "
+        "in suggested events unless the player has learned it.\n\n"
         "Creative naming boundary:\n"
         "- If the context packet includes creative_ideas, treat those examples as "
         "high-priority style seeds for newly invented names and setting details.\n"
@@ -277,32 +891,45 @@ def build_gemini_story_prompt(context_packet: dict[str, Any]) -> str:
         "Banned terms may appear only when already established in saved state or "
         "explicitly provided by the player.\n\n"
         f"Exact banned proper nouns for newly invented content: {banned_terms_text}\n\n"
-        "Return one JSON object and no surrounding Markdown. The object must match "
-        "this shape:\n"
-        "{\n"
-        '  "response": "Player-facing narration only, with no legacy tags.",\n'
-        '  "suggested_actions": ["Action option 1", "Action option 2", "Action option 3"],\n'
-        '  "events": [],\n'
-        '  "out_of_game": false\n'
-        "}\n\n"
+        "Return one JSON object and no surrounding Markdown. The API response "
+        "schema defines the required top-level fields.\n\n"
         "Rules:\n"
         "- response must be a non-empty string.\n"
         "- response must not contain legacy double-bracket tags.\n"
-        "- In NPC dialogue, use double quotation marks only to mark the outer "
-        "spoken dialogue. If a speaker mentions a named item, title, shop, "
-        "place, phrase, nickname, inscription, or other quoted specific inside "
-        "that dialogue, use single quotation marks for the inner quoted name.\n"
+        "- Spoken dialogue must use double quotation marks around the speaker's "
+        "full spoken sentence or paragraph. Do not use single quotation marks as "
+        "the outer boundary of dialogue. Use single quotation marks only when an "
+        "already-double-quoted speaker mentions a named item, title, shop, place, "
+        "phrase, nickname, inscription, or other quoted specific inside that "
+        "dialogue.\n"
         "- suggested_actions must be a list, even when empty.\n"
         "- events must be a list, even when empty.\n"
         "- events may include multiple entries of the same event type when multiple "
         "distinct state changes happen in the same turn.\n"
         "- If suggesting events, use the event_shape, known_event_types, and selected event contracts from the packet.\n"
+        "- For uncertain actions, suggest SkillCheckRequestedEvent before any "
+        "final outcome event. This is required for foraging, harvesting, "
+        "searching, researching, identifying, crafting, alchemy experiments, "
+        "persuasion, stealth, combat, and named skill use unless the action is "
+        "trivial and risk-free. Do not use SkillXpAddedEvent as a substitute "
+        "for a check.\n"
+        "- Every InventoryItemAddedEvent payload must include value_base_units "
+        "as an integer of at least 1.\n"
+        "- ReagentDiscoveredEvent records Alchemy Notebook knowledge only. If "
+        "the player physically collects, harvests, picks up, or stores that "
+        "reagent, also suggest InventoryItemAddedEvent for the same reagent.\n"
+        "- If the narration says the player physically gains, collects, harvests, "
+        "finds and keeps, or fills a basket/container with usable items, also "
+        "suggest InventoryItemAddedEvent for those items. Do not describe a "
+        "successful bounty, haul, stash, brimming basket, or collected specimens "
+        "without adding inventory.\n"
         "- Currency is stored as one integer, state.currency.balance_base_units, "
-        "not as coin items in inventory. For a completed purchase, sale, fee, "
-        "reward, refund, or other money movement, suggest CurrencyChangedEvent "
-        "with one net base_unit_amount. If the player buys an item, also suggest "
-        "the InventoryItemAddedEvent for that item; do not create coin inventory "
-        "items for payment or change.\n"
+        "which is loaded from game_state/currency.balance, not as coin items in "
+        "inventory. For a completed purchase, sale, fee, reward, refund, or other "
+        "money movement, suggest CurrencyChangedEvent with payload.base_unit_amount "
+        "as the one net money change. Never use net_base_unit_amount. If the "
+        "player buys an item, also suggest the InventoryItemAddedEvent for that "
+        "item; do not create coin inventory items for payment or change.\n"
         "- Do not invent hidden state, inventory, recipes, or flags as confirmed facts.\n\n"
         "Context packet:\n"
         f"{packet_json}"
@@ -431,10 +1058,14 @@ def build_gemini_new_game_prompt(setup_packet: dict[str, Any]) -> str:
         "realistic modern worlds may use dollars, and futuristic or space worlds "
         "may use credits. If setup.currency_denominations already contains "
         "player-provided values, preserve them.\n"
-        "- events must be a list, even when empty.\n"
-        "- Each event object should use this shape: "
-        "{\"type\": \"EventTypeName\", \"payload\": {\"field\": \"value\"}}. "
-        "Do not use event_type as the top-level event type key.\n"
+        "- starting_currency_balance_base_units must be a reasonable starting money "
+        "amount for the finalized character, genre, and economy. This is the "
+        "player's actual starting money stored in game_state/currency.balance as "
+        "one integer in the baseline currency unit. Do not create coin or purse "
+        "items in starting_items to represent spendable money.\n"
+        "- The API response schema defines the required output fields and event "
+        "envelope. Use type and payload for each event; do not use event_type as "
+        "the top-level event type key.\n"
         "- Use only player-known information in player-facing event fields.\n"
         "- Use NpcUpsertedEvent for prominent NPCs the player can know about at "
         "setup. Use ActiveTaskUpsertedEvent for initial active obligations. Use "
@@ -443,48 +1074,20 @@ def build_gemini_new_game_prompt(setup_packet: dict[str, Any]) -> str:
         "establishes a new denomination after initial setup. If "
         "setup_packet.audio.valid_music_tracks is non-empty, "
         "use one MusicChangedEvent to choose fitting opening background music; "
-        "its filename must exactly match one listed track.\n\n"
-        "Return this JSON shape:\n"
-        "{\n"
-        '  "selected_genre": "Specific genre or premise.",\n'
-        '  "world_summary": "Several player-known paragraphs.",\n'
-        '  "world_lore": {\n'
-        '    "Locations": {"The Gilded Tankard": "Known player-facing location facts."},\n'
-        '    "Religions": {"Temple Name": "Known player-facing religion facts."},\n'
-        '    "Economy": {"Coinage": "Known player-facing economy facts."},\n'
-        '    "Culture and Laws": {"Local Law": "Known player-facing culture or law facts."}\n'
-        "  },\n"
-        '  "start_location": "Short broad starting location name.",\n'
-        '  "starting_calendar": {\n'
-        '    "season_name": "Autumn",\n'
-        '    "season_hint": "autumn",\n'
-        '    "month_name": "September",\n'
-        '    "day_of_month": 1,\n'
-        '    "time_of_day_minutes": 480\n'
-        "  },\n"
-        '  "weather": "Clear, cold autumn wind.",\n'
-        '  "character": {\n'
-        '    "name": "Final character name.",\n'
-        '    "appearance": "Final character appearance.",\n'
-        '    "backstory": "Final character backstory.",\n'
-        '    "notes": "Final character notes/personality hooks."\n'
-        "  },\n"
-        '  "skills": [\n'
-        '    {"name": "Skill name", "description": "Concrete skill description.", "level": 1}\n'
-        "  ],\n"
-        '  "starting_items": [\n'
-        '    {"name": "Item name", "category": "Tool", "quantity": 1, "description": "Concrete item description.", "value_base_units": 10}\n'
-        "  ],\n"
-        '  "currency_denominations": [\n'
-        '    {"name": "Credit", "plural_name": "Credits", "value": 1}\n'
-        "  ],\n"
-        '  "currency_description": "Player-known description of local money and exchange customs.",\n'
-        '  "introductory_message": "Opening scene. What do you do now?",\n'
-        '  "events": []\n'
-        "}\n\n"
+        "its filename must exactly match one listed track. The API response "
+        "schema defines the required JSON fields.\n\n"
         "Setup packet:\n"
         f"{packet_json}"
     )
+
+
+def _structured_output_config(schema: dict[str, Any]) -> dict[str, Any]:
+    """Builds the Gemini structured-output config for a JSON response schema."""
+
+    return {
+        "response_mime_type": "application/json",
+        "response_json_schema": schema,
+    }
 
 
 def _banned_terms_from_context(context_packet: dict[str, Any]) -> list[str]:
@@ -537,6 +1140,8 @@ def parse_gemini_story_response(raw_text: str) -> AiNarrationResult:
         LOGGER.warning("Gemini JSON response was not an object. Using raw text fallback.")
         return AiNarrationResult(narrative_text=raw_text.strip(), raw_text=raw_text)
 
+    _log_json_schema_warnings(data, STORY_RESPONSE_JSON_SCHEMA, "story response")
+
     response_text = data.get("response", data.get("narrative_text"))
 
     if not isinstance(response_text, str) or not response_text.strip():
@@ -585,6 +1190,417 @@ def parse_gemini_story_response(raw_text: str) -> AiNarrationResult:
     )
 
 
+def _ensure_skill_check_for_uncertain_player_command(
+    result: AiNarrationResult,
+    context_packet: dict[str, Any],
+) -> AiNarrationResult:
+    """Adds a fallback skill-check event when Gemini skips a clearly uncertain action."""
+
+    if result.out_of_game:
+        return result
+
+    if any(_raw_event_type(event) == "SkillCheckRequestedEvent" for event in result.suggested_events):
+        return result
+
+    command = str(context_packet.get("player_command", "")).strip()
+    action_text = " ".join([command, result.narrative_text]).strip()
+
+    if not _looks_like_uncertain_action(action_text):
+        return result
+
+    skill_name = _infer_skill_check_name(action_text, context_packet)
+
+    if not skill_name:
+        return result
+
+    skill_check_event = {
+        "type": "SkillCheckRequestedEvent",
+        "payload": {
+            "skill_name": skill_name,
+            "difficulty": "normal",
+        },
+    }
+    filtered_events = [
+        event
+        for event in result.suggested_events
+        if _raw_event_type(event) != "SkillXpAddedEvent"
+    ]
+    LOGGER.warning(
+        "Gemini omitted SkillCheckRequestedEvent for uncertain player command %r; "
+        "injecting %s check.",
+        command,
+        skill_name,
+    )
+
+    return AiNarrationResult(
+        narrative_text=result.narrative_text,
+        suggested_actions=result.suggested_actions,
+        suggested_events=[skill_check_event, *filtered_events],
+        out_of_game=result.out_of_game,
+        raw_text=result.raw_text,
+    )
+
+
+def _ensure_inventory_for_collected_reagents(
+    result: AiNarrationResult,
+    context_packet: dict[str, Any],
+) -> AiNarrationResult:
+    """Adds inventory events for reagents Gemini says the player physically collected."""
+
+    if result.out_of_game:
+        return result
+
+    reagent_events = [
+        event
+        for event in result.suggested_events
+        if _raw_event_type(event) == "ReagentDiscoveredEvent"
+    ]
+
+    if not reagent_events:
+        return result
+
+    collection_text = " ".join(
+        [
+            result.narrative_text,
+            str(context_packet.get("player_command", "")),
+        ]
+    )
+
+    if not _text_suggests_physical_collection(collection_text):
+        return result
+
+    event_names_with_inventory = {
+        _event_payload_text(event, "item_name", "name").casefold()
+        for event in result.suggested_events
+        if _raw_event_type(event) == "InventoryItemAddedEvent"
+    }
+    updated_events: list[dict[str, Any]] = []
+    added_events: list[dict[str, Any]] = []
+
+    for event in result.suggested_events:
+        updated_events.append(event)
+
+        if _raw_event_type(event) != "ReagentDiscoveredEvent":
+            continue
+
+        payload = event.get("payload", {})
+
+        if not isinstance(payload, dict):
+            continue
+
+        name = str(payload.get("name", payload.get("reagent_name", ""))).strip()
+
+        if not name or name.casefold() in event_names_with_inventory:
+            continue
+
+        inventory_event = {
+            "type": "InventoryItemAddedEvent",
+            "payload": {
+                "item_type": str(payload.get("material_type", "")).strip() or "Reagent",
+                "item_name": name,
+                "description": _reagent_inventory_description(payload),
+                "amount": 1,
+                "value_base_units": 1,
+            },
+        }
+        updated_events.append(inventory_event)
+        added_events.append(inventory_event)
+        event_names_with_inventory.add(name.casefold())
+
+    if not added_events:
+        return result
+
+    LOGGER.warning(
+        "Gemini omitted InventoryItemAddedEvent for collected reagent(s): %s",
+        [
+            event["payload"]["item_name"]
+            for event in added_events
+        ],
+    )
+
+    return AiNarrationResult(
+        narrative_text=result.narrative_text,
+        suggested_actions=result.suggested_actions,
+        suggested_events=updated_events,
+        out_of_game=result.out_of_game,
+        raw_text=result.raw_text,
+    )
+
+
+def _ensure_inventory_for_narrated_collection(
+    result: AiNarrationResult,
+    context_packet: dict[str, Any],
+) -> AiNarrationResult:
+    """Adds a generic inventory item when Gemini narrates loot but emits none."""
+
+    if result.out_of_game:
+        return result
+
+    if any(_raw_event_type(event) == "InventoryItemAddedEvent" for event in result.suggested_events):
+        return result
+
+    collection_text = " ".join(
+        [
+            result.narrative_text,
+            str(context_packet.get("player_command", "")),
+        ]
+    )
+
+    if not _text_suggests_physical_collection(collection_text):
+        return result
+
+    if not _text_suggests_narrated_inventory_reward(collection_text):
+        return result
+
+    inventory_event = {
+        "type": "InventoryItemAddedEvent",
+        "payload": {
+            "item_type": "Foraged Goods",
+            "item_name": "Assorted Foraged Specimens",
+            "description": _narrated_collection_description(collection_text),
+            "amount": 1,
+            "value_base_units": 1,
+        },
+    }
+    LOGGER.warning(
+        "Gemini narrated collected inventory without InventoryItemAddedEvent; "
+        "adding Assorted Foraged Specimens."
+    )
+
+    return AiNarrationResult(
+        narrative_text=result.narrative_text,
+        suggested_actions=result.suggested_actions,
+        suggested_events=[*result.suggested_events, inventory_event],
+        out_of_game=result.out_of_game,
+        raw_text=result.raw_text,
+    )
+
+
+def _text_suggests_physical_collection(text: str) -> bool:
+    """Returns true when narration or command says the player took an item."""
+
+    clean_text = text.casefold()
+    collection_phrases = (
+        "basket brimming",
+        "bounty of",
+        "brimming with",
+        "collect",
+        "collected",
+        "collection",
+        "gather",
+        "gathered",
+        "geological find",
+        "geological finds",
+        "harvest",
+        "harvested",
+        "high-quality specimen",
+        "high-quality specimens",
+        "pick",
+        "picked",
+        "stow",
+        "stowed",
+        "take",
+        "taken",
+        "tuck",
+        "tucked",
+        "in your basket",
+        "into your basket",
+        "in her basket",
+        "into her basket",
+    )
+    return any(phrase in clean_text for phrase in collection_phrases)
+
+
+def _text_suggests_narrated_inventory_reward(text: str) -> bool:
+    """Returns true when narration describes a physical reward pile."""
+
+    clean_text = text.casefold()
+    reward_phrases = (
+        "basket brimming",
+        "bounty of",
+        "brimming with",
+        "into a padded pocket",
+        "popped free",
+        "pops free",
+        "fresh, high-quality specimens",
+        "quite the collection",
+        "tuck the",
+        "tucked the",
+        "your basket is brimming",
+        "you have quite the collection",
+    )
+    return any(phrase in clean_text for phrase in reward_phrases)
+
+
+def _narrated_collection_description(text: str) -> str:
+    """Builds a conservative description for fallback generic collection loot."""
+
+    clean_text = text.casefold()
+
+    if "flora" in clean_text and "geological" in clean_text:
+        return (
+            "A mixed bounty of local flora and rare geological finds gathered "
+            "during foraging."
+        )
+
+    if "geological" in clean_text:
+        return "Assorted geological specimens gathered during exploration."
+
+    if "flora" in clean_text or "specimen" in clean_text:
+        return "Assorted local flora and field specimens gathered during foraging."
+
+    return "Assorted useful specimens gathered during exploration."
+
+
+def _reagent_inventory_description(payload: dict[str, Any]) -> str:
+    """Builds an inventory description from a reagent-discovery payload."""
+
+    notes = str(payload.get("notes", payload.get("description", ""))).strip()
+
+    if notes:
+        return notes
+
+    qualities = _join_payload_list(payload.get("qualities", []))
+    uses = _join_payload_list(payload.get("uses", []))
+    details = []
+
+    if qualities:
+        details.append(f"Qualities: {qualities}")
+
+    if uses:
+        details.append(f"Uses: {uses}")
+
+    return "; ".join(details) or "A discovered alchemical reagent."
+
+
+def _join_payload_list(value: Any) -> str:
+    """Formats a payload list as comma-separated text."""
+
+    if not isinstance(value, list):
+        return ""
+
+    return ", ".join(str(item).strip() for item in value if str(item).strip())
+
+
+def _looks_like_uncertain_action(command: str) -> bool:
+    """Returns true when a player command likely needs a Python-resolved check."""
+
+    clean_command = command.strip().casefold()
+
+    if not clean_command:
+        return False
+
+    if clean_command.startswith(("oog", "out-of-game", "out of game")):
+        return False
+
+    if "skill check" in clean_command or "roll " in clean_command:
+        return True
+
+    for keywords in UNCERTAIN_ACTION_KEYWORDS.values():
+        if any(keyword in clean_command for keyword in keywords):
+            return True
+
+    command_words = set(re.findall(r"[a-zA-Z]+", clean_command))
+
+    if command_words and command_words.issubset(TRIVIAL_ACTION_KEYWORDS):
+        return False
+
+    return False
+
+
+def _infer_skill_check_name(command: str, context_packet: dict[str, Any]) -> str:
+    """Infers the most relevant skill for a fallback check."""
+
+    clean_command = command.casefold()
+    known_skills = _known_skill_names(context_packet)
+
+    for skill_name in known_skills:
+        if skill_name.casefold() in clean_command:
+            return skill_name
+
+    scored_candidates: list[tuple[int, str]] = []
+
+    for candidate, keywords in UNCERTAIN_ACTION_KEYWORDS.items():
+        score = sum(1 for keyword in keywords if keyword in clean_command)
+
+        if score > 0:
+            scored_candidates.append((score, candidate))
+
+    if scored_candidates:
+        scored_candidates.sort(key=lambda item: (-item[0], item[1]))
+        candidate = scored_candidates[0][1]
+        known_match = _find_known_skill(candidate, known_skills)
+        return known_match or candidate
+
+    return known_skills[0] if known_skills else "Awareness"
+
+
+def _known_skill_names(context_packet: dict[str, Any]) -> list[str]:
+    """Reads known skill names from a story context packet."""
+
+    raw_skills = (
+        context_packet.get("state", {})
+        .get("skills", {})
+        .get("known_skills", [])
+    )
+
+    if not isinstance(raw_skills, list):
+        return []
+
+    skill_names: list[str] = []
+
+    for raw_skill in raw_skills:
+        if not isinstance(raw_skill, dict):
+            continue
+
+        name = str(raw_skill.get("name", "")).strip()
+
+        if name:
+            skill_names.append(name)
+
+    return skill_names
+
+
+def _find_known_skill(candidate: str, known_skills: list[str]) -> str:
+    """Returns a known skill matching a fallback candidate."""
+
+    candidate_folded = candidate.casefold()
+
+    for skill_name in known_skills:
+        if skill_name.casefold() == candidate_folded:
+            return skill_name
+
+    if candidate_folded == "foraging":
+        for skill_name in known_skills:
+            if skill_name.casefold() == "fieldcraft":
+                return skill_name
+
+    return ""
+
+
+def _raw_event_type(event: dict[str, Any]) -> str:
+    """Reads a raw event type string."""
+
+    return str(event.get("type", "")).strip()
+
+
+def _event_payload_text(event: dict[str, Any], *keys: str) -> str:
+    """Reads the first text value from a raw event payload."""
+
+    payload = event.get("payload", {})
+
+    if not isinstance(payload, dict):
+        return ""
+
+    for key in keys:
+        value = str(payload.get(key, "")).strip()
+
+        if value:
+            return value
+
+    return ""
+
+
 def parse_gemini_new_game_response(raw_text: str) -> AiWorldSetupResult:
     """
     Parses Gemini new-game setup output.
@@ -616,6 +1632,8 @@ def parse_gemini_new_game_response(raw_text: str) -> AiWorldSetupResult:
             raw_text=raw_text,
         )
 
+    _log_json_schema_warnings(data, NEW_GAME_RESPONSE_JSON_SCHEMA, "new-game response")
+
     world_summary = str(data.get("world_summary", "")).strip()
     selected_genre = str(
         data.get("selected_genre", data.get("genre", ""))
@@ -636,6 +1654,9 @@ def parse_gemini_new_game_response(raw_text: str) -> AiWorldSetupResult:
     )
     finalized_currency_denominations = _parse_new_game_currency_denominations(data)
     finalized_currency_description = _parse_new_game_currency_description(data)
+    finalized_starting_currency_balance_base_units = (
+        _parse_new_game_starting_currency_balance(data)
+    )
     raw_events = data.get("events", data.get("suggested_events", []))
 
     if not world_summary:
@@ -676,6 +1697,9 @@ def parse_gemini_new_game_response(raw_text: str) -> AiWorldSetupResult:
         finalized_starter_items=finalized_starter_items,
         finalized_currency_denominations=finalized_currency_denominations,
         finalized_currency_description=finalized_currency_description,
+        finalized_starting_currency_balance_base_units=(
+            finalized_starting_currency_balance_base_units
+        ),
         suggested_events=suggested_events,
         raw_text=raw_text,
     )
@@ -892,6 +1916,216 @@ def _parse_new_game_currency_description(data: dict[str, Any]) -> str:
                 return value
 
     return ""
+
+
+def _parse_new_game_starting_currency_balance(data: dict[str, Any]) -> int | None:
+    """Parses AI-finalized starting money for game_state/currency.balance."""
+
+    for key in [
+        "starting_currency_balance_base_units",
+        "currency_balance_base_units",
+        "starting_money_base_units",
+    ]:
+        value = data.get(key)
+
+        if value in {"", None}:
+            continue
+
+        try:
+            return max(0, int(value)) # type: ignore
+        except (TypeError, ValueError):
+            LOGGER.warning("Gemini returned invalid starting currency balance: %r", value)
+            return None
+
+    raw_currency = data.get("currency")
+
+    if isinstance(raw_currency, dict):
+        for key in ["balance_base_units", "starting_balance_base_units"]:
+            value = raw_currency.get(key)
+
+            if value in {"", None}:
+                continue
+
+            try:
+                return max(0, int(value)) # type: ignore
+            except (TypeError, ValueError):
+                LOGGER.warning(
+                    "Gemini returned invalid nested starting currency balance: %r",
+                    value,
+                )
+                return None
+
+    return None
+
+
+def _log_json_schema_warnings(
+    data: Any,
+    schema: dict[str, Any],
+    label: str,
+) -> None:
+    """Logs local schema-shape warnings after Gemini structured output returns."""
+
+    errors = _json_schema_shape_errors(data, schema)
+
+    if errors:
+        LOGGER.warning(
+            "Gemini %s did not fully match the configured structured-output schema: %s",
+            label,
+            "; ".join(errors[:8]),
+        )
+
+
+def _json_schema_shape_errors(
+    value: Any,
+    schema: dict[str, Any],
+    path: str = "$",
+) -> list[str]:
+    """Checks the JSON Schema subset used for Gemini response envelopes."""
+
+    any_of = schema.get("anyOf")
+
+    if isinstance(any_of, list):
+        branch_errors = [
+            _json_schema_shape_errors(value, branch_schema, path)
+            for branch_schema in any_of
+            if isinstance(branch_schema, dict)
+        ]
+
+        if any(not errors for errors in branch_errors):
+            return []
+
+        return [
+            f"{path} did not match any allowed schema"
+        ] + [
+            error
+            for errors in branch_errors[:2]
+            for error in errors[:4]
+        ]
+
+    schema_type = schema.get("type")
+    errors: list[str] = []
+
+    if schema_type is not None and not _matches_json_schema_type(value, schema_type):
+        return [f"{path} expected {_format_json_schema_type(schema_type)}"]
+
+    if isinstance(value, dict):
+        enum = schema.get("enum")
+
+        if isinstance(enum, list) and value not in enum:
+            errors.append(f"{path} expected one of {enum}")
+
+        properties = schema.get("properties", {})
+        required = schema.get("required", [])
+
+        if isinstance(required, list):
+            for key in required:
+                if key not in value:
+                    errors.append(f"{path}.{key} is required")
+
+        if isinstance(properties, dict):
+            for key, child_schema in properties.items():
+                if key in value and isinstance(child_schema, dict):
+                    errors.extend(
+                        _json_schema_shape_errors(value[key], child_schema, f"{path}.{key}")
+                    )
+
+        additional_properties = schema.get("additionalProperties", True)
+
+        if additional_properties is False and isinstance(properties, dict):
+            allowed_keys = set(properties)
+            for key in value:
+                if key not in allowed_keys:
+                    errors.append(f"{path}.{key} is not allowed")
+        elif isinstance(additional_properties, dict) and isinstance(properties, dict):
+            for key, child_value in value.items():
+                if key not in properties:
+                    errors.extend(
+                        _json_schema_shape_errors(
+                            child_value,
+                            additional_properties,
+                            f"{path}.{key}",
+                        )
+                    )
+
+    if isinstance(value, list):
+        min_items = schema.get("minItems")
+        max_items = schema.get("maxItems")
+
+        if isinstance(min_items, int) and len(value) < min_items:
+            errors.append(f"{path} expected at least {min_items} item(s)")
+
+        if isinstance(max_items, int) and len(value) > max_items:
+            errors.append(f"{path} expected at most {max_items} item(s)")
+
+        items_schema = schema.get("items")
+
+        if isinstance(items_schema, dict):
+            for index, item in enumerate(value):
+                errors.extend(
+                    _json_schema_shape_errors(item, items_schema, f"{path}[{index}]")
+                )
+
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        enum = schema.get("enum")
+
+        if isinstance(enum, list) and value not in enum:
+            errors.append(f"{path} expected one of {enum}")
+
+        minimum = schema.get("minimum")
+        maximum = schema.get("maximum")
+
+        if isinstance(minimum, (int, float)) and value < minimum:
+            errors.append(f"{path} expected at least {minimum}")
+
+        if isinstance(maximum, (int, float)) and value > maximum:
+            errors.append(f"{path} expected at most {maximum}")
+
+    if isinstance(value, str):
+        enum = schema.get("enum")
+
+        if isinstance(enum, list) and value not in enum:
+            errors.append(f"{path} expected one of {enum}")
+
+    return errors
+
+
+def _matches_json_schema_type(value: Any, schema_type: Any) -> bool:
+    """Returns True when a JSON value matches one of the configured schema types."""
+
+    if isinstance(schema_type, list):
+        return any(_matches_json_schema_type(value, item) for item in schema_type)
+
+    if schema_type == "object":
+        return isinstance(value, dict)
+
+    if schema_type == "array":
+        return isinstance(value, list)
+
+    if schema_type == "string":
+        return isinstance(value, str)
+
+    if schema_type == "integer":
+        return isinstance(value, int) and not isinstance(value, bool)
+
+    if schema_type == "number":
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+    if schema_type == "boolean":
+        return isinstance(value, bool)
+
+    if schema_type == "null":
+        return value is None
+
+    return True
+
+
+def _format_json_schema_type(schema_type: Any) -> str:
+    """Formats a JSON Schema type value for diagnostics."""
+
+    if isinstance(schema_type, list):
+        return " or ".join(str(item) for item in schema_type)
+
+    return str(schema_type)
 
 
 def _strip_json_fence(raw_text: str) -> str:

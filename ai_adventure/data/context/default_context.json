@@ -68,7 +68,9 @@
         "guidelines": [
           "Treat known notes, reagents, and recipes as discovered knowledge.",
           "Undiscovered recipes should be hinted at through observation and experimentation.",
-          "When new alchemical knowledge is discovered, suggest a recipe, reagent, or notebook event."
+          "When new alchemical knowledge is discovered, suggest a recipe, reagent, or notebook event.",
+          "When the player learns a reagent's material type, alchemical qualities, motions, virtues, uses, or preparation notes, use ReagentDiscoveredEvent with name, material_type, qualities, motions, virtues, uses, and notes. Do not store discovered reagent properties only as WorldLoreAddedEvent.",
+          "If the player physically collects, harvests, picks up, or stores a reagent, also suggest InventoryItemAddedEvent for that same reagent."
         ]
       }
     },
@@ -80,7 +82,8 @@
       "priority": 82,
       "content": {
         "guidelines": [
-          "When an action's success, failure, speed, quality, or consequences are uncertain, suggest SkillCheckRequestedEvent.",
+          "When an action's success, failure, speed, quality, consequences, resource cost, or discovery quality are uncertain, suggest SkillCheckRequestedEvent before narrating a final outcome.",
+          "Foraging, harvesting, searching, researching, identifying, crafting, alchemy experiments, persuasion, stealth, combat, and named skill use require SkillCheckRequestedEvent unless the action is trivial and risk-free.",
           "Use SkillXpAddedEvent only after meaningful use, training, study, or practice.",
           "Do not use SkillXpAddedEvent as a substitute for resolving an uncertain action.",
           "Do not narrate final success or failure until the Python application has resolved the skill check."

@@ -169,6 +169,7 @@ class StateManager:
                 ReagentKnowledge(
                     id=_read_optional_int(row, "id"),
                     name=_read_string(row, "name", ""),
+                    material_type=_read_string(row, "material_type", ""),
                     qualities=_read_string_list(row, "qualities"),
                     motions=_read_string_list(row, "motions"),
                     virtues=_read_string_list(row, "virtues"),

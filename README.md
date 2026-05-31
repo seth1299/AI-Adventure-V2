@@ -93,9 +93,9 @@ The Alchemy Notebook is where the player tracks reagents, recipes, and discovere
 
 Planned features:
 
-- Display known reagents.
+- Display known reagents with material type.
 - Display known recipes.
-- Track discovered qualities, motions, virtues, and uses.
+- Track discovered material types, qualities, motions, virtues, and uses.
 - Support recipe discovery through events.
 - Eventually integrate with the adventure rules for experimentation and crafting.
 
@@ -148,7 +148,6 @@ Event models should represent meaningful changes in the game.
 
 Examples:
 
-- `StoryAdvancedEvent`
 - `InventoryItemAddedEvent`
 - `InventoryItemRemovedEvent`
 - `RecipeDiscoveredEvent`

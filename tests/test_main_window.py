@@ -5,6 +5,7 @@ import os
 import tempfile
 import unittest
 import importlib.util
+from types import SimpleNamespace
 from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -151,12 +152,114 @@ class MainWindowTests(unittest.TestCase):
             self.assertIn("- Take action.", screen.story_output.toPlainText())
             screen.close()
 
+    def test_story_submit_displays_player_text_and_busy_state_immediately(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            QApplication.instance() or QApplication([])
+            repository = SaveRepository.create_new_save(Path(temp_dir), "Submit Test")
+            screen = StoryScreen()
+            screen.set_repository(repository)
+            started_packets = []
+
+            def fake_start(context_packet):
+                started_packets.append(context_packet)
+
+            screen._start_gemini_story_request = fake_start
+            screen.player_input.setText("Look under the counter.")
+
+            screen._submit_player_action()
+
+            self.assertEqual(len(started_packets), 1)
+            self.assertIn("> Look under the counter.", screen.story_output.toPlainText())
+            self.assertEqual(screen.player_input.text(), "")
+            self.assertFalse(screen.player_input.isEnabled())
+            self.assertFalse(screen.submit_button.isEnabled())
+            self.assertEqual(screen.player_input.placeholderText(), "GM is thinking...")
+            self.assertEqual(screen.player_input.toolTip(), "GM is thinking...")
+            screen.close()
+
+    def test_story_result_keeps_input_disabled_until_tts_completes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            QApplication.instance() or QApplication([])
+            repository = SaveRepository.create_new_save(Path(temp_dir), "TTS Busy Test")
+            narration_player = FakeNarrationPlayer()
+            screen = StoryScreen(narration_player=narration_player)
+            screen.set_repository(repository)
+            screen._set_waiting_for_gm(True)
+
+            screen._handle_gemini_story_result(
+                SimpleNamespace(
+                    narrative_text="First sentence. Second sentence.",
+                    suggested_events=[],
+                )
+            )
+
+            self.assertFalse(screen.player_input.isEnabled())
+            self.assertFalse(screen.submit_button.isEnabled())
+            self.assertNotIn("First sentence.", screen.story_output.toPlainText())
+
+            narration_player.play_chunk("First sentence.")
+            QApplication.processEvents()
+
+            self.assertFalse(screen.player_input.isEnabled())
+            self.assertIn("First sentence.", screen.story_output.toPlainText())
+
+            narration_player.complete()
+            QApplication.processEvents()
+
+            self.assertTrue(screen.player_input.isEnabled())
+            self.assertTrue(screen.submit_button.isEnabled())
+            self.assertEqual(screen.player_input.placeholderText(), "Enter a player action...")
+            self.assertEqual(screen.player_input.toolTip(), "")
+            screen.close()
+
+    def test_ai_new_game_state_sets_currency_balance(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            QApplication.instance() or QApplication([])
+            temp_path = Path(temp_dir)
+            (temp_path / "saves").mkdir(parents=True, exist_ok=True)
+            (temp_path / "logs").mkdir(parents=True, exist_ok=True)
+            repository = SaveRepository.create_new_save(temp_path, "Currency Setup")
+            window = MainWindow(
+                app_paths=AppPaths(
+                    app_data_dir=temp_path,
+                    saves_dir=temp_path / "saves",
+                    logs_dir=temp_path / "logs",
+                    log_file=temp_path / "logs" / "ai_adventure.log",
+                )
+            )
+            setup = {
+                "currency_denominations": [
+                    {"name": "Bit", "plural_name": "Bits", "value": 1}
+                ]
+            }
+
+            window._apply_new_game_ai_state(
+                repository,
+                setup,
+                SimpleNamespace(
+                    start_location="",
+                    starting_calendar={},
+                    start_weather="",
+                    finalized_starting_currency_balance_base_units=37,
+                    finalized_currency_denominations=[],
+                    finalized_currency_description="",
+                    selected_genre="",
+                    finalized_character={},
+                    finalized_skills=[],
+                    finalized_starter_items=[],
+                ),
+            )
+
+            self.assertEqual(repository.get_state_value("currency.balance"), "37")
+            window.close()
+
     def test_alchemy_reagent_selection_populates_form_without_table_editing(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             QApplication.instance() or QApplication([])
             repository = SaveRepository.create_new_save(Path(temp_dir), "Alchemy UI Test")
             repository.add_alchemy_reagent(
                 name="Moon Salt",
+                material_type="Geological",
                 qualities=["cold", "silver"],
                 motions=["settling"],
                 virtues=["clarity"],
@@ -190,7 +293,10 @@ class MainWindowTests(unittest.TestCase):
             screen.reagent_table.selectRow(0)
             QApplication.processEvents()
 
+            self.assertEqual(screen.reagent_table.columnCount(), 7)
+            self.assertEqual(screen.reagent_table.horizontalHeaderItem(1).text(), "Material Type")
             self.assertEqual(screen.reagent_name_input.text(), "Moon Salt")
+            self.assertEqual(screen.reagent_material_type_input.text(), "Geological")
             self.assertEqual(screen.reagent_qualities_input.text(), "cold, silver")
             self.assertEqual(screen.reagent_motions_input.text(), "settling")
             self.assertEqual(screen.reagent_virtues_input.text(), "clarity")
@@ -198,9 +304,11 @@ class MainWindowTests(unittest.TestCase):
             self.assertEqual(screen.reagent_notes_input.toPlainText(), "Crystals hum softly.")
 
             screen.reagent_uses_input.setText("mirror inks")
+            screen.reagent_material_type_input.setText("Alchemical")
             screen._save_reagent()
 
             reagent = repository.list_alchemy_reagents()[0]
+            self.assertEqual(reagent["material_type"], "Alchemical")
             self.assertEqual(reagent["uses"], ["mirror inks"])
             self.assertEqual(screen.reagent_name_input.text(), "")
             screen.close()

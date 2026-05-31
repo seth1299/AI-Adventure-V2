@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+import sqlite3
+import random
 from pathlib import Path
 
 from ai_adventure.events.event_applier import EventApplier
@@ -42,6 +44,7 @@ class EventApplierTests(unittest.TestCase):
             self.assertEqual([result.status for result in results], ["applied", "applied"])
             self.assertEqual(len(glass_jars), 1)
             self.assertEqual(glass_jars[0]["quantity"], 1)
+            self.assertEqual(glass_jars[0]["value_base_units"], 1)
             self.assertIn("dried herbs", glass_jars[0]["description"])
 
             remove_result = applier.apply_event(
@@ -129,6 +132,153 @@ class EventApplierTests(unittest.TestCase):
                     if str(item.get("category", "")).casefold() == "currency"
                 },
             )
+
+    def test_inventory_item_added_merges_existing_stack(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = SaveRepository.create_new_save(Path(temp_dir), "Stack Test")
+
+            results = EventApplier(repository).apply_events(
+                [
+                    {
+                        "type": "InventoryItemAddedEvent",
+                        "payload": {
+                            "item_type": "Botanical",
+                            "item_name": "Silver-Spire Fern",
+                            "description": "Cool-natured fern.",
+                            "amount": 2,
+                            "value_base_units": 8,
+                        },
+                    },
+                    {
+                        "type": "InventoryItemAddedEvent",
+                        "payload": {
+                            "item_type": "Botanical",
+                            "item_name": "Silver-Spire Fern",
+                            "description": "Cool-natured fern.",
+                            "amount": 2,
+                            "value_base_units": 8,
+                        },
+                    },
+                ]
+            )
+
+            items = repository.list_inventory_items()
+
+            self.assertEqual([result.status for result in results], ["applied", "applied"])
+            fern_items = [item for item in items if item["name"] == "Silver-Spire Fern"]
+            self.assertEqual(len(fern_items), 1)
+            self.assertEqual(fern_items[0]["quantity"], 4)
+            self.assertEqual(fern_items[0]["value_base_units"], 8)
+
+    def test_failed_skill_check_blocks_following_reward_events(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = SaveRepository.create_new_save(Path(temp_dir), "Gate Test")
+            repository.upsert_skill("Foraging", "Finding useful materials.", 1)
+
+            results = EventApplier(repository, rng=random.Random(2)).apply_events(
+                [
+                    {
+                        "type": "SkillCheckRequestedEvent",
+                        "payload": {"skill_name": "Foraging", "dc": 14},
+                    },
+                    {
+                        "type": "InventoryItemAddedEvent",
+                        "payload": {
+                            "item_type": "Geological",
+                            "item_name": "Shimmering Stream Mineral",
+                            "description": "A dense, cool-to-the-touch stone.",
+                            "amount": 1,
+                            "value_base_units": 25,
+                        },
+                    },
+                    {
+                        "type": "StatusUpdatedEvent",
+                        "payload": {
+                            "location": "Dastrium Valley",
+                            "minutes_passed": 15,
+                            "weather": "Clear",
+                        },
+                    },
+                ]
+            )
+
+            self.assertEqual([result.status for result in results], ["applied", "skipped", "applied"])
+            self.assertIn("previous skill check failed", results[1].message)
+            self.assertNotIn(
+                "Shimmering Stream Mineral",
+                {item["name"] for item in repository.list_inventory_items()},
+            )
+            self.assertEqual(repository.get_state_snapshot()["location"], "Dastrium Valley")
+
+    def test_successful_skill_check_allows_following_reward_events(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = SaveRepository.create_new_save(Path(temp_dir), "Gate Test")
+            repository.upsert_skill("Foraging", "Finding useful materials.", 5)
+
+            results = EventApplier(repository, rng=random.Random(2)).apply_events(
+                [
+                    {
+                        "type": "SkillCheckRequestedEvent",
+                        "payload": {"skill_name": "Foraging", "dc": 11},
+                    },
+                    {
+                        "type": "InventoryItemAddedEvent",
+                        "payload": {
+                            "item_type": "Botanical",
+                            "item_name": "Silver-Spire Fern",
+                            "description": "Cool-natured fern.",
+                            "amount": 1,
+                            "value_base_units": 8,
+                        },
+                    },
+                ]
+            )
+
+            self.assertEqual([result.status for result in results], ["applied", "applied"])
+            self.assertIn(
+                "Silver-Spire Fern",
+                {item["name"] for item in repository.list_inventory_items()},
+            )
+
+    def test_existing_duplicate_inventory_stacks_are_coalesced_on_load(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            save_path = Path(temp_dir) / "old.sqlite3"
+            connection = sqlite3.connect(save_path)
+            try:
+                connection.executescript(
+                    """
+                    CREATE TABLE inventory_items (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        name TEXT NOT NULL,
+                        category TEXT NOT NULL DEFAULT '',
+                        quantity INTEGER NOT NULL DEFAULT 1,
+                        description TEXT NOT NULL DEFAULT '',
+                        value_base_units INTEGER NOT NULL DEFAULT 0
+                    );
+                    INSERT INTO inventory_items (
+                        name,
+                        category,
+                        quantity,
+                        description,
+                        value_base_units
+                    )
+                    VALUES
+                        ('Silver-Spire Fern', 'Botanical', 2, 'Cool-natured fern.', 8),
+                        ('Silver-Spire Fern', 'Botanical', 2, 'Cool-natured fern.', 8);
+                    """
+                )
+            finally:
+                connection.close()
+
+            repository = SaveRepository(save_path)
+            fern_items = [
+                item
+                for item in repository.list_inventory_items()
+                if item["name"] == "Silver-Spire Fern"
+            ]
+
+            self.assertEqual(len(fern_items), 1)
+            self.assertEqual(fern_items[0]["quantity"], 4)
 
     def test_location_changed_event_stores_short_broad_location_name(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -238,6 +388,7 @@ class EventApplierTests(unittest.TestCase):
                         "type": "ReagentDiscoveredEvent",
                         "payload": {
                             "name": "Moonwater",
+                            "material_type": "Elemental",
                             "qualities": ["cool", "moist"],
                             "motions": ["stilling", "opening"],
                             "virtues": ["reception"],
@@ -262,6 +413,7 @@ class EventApplierTests(unittest.TestCase):
             recipes = repository.list_alchemy_recipes()
 
             self.assertEqual(reagents[0]["name"], "Moonwater")
+            self.assertEqual(reagents[0]["material_type"], "Elemental")
             self.assertEqual(reagents[0]["qualities"], ["cool", "moist"])
             self.assertEqual(recipes[0]["name"], "Quiet Sleep Draught")
             self.assertEqual(recipes[0]["ingredients"], ["Moonwater: 1", "Mooncap Fungus: 1"])

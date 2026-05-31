@@ -28,7 +28,7 @@
           "Return valid JSON only, with no Markdown fence.",
           "Do not put legacy double-bracket events in response.",
           "Only put player-facing text in response.",
-          "Use events for inventory, world, quest, skill, currency, recipe, process, project, music, spell, and status changes.",
+                    "Use supported events for inventory, world, quest, task, skill, currency, recipe, reagent, NPC, music, spell, note, flag, and status changes.",
           "The Python application validates events before committing state."
         ]
       }
@@ -136,7 +136,7 @@
           "If the Player is speaking in character, DO NOT PARAPHRASE WHAT THE PLAYER SAID AS A DIEGETIC RESPONSE SAID BY THE PLAYER CHARACTER.",
           "Instead, you may paraphrase what the Player just said, but as a NON-DIEGETIC comment.",
           "Do not put words into the Player's mouth.",
-          "Use double quotation marks only for the outer boundaries of spoken dialogue. If an NPC mentions a named item, title, shop, location, inscription, nickname, or other quoted specific inside dialogue, use single quotation marks around that inner name.",
+          "Spoken dialogue must use double quotation marks around the speaker's full spoken sentence or paragraph. Do not use single quotation marks as the outer boundary of dialogue. Use single quotation marks only when an already-double-quoted speaker mentions a named item, title, shop, location, inscription, nickname, or other quoted specific inside that dialogue.",
           "Assume that whatever the Player is typing inside of Quotation Marks is usually said out loud (still check the context of the scene, but unless the Player is doing an OOG statement to you, Quotation Marks usually means that the Player is directly talking to an NPC). ---"
         ]
       }
@@ -256,7 +256,6 @@
           "Use the provided calendar settings and current calendar snapshot for date, day, month, season, and time labels.",
           "Do not invent new date labels in event payloads. Advance time only with `minutes_passed`; the Python application derives the displayed calendar date.",
           "Use each season's weather hint as the real-world analogue for weather, temperature, plants, and daylight tone.",
-          "If you suggest a ProjectWorkAppliedEvent event, the worked minutes must be included in the StatusUpdatedEvent `minutes_passed` payload.",
           "Do not include in structured event data passive process time in `MinutesPassed`; passive processes run in the background.",
           "Do not suggest StatusUpdatedEvent for fully Out-Of-Game messages."
         ]
@@ -280,10 +279,12 @@
         "payload_fields": [
           "skill_name"
         ],
-        "purpose": "If the player explicitly says they use a named skill, or attempts an action that could plausibly fail, go poorly, take extra time, produce a partial result, reveal misleading information, consume resources, attract attention, cause harm, or vary in quality, suggest SkillCheckRequestedEvent before narrating the final outcome. Do not hand-wave these actions as automatic success unless they are trivial, risk-free, and have no meaningful consequence.",
+        "purpose": "If the player explicitly says they use a named skill, or attempts an action that could plausibly fail, go poorly, take extra time, produce a partial result, reveal misleading information, consume resources, attract attention, cause harm, miss something, or vary in quality, suggest SkillCheckRequestedEvent before narrating the final outcome. Do not hand-wave these actions as automatic success unless they are trivial, risk-free, and have no meaningful consequence.",
         "rules": [
-          "Suggest SkillCheckRequestedEvent when an action's success, failure, speed, quality, or consequences are uncertain.",
+          "Suggest SkillCheckRequestedEvent when an action's success, failure, speed, quality, consequences, resource cost, or discovery quality are uncertain.",
+          "Foraging, harvesting, searching, researching, identifying, crafting, alchemy experiments, persuasion, stealth, combat, and named skill use require SkillCheckRequestedEvent unless the action is trivial and risk-free.",
           "Prefer SkillCheckRequestedEvent over SkillXpAddedEvent when the player is attempting a risky or uncertain action.",
+          "Do not narrate found items, harvested resources, crafted products, persuaded NPC outcomes, stealth results, combat results, or research conclusions as final success until after the Python application resolves the check.",
           "Use the most relevant skill name.",
           "If no existing skill fits and the player is attempting something new, choose a clear new skill name.",
           "Die rolls are non-diegetic. Do not mention dice, raw roll numbers, or game mechanics in the story narration.",
@@ -379,7 +380,7 @@
           "The current smallest/base currency is `{BASE_CURRENCY_NAME}`.",
           "In narration, dialogue, options, merchant offers, quest rewards, fees, and summaries, never say \"base unit\" or \"base units.\"",
           "For player-facing money amounts, use actual denomination names, not \"base unit\" or \"base units.\"",
-          "For completed purchases, sales, fees, rewards, refunds, and change, suggest one CurrencyChangedEvent for the net money movement.",
+          "For completed purchases, sales, fees, rewards, refunds, and change, suggest one CurrencyChangedEvent for the net money movement. Its payload field must be exactly base_unit_amount; never use net_base_unit_amount.",
           "Example: if the player has 1 Gold Piece and buys an item costing 3 Silver Pieces and 5 Copper Pieces, suggest CurrencyChangedEvent with base_unit_amount -35. Do not add or remove coin inventory items; the application displays the remaining balance as 6 Silver Pieces and 5 Copper Pieces.",
           "Example: if the fee is 10 base currency units, write the narration with actual denominations and suggest CurrencyChangedEvent with base_unit_amount -10."
         ]
@@ -441,7 +442,7 @@
           "`Item Name` should be specific.",
           "`Description` should explain what the item is and include in structured event data important state information, such as what sort of ammunition is used for a bow or a gun.",
           "`Amount` must be a positive integer.",
-          "`ValueBaseUnits` is optional. When an item has monetary value, provide its integer value in the baseline currency unit from state.currency.baseline_unit.",
+          "`ValueBaseUnits` is required for every InventoryItemAddedEvent and must be an integer of at least 1, measured in the baseline currency unit from state.currency.baseline_unit.",
           "Quest-related items should use `Quest Item` as the item type.",
           "Raw materials and refined materials should use different item types when relevant.",
           "Food, tools, weapons, ammo, armor, clothes, containers, crafting materials, books, documents, and valuables should be classified clearly."
@@ -509,184 +510,6 @@
       }
     },
     {
-      "id": "event.modify_stat",
-      "title": "StatModifiedEvent Contract",
-      "category": "event_contract",
-      "tags": [
-        "events",
-        "state"
-      ],
-      "priority": 70,
-      "content": {
-        "legacy_tag": "MODIFY_STAT",
-        "do_not_emit_legacy_tag": true,
-        "event_type": "StatModifiedEvent",
-        "payload_fields": [
-          "stat_name",
-          "value_change"
-        ],
-        "purpose": "Changes an existing tracked stat.",
-        "rules": [
-          "Suggest StatModifiedEvent only for stats explicitly listed in the `[CURRENT STATUS]` block.",
-          "Do not use this to create a new stat.",
-          "Use `SET X` to set the stat to a specific value.",
-          "Use `+X` to increase the stat.",
-          "Use `-X` to decrease the stat.",
-          "Values must be integers.",
-          "Follow the stat's rules and description from the `[CURRENT STATUS]` block. For example, if there is a stat labeled \"Hunger\" and the description says \"Increases over time\", then modify it slightly every turn.",
-          "Do not exceed logical minimums or maximums."
-        ]
-      }
-    },
-    {
-      "id": "event.define_stat",
-      "title": "StatDefinedEvent Contract",
-      "category": "event_contract",
-      "tags": [
-        "events",
-        "state"
-      ],
-      "priority": 70,
-      "content": {
-        "legacy_tag": "DEFINE_STAT",
-        "do_not_emit_legacy_tag": true,
-        "event_type": "StatDefinedEvent",
-        "payload_fields": [
-          "name",
-          "starting_value",
-          "description"
-        ],
-        "purpose": "Creates a new tracked stat when the story or setup needs one.",
-        "rules": [
-          "Suggest StatDefinedEvent only when a new stat is truly needed.",
-          "`Name` should be short and clear.",
-          "`Starting Value` must be an integer.",
-          "`Description` must explain what the stat tracks and include in structured event data minimum and maximum rules when possible.",
-          "Do not use this if the stat already exists in `[CURRENT STATUS]`."
-        ]
-      }
-    },
-    {
-      "id": "event.start_process",
-      "title": "ProcessStartedEvent Contract",
-      "category": "event_contract",
-      "tags": [
-        "events",
-        "process",
-        "crafting"
-      ],
-      "priority": 70,
-      "content": {
-        "legacy_tag": "START_PROCESS",
-        "do_not_emit_legacy_tag": true,
-        "event_type": "ProcessStartedEvent",
-        "payload_fields": [
-          "name",
-          "description",
-          "duration_minutes",
-          "expected_yield"
-        ],
-        "purpose": "Starts a passive process that completes automatically after a set amount of in-game time.",
-        "rules": [
-          "Suggest ProcessStartedEvent for time-sensitive processes that run in the background.",
-          "Examples include in structured event data drying, curing, fermenting, brewing, waiting for a commission, travel delivery, crop growth, repairs by an NPC, or similar passive progress.",
-          "If ingredients or items are consumed to start the process, suggest InventoryItemRemovedEvent first.",
-          "`DurationMinutes` must be an integer number of minutes.",
-          "`Description` should explain what is happening and how the player can collect or finish it once the process is completed.",
-          "Do not mention the exact future completion time in the description; the Python engine calculates that.",
-          "Passive process time should not be added to the final StatusUpdatedEvent event."
-        ]
-      }
-    },
-    {
-      "id": "event.start_project",
-      "title": "ProjectStartedEvent Contract",
-      "category": "event_contract",
-      "tags": [
-        "events",
-        "project",
-        "crafting"
-      ],
-      "priority": 70,
-      "content": {
-        "legacy_tag": "START_PROJECT",
-        "do_not_emit_legacy_tag": true,
-        "event_type": "ProjectStartedEvent",
-        "payload_fields": [
-          "name",
-          "description",
-          "total_minutes_required",
-          "skill_name",
-          "expected_yield"
-        ],
-        "purpose": "Starts an active project that requires player labor over time.",
-        "rules": [
-          "Suggest ProjectStartedEvent for projects the player must actively work on.",
-          "Examples include in structured event data building, repairing, crafting, researching, training, translating, clearing debris, writing, mapping, or other labor-based tasks.",
-          "`TotalMinutesRequired` is the base time a novice would need.",
-          "`SkillName` is the skill that affects work speed or quality.",
-          "`ExpectedYield` describes the expected result when completed.",
-          "If ingredients or tools are consumed at project start, suggest InventoryItemRemovedEvent first.",
-          "Do not use this for passive waiting. Use ProcessStartedEvent instead."
-        ]
-      }
-    },
-    {
-      "id": "event.work",
-      "title": "ProjectWorkAppliedEvent Contract",
-      "category": "event_contract",
-      "tags": [
-        "events",
-        "project",
-        "crafting",
-        "time"
-      ],
-      "priority": 70,
-      "content": {
-        "legacy_tag": "WORK",
-        "do_not_emit_legacy_tag": true,
-        "event_type": "ProjectWorkAppliedEvent",
-        "payload_fields": [
-          "project_name",
-          "minutes_worked"
-        ],
-        "purpose": "Applies active labor time to an existing project.",
-        "rules": [
-          "Suggest ProjectWorkAppliedEvent when the player actively works on a project that already exists.",
-          "`ProjectName` should match the existing project name as closely as possible.",
-          "`MinutesWorked` must be an integer or decimal number of minutes.",
-          "If this event is used, the same amount of time must also be reflected in the StatusUpdatedEvent payload.",
-          "Do not use this for passive processes.",
-          "Do not suggest this event if the player merely talks about working but does not actually spend time working."
-        ]
-      }
-    },
-    {
-      "id": "event.remove_process",
-      "title": "ProcessRemovedEvent Contract",
-      "category": "event_contract",
-      "tags": [
-        "events",
-        "process"
-      ],
-      "priority": 70,
-      "content": {
-        "legacy_tag": "REMOVE_PROCESS",
-        "do_not_emit_legacy_tag": true,
-        "event_type": "ProcessRemovedEvent",
-        "payload_fields": [
-          "name"
-        ],
-        "purpose": "Removes a completed or canceled passive process or project from the processing panel.",
-        "rules": [
-          "Suggest ProcessRemovedEvent when the player collects the result of a completed process or project.",
-          "Suggest ProcessRemovedEvent when a process or project is canceled, abandoned, destroyed, or made irrelevant.",
-          "When collecting the result, also suggest InventoryItemAddedEvent for the produced item if the player receives one.",
-          "`Name` should match the process or project name as closely as possible."
-        ]
-      }
-    },
-    {
       "id": "event.recipe",
       "title": "RecipeDiscoveredEvent Contract",
       "category": "event_contract",
@@ -712,6 +535,42 @@
           "Use logical ingredient names and quantities.",
           "Do not include in structured event data more than 3 ingredients.",
           "Do not use this to craft the item by itself. Crafting still requires InventoryItemRemovedEvent for ingredients and InventoryItemAddedEvent for the result."
+        ]
+      }
+    },
+    {
+      "id": "event.reagent",
+      "title": "ReagentDiscoveredEvent Contract",
+      "category": "event_contract",
+      "tags": [
+        "events",
+        "alchemy",
+        "reagent",
+        "crafting"
+      ],
+      "priority": 70,
+      "content": {
+        "legacy_tag": "REAGENT",
+        "do_not_emit_legacy_tag": true,
+        "event_type": "ReagentDiscoveredEvent",
+        "payload_fields": [
+          "name",
+          "material_type",
+          "qualities",
+          "motions",
+          "virtues",
+          "uses",
+          "notes"
+        ],
+        "purpose": "Saves a discovered alchemical reagent with structured properties for the Alchemy Notebook.",
+        "rules": [
+          "Suggest ReagentDiscoveredEvent when the player learns that a plant, mineral, fluid, creature part, or other material is useful as an alchemical reagent.",
+          "Do not use name-only reagent payloads. Include material_type, qualities, motions, virtues, uses, and notes.",
+          "`Material Type` should be a broad category such as Botanical, Fungal, Geological, Animal, Elemental, Alchemical, or a clear hybrid category.",
+          "`Qualities`, `Motions`, `Virtues`, and `Uses` must be arrays of short strings.",
+          "`Notes` should summarize player-known preparation, habitat, season, warnings, or source information.",
+          "ReagentDiscoveredEvent records notebook knowledge only. If the player physically collects, harvests, picks up, or stores the reagent, also suggest InventoryItemAddedEvent for the same reagent.",
+          "Use WorldLoreAddedEvent only for broader plant or world facts that are not structured reagent properties. If the player learns reagent properties, use ReagentDiscoveredEvent."
         ]
       }
     },
@@ -760,12 +619,12 @@
           "This event is for player-learned facts, not omniscient facts.",
           "Partial knowledge is valid. If the player learns that a named thing exists and learns even one useful fact about it, suggest an WorldLoreAddedEvent event for that visible fact.",
           "Do not skip a useful visible world update merely because the player has not learned every detail about the entity yet.",
-          "If a fact contains both player-known information and hidden information, split it. Put only the visible/player-known part in WorldLoreAddedEvent, and put hidden details in SecretAddedEvent.",
+          "If a fact contains both player-known information and hidden information, split it. Put only the visible/player-known part in WorldLoreAddedEvent, and do not include hidden details in suggested events.",
           "The text should be concise, factual, and encyclopedia-like.",
           "`Key` is the stable entry name, such as a location, faction, religion, law, custom, currency, or concept name.",
           "`Text` is the full player-facing lore text for that key.",
           "Use one WorldLoreAddedEvent event per newly learned entity or concept when multiple distinct facts are learned in the same response.",
-          "Do not include in structured event data hidden secrets the player has not learned. Use SecretAddedEvent for GM-only information.",
+          "Do not include in structured event data hidden secrets the player has not learned.",
           "Avoid time-relative wording such as tonight, tomorrow, yesterday, earlier today, or currently.",
           "Write durable and consistent facts that will still make sense later.",
           "If the section is unclear, use Uncategorized.",
@@ -802,64 +661,10 @@
           "Key must exactly match the existing World tab entry key whenever possible.",
           "Replacement Lore must be the full updated encyclopedia-style entry.",
           "Do not pair WorldLoreChangedEvent with WorldLoreAddedEvent for the same fact in the same response.",
-          "Do not include in structured event data hidden secrets the player has not learned. Use SecretAddedEvent for GM-only information.",
+          "Do not include in structured event data hidden secrets the player has not learned.",
           "Do not add labels, categories, parentheticals, or research subtopics to the key.",
           "If the existing entry key is `Glass-Gales`, the key must be `Glass-Gales`, not `Glass-Gales (Survival Tactics)`.",
           "Replacement Lore must keep the same entity key and incorporate the new facts into the full updated entry."
-        ]
-      }
-    },
-    {
-      "id": "event.secret",
-      "title": "SecretAddedEvent Contract",
-      "category": "event_contract",
-      "tags": [
-        "events",
-        "secret",
-        "world"
-      ],
-      "priority": 70,
-      "content": {
-        "legacy_tag": "SECRET",
-        "do_not_emit_legacy_tag": true,
-        "event_type": "SecretAddedEvent",
-        "payload_fields": [
-          "hidden_information"
-        ],
-        "purpose": "Stores GM-only information that the player should not see yet.",
-        "rules": [
-          "Suggest SecretAddedEvent for hidden villain identities, secret motives, traps, undiscovered treasure, conspiracy details, false alibis, off-screen plans, mystery solutions, and other concealed facts.",
-          "Do not reveal this information in the visible narration unless the player discovers it.",
-          "Keep the secret concise and factual.",
-          "Do not use this for information that the player is intended to learn. Use WorldLoreAddedEvent for newly discovered world facts."
-        ]
-      }
-    },
-    {
-      "id": "event.merchant",
-      "title": "MerchantInterfaceRequestedEvent Contract",
-      "category": "event_contract",
-      "tags": [
-        "events",
-        "merchant",
-        "currency"
-      ],
-      "priority": 70,
-      "content": {
-        "legacy_tag": "MERCHANT",
-        "do_not_emit_legacy_tag": true,
-        "event_type": "MerchantInterfaceRequestedEvent",
-        "payload_fields": [
-          "mode",
-          "items"
-        ],
-        "purpose": "",
-        "rules": [
-          "BUY means the player pays money and receives the listed item.",
-          "SELL means the player gives up the listed item and receives money.",
-          "Put BUY or SELL exactly once, immediately after MERCHANT:.",
-          "Never put BUY or SELL before individual item entries.",
-          "MerchantInterfaceRequestedEvent can open or describe a shop interface, but it does not replace final transaction events. When a purchase or sale actually succeeds, use InventoryItemAddedEvent or InventoryItemRemovedEvent for goods and CurrencyChangedEvent for the net base-unit money change. Do not add or remove coin inventory items. == Good BUY example: == == Good SELL example: == == Bad Examples: == MerchantInterfaceRequestedEvent MerchantInterfaceRequestedEvent MerchantInterfaceRequestedEvent ---"
         ]
       }
     },
@@ -1069,12 +874,12 @@
           "Do not include coin names inside CurrencyChangedEvent.",
           "Do not charge money until the player agrees to pay.",
           "Do not add purchased items until the purchase succeeds.",
-          "When a purchase succeeds, do not add only the item; also suggest CurrencyChangedEvent for the net price as a negative base_unit_amount.",
+          "When a purchase succeeds, do not add only the item; also suggest CurrencyChangedEvent with payload.base_unit_amount as the negative net price. Never use net_base_unit_amount.",
           "Do not model payment or change as coin inventory items. Currency is a single integer balance formatted into denominations by the application.",
           "Do not suggest structured events for events that happened in previous turns.",
-          "Do not create stats with StatModifiedEvent; use StatDefinedEvent.",
+          "Do not invent stat events. Track durable changes with the supported event types in the response contract.",
           "Do not create items with InventoryItemModifiedEvent; use InventoryItemAddedEvent.",
-          "Do not reveal secret information in visible narration, use SecretAddedEvent instead.",
+          "Do not reveal secret information in visible narration or suggested events unless the player has learned it.",
           "Do not suggest StatusUpdatedEvent for fully Out-Of-Game messages.",
           "Do not invent sound filenames.",
           "Do not invent event names.",
@@ -1150,7 +955,7 @@
           "Did I preserve fog of war?",
           "Did I suggest structured events only for current-turn events?",
           "Did I use CurrencyChangedEvent for money instead of coin names?",
-          "Did I use exact item/stat/project/quest names where possible?",
+          "Did I use exact item, task, NPC, skill, world, and quest names where possible?",
           "Did I suggest a StatusUpdatedEvent for in-game turns when status changes are needed (unless explicitly told otherwise)?",
           "Did I end with exactly `What do you do now?`",
           "Did I include 3-4 suggested_actions in the JSON response?",
