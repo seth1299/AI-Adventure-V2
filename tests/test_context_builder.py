@@ -126,6 +126,8 @@ class ContextBuilderTests(unittest.TestCase):
         self.assertEqual(packet["state"]["world_profile"]["summary"], "Rainmarket is a canal city.")
         self.assertEqual(packet["state"]["world_profile"]["genre"], "Realistic detective mystery")
         self.assertEqual(packet["state"]["currency"]["world_description"], "Crowns and half-crowns.")
+        self.assertIn("display_balance", packet["state"]["currency"])
+        self.assertIn("Currency is not an inventory item", packet["state"]["currency"]["transaction_rule"])
         self.assertEqual(
             packet["state"]["scene"]["time"],
             "Monday, Month 1 1, Year 1, Morning",
@@ -188,6 +190,11 @@ class ContextBuilderTests(unittest.TestCase):
             {category["id"] for category in packet["creative_ideas"]["categories"]},
         )
         self.assertIn("npc_memory", packet["response_contract"])
+        self.assertIn("currency_transactions", packet["response_contract"])
+        self.assertIn(
+            "not inventory coin items",
+            packet["response_contract"]["currency_transactions"],
+        )
         self.assertIn("multiple entries", packet["response_contract"]["events"])
         self.assertIn(
             "one NpcUpsertedEvent per distinct meaningful NPC",

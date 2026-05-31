@@ -90,6 +90,46 @@ class EventApplierTests(unittest.TestCase):
             self.assertEqual(snapshot["flag.met_gate_guard"], "True")
             self.assertEqual(snapshot["currency.balance"], "25")
 
+    def test_purchase_events_use_single_currency_balance_for_change(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = SaveRepository.create_new_save(Path(temp_dir), "Purchase Test")
+            repository.set_state_value("currency.balance", "100")
+
+            results = EventApplier(repository).apply_events(
+                [
+                    {
+                        "type": "InventoryItemAddedEvent",
+                        "payload": {
+                            "item_name": "Traveling Cloak",
+                            "category": "Clothing",
+                            "quantity": 1,
+                            "description": "A warm cloak for canal evenings.",
+                            "value_base_units": 35,
+                        },
+                    },
+                    {
+                        "type": "CurrencyChangedEvent",
+                        "payload": {"base_unit_amount": -35},
+                    },
+                ]
+            )
+
+            items = repository.list_inventory_items()
+            snapshot = repository.get_state_snapshot()
+
+            self.assertEqual([result.status for result in results], ["applied", "applied"])
+            self.assertIn("Traveling Cloak", {item["name"] for item in items})
+            self.assertEqual(snapshot["currency.balance"], "65")
+            self.assertIn("6 Silver Pieces and 5 Copper Pieces", results[1].message)
+            self.assertNotIn(
+                "Gold Piece",
+                {
+                    item["name"]
+                    for item in items
+                    if str(item.get("category", "")).casefold() == "currency"
+                },
+            )
+
     def test_location_changed_event_stores_short_broad_location_name(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             repository = SaveRepository.create_new_save(Path(temp_dir), "Location Test")
@@ -437,6 +477,122 @@ class EventApplierTests(unittest.TestCase):
             self.assertEqual([result.status for result in results], ["applied", "applied"])
             self.assertIn("Rough-Looking Figure", visible_names)
             self.assertIn("Second Rough-Looking Figure", visible_names)
+
+    def test_npc_upsert_merges_changed_internal_name_for_same_person(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = SaveRepository.create_new_save(Path(temp_dir), "NPC Test")
+            applier = EventApplier(repository)
+
+            first_result = applier.apply_event(
+                {
+                    "type": "NpcUpsertedEvent",
+                    "payload": {
+                        "internal_name": "copper_kettle_bartender",
+                        "display_name": "Bartender",
+                        "role": "Innkeeper",
+                        "location": "Copper Kettle",
+                        "player_facing_information": (
+                            "The person managing the Copper Kettle."
+                        ),
+                    },
+                }
+            )
+            with self.assertLogs("ai_adventure.events.event_applier", level="WARNING") as logs:
+                second_result = applier.apply_event(
+                    {
+                        "type": "NpcUpsertedEvent",
+                        "payload": {
+                            "internal_name": "copper_kettle_bartender_innkeeper_copper_kettle",
+                            "display_name": "Elara",
+                            "role": "Innkeeper",
+                            "location": "Copper Kettle",
+                            "player_facing_information": (
+                                "The manager of the Copper Kettle who hears local rumors."
+                            ),
+                        },
+                    }
+                )
+
+            npcs = repository.list_npcs()
+            visible_npcs = repository.list_player_visible_npcs()
+
+            self.assertEqual(first_result.status, "applied")
+            self.assertEqual(second_result.status, "applied")
+            self.assertIn("Removed banned generated NPC display_name", "\n".join(logs.output))
+            self.assertEqual(len(npcs), 1)
+            self.assertEqual(npcs[0]["npc_id"], "copper_kettle_bartender")
+            self.assertEqual(visible_npcs[0]["display_name"], "Bartender")
+            self.assertNotEqual(visible_npcs[0]["display_name"], "Elara")
+            self.assertIn("local rumors", visible_npcs[0]["notes"])
+
+    def test_npc_lists_coalesce_legacy_duplicate_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = SaveRepository.create_new_save(Path(temp_dir), "NPC Test")
+
+            with repository._connect() as connection:
+                connection.executemany(
+                    """
+                    INSERT INTO npcs (
+                        npc_id,
+                        name,
+                        display_name,
+                        role,
+                        location,
+                        public_description,
+                        player_facing_information,
+                        knowledge_scope_json,
+                        known_facts_json,
+                        disposition,
+                        created_at,
+                        updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    [
+                        (
+                            "copper_kettle_bartender",
+                            "copper_kettle_bartender",
+                            "Bartender",
+                            "Innkeeper",
+                            "Copper Kettle",
+                            "A practical bartender.",
+                            "The person managing the Copper Kettle.",
+                            '["Local gossip"]',
+                            "[]",
+                            "",
+                            "2026-05-30T18:26:05",
+                            "2026-05-30T18:26:05",
+                        ),
+                        (
+                            "copper_kettle_bartender_innkeeper_copper_kettle",
+                            "copper_kettle_bartender_innkeeper_copper_kettle",
+                            "Elara",
+                            "Innkeeper",
+                            "Copper Kettle",
+                            "A practical bartender with a welcoming presence.",
+                            "The manager of the Copper Kettle who hears local rumors.",
+                            '["Merchant trade"]',
+                            "[]",
+                            "",
+                            "2026-05-30T18:28:23",
+                            "2026-05-30T18:28:23",
+                        ),
+                    ],
+                )
+
+            visible_npcs = repository.list_player_visible_npcs()
+            relevant_npcs = repository.list_relevant_npcs(
+                location="Copper Kettle",
+                query_text="talk to the bartender",
+            )
+
+            self.assertEqual(len(visible_npcs), 1)
+            self.assertEqual(visible_npcs[0]["display_name"], "Bartender")
+            self.assertIn("local rumors", visible_npcs[0]["notes"])
+            self.assertEqual(len(relevant_npcs), 1)
+            self.assertEqual(relevant_npcs[0]["npc_id"], "copper_kettle_bartender")
+            self.assertIn("Local gossip", relevant_npcs[0]["knowledge_scope"])
+            self.assertIn("Merchant trade", relevant_npcs[0]["knowledge_scope"])
 
     def test_records_mechanical_event_results(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

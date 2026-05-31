@@ -6,6 +6,7 @@ from ai_adventure.alchemy.rulebook import AlchemyRulebook, AlchemyRulebookLoader
 from ai_adventure.context.creative_ideas import CreativeIdeasLibrary
 from ai_adventure.context.models import ContextLibrary
 from ai_adventure.context.reference_loader import ContextReferenceLoader
+from ai_adventure.currency import format_currency_amount
 from ai_adventure.core.models import AdventureState
 
 
@@ -304,6 +305,10 @@ class AiContextBuilder:
                 },
                 "currency": {
                     "balance_base_units": state.currency.balance_base_units,
+                    "display_balance": format_currency_amount(
+                        state.currency.balance_base_units,
+                        state.currency.denominations,
+                    ),
                     "denominations": state.currency.denominations,
                     "world_description": str(
                         state.settings.values.get("currency.description", "")
@@ -316,6 +321,15 @@ class AiContextBuilder:
                     "item_value_rule": (
                         "Inventory item value_base_units is an integer measured "
                         "in the baseline currency unit."
+                    ),
+                    "transaction_rule": (
+                        "Currency is not an inventory item. For purchases, sales, "
+                        "rewards, fees, refunds, change, or other money movement, "
+                        "suggest CurrencyChangedEvent with one net base_unit_amount. "
+                        "For example, buying a 35-base-unit item while paying with "
+                        "one 100-base-unit coin is still base_unit_amount -35; the "
+                        "application displays the remaining 65 base units as the "
+                        "appropriate denominations."
                     ),
                 },
                 "alchemy": {
@@ -339,7 +353,8 @@ class AiContextBuilder:
                         "xp_rule": (
                             "Suggest SkillXpAddedEvent only after meaningful use, "
                             "training, study, or practice; do not use XP as a "
-                            "substitute for a check."
+                            "substitute for a check. Always include xp_amount; use "
+                            "1 for a tiny meaningful gain if no stronger amount is obvious."
                         ),
                     },
                     "known_skills": [
@@ -505,10 +520,8 @@ class AiContextBuilder:
                     "longer active."
                 ),
                 "background_music": (
-                    "Use state.audio.valid_music_tracks for scene-aware background "
-                    "music. Suggest MusicChangedEvent when a meaningful scene, mood, "
-                    "location, environment, or danger shift calls for a different "
-                    "track. The filename must exactly match a valid track."
+                    "When StatusUpdatedEvent.location changes to a substantially different environment type, compare state.audio.current_music to state.audio.valid_music_tracks."
+                    "If a listed track clearly better matches the new environment or mood, include MusicChangedEvent before the final StatusUpdatedEvent."
                 ),
                 "creative_ideas": (
                     "Treat creative_ideas as the preferred source of style seeds "
@@ -527,7 +540,19 @@ class AiContextBuilder:
                     "only for facts the NPC plausibly learned this turn. In "
                     "NpcUpsertedEvent, display_name and player_facing_information are "
                     "player-visible and must not include secrets or undiscovered names. "
-                    "Use one NpcUpsertedEvent per distinct meaningful NPC introduced."
+                    "Before creating an NPC, inspect state.npcs.relevant. If the same "
+                    "person is already listed, reuse that existing npc_id/internal "
+                    "identifier and update the one profile; do not create a second "
+                    "internal name for the same role/person at the same location. Use "
+                    "one NpcUpsertedEvent per distinct meaningful NPC introduced."
+                ),
+                "currency_transactions": (
+                    "The player's money is state.currency.balance_base_units, not "
+                    "inventory coin items. When a purchase succeeds, include both "
+                    "the inventory event for the item and a CurrencyChangedEvent "
+                    "for the net price as a negative base_unit_amount. Do not model "
+                    "making change as separate coin items; the application formats "
+                    "the resulting integer balance into coin denominations."
                 ),
                 "out_of_game": "Boolean. True only for fully out-of-game answers.",
                 "event_shape": {

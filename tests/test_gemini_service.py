@@ -60,6 +60,7 @@ class GeminiServiceTests(unittest.TestCase):
             {
                 "packet_type": "story_turn",
                 "player_command": "look around",
+                "creative_ideas": {"banned_terms": ["Elara"]},
             }
         )
 
@@ -75,6 +76,12 @@ class GeminiServiceTests(unittest.TestCase):
         self.assertIn("player_facing_information is shown directly", prompt)
         self.assertIn("Creative naming boundary", prompt)
         self.assertIn("Never use creative_ideas.banned_terms", prompt)
+        self.assertIn("Exact banned proper nouns", prompt)
+        self.assertIn("Elara", prompt)
+        self.assertIn("reuse that exact npc_id/internal identifier", prompt)
+        self.assertIn("use single quotation marks for the inner quoted name", prompt)
+        self.assertIn("Currency is stored as one integer", prompt)
+        self.assertIn("do not create coin inventory", prompt)
         self.assertIn("look around", prompt)
 
     def test_parse_json_response(self) -> None:
@@ -116,6 +123,59 @@ class GeminiServiceTests(unittest.TestCase):
                 "What do you do now?\n"
                 "- Shield the flame.\n"
                 "- Listen at the door."
+            ),
+        )
+
+    def test_story_formatting_splits_after_sentence_ending_quote(self) -> None:
+        formatted = format_story_message(
+            '"Are you looking for a bite to eat, or something else?" What do you do now?\n'
+            "- Order a meal.\n"
+            "- Ask about rumors."
+        )
+
+        self.assertEqual(
+            formatted,
+            (
+                '"Are you looking for a bite to eat, or something else?"\n\n'
+                "What do you do now?\n"
+                "- Order a meal.\n"
+                "- Ask about rumors."
+            ),
+        )
+
+    def test_story_formatting_keeps_multi_sentence_dialogue_together(self) -> None:
+        formatted = format_story_message(
+            '"It is not just the rocks, Kit. The herb-gatherers I talk to? '
+            "They have been complaining. Some call it 'Ghost Moss.' "
+            'Does that sound like your sort of thing?" What do you do now?\n'
+            "- Ask about Ghost Moss.\n"
+            "- Order a drink."
+        )
+
+        self.assertEqual(
+            formatted,
+            (
+                '"It is not just the rocks, Kit. The herb-gatherers I talk to? '
+                "They have been complaining. Some call it 'Ghost Moss.' "
+                'Does that sound like your sort of thing?"\n\n'
+                "What do you do now?\n"
+                "- Ask about Ghost Moss.\n"
+                "- Order a drink."
+            ),
+        )
+
+    def test_story_formatting_keeps_dialogue_with_attribution_together(self) -> None:
+        formatted = format_story_message(
+            '"Fair enough. A scholar is just as good as a merchant, I suppose," '
+            'she says with a light chuckle. What do you do now?'
+        )
+
+        self.assertEqual(
+            formatted,
+            (
+                '"Fair enough. A scholar is just as good as a merchant, I suppose," '
+                "she says with a light chuckle.\n\n"
+                "What do you do now?"
             ),
         )
 

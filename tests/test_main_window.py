@@ -19,6 +19,7 @@ from ai_adventure.app.app_paths import AppPaths
 from ai_adventure.persistence.save_repository import SaveRepository
 from ai_adventure.ui.main_window import (
     AlchemyNotebookScreen,
+    GameShell,
     MainWindow,
     NewGameWizard,
     StoryScreen,
@@ -69,6 +70,7 @@ class MainWindowTests(unittest.TestCase):
                 self.assertIn("Character", tab_names)
                 self.assertIn("World", tab_names)
                 self.assertIn("Active Tasks", tab_names)
+                self.assertFalse(window.windowIcon().isNull())
                 npc_headers = [
                     window.game_shell.npcs_screen.table.horizontalHeaderItem(index).text()
                     for index in range(window.game_shell.npcs_screen.table.columnCount())
@@ -202,6 +204,75 @@ class MainWindowTests(unittest.TestCase):
             self.assertEqual(reagent["uses"], ["mirror inks"])
             self.assertEqual(screen.reagent_name_input.text(), "")
             screen.close()
+
+    def test_refresh_keeps_inventory_sorted_after_repository_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            QApplication.instance() or QApplication([])
+            repository = SaveRepository.create_new_save(Path(temp_dir), "Refresh Sort Test")
+            repository.add_inventory_item(
+                name="Small Stone",
+                category="Item",
+                quantity=1,
+                description="A small stone.",
+                value_base_units=0,
+            )
+            repository.add_inventory_item(
+                name="Torch",
+                category="Tool",
+                quantity=2,
+                description="A pitch torch.",
+                value_base_units=1,
+            )
+            shell = GameShell(on_return_to_menu=lambda: None)
+            shell.set_repository(repository)
+
+            shell.inventory_screen._sort_by_column(2)
+            shell.inventory_screen._sort_by_column(2)
+            repository.add_inventory_item(
+                name="Rope",
+                category="Tool",
+                quantity=3,
+                description="A coil of rope.",
+                value_base_units=5,
+            )
+
+            shell.refresh_screens()
+
+            self.assertEqual(shell.inventory_screen.table.item(0, 0).text(), "Rope")
+            self.assertEqual(shell.inventory_screen.table.item(1, 0).text(), "Torch")
+            self.assertEqual(shell.inventory_screen.table.item(2, 0).text(), "Small Stone")
+            shell.close()
+
+    def test_inventory_screen_displays_currency_balance_outside_inventory(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            QApplication.instance() or QApplication([])
+            repository = SaveRepository.create_new_save(Path(temp_dir), "Currency UI Test")
+            repository.set_state_value("currency.balance", "65")
+            shell = GameShell(on_return_to_menu=lambda: None)
+            shell.set_repository(repository)
+
+            self.assertEqual(
+                shell.inventory_screen.currency_label.text(),
+                "Currency: 6 Silver Pieces and 5 Copper Pieces",
+            )
+            shell.close()
+
+    def test_settings_autosave_persists_slider_release_and_refreshes_tabs(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            QApplication.instance() or QApplication([])
+            repository = SaveRepository.create_new_save(Path(temp_dir), "Settings Test")
+            shell = GameShell(on_return_to_menu=lambda: None)
+            shell.set_repository(repository)
+
+            shell.settings_screen.music_volume_slider.setValue(42)
+            shell.settings_screen.music_volume_slider.sliderReleased.emit()
+            shell.settings_screen.days_per_week_input.setValue(8)
+            QApplication.processEvents()
+
+            self.assertEqual(repository.get_setting("audio.music_volume"), 42)
+            self.assertEqual(repository.get_calendar_settings()["days_per_week"], 8)
+            self.assertEqual(shell.calendar_screen.table.columnCount(), 8)
+            shell.close()
 
     def test_new_game_wizard_loads_template_fields(self) -> None:
         QApplication.instance() or QApplication([])

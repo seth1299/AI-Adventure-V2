@@ -71,6 +71,8 @@ class AudioTests(unittest.TestCase):
 
             self.assertEqual(sound_directory, paths.package_music_tracks_dir)
             self.assertTrue((sound_directory / "Boss_Fight.mp3").exists())
+            self.assertEqual(paths.app_icon_path, paths.package_data_dir / "app_icon.ico")
+            self.assertTrue(paths.app_icon_path.exists())
             self.assertEqual(paths.kokoro_model_path, paths.package_tts_dir / "kokoro-v1.0.onnx")
             self.assertEqual(paths.kokoro_voices_path, paths.package_tts_dir / "voices-v1.0.bin")
             self.assertTrue(paths.kokoro_model_path.exists())

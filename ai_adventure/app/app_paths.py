@@ -47,6 +47,18 @@ class AppPaths:
         return self.repo_root / "ai_adventure" / "audio"
 
     @property
+    def package_data_dir(self) -> Path:
+        """Returns the packaged source-tree data asset directory."""
+
+        return self.repo_root / "ai_adventure" / "data"
+
+    @property
+    def app_icon_path(self) -> Path:
+        """Returns the packaged application icon path."""
+
+        return self.package_data_dir / "app_icon.ico"
+
+    @property
     def package_music_tracks_dir(self) -> Path:
         """Returns the packaged music-track directory."""
 
@@ -71,8 +83,14 @@ class AppPaths:
         return self.app_data_dir / "models" / "tts"
 
     @property
-    def new_game_template_path(self) -> Path:
-        """Returns the reusable new-game wizard template path."""
+    def new_game_templates_path(self) -> Path:
+        """Returns the reusable new-game wizard templates path."""
+
+        return self.app_data_dir / "new_game_templates.json"
+
+    @property
+    def legacy_new_game_template_path(self) -> Path:
+        """Returns the old single-template new-game wizard path."""
 
         return self.app_data_dir / "new_game_template.json"
 

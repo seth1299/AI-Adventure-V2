@@ -2,16 +2,17 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 
-from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QColor, QPalette
+from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtGui import QColor, QIcon, QPalette
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDialog,
     QFormLayout,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QMainWindow,
@@ -68,7 +69,7 @@ from ai_adventure.new_game_setup import (
     parse_starter_items_text,
 )
 from ai_adventure.new_game_templates import (
-    load_new_game_template,
+    load_new_game_templates,
     save_new_game_template,
 )
 from ai_adventure.persistence.save_repository import SaveRepository, SaveSummary
@@ -160,6 +161,7 @@ class RepositoryBackedWidget(QWidget):
     def __init__(self) -> None:
         super().__init__()
         self._repository: SaveRepository | None = None
+        self.on_repository_changed: Callable[["RepositoryBackedWidget"], None] | None = None
 
     def set_repository(self, repository: SaveRepository | None) -> None:
         """
@@ -184,6 +186,12 @@ class RepositoryBackedWidget(QWidget):
 
     def refresh(self) -> None:
         """Refreshes screen data. Subclasses may override this."""
+
+    def notify_repository_changed(self) -> None:
+        """Notifies the shell that saved data changed and other tabs should refresh."""
+
+        if self.on_repository_changed is not None:
+            self.on_repository_changed(self)
 
 
 class MainWindow(QMainWindow):
@@ -213,6 +221,7 @@ class MainWindow(QMainWindow):
         )
 
         self.setWindowTitle("AI Adventure")
+        self._set_app_icon()
         self.resize(1100, 750)
 
         self.stack = QStackedWidget()
@@ -235,18 +244,94 @@ class MainWindow(QMainWindow):
 
         self.return_to_menu()
 
+    def _set_app_icon(self) -> None:
+        """Sets the main-window icon when the packaged icon is available."""
+
+        icon_path = self.app_paths.app_icon_path
+
+        if not icon_path.exists():
+            LOGGER.warning("Application icon not found: %s", icon_path)
+            return
+
+        icon = QIcon(str(icon_path))
+
+        if icon.isNull():
+            LOGGER.warning("Application icon could not be loaded: %s", icon_path)
+            return
+
+        self.setWindowIcon(icon)
+
     def start_new_game_wizard(self) -> None:
         """Opens the New Game Wizard."""
 
-        wizard = NewGameWizard(
-            self,
-            template_setup=load_new_game_template(self.app_paths.new_game_template_path),
-        )
+        should_continue, template_setup = self._choose_new_game_template_setup()
+
+        if not should_continue:
+            return
+
+        wizard = NewGameWizard(self, template_setup=template_setup)
 
         if wizard.exec() != QDialog.DialogCode.Accepted:
             return
 
         self.create_new_game(wizard.build_setup())
+
+    def _choose_new_game_template_setup(self) -> tuple[bool, dict[str, Any] | None]:
+        """Asks whether a new game should start blank or from a saved template."""
+
+        choice = QMessageBox(self)
+        choice.setWindowTitle("New Game")
+        choice.setText("How would you like to start this new game?")
+        scratch_button = choice.addButton(
+            "Start From Scratch",
+            QMessageBox.ButtonRole.AcceptRole,
+        )
+        template_button = choice.addButton(
+            "Load Template",
+            QMessageBox.ButtonRole.ActionRole,
+        )
+        cancel_button = choice.addButton(QMessageBox.StandardButton.Cancel)
+        choice.exec()
+
+        clicked_button = choice.clickedButton()
+
+        if clicked_button == cancel_button:
+            return False, None
+
+        if clicked_button != template_button:
+            return True, None
+
+        templates = load_new_game_templates(
+            self.app_paths.new_game_templates_path,
+            legacy_template_path=self.app_paths.legacy_new_game_template_path,
+        )
+
+        if not templates:
+            QMessageBox.information(
+                self,
+                "No Templates Found",
+                "No saved new-game templates were found. Starting from scratch instead.",
+            )
+            return True, None
+
+        template_names = [template.name for template in templates]
+        selected_name, accepted = QInputDialog.getItem(
+            self,
+            "Load New Game Template",
+            "Template:",
+            template_names,
+            0,
+            False,
+        )
+
+        if not accepted:
+            return False, None
+
+        for template in templates:
+            if template.name == selected_name:
+                return True, template.setup
+
+        return True, None
 
     def create_new_game(self, setup: dict[str, Any]) -> None:
         """
@@ -269,7 +354,7 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "New Game Failed", "Could not create a new game.")
             return
 
-        save_new_game_template(self.app_paths.new_game_template_path, clean_setup)
+        save_new_game_template(self.app_paths.new_game_templates_path, clean_setup)
         self._synthesize_new_game_world(repository, clean_setup)
         self.open_repository(repository)
         self.game_shell.story_screen.narrate_latest_story()
@@ -1124,6 +1209,9 @@ class GameShell(QWidget):
             self.settings_screen,
         ]
 
+        for screen in self.screens:
+            screen.on_repository_changed = self._handle_screen_repository_changed
+
         self.tabs.addTab(self.story_screen, "Story")
         self.tabs.addTab(self.character_screen, "Character")
         self.tabs.addTab(self.world_screen, "World")
@@ -1163,6 +1251,27 @@ class GameShell(QWidget):
             screen.set_repository(repository)
 
         self._apply_audio_settings()
+
+    def refresh_screens(
+        self,
+        *,
+        exclude: set[RepositoryBackedWidget] | None = None,
+    ) -> None:
+        """Refreshes tabs from saved data while preserving each screen's local state."""
+
+        excluded_screens = exclude or set()
+
+        for screen in self.screens:
+            if screen in excluded_screens:
+                continue
+
+            screen.refresh()
+
+    def _handle_screen_repository_changed(self, source: RepositoryBackedWidget) -> None:
+        """Refreshes tabs after a screen or event changes repository data."""
+
+        self._apply_audio_settings()
+        self.refresh_screens(exclude={source})
 
     def _handle_tab_changed(self, index: int) -> None:
         """Resets the calendar view to the current month when opened."""
@@ -1267,7 +1376,7 @@ class StoryScreen(RepositoryBackedWidget):
             content = str(entry.get("content", ""))
 
             if kind == "player":
-                story_lines.append(f"You: {content}")
+                story_lines.append(f"> {content}")
             elif kind == "story":
                 entry_id = _safe_int(entry.get("id"), -1)
 
@@ -1276,8 +1385,10 @@ class StoryScreen(RepositoryBackedWidget):
                         story_lines.append("\n\n".join(self._revealed_story_chunks))
                 else:
                     story_lines.append(format_story_message(content))
-
-        self.story_output.setPlainText("\n\n".join(story_lines))
+        #"\n\n".join(story_lines).join("\n\n")
+        output = "\n\n".join(story_lines).join("\n\n")
+        #output += "\n============================================================================\n"
+        self.story_output.setPlainText(output)
         self.story_output.moveCursor(self.story_output.textCursor().MoveOperation.End)
 
     def _submit_player_action(self) -> None:
@@ -1350,6 +1461,7 @@ class StoryScreen(RepositoryBackedWidget):
                     sound_manager=self.sound_manager,
                     narration_player=self.narration_player,
                 )
+                self.notify_repository_changed()
 
         self.player_input.clear()
 
@@ -1521,6 +1633,7 @@ class CharacterScreen(RepositoryBackedWidget):
         repository.set_setting("player.backstory", self.backstory_input.toPlainText().strip())
         repository.set_setting("player.notes", self.notes_input.toPlainText().strip())
         repository.append_history("system", "Character profile updated.")
+        self.notify_repository_changed()
 
         QMessageBox.information(self, "Character Saved", "Character profile was saved.")
 
@@ -1710,9 +1823,11 @@ class InventoryScreen(RepositoryBackedWidget):
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         _enable_table_sorting(self.table, self._sort_by_column)
         self.table.horizontalHeader().setSortIndicator(self._sort_column, self._sort_order)
+        self.currency_label = QLabel("Currency: 0")
 
         layout = QVBoxLayout()
         layout.addWidget(QLabel("Inventory"))
+        layout.addWidget(self.currency_label)
         layout.addWidget(self.table)
 
         self.setLayout(layout)
@@ -1723,11 +1838,19 @@ class InventoryScreen(RepositoryBackedWidget):
         repository = self.repository()
 
         if repository is None:
+            self.currency_label.setText("Currency: 0")
             self.table.setRowCount(0)
             return
 
         items = repository.list_inventory_items()
         denominations = repository.get_currency_denominations()
+        balance_base_units = _safe_int(
+            repository.get_state_value("currency.balance", "0"),
+            0,
+        )
+        self.currency_label.setText(
+            f"Currency: {format_currency_amount(balance_base_units, denominations)}"
+        )
         items.sort(
             key=self._sort_key,
             reverse=_sort_descending(self._sort_order),
@@ -2067,6 +2190,10 @@ class AlchemyNotebookScreen(RepositoryBackedWidget):
         self.tabs = QTabWidget()
         self._reagent_rows: list[dict[str, Any]] = []
         self._refreshing_reagents = False
+        self._reagent_sort_column = 0
+        self._reagent_sort_order = Qt.SortOrder.AscendingOrder
+        self._recipe_sort_column = 0
+        self._recipe_sort_order = Qt.SortOrder.AscendingOrder
 
         self._setup_reagents_tab()
         self._setup_recipes_tab()
@@ -2099,7 +2226,11 @@ class AlchemyNotebookScreen(RepositoryBackedWidget):
         self.reagent_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.reagent_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.reagent_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
-        _use_soft_table_selection(self.reagent_table)
+        _enable_table_sorting(self.reagent_table, self._sort_reagents_by_column)
+        self.reagent_table.horizontalHeader().setSortIndicator(
+            self._reagent_sort_column,
+            self._reagent_sort_order,
+        )
         self.reagent_table.horizontalHeader().setStretchLastSection(True)
         self.reagent_table.itemSelectionChanged.connect(self._load_selected_reagent)
 
@@ -2151,7 +2282,11 @@ class AlchemyNotebookScreen(RepositoryBackedWidget):
             ["Name", "Ingredients", "Result", "Motions", "Virtues", "Notes"]
         )
         self.recipe_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        _use_soft_table_selection(self.recipe_table)
+        _enable_table_sorting(self.recipe_table, self._sort_recipes_by_column)
+        self.recipe_table.horizontalHeader().setSortIndicator(
+            self._recipe_sort_column,
+            self._recipe_sort_order,
+        )
         self.recipe_table.horizontalHeader().setStretchLastSection(True)
 
         self.recipe_name_input = QLineEdit()
@@ -2192,6 +2327,10 @@ class AlchemyNotebookScreen(RepositoryBackedWidget):
 
         reagents = repository.list_alchemy_reagents()
         selected_name = self.reagent_name_input.text().strip()
+        reagents.sort(
+            key=self._reagent_sort_key,
+            reverse=_sort_descending(self._reagent_sort_order),
+        )
         self._reagent_rows = reagents
         self._refreshing_reagents = True
         self.reagent_table.clearSelection()
@@ -2218,6 +2357,10 @@ class AlchemyNotebookScreen(RepositoryBackedWidget):
         """Reloads the recipe table."""
 
         recipes = repository.list_alchemy_recipes()
+        recipes.sort(
+            key=self._recipe_sort_key,
+            reverse=_sort_descending(self._recipe_sort_order),
+        )
         self.recipe_table.setRowCount(len(recipes))
 
         for row_index, recipe in enumerate(recipes):
@@ -2261,6 +2404,7 @@ class AlchemyNotebookScreen(RepositoryBackedWidget):
         self.reagent_notes_input.clear()
 
         self.refresh()
+        self.notify_repository_changed()
 
     def _load_selected_reagent(self) -> None:
         """Loads the selected reagent row into the edit controls."""
@@ -2326,6 +2470,73 @@ class AlchemyNotebookScreen(RepositoryBackedWidget):
         self.recipe_notes_input.clear()
 
         self.refresh()
+        self.notify_repository_changed()
+
+    def _sort_reagents_by_column(self, column_index: int) -> None:
+        """Sorts reagents by a clicked header column."""
+
+        self._reagent_sort_column, self._reagent_sort_order = _update_sort_state(
+            self.reagent_table,
+            self._reagent_sort_column,
+            self._reagent_sort_order,
+            column_index,
+        )
+        self.refresh()
+
+    def _sort_recipes_by_column(self, column_index: int) -> None:
+        """Sorts recipes by a clicked header column."""
+
+        self._recipe_sort_column, self._recipe_sort_order = _update_sort_state(
+            self.recipe_table,
+            self._recipe_sort_column,
+            self._recipe_sort_order,
+            column_index,
+        )
+        self.refresh()
+
+    def _reagent_sort_key(self, reagent: dict[str, Any]) -> tuple[str, str]:
+        """Returns the active reagent sort key."""
+
+        name = str(reagent.get("name", "")).casefold()
+
+        if self._reagent_sort_column == 1:
+            return _join_list(reagent.get("qualities", [])).casefold(), name
+
+        if self._reagent_sort_column == 2:
+            return _join_list(reagent.get("motions", [])).casefold(), name
+
+        if self._reagent_sort_column == 3:
+            return _join_list(reagent.get("virtues", [])).casefold(), name
+
+        if self._reagent_sort_column == 4:
+            return _join_list(reagent.get("uses", [])).casefold(), name
+
+        if self._reagent_sort_column == 5:
+            return str(reagent.get("notes", "")).casefold(), name
+
+        return name, name
+
+    def _recipe_sort_key(self, recipe: dict[str, Any]) -> tuple[str, str]:
+        """Returns the active recipe sort key."""
+
+        name = str(recipe.get("name", "")).casefold()
+
+        if self._recipe_sort_column == 1:
+            return _join_list(recipe.get("ingredients", [])).casefold(), name
+
+        if self._recipe_sort_column == 2:
+            return str(recipe.get("result", "")).casefold(), name
+
+        if self._recipe_sort_column == 3:
+            return _join_list(recipe.get("motions", [])).casefold(), name
+
+        if self._recipe_sort_column == 4:
+            return _join_list(recipe.get("virtues", [])).casefold(), name
+
+        if self._recipe_sort_column == 5:
+            return str(recipe.get("notes", "")).casefold(), name
+
+        return name, name
 
 class HistoryScreen(RepositoryBackedWidget):
     """Private player journal that is never sent to the AI."""
@@ -2365,6 +2576,7 @@ class HistoryScreen(RepositoryBackedWidget):
             return
 
         repository.set_journal_notes(self.journal_input.toPlainText())
+        self.notify_repository_changed()
         QMessageBox.information(self, "Journal Saved", "Journal notes were saved.")
 
 
@@ -2375,15 +2587,24 @@ class SettingsScreen(RepositoryBackedWidget):
         super().__init__()
 
         self.on_audio_settings_changed = on_audio_settings_changed
+        self._loading_settings = False
+        self._saving_settings = False
+        self._autosave_timer = QTimer(self)
+        self._autosave_timer.setSingleShot(True)
+        self._autosave_timer.setInterval(400)
+        self._autosave_timer.timeout.connect(self._save_settings)
 
         self.theme_combo = QComboBox()
         self.theme_combo.addItems(["System", "Light", "Dark"])
+        self.theme_combo.currentIndexChanged.connect(lambda _index: self._save_settings())
 
         self.music_enabled_checkbox = QCheckBox("Music enabled")
         self.music_enabled_checkbox.setChecked(True)
+        self.music_enabled_checkbox.toggled.connect(lambda _checked: self._save_settings())
 
         self.narrator_enabled_checkbox = QCheckBox("Narrator enabled")
         self.narrator_enabled_checkbox.setChecked(True)
+        self.narrator_enabled_checkbox.toggled.connect(lambda _checked: self._save_settings())
 
         self.music_volume_slider = QSlider(Qt.Orientation.Horizontal)
         self.music_volume_slider.setRange(0, 100)
@@ -2392,6 +2613,7 @@ class SettingsScreen(RepositoryBackedWidget):
         self.music_volume_slider.valueChanged.connect(
             lambda value: self.music_volume_label.setText(f"{value}%")
         )
+        self.music_volume_slider.sliderReleased.connect(self._save_settings)
 
         self.tts_volume_slider = QSlider(Qt.Orientation.Horizontal)
         self.tts_volume_slider.setRange(0, 100)
@@ -2400,44 +2622,56 @@ class SettingsScreen(RepositoryBackedWidget):
         self.tts_volume_slider.valueChanged.connect(
             lambda value: self.tts_volume_label.setText(f"{value}%")
         )
+        self.tts_volume_slider.sliderReleased.connect(self._save_settings)
 
         self.days_per_week_input = QSpinBox()
         self.days_per_week_input.setRange(1, 14)
         self.days_per_week_input.setValue(int(DEFAULT_CALENDAR_SETTINGS["days_per_week"]))
+        self.days_per_week_input.valueChanged.connect(lambda _value: self._save_settings())
 
         self.weeks_per_month_input = QSpinBox()
         self.weeks_per_month_input.setRange(1, 12)
         self.weeks_per_month_input.setValue(int(DEFAULT_CALENDAR_SETTINGS["weeks_per_month"]))
+        self.weeks_per_month_input.valueChanged.connect(lambda _value: self._save_settings())
 
         self.months_per_year_input = QSpinBox()
         self.months_per_year_input.setRange(1, 24)
         self.months_per_year_input.setValue(int(DEFAULT_CALENDAR_SETTINGS["months_per_year"]))
+        self.months_per_year_input.valueChanged.connect(lambda _value: self._save_settings())
 
         self.seasons_per_year_input = QSpinBox()
         self.seasons_per_year_input.setRange(1, 12)
         self.seasons_per_year_input.setValue(int(DEFAULT_CALENDAR_SETTINGS["seasons_per_year"]))
+        self.seasons_per_year_input.valueChanged.connect(lambda _value: self._save_settings())
 
         self.day_names_input = QLineEdit()
+        self.day_names_input.editingFinished.connect(self._save_settings)
+        self.day_names_input.textChanged.connect(lambda _text: self._schedule_settings_save())
         self.month_names_input = QLineEdit()
+        self.month_names_input.editingFinished.connect(self._save_settings)
+        self.month_names_input.textChanged.connect(lambda _text: self._schedule_settings_save())
         self.season_names_input = QLineEdit()
+        self.season_names_input.editingFinished.connect(self._save_settings)
+        self.season_names_input.textChanged.connect(lambda _text: self._schedule_settings_save())
         self.season_hints_input = QLineEdit()
+        self.season_hints_input.editingFinished.connect(self._save_settings)
+        self.season_hints_input.textChanged.connect(lambda _text: self._schedule_settings_save())
 
         self.additional_ai_context_input = QTextEdit()
         self.additional_ai_context_input.setPlaceholderText(
             "Optional AI-facing guidance, style preferences, boundaries, or reminders..."
         )
+        self.additional_ai_context_input.textChanged.connect(self._schedule_settings_save)
 
         self.time_display_combo = QComboBox()
         self.time_display_combo.addItem("Narrative", "narrative")
         self.time_display_combo.addItem("12-hour", "12_hour")
         self.time_display_combo.addItem("24-hour", "24_hour")
+        self.time_display_combo.currentIndexChanged.connect(lambda _index: self._save_settings())
 
         self.currency_name_inputs: list[QLineEdit] = []
         self.currency_plural_inputs: list[QLineEdit] = []
         self.currency_value_inputs: list[QSpinBox] = []
-
-        save_button = QPushButton("Save Settings")
-        save_button.clicked.connect(self._save_settings)
 
         layout = QFormLayout()
         layout.addRow("Theme Preference:", self.theme_combo)
@@ -2464,6 +2698,11 @@ class SettingsScreen(RepositoryBackedWidget):
             value_input.setMaximum(1_000_000_000)
             value_input.setValue(int(denomination["value"]))
             value_input.setEnabled(index != 0)
+            name_input.editingFinished.connect(self._save_settings)
+            name_input.textChanged.connect(lambda _text: self._schedule_settings_save())
+            plural_input.editingFinished.connect(self._save_settings)
+            plural_input.textChanged.connect(lambda _text: self._schedule_settings_save())
+            value_input.valueChanged.connect(lambda _value: self._save_settings())
 
             row = QHBoxLayout()
             row.addWidget(name_input)
@@ -2476,145 +2715,161 @@ class SettingsScreen(RepositoryBackedWidget):
 
             layout.addRow(f"Currency {index + 1}:", row)
 
-        layout.addRow(save_button)
-
         self.setLayout(layout)
 
     def refresh(self) -> None:
         """Reloads settings."""
 
         repository = self.repository()
+        self._autosave_timer.stop()
+        self._loading_settings = True
 
-        if repository is None:
-            self.theme_combo.setCurrentText("System")
-            self.days_per_week_input.setValue(int(DEFAULT_CALENDAR_SETTINGS["days_per_week"]))
-            self.weeks_per_month_input.setValue(int(DEFAULT_CALENDAR_SETTINGS["weeks_per_month"]))
-            self.months_per_year_input.setValue(int(DEFAULT_CALENDAR_SETTINGS["months_per_year"]))
-            self.seasons_per_year_input.setValue(int(DEFAULT_CALENDAR_SETTINGS["seasons_per_year"]))
-            self.day_names_input.clear()
-            self.month_names_input.clear()
-            self.season_names_input.clear()
-            self.season_hints_input.clear()
-            self.additional_ai_context_input.clear()
-            self.time_display_combo.setCurrentIndex(0)
-            self.music_enabled_checkbox.setChecked(True)
-            self.narrator_enabled_checkbox.setChecked(True)
-            self.music_volume_slider.setValue(25)
-            self.tts_volume_slider.setValue(90)
+        try:
+            if repository is None:
+                self.theme_combo.setCurrentText("System")
+                self.days_per_week_input.setValue(int(DEFAULT_CALENDAR_SETTINGS["days_per_week"]))
+                self.weeks_per_month_input.setValue(int(DEFAULT_CALENDAR_SETTINGS["weeks_per_month"]))
+                self.months_per_year_input.setValue(int(DEFAULT_CALENDAR_SETTINGS["months_per_year"]))
+                self.seasons_per_year_input.setValue(int(DEFAULT_CALENDAR_SETTINGS["seasons_per_year"]))
+                self.day_names_input.clear()
+                self.month_names_input.clear()
+                self.season_names_input.clear()
+                self.season_hints_input.clear()
+                self.additional_ai_context_input.clear()
+                self.time_display_combo.setCurrentIndex(0)
+                self.music_enabled_checkbox.setChecked(True)
+                self.narrator_enabled_checkbox.setChecked(True)
+                self.music_volume_slider.setValue(25)
+                self.tts_volume_slider.setValue(90)
+                return
+
+            theme = repository.get_setting("theme", "System")
+            additional_ai_context = repository.get_setting("ai.additional_context", "")
+            denominations = repository.get_currency_denominations()
+            calendar_settings = repository.get_calendar_settings()
+
+            if theme in ["System", "Light", "Dark"]:
+                self.theme_combo.setCurrentText(str(theme))
+            else:
+                LOGGER.warning("Unknown theme setting '%s'. Falling back to System.", theme)
+                self.theme_combo.setCurrentText("System")
+
+            for index, denomination in enumerate(denominations[: len(self.currency_name_inputs)]):
+                self.currency_name_inputs[index].setText(str(denomination["name"]))
+                self.currency_plural_inputs[index].setText(str(denomination["plural_name"]))
+                self.currency_value_inputs[index].setValue(int(denomination["value"]))
+
+            self.days_per_week_input.setValue(int(calendar_settings["days_per_week"]))
+            self.weeks_per_month_input.setValue(int(calendar_settings["weeks_per_month"]))
+            self.months_per_year_input.setValue(int(calendar_settings["months_per_year"]))
+            self.seasons_per_year_input.setValue(int(calendar_settings["seasons_per_year"]))
+            self.day_names_input.setText(", ".join(str(name) for name in calendar_settings["day_names"]))
+            self.month_names_input.setText(
+                ", ".join(str(name) for name in calendar_settings["month_names"])
+            )
+            self.season_names_input.setText(
+                ", ".join(str(season["name"]) for season in calendar_settings["seasons"])
+            )
+            self.season_hints_input.setText(
+                ", ".join(str(season["weather_hint"]) for season in calendar_settings["seasons"])
+            )
+            _set_combo_to_data(self.time_display_combo, str(calendar_settings["time_display"]))
+            self.additional_ai_context_input.setPlainText(str(additional_ai_context))
+            self.music_enabled_checkbox.setChecked(
+                _bool_setting(repository.get_setting("audio.music_enabled", True), True)
+            )
+            self.narrator_enabled_checkbox.setChecked(
+                _bool_setting(repository.get_setting("audio.narrator_enabled", True), True)
+            )
+            self.music_volume_slider.setValue(
+                _clamped_int(repository.get_setting("audio.music_volume", 25), 25, 0, 100)
+            )
+            self.tts_volume_slider.setValue(
+                _clamped_int(repository.get_setting("audio.tts_volume", 90), 90, 0, 100)
+            )
+        finally:
+            self._loading_settings = False
+
+    def _schedule_settings_save(self) -> None:
+        """Debounces text-field autosaves."""
+
+        if self._loading_settings or self._saving_settings:
             return
 
-        theme = repository.get_setting("theme", "System")
-        additional_ai_context = repository.get_setting("ai.additional_context", "")
-        denominations = repository.get_currency_denominations()
-        calendar_settings = repository.get_calendar_settings()
-
-        if theme in ["System", "Light", "Dark"]:
-            self.theme_combo.setCurrentText(str(theme))
-        else:
-            LOGGER.warning("Unknown theme setting '%s'. Falling back to System.", theme)
-            self.theme_combo.setCurrentText("System")
-
-        for index, denomination in enumerate(denominations[: len(self.currency_name_inputs)]):
-            self.currency_name_inputs[index].setText(str(denomination["name"]))
-            self.currency_plural_inputs[index].setText(str(denomination["plural_name"]))
-            self.currency_value_inputs[index].setValue(int(denomination["value"]))
-
-        self.days_per_week_input.setValue(int(calendar_settings["days_per_week"]))
-        self.weeks_per_month_input.setValue(int(calendar_settings["weeks_per_month"]))
-        self.months_per_year_input.setValue(int(calendar_settings["months_per_year"]))
-        self.seasons_per_year_input.setValue(int(calendar_settings["seasons_per_year"]))
-        self.day_names_input.setText(", ".join(str(name) for name in calendar_settings["day_names"]))
-        self.month_names_input.setText(
-            ", ".join(str(name) for name in calendar_settings["month_names"])
-        )
-        self.season_names_input.setText(
-            ", ".join(str(season["name"]) for season in calendar_settings["seasons"])
-        )
-        self.season_hints_input.setText(
-            ", ".join(str(season["weather_hint"]) for season in calendar_settings["seasons"])
-        )
-        _set_combo_to_data(self.time_display_combo, str(calendar_settings["time_display"]))
-        self.additional_ai_context_input.setPlainText(str(additional_ai_context))
-        self.music_enabled_checkbox.setChecked(
-            _bool_setting(repository.get_setting("audio.music_enabled", True), True)
-        )
-        self.narrator_enabled_checkbox.setChecked(
-            _bool_setting(repository.get_setting("audio.narrator_enabled", True), True)
-        )
-        self.music_volume_slider.setValue(
-            _clamped_int(repository.get_setting("audio.music_volume", 25), 25, 0, 100)
-        )
-        self.tts_volume_slider.setValue(
-            _clamped_int(repository.get_setting("audio.tts_volume", 90), 90, 0, 100)
-        )
+        self._autosave_timer.start()
 
     def _save_settings(self) -> None:
-        """Saves settings to the active save."""
+        """Autosaves settings to the active save."""
 
         repository = self.repository()
 
-        if repository is None:
+        if repository is None or self._loading_settings or self._saving_settings:
             return
 
-        repository.set_setting("theme", self.theme_combo.currentText())
-        repository.set_setting(
-            "ai.additional_context",
-            self.additional_ai_context_input.toPlainText().strip(),
-        )
-        repository.set_setting("audio.music_enabled", self.music_enabled_checkbox.isChecked())
-        repository.set_setting("audio.narrator_enabled", self.narrator_enabled_checkbox.isChecked())
-        repository.set_setting("audio.music_volume", self.music_volume_slider.value())
-        repository.set_setting("audio.tts_volume", self.tts_volume_slider.value())
-        repository.set_currency_denominations(
-            [
-                {
-                    "name": name_input.text(),
-                    "plural_name": plural_input.text(),
-                    "value": 1 if index == 0 else value_input.value(),
-                }
-                for index, (name_input, plural_input, value_input) in enumerate(
-                    zip(
-                        self.currency_name_inputs,
-                        self.currency_plural_inputs,
-                        self.currency_value_inputs,
+        self._autosave_timer.stop()
+        self._saving_settings = True
+
+        try:
+            repository.set_setting("theme", self.theme_combo.currentText())
+            repository.set_setting(
+                "ai.additional_context",
+                self.additional_ai_context_input.toPlainText().strip(),
+            )
+            repository.set_setting("audio.music_enabled", self.music_enabled_checkbox.isChecked())
+            repository.set_setting("audio.narrator_enabled", self.narrator_enabled_checkbox.isChecked())
+            repository.set_setting("audio.music_volume", self.music_volume_slider.value())
+            repository.set_setting("audio.tts_volume", self.tts_volume_slider.value())
+            repository.set_currency_denominations(
+                [
+                    {
+                        "name": name_input.text(),
+                        "plural_name": plural_input.text(),
+                        "value": 1 if index == 0 else value_input.value(),
+                    }
+                    for index, (name_input, plural_input, value_input) in enumerate(
+                        zip(
+                            self.currency_name_inputs,
+                            self.currency_plural_inputs,
+                            self.currency_value_inputs,
+                        )
                     )
-                )
-            ]
-        )
-        repository.set_calendar_settings(
-            {
-                "days_per_week": self.days_per_week_input.value(),
-                "weeks_per_month": self.weeks_per_month_input.value(),
-                "months_per_year": self.months_per_year_input.value(),
-                "seasons_per_year": self.seasons_per_year_input.value(),
-                "day_names": _split_list(self.day_names_input.text()),
-                "month_names": _split_list(self.month_names_input.text()),
-                "seasons": _build_season_settings(
-                    names=_split_list(self.season_names_input.text()),
-                    hints=_split_list(self.season_hints_input.text()),
-                    count=self.seasons_per_year_input.value(),
+                ]
+            )
+            repository.set_calendar_settings(
+                {
+                    "days_per_week": self.days_per_week_input.value(),
+                    "weeks_per_month": self.weeks_per_month_input.value(),
+                    "months_per_year": self.months_per_year_input.value(),
+                    "seasons_per_year": self.seasons_per_year_input.value(),
+                    "day_names": _split_list(self.day_names_input.text()),
+                    "month_names": _split_list(self.month_names_input.text()),
+                    "seasons": _build_season_settings(
+                        names=_split_list(self.season_names_input.text()),
+                        hints=_split_list(self.season_hints_input.text()),
+                        count=self.seasons_per_year_input.value(),
+                    ),
+                    "time_display": self.time_display_combo.currentData() or "narrative",
+                }
+            )
+            elapsed_minutes = _safe_int(
+                repository.get_state_value(
+                    "elapsed_minutes",
+                    str(DEFAULT_START_ELAPSED_MINUTES),
                 ),
-                "time_display": self.time_display_combo.currentData() or "narrative",
-            }
-        )
-        elapsed_minutes = _safe_int(
-            repository.get_state_value(
-                "elapsed_minutes",
-                str(DEFAULT_START_ELAPSED_MINUTES),
-            ),
-            DEFAULT_START_ELAPSED_MINUTES,
-        )
-        calendar_snapshot = build_calendar_snapshot(
-            elapsed_minutes,
-            repository.get_calendar_settings(),
-        )
-        repository.set_state_value("time", calendar_snapshot["display_label"])
-        repository.append_history("system", "Settings updated.")
+                DEFAULT_START_ELAPSED_MINUTES,
+            )
+            calendar_snapshot = build_calendar_snapshot(
+                elapsed_minutes,
+                repository.get_calendar_settings(),
+            )
+            repository.set_state_value("time", calendar_snapshot["display_label"])
 
-        if self.on_audio_settings_changed is not None:
-            self.on_audio_settings_changed()
+            if self.on_audio_settings_changed is not None:
+                self.on_audio_settings_changed()
+        finally:
+            self._saving_settings = False
 
-        QMessageBox.information(self, "Settings Saved", "Settings were saved.")
+        self.notify_repository_changed()
 
 
 def _apply_audio_settings_to_managers(

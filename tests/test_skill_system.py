@@ -53,6 +53,25 @@ class SkillSystemTests(unittest.TestCase):
             self.assertEqual(skill["xp"], 10)
             self.assertEqual(skill["bonus"], 4)
 
+    def test_skill_xp_event_without_amount_defaults_to_one_xp(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = SaveRepository.create_new_save(Path(temp_dir), "Skill Test")
+            repository.upsert_skill("Stealth", "Moving quietly and avoiding notice.", 1)
+
+            result = EventApplier(repository).apply_event(
+                {
+                    "type": "SkillXpAddedEvent",
+                    "payload": {"skill_name": "Stealth"},
+                }
+            )
+            skill = repository.get_skill("Stealth")
+
+            self.assertEqual(result.status, "applied")
+            self.assertIsNotNone(skill)
+            assert skill is not None
+            self.assertEqual(skill["xp"], 1)
+            self.assertEqual(skill["level"], 1)
+
     def test_replace_skills_removes_new_game_placeholders(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             repository = SaveRepository.create_new_save(Path(temp_dir), "Skill Test")

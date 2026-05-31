@@ -1262,14 +1262,19 @@ class SaveRepository:
 
         clean_role = role.strip()
         clean_location = location.strip()
-        clean_display_name = display_name.strip() or clean_name or "Unknown NPC"
+        requested_display_name = display_name.strip()
+        clean_display_name = requested_display_name or _fallback_npc_display_name(
+            clean_name,
+            clean_role,
+        )
         clean_public_description = public_description.strip()
         clean_player_facing_information = (
             player_facing_information.strip()
             or clean_public_description
             or clean_role
         )
-        clean_npc_id = npc_id.strip() or _npc_id_from_parts(
+        explicit_npc_id = npc_id.strip()
+        clean_npc_id = explicit_npc_id or _npc_id_from_parts(
             clean_name,
             clean_role,
             clean_location,
@@ -1285,6 +1290,20 @@ class SaveRepository:
                 """,
                 (clean_npc_id,),
             ).fetchone()
+
+            if existing is None:
+                matching_npc = self._find_matching_npc_for_upsert(
+                    connection,
+                    name=clean_name,
+                    display_name=clean_display_name,
+                    role=clean_role,
+                    location=clean_location,
+                )
+
+                if matching_npc is not None:
+                    clean_npc_id = str(matching_npc["npc_id"])
+                    clean_name = str(matching_npc["name"]) or clean_name
+                    existing = matching_npc
 
             if existing is None:
                 merged_knowledge_scope = _clean_string_list(knowledge_scope or [])
@@ -1324,7 +1343,7 @@ class SaveRepository:
                 ON CONFLICT(npc_id) DO UPDATE SET
                     name = excluded.name,
                     display_name = CASE
-                        WHEN excluded.display_name != '' THEN excluded.display_name
+                        WHEN ? != '' THEN excluded.display_name
                         ELSE npcs.display_name
                     END,
                     role = CASE
@@ -1364,10 +1383,95 @@ class SaveRepository:
                     disposition.strip(),
                     created_at,
                     timestamp,
+                    requested_display_name,
                 ),
             )
 
         return self.get_npc(clean_npc_id)
+
+    def _find_matching_npc_for_upsert(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        name: str,
+        display_name: str,
+        role: str,
+        location: str,
+    ) -> sqlite3.Row | None:
+        """Finds an existing NPC when Gemini changes its internal identifier."""
+
+        clean_location = location.casefold()
+
+        if not clean_location:
+            return None
+
+        rows = connection.execute(
+            """
+            SELECT
+                id,
+                npc_id,
+                name,
+                display_name,
+                role,
+                location,
+                public_description,
+                player_facing_information,
+                knowledge_scope_json,
+                known_facts_json,
+                disposition,
+                created_at,
+                updated_at
+            FROM npcs
+            WHERE lower(location) = lower(?)
+            """,
+            (location,),
+        ).fetchall()
+
+        scored_rows: list[tuple[int, sqlite3.Row]] = []
+
+        for row in rows:
+            score = _npc_match_score(
+                name=name,
+                display_name=display_name,
+                role=role,
+                location=location,
+                existing_name=str(row["name"]),
+                existing_display_name=str(row["display_name"]),
+                existing_role=str(row["role"]),
+                existing_location=str(row["location"]),
+            )
+
+            if score >= 8:
+                scored_rows.append((score, row))
+
+        if not scored_rows:
+            return None
+
+        scored_rows.sort(
+            key=lambda item: (
+                item[0],
+                str(item[1]["updated_at"]),
+                str(item[1]["npc_id"]),
+            ),
+            reverse=True,
+        )
+
+        if len(scored_rows) > 1 and scored_rows[0][0] == scored_rows[1][0]:
+            LOGGER.info(
+                "Skipped ambiguous NPC identity merge for name=%r role=%r location=%r.",
+                name,
+                role,
+                location,
+            )
+            return None
+
+        LOGGER.info(
+            "Resolved NPC upsert %r at %r to existing npc_id %r.",
+            name,
+            location,
+            scored_rows[0][1]["npc_id"],
+        )
+        return scored_rows[0][1]
 
     def add_npc_knowledge(
         self,
@@ -1476,7 +1580,7 @@ class SaveRepository:
 
     def get_npc_by_name(self, name: str) -> dict[str, Any] | None:
         """
-        Reads one NPC by exact display name.
+        Reads one NPC by exact internal or display name.
 
         Args:
             name: NPC display name.
@@ -1508,11 +1612,11 @@ class SaveRepository:
                     created_at,
                     updated_at
                 FROM npcs
-                WHERE name = ?
+                WHERE name = ? OR display_name = ?
                 ORDER BY updated_at DESC
                 LIMIT 1
                 """,
-                (clean_name,),
+                (clean_name, clean_name),
             ).fetchone()
 
         if row is None:
@@ -1570,7 +1674,7 @@ class SaveRepository:
 
         visible_npcs: list[dict[str, Any]] = []
 
-        for npc in self.list_npcs(limit=limit):
+        for npc in _coalesce_npc_profiles(self.list_npcs(limit=limit)):
             description = str(npc.get("public_description") or "").strip()
             notes = str(
                 npc.get("player_facing_information")
@@ -1623,7 +1727,7 @@ class SaveRepository:
         }
         scored_npcs: list[tuple[int, dict[str, Any]]] = []
 
-        for npc in self.list_npcs(limit=100):
+        for npc in _coalesce_npc_profiles(self.list_npcs(limit=100)):
             score = 0
             name = str(npc.get("name", "")).casefold()
             role = str(npc.get("role", "")).casefold()
@@ -2474,6 +2578,195 @@ def _npc_id_from_parts(name: str, role: str, location: str) -> str:
         return "unknown_npc"
 
     return cleaned[:80]
+
+
+def _fallback_npc_display_name(name: str, role: str) -> str:
+    """Chooses a player-visible fallback when the model did not provide one."""
+
+    clean_name = name.strip()
+    clean_role = role.strip()
+
+    if clean_name and not _looks_like_internal_npc_name(clean_name):
+        return clean_name
+
+    return clean_role or clean_name or "Unknown NPC"
+
+
+def _looks_like_internal_npc_name(value: str) -> bool:
+    """Returns True for slug-like model identifiers such as copper_kettle_bartender."""
+
+    clean_value = value.strip()
+
+    if "_" not in clean_value:
+        return False
+
+    return bool(re.fullmatch(r"[a-z0-9_]+", clean_value))
+
+
+def _coalesce_npc_profiles(npcs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Collapses obvious duplicate NPC rows for player-facing and AI context lists."""
+
+    coalesced: list[dict[str, Any]] = []
+
+    for npc in npcs:
+        match_index = next(
+            (
+                index
+                for index, existing in enumerate(coalesced)
+                if _npc_match_score(
+                    name=str(npc.get("name", "")),
+                    display_name=str(npc.get("display_name", "")),
+                    role=str(npc.get("role", "")),
+                    location=str(npc.get("location", "")),
+                    existing_name=str(existing.get("name", "")),
+                    existing_display_name=str(existing.get("display_name", "")),
+                    existing_role=str(existing.get("role", "")),
+                    existing_location=str(existing.get("location", "")),
+                )
+                >= 8
+            ),
+            None,
+        )
+
+        if match_index is None:
+            coalesced.append(dict(npc))
+        else:
+            coalesced[match_index] = _merge_npc_profiles(coalesced[match_index], npc)
+
+    return coalesced
+
+
+def _merge_npc_profiles(
+    first: dict[str, Any],
+    second: dict[str, Any],
+) -> dict[str, Any]:
+    """Merges two likely duplicate NPC profiles without mutating the database."""
+
+    primary, secondary = _preferred_npc_profile(first, second)
+    merged = dict(primary)
+
+    for key in ["name", "display_name", "role", "location", "disposition"]:
+        if not str(merged.get(key, "")).strip() and str(secondary.get(key, "")).strip():
+            merged[key] = secondary[key]
+
+    for key in ["public_description", "player_facing_information"]:
+        primary_text = str(merged.get(key, "")).strip()
+        secondary_text = str(secondary.get(key, "")).strip()
+
+        if len(secondary_text) > len(primary_text):
+            merged[key] = secondary_text
+
+    merged["knowledge_scope"] = _merge_string_lists(
+        list(first.get("knowledge_scope", [])),
+        list(second.get("knowledge_scope", [])),
+    )
+    merged["known_facts"] = _merge_string_lists(
+        list(first.get("known_facts", [])),
+        list(second.get("known_facts", [])),
+    )
+    merged["updated_at"] = max(
+        str(first.get("updated_at", "")),
+        str(second.get("updated_at", "")),
+    )
+
+    return merged
+
+
+def _preferred_npc_profile(
+    first: dict[str, Any],
+    second: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Picks the profile whose identifier looks more stable."""
+
+    first_id = str(first.get("npc_id", ""))
+    second_id = str(second.get("npc_id", ""))
+
+    if len(second_id) < len(first_id):
+        return second, first
+
+    return first, second
+
+
+def _npc_match_score(
+    *,
+    name: str,
+    display_name: str,
+    role: str,
+    location: str,
+    existing_name: str,
+    existing_display_name: str,
+    existing_role: str,
+    existing_location: str,
+) -> int:
+    """Scores whether two NPC descriptions appear to be the same person."""
+
+    score = 0
+
+    if location.strip().casefold() == existing_location.strip().casefold():
+        score += 4
+
+    if role.strip() and role.strip().casefold() == existing_role.strip().casefold():
+        score += 4
+
+    requested_aliases = _npc_aliases(name, display_name)
+    existing_aliases = _npc_aliases(existing_name, existing_display_name)
+
+    if requested_aliases and existing_aliases:
+        if requested_aliases.intersection(existing_aliases):
+            score += 6
+        elif _tokens_for_match(" ".join(requested_aliases)).intersection(
+            _tokens_for_match(" ".join(existing_aliases))
+        ):
+            score += 2
+
+    requested_internal_names = _npc_aliases(name)
+    existing_internal_names = _npc_aliases(existing_name)
+
+    if _has_alias_containment(requested_internal_names, existing_internal_names):
+        score += 5
+
+    return score
+
+
+def _npc_aliases(*values: str) -> set[str]:
+    """Returns clean case-folded NPC aliases."""
+
+    return {
+        str(value).strip().casefold()
+        for value in values
+        if str(value).strip()
+    }
+
+
+def _has_alias_containment(
+    requested_aliases: set[str],
+    existing_aliases: set[str],
+) -> bool:
+    """Returns True when one NPC alias is an expanded form of another."""
+
+    for requested_alias in requested_aliases:
+        for existing_alias in existing_aliases:
+            if (
+                len(requested_alias) >= 4
+                and len(existing_alias) >= 4
+                and (
+                    requested_alias in existing_alias
+                    or existing_alias in requested_alias
+                )
+            ):
+                return True
+
+    return False
+
+
+def _tokens_for_match(value: str) -> set[str]:
+    """Returns stable-ish tokens useful for loose NPC identity matching."""
+
+    return {
+        token
+        for token in re.split(r"[^a-zA-Z0-9']+", value.casefold())
+        if len(token) >= 4
+    }
 
 
 def _clean_string_list(values: list[str]) -> list[str]:

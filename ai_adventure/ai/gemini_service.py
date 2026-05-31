@@ -227,6 +227,8 @@ def build_gemini_story_prompt(context_packet: dict[str, Any]) -> str:
     """
 
     packet_json = json.dumps(context_packet, indent=2)
+    banned_terms = _banned_terms_from_context(context_packet)
+    banned_terms_text = ", ".join(banned_terms) if banned_terms else "(none provided)"
 
     return (
         "You are the AI narrator for AI Adventure.\n"
@@ -251,6 +253,10 @@ def build_gemini_story_prompt(context_packet: dict[str, Any]) -> str:
         "generic label such as 'Shady Character' when the player has not learned "
         "the NPC's actual name or role. role is for AI memory and should not be "
         "treated as the player-facing summary.\n"
+        "- Before creating an NPC, inspect state.npcs.relevant. If the person is "
+        "already listed there, reuse that exact npc_id/internal identifier and "
+        "update the existing profile instead of inventing a second identifier. "
+        "A different wording of the same role at the same location is not a new NPC.\n"
         "- The events array may contain multiple events with the same type. If the "
         "current turn introduces multiple distinct meaningful NPCs, suggest one "
         "NpcUpsertedEvent for each of them instead of only the first one.\n"
@@ -270,6 +276,7 @@ def build_gemini_story_prompt(context_packet: dict[str, Any]) -> str:
         "hyphenation variants, or obvious reskins for newly invented proper nouns. "
         "Banned terms may appear only when already established in saved state or "
         "explicitly provided by the player.\n\n"
+        f"Exact banned proper nouns for newly invented content: {banned_terms_text}\n\n"
         "Return one JSON object and no surrounding Markdown. The object must match "
         "this shape:\n"
         "{\n"
@@ -281,11 +288,21 @@ def build_gemini_story_prompt(context_packet: dict[str, Any]) -> str:
         "Rules:\n"
         "- response must be a non-empty string.\n"
         "- response must not contain legacy double-bracket tags.\n"
+        "- In NPC dialogue, use double quotation marks only to mark the outer "
+        "spoken dialogue. If a speaker mentions a named item, title, shop, "
+        "place, phrase, nickname, inscription, or other quoted specific inside "
+        "that dialogue, use single quotation marks for the inner quoted name.\n"
         "- suggested_actions must be a list, even when empty.\n"
         "- events must be a list, even when empty.\n"
         "- events may include multiple entries of the same event type when multiple "
         "distinct state changes happen in the same turn.\n"
         "- If suggesting events, use the event_shape, known_event_types, and selected event contracts from the packet.\n"
+        "- Currency is stored as one integer, state.currency.balance_base_units, "
+        "not as coin items in inventory. For a completed purchase, sale, fee, "
+        "reward, refund, or other money movement, suggest CurrencyChangedEvent "
+        "with one net base_unit_amount. If the player buys an item, also suggest "
+        "the InventoryItemAddedEvent for that item; do not create coin inventory "
+        "items for payment or change.\n"
         "- Do not invent hidden state, inventory, recipes, or flags as confirmed facts.\n\n"
         "Context packet:\n"
         f"{packet_json}"
@@ -468,6 +485,33 @@ def build_gemini_new_game_prompt(setup_packet: dict[str, Any]) -> str:
         "Setup packet:\n"
         f"{packet_json}"
     )
+
+
+def _banned_terms_from_context(context_packet: dict[str, Any]) -> list[str]:
+    """Reads banned generated-name terms from a story context packet."""
+
+    creative_ideas = context_packet.get("creative_ideas", {})
+
+    if not isinstance(creative_ideas, dict):
+        return []
+
+    raw_terms = creative_ideas.get("banned_terms", [])
+
+    if not isinstance(raw_terms, list):
+        return []
+
+    terms: list[str] = []
+    seen: set[str] = set()
+
+    for raw_term in raw_terms:
+        term = str(raw_term).strip()
+        folded = term.casefold()
+
+        if term and folded not in seen:
+            terms.append(term)
+            seen.add(folded)
+
+    return terms
 
 
 def parse_gemini_story_response(raw_text: str) -> AiNarrationResult:
@@ -937,7 +981,7 @@ def _split_story_sentences(text: str) -> list[str]:
     for original, replacement in replacements.items():
         protected_text = protected_text.replace(original, replacement)
 
-    raw_sentences = re.split(r"(?<=[.!?])\s+(?=[\"'A-Z0-9])", protected_text)
+    raw_sentences = _split_at_story_sentence_boundaries(protected_text)
     sentences: list[str] = []
 
     for raw_sentence in raw_sentences:
@@ -950,6 +994,126 @@ def _split_story_sentences(text: str) -> list[str]:
             sentences.append(sentence)
 
     return sentences or [clean_text]
+
+
+def _split_at_story_sentence_boundaries(text: str) -> list[str]:
+    """Splits text into display paragraphs without breaking inside dialogue quotes."""
+
+    sentence_endings = ".!?"
+    opening_quotes = {'"', "\u201c"}
+    closing_quotes = {'"', "\u201d"}
+    sentences: list[str] = []
+    start_index = 0
+    in_quote = False
+
+    for index, char in enumerate(text):
+        if char == '"':
+            in_quote = not in_quote
+            if not in_quote and _previous_non_space(text, index) in sentence_endings:
+                split_index = _quote_boundary_split_index(text, index)
+
+                if split_index is not None:
+                    sentences.append(text[start_index:split_index].strip())
+                    start_index = split_index
+
+            continue
+
+        if char in opening_quotes:
+            in_quote = True
+            continue
+
+        if char in closing_quotes:
+            in_quote = False
+
+            if _previous_non_space(text, index) in sentence_endings:
+                split_index = _quote_boundary_split_index(text, index)
+
+                if split_index is not None:
+                    sentences.append(text[start_index:split_index].strip())
+                    start_index = split_index
+
+            continue
+
+        if char in sentence_endings and not in_quote:
+            split_index = _sentence_boundary_split_index(text, index)
+
+            if split_index is not None:
+                sentences.append(text[start_index:split_index].strip())
+                start_index = split_index
+
+    tail = text[start_index:].strip()
+
+    if tail:
+        sentences.append(tail)
+
+    return [sentence for sentence in sentences if sentence]
+
+
+def _quote_boundary_split_index(text: str, quote_index: int) -> int | None:
+    """Returns a split position after a closing quote when the next token starts fresh."""
+
+    next_index = _next_non_space_index(text, quote_index + 1)
+
+    if next_index is None:
+        return None
+
+    if text[next_index] in {'"', "\u201c", "\u2018"} or text[next_index].isupper() or text[next_index].isdigit():
+        return next_index
+
+    return None
+
+
+def _sentence_boundary_split_index(text: str, punctuation_index: int) -> int | None:
+    """Returns a split position after sentence punctuation outside dialogue."""
+
+    next_index = punctuation_index + 1
+
+    while next_index < len(text) and text[next_index] in {'"', "'", "\u201d", "\u2019"}:
+        next_index += 1
+
+    if next_index >= len(text):
+        return None
+
+    if not text[next_index].isspace():
+        return None
+
+    next_token_index = _next_non_space_index(text, next_index)
+
+    if next_token_index is None:
+        return None
+
+    if text[next_token_index] in {'"', "'", "\u201c", "\u2018"} or text[next_token_index].isupper() or text[next_token_index].isdigit():
+        return next_token_index
+
+    return None
+
+
+def _previous_non_space(text: str, index: int) -> str:
+    """Returns the previous non-space character before index."""
+
+    cursor = index - 1
+
+    while cursor >= 0:
+        if not text[cursor].isspace():
+            return text[cursor]
+
+        cursor -= 1
+
+    return ""
+
+
+def _next_non_space_index(text: str, index: int) -> int | None:
+    """Returns the index of the next non-space character."""
+
+    cursor = index
+
+    while cursor < len(text):
+        if not text[cursor].isspace():
+            return cursor
+
+        cursor += 1
+
+    return None
 
 
 def _read_env_file(env_path: Path) -> dict[str, str]:

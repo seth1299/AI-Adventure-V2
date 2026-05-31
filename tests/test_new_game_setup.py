@@ -15,6 +15,7 @@ from ai_adventure.new_game_setup import (
 )
 from ai_adventure.new_game_templates import (
     load_new_game_template,
+    load_new_game_templates,
     save_new_game_template,
 )
 from ai_adventure.core.state_manager import StateManager
@@ -157,9 +158,9 @@ class NewGameSetupTests(unittest.TestCase):
         self.assertIn("at least one and at most four", packet["requirements"]["currency_generation"])
         self.assertIn("value=1", packet["requirements"]["currency_generation"])
 
-    def test_new_game_template_round_trips_normalized_setup(self) -> None:
+    def test_new_game_templates_round_trip_multiple_normalized_setups(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            template_path = Path(temp_dir) / "new_game_template.json"
+            template_path = Path(temp_dir) / "new_game_templates.json"
             setup = normalize_new_game_setup(
                 {
                     "title": "Template Test",
@@ -191,16 +192,58 @@ class NewGameSetupTests(unittest.TestCase):
             )
 
             self.assertTrue(save_new_game_template(template_path, setup))
+            self.assertTrue(
+                save_new_game_template(
+                    template_path,
+                    {
+                        "title": "Space Test",
+                        "character": {"name": "Nova"},
+                        "skills": [{"name": f"Ship Skill {index}"} for index in range(15)],
+                        "specified_genre": "Space opera",
+                    },
+                )
+            )
 
+            templates = load_new_game_templates(template_path)
             loaded = load_new_game_template(template_path)
 
+            self.assertEqual([template.name for template in templates], ["Space Test", "Template Test"])
             self.assertIsNotNone(loaded)
-            self.assertEqual(loaded["title"], "Template Test")
-            self.assertEqual(loaded["character"]["name"], "Iris Vale")
-            self.assertEqual(loaded["starter_items"][0]["name"], "Notebook")
-            self.assertEqual(loaded["calendar"]["time_display"], "24_hour")
-            self.assertEqual(loaded["currency_denominations"][1]["name"], "Crown")
-            self.assertEqual(loaded["specified_genre"], "Realistic detective mystery")
+            self.assertEqual(templates[1].setup["title"], "Template Test")
+            self.assertEqual(templates[1].setup["character"]["name"], "Iris Vale")
+            self.assertEqual(templates[1].setup["starter_items"][0]["name"], "Notebook")
+            self.assertEqual(templates[1].setup["calendar"]["time_display"], "24_hour")
+            self.assertEqual(templates[1].setup["currency_denominations"][1]["name"], "Crown")
+            self.assertEqual(templates[1].setup["specified_genre"], "Realistic detective mystery")
+            self.assertEqual(loaded["title"], "Space Test")
+
+    def test_new_game_templates_can_load_legacy_single_template(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            template_path = Path(temp_dir) / "new_game_templates.json"
+            legacy_template_path = Path(temp_dir) / "new_game_template.json"
+            legacy_template_path.write_text(
+                """
+{
+  "schema_version": 1,
+  "setup": {
+    "title": "Legacy Template",
+    "character": {
+      "name": "Iris Vale"
+    }
+  }
+}
+""".strip(),
+                encoding="utf-8",
+            )
+
+            templates = load_new_game_templates(
+                template_path,
+                legacy_template_path=legacy_template_path,
+            )
+
+            self.assertEqual(len(templates), 1)
+            self.assertEqual(templates[0].name, "Legacy Template")
+            self.assertEqual(templates[0].setup["character"]["name"], "Iris Vale")
 
     def test_repository_can_replace_setup_inventory_with_ai_items(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

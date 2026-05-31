@@ -6,12 +6,15 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from ai_adventure.calendar_system import DEFAULT_START_ELAPSED_MINUTES
+from ai_adventure.context.creative_ideas import CreativeIdeasLibrary
+from ai_adventure.currency import format_currency_amount
 from ai_adventure.locations import clean_player_location_name
 from ai_adventure.persistence.save_repository import SaveRepository
 from ai_adventure.skills.rules import bonus_for_level, dc_for_difficulty
 
 
 LOGGER = logging.getLogger(__name__)
+_BANNED_CREATIVE_TERMS: set[str] | None = None
 
 
 @dataclass(frozen=True)
@@ -284,7 +287,10 @@ class EventApplier:
         if not name:
             return _invalid(event_type, payload, "Skill name is required.")
 
-        xp_amount = _first_int(payload, 0, "xp_amount", "amount", "xp")
+        xp_amount = _optional_int(payload, "xp_amount", "amount", "xp")
+
+        if xp_amount is None:
+            xp_amount = 1
 
         if xp_amount <= 0:
             return _invalid(event_type, payload, "Positive XP amount is required.")
@@ -526,7 +532,13 @@ class EventApplier:
     ) -> AppliedEventResult:
         """Applies CurrencyChangedEvent."""
 
-        amount = _optional_int(payload, "base_unit_amount", "amount")
+        amount = _optional_int(
+            payload,
+            "base_unit_amount",
+            "base_units",
+            "delta_base_units",
+            "amount",
+        )
 
         if amount is None:
             return _invalid(event_type, payload, "Currency amount is required.")
@@ -537,12 +549,17 @@ class EventApplier:
         ) or 0
         new_balance = current_balance + amount
         self.repository.set_state_value("currency.balance", str(new_balance))
+        denominations = self.repository.get_currency_denominations()
 
         return AppliedEventResult(
             event_type,
             "applied",
-            f"Currency balance changed by {amount}.",
-            payload,
+            (
+                "Currency balance changed by "
+                f"{format_currency_amount(amount, denominations)}. "
+                f"New balance: {format_currency_amount(new_balance, denominations)}."
+            ),
+            {**payload, "base_unit_amount": amount, "balance_base_units": new_balance},
         )
 
     def _apply_currency_defined(
@@ -743,13 +760,17 @@ class EventApplier:
     ) -> AppliedEventResult:
         """Applies NpcUpsertedEvent."""
 
-        display_name = _first_text(payload, "display_name", "visible_name")
+        raw_display_name = _first_text(payload, "display_name", "visible_name")
         role = _first_text(payload, "role", "occupation")
+        display_name = _safe_generated_npc_display_name(raw_display_name, role)
+        internal_name = _first_text(payload, "internal_name")
+        npc_id = _first_text(payload, "npc_id", "id") or internal_name
         name = (
-            _first_text(payload, "name", "npc_name", "internal_name")
+            _first_text(payload, "name", "npc_name")
+            or internal_name
             or display_name
             or role
-            or _first_text(payload, "npc_id", "id")
+            or npc_id
         )
 
         if not name:
@@ -760,7 +781,7 @@ class EventApplier:
             )
 
         npc = self.repository.upsert_npc(
-            npc_id=_first_text(payload, "npc_id", "id"),
+            npc_id=npc_id,
             name=name,
             display_name=display_name,
             role=role,
@@ -941,6 +962,37 @@ def _as_string_list(value: Any) -> list[str]:
         ]
 
     return []
+
+
+def _safe_generated_npc_display_name(display_name: str, role: str) -> str:
+    """Avoids storing banned generated names as player-visible NPC names."""
+
+    if not display_name or not _is_banned_creative_term(display_name):
+        return display_name
+
+    LOGGER.warning(
+        "Removed banned generated NPC display_name %r before storage.",
+        display_name,
+    )
+    return ""
+
+
+def _is_banned_creative_term(value: str) -> bool:
+    """Returns True when a value exactly matches a banned generated term."""
+
+    global _BANNED_CREATIVE_TERMS
+
+    if _BANNED_CREATIVE_TERMS is None:
+        try:
+            _BANNED_CREATIVE_TERMS = {
+                term.casefold()
+                for term in CreativeIdeasLibrary.load_default().banned_terms
+            }
+        except Exception:
+            LOGGER.exception("Could not load banned creative terms.")
+            _BANNED_CREATIVE_TERMS = set()
+
+    return value.strip().casefold() in _BANNED_CREATIVE_TERMS
 
 
 def _ingredients_to_list(value: Any) -> list[str]:

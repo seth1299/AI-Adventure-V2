@@ -57,7 +57,7 @@
           "You MUST avoid cliched \"A.I.-isms\", such as using language like \"You don't just [X], you [Y].\" or \"It's not just [X], it's [Y].\"",
           "Make sure that if the Player takes an actionable step for an item in their inventory, such as storing an herb in a glass jar to prevent spoilage, that you suggest an InventoryItemModifiedEvent event (described later) to include the item's current state.",
           "When an inventory item changes condition or state, suggest an InventoryItemModifiedEvent instead of hiding the change in prose.",
-          "For merchant transactions, do not suggest inventory or currency events for the final exchange; the merchant system handles accepted transactions."
+          "For completed merchant transactions, suggest normal InventoryItemAddedEvent or InventoryItemRemovedEvent entries for transferred goods and CurrencyChangedEvent for the net money change."
         ]
       }
     },
@@ -99,7 +99,7 @@
           "Do not enclose normal item names in quotation marks.",
           "Only use quotation marks around an item name if it is a unique brand name, title, inscription, nickname, or personalized object name.",
           "When inventing new proper nouns, treat creative_ideas as the preferred naming source and avoid broad training-data fantasy defaults.",
-          "Never use creative_ideas.banned_terms, close spelling variants, hyphenation variants, or obvious reskins for newly invented people, places, factions, religions, taverns, regions, shops, guilds, or landmarks unless already established.",
+          "Before introducing any new personal name or proper noun, check the exact creative_ideas.banned_terms list. Never use those terms, close spelling variants, hyphenation variants, or obvious reskins for newly invented people, places, factions, religions, taverns, regions, shops, guilds, or landmarks unless already established.",
           "Prefer culturally distinct names with varied roots. For settlements, use geography, trade, history, climate, or local superstition as inspiration.",
           "Do not reuse a proper noun for a new character, settlement, faction, or landmark unless it is intentionally the same entity."
         ]
@@ -136,6 +136,7 @@
           "If the Player is speaking in character, DO NOT PARAPHRASE WHAT THE PLAYER SAID AS A DIEGETIC RESPONSE SAID BY THE PLAYER CHARACTER.",
           "Instead, you may paraphrase what the Player just said, but as a NON-DIEGETIC comment.",
           "Do not put words into the Player's mouth.",
+          "Use double quotation marks only for the outer boundaries of spoken dialogue. If an NPC mentions a named item, title, shop, location, inscription, nickname, or other quoted specific inside dialogue, use single quotation marks around that inner name.",
           "Assume that whatever the Player is typing inside of Quotation Marks is usually said out loud (still check the context of the scene, but unless the Player is doing an OOG statement to you, Quotation Marks usually means that the Player is directly talking to an NPC). ---"
         ]
       }
@@ -279,7 +280,7 @@
         "payload_fields": [
           "skill_name"
         ],
-        "purpose": "Requests a skill check when the success, failure, speed, quality, or consequences of an action are uncertain.",
+        "purpose": "If the player explicitly says they use a named skill, or attempts an action that could plausibly fail, go poorly, take extra time, produce a partial result, reveal misleading information, consume resources, attract attention, cause harm, or vary in quality, suggest SkillCheckRequestedEvent before narrating the final outcome. Do not hand-wave these actions as automatic success unless they are trivial, risk-free, and have no meaningful consequence.",
         "rules": [
           "Suggest SkillCheckRequestedEvent when an action's success, failure, speed, quality, or consequences are uncertain.",
           "Prefer SkillCheckRequestedEvent over SkillXpAddedEvent when the player is attempting a risky or uncertain action.",
@@ -347,6 +348,7 @@
           "Suggest SkillXpAddedEvent for study, practice, lessons, analysis, or meaningful use of an existing skill.",
           "Do not suggest SkillXpAddedEvent merely because an action is uncertain; request SkillCheckRequestedEvent for uncertainty.",
           "`XP Amount` must be a small integer.",
+          "Always include `xp_amount`; use 1 XP for a tiny meaningful gain if no stronger amount is obvious.",
           "Most study sessions should award 2-3 XP.",
           "Do not award very large XP amounts.",
           "Do not award XP to a Level 5 skill.",
@@ -376,8 +378,10 @@
           "`BaseUnitAmount` is an internal integer measured in the world's smallest currency unit.",
           "The current smallest/base currency is `{BASE_CURRENCY_NAME}`.",
           "In narration, dialogue, options, merchant offers, quest rewards, fees, and summaries, never say \"base unit\" or \"base units.\"",
-          "For player-facing money amounts, either use the actual currency name or use DisplayCurrencyEvent.",
-          "Example: if the fee is 10 base currency units, write DisplayCurrencyEvent, not \"10 base units.\""
+          "For player-facing money amounts, use actual denomination names, not \"base unit\" or \"base units.\"",
+          "For completed purchases, sales, fees, rewards, refunds, and change, suggest one CurrencyChangedEvent for the net money movement.",
+          "Example: if the player has 1 Gold Piece and buys an item costing 3 Silver Pieces and 5 Copper Pieces, suggest CurrencyChangedEvent with base_unit_amount -35. Do not add or remove coin inventory items; the application displays the remaining balance as 6 Silver Pieces and 5 Copper Pieces.",
+          "Example: if the fee is 10 base currency units, write the narration with actual denominations and suggest CurrencyChangedEvent with base_unit_amount -10."
         ]
       }
     },
@@ -432,7 +436,7 @@
         ],
         "purpose": "Adds an item to the player's inventory.",
         "rules": [
-          "Suggest InventoryItemAddedEvent every time the player receives a new item in the current turn, UNLESS the Player just bought that item from a Merchant Transaction (which will be automatically handled by the Game Engine).",
+          "Suggest InventoryItemAddedEvent every time the player receives a new item in the current turn, including completed purchases.",
           "`Item Type` becomes the inventory category.",
           "`Item Name` should be specific.",
           "`Description` should explain what the item is and include in structured event data important state information, such as what sort of ammunition is used for a bow or a gun.",
@@ -855,7 +859,7 @@
           "SELL means the player gives up the listed item and receives money.",
           "Put BUY or SELL exactly once, immediately after MERCHANT:.",
           "Never put BUY or SELL before individual item entries.",
-          "Do not suggest CHANGE_CURRENCY, ADD, or REMOVE for merchant transactions. The engine handles the final transaction. == Good BUY example: == == Good SELL example: == == Bad Examples: == MerchantInterfaceRequestedEvent MerchantInterfaceRequestedEvent MerchantInterfaceRequestedEvent ---"
+          "MerchantInterfaceRequestedEvent can open or describe a shop interface, but it does not replace final transaction events. When a purchase or sale actually succeeds, use InventoryItemAddedEvent or InventoryItemRemovedEvent for goods and CurrencyChangedEvent for the net base-unit money change. Do not add or remove coin inventory items. == Good BUY example: == == Good SELL example: == == Bad Examples: == MerchantInterfaceRequestedEvent MerchantInterfaceRequestedEvent MerchantInterfaceRequestedEvent ---"
         ]
       }
     },
@@ -1065,6 +1069,8 @@
           "Do not include coin names inside CurrencyChangedEvent.",
           "Do not charge money until the player agrees to pay.",
           "Do not add purchased items until the purchase succeeds.",
+          "When a purchase succeeds, do not add only the item; also suggest CurrencyChangedEvent for the net price as a negative base_unit_amount.",
+          "Do not model payment or change as coin inventory items. Currency is a single integer balance formatted into denominations by the application.",
           "Do not suggest structured events for events that happened in previous turns.",
           "Do not create stats with StatModifiedEvent; use StatDefinedEvent.",
           "Do not create items with InventoryItemModifiedEvent; use InventoryItemAddedEvent.",
