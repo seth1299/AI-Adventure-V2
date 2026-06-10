@@ -103,6 +103,7 @@ def normalize_new_game_setup(raw_setup: Any) -> dict[str, Any]:
         )
     )
     calendar_settings = _calendar_from_setup(raw_setup.get("calendar", {}))
+    audio_settings = _audio_from_setup(raw_setup.get("audio", {}))
     skills = _normalize_skills(raw_setup.get("skills", []))
     starter_items = _normalize_starter_items(raw_setup.get("starter_items", []))
 
@@ -117,6 +118,7 @@ def normalize_new_game_setup(raw_setup: Any) -> dict[str, Any]:
         "skills": skills,
         "starter_items": starter_items,
         "calendar": calendar_settings,
+        "audio": audio_settings,
         "time_display": calendar_settings["time_display"],
         "currency_denominations": currency_denominations,
         "currency_description": currency_description,
@@ -132,11 +134,25 @@ def normalize_new_game_setup(raw_setup: Any) -> dict[str, Any]:
     }
 
 
+def _audio_from_setup(raw_audio: Any) -> dict[str, Any]:
+    """Returns normalized new-game audio preferences."""
+
+    if not isinstance(raw_audio, dict):
+        raw_audio = {}
+
+    return {
+        "music_enabled": _safe_bool(raw_audio.get("music_enabled"), True),
+        "narrator_enabled": _safe_bool(raw_audio.get("narrator_enabled"), True),
+        "music_volume": _clamped_int(raw_audio.get("music_volume"), 25, 0, 100),
+        "tts_volume": _clamped_int(raw_audio.get("tts_volume"), 90, 0, 100),
+    }
+
+
 def parse_starter_items_text(raw_text: str) -> list[dict[str, Any]]:
     """
     Parses starter items from newline text.
 
-    Each line may be either a plain item name or:
+    Each line may be a natural-language item request, a plain item name, or:
     name | category | quantity | description | value_base_units
     """
 
@@ -146,6 +162,33 @@ def parse_starter_items_text(raw_text: str) -> list[dict[str, Any]]:
         clean_line = line.strip()
 
         if not clean_line:
+            continue
+
+        if "|" not in clean_line:
+            if _looks_like_item_request(clean_line):
+                items.append(
+                    {
+                        "name": "",
+                        "category": "Item",
+                        "quantity": 1,
+                        "description": "",
+                        "value_base_units": 0,
+                        "item_request": clean_line,
+                        "requires_ai_invention": True,
+                    }
+                )
+            else:
+                items.append(
+                    {
+                        "name": clean_line,
+                        "category": "Item",
+                        "quantity": 1,
+                        "description": "",
+                        "value_base_units": 0,
+                        "item_request": "",
+                        "requires_ai_invention": False,
+                    }
+                )
             continue
 
         parts = [part.strip() for part in clean_line.split("|")]
@@ -161,6 +204,8 @@ def parse_starter_items_text(raw_text: str) -> list[dict[str, Any]]:
                 "quantity": _safe_int(parts[2] if len(parts) > 2 else 1, 1),
                 "description": parts[3] if len(parts) > 3 else "",
                 "value_base_units": _safe_int(parts[4] if len(parts) > 4 else 0, 0),
+                "item_request": "",
+                "requires_ai_invention": False,
             }
         )
 
@@ -185,6 +230,7 @@ def build_new_game_setup_packet(
         if str(track).strip()
     ]
     creative_ideas = CreativeIdeasLibrary.load_default().select_for_new_game()
+    starter_item_count = len(clean_setup["starter_items"])
 
     return {
         "schema_version": 1,
@@ -258,6 +304,18 @@ def build_new_game_setup_packet(
                 "coherent; a detective can investigate a world not wholly built "
                 "around detective work."
             ),
+            "mature_content": (
+                "Assume the player and player character are adults of legal drinking "
+                "age unless the character setup explicitly says otherwise. Alcohol, "
+                "tavern drinking, drunken patrons, gambling, violence, injury, blood, "
+                "corpses, criminality, cruelty, corruption, and oppressive fictional "
+                "social attitudes are allowed when they fit the selected genre, "
+                "world, opening location, and player choices. Do not sanitize adult "
+                "fictional locations into harmless substitutes. Use fictional "
+                "in-world slurs only for fictional cultures, species, factions, "
+                "classes, guilds, or regions; do not use real-world slurs against "
+                "protected classes."
+            ),
             "starting_location": (
                 "If setup.start_location is blank/default, choose any fitting "
                 "starting location for the selected genre and character. The player "
@@ -289,14 +347,29 @@ def build_new_game_setup_packet(
                 "unless the player explicitly typed that skill name."
             ),
             "starter_inventory": (
-                "If setup.starter_items is empty or has fewer than five items, "
-                "create a finalized starting_items list with at least five concrete "
-                "items that fit the finalized character backstory, skills, selected "
-                "genre, starting location, weather, and economy. Preserve any "
-                "player-provided starter items and add fitting extra items as needed. "
-                "Do not use a generic fantasy kit unless the character and genre "
-                "actually justify it. Each item must include name, category, quantity, "
-                "description, and value_base_units."
+                "Return finalized inventory in the starting_items field, never in "
+                "starting_inventory. starting_items has no required minimum or "
+                "maximum count; return only the tracked possessions that naturally "
+                "fit the finalized character and opening situation. Do not add, "
+                "split, combine, or pad items to satisfy a quota. "
+                "Preserve any player-provided starter items with "
+                "requires_ai_invention=false. "
+                "When a setup.starter_items entry has requires_ai_invention=true or "
+                "item_request text, treat it as a player-authored item concept and "
+                "convert it into the number of concrete, setting-appropriate tracked "
+                "items that best fits the concept, rather than copying the request "
+                "verbatim. Set source_index to the zero-based setup.starter_items "
+                "index for any item based on that setup entry; for extra items not "
+                "based on a specific setup.starter_items entry, set source_index to "
+                "-1. Do not "
+                "include setup bookkeeping words such as Starting, Starter, Initial, "
+                "Amount, Quantity, Count, or Total in item names. Generalize resource "
+                "names to the actual inventory item, such as Fuel instead of Starting "
+                "Fuel Amount, Food instead of Starting Food Amount, and Water instead "
+                "of Starting Water Quantity. Put quantities in quantity, not name. Do not "
+                "use a generic fantasy kit unless the character and genre actually "
+                "justify it. Each item must include name, category, quantity, "
+                "description, value_base_units, and source_index."
             ),
             "currency_generation": (
                 "If setup.currency_denominations is empty, create a finalized "
@@ -332,6 +405,16 @@ def build_new_game_setup_packet(
             ),
         },
         "fields_requiring_ai_invention": _fields_requiring_ai_invention(clean_setup),
+        "starter_inventory_contract": {
+            "requested_item_count": starter_item_count,
+            "count_rule": "No required minimum or maximum starting item count.",
+            "output_field": "starting_items",
+            "alias_not_allowed": "starting_inventory",
+            "source_index_rule": (
+                "Use the zero-based setup.starter_items index for items based on "
+                "a setup starter-item entry and -1 only for extra invented items."
+            ),
+        },
         "character_generation_guidance": _character_generation_guidance(clean_setup),
         "genre_generation_guidance": _genre_generation_guidance(clean_setup),
         "audio": {
@@ -427,7 +510,7 @@ def _fields_requiring_ai_invention(clean_setup: dict[str, Any]) -> list[str]:
     if _has_ai_skill_placeholders(clean_setup["skills"]):
         invention_fields.append("distinct starting skill identities")
 
-    if len(clean_setup["starter_items"]) < 5:
+    if any(bool(item.get("requires_ai_invention")) for item in clean_setup["starter_items"]):
         invention_fields.append("starter inventory based on character and skills")
 
     if not clean_setup["currency_denominations"]:
@@ -537,11 +620,26 @@ def _normalize_starter_items(raw_items: Any) -> list[dict[str, Any]]:
 
     for raw_item in input_items:
         if not isinstance(raw_item, dict):
-            raw_item = {"name": str(raw_item)}
+            raw_text = str(raw_item)
+            if _looks_like_item_request(raw_text):
+                raw_item = {
+                    "item_request": raw_text,
+                    "requires_ai_invention": True,
+                }
+            else:
+                raw_item = {"name": raw_text}
 
         name = _clean_text(raw_item.get("name"))
+        item_request = (
+            _clean_text(raw_item.get("item_request"))
+            or _clean_text(raw_item.get("request"))
+            or _clean_text(raw_item.get("narrative_description"))
+        )
+        requires_ai_invention = bool(raw_item.get("requires_ai_invention")) or (
+            bool(item_request) and not name
+        )
 
-        if not name:
+        if not name and not item_request:
             continue
 
         items.append(
@@ -551,10 +649,33 @@ def _normalize_starter_items(raw_items: Any) -> list[dict[str, Any]]:
                 "quantity": max(1, _safe_int(raw_item.get("quantity"), 1)),
                 "description": _clean_text(raw_item.get("description")),
                 "value_base_units": max(0, _safe_int(raw_item.get("value_base_units"), 0)),
+                "item_request": item_request,
+                "requires_ai_invention": requires_ai_invention,
             }
         )
 
     return items
+
+
+def _looks_like_item_request(text: str) -> bool:
+    """Returns True when a starter-item line reads like an AI design brief."""
+
+    clean_text = str(text or "").strip()
+
+    if not clean_text:
+        return False
+
+    words = clean_text.split()
+
+    if len(words) >= 5:
+        return True
+
+    lowered = clean_text.casefold()
+
+    if lowered.startswith(("a ", "an ", "the ", "my ", "his ", "her ", "their ", "our ")):
+        return True
+
+    return any(marker in clean_text for marker in [".", ",", ";", ":"])
 
 
 def _calendar_from_setup(raw_calendar: Any) -> dict[str, Any]:
@@ -616,3 +737,29 @@ def _safe_int(value: Any, default: int) -> int:
         return int(value)
     except (TypeError, ValueError):
         return default
+
+
+def _clamped_int(value: Any, default: int, minimum: int, maximum: int) -> int:
+    """Converts a value to int and clamps it to an inclusive range."""
+
+    parsed = _safe_int(value, default)
+    return max(minimum, min(maximum, parsed))
+
+
+def _safe_bool(value: Any, default: bool) -> bool:
+    """Converts common setting values into a bool."""
+
+    if isinstance(value, bool):
+        return value
+
+    if value is None:
+        return default
+
+    if isinstance(value, str):
+        clean_value = value.strip().casefold()
+        if clean_value in {"1", "true", "yes", "on", "enabled"}:
+            return True
+        if clean_value in {"0", "false", "no", "off", "disabled"}:
+            return False
+
+    return bool(value)

@@ -6,6 +6,8 @@ from dataclasses import asdict, dataclass, field
 from importlib.resources import files
 from typing import Any
 
+from ai_adventure.alchemy.ingredients import COMMON_MEASUREMENT_UNITS
+
 
 LOGGER = logging.getLogger(__name__)
 
@@ -82,16 +84,28 @@ class AlchemyRulebook:
         """
 
         return {
-            "stages": [term.to_dict() for term in self.stages],
-            "product_types": [term.to_dict() for term in self.product_types],
-            "qualities": [term.to_dict() for term in self.qualities],
-            "motions": [term.to_dict() for term in self.motions],
-            "material_families": list(self.material_families),
-            "gathering_rules": list(self.gathering_rules),
-            "preparation_principles": list(self.preparation_principles),
-            "refinement_methods": list(self.refinement_methods),
+            "reagent_model": {
+                "fields": ["name", "description", "location", "uses"],
+                "summary": (
+                    "A known crafting item/material is a useful plant, mineral, "
+                    "part, salvage, or other material with practical uses."
+                ),
+            },
+            "recipe_model": {
+                "ingredient_fields": [
+                    "reagent_name",
+                    "quantity",
+                    "measure_amount",
+                    "measure_unit",
+                ],
+                "ingredient_rule": (
+                    "Use known crafting item/material names in reagent_name and "
+                    "common measurement units for recipe ingredients."
+                ),
+                "common_measurement_units": list(COMMON_MEASUREMENT_UNITS),
+            },
             "example_reagents": [
-                reagent.to_dict()
+                _simplified_reagent(reagent)
                 for reagent in self.select_reagents(
                     player_command,
                     max_reagents=max_reagents,
@@ -220,6 +234,17 @@ def _parse_reagent(raw_reagent: Any, source: str) -> RulebookReagent:
         motions=tuple(_read_string_list(raw_reagent, "motions", source)),
         locations=tuple(_read_string_list(raw_reagent, "locations", source)),
     )
+
+
+def _simplified_reagent(reagent: RulebookReagent) -> dict[str, Any]:
+    """Returns a simplified reagent example for AI context."""
+
+    return {
+        "name": reagent.name,
+        "description": reagent.description,
+        "location": ", ".join(reagent.locations),
+        "uses": list(reagent.common_uses),
+    }
 
 
 def _read_int(raw_data: dict[str, Any], key: str, source: str) -> int:

@@ -14,6 +14,8 @@ from ai_adventure.core.models import (
     AdventureState,
     HistoryEntry,
     HistoryState,
+    ItemCatalogEntry,
+    ItemCatalogState,
     InventoryItem,
     InventoryState,
     PlayerState,
@@ -65,6 +67,16 @@ class ContextBuilderTests(unittest.TestCase):
                     )
                 ]
             ),
+            item_catalog=ItemCatalogState(
+                items=[
+                    ItemCatalogEntry(
+                        name="Lantern",
+                        category="tool",
+                        description="A brass lantern.",
+                        value_base_units=12,
+                    )
+                ]
+            ),
             history=HistoryState(
                 entries=[
                     HistoryEntry(kind="system", content="Adventure started."),
@@ -80,6 +92,7 @@ class ContextBuilderTests(unittest.TestCase):
                         status="Active",
                         description="Recover the missing tavern ledger.",
                         requester="Mira Coppercup",
+                        notes="Legacy task notes should not be advertised as a field.",
                     )
                 ]
             ),
@@ -104,10 +117,20 @@ class ContextBuilderTests(unittest.TestCase):
                     "location": "Tavern",
                     "knowledge_scope": ["Common tavern gossip"],
                     "known_facts": ["The player asked about the north road."],
+                    "disposition": "Friendly",
                 }
             ],
             valid_music_tracks=["Town Village City.mp3", "Boss_Fight.mp3"],
             current_music="Town Village City.mp3",
+            resolved_skill_checks=[
+                {
+                    "skill_name": "Foraging",
+                    "roll": 20,
+                    "total": 24,
+                    "dc": 14,
+                    "outcome": "success",
+                }
+            ],
         )
 
         section_ids = {
@@ -156,6 +179,15 @@ class ContextBuilderTests(unittest.TestCase):
         )
         self.assertIn("player_ai_preferences", packet["response_contract"])
         self.assertIn("active_tasks", packet["response_contract"])
+        self.assertIn("mature_content", packet["response_contract"])
+        self.assertIn(
+            "adults of legal drinking age",
+            packet["response_contract"]["mature_content"],
+        )
+        self.assertIn(
+            "fictional in-world slurs",
+            packet["response_contract"]["mature_content"],
+        )
         self.assertIn("background_music", packet["response_contract"])
         self.assertIn("MusicChangedEvent", packet["response_contract"]["known_event_types"])
         self.assertIn("WorldLoreChangedEvent", packet["response_contract"]["known_event_types"])
@@ -172,19 +204,44 @@ class ContextBuilderTests(unittest.TestCase):
         self.assertEqual(packet["state"]["audio"]["current_music"], "Town Village City.mp3")
         self.assertEqual(packet["state"]["inventory"]["items"][0]["name"], "Lantern")
         self.assertEqual(packet["state"]["inventory"]["items"][0]["value_base_units"], 0)
+        self.assertEqual(packet["state"]["item_catalog"]["items"][0]["name"], "Lantern")
+        self.assertNotIn("quantity", packet["state"]["item_catalog"]["items"][0])
+        self.assertIn("item_catalog", packet["response_contract"])
+        self.assertIn(
+            "Material, Ingredient, Reagent, Crafting Item",
+            packet["response_contract"]["item_catalog"],
+        )
+        self.assertIn(
+            "state.item_catalog.items",
+            packet["state"]["alchemy"]["rules"]["recipe_ingredient_rule"],
+        )
         self.assertEqual(
             packet["state"]["active_tasks"]["tasks"][0]["name"],
             "Find the Missing Ledger",
         )
+        self.assertNotIn("notes", packet["state"]["active_tasks"]["tasks"][0])
         self.assertEqual(packet["state"]["currency"]["baseline_unit"], "base currency unit")
         self.assertEqual(len(packet["recent_history"]), 2)
         self.assertIn("narration.core_contract", section_ids)
+        self.assertIn("gm.safety_and_crime_narration", section_ids)
         self.assertIn("response.structured_story_turn", section_ids)
         self.assertIn("inventory.default_guidance", section_ids)
         self.assertIn("alchemy.default_guidance", section_ids)
         self.assertIn("skills.default_guidance", section_ids)
         self.assertIn("event.add", section_ids)
         self.assertIn("skill_checks", packet["response_contract"])
+        self.assertEqual(
+            packet["state"]["skills"]["resolved_checks_this_turn"][0]["roll"],
+            20,
+        )
+        self.assertIn(
+            "do not request duplicate checks",
+            packet["response_contract"]["skill_checks"],
+        )
+        self.assertIn(
+            "very high successful rolls",
+            packet["state"]["skills"]["rules"]["resolved_check_rule"],
+        )
         self.assertIn("creative_ideas", packet["response_contract"])
         self.assertIn("banned_terms", packet["creative_ideas"])
         self.assertIn("Alden", packet["creative_ideas"]["banned_terms"])
@@ -205,6 +262,10 @@ class ContextBuilderTests(unittest.TestCase):
             "preferred source",
             packet["response_contract"]["creative_ideas"],
         )
+        packet_json = json.dumps(packet)
+        self.assertNotIn("double-bracket", packet_json)
+        self.assertNotIn("legacy_tag", packet_json)
+        self.assertNotIn("do_not_emit_legacy_tag", packet_json)
         self.assertIn(
             "alchemy_ingredients",
             {category["id"] for category in packet["creative_ideas"]["categories"]},
@@ -220,13 +281,89 @@ class ContextBuilderTests(unittest.TestCase):
             "one NpcUpsertedEvent per distinct meaningful NPC",
             packet["response_contract"]["npc_memory"],
         )
+        self.assertIn("known_facts", packet["response_contract"]["npc_memory"])
+        self.assertIn("disposition", packet["response_contract"]["npc_memory"])
+        self.assertNotIn("disposition", packet["state"]["npcs"]["relevant"][0])
         self.assertIn("ActiveTaskUpsertedEvent", packet["response_contract"]["known_event_types"])
         self.assertIn("ActiveTaskCompletedEvent", packet["response_contract"]["known_event_types"])
+        self.assertIn(
+            "Do not leave visible task fields blank",
+            packet["state"]["active_tasks"]["rules"]["field_completion_rule"],
+        )
+        self.assertIn(
+            "due_elapsed_minutes",
+            packet["state"]["active_tasks"]["rules"]["field_completion_rule"],
+        )
+        self.assertIn(
+            "instead of vague due-date prose",
+            packet["response_contract"]["active_tasks"],
+        )
+        self.assertIn(
+            "should not be blank",
+            packet["state"]["npcs"]["rules"]["new_npc_rule"],
+        )
         self.assertEqual(
             packet["state"]["npcs"]["relevant"][0]["name"],
             "Mira Coppercup",
         )
         json.dumps(packet)
+
+    def test_build_story_context_caps_growing_state_sections(self) -> None:
+        library = ContextReferenceLoader().load_default_library()
+        builder = AiContextBuilder(library, max_history_entries=8)
+        state = AdventureState(
+            metadata=AdventureMetadata(title="Long Session"),
+            player=PlayerState(name="Kit"),
+            world=WorldState(location="Workshop", weather="Clear"),
+            inventory=InventoryState(
+                items=[
+                    InventoryItem(
+                        name=f"Inventory Item {index:02d}",
+                        description="x" * 1400,
+                    )
+                    for index in range(55)
+                ]
+            ),
+            item_catalog=ItemCatalogState(
+                items=[
+                    ItemCatalogEntry(
+                        name=f"Catalog Item {index:02d}",
+                        description="y" * 1400,
+                    )
+                    for index in range(70)
+                ]
+            ),
+            active_tasks=ActiveTasksState(
+                tasks=[
+                    ActiveTask(
+                        name=f"Task {index:02d}",
+                        description="z" * 1400,
+                    )
+                    for index in range(45)
+                ]
+            ),
+            history=HistoryState(
+                entries=[
+                    HistoryEntry(kind="story", content=f"Entry {index} " + "h" * 1400)
+                    for index in range(12)
+                ]
+            ),
+        )
+
+        packet = builder.build_story_context(
+            state,
+            player_command="Keep working.",
+        )
+
+        self.assertEqual(len(packet["state"]["inventory"]["items"]), 50)
+        self.assertEqual(len(packet["state"]["item_catalog"]["items"]), 60)
+        self.assertEqual(len(packet["state"]["active_tasks"]["tasks"]), 40)
+        self.assertEqual(len(packet["recent_history"]), 8)
+        self.assertLessEqual(
+            len(packet["state"]["inventory"]["items"][0]["description"]),
+            1200,
+        )
+        self.assertLessEqual(len(packet["recent_history"][0]["content"]), 1200)
 
     def test_creative_ideas_are_omitted_when_not_relevant(self) -> None:
         packet = AiContextBuilder(

@@ -18,10 +18,13 @@ from ai_adventure.core.models import (
     CurrencyState,
     HistoryEntry,
     HistoryState,
+    ItemCatalogEntry,
+    ItemCatalogState,
     InventoryItem,
     InventoryState,
     PlayerState,
     ReagentKnowledge,
+    RecipeIngredient,
     RecipeKnowledge,
     SettingsState,
     Skill,
@@ -85,6 +88,7 @@ class StateManager:
                 flags=self._load_flags(state_snapshot),
             ),
             inventory=self._load_inventory(),
+            item_catalog=self._load_item_catalog(),
             currency=CurrencyState(
                 balance_base_units=_read_int(state_snapshot, "currency.balance", 0),
                 denominations=self.repository.get_currency_denominations(),
@@ -147,6 +151,26 @@ class StateManager:
 
         return InventoryState(items=items)
 
+    def _load_item_catalog(self) -> ItemCatalogState:
+        """Loads remembered item definitions."""
+
+        items: list[ItemCatalogEntry] = []
+
+        for row in self.repository.list_item_catalog():
+            items.append(
+                ItemCatalogEntry(
+                    id=_read_optional_int(row, "id"),
+                    name=_read_string(row, "name", ""),
+                    category=_read_string(row, "category", ""),
+                    description=_read_string(row, "description", ""),
+                    value_base_units=_read_int(row, "value_base_units", 0),
+                    first_seen_at=_read_string(row, "first_seen_at", ""),
+                    updated_at=_read_string(row, "updated_at", ""),
+                )
+            )
+
+        return ItemCatalogState(items=items)
+
     def _load_alchemy(self) -> AlchemyNotebookState:
         """Loads typed alchemy notebook state."""
 
@@ -169,12 +193,9 @@ class StateManager:
                 ReagentKnowledge(
                     id=_read_optional_int(row, "id"),
                     name=_read_string(row, "name", ""),
-                    material_type=_read_string(row, "material_type", ""),
-                    qualities=_read_string_list(row, "qualities"),
-                    motions=_read_string_list(row, "motions"),
-                    virtues=_read_string_list(row, "virtues"),
+                    description=_read_string(row, "description", ""),
+                    location=_read_string(row, "location", ""),
                     uses=_read_string_list(row, "uses"),
-                    notes=_read_string(row, "notes", ""),
                     discovered_at=_read_string(row, "discovered_at", ""),
                 )
             )
@@ -184,10 +205,16 @@ class StateManager:
                 RecipeKnowledge(
                     id=_read_optional_int(row, "id"),
                     name=_read_string(row, "name", ""),
-                    ingredients=_read_string_list(row, "ingredients"),
+                    ingredients=[
+                        RecipeIngredient(
+                            reagent_name=_read_string(ingredient, "reagent_name", ""),
+                            quantity=_read_int(ingredient, "quantity", 1),
+                            measure_amount=_read_int(ingredient, "measure_amount", 1),
+                            measure_unit=_read_string(ingredient, "measure_unit", "each"),
+                        )
+                        for ingredient in _read_dict_list(row, "ingredients")
+                    ],
                     result=_read_string(row, "result", ""),
-                    motions=_read_string_list(row, "motions"),
-                    virtues=_read_string_list(row, "virtues"),
                     notes=_read_string(row, "notes", ""),
                     discovered_at=_read_string(row, "discovered_at", ""),
                 )
@@ -251,6 +278,7 @@ class StateManager:
                     location=_read_string(row, "location", ""),
                     reward=_read_string(row, "reward", ""),
                     due_date=_read_string(row, "due_date", ""),
+                    due_elapsed_minutes=_read_int(row, "due_elapsed_minutes", -1),
                     notes=_read_string(row, "notes", ""),
                     created_at=_read_string(row, "created_at", ""),
                     updated_at=_read_string(row, "updated_at", ""),
@@ -281,7 +309,9 @@ class StateManager:
 
         values = self.repository.list_settings()
         player_name = str(values.get("player_name", ""))
-        theme = str(values.get("theme", "System"))
+        theme = str(values.get("theme", "Light"))
+        if theme not in {"Light", "Dark"}:
+            theme = "Light"
 
         return SettingsState(player_name=player_name, theme=theme, values=values)
 
@@ -349,3 +379,15 @@ def _read_string_list(row: dict[str, Any], key: str) -> list[str]:
         for item in value
         if str(item).strip()
     ]
+
+
+def _read_dict_list(row: dict[str, Any], key: str) -> list[dict[str, Any]]:
+    """Reads a list of dictionaries from a row-like dictionary."""
+
+    value = row.get(key, [])
+
+    if not isinstance(value, list):
+        LOGGER.warning("Expected list for '%s', got %r.", key, value)
+        return []
+
+    return [dict(item) for item in value if isinstance(item, dict)]

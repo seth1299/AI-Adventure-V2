@@ -15,7 +15,7 @@
       "content": {
         "description": "The AI must return one machine-readable JSON object. Visible narration is a field, not the entire response envelope.",
         "json_shape": {
-          "response": "String. Visible narration only. No legacy events.",
+          "response": "String. Visible narration only.",
           "suggested_actions": "Array of 3-4 strings for in-game turns. Empty for fully out-of-game answers.",
           "events": "Array of structured event objects. Empty when no state change is proposed.",
           "out_of_game": "Boolean."
@@ -26,7 +26,6 @@
         },
         "rules": [
           "Return valid JSON only, with no Markdown fence.",
-          "Do not put legacy double-bracket events in response.",
           "Only put player-facing text in response.",
                     "Use supported events for inventory, world, quest, task, skill, currency, recipe, reagent, NPC, music, spell, note, flag, and status changes.",
           "The Python application validates events before committing state."
@@ -110,12 +109,18 @@
       "title": "Safety and Crime Narration",
       "category": "safety",
       "tags": [
+        "always",
+        "story",
         "crime",
         "combat"
       ],
-      "priority": 60,
+      "priority": 93,
       "content": {
         "rules": [
+          "Assume the player and player character are adults of legal drinking age unless the character profile explicitly says the character is underage.",
+          "Alcohol, tavern drinking, drunken patrons, gambling, threats, intimidation, violence, injury, blood, corpses, criminality, cruelty, corruption, and oppressive fictional social attitudes are allowed when they fit the scene, genre, and player choices.",
+          "Do not sanitize adult fictional locations into harmless substitutes. A tavern may be a tavern with beer, wine, spirits, intoxicated regulars, gambling, brawls, gossip, and shady deals.",
+          "For prejudice or slurs, use fictional in-world terms for fictional cultures, species, factions, classes, guilds, or regions. Do not use real-world slurs against protected classes.",
           "For illegal, dangerous, or illicit acts, narrate results, tension, consequences, and uncertainty.",
           "Do not provide real-world step-by-step instructions for crimes, lockpicking, weapon construction, evading law enforcement, or other dangerous real-world procedures.",
           "In fantasy or fictional contexts, keep the focus on story outcomes rather than procedural instruction."
@@ -152,16 +157,15 @@
       "priority": 98,
       "content": {
         "rules": [
-          "Return one JSON object, not prose with embedded legacy events.",
+          "Return one JSON object.",
           "Put all player-facing narration in the response field.",
-          "Do not include legacy double-bracket events in response.",
-          "Keep in-game responses under 30 sentences.",
+          "Keep in-game responses under 30 sentences, but do not use a fixed sentence count. Scale response length to the importance, risk, and consequences of the action.",
           "For in-game turns, response must end with exactly: What do you do now?",
           "For in-game turns, include 3-4 suggested_actions as separate strings.",
           "Use events for state changes instead of embedding commands in narration."
         ],
         "json_response_shape": {
-          "response": "Visible player-facing narration. No legacy events.",
+          "response": "Visible player-facing narration.",
           "suggested_actions": "Array of 3-4 suggested player actions for in-game turns.",
           "events": "Array of structured event objects. Empty when no state change is proposed.",
           "out_of_game": "Boolean. True only for fully out-of-game answers."
@@ -169,8 +173,8 @@
       }
     },
     {
-      "id": "gm.universal_tag_rules",
-      "title": "Universal Tag Rules",
+      "id": "gm.universal_event_rules",
+      "title": "Universal Event Rules",
       "category": "event_contract",
       "tags": [
         "always",
@@ -185,7 +189,7 @@
           "Do not invent event type names unless the response contract explicitly allows them.",
           "Keep event payload fields exact and machine-readable.",
           "Use plain integers for amounts and minute counts.",
-          "Never put legacy double-bracket events in visible narration."
+          "Keep event suggestions in the events array."
         ]
       }
     },
@@ -237,8 +241,6 @@
       ],
       "priority": 70,
       "content": {
-        "legacy_tag": "STATUS",
-        "do_not_emit_legacy_tag": true,
         "event_type": "StatusUpdatedEvent",
         "payload_fields": [
           "location",
@@ -273,22 +275,23 @@
       ],
       "priority": 70,
       "content": {
-        "legacy_tag": "ROLL",
-        "do_not_emit_legacy_tag": true,
         "event_type": "SkillCheckRequestedEvent",
         "payload_fields": [
           "skill_name"
         ],
-        "purpose": "If the player explicitly says they use a named skill, or attempts an action that could plausibly fail, go poorly, take extra time, produce a partial result, reveal misleading information, consume resources, attract attention, cause harm, miss something, or vary in quality, suggest SkillCheckRequestedEvent before narrating the final outcome. Do not hand-wave these actions as automatic success unless they are trivial, risk-free, and have no meaningful consequence.",
+        "purpose": "If the player explicitly says they use a named skill, or attempts an action that could plausibly fail, go poorly, take extra time, produce a partial result, reveal misleading information, consume resources, attract attention, cause harm, miss something, or vary in quality, suggest SkillCheckRequestedEvent before narrating the final outcome. Do not hand-wave these actions as automatic success unless they are trivial, risk-free, and have no meaningful consequence. Routine movement, paying a known price, receiving ordinary goods, eating, drinking, and casual conversation are not checks unless the player adds a contested, risky, hidden, time-sensitive, or deceptive goal.",
         "rules": [
           "Suggest SkillCheckRequestedEvent when an action's success, failure, speed, quality, consequences, resource cost, or discovery quality are uncertain.",
           "Foraging, harvesting, searching, researching, identifying, crafting, alchemy experiments, persuasion, stealth, combat, and named skill use require SkillCheckRequestedEvent unless the action is trivial and risk-free.",
+          "Do not request checks for routine movement, paying a known price, receiving ordinary goods, eating, drinking, or casual conversation unless the player adds a contested, risky, hidden, time-sensitive, or deceptive goal.",
           "Prefer SkillCheckRequestedEvent over SkillXpAddedEvent when the player is attempting a risky or uncertain action.",
           "Do not narrate found items, harvested resources, crafted products, persuaded NPC outcomes, stealth results, combat results, or research conclusions as final success until after the Python application resolves the check.",
           "Use the most relevant skill name.",
           "If no existing skill fits and the player is attempting something new, choose a clear new skill name.",
           "Die rolls are non-diegetic. Do not mention dice, raw roll numbers, or game mechanics in the story narration.",
           "After the system returns the roll result, incorporate the outcome into the narrative naturally.",
+          "When state.skills.resolved_checks_this_turn contains results, treat them as authoritative for the current player command and do not request duplicate checks for those skills.",
+          "Low failed rolls should create real setbacks, costs, missed information, danger, or slower progress; very high successful rolls should produce cleaner, richer, faster, or more advantageous results.",
           "Do not decide success or failure before the roll result is available."
         ]
       }
@@ -304,8 +307,6 @@
       ],
       "priority": 70,
       "content": {
-        "legacy_tag": "SKILL",
-        "do_not_emit_legacy_tag": true,
         "event_type": "SkillUpsertedEvent",
         "payload_fields": [
           "name",
@@ -337,8 +338,6 @@
       ],
       "priority": 70,
       "content": {
-        "legacy_tag": "ADD_XP",
-        "do_not_emit_legacy_tag": true,
         "event_type": "SkillXpAddedEvent",
         "payload_fields": [
           "skill_name",
@@ -368,8 +367,6 @@
       ],
       "priority": 70,
       "content": {
-        "legacy_tag": "CHANGE_CURRENCY",
-        "do_not_emit_legacy_tag": true,
         "event_type": "CurrencyChangedEvent",
         "payload_fields": [
           "base_unit_amount"
@@ -397,8 +394,6 @@
       ],
       "priority": 70,
       "content": {
-        "legacy_tag": "DEFINE_CURRENCY",
-        "do_not_emit_legacy_tag": true,
         "event_type": "CurrencyDefinedEvent",
         "payload_fields": [
           "name",
@@ -425,8 +420,6 @@
       ],
       "priority": 70,
       "content": {
-        "legacy_tag": "ADD",
-        "do_not_emit_legacy_tag": true,
         "event_type": "InventoryItemAddedEvent",
         "payload_fields": [
           "item_type",
@@ -459,8 +452,6 @@
       ],
       "priority": 70,
       "content": {
-        "legacy_tag": "REMOVE",
-        "do_not_emit_legacy_tag": true,
         "event_type": "InventoryItemRemovedEvent",
         "payload_fields": [
           "item_name",
@@ -487,8 +478,6 @@
       ],
       "priority": 70,
       "content": {
-        "legacy_tag": "MODIFY_ITEM",
-        "do_not_emit_legacy_tag": true,
         "event_type": "InventoryItemModifiedEvent",
         "payload_fields": [
           "target_name",
@@ -521,19 +510,19 @@
       ],
       "priority": 70,
       "content": {
-        "legacy_tag": "RECIPE",
-        "do_not_emit_legacy_tag": true,
         "event_type": "RecipeDiscoveredEvent",
         "payload_fields": [
-          "item_name",
-          "ingredients"
+          "name",
+          "ingredients",
+          "result",
+          "notes"
         ],
         "purpose": "Saves a known crafting recipe.",
         "rules": [
           "Suggest RecipeDiscoveredEvent when the player learns, discovers, invents, buys, reads, or successfully experiments with a recipe.",
-          "Include 1-3 ingredients.",
-          "Use logical ingredient names and quantities.",
-          "Do not include in structured event data more than 3 ingredients.",
+          "Ingredients must be structured objects with reagent_name, quantity, measure_amount, and measure_unit.",
+          "Use reagent_name values that match names in state.item_catalog.items, and only choose items whose category is Material, Ingredient, Reagent, or Crafting Item.",
+          "Use common measurement units such as each, mL, L, drops, tsp, tbsp, cups, grams, kg, oz, lbs, pinch, or handful.",
           "Do not use this to craft the item by itself. Crafting still requires InventoryItemRemovedEvent for ingredients and InventoryItemAddedEvent for the result."
         ]
       }
@@ -550,27 +539,22 @@
       ],
       "priority": 70,
       "content": {
-        "legacy_tag": "REAGENT",
-        "do_not_emit_legacy_tag": true,
         "event_type": "ReagentDiscoveredEvent",
         "payload_fields": [
           "name",
-          "material_type",
-          "qualities",
-          "motions",
-          "virtues",
-          "uses",
-          "notes"
+          "description",
+          "location",
+          "uses"
         ],
-        "purpose": "Saves a discovered alchemical reagent with structured properties for the Alchemy Notebook.",
+        "purpose": "Saves a discovered useful item/material for the Crafting tab.",
         "rules": [
-          "Suggest ReagentDiscoveredEvent when the player learns that a plant, mineral, fluid, creature part, or other material is useful as an alchemical reagent.",
-          "Do not use name-only reagent payloads. Include material_type, qualities, motions, virtues, uses, and notes.",
-          "`Material Type` should be a broad category such as Botanical, Fungal, Geological, Animal, Elemental, Alchemical, or a clear hybrid category.",
-          "`Qualities`, `Motions`, `Virtues`, and `Uses` must be arrays of short strings.",
-          "`Notes` should summarize player-known preparation, habitat, season, warnings, or source information.",
-          "ReagentDiscoveredEvent records notebook knowledge only. If the player physically collects, harvests, picks up, or stores the reagent, also suggest InventoryItemAddedEvent for the same reagent.",
-          "Use WorldLoreAddedEvent only for broader plant or world facts that are not structured reagent properties. If the player learns reagent properties, use ReagentDiscoveredEvent."
+          "Suggest ReagentDiscoveredEvent when the player learns that a plant, mineral, fluid, creature part, tool part, salvage, foodstuff, or other material is useful for crafting, repair, cooking, medicine, alchemy, or other practical preparation.",
+          "Do not use name-only item/material payloads. Include description, location, and uses.",
+          "`Description` should briefly explain what the item or material is.",
+          "`Location` should describe where the item or material is found.",
+          "`Uses` must be an array of short practical uses.",
+          "ReagentDiscoveredEvent records crafting knowledge and the app remembers that item as a Material for recipe ingredient selection. If the player physically collects, harvests, picks up, or stores the item/material, also suggest InventoryItemAddedEvent for the same item/material.",
+          "Use WorldLoreAddedEvent only for broader plant, material, or world facts that are not structured practical crafting knowledge. If the player learns practical item/material uses, use ReagentDiscoveredEvent."
         ]
       }
     },
@@ -605,8 +589,6 @@
       ],
       "priority": 70,
       "content": {
-        "legacy_tag": "UPDATE_WORLD",
-        "do_not_emit_legacy_tag": true,
         "event_type": "WorldLoreAddedEvent",
         "payload_fields": [
           "section",
@@ -645,8 +627,6 @@
       ],
       "priority": 70,
       "content": {
-        "legacy_tag": "UPSERT_WORLD",
-        "do_not_emit_legacy_tag": true,
         "event_type": "WorldLoreChangedEvent",
         "payload_fields": [
           "section",
@@ -656,7 +636,7 @@
         "purpose": "Updates one existing World panel entry under the correct section.",
         "rules": [
           "Suggest WorldLoreChangedEvent when a known NPC, location, faction, shop, landmark, custom, or world fact needs to be corrected, clarified, or changed based on what the player learned in the current turn.",
-          "WorldLoreUpdatedEvent is accepted as a legacy alias, but prefer WorldLoreChangedEvent.",
+          "WorldLoreUpdatedEvent is accepted as an older alias, but prefer WorldLoreChangedEvent.",
           "Section must be one of the allowed World sections.",
           "Key must exactly match the existing World tab entry key whenever possible.",
           "Replacement Lore must be the full updated encyclopedia-style entry.",
@@ -678,8 +658,6 @@
       ],
       "priority": 70,
       "content": {
-        "legacy_tag": "QUEST",
-        "do_not_emit_legacy_tag": true,
         "event_type": "QuestAddedEvent",
         "payload_fields": [
           "name",
@@ -710,8 +688,6 @@
       ],
       "priority": 70,
       "content": {
-        "legacy_tag": "COMPLETE_QUEST",
-        "do_not_emit_legacy_tag": true,
         "event_type": "QuestCompletedEvent",
         "payload_fields": [
           "name"
@@ -739,8 +715,6 @@
       ],
       "priority": 72,
       "content": {
-        "legacy_tag": null,
-        "do_not_emit_legacy_tag": true,
         "event_type": "ActiveTaskUpsertedEvent",
         "payload_fields": [
           "name",
@@ -751,7 +725,7 @@
           "location",
           "reward",
           "due_date",
-          "notes"
+          "due_elapsed_minutes"
         ],
         "purpose": "Creates or updates an active task, including quests, custom orders, commissions, pending purchases, deliveries, promises, and other ongoing obligations.",
         "rules": [
@@ -762,11 +736,13 @@
           "`Category` should be a plain label such as Quest, Commission, Order, Delivery, Favor, Debt, Research, or Task.",
           "`Status` should be concise, such as Active, Waiting, In Progress, Ready for Pickup, or Pending.",
           "`Description` should summarize what needs to happen.",
-          "`Requester` may be an NPC, faction, shop, customer, or Self.",
-          "`Location` should be where the task is relevant, picked up, completed, or turned in.",
-          "`Reward` may describe payment, promised reward, cost already paid, or Unknown.",
-          "`Due Date` may be empty if there is no known deadline.",
-          "`Notes` must contain only player-known information."
+          "Do not leave visible task fields blank. The Active Tasks tab shows Requester, Location, Reward, and Due Date directly.",
+          "`Requester` may be an NPC, faction, shop, customer, or Self. Use Self for personal goals.",
+          "`Location` should be where the task is relevant, picked up, completed, worked on, or turned in. For self-directed crafting or item creation, use the player's workshop or another logical workspace if one is established.",
+          "`Reward` may describe payment, promised reward, cost already paid, Unknown if a real reward exists but is unclear, or N/A if nobody is paying or trading for the task.",
+          "`Due Date` should be an exact in-world date and time or N/A if there is no known deadline.",
+          "`due_elapsed_minutes` should be the absolute in-world elapsed minute for the deadline, or -1 when there is no known deadline.",
+          "Do not add `notes`, `Notes`, or other extra fields to ActiveTaskUpsertedEvent."
         ]
       }
     },
@@ -781,8 +757,6 @@
       ],
       "priority": 72,
       "content": {
-        "legacy_tag": null,
-        "do_not_emit_legacy_tag": true,
         "event_type": "ActiveTaskCompletedEvent",
         "payload_fields": [
           "name",
@@ -808,8 +782,6 @@
       ],
       "priority": 70,
       "content": {
-        "legacy_tag": "MUSIC",
-        "do_not_emit_legacy_tag": true,
         "event_type": "MusicChangedEvent",
         "payload_fields": [
           "filename"
@@ -835,8 +807,6 @@
       ],
       "priority": 70,
       "content": {
-        "legacy_tag": "SPELL",
-        "do_not_emit_legacy_tag": true,
         "event_type": "SpellLearnedEvent",
         "payload_fields": [
           "name",

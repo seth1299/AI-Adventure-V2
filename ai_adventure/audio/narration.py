@@ -269,7 +269,8 @@ def sanitize_tts_text(text: str) -> str:
 def sanitize_narration_display_text(text: str) -> str:
     """Returns visible prose that should be revealed while narration plays."""
 
-    clean_text = re.sub(r"\[\[[^\]]+\]\]", " ", str(text or ""))
+    marker_pattern = r"\[" r"\[[^\]]+\]" r"\]"
+    clean_text = re.sub(marker_pattern, " ", str(text or ""))
     clean_text = re.sub(r"`([^`]+)`", r"\1", clean_text)
     clean_text = clean_text.replace("*", "")
     clean_text = clean_text.replace("_", "")

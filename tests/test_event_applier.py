@@ -10,6 +10,14 @@ from ai_adventure.events.event_applier import EventApplier
 from ai_adventure.persistence.save_repository import SaveRepository
 
 
+class _FixedRollRng:
+    def __init__(self, roll: int) -> None:
+        self.roll = roll
+
+    def randint(self, lower: int, upper: int) -> int:
+        return self.roll
+
+
 class EventApplierTests(unittest.TestCase):
     def test_applies_inventory_add_remove_and_modify_events(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -210,6 +218,44 @@ class EventApplierTests(unittest.TestCase):
             )
             self.assertEqual(repository.get_state_snapshot()["location"], "Dastrium Valley")
 
+    def test_failed_prior_skill_check_blocks_later_reward_events(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = SaveRepository.create_new_save(Path(temp_dir), "Split Gate Test")
+            repository.upsert_skill("Foraging", "Finding useful materials.", 1)
+            applier = EventApplier(repository, rng=random.Random(2))
+            prior_results = applier.apply_events(
+                [
+                    {
+                        "type": "SkillCheckRequestedEvent",
+                        "payload": {"skill_name": "Foraging", "dc": 14},
+                    }
+                ]
+            )
+
+            results = applier.apply_events(
+                [
+                    {
+                        "type": "InventoryItemAddedEvent",
+                        "payload": {
+                            "item_type": "Botanical",
+                            "item_name": "Silver-Spire Fern",
+                            "description": "Cool-natured fern.",
+                            "amount": 1,
+                            "value_base_units": 8,
+                        },
+                    }
+                ],
+                prior_results=prior_results,
+            )
+
+            self.assertEqual(prior_results[0].payload["outcome"], "failure")
+            self.assertEqual(results[0].status, "skipped")
+            self.assertIn("previous skill check failed", results[0].message)
+            self.assertNotIn(
+                "Silver-Spire Fern",
+                {item["name"] for item in repository.list_inventory_items()},
+            )
+
     def test_successful_skill_check_allows_following_reward_events(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             repository = SaveRepository.create_new_save(Path(temp_dir), "Gate Test")
@@ -239,6 +285,69 @@ class EventApplierTests(unittest.TestCase):
                 "Silver-Spire Fern",
                 {item["name"] for item in repository.list_inventory_items()},
             )
+
+    def test_bad_luck_streak_nudges_skill_check_roll(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = SaveRepository.create_new_save(Path(temp_dir), "Luck Test")
+            repository.upsert_skill("Prospecting", "Reading ore signs and mineral veins.", 3)
+
+            for roll in [3, 11, 9, 2, 13, 5, 4]:
+                repository.record_skill_check(
+                    skill_name="Prospecting",
+                    level=3,
+                    bonus=6,
+                    roll=roll,
+                    total=roll + 6,
+                    dc=14,
+                    outcome="success" if roll + 6 >= 14 else "failure",
+                )
+
+            result = EventApplier(repository, rng=_FixedRollRng(8)).apply_event(
+                {
+                    "type": "SkillCheckRequestedEvent",
+                    "payload": {"skill_name": "Prospecting", "dc": 15},
+                }
+            )
+            check = repository.list_skill_checks(limit=1)[0]
+
+            self.assertEqual(result.status, "applied")
+            self.assertEqual(result.payload["raw_roll"], 8)
+            self.assertEqual(result.payload["bad_luck_nudge"], 2)
+            self.assertEqual(result.payload["roll"], 10)
+            self.assertEqual(result.payload["total"], 16)
+            self.assertEqual(result.payload["outcome"], "success")
+            self.assertEqual(check["roll"], 10)
+            self.assertEqual(check["total"], 16)
+
+    def test_normal_roll_history_does_not_nudge_skill_check_roll(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = SaveRepository.create_new_save(Path(temp_dir), "Luck Test")
+            repository.upsert_skill("Prospecting", "Reading ore signs and mineral veins.", 3)
+
+            for roll in [3, 11, 9, 12, 13]:
+                repository.record_skill_check(
+                    skill_name="Prospecting",
+                    level=3,
+                    bonus=6,
+                    roll=roll,
+                    total=roll + 6,
+                    dc=14,
+                    outcome="success" if roll + 6 >= 14 else "failure",
+                )
+
+            result = EventApplier(repository, rng=_FixedRollRng(8)).apply_event(
+                {
+                    "type": "SkillCheckRequestedEvent",
+                    "payload": {"skill_name": "Prospecting", "dc": 15},
+                }
+            )
+
+            self.assertEqual(result.status, "applied")
+            self.assertEqual(result.payload["raw_roll"], 8)
+            self.assertEqual(result.payload["bad_luck_nudge"], 0)
+            self.assertEqual(result.payload["roll"], 8)
+            self.assertEqual(result.payload["total"], 14)
+            self.assertEqual(result.payload["outcome"], "failure")
 
     def test_existing_duplicate_inventory_stacks_are_coalesced_on_load(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -388,22 +497,40 @@ class EventApplierTests(unittest.TestCase):
                         "type": "ReagentDiscoveredEvent",
                         "payload": {
                             "name": "Moonwater",
-                            "material_type": "Elemental",
-                            "qualities": ["cool", "moist"],
-                            "motions": ["stilling", "opening"],
-                            "virtues": ["reception"],
+                            "description": "Water prepared under moonlight.",
+                            "location": "Open bowls left beneath a full moon",
                             "uses": ["sleep draughts"],
-                            "notes": "Prepared under moonlight.",
+                        },
+                    },
+                    {
+                        "type": "ReagentDiscoveredEvent",
+                        "payload": {
+                            "name": "Mooncap Fungus",
+                            "description": "Soft blue fungus that releases a drowsy scent.",
+                            "location": "Damp cave mouths and shaded roots",
+                            "uses": ["sleep draughts"],
                         },
                     },
                     {
                         "type": "RecipeDiscoveredEvent",
                         "payload": {
                             "name": "Quiet Sleep Draught",
-                            "ingredients": {"Moonwater": 1, "Mooncap Fungus": 1},
+                            "ingredients": [
+                                {
+                                    "reagent_name": "Moonwater",
+                                    "quantity": 1,
+                                    "measure_amount": 100,
+                                    "measure_unit": "mL",
+                                },
+                                {
+                                    "reagent_name": "Mooncap Fungus",
+                                    "quantity": 1,
+                                    "measure_amount": 1,
+                                    "measure_unit": "each",
+                                },
+                            ],
                             "result": "Invites sleep.",
-                            "motions": ["stilling"],
-                            "virtues": ["sleep"],
+                            "notes": "Best brewed at low heat.",
                         },
                     },
                 ]
@@ -412,11 +539,51 @@ class EventApplierTests(unittest.TestCase):
             reagents = repository.list_alchemy_reagents()
             recipes = repository.list_alchemy_recipes()
 
-            self.assertEqual(reagents[0]["name"], "Moonwater")
-            self.assertEqual(reagents[0]["material_type"], "Elemental")
-            self.assertEqual(reagents[0]["qualities"], ["cool", "moist"])
+            moonwater = next(reagent for reagent in reagents if reagent["name"] == "Moonwater")
+
+            self.assertEqual(moonwater["description"], "Water prepared under moonlight.")
+            self.assertEqual(moonwater["location"], "Open bowls left beneath a full moon")
+            catalog = repository.list_item_catalog()
+            catalog_moonwater = next(item for item in catalog if item["name"] == "Moonwater")
+            self.assertEqual(catalog_moonwater["category"], "Material")
             self.assertEqual(recipes[0]["name"], "Quiet Sleep Draught")
-            self.assertEqual(recipes[0]["ingredients"], ["Moonwater: 1", "Mooncap Fungus: 1"])
+            self.assertEqual(recipes[0]["ingredients"][0]["reagent_name"], "Moonwater")
+            self.assertEqual(recipes[0]["ingredients"][0]["measure_unit"], "mL")
+
+    def test_recipe_discovery_requires_allowed_item_catalog_category(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = SaveRepository.create_new_save(Path(temp_dir), "Event Test")
+            repository.add_inventory_item(
+                name="Glass Stirring Rod",
+                category="Tool",
+                quantity=1,
+                description="A glass rod used to stir mixtures.",
+                value_base_units=3,
+            )
+
+            results = EventApplier(repository).apply_events(
+                [
+                    {
+                        "type": "RecipeDiscoveredEvent",
+                        "payload": {
+                            "name": "Rod Powder",
+                            "ingredients": [
+                                {
+                                    "reagent_name": "Glass Stirring Rod",
+                                    "quantity": 1,
+                                    "measure_amount": 1,
+                                    "measure_unit": "each",
+                                }
+                            ],
+                            "result": "A questionable powder.",
+                            "notes": "This should be rejected.",
+                        },
+                    }
+                ]
+            )
+
+            self.assertEqual(results[0].status, "skipped")
+            self.assertEqual(repository.list_alchemy_recipes(), [])
 
     def test_applies_npc_profile_and_knowledge_events(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -487,6 +654,7 @@ class EventApplierTests(unittest.TestCase):
     def test_applies_active_task_and_quest_events(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             repository = SaveRepository.create_new_save(Path(temp_dir), "Task Test")
+            repository.set_calendar_settings({"time_display": "12_hour"})
 
             results = EventApplier(repository).apply_events(
                 [
@@ -527,6 +695,18 @@ class EventApplierTests(unittest.TestCase):
             self.assertIsNotNone(ledger_task)
             self.assertEqual(ledger_task["category"], "Quest")
             self.assertEqual(ledger_task["requester"], "Mira Coppercup")
+            self.assertEqual(ledger_task["location"], "Tavern")
+            self.assertEqual(ledger_task["reward"], "Free room and board.")
+            self.assertEqual(ledger_task["due_date"], "N/A")
+            self.assertEqual(ledger_task["due_elapsed_minutes"], -1)
+
+            commission_task = repository.get_active_task("Silver Ring Commission")
+            self.assertIsNotNone(commission_task)
+            self.assertEqual(
+                commission_task["due_date"],
+                "Wednesday, Month 1 3, Year 1, 5:00 P.M.",
+            )
+            self.assertEqual(commission_task["due_elapsed_minutes"], 3900)
 
             complete_result = EventApplier(repository).apply_event(
                 {
@@ -549,6 +729,111 @@ class EventApplierTests(unittest.TestCase):
             self.assertEqual(completed_task["status"], "Completed")
             self.assertEqual(completed_task["notes"], "The ring was collected.")
 
+    def test_active_task_vague_due_date_is_stored_as_exact_elapsed_minute(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = SaveRepository.create_new_save(Path(temp_dir), "Task Due Date")
+            repository.set_calendar_settings({"time_display": "12_hour"})
+            repository.set_state_value("elapsed_minutes", str(8 * 60))
+
+            result = EventApplier(repository).apply_event(
+                {
+                    "type": "ActiveTaskUpsertedEvent",
+                    "payload": {
+                        "name": "Deliver the Samples",
+                        "category": "Delivery",
+                        "status": "Active",
+                        "description": "Bring the samples to the river office.",
+                        "requester": "Mira Coppercup",
+                        "location": "River Office",
+                        "reward": "12 Bits",
+                        "due_date": "the end of the week",
+                    },
+                }
+            )
+
+            task = repository.get_active_task("Deliver the Samples")
+
+            self.assertEqual(result.status, "applied")
+            self.assertIsNotNone(task)
+            self.assertEqual(task["due_elapsed_minutes"], (6 * 24 * 60) + (23 * 60) + 59)
+            self.assertEqual(
+                task["due_date"],
+                "Sunday, Month 1 7, Year 1, 11:59 P.M.",
+            )
+
+            repository.set_calendar_settings(
+                {
+                    "days_per_week": 10,
+                    "day_names": [f"Day {index}" for index in range(1, 11)],
+                    "time_display": "24_hour",
+                }
+            )
+            refreshed_task = repository.get_active_task("Deliver the Samples")
+
+            self.assertEqual(
+                refreshed_task["due_elapsed_minutes"],
+                task["due_elapsed_minutes"],
+            )
+            self.assertIn("23:59", refreshed_task["due_date"])
+
+    def test_active_task_blank_visible_fields_get_meaningful_defaults(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = SaveRepository.create_new_save(Path(temp_dir), "Task Defaults")
+            repository.set_state_value("location", "Old Workshop")
+
+            result = EventApplier(repository).apply_event(
+                {
+                    "type": "ActiveTaskUpsertedEvent",
+                    "payload": {
+                        "name": "Craft spare lockpicks",
+                        "category": "Personal Goal",
+                        "description": "Create more lockpicks for future work.",
+                    },
+                }
+            )
+
+            task = repository.get_active_task("Craft spare lockpicks")
+
+            self.assertEqual(result.status, "applied")
+            self.assertIsNotNone(task)
+            self.assertEqual(task["requester"], "Self")
+            self.assertEqual(task["location"], "Player's Workshop")
+            self.assertEqual(task["reward"], "N/A")
+            self.assertEqual(task["due_date"], "N/A")
+
+    def test_active_task_defaults_do_not_overwrite_existing_values(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = SaveRepository.create_new_save(Path(temp_dir), "Task Defaults")
+            repository.upsert_active_task(
+                name="Collect the Samples",
+                category="Research",
+                status="Active",
+                description="Collect river mud samples.",
+                requester="Self",
+                location="Riverbank",
+                reward="N/A",
+                due_date="Before dawn",
+            )
+
+            result = EventApplier(repository).apply_event(
+                {
+                    "type": "ActiveTaskUpdatedEvent",
+                    "payload": {
+                        "name": "Collect the Samples",
+                        "description": "Collect river mud samples and label each jar.",
+                    },
+                }
+            )
+
+            task = repository.get_active_task("Collect the Samples")
+
+            self.assertEqual(result.status, "applied")
+            self.assertIsNotNone(task)
+            self.assertEqual(task["requester"], "Self")
+            self.assertEqual(task["location"], "Riverbank")
+            self.assertEqual(task["reward"], "N/A")
+            self.assertEqual(task["due_date"], "Before dawn")
+
     def test_npc_upsert_allows_display_name_without_known_name(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             repository = SaveRepository.create_new_save(Path(temp_dir), "NPC Test")
@@ -563,13 +848,21 @@ class EventApplierTests(unittest.TestCase):
                             "A wary figure lingered near the alley mouth."
                         ),
                         "knowledge_scope": ["Street rumors", "Visible alley activity"],
+                        "disposition": "Hostile",
                     },
                 }
             )
 
+            npcs = repository.list_npcs()
             visible_npcs = repository.list_player_visible_npcs()
 
             self.assertEqual(result.status, "applied")
+            self.assertEqual(npcs[0]["role"], "Shady Character")
+            self.assertEqual(
+                npcs[0]["known_facts"],
+                ["A wary figure lingered near the alley mouth."],
+            )
+            self.assertEqual(npcs[0]["disposition"], "")
             self.assertEqual(visible_npcs[0]["display_name"], "Shady Character")
             self.assertNotIn("name", visible_npcs[0])
 
@@ -591,6 +884,7 @@ class EventApplierTests(unittest.TestCase):
 
             self.assertEqual(result.status, "applied")
             self.assertEqual(visible_npcs[0]["display_name"], "Barmaid Elina")
+            self.assertEqual(visible_npcs[0]["location"], "Tavern")
             self.assertEqual(
                 visible_npcs[0]["notes"],
                 "Tavern server and local gossip source",

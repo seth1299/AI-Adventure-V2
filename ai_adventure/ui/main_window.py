@@ -4,13 +4,26 @@ import logging
 from pathlib import Path
 from typing import Any, Callable, Protocol
 
-from PySide6.QtCore import QObject, Qt, QThread, QTimer, Signal, Slot
+from PySide6.QtCore import (
+    QEvent,
+    QObject,
+    QStringListModel,
+    Qt,
+    QThread,
+    QTimer,
+    Signal,
+    Slot,
+)
 from PySide6.QtGui import QColor, QIcon, QPalette
 from PySide6.QtWidgets import (
+    QApplication,
     QCheckBox,
     QComboBox,
+    QCompleter,
     QDialog,
     QFormLayout,
+    QGridLayout,
+    QGroupBox,
     QHBoxLayout,
     QInputDialog,
     QLabel,
@@ -18,6 +31,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QScrollArea,
     QSlider,
     QSpinBox,
     QStackedWidget,
@@ -35,6 +49,13 @@ from PySide6.QtWidgets import (
 )
 
 from ai_adventure.app.app_paths import AppPaths
+from ai_adventure.alchemy.ingredients import (
+    COMMON_MEASUREMENT_UNITS,
+    CRAFTING_INGREDIENT_CATEGORY_NAMES,
+    format_recipe_ingredients,
+    is_crafting_ingredient_category,
+    normalize_recipe_ingredient,
+)
 from ai_adventure.ai.gemini_service import (
     GeminiConfigurationError,
     GeminiNarrationService,
@@ -72,11 +93,48 @@ from ai_adventure.new_game_templates import (
     load_new_game_templates,
     save_new_game_template,
 )
-from ai_adventure.persistence.save_repository import SaveRepository, SaveSummary
+from ai_adventure.persistence.save_repository import (
+    DuplicateSaveTitleError,
+    SaveRepository,
+    SaveSummary,
+)
 
 
 LOGGER = logging.getLogger(__name__)
 GM_THINKING_TEXT = "GM is thinking..."
+STORY_REVEAL_STALL_TIMEOUT_MS = 8000
+THEME_NAMES = {"Light", "Dark"}
+SKILL_LEVEL_DESCRIPTIONS = {
+    5: "Signature expertise - the character's strongest, defining capability.",
+    4: "Expert - a major specialty the character can rely on often.",
+    3: "Skilled - solid professional competence in meaningful situations.",
+    2: "Trained - useful practice, but not a primary specialty.",
+    1: "Familiar - basic exposure that can still matter in the right moment.",
+}
+
+
+def apply_application_theme(theme: str) -> None:
+    """Applies the selected app-wide theme to the active QApplication."""
+
+    app = QApplication.instance()
+
+    if not isinstance(app, QApplication):
+        return
+
+    clean_theme = _normalize_theme_name(theme)
+
+    if clean_theme == "Dark":
+        app.setPalette(_dark_theme_palette())
+        app.setStyleSheet(_dark_theme_stylesheet())
+        return
+
+    if clean_theme == "Light":
+        app.setPalette(_light_theme_palette())
+        app.setStyleSheet(_light_theme_stylesheet())
+        return
+
+    app.setPalette(_light_theme_palette())
+    app.setStyleSheet(_light_theme_stylesheet())
 
 
 class _NoCellFocusDelegate(QStyledItemDelegate):
@@ -110,11 +168,11 @@ def _enable_table_sorting(table: QTableWidget, on_section_clicked) -> None:
     """Makes a data table sortable by clicking its column headers."""
 
     _use_soft_table_selection(table)
+    table.setSortingEnabled(False)
     header = table.horizontalHeader()
     header.setSectionsClickable(True)
     header.setSortIndicatorShown(True)
     header.sectionClicked.connect(on_section_clicked)
-    table.setSortingEnabled(False)
 
 
 def _update_sort_state(
@@ -227,6 +285,38 @@ class _GeminiStoryWorker(QObject):
             self.finished.emit()
 
 
+class _GeminiSkillCheckPlanWorker(QObject):
+    """Runs one lightweight skill-check planning request away from the UI thread."""
+
+    completed = Signal(object)
+    configuration_error = Signal(str)
+    failed = Signal()
+    finished = Signal()
+
+    def __init__(self, context_packet: dict[str, Any]) -> None:
+        super().__init__()
+        self._context_packet = context_packet
+
+    @Slot()
+    def run(self) -> None:
+        """Generates one pre-narration skill-check plan."""
+
+        try:
+            result = GeminiNarrationService().plan_story_skill_checks(
+                self._context_packet
+            )
+        except GeminiConfigurationError as error:
+            LOGGER.warning("Gemini skill-check planning skipped: %s", error)
+            self.configuration_error.emit(str(error))
+        except Exception:
+            LOGGER.exception("Gemini skill-check planning request failed.")
+            self.failed.emit()
+        else:
+            self.completed.emit(result)
+        finally:
+            self.finished.emit()
+
+
 class MainWindow(QMainWindow):
     """
     Main application window.
@@ -244,6 +334,7 @@ class MainWindow(QMainWindow):
 
         self.app_paths = app_paths
         self.active_repository: SaveRepository | None = None
+        self.menu_theme = self._latest_saved_theme()
         self.sound_manager = SoundManager(prepare_sound_directory(self.app_paths))
         self.narration_player = NarrationPlayer(
             create_tts_manager(
@@ -268,6 +359,7 @@ class MainWindow(QMainWindow):
 
         self.game_shell = GameShell(
             on_return_to_menu=self.return_to_menu,
+            on_theme_changed=self._apply_active_theme,
             sound_manager=self.sound_manager,
             narration_player=self.narration_player,
         )
@@ -304,10 +396,34 @@ class MainWindow(QMainWindow):
 
         wizard = NewGameWizard(self, template_setup=template_setup)
 
-        if wizard.exec() != QDialog.DialogCode.Accepted:
-            return
+        while True:
+            if wizard.exec() != QDialog.DialogCode.Accepted:
+                return
 
-        self.create_new_game(wizard.build_setup())
+            while True:
+                clean_setup = wizard.build_setup()
+
+                try:
+                    self._create_new_game_from_setup(clean_setup)
+                    return
+                except DuplicateSaveTitleError as error:
+                    new_title = self._prompt_for_duplicate_save_title(
+                        clean_setup["title"],
+                        str(error),
+                    )
+
+                    if new_title is None:
+                        break
+
+                    wizard.title_input.setText(new_title)
+                except Exception:
+                    LOGGER.exception("Failed to create new game.")
+                    QMessageBox.critical(
+                        self,
+                        "New Game Failed",
+                        "Could not create a new game.",
+                    )
+                    return
 
     def _choose_new_game_template_setup(self) -> tuple[bool, dict[str, Any] | None]:
         """Asks whether a new game should start blank or from a saved template."""
@@ -362,35 +478,117 @@ class MainWindow(QMainWindow):
 
         for template in templates:
             if template.name == selected_name:
-                return True, template.setup
+                return True, self._template_setup_with_available_title(template.setup)
 
         return True, None
 
-    def create_new_game(self, setup: dict[str, Any]) -> None:
+    def _template_setup_with_available_title(
+        self,
+        setup: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Returns template setup with a title that does not collide with saves."""
+
+        template_setup = dict(setup)
+        template_setup["title"] = _next_available_save_title(
+            self.app_paths.saves_dir,
+            str(template_setup.get("title", "")),
+        )
+        return template_setup
+
+    def _prompt_for_duplicate_save_title(
+        self,
+        current_title: str,
+        message: str,
+    ) -> str | None:
+        """Asks for a replacement save title after a duplicate title collision."""
+
+        suggested_title = _next_available_save_title(
+            self.app_paths.saves_dir,
+            current_title,
+        )
+
+        while True:
+            new_title, accepted = QInputDialog.getText(
+                self,
+                "Save Name Already Exists",
+                f"{message}\n\nNew save name:",
+                QLineEdit.EchoMode.Normal,
+                suggested_title,
+            )
+
+            if not accepted:
+                return None
+
+            clean_title = new_title.strip()
+
+            if clean_title:
+                return clean_title
+
+            QMessageBox.warning(
+                self,
+                "Missing Save Name",
+                "Enter a save name before starting.",
+            )
+
+    def create_new_game(self, setup: dict[str, Any]) -> bool:
         """
         Creates a new save and opens it.
 
         Args:
             setup: New-game wizard setup dictionary.
+
+        Returns:
+            True when the save was created and opened.
         """
 
         clean_setup = normalize_new_game_setup(setup)
 
         try:
-            repository = SaveRepository.create_new_save(
-                self.app_paths.saves_dir,
-                clean_setup["title"],
-                setup=clean_setup,
-            )
+            self._create_new_game_from_setup(clean_setup)
+        except DuplicateSaveTitleError as error:
+            QMessageBox.warning(self, "Save Name Already Exists", str(error))
+            return False
         except Exception:
             LOGGER.exception("Failed to create new game.")
             QMessageBox.critical(self, "New Game Failed", "Could not create a new game.")
-            return
+            return False
+
+        return True
+
+    def _create_new_game_from_setup(self, clean_setup: dict[str, Any]) -> None:
+        """Creates a new save from normalized setup and opens the shell."""
+
+        repository = SaveRepository.create_new_save(
+            self.app_paths.saves_dir,
+            clean_setup["title"],
+            setup=clean_setup,
+        )
 
         save_new_game_template(self.app_paths.new_game_templates_path, clean_setup)
-        self._synthesize_new_game_world(repository, clean_setup)
         self.open_repository(repository)
-        self.game_shell.story_screen.narrate_latest_story()
+        self.game_shell.story_screen.set_initial_generation_pending(True)
+        QApplication.processEvents()
+        QTimer.singleShot(
+            0,
+            lambda: self._finish_new_game_generation(repository, clean_setup),
+        )
+
+    def _finish_new_game_generation(
+        self,
+        repository: SaveRepository,
+        setup: dict[str, Any],
+    ) -> None:
+        """Completes AI world synthesis after the fresh save is visible."""
+
+        if self.active_repository is not repository:
+            return
+
+        try:
+            self._synthesize_new_game_world(repository, setup)
+            self.game_shell.refresh_screens()
+            self.game_shell.story_screen.narrate_latest_story()
+        finally:
+            self.game_shell.story_screen.set_initial_generation_pending(False)
 
     def _synthesize_new_game_world(
         self,
@@ -513,15 +711,13 @@ class MainWindow(QMainWindow):
                 "Skipped AI-finalized skills because they did not match the starting skill plan."
             )
 
-        minimum_item_count = max(5, len(setup.get("starter_items", [])))
+        finalized_starter_items = _starter_items_for_save(
+            result.finalized_starter_items,
+            setup,
+        )
 
-        if len(result.finalized_starter_items) >= minimum_item_count:
-            repository.replace_inventory_items(result.finalized_starter_items)
-        elif result.finalized_starter_items:
-            LOGGER.warning(
-                "Skipped AI-finalized starter inventory because it had fewer than %s items.",
-                minimum_item_count,
-            )
+        if finalized_starter_items:
+            repository.replace_inventory_items(finalized_starter_items)
 
     def _apply_fallback_currency_if_needed(
         self,
@@ -575,6 +771,7 @@ class MainWindow(QMainWindow):
 
         self.active_repository = repository
         self.game_shell.set_repository(repository)
+        self._apply_active_theme()
         self.stack.setCurrentWidget(self.game_shell)
 
         title = repository.get_meta("title", default="AI Adventure")
@@ -587,9 +784,36 @@ class MainWindow(QMainWindow):
 
         self.active_repository = None
         self.game_shell.set_repository(None)
+        apply_application_theme(self.menu_theme)
         self.main_menu.refresh_saves()
         self.stack.setCurrentWidget(self.main_menu)
         self.setWindowTitle("AI Adventure")
+
+    def _apply_active_theme(self) -> None:
+        """Applies the theme saved for the currently loaded adventure."""
+
+        if self.active_repository is None:
+            apply_application_theme(self.menu_theme)
+            return
+
+        self.menu_theme = _normalize_theme_name(
+            self.active_repository.get_setting("theme", "Light")
+        )
+        apply_application_theme(self.menu_theme)
+
+    def _latest_saved_theme(self) -> str:
+        """Reads the most recent save's theme for the Main Menu."""
+
+        for summary in SaveRepository.list_saves(self.app_paths.saves_dir):
+            try:
+                repository = SaveRepository(summary.db_path)
+            except Exception:
+                LOGGER.exception("Failed to read theme from save: %s", summary.db_path)
+                continue
+
+            return _normalize_theme_name(repository.get_setting("theme", "Light"))
+
+        return "Light"
 
 
 class MainMenuScreen(QWidget):
@@ -712,6 +936,7 @@ class NewGameWizard(QWizard):
         self._build_character_page()
         self._build_skills_page()
         self._build_inventory_currency_page()
+        self._build_audio_page()
         self._build_calendar_page()
 
         if template_setup is not None:
@@ -724,32 +949,33 @@ class NewGameWizard(QWizard):
         self.setWizardStyle(QWizard.WizardStyle.ModernStyle)
 
         palette = self.palette()
-        palette.setColor(QPalette.ColorRole.Window, QColor("#20242b"))
-        palette.setColor(QPalette.ColorRole.WindowText, QColor("#f3f4f6"))
-        palette.setColor(QPalette.ColorRole.Base, QColor("#11151b"))
-        palette.setColor(QPalette.ColorRole.AlternateBase, QColor("#242a33"))
-        palette.setColor(QPalette.ColorRole.Text, QColor("#f3f4f6"))
-        palette.setColor(QPalette.ColorRole.PlaceholderText, QColor("#96a0ad"))
-        palette.setColor(QPalette.ColorRole.Button, QColor("#2d3642"))
-        palette.setColor(QPalette.ColorRole.ButtonText, QColor("#f3f4f6"))
-        palette.setColor(QPalette.ColorRole.Highlight, QColor("#2f7dd3"))
+        palette.setColor(QPalette.ColorRole.Window, QColor("#f5f7fb"))
+        palette.setColor(QPalette.ColorRole.WindowText, QColor("#111827"))
+        palette.setColor(QPalette.ColorRole.Base, QColor("#ffffff"))
+        palette.setColor(QPalette.ColorRole.AlternateBase, QColor("#eef2f7"))
+        palette.setColor(QPalette.ColorRole.Text, QColor("#111827"))
+        palette.setColor(QPalette.ColorRole.PlaceholderText, QColor("#4b5563"))
+        palette.setColor(QPalette.ColorRole.Button, QColor("#e5e7eb"))
+        palette.setColor(QPalette.ColorRole.ButtonText, QColor("#111827"))
+        palette.setColor(QPalette.ColorRole.Highlight, QColor("#1d4ed8"))
         palette.setColor(QPalette.ColorRole.HighlightedText, QColor("#ffffff"))
         self.setPalette(palette)
 
         self.setStyleSheet(
             """
             QWizard#newGameWizard {
-                background-color: #20242b;
-                color: #f3f4f6;
+                background-color: #f5f7fb;
+                color: #111827;
             }
 
             QWizard#newGameWizard QWizardPage {
-                background-color: #20242b;
-                color: #f3f4f6;
+                background-color: #f5f7fb;
+                color: #111827;
             }
 
             QWizard#newGameWizard QLabel {
-                color: #f3f4f6;
+                background-color: transparent;
+                color: #111827;
                 font-size: 13px;
             }
 
@@ -757,12 +983,12 @@ class NewGameWizard(QWizard):
             QWizard#newGameWizard QTextEdit,
             QWizard#newGameWizard QComboBox,
             QWizard#newGameWizard QSpinBox {
-                background-color: #11151b;
-                border: 1px solid #3a4250;
+                background-color: #ffffff;
+                border: 1px solid #64748b;
                 border-radius: 5px;
-                color: #f3f4f6;
+                color: #111827;
                 padding: 6px;
-                selection-background-color: #2f7dd3;
+                selection-background-color: #1d4ed8;
                 selection-color: #ffffff;
             }
 
@@ -770,69 +996,111 @@ class NewGameWizard(QWizard):
                 padding: 8px;
             }
 
+            QWizard#newGameWizard QCheckBox {
+                background-color: transparent;
+                color: #111827;
+                spacing: 8px;
+            }
+
+            QWizard#newGameWizard QGroupBox {
+                background-color: #eef2f7;
+                border: 1px solid #94a3b8;
+                border-radius: 6px;
+                color: #111827;
+                font-weight: 600;
+                margin-top: 12px;
+                padding: 10px;
+            }
+
+            QWizard#newGameWizard QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 4px;
+            }
+
+            QWizard#newGameWizard QScrollArea {
+                background-color: transparent;
+                border: 0;
+            }
+
+            QWizard#newGameWizard QSlider::groove:horizontal {
+                background-color: #d1d9e6;
+                border: 1px solid #94a3b8;
+                border-radius: 4px;
+                height: 8px;
+            }
+
+            QWizard#newGameWizard QSlider::handle:horizontal {
+                background-color: #2563eb;
+                border: 1px solid #1e40af;
+                border-radius: 7px;
+                margin: -4px 0;
+                width: 14px;
+            }
+
             QWizard#newGameWizard QLineEdit:focus,
             QWizard#newGameWizard QTextEdit:focus,
             QWizard#newGameWizard QComboBox:focus,
             QWizard#newGameWizard QSpinBox:focus {
-                border-color: #6aa6ff;
+                border-color: #1d4ed8;
             }
 
             QWizard#newGameWizard QComboBox::drop-down,
             QWizard#newGameWizard QSpinBox::up-button,
             QWizard#newGameWizard QSpinBox::down-button {
-                background-color: #242a33;
+                background-color: #e2e8f0;
                 border: 0;
                 width: 22px;
             }
 
             QWizard#newGameWizard QTableWidget {
-                background-color: #11151b;
-                alternate-background-color: #171c24;
-                border: 1px solid #3a4250;
+                background-color: #ffffff;
+                alternate-background-color: #eef2f7;
+                border: 1px solid #64748b;
                 border-radius: 5px;
-                color: #f3f4f6;
-                gridline-color: #303845;
-                selection-background-color: #2f7dd3;
+                color: #111827;
+                gridline-color: #cbd5e1;
+                selection-background-color: #1d4ed8;
                 selection-color: #ffffff;
             }
 
             QWizard#newGameWizard QHeaderView::section {
-                background-color: #242a33;
+                background-color: #e2e8f0;
                 border: 0;
-                border-right: 1px solid #303845;
-                color: #dbe3ee;
+                border-right: 1px solid #cbd5e1;
+                color: #111827;
                 font-weight: 600;
                 padding: 7px;
             }
 
             QWizard#newGameWizard QPushButton {
-                background-color: #2d3642;
-                border: 1px solid #465163;
+                background-color: #e5e7eb;
+                border: 1px solid #64748b;
                 border-radius: 5px;
-                color: #f3f4f6;
+                color: #111827;
                 min-width: 76px;
                 padding: 6px 14px;
             }
 
             QWizard#newGameWizard QPushButton:hover {
-                background-color: #374353;
-                border-color: #5b6a80;
+                background-color: #dbe4ee;
+                border-color: #475569;
             }
 
             QWizard#newGameWizard QPushButton:pressed {
-                background-color: #25303c;
+                background-color: #cbd5e1;
             }
 
             QWizard#newGameWizard QPushButton:default {
-                background-color: #2f7dd3;
-                border-color: #6aa6ff;
+                background-color: #2563eb;
+                border-color: #1d4ed8;
                 color: #ffffff;
             }
 
             QWizard#newGameWizard QPushButton:disabled {
-                background-color: #252a32;
-                border-color: #303640;
-                color: #737d8c;
+                background-color: #edf1f5;
+                border-color: #cbd5e1;
+                color: #6b7280;
             }
             """
         )
@@ -866,11 +1134,14 @@ class NewGameWizard(QWizard):
         skills = [
             {
                 "name": skill_input.text(),
-                "description": "",
+                "description": description_input.text(),
                 "level": level,
-                "requires_ai_invention": not skill_input.text().strip(),
+                "requires_ai_invention": (
+                    not skill_input.text().strip()
+                    or not description_input.text().strip()
+                ),
             }
-            for level, skill_input in self.skill_inputs
+            for level, skill_input, description_input in self.skill_inputs
         ]
         setup = {
             "title": self.title_input.text(),
@@ -885,6 +1156,12 @@ class NewGameWizard(QWizard):
                 self.starter_items_input.toPlainText()
             ),
             "calendar": calendar_settings,
+            "audio": {
+                "music_enabled": self.music_enabled_checkbox.isChecked(),
+                "narrator_enabled": self.narrator_enabled_checkbox.isChecked(),
+                "music_volume": self.music_volume_slider.value(),
+                "tts_volume": self.tts_volume_slider.value(),
+            },
             "currency_denominations": self._currency_denominations_from_table(),
             "currency_description": self.currency_description_input.toPlainText(),
             "specified_genre": self.genre_input.text(),
@@ -901,6 +1178,7 @@ class NewGameWizard(QWizard):
         clean_setup = normalize_new_game_setup(setup)
         character = clean_setup["character"]
         calendar = clean_setup["calendar"]
+        audio = clean_setup["audio"]
 
         self.title_input.setText(clean_setup["title"])
         self.genre_input.setText(clean_setup["specified_genre"])
@@ -913,9 +1191,10 @@ class NewGameWizard(QWizard):
         self.backstory_input.setPlainText(character["backstory"])
         self.character_notes_input.setPlainText(character["notes"])
 
-        for index, (_, skill_input) in enumerate(self.skill_inputs):
+        for index, (_, skill_input, description_input) in enumerate(self.skill_inputs):
             skill = clean_setup["skills"][index] if index < len(clean_setup["skills"]) else {}
             skill_input.setText(str(skill.get("name", "")))
+            description_input.setText(str(skill.get("description", "")))
 
         self.starter_items_input.setPlainText(
             _format_starter_items_for_template(clean_setup["starter_items"])
@@ -947,6 +1226,10 @@ class NewGameWizard(QWizard):
         self.season_hints_input.setText(
             ", ".join(str(season["weather_hint"]) for season in calendar["seasons"])
         )
+        self.music_enabled_checkbox.setChecked(bool(audio["music_enabled"]))
+        self.narrator_enabled_checkbox.setChecked(bool(audio["narrator_enabled"]))
+        self.music_volume_slider.setValue(int(audio["music_volume"]))
+        self.tts_volume_slider.setValue(int(audio["tts_volume"]))
 
     def _build_adventure_page(self) -> None:
         """Builds the adventure/world setup page."""
@@ -1020,23 +1303,50 @@ class NewGameWizard(QWizard):
 
         page = QWizardPage()
         page.setTitle("Skills")
-        page.setSubTitle(
-            "Choose one level 5 skill, two level 4 skills, three level 3 skills, "
-            "four level 2 skills, and five level 1 skills."
-        )
+        page.setSubTitle("Name the character's starting skills and describe what each means in play.")
 
-        self.skill_inputs: list[tuple[int, QLineEdit]] = []
-        layout = QFormLayout()
-        level_counts: dict[int, int] = {}
+        self.skill_inputs: list[tuple[int, QLineEdit, QLineEdit]] = []
+        content = QWidget()
+        layout = QVBoxLayout()
 
-        for level in SKILL_LEVEL_PLAN:
-            level_counts[level] = level_counts.get(level, 0) + 1
-            skill_input = QLineEdit()
-            skill_input.setPlaceholderText(f"Level {level} skill")
-            self.skill_inputs.append((level, skill_input))
-            layout.addRow(f"Level {level} Skill {level_counts[level]}:", skill_input)
+        for level in sorted(set(SKILL_LEVEL_PLAN), reverse=True):
+            skill_count = SKILL_LEVEL_PLAN.count(level)
+            group = QGroupBox(f"Level {level}")
+            group_layout = QGridLayout()
+            group_layout.setColumnStretch(0, 1)
+            group_layout.setColumnStretch(1, 2)
 
-        page.setLayout(layout)
+            meaning_label = QLabel(SKILL_LEVEL_DESCRIPTIONS[level])
+            meaning_label.setWordWrap(True)
+            group_layout.addWidget(meaning_label, 0, 0, 1, 2)
+            group_layout.addWidget(QLabel("Skill"), 1, 0)
+            group_layout.addWidget(QLabel("Description for AI"), 1, 1)
+
+            for row_index in range(skill_count):
+                skill_input = QLineEdit()
+                skill_input.setPlaceholderText("Skill name")
+                description_input = QLineEdit()
+                description_input.setPlaceholderText(
+                    "What this skill covers, how it shows up, or what makes it distinct"
+                )
+                self.skill_inputs.append((level, skill_input, description_input))
+                group_layout.addWidget(skill_input, row_index + 2, 0)
+                group_layout.addWidget(description_input, row_index + 2, 1)
+
+            group.setLayout(group_layout)
+            layout.addWidget(group)
+
+        layout.addStretch()
+        content.setLayout(layout)
+
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setFrameShape(QScrollArea.Shape.NoFrame)
+        scroll_area.setWidget(content)
+
+        page_layout = QVBoxLayout()
+        page_layout.addWidget(scroll_area)
+        page.setLayout(page_layout)
         self.addPage(page)
 
     def _build_inventory_currency_page(self) -> None:
@@ -1048,7 +1358,8 @@ class NewGameWizard(QWizard):
 
         self.starter_items_input = QTextEdit()
         self.starter_items_input.setPlaceholderText(
-            "One item per line. Example: Lantern | Tool | 2 | Hooded brass lantern | 15"
+            "One item per line. Describe an item naturally, or use: "
+            "Name | Type | Amount | Description | Value"
         )
 
         self.currency_table = QTableWidget(0, 3)
@@ -1071,6 +1382,44 @@ class NewGameWizard(QWizard):
         layout.addRow("Currencies:", self.currency_table)
         layout.addRow("", add_currency_button)
         layout.addRow("Economy Notes:", self.currency_description_input)
+        page.setLayout(layout)
+
+        self.addPage(page)
+
+    def _build_audio_page(self) -> None:
+        """Builds the starting audio preferences page."""
+
+        page = QWizardPage()
+        page.setTitle("Audio")
+        page.setSubTitle("Choose narration and music preferences before the save starts.")
+
+        self.music_enabled_checkbox = QCheckBox("Music enabled")
+        self.music_enabled_checkbox.setChecked(True)
+
+        self.narrator_enabled_checkbox = QCheckBox("Narrator enabled")
+        self.narrator_enabled_checkbox.setChecked(True)
+
+        self.music_volume_slider = QSlider(Qt.Orientation.Horizontal)
+        self.music_volume_slider.setRange(0, 100)
+        self.music_volume_slider.setValue(25)
+        self.music_volume_label = QLabel("25%")
+        self.music_volume_slider.valueChanged.connect(
+            lambda value: self.music_volume_label.setText(f"{value}%")
+        )
+
+        self.tts_volume_slider = QSlider(Qt.Orientation.Horizontal)
+        self.tts_volume_slider.setRange(0, 100)
+        self.tts_volume_slider.setValue(90)
+        self.tts_volume_label = QLabel("90%")
+        self.tts_volume_slider.valueChanged.connect(
+            lambda value: self.tts_volume_label.setText(f"{value}%")
+        )
+
+        layout = QFormLayout()
+        layout.addRow("Background Music:", self.music_enabled_checkbox)
+        layout.addRow("Music Volume:", _slider_row(self.music_volume_slider, self.music_volume_label))
+        layout.addRow("Narrator:", self.narrator_enabled_checkbox)
+        layout.addRow("Narrator Volume:", _slider_row(self.tts_volume_slider, self.tts_volume_label))
         page.setLayout(layout)
 
         self.addPage(page)
@@ -1191,6 +1540,7 @@ class GameShell(QWidget):
         self,
         on_return_to_menu,
         *,
+        on_theme_changed=None,
         sound_manager: SoundManager | None = None,
         narration_player: NarrationPlayer | None = None,
     ) -> None:
@@ -1202,6 +1552,7 @@ class GameShell(QWidget):
         super().__init__()
 
         self.on_return_to_menu = on_return_to_menu
+        self.on_theme_changed = on_theme_changed
         self.sound_manager = sound_manager
         self.narration_player = narration_player
         self.repository: SaveRepository | None = None
@@ -1232,7 +1583,10 @@ class GameShell(QWidget):
         self.skills_screen = SkillsScreen()
         self.alchemy_screen = AlchemyNotebookScreen()
         self.history_screen = HistoryScreen()
-        self.settings_screen = SettingsScreen(on_audio_settings_changed=self._apply_audio_settings)
+        self.settings_screen = SettingsScreen(
+            on_audio_settings_changed=self._apply_audio_settings,
+            on_theme_changed=self._apply_theme,
+        )
 
         self.screens: list[RepositoryBackedWidget] = [
             self.story_screen,
@@ -1259,7 +1613,7 @@ class GameShell(QWidget):
         self.tabs.addTab(self.npcs_screen, "NPCs")
         self.tabs.addTab(self.active_tasks_screen, "Active Tasks")
         self.tabs.addTab(self.skills_screen, "Skills")
-        self.tabs.addTab(self.alchemy_screen, "Alchemy Notebook")
+        self.tabs.addTab(self.alchemy_screen, "Crafting")
         self.tabs.addTab(self.history_screen, "Journal")
         self.tabs.addTab(self.settings_screen, "Settings")
         self.tabs.currentChanged.connect(self._handle_tab_changed)
@@ -1334,6 +1688,12 @@ class GameShell(QWidget):
             narration_player=self.narration_player,
         )
 
+    def _apply_theme(self) -> None:
+        """Notifies the main window that save-specific theme settings changed."""
+
+        if self.on_theme_changed is not None:
+            self.on_theme_changed()
+
 
 class StoryScreen(RepositoryBackedWidget):
     """Story screen for player input and narrative output."""
@@ -1353,8 +1713,10 @@ class StoryScreen(RepositoryBackedWidget):
         self.narration_player = narration_player
         self._revealing_story_id: int | None = None
         self._revealed_story_chunks: list[str] = []
+        self._story_reveal_generation = 0
         self._gemini_thread: QThread | None = None
-        self._gemini_worker: _GeminiStoryWorker | None = None
+        self._gemini_worker: QObject | None = None
+        self._pending_skill_check_event_results: list[Any] = []
         self._waiting_for_gm = False
         self._default_input_placeholder = "Enter a player action..."
         self._narration_chunk_ready.connect(self._append_revealed_story_chunk)
@@ -1392,6 +1754,12 @@ class StoryScreen(RepositoryBackedWidget):
 
         self.setLayout(layout)
 
+    def set_repository(self, repository: SaveRepository | None) -> None:
+        """Sets the active save and clears any stale narration reveal state."""
+
+        self._clear_story_reveal_state()
+        super().set_repository(repository)
+
     def refresh(self) -> None:
         """Refreshes the story output from history."""
 
@@ -1428,9 +1796,8 @@ class StoryScreen(RepositoryBackedWidget):
                         story_lines.append("\n\n".join(self._revealed_story_chunks))
                 else:
                     story_lines.append(format_story_message(content))
-        #"\n\n".join(story_lines).join("\n\n")
-        output = "\n\n".join(story_lines).join("\n\n")
-        #output += "\n============================================================================\n"
+
+        output = "\n\n".join(story_lines)
         self.story_output.setPlainText(output)
         self.story_output.moveCursor(self.story_output.textCursor().MoveOperation.End)
 
@@ -1453,8 +1820,22 @@ class StoryScreen(RepositoryBackedWidget):
 
         repository.append_history("player", player_text)
         self.player_input.clear()
+        self._pending_skill_check_event_results = []
         self._set_waiting_for_gm(True)
         self.refresh()
+
+        context_packet = self._build_story_context_packet(repository, player_text)
+
+        self._start_skill_check_planning_request(context_packet)
+
+    def _build_story_context_packet(
+        self,
+        repository: SaveRepository,
+        player_text: str,
+        *,
+        resolved_skill_checks: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        """Builds the Gemini story context packet for the current save."""
 
         state = StateManager(repository).load_state()
         relevant_npcs = repository.list_relevant_npcs(
@@ -1466,12 +1847,87 @@ class StoryScreen(RepositoryBackedWidget):
             if self.sound_manager is not None
             else []
         )
-        context_packet = AiContextBuilder.from_default_library().build_story_context(
+        return AiContextBuilder.from_default_library().build_story_context(
             state,
             player_command=player_text,
             relevant_npcs=relevant_npcs,
             valid_music_tracks=valid_music_tracks,
             current_music=str(repository.get_setting("audio.current_music", "")),
+            resolved_skill_checks=resolved_skill_checks,
+        )
+
+    def _start_skill_check_planning_request(self, context_packet: dict[str, Any]) -> None:
+        """Starts one background pre-narration skill-check planning request."""
+
+        thread = QThread(self)
+        worker = _GeminiSkillCheckPlanWorker(context_packet)
+        worker.moveToThread(thread)
+
+        thread.started.connect(worker.run)
+        worker.completed.connect(self._handle_skill_check_plan_result)
+        worker.configuration_error.connect(self._handle_gemini_configuration_error)
+        worker.failed.connect(self._handle_gemini_story_failure)
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(
+            lambda thread=thread, worker=worker: self._clear_gemini_worker(thread, worker)
+        )
+
+        self._gemini_thread = thread
+        self._gemini_worker = worker
+        thread.start()
+
+    @Slot(object)
+    def _handle_skill_check_plan_result(self, plan_result: Any) -> None:
+        """Applies planned skill checks, then starts the full narration request."""
+
+        repository = self.repository()
+
+        if repository is None:
+            self._pending_skill_check_event_results = []
+            self._set_waiting_for_gm(False)
+            return
+
+        player_text = self._latest_player_command()
+
+        if not player_text:
+            LOGGER.warning("Skill-check plan finished without a player command.")
+            self._set_waiting_for_gm(False)
+            return
+
+        planned_checks = [
+            check
+            for check in getattr(plan_result, "checks", [])
+            if isinstance(check, dict) and str(check.get("skill_name", "")).strip()
+        ]
+        check_events = [
+            {
+                "type": "SkillCheckRequestedEvent",
+                "payload": check,
+            }
+            for check in planned_checks
+        ]
+
+        if check_events:
+            self._pending_skill_check_event_results = EventApplier(repository).apply_events(
+                check_events
+            )
+            LOGGER.info(
+                "Applied %s pre-narration skill check(s).",
+                len(self._pending_skill_check_event_results),
+            )
+            self.notify_repository_changed()
+        else:
+            self._pending_skill_check_event_results = []
+
+        resolved_skill_checks = _resolved_skill_checks_for_context(
+            self._pending_skill_check_event_results
+        )
+        context_packet = self._build_story_context_packet(
+            repository,
+            player_text,
+            resolved_skill_checks=resolved_skill_checks,
         )
 
         self._start_gemini_story_request(context_packet)
@@ -1490,7 +1946,9 @@ class StoryScreen(RepositoryBackedWidget):
         worker.finished.connect(thread.quit)
         worker.finished.connect(worker.deleteLater)
         thread.finished.connect(thread.deleteLater)
-        thread.finished.connect(self._clear_gemini_worker)
+        thread.finished.connect(
+            lambda thread=thread, worker=worker: self._clear_gemini_worker(thread, worker)
+        )
 
         self._gemini_thread = thread
         self._gemini_worker = worker
@@ -1509,7 +1967,10 @@ class StoryScreen(RepositoryBackedWidget):
         repository.append_history("story", result.narrative_text)
 
         if result.suggested_events:
-            event_results = EventApplier(repository).apply_events(result.suggested_events)
+            event_results = EventApplier(repository).apply_events(
+                result.suggested_events,
+                prior_results=self._pending_skill_check_event_results,
+            )
             applied_count = sum(
                 1 for event_result in event_results if event_result.status == "applied"
             )
@@ -1526,6 +1987,7 @@ class StoryScreen(RepositoryBackedWidget):
             )
             self.notify_repository_changed()
 
+        self._pending_skill_check_event_results = []
         latest_story = self._latest_story_entry()
 
         if latest_story is not None and self._reveal_story_with_narration(
@@ -1542,6 +2004,7 @@ class StoryScreen(RepositoryBackedWidget):
         """Displays the configured-no-key fallback after a recorded player action."""
 
         repository = self.repository()
+        self._pending_skill_check_event_results = []
 
         if repository is not None:
             repository.append_history(
@@ -1560,6 +2023,7 @@ class StoryScreen(RepositoryBackedWidget):
         """Displays the generic Gemini failure fallback."""
 
         repository = self.repository()
+        self._pending_skill_check_event_results = []
 
         if repository is not None:
             repository.append_history(
@@ -1571,11 +2035,18 @@ class StoryScreen(RepositoryBackedWidget):
         self._set_waiting_for_gm(False)
 
     @Slot()
-    def _clear_gemini_worker(self) -> None:
+    def _clear_gemini_worker(
+        self,
+        thread: QThread | None = None,
+        worker: QObject | None = None,
+    ) -> None:
         """Drops references after the Gemini request thread exits."""
 
-        self._gemini_thread = None
-        self._gemini_worker = None
+        if thread is None or self._gemini_thread is thread:
+            self._gemini_thread = None
+
+        if worker is None or self._gemini_worker is worker:
+            self._gemini_worker = None
 
     def _set_waiting_for_gm(self, waiting: bool) -> None:
         """Toggles player input while Gemini or narration is still working."""
@@ -1592,6 +2063,11 @@ class StoryScreen(RepositoryBackedWidget):
             self.player_input.setPlaceholderText(self._default_input_placeholder)
             self.player_input.setToolTip("")
             self.submit_button.setToolTip("")
+
+    def set_initial_generation_pending(self, pending: bool) -> None:
+        """Toggles the story input while the opening scene is generated."""
+
+        self._set_waiting_for_gm(pending)
 
     def narrate_latest_story(self) -> None:
         """Narrates the latest story history entry when narrator is enabled."""
@@ -1610,11 +2086,8 @@ class StoryScreen(RepositoryBackedWidget):
                     sound_manager=self.sound_manager,
                     narration_player=self.narration_player,
                 )
-                if not self._reveal_story_with_narration(
-                    int(entry.get("id", -1)),
-                    str(entry.get("content", "")),
-                ):
-                    self.refresh()
+                self.refresh()
+                self._narrate_text(str(entry.get("content", "")))
                 return
 
     def _narrate_text(
@@ -1645,13 +2118,21 @@ class StoryScreen(RepositoryBackedWidget):
 
         self._revealing_story_id = story_id
         self._revealed_story_chunks = []
+        self._story_reveal_generation += 1
+        reveal_generation = self._story_reveal_generation
         self.refresh()
 
         if self._narrate_text(text, story_id=story_id):
+            QTimer.singleShot(
+                STORY_REVEAL_STALL_TIMEOUT_MS,
+                lambda: self._recover_stalled_story_reveal(
+                    story_id,
+                    reveal_generation,
+                ),
+            )
             return True
 
-        self._revealing_story_id = None
-        self._revealed_story_chunks = []
+        self._clear_story_reveal_state()
         return False
 
     def _append_revealed_story_chunk(self, story_id: int, chunk: str) -> None:
@@ -1674,10 +2155,41 @@ class StoryScreen(RepositoryBackedWidget):
         if story_id != self._revealing_story_id:
             return
 
-        self._revealing_story_id = None
-        self._revealed_story_chunks = []
+        self._clear_story_reveal_state()
         self.refresh()
         self._set_waiting_for_gm(False)
+
+    def _recover_stalled_story_reveal(
+        self,
+        story_id: int,
+        reveal_generation: int,
+    ) -> None:
+        """Shows the saved story if narration starts but never reveals chunks."""
+
+        if story_id != self._revealing_story_id:
+            return
+
+        if reveal_generation != self._story_reveal_generation:
+            return
+
+        if self._revealed_story_chunks:
+            return
+
+        LOGGER.warning(
+            "Narration reveal for story entry %s produced no visible chunks; "
+            "showing the saved story text.",
+            story_id,
+        )
+        self._clear_story_reveal_state()
+        self.refresh()
+        self._set_waiting_for_gm(False)
+
+    def _clear_story_reveal_state(self) -> None:
+        """Clears progressive story reveal state."""
+
+        self._story_reveal_generation += 1
+        self._revealing_story_id = None
+        self._revealed_story_chunks = []
 
     def _latest_story_entry(self) -> dict[str, Any] | None:
         """Returns the most recent saved story entry."""
@@ -1692,6 +2204,20 @@ class StoryScreen(RepositoryBackedWidget):
                 return entry
 
         return None
+
+    def _latest_player_command(self) -> str:
+        """Returns the most recent saved player command."""
+
+        repository = self.repository()
+
+        if repository is None:
+            return ""
+
+        for entry in reversed(repository.list_history()):
+            if str(entry.get("kind", "")).casefold() == "player":
+                return str(entry.get("content", "")).strip()
+
+        return ""
 
 
 class CharacterScreen(RepositoryBackedWidget):
@@ -2212,6 +2738,11 @@ class ActiveTasksScreen(RepositoryBackedWidget):
             return str(task.get("reward", "")).casefold(), name
 
         if self._sort_column == 7:
+            due_elapsed_minutes = _safe_int(task.get("due_elapsed_minutes"), -1)
+
+            if due_elapsed_minutes >= 0:
+                return f"{due_elapsed_minutes:012d}", name
+
             return str(task.get("due_date", "")).casefold(), name
 
         return name, name
@@ -2301,13 +2832,14 @@ class SkillsScreen(RepositoryBackedWidget):
 
 
 class AlchemyNotebookScreen(RepositoryBackedWidget):
-    """Alchemy notebook screen for reagents and recipes."""
+    """Crafting screen for useful items/materials and recipes."""
 
     def __init__(self) -> None:
         super().__init__()
 
         self.tabs = QTabWidget()
         self._reagent_rows: list[dict[str, Any]] = []
+        self._recipe_ingredient_rows: list[dict[str, Any]] = []
         self._refreshing_reagents = False
         self._reagent_sort_column = 0
         self._reagent_sort_order = Qt.SortOrder.AscendingOrder
@@ -2323,24 +2855,25 @@ class AlchemyNotebookScreen(RepositoryBackedWidget):
         self.setLayout(layout)
 
     def refresh(self) -> None:
-        """Reloads all alchemy notebook data."""
+        """Reloads all crafting data."""
 
         repository = self.repository()
 
         if repository is None:
             self.reagent_table.setRowCount(0)
             self.recipe_table.setRowCount(0)
+            self.recipe_reagent_combo.clear()
             return
 
         self._refresh_reagents(repository)
         self._refresh_recipes(repository)
 
     def _setup_reagents_tab(self) -> None:
-        """Builds the structured reagent discovery tab."""
+        """Builds the structured useful item/material discovery tab."""
 
-        self.reagent_table = QTableWidget(0, 7)
+        self.reagent_table = QTableWidget(0, 4)
         self.reagent_table.setHorizontalHeaderLabels(
-            ["Name", "Material Type", "Qualities", "Motions", "Virtues", "Uses", "Notes"]
+            ["Name", "Description", "Location", "Uses"]
         )
         self.reagent_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.reagent_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
@@ -2354,23 +2887,19 @@ class AlchemyNotebookScreen(RepositoryBackedWidget):
         self.reagent_table.itemSelectionChanged.connect(self._load_selected_reagent)
 
         self.reagent_name_input = QLineEdit()
-        self.reagent_name_input.setPlaceholderText("Reagent name")
-        self.reagent_material_type_input = QLineEdit()
-        self.reagent_material_type_input.setPlaceholderText("Botanical, Geological, Animal, Elemental...")
-        self.reagent_qualities_input = QLineEdit()
-        self.reagent_qualities_input.setPlaceholderText("Comma-separated qualities")
-        self.reagent_motions_input = QLineEdit()
-        self.reagent_motions_input.setPlaceholderText("Comma-separated motions")
-        self.reagent_virtues_input = QLineEdit()
-        self.reagent_virtues_input.setPlaceholderText("Comma-separated virtues")
+        self.reagent_name_input.setPlaceholderText("Item or material name")
+        self.reagent_description_input = QLineEdit()
+        self.reagent_description_input.setPlaceholderText("Short description")
+        self.reagent_location_input = QLineEdit()
+        self.reagent_location_input.setPlaceholderText("Where this item or material is found")
         self.reagent_uses_input = QLineEdit()
-        self.reagent_uses_input.setPlaceholderText("Comma-separated uses")
-        self.reagent_notes_input = QTextEdit()
-        self.reagent_notes_input.setPlaceholderText("Reagent notes")
+        self.reagent_uses_input.setPlaceholderText(
+            "Comma-separated uses, such as repair, dye, medicine, fuel"
+        )
 
-        save_button = QPushButton("Save Reagent")
+        save_button = QPushButton("Save Item")
         save_button.clicked.connect(self._save_reagent)
-        new_button = QPushButton("New Reagent")
+        new_button = QPushButton("New Item")
         new_button.clicked.connect(self._clear_reagent_form)
 
         button_row = QHBoxLayout()
@@ -2380,12 +2909,9 @@ class AlchemyNotebookScreen(RepositoryBackedWidget):
 
         form = QFormLayout()
         form.addRow("Name:", self.reagent_name_input)
-        form.addRow("Material Type:", self.reagent_material_type_input)
-        form.addRow("Qualities:", self.reagent_qualities_input)
-        form.addRow("Motions:", self.reagent_motions_input)
-        form.addRow("Virtues:", self.reagent_virtues_input)
+        form.addRow("Description:", self.reagent_description_input)
+        form.addRow("Location:", self.reagent_location_input)
         form.addRow("Uses:", self.reagent_uses_input)
-        form.addRow("Notes:", self.reagent_notes_input)
         form.addRow(button_row)
 
         layout = QVBoxLayout()
@@ -2394,14 +2920,14 @@ class AlchemyNotebookScreen(RepositoryBackedWidget):
 
         wrapper = QWidget()
         wrapper.setLayout(layout)
-        self.tabs.addTab(wrapper, "Reagents")
+        self.tabs.addTab(wrapper, "Items")
 
     def _setup_recipes_tab(self) -> None:
         """Builds the structured recipe discovery tab."""
 
-        self.recipe_table = QTableWidget(0, 6)
+        self.recipe_table = QTableWidget(0, 4)
         self.recipe_table.setHorizontalHeaderLabels(
-            ["Name", "Ingredients", "Result", "Motions", "Virtues", "Notes"]
+            ["Name", "Ingredients", "Result", "Notes"]
         )
         self.recipe_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         _enable_table_sorting(self.recipe_table, self._sort_recipes_by_column)
@@ -2413,28 +2939,92 @@ class AlchemyNotebookScreen(RepositoryBackedWidget):
 
         self.recipe_name_input = QLineEdit()
         self.recipe_name_input.setPlaceholderText("Recipe name")
-        self.recipe_ingredients_input = QLineEdit()
-        self.recipe_ingredients_input.setPlaceholderText("Comma-separated ingredients")
         self.recipe_result_input = QLineEdit()
         self.recipe_result_input.setPlaceholderText("Recipe result")
-        self.recipe_motions_input = QLineEdit()
-        self.recipe_motions_input.setPlaceholderText("Comma-separated motions")
-        self.recipe_virtues_input = QLineEdit()
-        self.recipe_virtues_input.setPlaceholderText("Comma-separated virtues")
         self.recipe_notes_input = QTextEdit()
         self.recipe_notes_input.setPlaceholderText("Recipe notes")
 
-        add_button = QPushButton("Save Recipe")
-        add_button.clicked.connect(self._add_recipe)
+        self.recipe_reagent_combo = QComboBox()
+        self.recipe_reagent_combo.setEditable(True)
+        self.recipe_reagent_combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        self.recipe_reagent_combo.setPlaceholderText("Search material, ingredient, reagent, or crafting item")
+        self.recipe_reagent_combo.setMinimumWidth(220)
+        self.recipe_reagent_choice_model = QStringListModel(self)
+        self.recipe_reagent_completer = QCompleter(
+            self.recipe_reagent_choice_model,
+            self.recipe_reagent_combo,
+        )
+        self.recipe_reagent_completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+        self.recipe_reagent_completer.setFilterMode(Qt.MatchFlag.MatchContains)
+        self.recipe_reagent_completer.setCompletionMode(
+            QCompleter.CompletionMode.PopupCompletion
+        )
+        self.recipe_reagent_completer.activated[str].connect(
+            self._select_recipe_reagent_label
+        )
+        self.recipe_reagent_combo.setCompleter(self.recipe_reagent_completer)
+        self.recipe_reagent_line_edit = self.recipe_reagent_combo.lineEdit()
+        self.recipe_reagent_combo.installEventFilter(self)
+        if self.recipe_reagent_line_edit is not None:
+            self.recipe_reagent_line_edit.installEventFilter(self)
+            self.recipe_reagent_line_edit.textEdited.connect(
+                self._show_recipe_reagent_choices
+            )
+        self.recipe_quantity_input = QSpinBox()
+        self.recipe_quantity_input.setRange(1, 999)
+        self.recipe_quantity_input.setValue(1)
+        self.recipe_measure_amount_input = QSpinBox()
+        self.recipe_measure_amount_input.setRange(1, 99999)
+        self.recipe_measure_amount_input.setValue(1)
+        self.recipe_measure_unit_combo = QComboBox()
+        for unit in COMMON_MEASUREMENT_UNITS:
+            self.recipe_measure_unit_combo.addItem(unit, unit)
+
+        add_ingredient_button = QPushButton("Add Ingredient")
+        add_ingredient_button.clicked.connect(self._add_recipe_ingredient)
+        remove_ingredient_button = QPushButton("Remove Ingredient")
+        remove_ingredient_button.clicked.connect(self._remove_recipe_ingredient)
+
+        ingredient_controls = QHBoxLayout()
+        ingredient_controls.addWidget(self.recipe_reagent_combo, 2)
+        ingredient_controls.addWidget(QLabel("Count:"))
+        ingredient_controls.addWidget(self.recipe_quantity_input)
+        ingredient_controls.addWidget(QLabel("Measure:"))
+        ingredient_controls.addWidget(self.recipe_measure_amount_input)
+        ingredient_controls.addWidget(self.recipe_measure_unit_combo)
+        ingredient_controls.addWidget(add_ingredient_button)
+        ingredient_controls.addWidget(remove_ingredient_button)
+
+        self.recipe_ingredient_table = QTableWidget(0, 4)
+        self.recipe_ingredient_table.setHorizontalHeaderLabels(
+            ["Item", "Count", "Amount", "Unit"]
+        )
+        self.recipe_ingredient_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.recipe_ingredient_table.setSelectionBehavior(
+            QTableWidget.SelectionBehavior.SelectRows
+        )
+        self.recipe_ingredient_table.setSelectionMode(
+            QTableWidget.SelectionMode.SingleSelection
+        )
+        _use_soft_table_selection(self.recipe_ingredient_table)
+
+        save_button = QPushButton("Save Recipe")
+        save_button.clicked.connect(self._add_recipe)
+        new_button = QPushButton("New Recipe")
+        new_button.clicked.connect(self._clear_recipe_form)
+
+        button_row = QHBoxLayout()
+        button_row.addWidget(save_button)
+        button_row.addWidget(new_button)
+        button_row.addStretch()
 
         form = QFormLayout()
         form.addRow("Name:", self.recipe_name_input)
-        form.addRow("Ingredients:", self.recipe_ingredients_input)
+        form.addRow("Ingredient:", ingredient_controls)
+        form.addRow("Selected Ingredients:", self.recipe_ingredient_table)
         form.addRow("Result:", self.recipe_result_input)
-        form.addRow("Motions:", self.recipe_motions_input)
-        form.addRow("Virtues:", self.recipe_virtues_input)
         form.addRow("Notes:", self.recipe_notes_input)
-        form.addRow(add_button)
+        form.addRow(button_row)
 
         layout = QVBoxLayout()
         layout.addLayout(form)
@@ -2444,8 +3034,24 @@ class AlchemyNotebookScreen(RepositoryBackedWidget):
         wrapper.setLayout(layout)
         self.tabs.addTab(wrapper, "Recipes")
 
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:
+        """Keeps the editable Ingredient selector behaving like a dropdown."""
+
+        if (
+            event.type() == QEvent.Type.MouseButtonPress
+            and hasattr(self, "recipe_reagent_combo")
+            and (
+                watched is self.recipe_reagent_combo
+                or watched is getattr(self, "recipe_reagent_line_edit", None)
+            )
+            and self.recipe_reagent_combo.count() > 0
+        ):
+            QTimer.singleShot(0, self._show_recipe_reagent_choices)
+
+        return super().eventFilter(watched, event)
+
     def _refresh_reagents(self, repository: SaveRepository) -> None:
-        """Reloads the reagent table."""
+        """Reloads the known crafting item/material table."""
 
         reagents = repository.list_alchemy_reagents()
         selected_name = self.reagent_name_input.text().strip()
@@ -2460,12 +3066,9 @@ class AlchemyNotebookScreen(RepositoryBackedWidget):
 
         for row_index, reagent in enumerate(reagents):
             self.reagent_table.setItem(row_index, 0, _table_item(str(reagent.get("name", ""))))
-            self.reagent_table.setItem(row_index, 1, _table_item(str(reagent.get("material_type", ""))))
-            self.reagent_table.setItem(row_index, 2, _table_item(_join_list(reagent.get("qualities", []))))
-            self.reagent_table.setItem(row_index, 3, _table_item(_join_list(reagent.get("motions", []))))
-            self.reagent_table.setItem(row_index, 4, _table_item(_join_list(reagent.get("virtues", []))))
-            self.reagent_table.setItem(row_index, 5, _table_item(_join_list(reagent.get("uses", []))))
-            self.reagent_table.setItem(row_index, 6, _table_item(str(reagent.get("notes", ""))))
+            self.reagent_table.setItem(row_index, 1, _table_item(str(reagent.get("description", ""))))
+            self.reagent_table.setItem(row_index, 2, _table_item(str(reagent.get("location", ""))))
+            self.reagent_table.setItem(row_index, 3, _table_item(_join_list(reagent.get("uses", []))))
 
         self.reagent_table.resizeColumnsToContents()
         self._refreshing_reagents = False
@@ -2475,6 +3078,8 @@ class AlchemyNotebookScreen(RepositoryBackedWidget):
                 if str(reagent.get("name", "")).casefold() == selected_name.casefold():
                     self.reagent_table.selectRow(row_index)
                     break
+
+        self._refresh_recipe_reagent_choices(repository)
 
     def _refresh_recipes(self, repository: SaveRepository) -> None:
         """Reloads the recipe table."""
@@ -2488,16 +3093,14 @@ class AlchemyNotebookScreen(RepositoryBackedWidget):
 
         for row_index, recipe in enumerate(recipes):
             self.recipe_table.setItem(row_index, 0, _table_item(str(recipe.get("name", ""))))
-            self.recipe_table.setItem(row_index, 1, _table_item(_join_list(recipe.get("ingredients", []))))
+            self.recipe_table.setItem(row_index, 1, _table_item(format_recipe_ingredients(recipe.get("ingredients", []))))
             self.recipe_table.setItem(row_index, 2, _table_item(str(recipe.get("result", ""))))
-            self.recipe_table.setItem(row_index, 3, _table_item(_join_list(recipe.get("motions", []))))
-            self.recipe_table.setItem(row_index, 4, _table_item(_join_list(recipe.get("virtues", []))))
-            self.recipe_table.setItem(row_index, 5, _table_item(str(recipe.get("notes", ""))))
+            self.recipe_table.setItem(row_index, 3, _table_item(str(recipe.get("notes", ""))))
 
         self.recipe_table.resizeColumnsToContents()
 
     def _save_reagent(self) -> None:
-        """Adds or updates a known reagent."""
+        """Adds or updates a known crafting item/material."""
 
         repository = self.repository()
 
@@ -2507,32 +3110,26 @@ class AlchemyNotebookScreen(RepositoryBackedWidget):
         name = self.reagent_name_input.text().strip()
 
         if not name:
-            QMessageBox.warning(self, "Missing Name", "Reagent name is required.")
+            QMessageBox.warning(self, "Missing Name", "Item name is required.")
             return
 
         repository.add_alchemy_reagent(
             name=name,
-            material_type=self.reagent_material_type_input.text(),
-            qualities=_split_list(self.reagent_qualities_input.text()),
-            motions=_split_list(self.reagent_motions_input.text()),
-            virtues=_split_list(self.reagent_virtues_input.text()),
+            description=self.reagent_description_input.text(),
+            location=self.reagent_location_input.text(),
             uses=_split_list(self.reagent_uses_input.text()),
-            notes=self.reagent_notes_input.toPlainText(),
         )
 
         self.reagent_name_input.clear()
-        self.reagent_material_type_input.clear()
-        self.reagent_qualities_input.clear()
-        self.reagent_motions_input.clear()
-        self.reagent_virtues_input.clear()
+        self.reagent_description_input.clear()
+        self.reagent_location_input.clear()
         self.reagent_uses_input.clear()
-        self.reagent_notes_input.clear()
 
         self.refresh()
         self.notify_repository_changed()
 
     def _load_selected_reagent(self) -> None:
-        """Loads the selected reagent row into the edit controls."""
+        """Loads the selected crafting item/material row into the edit controls."""
 
         if self._refreshing_reagents:
             return
@@ -2547,24 +3144,191 @@ class AlchemyNotebookScreen(RepositoryBackedWidget):
 
         reagent = self._reagent_rows[row_index]
         self.reagent_name_input.setText(str(reagent.get("name", "")))
-        self.reagent_material_type_input.setText(str(reagent.get("material_type", "")))
-        self.reagent_qualities_input.setText(_join_list(reagent.get("qualities", [])))
-        self.reagent_motions_input.setText(_join_list(reagent.get("motions", [])))
-        self.reagent_virtues_input.setText(_join_list(reagent.get("virtues", [])))
+        self.reagent_description_input.setText(str(reagent.get("description", "")))
+        self.reagent_location_input.setText(str(reagent.get("location", "")))
         self.reagent_uses_input.setText(_join_list(reagent.get("uses", [])))
-        self.reagent_notes_input.setPlainText(str(reagent.get("notes", "")))
 
     def _clear_reagent_form(self) -> None:
-        """Clears reagent edit controls and table selection."""
+        """Clears item edit controls and table selection."""
 
         self.reagent_table.clearSelection()
         self.reagent_name_input.clear()
-        self.reagent_material_type_input.clear()
-        self.reagent_qualities_input.clear()
-        self.reagent_motions_input.clear()
-        self.reagent_virtues_input.clear()
+        self.reagent_description_input.clear()
+        self.reagent_location_input.clear()
         self.reagent_uses_input.clear()
-        self.reagent_notes_input.clear()
+
+    def _refresh_recipe_reagent_choices(self, repository: SaveRepository) -> None:
+        """Reloads the category-filtered item dropdown used by recipe ingredients."""
+
+        current_text = self.recipe_reagent_combo.currentText().strip()
+        self.recipe_reagent_combo.clear()
+        choices = _crafting_ingredient_catalog_choices(repository.list_item_catalog())
+        choice_labels: list[str] = []
+
+        for item in choices:
+            name = str(item.get("name", "")).strip()
+            category = str(item.get("category", "")).strip()
+            if name:
+                label = f"{name} ({category})"
+                self.recipe_reagent_combo.addItem(label, name)
+                choice_labels.append(label)
+
+        self.recipe_reagent_choice_model.setStringList(choice_labels)
+
+        if current_text:
+            for index in range(self.recipe_reagent_combo.count()):
+                item_name = str(self.recipe_reagent_combo.itemData(index)).strip()
+                if (
+                    item_name.casefold() == current_text.casefold()
+                    or self.recipe_reagent_combo.itemText(index).casefold()
+                    == current_text.casefold()
+                ):
+                    self.recipe_reagent_combo.setCurrentIndex(index)
+                    return
+
+        if self.recipe_reagent_combo.count() > 0:
+            self.recipe_reagent_combo.setCurrentIndex(0)
+
+    @Slot(str)
+    def _show_recipe_reagent_choices(self, _text: str = "") -> None:
+        """Shows the searchable Ingredient choices popup."""
+
+        if self.recipe_reagent_combo.count() <= 0:
+            return
+
+        if self.recipe_reagent_line_edit is None:
+            self.recipe_reagent_combo.showPopup()
+            return
+
+        self.recipe_reagent_completer.setCompletionPrefix(
+            self.recipe_reagent_line_edit.text()
+        )
+        self.recipe_reagent_completer.complete()
+
+    @Slot(str)
+    def _select_recipe_reagent_label(self, label: str) -> None:
+        """Selects an Ingredient dropdown row by its visible label."""
+
+        clean_label = str(label).strip()
+
+        if not clean_label:
+            return
+
+        for index in range(self.recipe_reagent_combo.count()):
+            if self.recipe_reagent_combo.itemText(index) == clean_label:
+                self.recipe_reagent_combo.setCurrentIndex(index)
+                return
+
+    def _add_recipe_ingredient(self) -> None:
+        """Adds a structured known-item ingredient to the draft recipe."""
+
+        selected_name = self._selected_recipe_reagent_name()
+
+        if not selected_name:
+            QMessageBox.warning(
+                self,
+                "Unknown Item",
+                (
+                    "Choose an item categorized as "
+                    f"{CRAFTING_INGREDIENT_CATEGORY_NAMES}."
+                ),
+            )
+            return
+
+        ingredient = normalize_recipe_ingredient(
+            {
+                "reagent_name": selected_name,
+                "quantity": self.recipe_quantity_input.value(),
+                "measure_amount": self.recipe_measure_amount_input.value(),
+                "measure_unit": self.recipe_measure_unit_combo.currentData(),
+            }
+        )
+
+        if ingredient is None:
+            return
+
+        for index, existing in enumerate(self._recipe_ingredient_rows):
+            if (
+                str(existing.get("reagent_name", "")).casefold()
+                == ingredient["reagent_name"].casefold()
+            ):
+                self._recipe_ingredient_rows[index] = ingredient
+                self._refresh_recipe_ingredient_table()
+                return
+
+        self._recipe_ingredient_rows.append(ingredient)
+        self._refresh_recipe_ingredient_table()
+
+    def _remove_recipe_ingredient(self) -> None:
+        """Removes the selected ingredient from the draft recipe."""
+
+        row_index = self.recipe_ingredient_table.currentRow()
+
+        if row_index < 0 or row_index >= len(self._recipe_ingredient_rows):
+            return
+
+        del self._recipe_ingredient_rows[row_index]
+        self._refresh_recipe_ingredient_table()
+
+    def _refresh_recipe_ingredient_table(self) -> None:
+        """Reloads the draft recipe ingredient table."""
+
+        self.recipe_ingredient_table.setRowCount(len(self._recipe_ingredient_rows))
+
+        for row_index, ingredient in enumerate(self._recipe_ingredient_rows):
+            self.recipe_ingredient_table.setItem(
+                row_index,
+                0,
+                _table_item(str(ingredient.get("reagent_name", ""))),
+            )
+            self.recipe_ingredient_table.setItem(
+                row_index,
+                1,
+                _table_item(str(ingredient.get("quantity", 1))),
+            )
+            self.recipe_ingredient_table.setItem(
+                row_index,
+                2,
+                _table_item(str(ingredient.get("measure_amount", 1))),
+            )
+            self.recipe_ingredient_table.setItem(
+                row_index,
+                3,
+                _table_item(str(ingredient.get("measure_unit", "each"))),
+            )
+
+        self.recipe_ingredient_table.resizeColumnsToContents()
+
+    def _selected_recipe_reagent_name(self) -> str:
+        """Returns the exact selected known item name, or blank."""
+
+        requested_name = self.recipe_reagent_combo.currentText().strip()
+
+        if not requested_name:
+            return ""
+
+        for index in range(self.recipe_reagent_combo.count()):
+            name = str(self.recipe_reagent_combo.itemData(index)).strip()
+            label = str(self.recipe_reagent_combo.itemText(index)).strip()
+            if (
+                name.casefold() == requested_name.casefold()
+                or label.casefold() == requested_name.casefold()
+            ):
+                return name
+
+        return ""
+
+    def _clear_recipe_form(self) -> None:
+        """Clears recipe edit controls and draft ingredients."""
+
+        self.recipe_name_input.clear()
+        self._recipe_ingredient_rows.clear()
+        self._refresh_recipe_ingredient_table()
+        self.recipe_result_input.clear()
+        self.recipe_notes_input.clear()
+        self.recipe_quantity_input.setValue(1)
+        self.recipe_measure_amount_input.setValue(1)
+        self.recipe_measure_unit_combo.setCurrentIndex(0)
 
     def _add_recipe(self) -> None:
         """Adds or updates a known recipe."""
@@ -2580,27 +3344,28 @@ class AlchemyNotebookScreen(RepositoryBackedWidget):
             QMessageBox.warning(self, "Missing Name", "Recipe name is required.")
             return
 
+        if not self._recipe_ingredient_rows:
+            QMessageBox.warning(
+                self,
+                "Missing Ingredients",
+                "Add at least one known item ingredient.",
+            )
+            return
+
         repository.add_alchemy_recipe(
             name=name,
-            ingredients=_split_list(self.recipe_ingredients_input.text()),
+            ingredients=list(self._recipe_ingredient_rows),
             result=self.recipe_result_input.text(),
-            motions=_split_list(self.recipe_motions_input.text()),
-            virtues=_split_list(self.recipe_virtues_input.text()),
             notes=self.recipe_notes_input.toPlainText(),
         )
 
-        self.recipe_name_input.clear()
-        self.recipe_ingredients_input.clear()
-        self.recipe_result_input.clear()
-        self.recipe_motions_input.clear()
-        self.recipe_virtues_input.clear()
-        self.recipe_notes_input.clear()
+        self._clear_recipe_form()
 
         self.refresh()
         self.notify_repository_changed()
 
     def _sort_reagents_by_column(self, column_index: int) -> None:
-        """Sorts reagents by a clicked header column."""
+        """Sorts crafting items/materials by a clicked header column."""
 
         self._reagent_sort_column, self._reagent_sort_order = _update_sort_state(
             self.reagent_table,
@@ -2622,27 +3387,18 @@ class AlchemyNotebookScreen(RepositoryBackedWidget):
         self.refresh()
 
     def _reagent_sort_key(self, reagent: dict[str, Any]) -> tuple[str, str]:
-        """Returns the active reagent sort key."""
+        """Returns the active crafting item/material sort key."""
 
         name = str(reagent.get("name", "")).casefold()
 
         if self._reagent_sort_column == 1:
-            return str(reagent.get("material_type", "")).casefold(), name
+            return str(reagent.get("description", "")).casefold(), name
 
         if self._reagent_sort_column == 2:
-            return _join_list(reagent.get("qualities", [])).casefold(), name
+            return str(reagent.get("location", "")).casefold(), name
 
         if self._reagent_sort_column == 3:
-            return _join_list(reagent.get("motions", [])).casefold(), name
-
-        if self._reagent_sort_column == 4:
-            return _join_list(reagent.get("virtues", [])).casefold(), name
-
-        if self._reagent_sort_column == 5:
             return _join_list(reagent.get("uses", [])).casefold(), name
-
-        if self._reagent_sort_column == 6:
-            return str(reagent.get("notes", "")).casefold(), name
 
         return name, name
 
@@ -2652,71 +3408,121 @@ class AlchemyNotebookScreen(RepositoryBackedWidget):
         name = str(recipe.get("name", "")).casefold()
 
         if self._recipe_sort_column == 1:
-            return _join_list(recipe.get("ingredients", [])).casefold(), name
+            return format_recipe_ingredients(recipe.get("ingredients", [])).casefold(), name
 
         if self._recipe_sort_column == 2:
             return str(recipe.get("result", "")).casefold(), name
 
         if self._recipe_sort_column == 3:
-            return _join_list(recipe.get("motions", [])).casefold(), name
-
-        if self._recipe_sort_column == 4:
-            return _join_list(recipe.get("virtues", [])).casefold(), name
-
-        if self._recipe_sort_column == 5:
             return str(recipe.get("notes", "")).casefold(), name
 
         return name, name
 
 class HistoryScreen(RepositoryBackedWidget):
-    """Private player journal that is never sent to the AI."""
+    """Player journal with explicit AI sharing control."""
 
     def __init__(self) -> None:
         super().__init__()
 
+        self._loading_journal = False
+        self._saving_journal = False
+        self._autosave_timer = QTimer(self)
+        self._autosave_timer.setSingleShot(True)
+        self._autosave_timer.setInterval(900)
+        self._autosave_timer.timeout.connect(self._autosave_journal)
+
         self.journal_input = QTextEdit()
-        self.journal_input.setPlaceholderText("Write private notes here. These are not sent to the AI.")
+        self.journal_input.setPlaceholderText(
+            "Write player notes here. They stay private unless sharing is enabled."
+        )
+        self.journal_input.textChanged.connect(self._schedule_journal_autosave)
+
+        self.share_with_ai_checkbox = QCheckBox("Send these journal notes to the AI")
+        self.share_with_ai_checkbox.toggled.connect(
+            lambda _checked: self._schedule_journal_autosave()
+        )
 
         save_button = QPushButton("Save Journal")
         save_button.clicked.connect(self._save_journal)
 
         layout = QVBoxLayout()
+        layout.addWidget(self.share_with_ai_checkbox)
         layout.addWidget(self.journal_input)
         layout.addWidget(save_button)
 
         self.setLayout(layout)
 
     def refresh(self) -> None:
-        """Reloads private journal notes."""
+        """Reloads journal notes and sharing preference."""
 
         repository = self.repository()
+        self._autosave_timer.stop()
+        self._loading_journal = True
 
-        if repository is None:
-            self.journal_input.clear()
+        try:
+            if repository is None:
+                self.journal_input.clear()
+                self.share_with_ai_checkbox.setChecked(False)
+                return
+
+            self.journal_input.setPlainText(repository.get_journal_notes())
+            self.share_with_ai_checkbox.setChecked(repository.get_journal_share_with_ai())
+        finally:
+            self._loading_journal = False
+
+    def _schedule_journal_autosave(self) -> None:
+        """Debounces journal autosaves while the player is typing."""
+
+        if self._loading_journal or self._saving_journal:
             return
 
-        self.journal_input.setPlainText(repository.get_journal_notes())
+        self._autosave_timer.start()
+
+    def _autosave_journal(self) -> None:
+        """Persists journal changes without interrupting the player."""
+
+        self._autosave_timer.stop()
+        self._persist_journal(show_confirmation=False)
 
     def _save_journal(self) -> None:
-        """Persists private journal notes without touching AI context."""
+        """Persists journal notes from the manual save button."""
+
+        self._autosave_timer.stop()
+        self._persist_journal(show_confirmation=True)
+
+    def _persist_journal(self, *, show_confirmation: bool) -> None:
+        """Persists journal notes and AI sharing preference."""
 
         repository = self.repository()
 
-        if repository is None:
+        if repository is None or self._loading_journal or self._saving_journal:
             return
 
-        repository.set_journal_notes(self.journal_input.toPlainText())
-        self.notify_repository_changed()
-        QMessageBox.information(self, "Journal Saved", "Journal notes were saved.")
+        self._saving_journal = True
+
+        try:
+            repository.set_journal_notes(self.journal_input.toPlainText())
+            repository.set_journal_share_with_ai(self.share_with_ai_checkbox.isChecked())
+            self.notify_repository_changed()
+
+            if show_confirmation:
+                QMessageBox.information(self, "Journal Saved", "Journal notes were saved.")
+        finally:
+            self._saving_journal = False
 
 
 class SettingsScreen(RepositoryBackedWidget):
     """Basic save-specific settings screen."""
 
-    def __init__(self, on_audio_settings_changed=None) -> None:
+    def __init__(
+        self,
+        on_audio_settings_changed=None,
+        on_theme_changed=None,
+    ) -> None:
         super().__init__()
 
         self.on_audio_settings_changed = on_audio_settings_changed
+        self.on_theme_changed = on_theme_changed
         self._loading_settings = False
         self._saving_settings = False
         self._autosave_timer = QTimer(self)
@@ -2725,7 +3531,7 @@ class SettingsScreen(RepositoryBackedWidget):
         self._autosave_timer.timeout.connect(self._save_settings)
 
         self.theme_combo = QComboBox()
-        self.theme_combo.addItems(["System", "Light", "Dark"])
+        self.theme_combo.addItems(["Light", "Dark"])
         self.theme_combo.currentIndexChanged.connect(lambda _index: self._save_settings())
 
         self.music_enabled_checkbox = QCheckBox("Music enabled")
@@ -2856,7 +3662,7 @@ class SettingsScreen(RepositoryBackedWidget):
 
         try:
             if repository is None:
-                self.theme_combo.setCurrentText("System")
+                self.theme_combo.setCurrentText("Light")
                 self.days_per_week_input.setValue(int(DEFAULT_CALENDAR_SETTINGS["days_per_week"]))
                 self.weeks_per_month_input.setValue(int(DEFAULT_CALENDAR_SETTINGS["weeks_per_month"]))
                 self.months_per_year_input.setValue(int(DEFAULT_CALENDAR_SETTINGS["months_per_year"]))
@@ -2873,16 +3679,17 @@ class SettingsScreen(RepositoryBackedWidget):
                 self.tts_volume_slider.setValue(90)
                 return
 
-            theme = repository.get_setting("theme", "System")
+            theme = repository.get_setting("theme", "Light")
             additional_ai_context = repository.get_setting("ai.additional_context", "")
             denominations = repository.get_currency_denominations()
             calendar_settings = repository.get_calendar_settings()
 
-            if theme in ["System", "Light", "Dark"]:
+            if theme in ["Light", "Dark"]:
                 self.theme_combo.setCurrentText(str(theme))
             else:
-                LOGGER.warning("Unknown theme setting '%s'. Falling back to System.", theme)
-                self.theme_combo.setCurrentText("System")
+                LOGGER.warning("Unknown theme setting '%s'. Falling back to Light.", theme)
+                self.theme_combo.setCurrentText("Light")
+                repository.set_setting("theme", "Light")
 
             for index, denomination in enumerate(denominations[: len(self.currency_name_inputs)]):
                 self.currency_name_inputs[index].setText(str(denomination["name"]))
@@ -2996,6 +3803,8 @@ class SettingsScreen(RepositoryBackedWidget):
 
             if self.on_audio_settings_changed is not None:
                 self.on_audio_settings_changed()
+            if self.on_theme_changed is not None:
+                self.on_theme_changed()
         finally:
             self._saving_settings = False
 
@@ -3029,9 +3838,252 @@ def _apply_audio_settings_to_managers(
         elif not music_enabled:
             sound_manager.stop_music(clear_current=False)
 
-    if narration_player is not None:
+    if narration_player is not None and hasattr(narration_player, "set_volume"):
         narration_player.set_volume(tts_volume)
+    if narration_player is not None and hasattr(narration_player, "set_enabled"):
         narration_player.set_enabled(narrator_enabled)
+
+
+def _normalize_theme_name(theme: str) -> str:
+    """Returns a supported theme name."""
+
+    clean_theme = str(theme or "Light").strip()
+    return clean_theme if clean_theme in THEME_NAMES else "Light"
+
+
+def _next_available_save_title(saves_dir: Path, requested_title: str) -> str:
+    """Returns the first non-conflicting player-facing save title."""
+
+    base_title = str(requested_title or "").strip() or "New Adventure"
+
+    if not SaveRepository.save_title_exists(saves_dir, base_title):
+        return base_title
+
+    suffix = 2
+
+    while True:
+        candidate = f"{base_title} {suffix}"
+
+        if not SaveRepository.save_title_exists(saves_dir, candidate):
+            return candidate
+
+        suffix += 1
+
+
+def _light_theme_palette() -> QPalette:
+    """Builds a light, high-contrast application palette."""
+
+    palette = QPalette()
+    palette.setColor(QPalette.ColorRole.Window, QColor("#f5f7fb"))
+    palette.setColor(QPalette.ColorRole.WindowText, QColor("#111827"))
+    palette.setColor(QPalette.ColorRole.Base, QColor("#ffffff"))
+    palette.setColor(QPalette.ColorRole.AlternateBase, QColor("#eef2f7"))
+    palette.setColor(QPalette.ColorRole.Text, QColor("#111827"))
+    palette.setColor(QPalette.ColorRole.PlaceholderText, QColor("#4b5563"))
+    palette.setColor(QPalette.ColorRole.Button, QColor("#e5e7eb"))
+    palette.setColor(QPalette.ColorRole.ButtonText, QColor("#111827"))
+    palette.setColor(QPalette.ColorRole.Highlight, QColor("#1d4ed8"))
+    palette.setColor(QPalette.ColorRole.HighlightedText, QColor("#ffffff"))
+    palette.setColor(QPalette.ColorRole.ToolTipBase, QColor("#ffffff"))
+    palette.setColor(QPalette.ColorRole.ToolTipText, QColor("#111827"))
+    return palette
+
+
+def _dark_theme_palette() -> QPalette:
+    """Builds a dark, high-contrast application palette."""
+
+    palette = QPalette()
+    palette.setColor(QPalette.ColorRole.Window, QColor("#202124"))
+    palette.setColor(QPalette.ColorRole.WindowText, QColor("#f1f3f4"))
+    palette.setColor(QPalette.ColorRole.Base, QColor("#121416"))
+    palette.setColor(QPalette.ColorRole.AlternateBase, QColor("#2a2d30"))
+    palette.setColor(QPalette.ColorRole.Text, QColor("#f1f3f4"))
+    palette.setColor(QPalette.ColorRole.PlaceholderText, QColor("#a9b0b6"))
+    palette.setColor(QPalette.ColorRole.Button, QColor("#303437"))
+    palette.setColor(QPalette.ColorRole.ButtonText, QColor("#f1f3f4"))
+    palette.setColor(QPalette.ColorRole.Highlight, QColor("#4c8fcb"))
+    palette.setColor(QPalette.ColorRole.HighlightedText, QColor("#ffffff"))
+    palette.setColor(QPalette.ColorRole.ToolTipBase, QColor("#303437"))
+    palette.setColor(QPalette.ColorRole.ToolTipText, QColor("#f1f3f4"))
+    return palette
+
+
+def _light_theme_stylesheet() -> str:
+    """Returns stylesheet rules that make the light theme visible on all platforms."""
+
+    return """
+        QWidget {
+            background-color: #f5f7fb;
+            color: #111827;
+        }
+        QLineEdit, QTextEdit, QPlainTextEdit, QComboBox, QSpinBox, QTableWidget {
+            background-color: #ffffff;
+            color: #111827;
+            border: 1px solid #64748b;
+            selection-background-color: #1d4ed8;
+            selection-color: #ffffff;
+        }
+        QComboBox, QSpinBox {
+            min-height: 24px;
+            padding: 3px 28px 3px 6px;
+        }
+        QComboBox::drop-down {
+            background-color: #e2e8f0;
+            border-left: 1px solid #94a3b8;
+            subcontrol-origin: padding;
+            subcontrol-position: top right;
+            width: 24px;
+        }
+        QComboBox QAbstractItemView {
+            background-color: #ffffff;
+            color: #111827;
+            selection-background-color: #1d4ed8;
+            selection-color: #ffffff;
+        }
+        QSpinBox::up-button, QSpinBox::down-button {
+            background-color: #e2e8f0;
+            border-left: 1px solid #94a3b8;
+            subcontrol-origin: border;
+            width: 24px;
+        }
+        QSpinBox::up-button {
+            border-bottom: 1px solid #94a3b8;
+            subcontrol-position: top right;
+        }
+        QSpinBox::down-button {
+            subcontrol-position: bottom right;
+        }
+        QLineEdit:focus, QTextEdit:focus, QPlainTextEdit:focus, QComboBox:focus, QSpinBox:focus {
+            border-color: #1d4ed8;
+        }
+        QLabel, QCheckBox {
+            background-color: transparent;
+            color: #111827;
+        }
+        QSlider::groove:horizontal {
+            background-color: #d1d9e6;
+            border: 1px solid #94a3b8;
+            border-radius: 4px;
+            height: 8px;
+        }
+        QSlider::handle:horizontal {
+            background-color: #2563eb;
+            border: 1px solid #1e40af;
+            border-radius: 7px;
+            margin: -4px 0;
+            width: 14px;
+        }
+        QPushButton {
+            background-color: #e5e7eb;
+            color: #111827;
+            border: 1px solid #64748b;
+            padding: 4px 10px;
+        }
+        QPushButton:hover {
+            background-color: #dbe4ee;
+            border-color: #475569;
+        }
+        QPushButton:default {
+            background-color: #2563eb;
+            border-color: #1d4ed8;
+            color: #ffffff;
+        }
+        QTabWidget::pane {
+            border: 1px solid #94a3b8;
+        }
+        QTabBar::tab {
+            background-color: #e5e7eb;
+            color: #111827;
+            border: 1px solid #94a3b8;
+            padding: 6px 10px;
+        }
+        QTabBar::tab:selected {
+            background-color: #ffffff;
+            border-bottom-color: #ffffff;
+        }
+        QHeaderView::section {
+            background-color: #e2e8f0;
+            color: #111827;
+            border: 1px solid #cbd5e1;
+            padding: 4px;
+        }
+    """
+
+
+def _dark_theme_stylesheet() -> str:
+    """Returns stylesheet rules that make the dark theme visible on all platforms."""
+
+    return """
+        QWidget {
+            background-color: #202124;
+            color: #f1f3f4;
+        }
+        QLineEdit, QTextEdit, QPlainTextEdit, QComboBox, QSpinBox, QTableWidget {
+            background-color: #121416;
+            color: #f1f3f4;
+            border: 1px solid #4b5258;
+            selection-background-color: #4c8fcb;
+            selection-color: #ffffff;
+        }
+        QComboBox, QSpinBox {
+            min-height: 24px;
+            padding: 3px 28px 3px 6px;
+        }
+        QComboBox::drop-down {
+            background-color: #303437;
+            border-left: 1px solid #5b6268;
+            subcontrol-origin: padding;
+            subcontrol-position: top right;
+            width: 24px;
+        }
+        QComboBox QAbstractItemView {
+            background-color: #121416;
+            color: #f1f3f4;
+            selection-background-color: #4c8fcb;
+            selection-color: #ffffff;
+        }
+        QSpinBox::up-button, QSpinBox::down-button {
+            background-color: #303437;
+            border-left: 1px solid #5b6268;
+            subcontrol-origin: border;
+            width: 24px;
+        }
+        QSpinBox::up-button {
+            border-bottom: 1px solid #5b6268;
+            subcontrol-position: top right;
+        }
+        QSpinBox::down-button {
+            subcontrol-position: bottom right;
+        }
+        QPushButton {
+            background-color: #303437;
+            color: #f1f3f4;
+            border: 1px solid #5b6268;
+            padding: 4px 10px;
+        }
+        QPushButton:hover {
+            background-color: #3c4247;
+        }
+        QTabWidget::pane {
+            border: 1px solid #4b5258;
+        }
+        QTabBar::tab {
+            background-color: #303437;
+            color: #f1f3f4;
+            border: 1px solid #4b5258;
+            padding: 6px 10px;
+        }
+        QTabBar::tab:selected {
+            background-color: #202124;
+            border-bottom-color: #202124;
+        }
+        QHeaderView::section {
+            background-color: #303437;
+            color: #f1f3f4;
+            border: 1px solid #4b5258;
+            padding: 4px;
+        }
+    """
 
 
 def _slider_row(slider: QSlider, value_label: QLabel) -> QWidget:
@@ -3109,6 +4161,165 @@ def _ai_skills_match_setup(
     )
 
 
+def _starter_items_for_save(
+    ai_items: list[dict[str, Any]],
+    setup: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Returns AI starter items while preserving explicit named setup items."""
+
+    setup_items = setup.get("starter_items", [])
+
+    if not isinstance(setup_items, list):
+        setup_items = []
+
+    if not ai_items:
+        return []
+
+    completed_items = [item for item in ai_items if isinstance(item, dict)]
+    original_completed_count = len(completed_items)
+    used_source_indexes = {
+        source_index
+        for source_index in (
+            _optional_int(item.get("source_index"))
+            for item in completed_items
+            if isinstance(item, dict)
+        )
+        if source_index is not None and source_index >= 0
+    }
+    seen_names = {
+        str(item.get("name", "")).strip().casefold()
+        for item in completed_items
+        if isinstance(item, dict) and str(item.get("name", "")).strip()
+    }
+
+    for index, setup_item in enumerate(setup_items):
+        if index in used_source_indexes:
+            continue
+
+        if not isinstance(setup_item, dict) or bool(setup_item.get("requires_ai_invention")):
+            continue
+
+        fallback_item = _fallback_starter_item_from_setup(setup_item)
+
+        if not fallback_item:
+            continue
+
+        folded_name = fallback_item["name"].casefold()
+
+        if folded_name in seen_names:
+            continue
+
+        completed_items.append(fallback_item)
+        seen_names.add(folded_name)
+
+    if len(completed_items) > original_completed_count:
+        LOGGER.warning(
+            "Gemini omitted %s explicit starter item(s); preserved named setup "
+            "item(s) without applying a starter inventory count requirement.",
+            len(completed_items) - original_completed_count,
+        )
+
+    return completed_items
+
+
+def _fallback_starter_item_from_setup(raw_item: Any) -> dict[str, Any] | None:
+    """Builds a structured starter item from a wizard entry when AI output is partial."""
+
+    if not isinstance(raw_item, dict):
+        return None
+
+    name = str(raw_item.get("name", "")).strip()
+    item_request = str(raw_item.get("item_request", "")).strip()
+    description = str(raw_item.get("description", "")).strip()
+
+    if not name:
+        name = _starter_item_name_from_request(item_request)
+
+    if not name:
+        return None
+
+    return {
+        "name": name,
+        "category": str(raw_item.get("category", "Item")).strip() or "Item",
+        "quantity": max(1, _safe_int(raw_item.get("quantity"), 1)),
+        "description": description
+        or item_request
+        or "Player-requested starter item awaiting AI detail.",
+        "value_base_units": max(0, _safe_int(raw_item.get("value_base_units"), 0)),
+    }
+
+
+def _starter_item_name_from_request(item_request: str) -> str:
+    """Derives a compact item name from a natural-language starter item request."""
+
+    clean_request = str(item_request or "").strip()
+
+    if not clean_request:
+        return ""
+
+    candidate = clean_request
+
+    for separator in [" that ", " which ", " with ", " used ", " for ", ".", ",", ";", ":"]:
+        before_separator = candidate.split(separator, 1)[0].strip()
+
+        if before_separator:
+            candidate = before_separator
+
+    words = [
+        word.strip("'\"()[]{}")
+        for word in candidate.split()
+        if word.strip("'\"()[]{}")
+    ]
+
+    while words and words[0].casefold() in {"a", "an", "the", "my", "his", "her", "their", "our"}:
+        words.pop(0)
+
+    if not words:
+        return ""
+
+    return " ".join(words[:5]).title()
+
+
+def _resolved_skill_checks_for_context(event_results: list[Any]) -> list[dict[str, Any]]:
+    """Converts applied skill-check results into serializable narration context."""
+
+    resolved_checks: list[dict[str, Any]] = []
+
+    for result in event_results:
+        if getattr(result, "event_type", "") != "SkillCheckRequestedEvent":
+            continue
+
+        if getattr(result, "status", "") != "applied":
+            continue
+
+        payload = getattr(result, "payload", {})
+
+        if not isinstance(payload, dict):
+            continue
+
+        resolved_checks.append(
+            {
+                **payload,
+                "status": getattr(result, "status", ""),
+                "message": getattr(result, "message", ""),
+            }
+        )
+
+    return resolved_checks
+
+
+def _optional_int(value: Any) -> int | None:
+    """Parses an optional integer."""
+
+    if value is None:
+        return None
+
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _append_ai_context_line(existing_context: str, line: str) -> str:
     """Appends an AI-facing setup context line if it is not already present."""
 
@@ -3134,6 +4345,11 @@ def _format_starter_items_for_template(items: list[dict[str, Any]]) -> str:
 
     for item in items:
         name = str(item.get("name", "")).strip()
+        item_request = str(item.get("item_request", "")).strip()
+
+        if bool(item.get("requires_ai_invention")) and item_request:
+            lines.append(item_request)
+            continue
 
         if not name:
             continue
@@ -3223,6 +4439,26 @@ def _join_list(values) -> str:
         return ""
 
     return ", ".join(str(value) for value in values if str(value).strip())
+
+
+def _crafting_ingredient_catalog_choices(
+    catalog_items: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Returns sorted catalog items that may be used as recipe ingredients."""
+
+    choices = [
+        item
+        for item in catalog_items
+        if str(item.get("name", "")).strip()
+        and is_crafting_ingredient_category(item.get("category", ""))
+    ]
+    choices.sort(
+        key=lambda item: (
+            str(item.get("name", "")).casefold(),
+            str(item.get("category", "")).casefold(),
+        )
+    )
+    return choices
 
 
 def _status_label(label: str, value_label: QLabel) -> QWidget:

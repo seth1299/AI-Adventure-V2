@@ -10,7 +10,7 @@ from ai_adventure.persistence.save_repository import SaveRepository
 
 
 class AlchemySystemTests(unittest.TestCase):
-    def test_existing_saves_gain_reagent_material_type_column(self) -> None:
+    def test_existing_saves_gain_simplified_reagent_columns(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             save_path = Path(temp_dir) / "old.sqlite3"
             connection = sqlite3.connect(save_path)
@@ -24,23 +24,17 @@ class AlchemySystemTests(unittest.TestCase):
                     CREATE TABLE alchemy_reagents (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
                         name TEXT NOT NULL UNIQUE,
-                        qualities_json TEXT NOT NULL DEFAULT '[]',
-                        motions_json TEXT NOT NULL DEFAULT '[]',
-                        virtues_json TEXT NOT NULL DEFAULT '[]',
                         uses_json TEXT NOT NULL DEFAULT '[]',
                         notes TEXT NOT NULL DEFAULT '',
                         discovered_at TEXT NOT NULL
                     );
                     INSERT INTO alchemy_reagents (
                         name,
-                        qualities_json,
-                        motions_json,
-                        virtues_json,
                         uses_json,
                         notes,
                         discovered_at
                     )
-                    VALUES ('Old Salt', '["dry"]', '["settling"]', '["clarity"]', '[]', '', '2026-05-31T00:00:00');
+                    VALUES ('Old Salt', '["preservation"]', 'Found under old stone.', '2026-05-31T00:00:00');
                     """
                 )
             finally:
@@ -50,31 +44,31 @@ class AlchemySystemTests(unittest.TestCase):
             reagents = repository.list_alchemy_reagents()
 
             self.assertEqual(reagents[0]["name"], "Old Salt")
-            self.assertEqual(reagents[0]["material_type"], "")
+            self.assertEqual(reagents[0]["description"], "Found under old stone.")
+            self.assertEqual(reagents[0]["location"], "")
+            self.assertEqual(reagents[0]["uses"], ["preservation"])
 
-    def test_reagent_discovery_persists_structured_fields(self) -> None:
+    def test_reagent_discovery_persists_simplified_fields(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             repository = SaveRepository.create_new_save(Path(temp_dir), "Alchemy Test")
 
             repository.add_alchemy_reagent(
                 name="Moon Salt",
-                material_type="Geological",
-                qualities=["cold", "silver", ""],
-                motions=["settling"],
-                virtues=["clarity"],
+                description="Pale crystals that hum under moonlight.",
+                location="Moonlit stone basins",
                 uses=["cooling draughts", "mirror inks"],
-                notes="Forms under moonlit stone.",
             )
 
             reagents = repository.list_alchemy_reagents()
 
             self.assertEqual(len(reagents), 1)
             self.assertEqual(reagents[0]["name"], "Moon Salt")
-            self.assertEqual(reagents[0]["material_type"], "Geological")
-            self.assertEqual(reagents[0]["qualities"], ["cold", "silver"])
-            self.assertEqual(reagents[0]["motions"], ["settling"])
-            self.assertEqual(reagents[0]["virtues"], ["clarity"])
+            self.assertEqual(reagents[0]["description"], "Pale crystals that hum under moonlight.")
+            self.assertEqual(reagents[0]["location"], "Moonlit stone basins")
             self.assertEqual(reagents[0]["uses"], ["cooling draughts", "mirror inks"])
+            catalog = repository.list_item_catalog()
+            moon_salt = next(item for item in catalog if item["name"] == "Moon Salt")
+            self.assertEqual(moon_salt["category"], "Material")
 
     def test_recipe_discovery_persists_structured_fields(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -82,10 +76,21 @@ class AlchemySystemTests(unittest.TestCase):
 
             repository.add_alchemy_recipe(
                 name="Mistglass Tincture",
-                ingredients=["Moon Salt", "Rainwater"],
+                ingredients=[
+                    {
+                        "reagent_name": "Moon Salt",
+                        "quantity": 1,
+                        "measure_amount": 5,
+                        "measure_unit": "grams",
+                    },
+                    {
+                        "reagent_name": "Rainwater",
+                        "quantity": 1,
+                        "measure_amount": 100,
+                        "measure_unit": "mL",
+                    },
+                ],
                 result="Reveals faint hidden script.",
-                motions=["dissolve", "turn clockwise"],
-                virtues=["revelation"],
                 notes="Clouds if stirred too quickly.",
             )
 
@@ -93,39 +98,73 @@ class AlchemySystemTests(unittest.TestCase):
 
             self.assertEqual(len(recipes), 1)
             self.assertEqual(recipes[0]["name"], "Mistglass Tincture")
-            self.assertEqual(recipes[0]["ingredients"], ["Moon Salt", "Rainwater"])
+            self.assertEqual(
+                recipes[0]["ingredients"][0],
+                {
+                    "reagent_name": "Moon Salt",
+                    "quantity": 1,
+                    "measure_amount": 5,
+                    "measure_unit": "grams",
+                },
+            )
             self.assertEqual(recipes[0]["result"], "Reveals faint hidden script.")
-            self.assertEqual(recipes[0]["motions"], ["dissolve", "turn clockwise"])
-            self.assertEqual(recipes[0]["virtues"], ["revelation"])
 
     def test_state_manager_loads_reagents_and_recipes(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             repository = SaveRepository.create_new_save(Path(temp_dir), "Alchemy Test")
             repository.add_alchemy_reagent(
                 name="Ash Fern",
-                material_type="Botanical",
-                qualities=["dry", "bitter"],
-                motions=["rising"],
-                virtues=["memory"],
+                description="Grey fronds that curl toward heat.",
+                location="Charcoal-rich forest clearings",
                 uses=["smoke readings"],
-                notes="Curls toward heat.",
             )
             repository.add_alchemy_recipe(
                 name="Ember Mnemonic",
-                ingredients=["Ash Fern"],
+                ingredients=[
+                    {
+                        "reagent_name": "Ash Fern",
+                        "quantity": 1,
+                        "measure_amount": 1,
+                        "measure_unit": "handful",
+                    }
+                ],
                 result="Restores a recent sensory impression.",
-                motions=["kindle"],
-                virtues=["memory"],
                 notes="Unstable in rain.",
             )
 
             state = StateManager(repository).load_state()
 
             self.assertEqual(state.alchemy.known_reagents[0].name, "Ash Fern")
-            self.assertEqual(state.alchemy.known_reagents[0].material_type, "Botanical")
-            self.assertEqual(state.alchemy.known_reagents[0].qualities, ["dry", "bitter"])
+            self.assertEqual(state.alchemy.known_reagents[0].description, "Grey fronds that curl toward heat.")
+            self.assertEqual(state.alchemy.known_reagents[0].location, "Charcoal-rich forest clearings")
             self.assertEqual(state.alchemy.known_recipes[0].name, "Ember Mnemonic")
-            self.assertEqual(state.alchemy.known_recipes[0].ingredients, ["Ash Fern"])
+            self.assertEqual(
+                state.alchemy.known_recipes[0].ingredients[0].reagent_name,
+                "Ash Fern",
+            )
+
+    def test_item_catalog_remembers_removed_inventory_items(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = SaveRepository.create_new_save(Path(temp_dir), "Catalog Test")
+            repository.add_inventory_item(
+                "Glass Prism",
+                "Tool",
+                1,
+                "A triangular glass prism.",
+                value_base_units=12,
+            )
+            repository.remove_inventory_item("Glass Prism", 1)
+
+            self.assertNotIn(
+                "Glass Prism",
+                {item["name"] for item in repository.list_inventory_items()},
+            )
+            catalog = repository.list_item_catalog()
+
+            self.assertIn("Glass Prism", {item["name"] for item in catalog})
+            prism = next(item for item in catalog if item["name"] == "Glass Prism")
+            self.assertNotIn("quantity", prism)
+            self.assertEqual(prism["description"], "A triangular glass prism.")
 
 
 if __name__ == "__main__":

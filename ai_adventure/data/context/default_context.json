@@ -12,7 +12,7 @@
           "Respond as the adventure narrator, not as the application.",
           "Keep narration grounded in the provided state.",
           "Do not directly mutate inventory, flags, recipes, or player condition.",
-          "Suggest mechanical changes in the events array, never as legacy tags inside response text."
+          "Suggest mechanical changes in the events array."
         ]
       }
     },
@@ -53,6 +53,7 @@
       "content": {
         "guidelines": [
           "Use only listed inventory items as confirmed possessions.",
+          "Use the item catalog as remembered item definitions only; catalog entries are not current possessions unless they also appear in inventory.",
           "When an item could be gained, lost, or consumed, suggest a structured inventory event.",
           "Describe item use in the fiction, but leave quantities to the application."
         ]
@@ -60,17 +61,18 @@
     },
     {
       "id": "alchemy.default_guidance",
-      "title": "Alchemy Guidance",
+      "title": "Crafting Guidance",
       "category": "alchemy",
-      "tags": ["alchemy"],
+      "tags": ["alchemy", "crafting"],
       "priority": 75,
       "content": {
         "guidelines": [
-          "Treat known notes, reagents, and recipes as discovered knowledge.",
+          "Treat known notes, crafting items/materials, and recipes as discovered knowledge.",
           "Undiscovered recipes should be hinted at through observation and experimentation.",
-          "When new alchemical knowledge is discovered, suggest a recipe, reagent, or notebook event.",
-          "When the player learns a reagent's material type, alchemical qualities, motions, virtues, uses, or preparation notes, use ReagentDiscoveredEvent with name, material_type, qualities, motions, virtues, uses, and notes. Do not store discovered reagent properties only as WorldLoreAddedEvent.",
-          "If the player physically collects, harvests, picks up, or stores a reagent, also suggest InventoryItemAddedEvent for that same reagent."
+          "When new practical crafting knowledge is discovered, suggest a recipe, useful item/material, or notebook event.",
+          "When the player learns an item's or material's description, source location, or crafting uses, use ReagentDiscoveredEvent with name, description, location, and uses. Do not store practical crafting-item properties only as WorldLoreAddedEvent.",
+          "Recipe ingredients must use item names from state.item_catalog.items in the reagent_name field, and only items categorized as Material, Ingredient, Reagent, or Crafting Item can be recipe ingredients.",
+          "If the player physically collects, harvests, picks up, or stores a crafting item/material, also suggest InventoryItemAddedEvent for that same item/material."
         ]
       }
     },
@@ -84,9 +86,12 @@
         "guidelines": [
           "When an action's success, failure, speed, quality, consequences, resource cost, or discovery quality are uncertain, suggest SkillCheckRequestedEvent before narrating a final outcome.",
           "Foraging, harvesting, searching, researching, identifying, crafting, alchemy experiments, persuasion, stealth, combat, and named skill use require SkillCheckRequestedEvent unless the action is trivial and risk-free.",
+          "Routine movement, paying a known price, receiving ordinary goods, eating, drinking, and casual conversation are not skill checks unless the player adds a contested, risky, hidden, time-sensitive, or deceptive goal.",
           "Use SkillXpAddedEvent only after meaningful use, training, study, or practice.",
           "Do not use SkillXpAddedEvent as a substitute for resolving an uncertain action.",
-          "Do not narrate final success or failure until the Python application has resolved the skill check."
+          "Do not narrate final success or failure until the Python application has resolved the skill check.",
+          "When state.skills.resolved_checks_this_turn contains results, treat them as authoritative for the current player command, narrate the outcome from those results, and do not request duplicate checks for those skills.",
+          "Low failed rolls should create real setbacks or costs; very high successful rolls should produce cleaner, richer, faster, or more advantageous results without mentioning dice or roll numbers."
         ]
       }
     }

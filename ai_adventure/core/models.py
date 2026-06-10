@@ -77,6 +77,36 @@ class InventoryState:
 
 
 @dataclass
+class ItemCatalogEntry:
+    """A remembered item definition, whether or not it is currently owned."""
+
+    id: int | None = None
+    name: str = ""
+    category: str = ""
+    description: str = ""
+    value_base_units: int = 0
+    first_seen_at: str = ""
+    updated_at: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        """Returns a JSON-serializable item-catalog dictionary."""
+
+        return asdict(self)
+
+
+@dataclass
+class ItemCatalogState:
+    """The master list of item definitions remembered for this save."""
+
+    items: list[ItemCatalogEntry] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Returns a JSON-serializable item-catalog state."""
+
+        return {"items": [item.to_dict() for item in self.items]}
+
+
+@dataclass
 class CurrencyState:
     """The player's money and denomination definitions."""
 
@@ -127,20 +157,32 @@ class CalendarState:
 
 @dataclass
 class ReagentKnowledge:
-    """A discovered alchemical reagent."""
+    """A discovered useful crafting item/material."""
 
     id: int | None = None
     name: str = ""
-    material_type: str = ""
-    qualities: list[str] = field(default_factory=list)
-    motions: list[str] = field(default_factory=list)
-    virtues: list[str] = field(default_factory=list)
+    description: str = ""
+    location: str = ""
     uses: list[str] = field(default_factory=list)
-    notes: str = ""
     discovered_at: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         """Returns a JSON-serializable reagent dictionary."""
+
+        return asdict(self)
+
+
+@dataclass
+class RecipeIngredient:
+    """One known-reagent ingredient in an alchemical recipe."""
+
+    reagent_name: str = ""
+    quantity: int = 1
+    measure_amount: int = 1
+    measure_unit: str = "each"
+
+    def to_dict(self) -> dict[str, Any]:
+        """Returns a JSON-serializable recipe-ingredient dictionary."""
 
         return asdict(self)
 
@@ -151,10 +193,8 @@ class RecipeKnowledge:
 
     id: int | None = None
     name: str = ""
-    ingredients: list[str] = field(default_factory=list)
+    ingredients: list[RecipeIngredient] = field(default_factory=list)
     result: str = ""
-    motions: list[str] = field(default_factory=list)
-    virtues: list[str] = field(default_factory=list)
     notes: str = ""
     discovered_at: str = ""
 
@@ -290,6 +330,7 @@ class ActiveTask:
     location: str = ""
     reward: str = ""
     due_date: str = ""
+    due_elapsed_minutes: int = -1
     notes: str = ""
     created_at: str = ""
     updated_at: str = ""
@@ -317,7 +358,7 @@ class SettingsState:
     """Save-specific settings that affect the adventure runtime."""
 
     player_name: str = ""
-    theme: str = "System"
+    theme: str = "Light"
     values: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -334,6 +375,7 @@ class AdventureState:
     player: PlayerState = field(default_factory=PlayerState)
     world: WorldState = field(default_factory=WorldState)
     inventory: InventoryState = field(default_factory=InventoryState)
+    item_catalog: ItemCatalogState = field(default_factory=ItemCatalogState)
     currency: CurrencyState = field(default_factory=CurrencyState)
     calendar: CalendarState = field(default_factory=CalendarState)
     alchemy: AlchemyNotebookState = field(default_factory=AlchemyNotebookState)
@@ -350,6 +392,7 @@ class AdventureState:
             "player": self.player.to_dict(),
             "world": self.world.to_dict(),
             "inventory": self.inventory.to_dict(),
+            "item_catalog": self.item_catalog.to_dict(),
             "currency": self.currency.to_dict(),
             "calendar": self.calendar.to_dict(),
             "alchemy": self.alchemy.to_dict(),

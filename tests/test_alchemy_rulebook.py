@@ -43,7 +43,18 @@ class AlchemyRulebookTests(unittest.TestCase):
         )
 
         self.assertIn("alchemy", packet["rulebooks"])
-        self.assertEqual(len(packet["rulebooks"]["alchemy"]["motions"]), 7)
+        self.assertEqual(
+            packet["rulebooks"]["alchemy"]["reagent_model"]["fields"],
+            ["name", "description", "location", "uses"],
+        )
+        self.assertIn(
+            "crafting item/material",
+            packet["rulebooks"]["alchemy"]["reagent_model"]["summary"],
+        )
+        self.assertIn(
+            "measure_unit",
+            packet["rulebooks"]["alchemy"]["recipe_model"]["ingredient_fields"],
+        )
         reagent_names = {
             reagent["name"]
             for reagent in packet["rulebooks"]["alchemy"]["example_reagents"]
@@ -54,7 +65,10 @@ class AlchemyRulebookTests(unittest.TestCase):
             for reagent in packet["rulebooks"]["alchemy"]["example_reagents"]
             if reagent["name"] == "Moonwater"
         )
-        self.assertIn("material_type", moonwater)
+        self.assertEqual(
+            set(moonwater),
+            {"name", "description", "location", "uses"},
+        )
 
     def test_context_builder_omits_rulebook_for_non_alchemy_commands(self) -> None:
         builder = AiContextBuilder(

@@ -5,7 +5,7 @@ cd /d "%~dp0"
 
 set "APP_NAME=AI Adventure"
 set "ENTRYPOINT=main.py"
-set "PYTHON=python"
+if not defined PYTHON set "PYTHON=python"
 set "TTS_MODEL=ai_adventure\audio\tts\kokoro-v1.0.onnx"
 set "TTS_VOICES=ai_adventure\audio\tts\voices-v1.0.bin"
 set "APP_ICON=ai_adventure\data\app_icon.ico"
@@ -38,11 +38,14 @@ if not exist "%TTS_VOICES%" (
     --name "%APP_NAME%" ^
     --add-data "ai_adventure\data\context;ai_adventure\data\context" ^
     --add-data "ai_adventure\data\alchemy;ai_adventure\data\alchemy" ^
+    --add-data "%APP_ICON%;ai_adventure\data" ^
     --add-data "ai_adventure\audio\music_tracks;ai_adventure\audio\music_tracks" ^
     --add-data "%TTS_MODEL%;ai_adventure\audio\tts" ^
     --add-data "%TTS_VOICES%;ai_adventure\audio\tts" ^
     --icon "%APP_ICON%" ^
     --collect-all "kokoro_onnx" ^
+    --collect-all "language_tags" ^
+    --collect-all "espeakng_loader" ^
     --collect-all "onnxruntime" ^
     --collect-all "soundfile" ^
     --hidden-import "google.genai" ^

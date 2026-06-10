@@ -11,6 +11,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from ai_adventure.alchemy.ingredients import normalize_recipe_ingredients
 from ai_adventure.calendar_system import (
     DEFAULT_CALENDAR_SETTINGS,
     DEFAULT_START_ELAPSED_MINUTES,
@@ -42,6 +43,10 @@ class SaveSummary:
     title: str
     db_path: Path
     last_modified: datetime
+
+
+class DuplicateSaveTitleError(ValueError):
+    """Raised when a new save title already exists."""
 
 
 class SaveRepository:
@@ -82,13 +87,16 @@ class SaveRepository:
             Repository for the newly created save.
         """
 
-        safe_title = _slugify(title.strip() or "New Adventure")
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        save_dir = saves_dir / f"{safe_title}_{timestamp}"
+        clean_title = title.strip() or "New Adventure"
+        cls._raise_for_duplicate_save_title(saves_dir, clean_title)
+
+        safe_title = _slugify(clean_title)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        save_dir = _unique_save_dir(saves_dir, safe_title, timestamp)
         db_path = save_dir / cls.DATABASE_NAME
 
         repository = cls(db_path)
-        repository.set_meta("title", title.strip() or "New Adventure")
+        repository.set_meta("title", clean_title)
 
         if setup is not None:
             repository.apply_new_game_setup(setup)
@@ -106,6 +114,7 @@ class SaveRepository:
         repository.set_setting("audio.tts_volume", 90)
         repository.set_setting("audio.current_music", "")
         repository.set_journal_notes("")
+        repository.set_journal_share_with_ai(False)
         repository.set_currency_denominations(DEFAULT_CURRENCY_DENOMINATIONS)
         repository.set_calendar_settings(DEFAULT_CALENDAR_SETTINGS)
         repository.set_state_value("elapsed_minutes", str(DEFAULT_START_ELAPSED_MINUTES))
@@ -148,8 +157,8 @@ class SaveRepository:
             "A sealed waterskin suitable for a day's travel.",
         )
         repository.upsert_skill(
-            "Alchemy",
-            "Preparing reagents, identifying virtues, and brewing simple preparations.",
+            "Crafting",
+            "Identifying useful materials, preparing components, repairing items, and making simple preparations.",
             1,
         )
         repository.upsert_skill(
@@ -191,6 +200,7 @@ class SaveRepository:
         title = clean_setup["title"]
         start_location = clean_setup["start_location"]
         calendar_settings = clean_setup["calendar"]
+        audio_settings = clean_setup["audio"]
         calendar_snapshot = build_calendar_snapshot(
             DEFAULT_START_ELAPSED_MINUTES,
             calendar_settings,
@@ -202,10 +212,10 @@ class SaveRepository:
         self.set_setting("player.backstory", character["backstory"])
         self.set_setting("player.notes", character["notes"])
         self.set_setting("ai.additional_context", clean_setup["ai_additional_context"])
-        self.set_setting("audio.music_enabled", True)
-        self.set_setting("audio.narrator_enabled", True)
-        self.set_setting("audio.music_volume", 25)
-        self.set_setting("audio.tts_volume", 90)
+        self.set_setting("audio.music_enabled", bool(audio_settings["music_enabled"]))
+        self.set_setting("audio.narrator_enabled", bool(audio_settings["narrator_enabled"]))
+        self.set_setting("audio.music_volume", int(audio_settings["music_volume"]))
+        self.set_setting("audio.tts_volume", int(audio_settings["tts_volume"]))
         self.set_setting("audio.current_music", "")
         self.set_setting("new_game.setup", clean_setup)
         self.set_setting("world.setup_context", clean_setup["world_context"])
@@ -213,6 +223,7 @@ class SaveRepository:
         self.set_setting("world.game_style", clean_setup["game_style"])
         self.set_setting("currency.description", clean_setup["currency_description"])
         self.set_journal_notes("")
+        self.set_journal_share_with_ai(False)
         self.set_currency_denominations(clean_setup["currency_denominations"])
         self.set_calendar_settings(calendar_settings)
         self.set_state_value("elapsed_minutes", str(DEFAULT_START_ELAPSED_MINUTES))
@@ -222,6 +233,9 @@ class SaveRepository:
         self.set_state_value("condition", "Healthy")
 
         for item in clean_setup["starter_items"]:
+            if bool(item.get("requires_ai_invention")) or not str(item.get("name", "")).strip():
+                continue
+
             self.add_inventory_item(
                 name=item["name"],
                 category=item["category"],
@@ -275,6 +289,31 @@ class SaveRepository:
 
         summaries.sort(key=lambda summary: summary.last_modified, reverse=True)
         return summaries
+
+    @classmethod
+    def save_title_exists(cls, saves_dir: Path, title: str) -> bool:
+        """Returns True when a save already uses this player-facing title."""
+
+        clean_title = _normalize_save_title(title)
+
+        if not clean_title:
+            clean_title = _normalize_save_title("New Adventure")
+
+        return any(
+            _normalize_save_title(summary.title) == clean_title
+            for summary in cls.list_saves(saves_dir)
+        )
+
+    @classmethod
+    def _raise_for_duplicate_save_title(cls, saves_dir: Path, title: str) -> None:
+        """Rejects duplicate player-facing save titles."""
+
+        clean_title = title.strip() or "New Adventure"
+
+        if cls.save_title_exists(saves_dir, clean_title):
+            raise DuplicateSaveTitleError(
+                f"A save named '{clean_title}' already exists."
+            )
 
     def set_meta(self, key: str, value: str) -> None:
         """
@@ -491,6 +530,14 @@ class SaveRepository:
                     ),
                 )
 
+            _upsert_item_catalog_entry(
+                connection,
+                name=clean_name,
+                category=category,
+                description=description,
+                value_base_units=clean_value,
+            )
+
         self.append_history("inventory", f"Added {quantity} x {clean_name}.")
 
     def list_inventory_items(self) -> list[dict[str, Any]]:
@@ -586,8 +633,64 @@ class SaveRepository:
                     for item in clean_items
                 ],
             )
+            for item in clean_items:
+                _upsert_item_catalog_entry(
+                    connection,
+                    name=item["name"],
+                    category=item["category"],
+                    description=item["description"],
+                    value_base_units=item["value_base_units"],
+                )
 
         self.append_history("inventory", "Starting inventory finalized.")
+
+    def upsert_item_catalog_entry(
+        self,
+        *,
+        name: str,
+        category: str = "",
+        description: str = "",
+        value_base_units: int = 0,
+    ) -> None:
+        """Adds or updates one remembered item definition."""
+
+        clean_name = name.strip()
+
+        if not clean_name:
+            LOGGER.error("Attempted to upsert item catalog entry with blank name.")
+            return
+
+        clean_value = max(0, _safe_int(value_base_units, default=0) or 0)
+
+        with self._connect() as connection:
+            _upsert_item_catalog_entry(
+                connection,
+                name=clean_name,
+                category=category,
+                description=description,
+                value_base_units=clean_value,
+            )
+
+    def list_item_catalog(self) -> list[dict[str, Any]]:
+        """Reads all remembered item definitions without inventory quantities."""
+
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT
+                    id,
+                    name,
+                    category,
+                    description,
+                    value_base_units,
+                    first_seen_at,
+                    updated_at
+                FROM item_catalog
+                ORDER BY name COLLATE NOCASE
+                """
+            ).fetchall()
+
+        return [dict(row) for row in rows]
 
     def add_alchemy_note(self, title: str, body: str) -> None:
         """
@@ -714,7 +817,7 @@ class SaveRepository:
         with self._connect() as connection:
             row = connection.execute(
                 """
-                SELECT id, name, description, quantity, value_base_units
+                SELECT id, name, category, description, quantity, value_base_units
                 FROM inventory_items
                 WHERE name = ?
                 ORDER BY id ASC
@@ -770,6 +873,13 @@ class SaveRepository:
                     row["id"],
                 ),
             )
+            _upsert_item_catalog_entry(
+                connection,
+                name=updated_name,
+                category=str(row["category"]),
+                description=updated_description,
+                value_base_units=updated_value,
+            )
 
         self.append_history("inventory", f"Modified inventory item: {clean_target}.")
 
@@ -777,24 +887,19 @@ class SaveRepository:
         self,
         *,
         name: str,
-        qualities: list[str],
-        motions: list[str],
-        virtues: list[str],
-        uses: list[str],
-        notes: str,
-        material_type: str = "",
+        description: str = "",
+        location: str = "",
+        uses: list[str] | None = None,
+        notes: str = "",
     ) -> None:
         """
-        Adds or updates a discovered alchemical reagent.
+        Adds or updates a discovered useful crafting item/material.
 
         Args:
-            name: Reagent name.
-            material_type: Broad reagent material category.
-            qualities: Discovered reagent qualities.
-            motions: Discovered alchemical motions.
-            virtues: Discovered alchemical virtues.
+            name: Item/material name.
+            description: Short player-facing description.
+            location: Where the reagent is commonly found.
             uses: Known uses or experimentation hints.
-            notes: Freeform notes.
         """
 
         clean_name = name.strip()
@@ -804,46 +909,50 @@ class SaveRepository:
             return
 
         discovered_at = datetime.now().isoformat(timespec="seconds")
+        clean_description = description.strip() or notes.strip()
+        clean_location = location.strip()
+        clean_uses = uses or []
 
         with self._connect() as connection:
             connection.execute(
                 """
                 INSERT INTO alchemy_reagents (
                     name,
-                    material_type,
-                    qualities_json,
-                    motions_json,
-                    virtues_json,
+                    description,
+                    location,
                     uses_json,
                     notes,
                     discovered_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?)
                 ON CONFLICT(name) DO UPDATE SET
-                    material_type = excluded.material_type,
-                    qualities_json = excluded.qualities_json,
-                    motions_json = excluded.motions_json,
-                    virtues_json = excluded.virtues_json,
+                    description = excluded.description,
+                    location = excluded.location,
                     uses_json = excluded.uses_json,
                     notes = excluded.notes
                 """,
                 (
                     clean_name,
-                    material_type.strip(),
-                    _encode_string_list(qualities),
-                    _encode_string_list(motions),
-                    _encode_string_list(virtues),
-                    _encode_string_list(uses),
+                    clean_description,
+                    clean_location,
+                    _encode_string_list(clean_uses),
                     notes.strip(),
                     discovered_at,
                 ),
+            )
+            _upsert_item_catalog_entry(
+                connection,
+                name=clean_name,
+                category="Material",
+                description=clean_description,
+                value_base_units=0,
             )
 
         self.append_history("alchemy", f"Discovered reagent: {clean_name}.")
 
     def list_alchemy_reagents(self) -> list[dict[str, Any]]:
         """
-        Reads discovered alchemical reagents.
+        Reads discovered useful crafting items/materials.
 
         Returns:
             List of reagent dictionaries.
@@ -855,10 +964,8 @@ class SaveRepository:
                 SELECT
                     id,
                     name,
-                    material_type,
-                    qualities_json,
-                    motions_json,
-                    virtues_json,
+                    description,
+                    location,
                     uses_json,
                     notes,
                     discovered_at
@@ -874,12 +981,9 @@ class SaveRepository:
                 {
                     "id": row["id"],
                     "name": row["name"],
-                    "material_type": row["material_type"],
-                    "qualities": _decode_string_list(row["qualities_json"], "qualities"),
-                    "motions": _decode_string_list(row["motions_json"], "motions"),
-                    "virtues": _decode_string_list(row["virtues_json"], "virtues"),
+                    "description": row["description"] or row["notes"],
+                    "location": row["location"],
                     "uses": _decode_string_list(row["uses_json"], "uses"),
-                    "notes": row["notes"],
                     "discovered_at": row["discovered_at"],
                 }
             )
@@ -890,21 +994,17 @@ class SaveRepository:
         self,
         *,
         name: str,
-        ingredients: list[str],
+        ingredients: list[dict[str, Any]] | list[str],
         result: str,
-        motions: list[str],
-        virtues: list[str],
-        notes: str,
+        notes: str = "",
     ) -> None:
         """
         Adds or updates a discovered alchemical recipe.
 
         Args:
             name: Recipe name.
-            ingredients: Known ingredients.
+            ingredients: Known reagent ingredients.
             result: Recipe result.
-            motions: Required or observed motions.
-            virtues: Required or produced virtues.
             notes: Freeform notes.
         """
 
@@ -915,6 +1015,7 @@ class SaveRepository:
             return
 
         discovered_at = datetime.now().isoformat(timespec="seconds")
+        clean_ingredients = normalize_recipe_ingredients(ingredients)
 
         with self._connect() as connection:
             connection.execute(
@@ -923,25 +1024,19 @@ class SaveRepository:
                     name,
                     ingredients_json,
                     result,
-                    motions_json,
-                    virtues_json,
                     notes,
                     discovered_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?)
                 ON CONFLICT(name) DO UPDATE SET
                     ingredients_json = excluded.ingredients_json,
                     result = excluded.result,
-                    motions_json = excluded.motions_json,
-                    virtues_json = excluded.virtues_json,
                     notes = excluded.notes
                 """,
                 (
                     clean_name,
-                    _encode_string_list(ingredients),
+                    json.dumps(clean_ingredients, ensure_ascii=False),
                     result.strip(),
-                    _encode_string_list(motions),
-                    _encode_string_list(virtues),
                     notes.strip(),
                     discovered_at,
                 ),
@@ -965,8 +1060,6 @@ class SaveRepository:
                     name,
                     ingredients_json,
                     result,
-                    motions_json,
-                    virtues_json,
                     notes,
                     discovered_at
                 FROM alchemy_recipes
@@ -981,13 +1074,10 @@ class SaveRepository:
                 {
                     "id": row["id"],
                     "name": row["name"],
-                    "ingredients": _decode_string_list(
-                        row["ingredients_json"],
-                        "ingredients",
+                    "ingredients": normalize_recipe_ingredients(
+                        _decode_json_list(row["ingredients_json"], "ingredients")
                     ),
                     "result": row["result"],
-                    "motions": _decode_string_list(row["motions_json"], "motions"),
-                    "virtues": _decode_string_list(row["virtues_json"], "virtues"),
                     "notes": row["notes"],
                     "discovered_at": row["discovered_at"],
                 }
@@ -1939,6 +2029,7 @@ class SaveRepository:
         location: str = "",
         reward: str = "",
         due_date: str = "",
+        due_elapsed_minutes: int | None = None,
         notes: str = "",
     ) -> dict[str, Any] | None:
         """
@@ -1952,7 +2043,8 @@ class SaveRepository:
             requester: Person or faction associated with the task.
             location: Relevant location.
             reward: Expected reward, cost, or exchange.
-            due_date: In-world due date or timing note.
+            due_date: In-world due date label or N/A.
+            due_elapsed_minutes: Absolute due minute, or -1 for no exact deadline.
             notes: Additional player-visible task notes.
 
         Returns:
@@ -1967,6 +2059,16 @@ class SaveRepository:
 
         clean_category = category.strip() or "Task"
         clean_status = status.strip() or "Active"
+        parsed_due_elapsed = (
+            None
+            if due_elapsed_minutes is None
+            else _safe_int(due_elapsed_minutes, default=-1)
+        )
+        clean_due_elapsed = (
+            -1
+            if parsed_due_elapsed is None
+            else max(-1, parsed_due_elapsed)
+        )
         timestamp = datetime.now().isoformat(timespec="seconds")
 
         with self._connect() as connection:
@@ -1981,11 +2083,12 @@ class SaveRepository:
                     location,
                     reward,
                     due_date,
+                    due_elapsed_minutes,
                     notes,
                     created_at,
                     updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(name) DO UPDATE SET
                     category = excluded.category,
                     status = excluded.status,
@@ -2009,6 +2112,11 @@ class SaveRepository:
                         WHEN excluded.due_date != '' THEN excluded.due_date
                         ELSE active_tasks.due_date
                     END,
+                    due_elapsed_minutes = CASE
+                        WHEN excluded.due_elapsed_minutes >= 0 THEN excluded.due_elapsed_minutes
+                        WHEN excluded.due_date != '' THEN excluded.due_elapsed_minutes
+                        ELSE active_tasks.due_elapsed_minutes
+                    END,
                     notes = CASE
                         WHEN excluded.notes != '' THEN excluded.notes
                         ELSE active_tasks.notes
@@ -2024,6 +2132,7 @@ class SaveRepository:
                     location.strip(),
                     reward.strip(),
                     due_date.strip(),
+                    clean_due_elapsed,
                     notes.strip(),
                     timestamp,
                     timestamp,
@@ -2110,6 +2219,7 @@ class SaveRepository:
                     location,
                     reward,
                     due_date,
+                    due_elapsed_minutes,
                     notes,
                     created_at,
                     updated_at,
@@ -2123,7 +2233,7 @@ class SaveRepository:
         if row is None:
             return None
 
-        return dict(row)
+        return self._active_task_row_dict(dict(row))
 
     def list_active_tasks(
         self,
@@ -2157,6 +2267,7 @@ class SaveRepository:
                     location,
                     reward,
                     due_date,
+                    due_elapsed_minutes,
                     notes,
                     created_at,
                     updated_at,
@@ -2169,26 +2280,50 @@ class SaveRepository:
                 (max(1, limit),),
             ).fetchall()
 
-        return [dict(row) for row in rows]
+        calendar_settings = self.get_calendar_settings()
+        return [
+            self._active_task_row_dict(dict(row), calendar_settings=calendar_settings)
+            for row in rows
+        ]
+
+    def _active_task_row_dict(
+        self,
+        row: dict[str, Any],
+        *,
+        calendar_settings: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Returns an active-task row with a display label for exact deadlines."""
+
+        due_elapsed_minutes = _safe_int(row.get("due_elapsed_minutes"), default=-1)
+        row["due_elapsed_minutes"] = due_elapsed_minutes
+
+        if due_elapsed_minutes >= 0:
+            row["due_date"] = build_calendar_snapshot(
+                due_elapsed_minutes,
+                calendar_settings or self.get_calendar_settings(),
+            )["display_label"]
+
+        return row
 
     def set_journal_notes(self, notes: str) -> None:
-        """
-        Stores the player's private journal notes.
-
-        These notes are intentionally not included in AdventureState or AI context.
-        """
+        """Stores the player's journal notes."""
 
         self.set_setting("journal.private_notes", str(notes))
 
     def get_journal_notes(self) -> str:
-        """
-        Reads the player's private journal notes.
-
-        Returns:
-            Private journal text.
-        """
+        """Reads the player's journal notes."""
 
         return str(self.get_setting("journal.private_notes", ""))
+
+    def set_journal_share_with_ai(self, share_with_ai: bool) -> None:
+        """Stores whether journal notes should be included in AI context."""
+
+        self.set_setting("journal.share_with_ai", bool(share_with_ai))
+
+    def get_journal_share_with_ai(self) -> bool:
+        """Reads whether journal notes should be included in AI context."""
+
+        return _safe_bool(self.get_setting("journal.share_with_ai", False), default=False)
 
     def set_world_summary(self, summary: str) -> None:
         """
@@ -2470,6 +2605,16 @@ class SaveRepository:
                     value_base_units INTEGER NOT NULL DEFAULT 0
                 );
 
+                CREATE TABLE IF NOT EXISTS item_catalog (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                    category TEXT NOT NULL DEFAULT '',
+                    description TEXT NOT NULL DEFAULT '',
+                    value_base_units INTEGER NOT NULL DEFAULT 0,
+                    first_seen_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
                 CREATE TABLE IF NOT EXISTS alchemy_notes (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     title TEXT NOT NULL,
@@ -2480,10 +2625,8 @@ class SaveRepository:
                 CREATE TABLE IF NOT EXISTS alchemy_reagents (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     name TEXT NOT NULL UNIQUE,
-                    material_type TEXT NOT NULL DEFAULT '',
-                    qualities_json TEXT NOT NULL DEFAULT '[]',
-                    motions_json TEXT NOT NULL DEFAULT '[]',
-                    virtues_json TEXT NOT NULL DEFAULT '[]',
+                    description TEXT NOT NULL DEFAULT '',
+                    location TEXT NOT NULL DEFAULT '',
                     uses_json TEXT NOT NULL DEFAULT '[]',
                     notes TEXT NOT NULL DEFAULT '',
                     discovered_at TEXT NOT NULL
@@ -2494,8 +2637,6 @@ class SaveRepository:
                     name TEXT NOT NULL UNIQUE,
                     ingredients_json TEXT NOT NULL DEFAULT '[]',
                     result TEXT NOT NULL DEFAULT '',
-                    motions_json TEXT NOT NULL DEFAULT '[]',
-                    virtues_json TEXT NOT NULL DEFAULT '[]',
                     notes TEXT NOT NULL DEFAULT '',
                     discovered_at TEXT NOT NULL
                 );
@@ -2531,6 +2672,7 @@ class SaveRepository:
                     location TEXT NOT NULL DEFAULT '',
                     reward TEXT NOT NULL DEFAULT '',
                     due_date TEXT NOT NULL DEFAULT '',
+                    due_elapsed_minutes INTEGER NOT NULL DEFAULT -1,
                     notes TEXT NOT NULL DEFAULT '',
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
@@ -2596,10 +2738,35 @@ class SaveRepository:
             _ensure_column(
                 connection,
                 "alchemy_reagents",
-                "material_type",
+                "description",
                 "TEXT NOT NULL DEFAULT ''",
             )
+            _ensure_column(
+                connection,
+                "alchemy_reagents",
+                "location",
+                "TEXT NOT NULL DEFAULT ''",
+            )
+            _ensure_column(
+                connection,
+                "alchemy_reagents",
+                "uses_json",
+                "TEXT NOT NULL DEFAULT '[]'",
+            )
+            _ensure_column(
+                connection,
+                "alchemy_reagents",
+                "notes",
+                "TEXT NOT NULL DEFAULT ''",
+            )
+            _ensure_column(
+                connection,
+                "active_tasks",
+                "due_elapsed_minutes",
+                "INTEGER NOT NULL DEFAULT -1",
+            )
             self._coalesce_inventory_stacks(connection)
+            self._seed_item_catalog_from_inventory(connection)
 
     def _coalesce_inventory_stacks(self, connection: sqlite3.Connection) -> None:
         """Merges duplicate inventory rows by case-insensitive item name."""
@@ -2663,6 +2830,26 @@ class SaveRepository:
                 duplicate_ids,
             )
 
+    def _seed_item_catalog_from_inventory(self, connection: sqlite3.Connection) -> None:
+        """Ensures existing inventory rows are represented in the item catalog."""
+
+        rows = connection.execute(
+            """
+            SELECT name, category, description, value_base_units
+            FROM inventory_items
+            ORDER BY id ASC
+            """
+        ).fetchall()
+
+        for row in rows:
+            _upsert_item_catalog_entry(
+                connection,
+                name=str(row["name"]),
+                category=str(row["category"]),
+                description=str(row["description"]),
+                value_base_units=int(row["value_base_units"]),
+            )
+
 
 def _slugify(value: str) -> str:
     """
@@ -2683,6 +2870,28 @@ def _slugify(value: str) -> str:
         return "New_Adventure"
 
     return cleaned[:40]
+
+
+def _normalize_save_title(value: str) -> str:
+    """Normalizes player-facing save titles for uniqueness checks."""
+
+    return re.sub(r"\s+", " ", value.strip()).casefold()
+
+
+def _unique_save_dir(saves_dir: Path, safe_title: str, timestamp: str) -> Path:
+    """Returns a save directory path that does not collide on disk."""
+
+    save_dir = saves_dir / f"{safe_title}_{timestamp}"
+
+    if not save_dir.exists():
+        return save_dir
+
+    suffix = 2
+    while True:
+        candidate = saves_dir / f"{safe_title}_{timestamp}_{suffix}"
+        if not candidate.exists():
+            return candidate
+        suffix += 1
 
 
 def _npc_id_from_parts(name: str, role: str, location: str) -> str:
@@ -2922,6 +3131,24 @@ def _safe_int(value: Any, *, default: int | None) -> int | None:
         return default
 
 
+def _safe_bool(value: Any, *, default: bool) -> bool:
+    """Safely converts a saved value to bool."""
+
+    if isinstance(value, bool):
+        return value
+
+    if isinstance(value, str):
+        normalized = value.strip().casefold()
+
+        if normalized in {"true", "1", "yes", "on"}:
+            return True
+
+        if normalized in {"false", "0", "no", "off", ""}:
+            return False
+
+    return default
+
+
 def _ensure_column(
     connection: sqlite3.Connection,
     table_name: str,
@@ -2938,6 +3165,74 @@ def _ensure_column(
 
     connection.execute(
         f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_definition}"
+    )
+
+
+def _upsert_item_catalog_entry(
+    connection: sqlite3.Connection,
+    *,
+    name: str,
+    category: str = "",
+    description: str = "",
+    value_base_units: int = 0,
+) -> None:
+    """Adds or updates the durable item definition catalog."""
+
+    clean_name = name.strip()
+
+    if not clean_name:
+        return
+
+    clean_category = category.strip()
+    clean_description = description.strip()
+    clean_value = max(0, _safe_int(value_base_units, default=0) or 0)
+    now = datetime.now().isoformat(timespec="seconds")
+    row = connection.execute(
+        """
+        SELECT id, category, description, value_base_units, first_seen_at
+        FROM item_catalog
+        WHERE name = ? COLLATE NOCASE
+        ORDER BY id ASC
+        LIMIT 1
+        """,
+        (clean_name,),
+    ).fetchone()
+
+    if row is None:
+        connection.execute(
+            """
+            INSERT INTO item_catalog (
+                name,
+                category,
+                description,
+                value_base_units,
+                first_seen_at,
+                updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (clean_name, clean_category, clean_description, clean_value, now, now),
+        )
+        return
+
+    connection.execute(
+        """
+        UPDATE item_catalog
+        SET name = ?,
+            category = ?,
+            description = ?,
+            value_base_units = ?,
+            updated_at = ?
+        WHERE id = ?
+        """,
+        (
+            clean_name,
+            clean_category or str(row["category"]),
+            clean_description or str(row["description"]),
+            clean_value if clean_value > 0 else int(row["value_base_units"]),
+            now,
+            row["id"],
+        ),
     )
 
 
@@ -2994,6 +3289,22 @@ def _decode_string_list(raw_json: Any, label: str) -> list[str]:
         for value in values
         if str(value).strip()
     ]
+
+
+def _decode_json_list(raw_json: Any, label: str) -> list[Any]:
+    """Decodes a JSON list, preserving structured entries."""
+
+    try:
+        values = json.loads(str(raw_json))
+    except json.JSONDecodeError:
+        LOGGER.exception("Invalid JSON list for alchemy %s.", label)
+        return []
+
+    if not isinstance(values, list):
+        LOGGER.warning("Alchemy %s JSON was not a list.", label)
+        return []
+
+    return values
 
 
 def _normalize_world_lore(raw_lore: Any) -> dict[str, dict[str, str]]:

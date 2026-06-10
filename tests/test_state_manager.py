@@ -15,6 +15,7 @@ class StateManagerTests(unittest.TestCase):
 
             state = StateManager(repository).load_state()
             item_names = {item.name for item in state.inventory.items}
+            catalog_names = {item.name for item in state.item_catalog.items}
             skill_names = {skill.name for skill in state.skills.skills}
 
             self.assertEqual(state.player.name, "Player Name")
@@ -24,9 +25,10 @@ class StateManagerTests(unittest.TestCase):
             self.assertIn("Healing Draught", item_names)
             self.assertIn("Iron Dagger", item_names)
             self.assertIn("Lantern", item_names)
+            self.assertIn("Lantern", catalog_names)
             self.assertIn("Trail Ration", item_names)
             self.assertIn("Waterskin", item_names)
-            self.assertIn("Alchemy", skill_names)
+            self.assertIn("Crafting", skill_names)
             self.assertIn("Athletics", skill_names)
             self.assertIn("Awareness", skill_names)
             self.assertIn("Melee", skill_names)
@@ -66,6 +68,7 @@ class StateManagerTests(unittest.TestCase):
             self.assertEqual(state.player.condition, "Healthy")
             self.assertEqual(state.world.location, "Tavern")
             self.assertIn("Lantern", {item.name for item in state.inventory.items})
+            self.assertIn("Lantern", {item.name for item in state.item_catalog.items})
             self.assertEqual(state.alchemy.notes[0].title, "Moon Salt")
             self.assertGreaterEqual(len(state.history.entries), 3)
 

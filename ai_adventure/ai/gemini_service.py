@@ -5,17 +5,32 @@ import logging
 import os
 import re
 from dataclasses import dataclass, field
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
 
+from ai_adventure.alchemy.ingredients import (
+    COMMON_MEASUREMENT_UNITS,
+    CRAFTING_INGREDIENT_CATEGORY_NAMES,
+)
 from ai_adventure.currency import normalize_currency_denominations
 from ai_adventure.locations import clean_player_location_name
+
+try:
+    from rapidfuzz import fuzz as _rapidfuzz_fuzz
+except ImportError:  # pragma: no cover - exercised only in lean dev environments.
+    _rapidfuzz_fuzz = None
 
 
 LOGGER = logging.getLogger(__name__)
 
 
 DEFAULT_GEMINI_MODEL = "gemini-3.1-flash-lite"
+FALLBACK_SUGGESTED_ACTIONS = [
+    "Look around and take stock of the situation.",
+    "Check your inventory, tasks, or surroundings.",
+    "Choose the next thing to focus on.",
+]
 KNOWN_TEXT_MODELS = {
     "gemini-3.1-flash-lite",
     "gemini-3.1-flash-lite-preview",
@@ -52,6 +67,13 @@ KNOWN_EVENT_TYPE_NAMES = [
     "NpcUpsertedEvent",
     "NpcKnowledgeAddedEvent",
 ]
+TEXT_SAFETY_HARM_CATEGORIES = [
+    "HARM_CATEGORY_HARASSMENT",
+    "HARM_CATEGORY_HATE_SPEECH",
+    "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+    "HARM_CATEGORY_DANGEROUS_CONTENT",
+    "HARM_CATEGORY_CIVIC_INTEGRITY",
+]
 STRING_LIST_SCHEMA: dict[str, Any] = {
     "type": "array",
     "items": {"type": "string"},
@@ -59,6 +81,30 @@ STRING_LIST_SCHEMA: dict[str, Any] = {
 NONEMPTY_STRING_LIST_SCHEMA: dict[str, Any] = {
     "type": "array",
     "items": {"type": "string"},
+    "minItems": 1,
+}
+RECIPE_INGREDIENT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "reagent_name": {"type": "string"},
+        "quantity": {"type": "integer", "minimum": 1},
+        "measure_amount": {"type": "integer", "minimum": 1},
+        "measure_unit": {
+            "type": "string",
+            "enum": list(COMMON_MEASUREMENT_UNITS),
+        },
+    },
+    "required": [
+        "reagent_name",
+        "quantity",
+        "measure_amount",
+        "measure_unit",
+    ],
+    "additionalProperties": False,
+}
+NONEMPTY_RECIPE_INGREDIENT_LIST_SCHEMA: dict[str, Any] = {
+    "type": "array",
+    "items": RECIPE_INGREDIENT_SCHEMA,
     "minItems": 1,
 }
 INT_OR_AUTO_SCHEMA: dict[str, Any] = {
@@ -195,27 +241,25 @@ EVENT_RESPONSE_SCHEMA: dict[str, Any] = {
             "RecipeDiscoveredEvent",
             {
                 "name": {"type": "string"},
-                "ingredients": NONEMPTY_STRING_LIST_SCHEMA,
+                "ingredients": NONEMPTY_RECIPE_INGREDIENT_LIST_SCHEMA,
                 "result": {"type": "string"},
-                "motions": STRING_LIST_SCHEMA,
-                "virtues": STRING_LIST_SCHEMA,
                 "notes": {"type": "string"},
             },
-            ["name", "ingredients", "result"],
+            ["name", "ingredients", "result", "notes"],
         ),
         _event_response_schema(
             "ReagentDiscoveredEvent",
             {
                 "name": {"type": "string"},
-                "material_type": {"type": "string"},
-                "qualities": NONEMPTY_STRING_LIST_SCHEMA,
-                "motions": NONEMPTY_STRING_LIST_SCHEMA,
-                "virtues": NONEMPTY_STRING_LIST_SCHEMA,
+                "description": {"type": "string"},
+                "location": {"type": "string"},
                 "uses": NONEMPTY_STRING_LIST_SCHEMA,
-                "notes": {"type": "string"},
             },
-            ["name", "material_type", "qualities", "motions", "virtues", "uses", "notes"],
-            description="Stores a structured alchemy reagent; name-only payloads are incomplete.",
+            ["name", "description", "location", "uses"],
+            description=(
+                "Stores a simplified useful crafting item/material; name-only "
+                "payloads are incomplete."
+            ),
         ),
         _event_response_schema(
             "CurrencyChangedEvent",
@@ -317,9 +361,26 @@ EVENT_RESPONSE_SCHEMA: dict[str, Any] = {
                 "location": {"type": "string"},
                 "reward": {"type": "string"},
                 "due_date": {"type": "string"},
-                "notes": {"type": "string"},
+                "due_elapsed_minutes": {
+                    "type": "integer",
+                    "minimum": -1,
+                    "description": (
+                        "Absolute in-world minute when the task is due, or -1 "
+                        "when there is no known deadline."
+                    ),
+                },
             },
-            ["name", "description"],
+            [
+                "name",
+                "category",
+                "status",
+                "description",
+                "requester",
+                "location",
+                "reward",
+                "due_date",
+                "due_elapsed_minutes",
+            ],
         ),
         _event_response_schema(
             "ActiveTaskUpdatedEvent",
@@ -332,7 +393,10 @@ EVENT_RESPONSE_SCHEMA: dict[str, Any] = {
                 "location": {"type": "string"},
                 "reward": {"type": "string"},
                 "due_date": {"type": "string"},
-                "notes": {"type": "string"},
+                "due_elapsed_minutes": {
+                    "type": "integer",
+                    "minimum": -1,
+                },
             },
             ["name"],
         ),
@@ -364,11 +428,18 @@ EVENT_RESPONSE_SCHEMA: dict[str, Any] = {
                 "location": {"type": "string"},
                 "public_description": {"type": "string"},
                 "player_facing_information": {"type": "string"},
-                "knowledge_scope": STRING_LIST_SCHEMA,
-                "known_facts": STRING_LIST_SCHEMA,
-                "disposition": {"type": "string"},
+                "knowledge_scope": NONEMPTY_STRING_LIST_SCHEMA,
+                "known_facts": NONEMPTY_STRING_LIST_SCHEMA,
             },
-            ["display_name", "player_facing_information"],
+            [
+                "display_name",
+                "role",
+                "location",
+                "public_description",
+                "player_facing_information",
+                "knowledge_scope",
+                "known_facts",
+            ],
         ),
         _event_response_schema(
             "NpcKnowledgeAddedEvent",
@@ -388,7 +459,7 @@ STORY_RESPONSE_JSON_SCHEMA: dict[str, Any] = {
     "properties": {
         "response": {
             "type": "string",
-            "description": "Player-facing narration only, with no legacy tags.",
+            "description": "Player-facing narration only.",
         },
         "suggested_actions": {
             "type": "array",
@@ -407,6 +478,31 @@ STORY_RESPONSE_JSON_SCHEMA: dict[str, Any] = {
         },
     },
     "required": ["response", "suggested_actions", "events", "out_of_game"],
+    "additionalProperties": False,
+}
+SKILL_CHECK_PLAN_RESPONSE_JSON_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "checks": {
+            "type": "array",
+            "description": (
+                "Skill checks the Python application should resolve before the "
+                "full narration request."
+            ),
+            "items": {
+                "type": "object",
+                "properties": {
+                    "skill_name": {"type": "string"},
+                    "difficulty": {"type": "string"},
+                    "dc": {"type": "integer", "minimum": 1},
+                    "reason": {"type": "string"},
+                },
+                "required": ["skill_name"],
+                "additionalProperties": False,
+            },
+        }
+    },
+    "required": ["checks"],
     "additionalProperties": False,
 }
 NEW_GAME_RESPONSE_JSON_SCHEMA: dict[str, Any] = {
@@ -464,7 +560,6 @@ NEW_GAME_RESPONSE_JSON_SCHEMA: dict[str, Any] = {
         },
         "starting_items": {
             "type": "array",
-            "minItems": 5,
             "items": {
                 "type": "object",
                 "properties": {
@@ -473,6 +568,14 @@ NEW_GAME_RESPONSE_JSON_SCHEMA: dict[str, Any] = {
                     "quantity": {"type": "integer", "minimum": 1},
                     "description": {"type": "string"},
                     "value_base_units": {"type": "integer", "minimum": 0},
+                    "source_index": {
+                        "type": "integer",
+                        "minimum": -1,
+                        "description": (
+                            "Zero-based setup.starter_items index for player-requested "
+                            "items, or -1 for extra invented items."
+                        ),
+                    },
                 },
                 "required": [
                     "name",
@@ -480,6 +583,7 @@ NEW_GAME_RESPONSE_JSON_SCHEMA: dict[str, Any] = {
                     "quantity",
                     "description",
                     "value_base_units",
+                    "source_index",
                 ],
                 "additionalProperties": False,
             },
@@ -530,27 +634,26 @@ NEW_GAME_RESPONSE_JSON_SCHEMA: dict[str, Any] = {
 }
 
 UNCERTAIN_ACTION_KEYWORDS: dict[str, tuple[str, ...]] = {
-    "Alchemy": (
+    "Crafting": (
         "alchemy",
         "brew",
+        "craft",
+        "crafting",
         "distill",
         "elixir",
         "experiment",
         "identify reagent",
+        "make",
         "mix",
         "potion",
-        "prepare",
         "recipe",
         "reagent",
+        "repair",
         "tincture",
     ),
     "Foraging": (
-        "basket",
-        "bounty",
-        "brimming",
-        "collection",
         "forage",
-        "gather",
+        "foraging",
         "geological find",
         "harvest",
         "herb",
@@ -558,8 +661,6 @@ UNCERTAIN_ACTION_KEYWORDS: dict[str, tuple[str, ...]] = {
         "plant",
         "search for",
         "specimen",
-    ),
-    "Fieldcraft": (
         "camp",
         "flora",
         "forage",
@@ -570,6 +671,16 @@ UNCERTAIN_ACTION_KEYWORDS: dict[str, tuple[str, ...]] = {
         "trail",
         "wild",
     ),
+    "Mining": (
+        "dig",
+        "mine",
+        "mining",
+        "mineral",
+        "ore",
+        "pickaxe",
+        "quarry",
+        "vein",
+    ),
     "Investigation": (
         "clue",
         "examine",
@@ -579,17 +690,14 @@ UNCERTAIN_ACTION_KEYWORDS: dict[str, tuple[str, ...]] = {
         "search",
         "study",
     ),
-    "Awareness": (
+    "Perception": (
         "listen",
-        "look for",
         "notice",
         "observe",
         "scan",
         "spot",
-        "watch",
     ),
     "Persuasion": (
-        "ask",
         "bargain",
         "convince",
         "haggle",
@@ -600,7 +708,7 @@ UNCERTAIN_ACTION_KEYWORDS: dict[str, tuple[str, ...]] = {
         "hide",
         "sneak",
         "stealth",
-        "steal",
+        "conceal",
     ),
     "Athletics": (
         "balance",
@@ -631,6 +739,38 @@ TRIVIAL_ACTION_KEYWORDS = {
     "talk",
     "walk",
 }
+SKILL_NAME_MATCH_THRESHOLD = 82.0
+SKILL_DESCRIPTION_MATCH_THRESHOLD = 78.0
+SKILL_KEYWORD_ALIASES: dict[str, tuple[str, ...]] = {
+    "Foraging": ("Fieldcraft", "Survival"),
+    "Mining": ("Prospecting",),
+    "Perception": ("Awareness",),
+    "Prospecting": ("Mining",),
+}
+SKILL_MATCH_STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "are",
+    "as",
+    "at",
+    "by",
+    "for",
+    "from",
+    "in",
+    "into",
+    "is",
+    "it",
+    "of",
+    "on",
+    "or",
+    "that",
+    "the",
+    "their",
+    "to",
+    "with",
+    "your",
+}
 
 
 @dataclass(frozen=True)
@@ -655,6 +795,14 @@ class AiNarrationResult:
     suggested_actions: list[str] = field(default_factory=list)
     suggested_events: list[dict[str, Any]] = field(default_factory=list)
     out_of_game: bool = False
+    raw_text: str = ""
+
+
+@dataclass(frozen=True)
+class SkillCheckPlanResult:
+    """Parsed result from a lightweight pre-narration skill-check request."""
+
+    checks: list[dict[str, Any]] = field(default_factory=list)
     raw_text: str = ""
 
 
@@ -723,6 +871,13 @@ class GeminiNarrationService:
         prompt = build_gemini_story_prompt(context_packet)
         client = genai.Client(api_key=self.settings.api_key)
 
+        LOGGER.info(
+            "Story context packet summary: %s",
+            json.dumps(
+                _context_packet_stats(context_packet, prompt_chars=len(prompt)),
+                sort_keys=True,
+            ),
+        )
         LOGGER.info("Sending story context packet to Gemini model %s.", self.settings.model)
         response = client.models.generate_content(
             model=self.settings.model,
@@ -740,9 +895,63 @@ class GeminiNarrationService:
             )
 
         result = parse_gemini_story_response(raw_text)
+        result = _drop_duplicate_resolved_skill_check_events(result, context_packet)
+        result = _ensure_in_game_suggested_actions(result, context_packet)
+        result = _ensure_status_event_for_in_game_response(result, context_packet)
         result = _ensure_skill_check_for_uncertain_player_command(result, context_packet)
         result = _ensure_inventory_for_collected_reagents(result, context_packet)
         return _ensure_inventory_for_narrated_collection(result, context_packet)
+
+    def plan_story_skill_checks(
+        self,
+        context_packet: dict[str, Any],
+    ) -> SkillCheckPlanResult:
+        """
+        Asks Gemini which checks should be resolved before full narration.
+
+        Args:
+            context_packet: Structured context packet from AiContextBuilder.
+
+        Returns:
+            Parsed skill-check plan.
+        """
+
+        if not self.settings.is_configured:
+            raise GeminiConfigurationError(
+                "GEMINI_API_KEY is not configured. Add it to .env or the environment."
+            )
+
+        try:
+            from google import genai
+        except ImportError as error:
+            raise GeminiConfigurationError(
+                "google-genai is not installed. Install project requirements first."
+            ) from error
+
+        prompt = build_skill_check_plan_prompt(context_packet)
+        client = genai.Client(api_key=self.settings.api_key)
+
+        LOGGER.info(
+            "Skill-check planning packet summary: %s",
+            json.dumps(
+                _context_packet_stats(context_packet, prompt_chars=len(prompt)),
+                sort_keys=True,
+            ),
+        )
+        LOGGER.info("Sending skill-check planning packet to Gemini model %s.", self.settings.model)
+        response = client.models.generate_content(
+            model=self.settings.model,
+            contents=prompt,
+            config=_structured_output_config(SKILL_CHECK_PLAN_RESPONSE_JSON_SCHEMA),  # type: ignore[arg-type]
+        )
+        raw_text = str(getattr(response, "text", "") or "").strip()
+        LOGGER.info("Gemini raw skill-check plan response:\n%s", raw_text)
+
+        if not raw_text:
+            LOGGER.warning("Gemini returned an empty skill-check plan response.")
+            return SkillCheckPlanResult(raw_text=raw_text)
+
+        return parse_skill_check_plan_response(raw_text)
 
     def generate_new_game_world(
         self,
@@ -823,9 +1032,51 @@ def load_gemini_settings(env_path: Path | None = None) -> GeminiSettings:
         api_key=(
             os.getenv("GEMINI_API_KEY")
             or env_values.get("GEMINI_API_KEY")
+            or "AIzaSyBTvA3_8kx8cykxITUWYCp7Bf8ilb73HSM" # FOR SOME REASON, THE .env FILE IS NOT READING PROPERLY ANYMORE. PLEASE LEAVE THIS HARD-CODED API KEY ALONE. I CAN GENERATE A NEW KEY IF THIS ONE BECOMES COMPROMISED.
             or ""
         ).strip(),
         model=model,
+    )
+
+
+def build_skill_check_plan_prompt(context_packet: dict[str, Any]) -> str:
+    """
+    Builds the lightweight prompt used before full narration.
+
+    Args:
+        context_packet: Structured story context packet.
+
+    Returns:
+        Prompt text.
+    """
+
+    planning_packet = _skill_check_planning_packet(context_packet)
+    packet_json = json.dumps(planning_packet, indent=2)
+
+    return (
+        "You are a game master deciding whether the player's latest action "
+        "needs one or more skill checks before narration is written.\n"
+        "Return one JSON object and no surrounding Markdown.\n\n"
+        "Rules:\n"
+        "- Return checks as an array. Use [] when no check is needed.\n"
+        "- Choose only checks needed to resolve meaningful uncertainty in the "
+        "latest player_command.\n"
+        "- Request checks for actions that could plausibly fail, go poorly, take "
+        "extra time, vary in quality, consume resources, reveal misleading "
+        "information, attract attention, cause harm, or miss something.\n"
+        "- Named skill use, foraging, harvesting, searching, researching, "
+        "identifying, crafting, alchemy experiments, persuasion, stealth, and "
+        "combat usually need checks unless trivial and risk-free.\n"
+        "- Routine movement, paying a known price, receiving ordinary goods, "
+        "eating, drinking, and casual conversation do not need checks unless the "
+        "player adds a contested, risky, hidden, time-sensitive, or deceptive goal.\n"
+        "- Prefer an existing known skill_name when one fits. If no existing skill "
+        "fits, use a clear new skill_name.\n"
+        "- Include difficulty or dc when the action's risk is clear. Use reason "
+        "to briefly explain why the check is needed.\n"
+        "- Do not narrate the outcome. Do not roll. The Python application rolls.\n\n"
+        "Planning packet:\n"
+        f"{packet_json}"
     )
 
 
@@ -862,11 +1113,15 @@ def build_gemini_story_prompt(context_packet: dict[str, Any]) -> str:
         "so or the bartender saw the purse emptied.\n"
         "- When introducing a meaningful new NPC, suggest NpcUpsertedEvent in events "
         "with the NPC's internal name, player-visible display_name, internal role, "
-        "location, public description, player_facing_information, and plausible "
-        "knowledge scope. display_name is the name shown in the NPCs tab; use a "
+        "location, public description, player_facing_information, knowledge_scope, "
+        "and known_facts. display_name is the name shown in the NPCs tab; use a "
         "generic label such as 'Shady Character' when the player has not learned "
         "the NPC's actual name or role. role is for AI memory and should not be "
-        "treated as the player-facing summary.\n"
+        "treated as the player-facing summary. location must be a meaningful "
+        "player-known place, usually the current scene location where the NPC was "
+        "encountered; do not leave it blank. known_facts should list what this NPC "
+        "personally knows; if nothing private is established yet, use a clear "
+        "public/observable fact instead of omitting the field.\n"
         "- Before creating an NPC, inspect state.npcs.relevant. If the person is "
         "already listed there, reuse that exact npc_id/internal identifier and "
         "update the existing profile instead of inventing a second identifier. "
@@ -895,7 +1150,17 @@ def build_gemini_story_prompt(context_packet: dict[str, Any]) -> str:
         "schema defines the required top-level fields.\n\n"
         "Rules:\n"
         "- response must be a non-empty string.\n"
-        "- response must not contain legacy double-bracket tags.\n"
+        "- Mature fictional content is allowed when it fits the scene, genre, and "
+        "player choices. Assume the player character and player are adults of legal "
+        "drinking age unless the saved character profile explicitly says otherwise. "
+        "Do not sanitize taverns, inns, feasts, criminal districts, battlefields, "
+        "or political conflicts into harmless substitutes. Alcohol, drunken "
+        "patrons, gambling, threats, intimidation, violence, injury, blood, corpses, "
+        "crime, cruelty, corruption, and oppressive social attitudes may appear as "
+        "ordinary fictional world content. Keep descriptions story-focused rather "
+        "than instructional. For prejudice or slurs, use fictional in-world terms "
+        "for fictional cultures, species, factions, classes, or guilds; do not use "
+        "real-world slurs against protected classes.\n"
         "- Spoken dialogue must use double quotation marks around the speaker's "
         "full spoken sentence or paragraph. Do not use single quotation marks as "
         "the outer boundary of dialogue. Use single quotation marks only when an "
@@ -913,11 +1178,36 @@ def build_gemini_story_prompt(context_packet: dict[str, Any]) -> str:
         "persuasion, stealth, combat, and named skill use unless the action is "
         "trivial and risk-free. Do not use SkillXpAddedEvent as a substitute "
         "for a check.\n"
+        "- Routine movement, paying a known price, receiving ordinary goods, "
+        "eating, drinking, and casual conversation are not skill checks unless "
+        "the player adds a contested, risky, hidden, time-sensitive, or "
+        "deceptive goal.\n"
+        "- If state.skills.resolved_checks_this_turn is non-empty, those are "
+        "the authoritative skill-check results for this player_command. Do not "
+        "request duplicate SkillCheckRequestedEvent entries for those skills. "
+        "Narrate the action from the resolved outcomes: low failed rolls should "
+        "produce real setbacks, costs, missed information, danger, or slower "
+        "progress; ordinary failures should fail or partly succeed with a clear "
+        "complication; ordinary successes should make real progress; very high "
+        "rolls or totals that beat the DC by 5 or more should produce a notably "
+        "cleaner, faster, richer, or more advantageous result. Do not mention "
+        "dice, raw roll numbers, totals, DCs, or game mechanics in the story.\n"
         "- Every InventoryItemAddedEvent payload must include value_base_units "
         "as an integer of at least 1.\n"
-        "- ReagentDiscoveredEvent records Alchemy Notebook knowledge only. If "
-        "the player physically collects, harvests, picks up, or stores that "
-        "reagent, also suggest InventoryItemAddedEvent for the same reagent.\n"
+        "- state.item_catalog.items is the master list of known item definitions. "
+        "Use it to remember item descriptions after items leave inventory, but "
+        "only state.inventory.items are current possessions.\n"
+        "- ReagentDiscoveredEvent records Crafting tab knowledge for useful "
+        "items/materials only and uses exactly name, description, location, "
+        "and uses. If the player physically collects, harvests, picks up, or "
+        "stores that item/material, also suggest InventoryItemAddedEvent for "
+        "the same item/material.\n"
+        "- RecipeDiscoveredEvent ingredients must be structured entries using "
+        "item names from state.item_catalog.items in the reagent_name field. "
+        "Only items with category "
+        f"{CRAFTING_INGREDIENT_CATEGORY_NAMES} may be used as recipe ingredients. "
+        "Include quantity, measure_amount, and measure_unit from the listed "
+        "common measurement units.\n"
         "- If the narration says the player physically gains, collects, harvests, "
         "finds and keeps, or fills a basket/container with usable items, also "
         "suggest InventoryItemAddedEvent for those items. Do not describe a "
@@ -930,6 +1220,23 @@ def build_gemini_story_prompt(context_packet: dict[str, Any]) -> str:
         "as the one net money change. Never use net_base_unit_amount. If the "
         "player buys an item, also suggest the InventoryItemAddedEvent for that "
         "item; do not create coin inventory items for payment or change.\n"
+        "- ActiveTaskUpsertedEvent is shown directly in the Active Tasks tab. Fill "
+        "only category, status, description, requester, location, reward, due_date, "
+        "and due_elapsed_minutes with useful player-facing values. Do not add "
+        "notes, Notes, or any other extra active-task fields. Use requester='Self' "
+        "for personal goals, reward='N/A' when nobody is paying or trading for "
+        "the task, due_date='N/A' and due_elapsed_minutes=-1 when no deadline is "
+        "known, and location as the relevant place for doing, picking up, "
+        "completing, or turning in the task. For any real deadline, due_date must "
+        "be an exact player-facing date and time, not vague prose, and "
+        "due_elapsed_minutes must be the absolute in-world elapsed minute for "
+        "that deadline. Use 'Unknown' only when a value exists but is genuinely "
+        "unclear.\n"
+        "Do not use a fixed sentence count. Scale response length to the "
+        "importance, risk, and consequences of the action; provide enough text "
+        "to make the outcome feel earned without being padded. "
+        "Concisely describe the scene, and make sure to properly address all parts of the user's query. \n"
+        "When creating items, ensure that you give a quantifiable amount or size for the item, rather than using phrases such as \"a pile of [ore/apples/etc.]\".\n"
         "- Do not invent hidden state, inventory, recipes, or flags as confirmed facts.\n\n"
         "Context packet:\n"
         f"{packet_json}"
@@ -969,6 +1276,16 @@ def build_gemini_new_game_prompt(setup_packet: dict[str, Any]) -> str:
         "regions, factions, religions, shops, guilds, and landmarks. Banned terms "
         "may appear only when explicitly provided by the player as confirmed setup "
         "input.\n"
+        "- Mature fictional content is allowed when it fits the selected genre, "
+        "world, opening location, and player setup. Assume the player character "
+        "and player are adults of legal drinking age unless the character setup "
+        "explicitly says otherwise. Taverns may include alcohol, bartenders, "
+        "drunken patrons, gambling, brawls, shady deals, and adult social texture. "
+        "Violence, blood, corpses, criminality, cruelty, corruption, and oppressive "
+        "social attitudes may be part of the world when genre-appropriate. Use "
+        "fictional in-world slurs or insults only for fictional cultures, species, "
+        "factions, classes, or guilds; do not invent or use real-world slurs "
+        "against protected classes.\n"
         "- If the setup packet includes character_generation_guidance, follow its "
         "gender_presentation_hint when inventing blank/default player character "
         "fields. A blank/default player character does not imply male. Vary gender "
@@ -1038,17 +1355,29 @@ def build_gemini_new_game_prompt(setup_packet: dict[str, Any]) -> str:
         "as Lore (Syndicate), Lore (Flijosha), or Lore (Merchant Law), rather than "
         "Syndicate Lore or Flijosha Observance. "
         "Never return placeholder descriptions such as 'Player-selected level 1 "
-        "starting skill.' Do not reuse generic default names like Athletics, "
-        "Awareness, Crafting, Fieldcraft, Investigation, Lore, Medicine, Melee, "
-        "Performance, Persuasion, Primary Training, Secondary Training, Signature "
-        "Expertise, Stealth, or Survival unless the player explicitly typed that "
-        "name. Preserve the exact level spread from setup.skills.\n"
-        "- starting_items must contain at least five concrete starting inventory "
-        "items. Preserve any player-provided setup.starter_items and add fitting "
-        "items as needed. If setup.starter_items is blank or sparse, invent items "
-        "that fit the finalized character backstory, finalized skills, selected "
-        "genre, starting location, weather, and economy. Each item must include "
-        "name, category, quantity, description, and value_base_units.\n"
+        "starting skill.'\n"
+        "- starting_items has no required minimum or maximum item count. Return "
+        "only the concrete tracked possessions that naturally fit the finalized "
+        "character, genre, starting location, weather, and economy. Do not add, "
+        "split, combine, or pad items to satisfy a quota. Return the finalized "
+        "inventory in the starting_items field; do not use the alias starting_inventory. Preserve "
+        "any player-provided setup.starter_items entries whose requires_ai_invention "
+        "field is false. Set source_index to the zero-based setup.starter_items "
+        "index for items based on a setup starter-item entry, and -1 for extra "
+        "invented items. "
+        "If a setup.starter_items entry has requires_ai_invention=true or "
+        "item_request text, treat it as a player-authored item concept and "
+        "convert it into the number of concrete, setting-appropriate tracked "
+        "items that best fits the concept rather than copying the request "
+        "verbatim. If setup.starter_items is blank, you may return [] or invent "
+        "items that fit the finalized character backstory, finalized skills, selected "
+        "genre, starting location, weather, and economy. Do not include setup "
+        "bookkeeping words such as Starting, Starter, Initial, Amount, Quantity, "
+        "Count, or Total in item names. Generalize resource names to the actual "
+        "inventory item, such as Fuel instead of Starting Fuel Amount, Food instead "
+        "of Starting Food Amount, and Water instead of Starting Water Quantity. Put "
+        "quantities in quantity, not name. Each item must include "
+        "name, category, quantity, description, value_base_units, and source_index.\n"
         "- If setup.currency_denominations is empty, currency_denominations must "
         "contain at least one and at most four concrete denominations that fit "
         "the selected genre, world, and economy. One denomination must have "
@@ -1087,7 +1416,20 @@ def _structured_output_config(schema: dict[str, Any]) -> dict[str, Any]:
     return {
         "response_mime_type": "application/json",
         "response_json_schema": schema,
+        "safety_settings": _permissive_text_safety_settings(),
     }
+
+
+def _permissive_text_safety_settings() -> list[dict[str, str]]:
+    """Returns explicit Gemini safety settings for mature fictional storytelling."""
+
+    return [
+        {
+            "category": category,
+            "threshold": "OFF",
+        }
+        for category in TEXT_SAFETY_HARM_CATEGORIES
+    ]
 
 
 def _banned_terms_from_context(context_packet: dict[str, Any]) -> list[str]:
@@ -1115,6 +1457,168 @@ def _banned_terms_from_context(context_packet: dict[str, Any]) -> list[str]:
             seen.add(folded)
 
     return terms
+
+
+def _skill_check_planning_packet(context_packet: dict[str, Any]) -> dict[str, Any]:
+    """Builds the small packet for pre-narration skill-check planning."""
+
+    state = context_packet.get("state", {})
+
+    if not isinstance(state, dict):
+        state = {}
+
+    skills = state.get("skills", {})
+
+    if not isinstance(skills, dict):
+        skills = {}
+
+    recent_history = context_packet.get("recent_history", [])
+
+    if not isinstance(recent_history, list):
+        recent_history = []
+
+    return {
+        "packet_type": "skill_check_planning",
+        "player_command": str(context_packet.get("player_command", "")).strip(),
+        "scene": state.get("scene", {}) if isinstance(state.get("scene"), dict) else {},
+        "player": state.get("player", {}) if isinstance(state.get("player"), dict) else {},
+        "known_skills": skills.get("known_skills", []),
+        "recent_checks": skills.get("recent_checks", []),
+        "recent_history": recent_history[-2:],
+    }
+
+
+def _context_packet_stats(
+    context_packet: dict[str, Any],
+    *,
+    prompt_chars: int,
+) -> dict[str, int]:
+    """Builds compact telemetry for context-size drift diagnostics."""
+
+    state = context_packet.get("state", {})
+
+    if not isinstance(state, dict):
+        state = {}
+
+    return {
+        "prompt_chars": prompt_chars,
+        "packet_chars": len(json.dumps(context_packet, ensure_ascii=False)),
+        "recent_history": _list_len(context_packet.get("recent_history")),
+        "reference_sections": _list_len(context_packet.get("reference_sections")),
+        "inventory_items": _list_len(_nested_value(state, "inventory", "items")),
+        "item_catalog_items": _list_len(_nested_value(state, "item_catalog", "items")),
+        "crafting_items": _list_len(_nested_value(state, "alchemy", "known_reagents")),
+        "crafting_recipes": _list_len(_nested_value(state, "alchemy", "known_recipes")),
+        "known_skills": _list_len(_nested_value(state, "skills", "known_skills")),
+        "recent_checks": _list_len(_nested_value(state, "skills", "recent_checks")),
+        "active_tasks": _list_len(_nested_value(state, "active_tasks", "tasks")),
+        "relevant_npcs": _list_len(_nested_value(state, "npcs", "relevant")),
+        "valid_music_tracks": _list_len(_nested_value(state, "audio", "valid_music_tracks")),
+    }
+
+
+def _list_len(value: Any) -> int:
+    """Returns list length for packet telemetry."""
+
+    return len(value) if isinstance(value, list) else 0
+
+
+def _nested_value(mapping: dict[str, Any], *keys: str) -> Any:
+    """Reads a nested dict value without raising on malformed packets."""
+
+    current: Any = mapping
+
+    for key in keys:
+        if not isinstance(current, dict):
+            return None
+
+        current = current.get(key)
+
+    return current
+
+
+def _state_subpacket(context_packet: dict[str, Any], name: str) -> dict[str, Any]:
+    """Reads a named state subpacket."""
+
+    state = context_packet.get("state", {})
+
+    if not isinstance(state, dict):
+        return {}
+
+    subpacket = state.get(name, {})
+
+    return subpacket if isinstance(subpacket, dict) else {}
+
+
+def parse_skill_check_plan_response(raw_text: str) -> SkillCheckPlanResult:
+    """
+    Parses Gemini skill-check planning output.
+
+    Args:
+        raw_text: Raw Gemini response text.
+
+    Returns:
+        Parsed skill-check plan. Invalid or non-JSON output becomes an empty plan.
+    """
+
+    clean_text = _strip_json_fence(raw_text.strip())
+
+    try:
+        data = json.loads(clean_text)
+    except json.JSONDecodeError:
+        LOGGER.warning("Gemini returned non-JSON skill-check plan. Using empty plan.")
+        return SkillCheckPlanResult(raw_text=raw_text)
+
+    if not isinstance(data, dict):
+        LOGGER.warning("Gemini skill-check plan JSON response was not an object.")
+        return SkillCheckPlanResult(raw_text=raw_text)
+
+    _log_json_schema_warnings(
+        data,
+        SKILL_CHECK_PLAN_RESPONSE_JSON_SCHEMA,
+        "skill-check plan response",
+    )
+
+    raw_checks = data.get("checks", [])
+
+    if not isinstance(raw_checks, list):
+        LOGGER.warning("Gemini skill-check plan checks was not a list. Ignoring it.")
+        raw_checks = []
+
+    checks: list[dict[str, Any]] = []
+    seen_names: set[str] = set()
+
+    for raw_check in raw_checks:
+        if not isinstance(raw_check, dict):
+            continue
+
+        skill_name = str(raw_check.get("skill_name", raw_check.get("name", ""))).strip()
+
+        if not skill_name:
+            continue
+
+        folded_name = skill_name.casefold()
+
+        if folded_name in seen_names:
+            continue
+
+        payload: dict[str, Any] = {"skill_name": skill_name}
+        difficulty = str(raw_check.get("difficulty", "")).strip()
+        reason = str(raw_check.get("reason", "")).strip()
+        dc = _optional_positive_int(raw_check.get("dc"))
+
+        if dc is not None:
+            payload["dc"] = dc
+        elif difficulty:
+            payload["difficulty"] = difficulty
+
+        if reason:
+            payload["reason"] = reason
+
+        checks.append(payload)
+        seen_names.add(folded_name)
+
+    return SkillCheckPlanResult(checks=checks, raw_text=raw_text)
 
 
 def parse_gemini_story_response(raw_text: str) -> AiNarrationResult:
@@ -1190,27 +1694,102 @@ def parse_gemini_story_response(raw_text: str) -> AiNarrationResult:
     )
 
 
+def _ensure_in_game_suggested_actions(
+    result: AiNarrationResult,
+    context_packet: dict[str, Any],
+) -> AiNarrationResult:
+    """Adds generic action choices when Gemini leaves an in-game turn with none."""
+
+    if result.out_of_game or result.suggested_actions:
+        return result
+
+    if str(context_packet.get("packet_type", "")).strip() != "story_turn":
+        return result
+
+    LOGGER.warning(
+        "Gemini omitted suggested_actions for an in-game story turn; "
+        "using fallback suggestions."
+    )
+    fallback_actions = list(FALLBACK_SUGGESTED_ACTIONS)
+
+    return AiNarrationResult(
+        narrative_text=_format_visible_response(result.narrative_text, fallback_actions),
+        suggested_actions=fallback_actions,
+        suggested_events=result.suggested_events,
+        out_of_game=result.out_of_game,
+        raw_text=result.raw_text,
+    )
+
+
+def _ensure_status_event_for_in_game_response(
+    result: AiNarrationResult,
+    context_packet: dict[str, Any],
+) -> AiNarrationResult:
+    """Adds a no-advance status event when Gemini omits one for an in-game turn."""
+
+    if result.out_of_game:
+        return result
+
+    if str(context_packet.get("packet_type", "")).strip() != "story_turn":
+        return result
+
+    if any(
+        _raw_event_type(event) in {"StatusUpdatedEvent", "LocationChangedEvent"}
+        for event in result.suggested_events
+    ):
+        return result
+
+    scene = _state_subpacket(context_packet, "scene")
+    payload = {
+        "location": str(scene.get("location", "AUTO") or "AUTO"),
+        "minutes_passed": "AUTO",
+        "weather": str(scene.get("weather", "AUTO") or "AUTO"),
+    }
+    status_event = {
+        "type": "StatusUpdatedEvent",
+        "payload": payload,
+    }
+    LOGGER.warning(
+        "Gemini omitted StatusUpdatedEvent for an in-game story turn; "
+        "injecting no-advance status event."
+    )
+
+    return AiNarrationResult(
+        narrative_text=result.narrative_text,
+        suggested_actions=result.suggested_actions,
+        suggested_events=[*result.suggested_events, status_event],
+        out_of_game=result.out_of_game,
+        raw_text=result.raw_text,
+    )
+
+
 def _ensure_skill_check_for_uncertain_player_command(
     result: AiNarrationResult,
     context_packet: dict[str, Any],
 ) -> AiNarrationResult:
-    """Adds a fallback skill-check event when Gemini skips a clearly uncertain action."""
+    """Adds a fallback skill-check event for a clearly uncertain player command."""
 
     if result.out_of_game:
+        return result
+
+    if _resolved_skill_names_from_context(context_packet):
         return result
 
     if any(_raw_event_type(event) == "SkillCheckRequestedEvent" for event in result.suggested_events):
         return result
 
     command = str(context_packet.get("player_command", "")).strip()
-    action_text = " ".join([command, result.narrative_text]).strip()
-
-    if not _looks_like_uncertain_action(action_text):
-        return result
-
-    skill_name = _infer_skill_check_name(action_text, context_packet)
+    looks_uncertain = _looks_like_uncertain_action(command)
+    skill_name = _infer_skill_check_name(
+        command,
+        context_packet,
+        result.suggested_events,
+    )
 
     if not skill_name:
+        return result
+
+    if not looks_uncertain and not _skill_text_matches_command(skill_name, command):
         return result
 
     skill_check_event = {
@@ -1241,11 +1820,73 @@ def _ensure_skill_check_for_uncertain_player_command(
     )
 
 
+def _drop_duplicate_resolved_skill_check_events(
+    result: AiNarrationResult,
+    context_packet: dict[str, Any],
+) -> AiNarrationResult:
+    """Removes SkillCheckRequestedEvent entries for checks already resolved this turn."""
+
+    resolved_skill_names = _resolved_skill_names_from_context(context_packet)
+
+    if not resolved_skill_names:
+        return result
+
+    filtered_events = [
+        event
+        for event in result.suggested_events
+        if not (
+            _raw_event_type(event) == "SkillCheckRequestedEvent"
+            and _event_payload_text(event, "skill_name", "name").casefold()
+            in resolved_skill_names
+        )
+    ]
+
+    if len(filtered_events) == len(result.suggested_events):
+        return result
+
+    LOGGER.warning(
+        "Gemini requested already-resolved skill check(s); dropped duplicate event(s)."
+    )
+    return AiNarrationResult(
+        narrative_text=result.narrative_text,
+        suggested_actions=result.suggested_actions,
+        suggested_events=filtered_events,
+        out_of_game=result.out_of_game,
+        raw_text=result.raw_text,
+    )
+
+
+def _resolved_skill_names_from_context(context_packet: dict[str, Any]) -> set[str]:
+    """Reads resolved skill-check names from a story context packet."""
+
+    state = context_packet.get("state", {})
+
+    if not isinstance(state, dict):
+        return set()
+
+    skills = state.get("skills", {})
+
+    if not isinstance(skills, dict):
+        return set()
+
+    resolved_checks = skills.get("resolved_checks_this_turn", [])
+
+    if not isinstance(resolved_checks, list):
+        return set()
+
+    return {
+        str(check.get("skill_name", check.get("name", ""))).strip().casefold()
+        for check in resolved_checks
+        if isinstance(check, dict)
+        and str(check.get("skill_name", check.get("name", ""))).strip()
+    }
+
+
 def _ensure_inventory_for_collected_reagents(
     result: AiNarrationResult,
     context_packet: dict[str, Any],
 ) -> AiNarrationResult:
-    """Adds inventory events for reagents Gemini says the player physically collected."""
+    """Adds inventory events for useful materials Gemini says the player collected."""
 
     if result.out_of_game:
         return result
@@ -1296,7 +1937,7 @@ def _ensure_inventory_for_collected_reagents(
         inventory_event = {
             "type": "InventoryItemAddedEvent",
             "payload": {
-                "item_type": str(payload.get("material_type", "")).strip() or "Reagent",
+                "item_type": "Item",
                 "item_name": name,
                 "description": _reagent_inventory_description(payload),
                 "amount": 1,
@@ -1311,7 +1952,7 @@ def _ensure_inventory_for_collected_reagents(
         return result
 
     LOGGER.warning(
-        "Gemini omitted InventoryItemAddedEvent for collected reagent(s): %s",
+        "Gemini omitted InventoryItemAddedEvent for collected crafting item(s): %s",
         [
             event["payload"]["item_name"]
             for event in added_events
@@ -1453,24 +2094,24 @@ def _narrated_collection_description(text: str) -> str:
 
 
 def _reagent_inventory_description(payload: dict[str, Any]) -> str:
-    """Builds an inventory description from a reagent-discovery payload."""
+    """Builds an inventory description from a useful-item discovery payload."""
 
-    notes = str(payload.get("notes", payload.get("description", ""))).strip()
+    description = str(payload.get("description", payload.get("notes", ""))).strip()
 
-    if notes:
-        return notes
+    if description:
+        return description
 
-    qualities = _join_payload_list(payload.get("qualities", []))
     uses = _join_payload_list(payload.get("uses", []))
+    location = str(payload.get("location", "")).strip()
     details = []
 
-    if qualities:
-        details.append(f"Qualities: {qualities}")
+    if location:
+        details.append(f"Found in {location}")
 
     if uses:
         details.append(f"Uses: {uses}")
 
-    return "; ".join(details) or "A discovered alchemical reagent."
+    return "; ".join(details) or "A discovered useful crafting item/material."
 
 
 def _join_payload_list(value: Any) -> str:
@@ -1508,15 +2149,30 @@ def _looks_like_uncertain_action(command: str) -> bool:
     return False
 
 
-def _infer_skill_check_name(command: str, context_packet: dict[str, Any]) -> str:
+def _infer_skill_check_name(
+    command: str,
+    context_packet: dict[str, Any],
+    suggested_events: list[dict[str, Any]] | None = None,
+) -> str:
     """Infers the most relevant skill for a fallback check."""
 
     clean_command = command.casefold()
-    known_skills = _known_skill_names(context_packet)
+    known_skill_records = _known_skill_records(context_packet)
+    known_skills = [record["name"] for record in known_skill_records]
 
-    for skill_name in known_skills:
-        if skill_name.casefold() in clean_command:
-            return skill_name
+    known_match = _find_known_skill_for_text(command, known_skill_records)
+
+    if known_match:
+        return known_match
+
+    event_match = _find_event_skill_for_text(
+        command,
+        suggested_events or [],
+        known_skills,
+    )
+
+    if event_match:
+        return event_match
 
     scored_candidates: list[tuple[int, str]] = []
 
@@ -1532,11 +2188,20 @@ def _infer_skill_check_name(command: str, context_packet: dict[str, Any]) -> str
         known_match = _find_known_skill(candidate, known_skills)
         return known_match or candidate
 
-    return known_skills[0] if known_skills else "Awareness"
+    if "skill check" in clean_command or "roll " in clean_command:
+        return _find_known_skill("Awareness", known_skills) or "Awareness"
+
+    return ""
 
 
 def _known_skill_names(context_packet: dict[str, Any]) -> list[str]:
     """Reads known skill names from a story context packet."""
+
+    return [record["name"] for record in _known_skill_records(context_packet)]
+
+
+def _known_skill_records(context_packet: dict[str, Any]) -> list[dict[str, str]]:
+    """Reads known skill names and descriptions from a story context packet."""
 
     raw_skills = (
         context_packet.get("state", {})
@@ -1547,7 +2212,7 @@ def _known_skill_names(context_packet: dict[str, Any]) -> list[str]:
     if not isinstance(raw_skills, list):
         return []
 
-    skill_names: list[str] = []
+    skill_records: list[dict[str, str]] = []
 
     for raw_skill in raw_skills:
         if not isinstance(raw_skill, dict):
@@ -1556,9 +2221,14 @@ def _known_skill_names(context_packet: dict[str, Any]) -> list[str]:
         name = str(raw_skill.get("name", "")).strip()
 
         if name:
-            skill_names.append(name)
+            skill_records.append(
+                {
+                    "name": name,
+                    "description": str(raw_skill.get("description", "")).strip(),
+                }
+            )
 
-    return skill_names
+    return skill_records
 
 
 def _find_known_skill(candidate: str, known_skills: list[str]) -> str:
@@ -1570,12 +2240,263 @@ def _find_known_skill(candidate: str, known_skills: list[str]) -> str:
         if skill_name.casefold() == candidate_folded:
             return skill_name
 
-    if candidate_folded == "foraging":
-        for skill_name in known_skills:
-            if skill_name.casefold() == "fieldcraft":
-                return skill_name
+    for skill_name in _skill_keyword_aliases(candidate):
+        for known_skill in known_skills:
+            if known_skill.casefold() == skill_name.casefold():
+                return known_skill
 
-    return ""
+    return _find_known_skill_for_text(
+        candidate,
+        [{"name": skill_name, "description": ""} for skill_name in known_skills],
+    )
+
+
+def _skill_keyword_aliases(candidate: str) -> tuple[str, ...]:
+    """Returns explicit broad-category aliases for legacy keyword buckets."""
+
+    candidate_folded = candidate.casefold()
+
+    for skill_name, aliases in SKILL_KEYWORD_ALIASES.items():
+        if skill_name.casefold() == candidate_folded:
+            return aliases
+
+    return ()
+
+
+def _find_known_skill_for_text(
+    text: str,
+    known_skill_records: list[dict[str, str]],
+) -> str:
+    """Returns the known skill whose name or description best matches text."""
+
+    scored_skills: list[tuple[float, int, str]] = []
+
+    for record in known_skill_records:
+        name = record["name"]
+        name_score = _skill_text_match_score(name, text)
+        description_score = _skill_description_match_score(
+            record.get("description", ""),
+            text,
+        )
+        score = max(name_score, description_score)
+
+        if (
+            name_score >= SKILL_NAME_MATCH_THRESHOLD
+            or description_score >= SKILL_DESCRIPTION_MATCH_THRESHOLD
+        ):
+            scored_skills.append((score, len(name), name))
+
+    if not scored_skills:
+        return ""
+
+    scored_skills.sort(key=lambda item: (-item[0], item[1], item[2].casefold()))
+    return scored_skills[0][2]
+
+
+def _find_event_skill_for_text(
+    command: str,
+    suggested_events: list[dict[str, Any]],
+    known_skills: list[str],
+) -> str:
+    """Returns a skill from Gemini's XP/upsert events when it matches the command."""
+
+    scored_skills: list[tuple[float, int, str]] = []
+
+    for skill_name in _skill_names_from_events(suggested_events):
+        score = _skill_text_match_score(skill_name, command)
+
+        if score < SKILL_NAME_MATCH_THRESHOLD:
+            continue
+
+        known_match = _find_known_skill(skill_name, known_skills)
+        matched_name = known_match or skill_name
+        scored_skills.append((score, len(matched_name), matched_name))
+
+    if not scored_skills:
+        return ""
+
+    scored_skills.sort(key=lambda item: (-item[0], item[1], item[2].casefold()))
+    return scored_skills[0][2]
+
+
+def _skill_names_from_events(events: list[dict[str, Any]]) -> list[str]:
+    """Reads skill names Gemini used in skill-related non-check events."""
+
+    skill_names: list[str] = []
+
+    for event in events:
+        event_type = _raw_event_type(event)
+
+        if event_type not in {"SkillXpAddedEvent", "SkillUpsertedEvent"}:
+            continue
+
+        payload = event.get("payload", {})
+
+        if not isinstance(payload, dict):
+            continue
+
+        skill_name = str(payload.get("skill_name", payload.get("name", ""))).strip()
+
+        if skill_name:
+            skill_names.append(skill_name)
+
+    return skill_names
+
+
+def _skill_text_matches_command(skill_name: str, command: str) -> bool:
+    """Returns True when the player command directly resembles a skill name."""
+
+    return _skill_text_match_score(skill_name, command) >= SKILL_NAME_MATCH_THRESHOLD
+
+
+def _skill_text_match_score(skill_text: str, command: str) -> float:
+    """Scores whether a command text is close enough to a skill name."""
+
+    clean_skill = _normalized_match_text(skill_text)
+    clean_command = _normalized_match_text(command)
+
+    if not clean_skill or not clean_command:
+        return 0.0
+
+    skill_tokens = _word_tokens(clean_skill)
+    coverage_score = _token_coverage_score(clean_skill, clean_command)
+    sequence_score = _sequence_window_score(clean_skill, clean_command)
+    rapidfuzz_score = 0.0
+
+    if _rapidfuzz_fuzz is not None:
+        rapidfuzz_score = max(
+            float(_rapidfuzz_fuzz.WRatio(clean_skill, clean_command)),
+            float(_rapidfuzz_fuzz.partial_ratio(clean_skill, clean_command)),
+        )
+
+        if len(skill_tokens) > 1 and coverage_score < 60.0:
+            rapidfuzz_score = min(rapidfuzz_score, coverage_score)
+
+    return max(coverage_score, sequence_score, rapidfuzz_score)
+
+
+def _skill_description_match_score(description: str, command: str) -> float:
+    """Scores a skill description against a command using significant word overlap."""
+
+    description_terms = _expanded_token_set(description, significant=True)
+    command_terms = _expanded_token_set(command, significant=True)
+
+    if not description_terms or not command_terms:
+        return 0.0
+
+    overlap_count = len(description_terms.intersection(command_terms))
+
+    if overlap_count >= 3:
+        return 86.0
+
+    if overlap_count == 2:
+        return SKILL_DESCRIPTION_MATCH_THRESHOLD
+
+    return 0.0
+
+
+def _token_coverage_score(skill_text: str, command: str) -> float:
+    """Scores how many skill-name tokens or simple variants appear in the command."""
+
+    skill_tokens = [
+        token
+        for token in _word_tokens(skill_text)
+        if token not in SKILL_MATCH_STOPWORDS
+    ]
+
+    if not skill_tokens:
+        return 0.0
+
+    command_terms = _expanded_token_set(command)
+    covered_tokens = 0
+
+    for token in skill_tokens:
+        if _token_variants(token).intersection(command_terms):
+            covered_tokens += 1
+
+    return (covered_tokens / len(skill_tokens)) * 100.0
+
+
+def _sequence_window_score(skill_text: str, command: str) -> float:
+    """Scores fuzzy similarity against command word windows."""
+
+    skill_tokens = _word_tokens(skill_text)
+    command_tokens = _word_tokens(command)
+
+    if not skill_tokens or not command_tokens:
+        return 0.0
+
+    best_score = 0.0
+    min_window = max(1, len(skill_tokens) - 1)
+    max_window = min(len(command_tokens), len(skill_tokens) + 1)
+
+    for window_size in range(min_window, max_window + 1):
+        for index in range(0, len(command_tokens) - window_size + 1):
+            phrase = " ".join(command_tokens[index : index + window_size])
+            best_score = max(
+                best_score,
+                SequenceMatcher(None, skill_text, phrase).ratio() * 100.0,
+            )
+
+    return best_score
+
+
+def _normalized_match_text(text: str) -> str:
+    """Normalizes free text before skill-name matching."""
+
+    return " ".join(_word_tokens(text))
+
+
+def _word_tokens(text: str) -> list[str]:
+    """Splits text into lower-case word tokens for matching."""
+
+    return re.findall(r"[a-zA-Z0-9]+", str(text).casefold())
+
+
+def _expanded_token_set(text: str, *, significant: bool = False) -> set[str]:
+    """Returns word tokens plus simple inflection variants."""
+
+    terms: set[str] = set()
+
+    for token in _word_tokens(text):
+        if significant and token in SKILL_MATCH_STOPWORDS:
+            continue
+
+        terms.update(_token_variants(token))
+
+    return terms
+
+
+def _token_variants(token: str) -> set[str]:
+    """Returns simple word-form variants for skill matching."""
+
+    clean_token = token.casefold().strip()
+
+    if not clean_token:
+        return set()
+
+    variants = {clean_token}
+
+    if clean_token.endswith("ies") and len(clean_token) > 4:
+        variants.add(f"{clean_token[:-3]}y")
+
+    if clean_token.endswith("s") and len(clean_token) > 3:
+        variants.add(clean_token[:-1])
+
+    if clean_token.endswith("ing") and len(clean_token) > 5:
+        stem = clean_token[:-3]
+        variants.add(stem)
+        variants.add(f"{stem}e")
+
+        if len(stem) > 2 and stem[-1] == stem[-2]:
+            variants.add(stem[:-1])
+
+    if clean_token.endswith("ed") and len(clean_token) > 4:
+        stem = clean_token[:-2]
+        variants.add(stem)
+        variants.add(f"{stem}e")
+
+    return variants
 
 
 def _raw_event_type(event: dict[str, Any]) -> str:
@@ -1650,7 +2571,7 @@ def parse_gemini_new_game_response(raw_text: str) -> AiWorldSetupResult:
     finalized_character = _parse_new_game_character(data.get("character"))
     finalized_skills = _parse_new_game_skills(data.get("skills"))
     finalized_starter_items = _parse_new_game_starter_items(
-        data.get("starting_items", data.get("starter_items", data.get("inventory")))
+        _new_game_starter_items_payload(data)
     )
     finalized_currency_denominations = _parse_new_game_currency_denominations(data)
     finalized_currency_description = _parse_new_game_currency_description(data)
@@ -1842,7 +2763,9 @@ def _parse_new_game_starter_items(raw_items: Any) -> list[dict[str, Any]]:
         if not isinstance(raw_item, dict):
             continue
 
-        name = str(raw_item.get("name", raw_item.get("item_name", ""))).strip()
+        name = _generalized_starter_item_name(
+            raw_item.get("name", raw_item.get("item_name", ""))
+        )
 
         if not name or name.casefold() in seen_names:
             continue
@@ -1869,11 +2792,90 @@ def _parse_new_game_starter_items(raw_items: Any) -> list[dict[str, Any]]:
                 "quantity": max(1, quantity),
                 "description": str(raw_item.get("description", "")).strip(),
                 "value_base_units": max(0, value_base_units),
+                "source_index": _parse_optional_source_index(raw_item),
             }
         )
         seen_names.add(name.casefold())
 
     return items
+
+
+def _generalized_starter_item_name(raw_name: Any) -> str:
+    """Removes setup bookkeeping words from finalized starter item names."""
+
+    clean_name = str(raw_name or "").strip()
+
+    if not clean_name:
+        return ""
+
+    words = [
+        word.strip()
+        for word in re.split(r"\s+", clean_name)
+        if word.strip()
+    ]
+
+    if len(words) <= 1:
+        return clean_name
+
+    removed_setup_prefix = False
+
+    while len(words) > 1 and words[0].strip(":-_").casefold() in {
+        "starting",
+        "initial",
+        "beginning",
+    }:
+        words.pop(0)
+        removed_setup_prefix = True
+
+    if (
+        len(words) > 1
+        and words[0].strip(":-_").casefold() == "starter"
+        and words[-1].strip(":-_").casefold()
+        in {"amount", "quantity", "count", "total"}
+    ):
+        words.pop(0)
+        removed_setup_prefix = True
+
+    while (
+        removed_setup_prefix
+        and len(words) > 1
+        and words[-1].strip(":-_").casefold()
+        in {"amount", "quantity", "count", "total"}
+    ):
+        words.pop()
+
+    return " ".join(words).strip()
+
+
+def _new_game_starter_items_payload(data: dict[str, Any]) -> Any:
+    """Reads finalized starter inventory from current and legacy response keys."""
+
+    if "starting_items" in data:
+        return data.get("starting_items")
+
+    for alias in ["starter_items", "starting_inventory", "inventory"]:
+        if alias in data:
+            LOGGER.warning(
+                "Gemini new-game setup used %s; treating it as starting_items.",
+                alias,
+            )
+            return data.get(alias)
+
+    return None
+
+
+def _parse_optional_source_index(raw_item: dict[str, Any]) -> int | None:
+    """Parses optional setup starter-item source index metadata."""
+
+    raw_source_index = raw_item.get("source_index")
+
+    if raw_source_index is None:
+        return None
+
+    try:
+        return int(raw_source_index)
+    except (TypeError, ValueError):
+        return None
 
 
 def _parse_new_game_currency_denominations(data: dict[str, Any]) -> list[dict[str, Any]]:
@@ -2140,6 +3142,20 @@ def _strip_json_fence(raw_text: str) -> str:
         return "\n".join(lines[1:-1]).strip()
 
     return raw_text
+
+
+def _optional_positive_int(value: Any) -> int | None:
+    """Parses a positive integer or returns None."""
+
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+
+    if parsed < 1:
+        return None
+
+    return parsed
 
 
 def _format_visible_response(response_text: str, suggested_actions: list[str]) -> str:

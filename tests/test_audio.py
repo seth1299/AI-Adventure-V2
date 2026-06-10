@@ -15,9 +15,13 @@ from ai_adventure.audio.sound_manager import prepare_sound_directory
 
 
 class AudioTests(unittest.TestCase):
-    def test_sanitize_tts_text_removes_tags_and_action_suggestions(self) -> None:
+    def test_sanitize_tts_text_removes_embedded_events_and_action_suggestions(self) -> None:
         text = sanitize_tts_text(
-            "The room falls quiet. [[MUSIC: Boss_Fight.mp3]]\n\n"
+            "The room falls quiet. "
+            "[" "["
+            "MUSIC: Boss_Fight.mp3"
+            "]" "]"
+            "\n\n"
             "- Search the desk.\n"
             "- Leave the room."
         )

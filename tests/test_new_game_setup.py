@@ -19,7 +19,10 @@ from ai_adventure.new_game_templates import (
     save_new_game_template,
 )
 from ai_adventure.core.state_manager import StateManager
-from ai_adventure.persistence.save_repository import SaveRepository
+from ai_adventure.persistence.save_repository import (
+    DuplicateSaveTitleError,
+    SaveRepository,
+)
 
 
 class NewGameSetupTests(unittest.TestCase):
@@ -47,15 +50,22 @@ class NewGameSetupTests(unittest.TestCase):
 
     def test_parse_starter_items_text_supports_plain_and_structured_lines(self) -> None:
         items = parse_starter_items_text(
-            "Notebook\nLantern | Tool | 2 | Hooded brass lantern | 15"
+            "Notebook\nAn old brass lantern that only burns blue near danger.\nLantern | Tool | 2 | Hooded brass lantern | 15"
         )
 
         self.assertEqual(items[0]["name"], "Notebook")
         self.assertEqual(items[0]["quantity"], 1)
-        self.assertEqual(items[1]["name"], "Lantern")
-        self.assertEqual(items[1]["category"], "Tool")
-        self.assertEqual(items[1]["quantity"], 2)
-        self.assertEqual(items[1]["value_base_units"], 15)
+        self.assertFalse(items[0]["requires_ai_invention"])
+        self.assertEqual(items[1]["name"], "")
+        self.assertEqual(
+            items[1]["item_request"],
+            "An old brass lantern that only burns blue near danger.",
+        )
+        self.assertTrue(items[1]["requires_ai_invention"])
+        self.assertEqual(items[2]["name"], "Lantern")
+        self.assertEqual(items[2]["category"], "Tool")
+        self.assertEqual(items[2]["quantity"], 2)
+        self.assertEqual(items[2]["value_base_units"], 15)
 
     def test_create_new_save_with_setup_persists_player_choices(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -77,6 +87,12 @@ class NewGameSetupTests(unittest.TestCase):
                     "game_style": "Realistic detective mystery",
                     "start_location": "Rainmarket Station",
                     "world_context": "The city is controlled by canal guilds.",
+                    "audio": {
+                        "music_enabled": False,
+                        "narrator_enabled": False,
+                        "music_volume": 0,
+                        "tts_volume": 35,
+                    },
                 }
             )
             repository = SaveRepository.create_new_save(
@@ -105,10 +121,10 @@ class NewGameSetupTests(unittest.TestCase):
                 state.settings.values["currency.description"],
                 "Crowns dominate city trade.",
             )
-            self.assertTrue(state.settings.values["audio.music_enabled"])
-            self.assertTrue(state.settings.values["audio.narrator_enabled"])
-            self.assertEqual(state.settings.values["audio.music_volume"], 25)
-            self.assertEqual(state.settings.values["audio.tts_volume"], 90)
+            self.assertFalse(state.settings.values["audio.music_enabled"])
+            self.assertFalse(state.settings.values["audio.narrator_enabled"])
+            self.assertEqual(state.settings.values["audio.music_volume"], 0)
+            self.assertEqual(state.settings.values["audio.tts_volume"], 35)
             repository.set_world_lore(
                 {
                     "Locations": {
@@ -130,6 +146,72 @@ class NewGameSetupTests(unittest.TestCase):
             )
             self.assertEqual(state.currency.denominations[1]["name"], "Crown")
             self.assertEqual(state.currency.denominations[1]["value"], 12)
+
+    def test_create_new_save_rejects_duplicate_titles(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            saves_dir = Path(temp_dir)
+            first_repository = SaveRepository.create_new_save(
+                saves_dir,
+                "Duplicate Test",
+            )
+            first_repository.set_state_value("location", "First Save Only")
+
+            with self.assertRaises(DuplicateSaveTitleError):
+                SaveRepository.create_new_save(saves_dir, " duplicate   test ")
+
+            saves = SaveRepository.list_saves(saves_dir)
+            reloaded_repository = SaveRepository(saves[0].db_path)
+
+            self.assertEqual(len(saves), 1)
+            self.assertEqual(reloaded_repository.get_state_value("location"), "First Save Only")
+
+    def test_create_new_save_uses_distinct_database_paths_for_unique_titles(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            saves_dir = Path(temp_dir)
+
+            first_repository = SaveRepository.create_new_save(saves_dir, "First Save")
+            second_repository = SaveRepository.create_new_save(saves_dir, "Second Save")
+
+            self.assertNotEqual(first_repository.db_path, second_repository.db_path)
+            self.assertTrue(first_repository.db_path.exists())
+            self.assertTrue(second_repository.db_path.exists())
+
+    def test_create_new_save_skips_ai_item_requests_until_finalized(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            setup = normalize_new_game_setup(
+                {
+                    "title": "Item Request Test",
+                    "starter_items": parse_starter_items_text(
+                        "A compass that points toward unfinished promises."
+                    ),
+                }
+            )
+            repository = SaveRepository.create_new_save(
+                Path(temp_dir),
+                setup["title"],
+                setup=setup,
+            )
+
+            self.assertEqual(repository.list_inventory_items(), [])
+
+    def test_normalized_setup_accepts_raw_narrative_item_requests(self) -> None:
+        setup = normalize_new_game_setup(
+            {
+                "starter_items": [
+                    "Notebook",
+                    "A compass that points toward unfinished promises.",
+                ]
+            }
+        )
+
+        self.assertEqual(setup["starter_items"][0]["name"], "Notebook")
+        self.assertFalse(setup["starter_items"][0]["requires_ai_invention"])
+        self.assertEqual(setup["starter_items"][1]["name"], "")
+        self.assertEqual(
+            setup["starter_items"][1]["item_request"],
+            "A compass that points toward unfinished promises.",
+        )
+        self.assertTrue(setup["starter_items"][1]["requires_ai_invention"])
 
     def test_currency_description_defaults_to_structured_denominations(self) -> None:
         setup = normalize_new_game_setup(
@@ -323,7 +405,7 @@ class NewGameSetupTests(unittest.TestCase):
         self.assertIn("specific genre or premise", invention_fields)
         self.assertIn("world context, factions, religions, and locations", invention_fields)
         self.assertIn("distinct starting skill identities", invention_fields)
-        self.assertIn("starter inventory based on character and skills", invention_fields)
+        self.assertNotIn("starter inventory based on character and skills", invention_fields)
         self.assertIn("ai_invention_policy", packet["requirements"])
         self.assertIn("character_generation", packet["requirements"])
         self.assertIn("should default to male", packet["requirements"]["character_generation"])
@@ -339,6 +421,10 @@ class NewGameSetupTests(unittest.TestCase):
         self.assertIn("rather than Syndicate Lore", packet["requirements"]["skill_generation"])
         self.assertIn("currency_generation", packet["requirements"])
         self.assertIn("at least one and at most four", packet["requirements"]["currency_generation"])
+        self.assertIn("mature_content", packet["requirements"])
+        self.assertIn("adults of legal drinking age", packet["requirements"]["mature_content"])
+        self.assertIn("drunken patrons", packet["requirements"]["mature_content"])
+        self.assertIn("fictional in-world slurs", packet["requirements"]["mature_content"])
         self.assertIn("starting_currency_balance", packet["requirements"])
         self.assertIn(
             "game_state/currency.balance",
@@ -346,6 +432,19 @@ class NewGameSetupTests(unittest.TestCase):
         )
         self.assertIn("creative_ideas", packet["requirements"])
         self.assertIn("high-priority style seeds", packet["requirements"]["creative_ideas"])
+        self.assertIn("item_request", packet["requirements"]["starter_inventory"])
+        self.assertIn("no required minimum or maximum", packet["requirements"]["starter_inventory"])
+        self.assertIn("Do not add, split, combine, or pad", packet["requirements"]["starter_inventory"])
+        self.assertIn("starting_items", packet["requirements"]["starter_inventory"])
+        self.assertIn("source_index", packet["requirements"]["starter_inventory"])
+        self.assertIn("Fuel instead of Starting Fuel Amount", packet["requirements"]["starter_inventory"])
+        self.assertIn("Put quantities in quantity, not name", packet["requirements"]["starter_inventory"])
+        self.assertEqual(packet["starter_inventory_contract"]["requested_item_count"], 0)
+        self.assertEqual(
+            packet["starter_inventory_contract"]["count_rule"],
+            "No required minimum or maximum starting item count.",
+        )
+        self.assertEqual(packet["starter_inventory_contract"]["output_field"], "starting_items")
         self.assertIn("creative_ideas", packet)
         self.assertIn("character_generation_guidance", packet)
         self.assertIn(
@@ -387,6 +486,31 @@ class NewGameSetupTests(unittest.TestCase):
         self.assertEqual(packet["current_calendar"]["season_hint"], "spring")
         self.assertEqual(packet["current_weather"], "Clear")
         self.assertIn("calendar_weather_consistency", packet["requirements"])
+
+    def test_setup_packet_does_not_require_large_requested_starter_inventory_count(self) -> None:
+        setup = normalize_new_game_setup(
+            {
+                "starter_items": parse_starter_items_text(
+                    "\n".join(
+                        f"A specialized expedition item number {index}."
+                        for index in range(12)
+                    )
+                )
+            }
+        )
+
+        packet = build_new_game_setup_packet(setup)
+
+        self.assertEqual(packet["starter_inventory_contract"]["requested_item_count"], 12)
+        self.assertEqual(
+            packet["starter_inventory_contract"]["count_rule"],
+            "No required minimum or maximum starting item count.",
+        )
+        self.assertIn(
+            "no required minimum or maximum",
+            packet["requirements"]["starter_inventory"],
+        )
+        self.assertEqual(len(packet["setup"]["starter_items"]), 12)
 
 
 if __name__ == "__main__":

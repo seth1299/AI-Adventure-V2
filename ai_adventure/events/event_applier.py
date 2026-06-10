@@ -2,10 +2,22 @@ from __future__ import annotations
 
 import logging
 import random
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
-from ai_adventure.calendar_system import DEFAULT_START_ELAPSED_MINUTES
+from ai_adventure.calendar_system import (
+    DEFAULT_START_ELAPSED_MINUTES,
+    MINUTES_PER_DAY,
+    build_calendar_snapshot,
+    month_start_day_index,
+    normalize_calendar_settings,
+)
+from ai_adventure.alchemy.ingredients import (
+    CRAFTING_INGREDIENT_CATEGORY_NAMES,
+    is_crafting_ingredient_category,
+    normalize_recipe_ingredients,
+)
 from ai_adventure.context.creative_ideas import CreativeIdeasLibrary
 from ai_adventure.currency import format_currency_amount
 from ai_adventure.locations import clean_player_location_name
@@ -27,6 +39,11 @@ _SKILL_CHECK_GATED_EVENT_TYPES = {
     "SkillXpAddedEvent",
     "SpellLearnedEvent",
 }
+_BAD_LUCK_HISTORY_LIMIT = 8
+_BAD_LUCK_MIN_HISTORY = 5
+_BAD_LUCK_LOW_ROLL_MAX = 10
+_BAD_LUCK_LOW_ROLL_RATIO = 0.70
+_BAD_LUCK_MAX_NUDGE = 3
 
 
 @dataclass(frozen=True)
@@ -52,19 +69,26 @@ class EventApplier:
         self.repository = repository
         self.rng = rng or random.Random()
 
-    def apply_events(self, raw_events: list[dict[str, Any]]) -> list[AppliedEventResult]:
+    def apply_events(
+        self,
+        raw_events: list[dict[str, Any]],
+        *,
+        prior_results: list[AppliedEventResult] | None = None,
+    ) -> list[AppliedEventResult]:
         """
         Applies a list of raw event dictionaries.
 
         Args:
             raw_events: Event objects from Gemini's JSON response.
+            prior_results: Already-applied event results from the same player
+                command, such as pre-narration skill checks.
 
         Returns:
             Application results for every attempted event.
         """
 
         results: list[AppliedEventResult] = []
-        blocking_failure: AppliedEventResult | None = None
+        blocking_failure = _blocking_skill_check_failure(prior_results or [])
 
         for raw_event in raw_events:
             event_type, payload = normalize_event(raw_event)
@@ -375,7 +399,11 @@ class EventApplier:
         if dc is None:
             dc = dc_for_difficulty(payload.get("difficulty"))
 
-        roll = self.rng.randint(1, 20)
+        raw_roll = self.rng.randint(1, 20)
+        luck_nudge = _bad_luck_roll_nudge(
+            self.repository.list_skill_checks(_BAD_LUCK_HISTORY_LIMIT)
+        )
+        roll = min(20, raw_roll + luck_nudge)
         total = roll + bonus
         outcome = "success" if total >= dc else "failure"
 
@@ -395,6 +423,14 @@ class EventApplier:
             dc,
             outcome,
         )
+        if luck_nudge:
+            LOGGER.info(
+                "Applied bad-luck nudge to %s check: raw d20 %s + %s = %s.",
+                name,
+                raw_roll,
+                luck_nudge,
+                roll,
+            )
 
         return AppliedEventResult(
             event_type,
@@ -406,6 +442,8 @@ class EventApplier:
                 "level": level,
                 "bonus": bonus,
                 "roll": roll,
+                "raw_roll": raw_roll,
+                "bad_luck_nudge": luck_nudge,
                 "total": total,
                 "dc": dc,
                 "outcome": outcome,
@@ -506,12 +544,36 @@ class EventApplier:
         if not name:
             return _invalid(event_type, payload, "Recipe name is required.")
 
+        ingredients = normalize_recipe_ingredients(payload.get("ingredients", []))
+
+        if not ingredients:
+            return _invalid(event_type, payload, "Recipe ingredients are required.")
+
+        known_reagent_names = {
+            str(item.get("name", "")).casefold()
+            for item in self.repository.list_item_catalog()
+            if str(item.get("name", "")).strip()
+            and is_crafting_ingredient_category(item.get("category", ""))
+        }
+        unknown_ingredients = [
+            ingredient["reagent_name"]
+            for ingredient in ingredients
+            if ingredient["reagent_name"].casefold() not in known_reagent_names
+        ]
+
+        if unknown_ingredients:
+            return _invalid(
+                event_type,
+                payload,
+                "Recipe ingredients must be known items with category "
+                f"{CRAFTING_INGREDIENT_CATEGORY_NAMES}: "
+                + ", ".join(unknown_ingredients),
+            )
+
         self.repository.add_alchemy_recipe(
             name=name,
-            ingredients=_ingredients_to_list(payload.get("ingredients", [])),
+            ingredients=ingredients,
             result=_first_text(payload, "result", "description"),
-            motions=_as_string_list(payload.get("motions", [])),
-            virtues=_as_string_list(payload.get("virtues", [])),
             notes=_first_text(payload, "notes"),
         )
 
@@ -532,16 +594,31 @@ class EventApplier:
         name = _first_text(payload, "name", "reagent_name")
 
         if not name:
-            return _invalid(event_type, payload, "Reagent name is required.")
+            return _invalid(event_type, payload, "Item name is required.")
+
+        description = _first_text(payload, "description", "notes")
+        location = _first_text(payload, "location", "found_at", "source")
+        uses = _as_string_list(payload.get("uses", []))
+
+        if not description:
+            return _invalid(event_type, payload, "Reagent description is required.")
+
+        if not location:
+            return _invalid(event_type, payload, "Reagent location is required.")
+
+        if not uses:
+            return _invalid(event_type, payload, "Reagent uses are required.")
 
         self.repository.add_alchemy_reagent(
             name=name,
-            material_type=_first_text(payload, "material_type"),
-            qualities=_as_string_list(payload.get("qualities", [])),
-            motions=_as_string_list(payload.get("motions", [])),
-            virtues=_as_string_list(payload.get("virtues", [])),
-            uses=_as_string_list(payload.get("uses", [])),
-            notes=_first_text(payload, "notes", "description"),
+            description=description,
+            location=location,
+            uses=uses,
+        )
+        self.repository.upsert_item_catalog_entry(
+            name=name,
+            category="Material",
+            description=description,
         )
 
         return AppliedEventResult(
@@ -700,22 +777,45 @@ class EventApplier:
             return AppliedEventResult(event_type, "applied", f"Completed quest: {name}.", payload)
 
         self.repository.set_state_value(f"quest.{name}.status", "active")
+        description = _first_text(payload, "description")
+        existing_task = self.repository.get_active_task(name)
+        due_fields = _active_task_due_fields(
+            self.repository,
+            payload,
+            due_date=_first_text(payload, "due_date", "deadline"),
+        )
+        default_fields = _active_task_defaults(
+            self.repository,
+            name=name,
+            category="Quest",
+            description=description,
+            requester=_first_text(payload, "giver", "quest_giver", "requester"),
+            location=_first_text(payload, "turn_in", "location"),
+            reward=_first_text(payload, "reward"),
+            due_date=due_fields["due_date"],
+            existing_task=existing_task,
+        )
         self.repository.upsert_active_task(
             name=name,
             category="Quest",
             status="Active",
-            description=_first_text(payload, "description"),
-            requester=_first_text(payload, "giver", "quest_giver", "requester"),
-            location=_first_text(payload, "turn_in", "location"),
-            reward=_first_text(payload, "reward"),
-            due_date=_first_text(payload, "due_date", "deadline"),
-            notes=_first_text(payload, "notes"),
+            description=description,
+            requester=default_fields["requester"],
+            location=default_fields["location"],
+            reward=default_fields["reward"],
+            due_date=default_fields["due_date"],
+            due_elapsed_minutes=due_fields["due_elapsed_minutes"],
         )
         self.repository.append_history(
             "quest",
-            f"Added quest: {name}. {_first_text(payload, 'description')}",
+            f"Added quest: {name}. {description}",
         )
-        return AppliedEventResult(event_type, "applied", f"Added quest: {name}.", payload)
+        return AppliedEventResult(
+            event_type,
+            "applied",
+            f"Added quest: {name}.",
+            {**payload, "name": name, **default_fields},
+        )
 
     def _apply_active_task_upserted(
         self,
@@ -729,16 +829,41 @@ class EventApplier:
         if not name:
             return _invalid(event_type, payload, "Active task name is required.")
 
-        task = self.repository.upsert_active_task(
+        existing_task = self.repository.get_active_task(name)
+        category = _first_text(payload, "category", "type") or "Task"
+        description = _first_text(payload, "description", "objective", "summary")
+        default_fields = _active_task_defaults(
+            self.repository,
             name=name,
-            category=_first_text(payload, "category", "type") or "Task",
-            status=_first_text(payload, "status") or "Active",
-            description=_first_text(payload, "description", "objective", "summary"),
+            category=category,
+            description=description,
             requester=_first_text(payload, "requester", "giver", "client", "npc"),
             location=_first_text(payload, "location", "turn_in"),
             reward=_first_text(payload, "reward", "payment"),
+            due_date="",
+            existing_task=existing_task,
+        )
+        due_fields = _active_task_due_fields(
+            self.repository,
+            payload,
             due_date=_first_text(payload, "due_date", "deadline", "due"),
-            notes=_first_text(payload, "notes"),
+        )
+        default_fields["due_date"] = _task_field_value(
+            provided=due_fields["due_date"],
+            existing=existing_task,
+            field_name="due_date",
+            default="N/A",
+        )
+        task = self.repository.upsert_active_task(
+            name=name,
+            category=category,
+            status=_first_text(payload, "status") or "Active",
+            description=description,
+            requester=default_fields["requester"],
+            location=default_fields["location"],
+            reward=default_fields["reward"],
+            due_date=default_fields["due_date"],
+            due_elapsed_minutes=due_fields["due_elapsed_minutes"],
         )
 
         if task is None:
@@ -748,7 +873,7 @@ class EventApplier:
             event_type,
             "applied",
             f"Stored active task: {name}.",
-            payload,
+            {**payload, "name": name, **default_fields},
         )
 
     def _apply_active_task_completed(
@@ -802,8 +927,8 @@ class EventApplier:
         """Applies NpcUpsertedEvent."""
 
         raw_display_name = _first_text(payload, "display_name", "visible_name")
-        role = _first_text(payload, "role", "occupation")
-        display_name = _safe_generated_npc_display_name(raw_display_name, role)
+        raw_role = _first_text(payload, "role", "occupation")
+        display_name = _safe_generated_npc_display_name(raw_display_name, raw_role)
         internal_name = _first_text(payload, "internal_name")
         npc_id = _first_text(payload, "npc_id", "id") or internal_name
         name = (
@@ -821,27 +946,43 @@ class EventApplier:
                 "NPC name, display_name, role, or npc_id is required.",
             )
 
+        role = raw_role or _fallback_npc_role(display_name=display_name, name=name)
+        location = _first_text(payload, "location") or _current_player_location(self.repository)
+        public_description = _first_text(
+            payload,
+            "public_description",
+            "description",
+            "appearance",
+        )
+        player_facing_information = _first_text(
+            payload,
+            "player_facing_information",
+            "player_facing_summary",
+            "player_known_information",
+        )
+        knowledge_scope = _npc_knowledge_scope(
+            payload,
+            role=role,
+            location=location,
+        )
+        known_facts = _npc_known_facts(
+            payload,
+            player_facing_information=player_facing_information,
+            public_description=public_description,
+            role=role,
+            location=location,
+        )
+
         npc = self.repository.upsert_npc(
             npc_id=npc_id,
             name=name,
             display_name=display_name,
             role=role,
-            location=_first_text(payload, "location"),
-            public_description=_first_text(
-                payload,
-                "public_description",
-                "description",
-                "appearance",
-            ),
-            player_facing_information=_first_text(
-                payload,
-                "player_facing_information",
-                "player_facing_summary",
-                "player_known_information",
-            ),
-            knowledge_scope=_as_string_list(payload.get("knowledge_scope", [])),
-            known_facts=_as_string_list(payload.get("known_facts", [])),
-            disposition=_first_text(payload, "disposition"),
+            location=location,
+            public_description=public_description,
+            player_facing_information=player_facing_information,
+            knowledge_scope=knowledge_scope,
+            known_facts=known_facts,
         )
 
         if npc is None:
@@ -871,7 +1012,7 @@ class EventApplier:
             name=_first_text(payload, "name", "npc_name"),
             facts=facts,
             role=_first_text(payload, "role", "occupation"),
-            location=_first_text(payload, "location"),
+            location=_first_text(payload, "location") or _current_player_location(self.repository),
         )
 
         if npc is None:
@@ -951,6 +1092,495 @@ def _first_text(payload: dict[str, Any], *keys: str) -> str:
     return ""
 
 
+def _blocking_skill_check_failure(
+    results: list[AppliedEventResult],
+) -> AppliedEventResult | None:
+    """Returns the first failed skill check result from this player command."""
+
+    for result in results:
+        if (
+            result.event_type == "SkillCheckRequestedEvent"
+            and result.status == "applied"
+            and str(result.payload.get("outcome", "")).casefold() == "failure"
+        ):
+            return result
+
+    return None
+
+
+def _bad_luck_roll_nudge(recent_checks: list[dict[str, Any]]) -> int:
+    """Returns a small d20 nudge when recent skill rolls are unusually cold."""
+
+    if len(recent_checks) < _BAD_LUCK_MIN_HISTORY:
+        return 0
+
+    recent_rolls = [
+        roll
+        for roll in (
+            _safe_int(check.get("roll"), default=0)
+            for check in recent_checks[-_BAD_LUCK_HISTORY_LIMIT:]
+        )
+        if roll is not None and 1 <= roll <= 20
+    ]
+
+    if len(recent_rolls) < _BAD_LUCK_MIN_HISTORY:
+        return 0
+
+    low_roll_count = sum(
+        1 for roll in recent_rolls if roll <= _BAD_LUCK_LOW_ROLL_MAX
+    )
+    low_roll_ratio = low_roll_count / len(recent_rolls)
+
+    if low_roll_ratio < _BAD_LUCK_LOW_ROLL_RATIO:
+        return 0
+
+    extra_low_rolls = low_roll_count - (len(recent_rolls) // 2)
+    return max(1, min(_BAD_LUCK_MAX_NUDGE, extra_low_rolls))
+
+
+def _current_player_location(repository: SaveRepository) -> str:
+    """Returns the current player location for event defaulting."""
+
+    return clean_player_location_name(repository.get_state_value("location", "")) or "Unknown"
+
+
+def _active_task_defaults(
+    repository: SaveRepository,
+    *,
+    name: str,
+    category: str,
+    description: str,
+    requester: str,
+    location: str,
+    reward: str,
+    due_date: str,
+    existing_task: dict[str, Any] | None = None,
+) -> dict[str, str]:
+    """Fills player-visible active-task fields with meaningful defaults."""
+
+    is_personal = _looks_like_personal_task(
+        name=name,
+        category=category,
+        description=description,
+        requester=requester,
+    )
+
+    return {
+        "requester": _task_field_value(
+            provided=requester,
+            existing=existing_task,
+            field_name="requester",
+            default="Self" if is_personal else "Unknown",
+        ),
+        "location": _task_field_value(
+            provided=location,
+            existing=existing_task,
+            field_name="location",
+            default=_default_task_location(
+                repository,
+                name=name,
+                category=category,
+                description=description,
+                is_personal=is_personal,
+            ),
+        ),
+        "reward": _task_field_value(
+            provided=reward,
+            existing=existing_task,
+            field_name="reward",
+            default="N/A" if is_personal else "Unknown",
+        ),
+        "due_date": _task_field_value(
+            provided=due_date,
+            existing=existing_task,
+            field_name="due_date",
+            default="N/A",
+        ),
+    }
+
+
+def _task_field_value(
+    *,
+    provided: str,
+    existing: dict[str, Any] | None,
+    field_name: str,
+    default: str,
+) -> str:
+    """Returns provided text, preserves existing text, or supplies a default."""
+
+    clean_provided = str(provided or "").strip()
+
+    if clean_provided:
+        return clean_provided
+
+    if existing is not None and str(existing.get(field_name, "")).strip():
+        return ""
+
+    return default
+
+
+def _looks_like_personal_task(
+    *,
+    name: str,
+    category: str,
+    description: str,
+    requester: str,
+) -> bool:
+    """Returns True when a task appears self-directed."""
+
+    clean_requester = requester.strip().casefold()
+
+    if clean_requester in {"self", "player", "player character", "me"}:
+        return True
+
+    if clean_requester:
+        return False
+
+    category_text = category.casefold()
+
+    if any(
+        marker in category_text
+        for marker in ["personal", "goal", "research", "training", "craft"]
+    ):
+        return True
+
+    task_text = f"{name} {description}".casefold()
+    return any(
+        marker in task_text
+        for marker in [
+            "practice",
+            "train",
+            "research",
+            "study",
+            "learn",
+            "craft",
+            "create",
+            "make",
+            "build",
+            "brew",
+            "prepare",
+            "repair",
+            "upgrade",
+        ]
+    )
+
+
+def _default_task_location(
+    repository: SaveRepository,
+    *,
+    name: str,
+    category: str,
+    description: str,
+    is_personal: bool,
+) -> str:
+    """Chooses a reasonable active-task location fallback."""
+
+    task_text = f"{name} {category} {description}".casefold()
+
+    if is_personal and any(
+        marker in task_text
+        for marker in [
+            "alchemy",
+            "brew",
+            "craft",
+            "create",
+            "forge",
+            "make",
+            "repair",
+            "workshop",
+        ]
+    ):
+        return "Player's Workshop"
+
+    return _current_player_location(repository)
+
+
+def _active_task_due_fields(
+    repository: SaveRepository,
+    payload: dict[str, Any],
+    *,
+    due_date: str,
+) -> dict[str, Any]:
+    """Resolves active-task due text to an absolute in-world minute when possible."""
+
+    explicit_elapsed = _active_task_due_elapsed_from_payload(payload)
+
+    if explicit_elapsed is not None:
+        if explicit_elapsed < 0:
+            return {"due_date": "N/A", "due_elapsed_minutes": -1}
+
+        return {
+            "due_date": _format_due_elapsed_minutes(repository, explicit_elapsed),
+            "due_elapsed_minutes": explicit_elapsed,
+        }
+
+    clean_due_date = str(due_date or "").strip()
+
+    if not clean_due_date:
+        return {"due_date": "", "due_elapsed_minutes": None}
+
+    if _is_no_deadline(clean_due_date):
+        return {"due_date": "N/A", "due_elapsed_minutes": -1}
+
+    resolved_elapsed = _resolve_due_text_to_elapsed_minutes(
+        repository,
+        clean_due_date,
+        payload,
+    )
+
+    if resolved_elapsed is None:
+        return {"due_date": clean_due_date, "due_elapsed_minutes": None}
+
+    return {
+        "due_date": _format_due_elapsed_minutes(repository, resolved_elapsed),
+        "due_elapsed_minutes": resolved_elapsed,
+    }
+
+
+def _active_task_due_elapsed_from_payload(payload: dict[str, Any]) -> int | None:
+    """Reads an exact active-task due minute from supported payload fields."""
+
+    for key in ["due_elapsed_minutes", "deadline_elapsed_minutes"]:
+        if key not in payload:
+            continue
+
+        value = payload.get(key)
+
+        if value is None or str(value).strip().upper() in {"AUTO", "SAME", "SKIP"}:
+            continue
+
+        parsed_value = _safe_int(value, default=-1)
+        return max(-1, parsed_value if parsed_value is not None else -1)
+
+    return None
+
+
+def _resolve_due_text_to_elapsed_minutes(
+    repository: SaveRepository,
+    due_text: str,
+    payload: dict[str, Any],
+) -> int | None:
+    """Resolves common relative or calendar due text to an absolute minute."""
+
+    clean_text = due_text.strip()
+    folded_text = clean_text.casefold()
+    parsed_current_elapsed = _safe_int(
+        repository.get_state_value(
+            "elapsed_minutes",
+            str(DEFAULT_START_ELAPSED_MINUTES),
+        ),
+        default=DEFAULT_START_ELAPSED_MINUTES,
+    )
+    current_elapsed = max(
+        0,
+        parsed_current_elapsed
+        if parsed_current_elapsed is not None
+        else DEFAULT_START_ELAPSED_MINUTES,
+    )
+    settings = normalize_calendar_settings(repository.get_calendar_settings())
+    current_day_index = current_elapsed // MINUTES_PER_DAY
+    days_per_week = int(settings["days_per_week"])
+    due_time = _resolve_due_time_of_day_minutes(payload, clean_text)
+
+    if "end of" in folded_text and "week" in folded_text:
+        days_until_due = (days_per_week - 1) - (current_day_index % days_per_week)
+        return (current_day_index + days_until_due) * MINUTES_PER_DAY + due_time
+
+    if "tomorrow" in folded_text:
+        return (current_day_index + 1) * MINUTES_PER_DAY + due_time
+
+    if "today" in folded_text:
+        return current_day_index * MINUTES_PER_DAY + due_time
+
+    relative_days = _relative_due_days(folded_text, days_per_week)
+
+    if relative_days is not None:
+        return (current_day_index + relative_days) * MINUTES_PER_DAY + due_time
+
+    exact_day_index = _exact_due_day_index(clean_text, settings)
+
+    if exact_day_index is not None:
+        return exact_day_index * MINUTES_PER_DAY + due_time
+
+    return None
+
+
+def _resolve_due_time_of_day_minutes(payload: dict[str, Any], due_text: str) -> int:
+    """Resolves a due time, defaulting to a concrete late-day deadline."""
+
+    explicit_minutes = _optional_int(payload, "due_time_of_day_minutes", "time_of_day_minutes")
+
+    if explicit_minutes is not None:
+        return max(0, min(MINUTES_PER_DAY - 1, explicit_minutes))
+
+    for key in ["due_time", "deadline_time", "time"]:
+        raw_time = str(payload.get(key, "")).strip()
+
+        if raw_time:
+            parsed_time = _parse_time_of_day(raw_time)
+
+            if parsed_time is not None:
+                return parsed_time
+
+    parsed_text_time = _parse_time_of_day(due_text)
+
+    if parsed_text_time is not None:
+        return parsed_text_time
+
+    folded_text = due_text.casefold()
+
+    if "end of" in folded_text or "by night" in folded_text:
+        return MINUTES_PER_DAY - 1
+
+    if "dawn" in folded_text:
+        return 6 * 60
+
+    return 17 * 60
+
+
+def _parse_time_of_day(text: str) -> int | None:
+    """Parses common clock and narrative time strings."""
+
+    folded_text = text.strip().casefold()
+
+    if not folded_text:
+        return None
+
+    if "midnight" in folded_text:
+        return 0
+
+    if "noon" in folded_text:
+        return 12 * 60
+
+    clock_match = re.search(
+        r"\b(\d{1,2})(?::(\d{2}))?\s*(a\.?m\.?|p\.?m\.?)?\b",
+        folded_text,
+    )
+
+    if clock_match is None:
+        return None
+
+    hour = int(clock_match.group(1))
+    minute = int(clock_match.group(2) or 0)
+    suffix = str(clock_match.group(3) or "").replace(".", "")
+    matched_text = clock_match.group(0)
+
+    if minute > 59:
+        return None
+
+    if not suffix and ":" not in matched_text:
+        return None
+
+    if suffix in {"am", "pm"}:
+        if hour < 1 or hour > 12:
+            return None
+
+        if suffix == "am":
+            hour = hour % 12
+        else:
+            hour = (hour % 12) + 12
+    elif hour > 23:
+        return None
+
+    return hour * 60 + minute
+
+
+def _relative_due_days(text: str, days_per_week: int) -> int | None:
+    """Parses relative due phrases such as 'in 3 days' or 'in two weeks'."""
+
+    match = re.search(r"\bin\s+([a-z0-9]+)\s+(day|days|week|weeks)\b", text)
+
+    if match is None:
+        return None
+
+    amount = _number_word_value(match.group(1))
+
+    if amount is None:
+        return None
+
+    unit = match.group(2)
+    multiplier = days_per_week if unit.startswith("week") else 1
+    return max(0, amount * multiplier)
+
+
+def _number_word_value(text: str) -> int | None:
+    """Parses a small integer or common English number word."""
+
+    clean_text = text.strip().casefold()
+
+    if clean_text.isdigit():
+        return int(clean_text)
+
+    return {
+        "one": 1,
+        "two": 2,
+        "three": 3,
+        "four": 4,
+        "five": 5,
+        "six": 6,
+        "seven": 7,
+        "eight": 8,
+        "nine": 9,
+        "ten": 10,
+        "eleven": 11,
+        "twelve": 12,
+    }.get(clean_text)
+
+
+def _exact_due_day_index(text: str, settings: dict[str, Any]) -> int | None:
+    """Parses simple month/day due dates using the active calendar settings."""
+
+    folded_text = text.strip().casefold()
+    month_names = [
+        (index, str(name).strip())
+        for index, name in enumerate(settings["month_names"])
+        if str(name).strip()
+    ]
+    month_names.sort(key=lambda item: len(item[1]), reverse=True)
+
+    for month_index, month_name in month_names:
+        folded_month = month_name.casefold()
+
+        if not folded_text.startswith(folded_month):
+            continue
+
+        remainder = text[len(month_name):].strip(" ,")
+        match = re.match(r"(\d{1,2})(?:\D+year\s+(\d+))?", remainder, flags=re.IGNORECASE)
+
+        if match is None:
+            continue
+
+        days_per_month = int(settings["days_per_week"]) * int(settings["weeks_per_month"])
+        day_of_month = max(1, min(days_per_month, int(match.group(1))))
+        year = int(match.group(2) or 1)
+        return month_start_day_index(year, month_index, settings) + day_of_month - 1
+
+    return None
+
+
+def _format_due_elapsed_minutes(repository: SaveRepository, elapsed_minutes: int) -> str:
+    """Formats an absolute due minute with the current save calendar settings."""
+
+    return build_calendar_snapshot(
+        max(0, elapsed_minutes),
+        repository.get_calendar_settings(),
+    )["display_label"]
+
+
+def _is_no_deadline(text: str) -> bool:
+    """Returns True for no-deadline task values."""
+
+    return text.strip().casefold() in {
+        "",
+        "n/a",
+        "na",
+        "none",
+        "no deadline",
+        "no known deadline",
+        "not applicable",
+    }
+
+
 def _first_int(payload: dict[str, Any], default: int, *keys: str) -> int:
     """Reads the first integer value, with fallback."""
 
@@ -1018,6 +1648,66 @@ def _safe_generated_npc_display_name(display_name: str, role: str) -> str:
     return ""
 
 
+def _fallback_npc_role(*, display_name: str, name: str) -> str:
+    """Builds a conservative role when Gemini omits the NPC role field."""
+
+    clean_display_name = display_name.strip()
+    clean_name = name.strip()
+
+    if clean_display_name:
+        return clean_display_name
+
+    return clean_name or "Unspecified NPC"
+
+
+def _npc_knowledge_scope(
+    payload: dict[str, Any],
+    *,
+    role: str,
+    location: str,
+) -> list[str]:
+    """Returns an NPC knowledge scope, defaulting to safe observable topics."""
+
+    knowledge_scope = _as_string_list(payload.get("knowledge_scope", []))
+
+    if knowledge_scope:
+        return knowledge_scope
+
+    clean_role = role.strip() or "this NPC"
+    clean_location = location.strip() or "the current scene"
+    return [
+        f"Visible behavior and public activity involving {clean_role}.",
+        f"Public information around {clean_location}.",
+    ]
+
+
+def _npc_known_facts(
+    payload: dict[str, Any],
+    *,
+    player_facing_information: str,
+    public_description: str,
+    role: str,
+    location: str,
+) -> list[str]:
+    """Returns known facts without inventing private player information."""
+
+    known_facts = _as_string_list(payload.get("known_facts", []))
+
+    if known_facts:
+        return known_facts
+
+    for candidate in [
+        player_facing_information,
+        public_description,
+        f"{role} encountered at {location}.",
+    ]:
+        clean_candidate = candidate.strip()
+        if clean_candidate:
+            return [clean_candidate]
+
+    return ["No private facts about the player are established."]
+
+
 def _is_banned_creative_term(value: str) -> bool:
     """Returns True when a value exactly matches a banned generated term."""
 
@@ -1034,16 +1724,3 @@ def _is_banned_creative_term(value: str) -> bool:
             _BANNED_CREATIVE_TERMS = set()
 
     return value.strip().casefold() in _BANNED_CREATIVE_TERMS
-
-
-def _ingredients_to_list(value: Any) -> list[str]:
-    """Normalizes recipe ingredients."""
-
-    if isinstance(value, dict):
-        return [
-            f"{name}: {quantity}"
-            for name, quantity in value.items()
-            if str(name).strip()
-        ]
-
-    return _as_string_list(value)

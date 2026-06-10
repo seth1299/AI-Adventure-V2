@@ -2,12 +2,26 @@ from __future__ import annotations
 
 from typing import Any
 
+from ai_adventure.alchemy.ingredients import (
+    COMMON_MEASUREMENT_UNITS,
+    CRAFTING_INGREDIENT_CATEGORY_NAMES,
+)
 from ai_adventure.alchemy.rulebook import AlchemyRulebook, AlchemyRulebookLoader
 from ai_adventure.context.creative_ideas import CreativeIdeasLibrary
 from ai_adventure.context.models import ContextLibrary
 from ai_adventure.context.reference_loader import ContextReferenceLoader
 from ai_adventure.currency import format_currency_amount
 from ai_adventure.core.models import AdventureState
+
+
+MAX_CONTEXT_TEXT_CHARS = 1200
+MAX_SHORT_CONTEXT_TEXT_CHARS = 500
+MAX_CONTEXT_DICT_ITEMS = 50
+MAX_CONTEXT_LIST_ITEMS = 40
+MAX_INVENTORY_CONTEXT_ITEMS = 50
+MAX_ITEM_CATALOG_CONTEXT_ITEMS = 60
+MAX_CRAFTING_CONTEXT_ENTRIES = 40
+MAX_ACTIVE_TASK_CONTEXT_ITEMS = 40
 
 
 KEYWORD_TAGS: dict[str, set[str]] = {
@@ -201,6 +215,7 @@ class AiContextBuilder:
         relevant_npcs: list[dict[str, Any]] | None = None,
         valid_music_tracks: list[str] | None = None,
         current_music: str | None = None,
+        resolved_skill_checks: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         """
         Builds the context packet for one story turn.
@@ -211,6 +226,7 @@ class AiContextBuilder:
             relevant_npcs: NPC memory profiles likely relevant this turn.
             valid_music_tracks: Playable background music filenames.
             current_music: Currently selected background music filename.
+            resolved_skill_checks: Skill checks already resolved for this command.
 
         Returns:
             JSON-serializable context packet.
@@ -231,6 +247,20 @@ class AiContextBuilder:
             selected_tags,
             max_sections=self.max_reference_sections,
         )
+        clean_relevant_npcs = [
+            _npc_context_profile(npc)
+            for npc in (relevant_npcs or [])
+        ]
+        journal_share_with_ai = _coerce_bool(
+            state.settings.values.get("journal.share_with_ai", False),
+            default=False,
+        )
+        journal_notes = ""
+
+        if journal_share_with_ai:
+            journal_notes = _compact_text(
+                state.settings.values.get("journal.private_notes", "")
+            )
 
         return {
             "schema_version": 1,
@@ -245,13 +275,16 @@ class AiContextBuilder:
                 "adventure_title": state.metadata.title,
                 "player": {
                     "name": state.player.name,
-                    "appearance": state.player.appearance,
-                    "backstory": state.player.backstory,
-                    "condition": state.player.condition,
-                    "notes": state.player.notes,
+                    "appearance": _compact_text(state.player.appearance),
+                    "backstory": _compact_text(state.player.backstory),
+                    "condition": _compact_text(
+                        state.player.condition,
+                        max_chars=MAX_SHORT_CONTEXT_TEXT_CHARS,
+                    ),
+                    "notes": _compact_text(state.player.notes),
                 },
                 "player_ai_preferences": {
-                    "additional_context": str(
+                    "additional_context": _compact_text(
                         state.settings.values.get("ai.additional_context", "")
                     ),
                     "rules": (
@@ -261,17 +294,30 @@ class AiContextBuilder:
                         "structured response rules."
                     ),
                 },
+                "journal": {
+                    "share_with_ai": journal_share_with_ai,
+                    "player_notes": journal_notes,
+                    "rules": (
+                        "Use player_notes only when share_with_ai is true. "
+                        "These are player-authored journal notes, not verified "
+                        "world facts unless supported by established state or "
+                        "story history."
+                    ),
+                },
                 "scene": {
                     "location": state.world.location,
                     "time": state.calendar.display_label,
                     "weather": state.world.weather,
-                    "flags": state.world.flags,
+                    "flags": _compact_mapping(state.world.flags),
                 },
                 "world_profile": {
-                    "summary": str(state.settings.values.get("world.summary", "")),
-                    "genre": str(state.settings.values.get("world.genre", "")),
-                    "game_style": str(state.settings.values.get("world.game_style", "")),
-                    "setup_context": str(state.settings.values.get("world.setup_context", "")),
+                    "summary": _compact_text(state.settings.values.get("world.summary", "")),
+                    "genre": _compact_text(
+                        state.settings.values.get("world.genre", ""),
+                        max_chars=MAX_SHORT_CONTEXT_TEXT_CHARS,
+                    ),
+                    "game_style": _compact_text(state.settings.values.get("world.game_style", "")),
+                    "setup_context": _compact_text(state.settings.values.get("world.setup_context", "")),
                 },
                 "calendar": {
                     "current": state.calendar.to_dict(),
@@ -297,11 +343,34 @@ class AiContextBuilder:
                             "name": item.name,
                             "category": item.category,
                             "quantity": item.quantity,
-                            "description": item.description,
+                            "description": _compact_text(item.description),
                             "value_base_units": item.value_base_units,
                         }
-                        for item in state.inventory.items
+                        for item in state.inventory.items[:MAX_INVENTORY_CONTEXT_ITEMS]
                     ],
+                },
+                "item_catalog": {
+                    "items": [
+                        {
+                            "name": item.name,
+                            "category": item.category,
+                            "description": _compact_text(item.description),
+                            "value_base_units": item.value_base_units,
+                        }
+                        for item in state.item_catalog.items[:MAX_ITEM_CATALOG_CONTEXT_ITEMS]
+                    ],
+                    "rules": {
+                        "purpose": (
+                            "This is the durable master list of known item "
+                            "definitions. It may include items the player no "
+                            "longer owns."
+                        ),
+                        "possession_rule": (
+                            "Only state.inventory.items are current possessions. "
+                            "Use item_catalog to remember descriptions, categories, "
+                            "and values for previously seen items."
+                        ),
+                    },
                 },
                 "currency": {
                     "balance": state.currency.balance_base_units,
@@ -313,7 +382,7 @@ class AiContextBuilder:
                         state.currency.denominations,
                     ),
                     "denominations": state.currency.denominations,
-                    "world_description": str(
+                    "world_description": _compact_text(
                         state.settings.values.get("currency.description", "")
                     ),
                     "baseline_unit": (
@@ -341,11 +410,34 @@ class AiContextBuilder:
                 },
                 "alchemy": {
                     "known_reagents": [
-                        reagent.to_dict() for reagent in state.alchemy.known_reagents
+                        _compact_context_value(reagent.to_dict())
+                        for reagent in state.alchemy.known_reagents[
+                            :MAX_CRAFTING_CONTEXT_ENTRIES
+                        ]
                     ],
                     "known_recipes": [
-                        recipe.to_dict() for recipe in state.alchemy.known_recipes
+                        _compact_context_value(recipe.to_dict())
+                        for recipe in state.alchemy.known_recipes[
+                            :MAX_CRAFTING_CONTEXT_ENTRIES
+                        ]
                     ],
+                    "rules": {
+                        "reagent_fields": (
+                            "Crafting items/materials use only name, description, "
+                            "location, and uses as player-known structured fields."
+                        ),
+                        "recipe_ingredient_rule": (
+                            "Recipe ingredients are structured entries that must "
+                            "use item names from state.item_catalog.items whose "
+                            "category is one of "
+                            f"{CRAFTING_INGREDIENT_CATEGORY_NAMES}, plus quantity, "
+                            "measure_amount, and measure_unit. "
+                            "state.alchemy.known_reagents stores crafting knowledge, "
+                            "but item_catalog categories decide whether an item can "
+                            "be chosen as a recipe ingredient."
+                        ),
+                        "common_measurement_units": list(COMMON_MEASUREMENT_UNITS),
+                    },
                 },
                 "skills": {
                     "rules": {
@@ -360,7 +452,20 @@ class AiContextBuilder:
                             "searching, researching, identifying, crafting, alchemy "
                             "experiments, persuasion, stealth, combat, and any named "
                             "skill use unless the action is trivial and risk-free. "
+                            "Routine movement, paying a known price, receiving "
+                            "ordinary goods, eating, drinking, and casual conversation "
+                            "are not checks unless the player adds a contested, risky, "
+                            "hidden, time-sensitive, or deceptive goal. "
                             "The Python application resolves the roll."
+                        ),
+                        "resolved_check_rule": (
+                            "When resolved_checks_this_turn is non-empty, narrate "
+                            "this player command from those authoritative results. "
+                            "Do not request duplicate checks for those skills. Low "
+                            "failed rolls should create real setbacks or costs; very "
+                            "high successful rolls should produce a cleaner, richer, "
+                            "faster, or more advantageous result. Never mention dice "
+                            "or roll numbers in player-facing narration."
                         ),
                         "xp_rule": (
                             "Suggest SkillXpAddedEvent only after meaningful use, "
@@ -375,6 +480,11 @@ class AiContextBuilder:
                     "recent_checks": [
                         check.to_dict() for check in state.skills.recent_checks
                     ],
+                    "resolved_checks_this_turn": [
+                        dict(check)
+                        for check in (resolved_skill_checks or [])
+                        if isinstance(check, dict)
+                    ],
                 },
                 "active_tasks": {
                     "rules": {
@@ -386,7 +496,18 @@ class AiContextBuilder:
                         "upsert_rule": (
                             "Suggest ActiveTaskUpsertedEvent when a new task appears "
                             "or an existing task changes status, description, reward, "
-                            "requester, location, due date, or notes."
+                            "requester, location, due date, or exact due elapsed minute."
+                        ),
+                        "field_completion_rule": (
+                            "Do not leave visible task fields blank. Use Self for "
+                            "personal goals, N/A for no reward or no deadline, and "
+                            "a logical player-known location for where the task is "
+                            "done, picked up, completed, or turned in. Use Unknown "
+                            "only when a real value exists but is unclear. Do not add "
+                            "Notes or other extra active-task fields. For real "
+                            "deadlines, include an exact due_elapsed_minutes value; "
+                            "the app will display it with the current calendar and "
+                            "time settings."
                         ),
                         "completion_rule": (
                             "Suggest ActiveTaskCompletedEvent or QuestCompletedEvent "
@@ -395,7 +516,8 @@ class AiContextBuilder:
                         ),
                     },
                     "tasks": [
-                        task.to_dict() for task in state.active_tasks.tasks
+                        _active_task_context(task)
+                        for task in state.active_tasks.tasks[:MAX_ACTIVE_TASK_CONTEXT_ITEMS]
                     ],
                 },
                 "audio": {
@@ -435,9 +557,12 @@ class AiContextBuilder:
                             "When introducing a meaningful new NPC, suggest "
                             "NpcUpsertedEvent with internal name, player-visible "
                             "display_name, internal role, location, public "
-                            "description, player-facing information, and plausible "
-                            "knowledge scope. role is for AI memory and should not "
-                            "replace player_facing_information."
+                            "description, player-facing information, knowledge_scope, "
+                            "and known_facts. role is for AI memory and should not "
+                            "replace player_facing_information. location should be "
+                            "a meaningful player-known place, usually the current "
+                            "scene location, and should not be blank. Do not add "
+                            "unsupported NPC fields such as disposition."
                         ),
                         "multiple_npc_rule": (
                             "If one turn introduces multiple distinct meaningful NPCs, "
@@ -460,7 +585,7 @@ class AiContextBuilder:
                             "plans, or GM-only facts there."
                         ),
                     },
-                    "relevant": relevant_npcs or [],
+                    "relevant": clean_relevant_npcs,
                 },
             },
             "rulebooks": self._build_rulebook_context(
@@ -469,7 +594,7 @@ class AiContextBuilder:
             ),
             "creative_ideas": self._build_creative_ideas_context(selected_tags),
             "recent_history": [
-                entry.to_dict()
+                _history_entry_context(entry)
                 for entry in state.history.entries[-self.max_history_entries :]
             ],
             "reference_sections": [
@@ -478,7 +603,6 @@ class AiContextBuilder:
             "response_contract": {
                 "response": (
                     "Required string. Player-facing narration only. "
-                    "Never include legacy double-bracket tags."
                 ),
                 "suggested_actions": (
                     "Array of 3-4 suggested player actions for in-game turns. "
@@ -493,9 +617,16 @@ class AiContextBuilder:
                 "skill_checks": (
                     "For uncertain actions, suggest SkillCheckRequestedEvent with "
                     "skill_name and either dc or difficulty before any outcome event. "
+                    "When state.skills.resolved_checks_this_turn is non-empty, those "
+                    "checks are already resolved for the current player command; "
+                    "narrate the outcome from those results and do not request "
+                    "duplicate checks for those skills. "
                     "Do not narrate final success, failure, discoveries, harvested "
                     "items, crafted products, persuaded NPC outcomes, stealth results, "
-                    "or combat results until the application has resolved the check."
+                    "or combat results until the application has resolved the check. "
+                    "Do not request checks for routine movement, ordinary purchases, "
+                    "meals, drinking, or casual conversation unless the player adds "
+                    "a contested, risky, hidden, time-sensitive, or deceptive goal."
                 ),
                 "calendar_time": (
                     "Use state.calendar.current for date, day names, seasons, and "
@@ -523,15 +654,41 @@ class AiContextBuilder:
                 "player_ai_preferences": (
                     "Use state.player_ai_preferences.additional_context as persistent "
                     "player-provided guidance for narration style, boundaries, and "
-                    "miscellaneous preferences. This is intentionally AI-facing, "
-                    "unlike the private Journal."
+                    "miscellaneous preferences. This is always AI-facing; Journal "
+                    "notes are only AI-facing when state.journal.share_with_ai is true."
+                ),
+                "journal": (
+                    "When state.journal.share_with_ai is true, use "
+                    "state.journal.player_notes as player-authored notes, theories, "
+                    "reminders, and priorities. Treat them as the player's perspective, "
+                    "not automatically true world facts. When share_with_ai is false, "
+                    "ignore Journal notes because they are private."
+                ),
+                "mature_content": (
+                    "Assume the player and player character are adults of legal "
+                    "drinking age unless the character profile explicitly says "
+                    "otherwise. Alcohol, drunken patrons, gambling, violence, blood, "
+                    "corpses, criminality, cruelty, corruption, and fictional "
+                    "oppressive social attitudes are allowed when genre-appropriate. "
+                    "Use fictional in-world slurs only for fictional groups; do not "
+                    "use real-world slurs against protected classes."
                 ),
                 "active_tasks": (
                     "Use state.active_tasks.tasks to remember current quests, "
                     "commissions, custom orders, pending purchases, and other "
                     "ongoing obligations. Suggest ActiveTaskUpsertedEvent for new "
                     "or changed tasks and ActiveTaskCompletedEvent when one is no "
-                    "longer active."
+                    "longer active. Use due_elapsed_minutes for exact deadlines "
+                    "instead of vague due-date prose."
+                ),
+                "item_catalog": (
+                    "Use state.item_catalog.items as the master list of remembered "
+                    "item definitions. It preserves descriptions, categories, and "
+                    "values for items even after they leave inventory. Do not treat "
+                    "catalog entries as possessions unless they also appear in "
+                    "state.inventory.items. Recipe ingredients may only use "
+                    "catalog items whose category is one of "
+                    f"{CRAFTING_INGREDIENT_CATEGORY_NAMES}."
                 ),
                 "background_music": (
                     "When StatusUpdatedEvent.location changes to a substantially different environment type, compare state.audio.current_music to state.audio.valid_music_tracks."
@@ -554,6 +711,9 @@ class AiContextBuilder:
                     "only for facts the NPC plausibly learned this turn. In "
                     "NpcUpsertedEvent, display_name and player_facing_information are "
                     "player-visible and must not include secrets or undiscovered names. "
+                    "role, location, public_description, knowledge_scope, and known_facts "
+                    "are required NPC memory fields; do not add unsupported fields such "
+                    "as disposition. "
                     "Before creating an NPC, inspect state.npcs.relevant. If the same "
                     "person is already listed, reuse that existing npc_id/internal "
                     "identifier and update the one profile; do not create a second "
@@ -633,6 +793,30 @@ class AiContextBuilder:
         return self.creative_ideas.select_for_tags(selected_tags)
 
 
+def _active_task_context(task) -> dict[str, Any]:
+    """Returns only the AI-supported active-task fields."""
+
+    return {
+        "name": _compact_text(task.name, max_chars=MAX_SHORT_CONTEXT_TEXT_CHARS),
+        "category": _compact_text(task.category, max_chars=MAX_SHORT_CONTEXT_TEXT_CHARS),
+        "status": _compact_text(task.status, max_chars=MAX_SHORT_CONTEXT_TEXT_CHARS),
+        "description": _compact_text(task.description),
+        "requester": _compact_text(task.requester, max_chars=MAX_SHORT_CONTEXT_TEXT_CHARS),
+        "location": _compact_text(task.location, max_chars=MAX_SHORT_CONTEXT_TEXT_CHARS),
+        "reward": _compact_text(task.reward, max_chars=MAX_SHORT_CONTEXT_TEXT_CHARS),
+        "due_date": _compact_text(task.due_date, max_chars=MAX_SHORT_CONTEXT_TEXT_CHARS),
+        "due_elapsed_minutes": task.due_elapsed_minutes,
+    }
+
+
+def _history_entry_context(entry) -> dict[str, Any]:
+    """Returns a compact history entry for AI context."""
+
+    data = entry.to_dict()
+    data["content"] = _compact_text(data.get("content", ""))
+    return data
+
+
 def infer_context_tags(player_command: str) -> set[str]:
     """
     Infers relevant context tags from a player command.
@@ -652,3 +836,91 @@ def infer_context_tags(player_command: str) -> set[str]:
             tags.add(tag)
 
     return tags
+
+
+def _npc_context_profile(npc: dict[str, Any]) -> dict[str, Any]:
+    """Returns NPC fields that belong in AI memory context."""
+
+    allowed_fields = {
+        "npc_id",
+        "name",
+        "display_name",
+        "role",
+        "location",
+        "public_description",
+        "player_facing_information",
+        "knowledge_scope",
+        "known_facts",
+        "created_at",
+        "updated_at",
+    }
+    return {
+        key: _compact_context_value(value)
+        for key, value in npc.items()
+        if key in allowed_fields
+    }
+
+
+def _compact_text(value: Any, *, max_chars: int = MAX_CONTEXT_TEXT_CHARS) -> str:
+    """Returns bounded text for AI context fields."""
+
+    text = str(value or "").strip()
+
+    if len(text) <= max_chars:
+        return text
+
+    return f"{text[: max_chars - 3].rstrip()}..."
+
+
+def _compact_mapping(
+    mapping: dict[str, Any],
+    *,
+    max_items: int = MAX_CONTEXT_DICT_ITEMS,
+) -> dict[str, Any]:
+    """Returns a bounded mapping with compact string/list values."""
+
+    compact: dict[str, Any] = {}
+
+    for index, (key, value) in enumerate(mapping.items()):
+        if index >= max_items:
+            break
+
+        compact[str(key)] = _compact_context_value(value)
+
+    return compact
+
+
+def _compact_context_value(value: Any) -> Any:
+    """Compacts nested context values without changing their broad JSON shape."""
+
+    if isinstance(value, str):
+        return _compact_text(value)
+
+    if isinstance(value, list):
+        return [
+            _compact_context_value(item)
+            for item in value[:MAX_CONTEXT_LIST_ITEMS]
+        ]
+
+    if isinstance(value, dict):
+        return _compact_mapping(value)
+
+    return value
+
+
+def _coerce_bool(value: Any, *, default: bool = False) -> bool:
+    """Returns a conservative boolean value for saved settings."""
+
+    if isinstance(value, bool):
+        return value
+
+    if isinstance(value, str):
+        normalized = value.strip().casefold()
+
+        if normalized in {"true", "1", "yes", "on"}:
+            return True
+
+        if normalized in {"false", "0", "no", "off", ""}:
+            return False
+
+    return default
