@@ -13,8 +13,14 @@ from ai_adventure.alchemy.ingredients import (
     COMMON_MEASUREMENT_UNITS,
     CRAFTING_INGREDIENT_CATEGORY_NAMES,
 )
+from ai_adventure.calendar_system import normalize_calendar_settings
+from ai_adventure.context.creative_guardrails import (
+    find_banned_creative_terms,
+    sanitize_banned_creative_terms_in_data,
+)
 from ai_adventure.currency import normalize_currency_denominations
 from ai_adventure.locations import clean_player_location_name
+from ai_adventure.new_game_setup import STARTER_INVENTORY_MIN_ITEMS
 
 try:
     from rapidfuzz import fuzz as _rapidfuzz_fuzz
@@ -459,7 +465,10 @@ STORY_RESPONSE_JSON_SCHEMA: dict[str, Any] = {
     "properties": {
         "response": {
             "type": "string",
-            "description": "Player-facing narration only.",
+            "description": (
+                "Player-facing narration only. Do not include the app prompt "
+                "'What do you do now?'; the application appends that separately."
+            ),
         },
         "suggested_actions": {
             "type": "array",
@@ -519,6 +528,40 @@ NEW_GAME_RESPONSE_JSON_SCHEMA: dict[str, Any] = {
             },
         },
         "start_location": {"type": "string"},
+        "calendar_settings": {
+            "type": "object",
+            "properties": {
+                "days_per_week": {"type": "integer", "minimum": 1, "maximum": 14},
+                "weeks_per_month": {"type": "integer", "minimum": 1, "maximum": 12},
+                "months_per_year": {"type": "integer", "minimum": 1, "maximum": 24},
+                "seasons_per_year": {"type": "integer", "minimum": 1, "maximum": 12},
+                "day_names": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                },
+                "month_names": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                },
+                "seasons": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string"},
+                            "weather_hint": {"type": "string"},
+                        },
+                        "required": ["name", "weather_hint"],
+                        "additionalProperties": False,
+                    },
+                },
+                "time_display": {
+                    "type": "string",
+                    "enum": ["narrative", "12_hour", "24_hour"],
+                },
+            },
+            "additionalProperties": False,
+        },
         "starting_calendar": {
             "type": "object",
             "properties": {
@@ -560,6 +603,7 @@ NEW_GAME_RESPONSE_JSON_SCHEMA: dict[str, Any] = {
         },
         "starting_items": {
             "type": "array",
+            "minItems": STARTER_INVENTORY_MIN_ITEMS,
             "items": {
                 "type": "object",
                 "properties": {
@@ -612,6 +656,11 @@ NEW_GAME_RESPONSE_JSON_SCHEMA: dict[str, Any] = {
             ),
         },
         "introductory_message": {"type": "string"},
+        "suggested_actions": {
+            "type": "array",
+            "description": "Three or four short player-facing action options for the opening scene.",
+            "items": {"type": "string"},
+        },
         "events": {"type": "array", "items": EVENT_RESPONSE_SCHEMA},
     },
     "required": [
@@ -813,6 +862,7 @@ class AiWorldSetupResult:
     world_summary: str
     introductory_message: str
     start_location: str = ""
+    calendar_settings: dict[str, Any] = field(default_factory=dict)
     starting_calendar: dict[str, Any] = field(default_factory=dict)
     start_weather: str = ""
     selected_genre: str = ""
@@ -823,6 +873,7 @@ class AiWorldSetupResult:
     finalized_currency_denominations: list[dict[str, Any]] = field(default_factory=list)
     finalized_currency_description: str = ""
     finalized_starting_currency_balance_base_units: int | None = None
+    suggested_actions: list[str] = field(default_factory=list)
     suggested_events: list[dict[str, Any]] = field(default_factory=list)
     raw_text: str = ""
 
@@ -884,7 +935,13 @@ class GeminiNarrationService:
             contents=prompt,
             config=_structured_output_config(STORY_RESPONSE_JSON_SCHEMA),  # type: ignore[arg-type]
         )
-        raw_text = str(getattr(response, "text", "") or "").strip()
+        raw_text = _repair_gemini_creative_terms(
+            client,
+            self.settings.model,
+            str(getattr(response, "text", "") or "").strip(),
+            "story response",
+            STORY_RESPONSE_JSON_SCHEMA,
+        )
         LOGGER.info("Gemini raw story response:\n%s", raw_text)
 
         if not raw_text:
@@ -944,7 +1001,13 @@ class GeminiNarrationService:
             contents=prompt,
             config=_structured_output_config(SKILL_CHECK_PLAN_RESPONSE_JSON_SCHEMA),  # type: ignore[arg-type]
         )
-        raw_text = str(getattr(response, "text", "") or "").strip()
+        raw_text = _repair_gemini_creative_terms(
+            client,
+            self.settings.model,
+            str(getattr(response, "text", "") or "").strip(),
+            "skill-check plan response",
+            SKILL_CHECK_PLAN_RESPONSE_JSON_SCHEMA,
+        )
         LOGGER.info("Gemini raw skill-check plan response:\n%s", raw_text)
 
         if not raw_text:
@@ -988,14 +1051,24 @@ class GeminiNarrationService:
             contents=prompt,
             config=_structured_output_config(NEW_GAME_RESPONSE_JSON_SCHEMA),  # type: ignore[arg-type]
         )
-        raw_text = str(getattr(response, "text", "") or "").strip()
+        raw_text = _repair_gemini_creative_terms(
+            client,
+            self.settings.model,
+            str(getattr(response, "text", "") or "").strip(),
+            "new-game response",
+            NEW_GAME_RESPONSE_JSON_SCHEMA,
+        )
         LOGGER.info("Gemini raw new-game response:\n%s", raw_text)
 
         if not raw_text:
             LOGGER.warning("Gemini returned an empty new-game response.")
             return AiWorldSetupResult(
                 world_summary="The world is still taking shape.",
-                introductory_message="The adventure begins.\n\nWhat do you do now?",
+                introductory_message=_format_visible_response(
+                    "The adventure begins.",
+                    FALLBACK_SUGGESTED_ACTIONS,
+                ),
+                suggested_actions=list(FALLBACK_SUGGESTED_ACTIONS),
                 raw_text=raw_text,
             )
 
@@ -1032,7 +1105,6 @@ def load_gemini_settings(env_path: Path | None = None) -> GeminiSettings:
         api_key=(
             os.getenv("GEMINI_API_KEY")
             or env_values.get("GEMINI_API_KEY")
-            or "AIzaSyBTvA3_8kx8cykxITUWYCp7Bf8ilb73HSM" # FOR SOME REASON, THE .env FILE IS NOT READING PROPERLY ANYMORE. PLEASE LEAVE THIS HARD-CODED API KEY ALONE. I CAN GENERATE A NEW KEY IF THIS ONE BECOMES COMPROMISED.
             or ""
         ).strip(),
         model=model,
@@ -1167,6 +1239,42 @@ def build_gemini_story_prompt(context_packet: dict[str, Any]) -> str:
         "already-double-quoted speaker mentions a named item, title, shop, place, "
         "phrase, nickname, inscription, or other quoted specific inside that "
         "dialogue.\n"
+        "- The response field may use light Markdown for player-facing prose: "
+        "italics for inner thoughts, sensory impressions, emphasis, or quiet "
+        "self-reflection; bold for the first mention of important NPCs, locations, "
+        "factions, quests, or items; and headings or bullet lists for longer "
+        "summaries. Do not use Markdown tables, code fences, HTML, or Markdown "
+        "that hides text from the player.\n"
+        "- Use state.player_ai_preferences.narration_tense_label and "
+        "state.player_ai_preferences.narration_style_label for the response "
+        "field. Limited narration stays within the player character's observed "
+        "or reasonably inferred experience. Omniscient narration may use a "
+        "broader narrative camera, but it must not reveal secrets, hidden state, "
+        "mystery solutions, or NPC-private facts, and NPCs still obey the NPC "
+        "knowledge boundary.\n"
+        "- Resolve the player's submitted action in the narration. Do not end by "
+        "merely restating the action, intent, or search target. For example, if "
+        "the player opens a book to search for clues, describe what the book "
+        "contains, what they notice, what blocks them, or why the result remains "
+        "uncertain.\n"
+        "- Do not speak for the player character. Do not invent player dialogue, "
+        "questions, promises, purchases, attacks, or choices that the player did "
+        "not explicitly provide. NPCs may speak, react, refuse, answer, or ask "
+        "questions, but the player character's next words and decisions belong "
+        "to the player.\n"
+        "- The response field must not include 'What do you do now?' or any "
+        "variant of an end-of-turn prompt. The Python application displays that "
+        "prompt after your response when appropriate.\n"
+        "- Do not end the response with a player-character action or player-"
+        "character dialogue as though the player still needs to finish the same "
+        "thought. End on the world's response, a resolved immediate outcome, a "
+        "clear obstacle, an NPC reaction, or a concrete new detail.\n"
+        "- If context_packet.continuation_request.active is true, continue the "
+        "latest story response as though it had been longer originally. Do not "
+        "treat this as a new player action, do not invent a new player decision, "
+        "and do not advance time or add durable events unless the previous "
+        "response already clearly described a current-turn state change that "
+        "needs an event.\n"
         "- suggested_actions must be a list, even when empty.\n"
         "- events must be a list, even when empty.\n"
         "- events may include multiple entries of the same event type when multiple "
@@ -1309,16 +1417,31 @@ def build_gemini_new_game_prompt(setup_packet: dict[str, Any]) -> str:
         "can matter without every institution being coin-themed.\n"
         "- world_summary must be a few paragraphs describing at least the basics "
         "of the world or city, prominent NPCs, locations of interest, religions, "
-        "and economy.\n"
+        "and economy. It may use light Markdown headings, bold names, italics, "
+        "and bullet lists when that improves readability.\n"
         "- world_lore must group player-known starting lore into keyed category "
         "objects where each key is the durable entry name and each value is the "
         "player-facing lore text. Include useful categories such as Locations, Religions, Economy, "
         "Culture and Laws, Factions and Guilds, Prominent NPCs, and Current Rumors "
         "when they fit the game. Do not include secrets, mystery solutions, hidden "
-        "villains, or GM-only facts in world_lore.\n"
+        "villains, or GM-only facts in world_lore. Lore text may use light "
+        "Markdown such as italics, bold important names, and short lists.\n"
         "- introductory_message must be player-facing narration for the first "
         "scene at start_location and must end with exactly "
         "'What do you do now?'\n"
+        "- suggested_actions must contain three or four short opening-scene "
+        "actions the player can take next. Keep them concrete, immediate, and "
+        "consistent with the introductory_message.\n"
+        "- introductory_message may use light Markdown for player-facing prose: "
+        "italics for inner thoughts or sensory emphasis, and bold for the first "
+        "mention of important NPCs, locations, factions, or items. Do not use "
+        "Markdown tables, code fences, or HTML.\n"
+        "- introductory_message and other player-facing setup prose must use "
+        "setup.narration.tense_label and setup.narration.style_label. Limited "
+        "styles stay within the player character's observed or reasonably "
+        "inferred experience. Omniscient styles may use a broader narrative "
+        "camera, but must not reveal secrets, hidden state, mystery solutions, "
+        "or NPC-private facts.\n"
         "- introductory_message must match setup_packet.current_calendar and "
         "setup_packet.current_weather unless you intentionally return "
         "starting_calendar and/or weather fields to change the starting date, "
@@ -1337,10 +1460,22 @@ def build_gemini_new_game_prompt(setup_packet: dict[str, Any]) -> str:
         "weather, and exact position in introductory_message instead. Example: "
         "use \"Y/N's Office\", not \"Y/N's Office, high up near the penthouse, "
         "overlooking the Hudson River\".\n"
+        "- If setup.calendar.ai_generated is true, invent calendar_settings that "
+        "fit the selected world, genre, culture, climate, and playstyle. Use "
+        "clear day names, month names, season names, season weather hints, and "
+        "a time_display value. Keep the calendar playable: days_per_week 1-14, "
+        "weeks_per_month 1-12, months_per_year 1-24, and seasons_per_year 1-12. "
+        "If setup.calendar.ai_generated is false, return calendar_settings as an "
+        "empty object and use the provided calendar.\n"
         "- character must finalize the player character profile. If character name, "
         "appearance, backstory, or notes are blank/default placeholders, replace "
         "them with coherent player-facing details suitable for the world. Preserve "
-        "explicit custom player input.\n"
+        "explicit custom player input exactly. For each character field, if the "
+        "corresponding setup.character value is not blank/default, copy that field "
+        "unchanged in character and use that exact identity in world_summary, "
+        "introductory_message, and events. Do not rename, partially rename, "
+        "embellish, paraphrase, or reinterpret a player-provided character name, "
+        "appearance, backstory, or notes field.\n"
         "- skills must contain every starting skill with name, description, and level. "
         "For any skill whose name or description is blank/default/placeholder or "
         "whose setup entry has requires_ai_invention=true, invent a distinct "
@@ -1356,11 +1491,12 @@ def build_gemini_new_game_prompt(setup_packet: dict[str, Any]) -> str:
         "Syndicate Lore or Flijosha Observance. "
         "Never return placeholder descriptions such as 'Player-selected level 1 "
         "starting skill.'\n"
-        "- starting_items has no required minimum or maximum item count. Return "
-        "only the concrete tracked possessions that naturally fit the finalized "
-        "character, genre, starting location, weather, and economy. Do not add, "
-        "split, combine, or pad items to satisfy a quota. Return the finalized "
-        "inventory in the starting_items field; do not use the alias starting_inventory. Preserve "
+        "- starting_items must contain at least five total tracked possessions "
+        "and has no maximum item count. Include any player-requested items, then "
+        "invent enough additional concrete items that naturally fit the finalized "
+        "character, genre, starting location, weather, and economy to reach the "
+        "minimum. Return the finalized inventory in the starting_items field; "
+        "do not use the alias starting_inventory. Preserve "
         "any player-provided setup.starter_items entries whose requires_ai_invention "
         "field is false. Set source_index to the zero-based setup.starter_items "
         "index for items based on a setup starter-item entry, and -1 for extra "
@@ -1369,8 +1505,8 @@ def build_gemini_new_game_prompt(setup_packet: dict[str, Any]) -> str:
         "item_request text, treat it as a player-authored item concept and "
         "convert it into the number of concrete, setting-appropriate tracked "
         "items that best fits the concept rather than copying the request "
-        "verbatim. If setup.starter_items is blank, you may return [] or invent "
-        "items that fit the finalized character backstory, finalized skills, selected "
+        "verbatim. If setup.starter_items is blank, invent at least five items "
+        "that fit the finalized character backstory, finalized skills, selected "
         "genre, starting location, weather, and economy. Do not include setup "
         "bookkeeping words such as Starting, Starter, Initial, Amount, Quantity, "
         "Count, or Total in item names. Generalize resource names to the actual "
@@ -1397,7 +1533,8 @@ def build_gemini_new_game_prompt(setup_packet: dict[str, Any]) -> str:
         "the top-level event type key.\n"
         "- Use only player-known information in player-facing event fields.\n"
         "- Use NpcUpsertedEvent for prominent NPCs the player can know about at "
-        "setup. Use ActiveTaskUpsertedEvent for initial active obligations. Use "
+        "setup. Remember that if the Player requested more than one NPC, or that you think that the Player would know more than one NPC, then you can pass more than one NpcUpsertedEvent.\n"
+        "Use ActiveTaskUpsertedEvent for initial active obligations. Use "
         "currency_denominations for initial generated money instead of "
         "CurrencyDefinedEvent. Use CurrencyDefinedEvent only when a story event "
         "establishes a new denomination after initial setup. If "
@@ -1430,6 +1567,96 @@ def _permissive_text_safety_settings() -> list[dict[str, str]]:
         }
         for category in TEXT_SAFETY_HARM_CATEGORIES
     ]
+
+
+def _repair_gemini_creative_terms(
+    client: Any,
+    model: str,
+    raw_text: str,
+    response_label: str,
+    schema: dict[str, Any],
+) -> str:
+    """Asks Gemini to rewrite a response when it uses banned generated names."""
+
+    banned_terms = find_banned_creative_terms(raw_text)
+
+    if not banned_terms:
+        return raw_text
+
+    LOGGER.warning(
+        "Gemini %s contained banned creative term(s): %s. Requesting a repair.",
+        response_label,
+        ", ".join(banned_terms),
+    )
+    repair_prompt = (
+        "Rewrite the JSON response below so it preserves the same facts, tone, "
+        "structure, and player-facing intent, but replaces every forbidden "
+        "newly generated proper noun with a fresh original alternative. Do not "
+        "use placeholders such as unnamed place, unnamed person, the city, the "
+        "person, Local Item, or Local Skill unless the original text was already "
+        "generic. Return only one JSON object that matches the configured schema.\n\n"
+        f"Forbidden terms: {', '.join(banned_terms)}\n\n"
+        "JSON response to repair:\n"
+        f"{raw_text}"
+    )
+
+    try:
+        response = client.models.generate_content(
+            model=model,
+            contents=repair_prompt,
+            config=_structured_output_config(schema),  # type: ignore[arg-type]
+        )
+    except Exception:
+        LOGGER.exception("Gemini %s repair request failed.", response_label)
+        return str(_sanitize_gemini_creative_terms(raw_text, response_label))
+
+    repaired_text = str(getattr(response, "text", "") or "").strip()
+
+    if repaired_text and not find_banned_creative_terms(repaired_text):
+        LOGGER.info("Gemini %s repair removed banned creative terms.", response_label)
+        return repaired_text
+
+    if repaired_text:
+        LOGGER.warning(
+            "Gemini %s repair still contained banned creative term(s): %s.",
+            response_label,
+            ", ".join(find_banned_creative_terms(repaired_text)),
+        )
+    else:
+        LOGGER.warning("Gemini %s repair returned an empty response.", response_label)
+
+    return str(_sanitize_gemini_creative_terms(raw_text, response_label))
+
+
+def _sanitize_gemini_creative_terms(value: Any, response_label: str) -> Any:
+    """Removes banned generated-name terms before AI output reaches state or UI."""
+
+    banned_terms = find_banned_creative_terms(value)
+
+    if not banned_terms:
+        return value
+
+    LOGGER.warning(
+        "Gemini %s contained banned creative term(s): %s. "
+        "Sanitized before display, logging, or persistence.",
+        response_label,
+        ", ".join(banned_terms),
+    )
+
+    if isinstance(value, str):
+        clean_text = _strip_json_fence(value.strip())
+
+        try:
+            data = json.loads(clean_text)
+        except json.JSONDecodeError:
+            return sanitize_banned_creative_terms_in_data(value)
+
+        return json.dumps(
+            sanitize_banned_creative_terms_in_data(data),
+            ensure_ascii=False,
+        )
+
+    return sanitize_banned_creative_terms_in_data(value)
 
 
 def _banned_terms_from_context(context_packet: dict[str, Any]) -> list[str]:
@@ -1567,11 +1794,20 @@ def parse_skill_check_plan_response(raw_text: str) -> SkillCheckPlanResult:
         data = json.loads(clean_text)
     except json.JSONDecodeError:
         LOGGER.warning("Gemini returned non-JSON skill-check plan. Using empty plan.")
-        return SkillCheckPlanResult(raw_text=raw_text)
+        guarded_raw_text = str(
+            _sanitize_gemini_creative_terms(raw_text, "skill-check plan response")
+        )
+        return SkillCheckPlanResult(raw_text=guarded_raw_text)
 
     if not isinstance(data, dict):
         LOGGER.warning("Gemini skill-check plan JSON response was not an object.")
-        return SkillCheckPlanResult(raw_text=raw_text)
+        guarded_raw_text = str(
+            _sanitize_gemini_creative_terms(raw_text, "skill-check plan response")
+        )
+        return SkillCheckPlanResult(raw_text=guarded_raw_text)
+
+    data = _sanitize_gemini_creative_terms(data, "skill-check plan response")
+    guarded_raw_text = json.dumps(data, ensure_ascii=False)
 
     _log_json_schema_warnings(
         data,
@@ -1618,7 +1854,7 @@ def parse_skill_check_plan_response(raw_text: str) -> SkillCheckPlanResult:
         checks.append(payload)
         seen_names.add(folded_name)
 
-    return SkillCheckPlanResult(checks=checks, raw_text=raw_text)
+    return SkillCheckPlanResult(checks=checks, raw_text=guarded_raw_text)
 
 
 def parse_gemini_story_response(raw_text: str) -> AiNarrationResult:
@@ -1638,11 +1874,26 @@ def parse_gemini_story_response(raw_text: str) -> AiNarrationResult:
         data = json.loads(clean_text)
     except json.JSONDecodeError:
         LOGGER.warning("Gemini returned non-JSON narration. Using raw text fallback.")
-        return AiNarrationResult(narrative_text=raw_text.strip(), raw_text=raw_text)
+        guarded_raw_text = str(
+            _sanitize_gemini_creative_terms(raw_text, "story response")
+        )
+        return AiNarrationResult(
+            narrative_text=guarded_raw_text.strip(),
+            raw_text=guarded_raw_text,
+        )
 
     if not isinstance(data, dict):
         LOGGER.warning("Gemini JSON response was not an object. Using raw text fallback.")
-        return AiNarrationResult(narrative_text=raw_text.strip(), raw_text=raw_text)
+        guarded_raw_text = str(
+            _sanitize_gemini_creative_terms(raw_text, "story response")
+        )
+        return AiNarrationResult(
+            narrative_text=guarded_raw_text.strip(),
+            raw_text=guarded_raw_text,
+        )
+
+    data = _sanitize_gemini_creative_terms(data, "story response")
+    guarded_raw_text = json.dumps(data, ensure_ascii=False)
 
     _log_json_schema_warnings(data, STORY_RESPONSE_JSON_SCHEMA, "story response")
 
@@ -1652,17 +1903,10 @@ def parse_gemini_story_response(raw_text: str) -> AiNarrationResult:
         LOGGER.warning("Gemini JSON response omitted response text.")
         response_text = "The narrator has no clear response."
 
-    raw_actions = data.get("suggested_actions", [])
-
-    if not isinstance(raw_actions, list):
-        LOGGER.warning("Gemini suggested_actions was not a list. Ignoring it.")
-        raw_actions = []
-
-    suggested_actions = [
-        str(action).strip()
-        for action in raw_actions
-        if str(action).strip()
-    ]
+    suggested_actions = _parse_suggested_actions(
+        data.get("suggested_actions", []),
+        response_label="story response",
+    )
 
     raw_events = data.get("events", data.get("suggested_events", []))
 
@@ -1690,8 +1934,22 @@ def parse_gemini_story_response(raw_text: str) -> AiNarrationResult:
         suggested_actions=suggested_actions,
         suggested_events=suggested_events,
         out_of_game=bool(data.get("out_of_game", False)),
-        raw_text=raw_text,
+        raw_text=guarded_raw_text,
     )
+
+
+def _parse_suggested_actions(raw_actions: Any, *, response_label: str) -> list[str]:
+    """Parses suggested player action labels from Gemini response data."""
+
+    if not isinstance(raw_actions, list):
+        LOGGER.warning("Gemini %s suggested_actions was not a list. Ignoring it.", response_label)
+        return []
+
+    return [
+        str(action).strip()
+        for action in raw_actions
+        if str(action).strip()
+    ]
 
 
 def _ensure_in_game_suggested_actions(
@@ -1727,7 +1985,7 @@ def _ensure_status_event_for_in_game_response(
 ) -> AiNarrationResult:
     """Adds a no-advance status event when Gemini omits one for an in-game turn."""
 
-    if result.out_of_game:
+    if result.out_of_game or _is_continuation_request(context_packet):
         return result
 
     if str(context_packet.get("packet_type", "")).strip() != "story_turn":
@@ -1769,7 +2027,7 @@ def _ensure_skill_check_for_uncertain_player_command(
 ) -> AiNarrationResult:
     """Adds a fallback skill-check event for a clearly uncertain player command."""
 
-    if result.out_of_game:
+    if result.out_of_game or _is_continuation_request(context_packet):
         return result
 
     if _resolved_skill_names_from_context(context_packet):
@@ -1880,6 +2138,17 @@ def _resolved_skill_names_from_context(context_packet: dict[str, Any]) -> set[st
         if isinstance(check, dict)
         and str(check.get("skill_name", check.get("name", ""))).strip()
     }
+
+
+def _is_continuation_request(context_packet: dict[str, Any]) -> bool:
+    """Returns True when the UI asked to expand the latest story response."""
+
+    continuation = context_packet.get("continuation_request")
+
+    if not isinstance(continuation, dict):
+        return False
+
+    return bool(continuation.get("active", False))
 
 
 def _ensure_inventory_for_collected_reagents(
@@ -2539,19 +2808,36 @@ def parse_gemini_new_game_response(raw_text: str) -> AiWorldSetupResult:
         data = json.loads(clean_text)
     except json.JSONDecodeError:
         LOGGER.warning("Gemini returned non-JSON new-game setup. Using raw text fallback.")
+        guarded_raw_text = str(
+            _sanitize_gemini_creative_terms(raw_text, "new-game response")
+        )
         return AiWorldSetupResult(
-            world_summary=raw_text.strip(),
-            introductory_message="The adventure begins.\n\nWhat do you do now?",
-            raw_text=raw_text,
+            world_summary=guarded_raw_text.strip(),
+            introductory_message=_format_visible_response(
+                "The adventure begins.",
+                FALLBACK_SUGGESTED_ACTIONS,
+            ),
+            suggested_actions=list(FALLBACK_SUGGESTED_ACTIONS),
+            raw_text=guarded_raw_text,
         )
 
     if not isinstance(data, dict):
         LOGGER.warning("Gemini new-game JSON response was not an object.")
-        return AiWorldSetupResult(
-            world_summary=raw_text.strip(),
-            introductory_message="The adventure begins.\n\nWhat do you do now?",
-            raw_text=raw_text,
+        guarded_raw_text = str(
+            _sanitize_gemini_creative_terms(raw_text, "new-game response")
         )
+        return AiWorldSetupResult(
+            world_summary=guarded_raw_text.strip(),
+            introductory_message=_format_visible_response(
+                "The adventure begins.",
+                FALLBACK_SUGGESTED_ACTIONS,
+            ),
+            suggested_actions=list(FALLBACK_SUGGESTED_ACTIONS),
+            raw_text=guarded_raw_text,
+        )
+
+    data = _sanitize_gemini_creative_terms(data, "new-game response")
+    guarded_raw_text = json.dumps(data, ensure_ascii=False)
 
     _log_json_schema_warnings(data, NEW_GAME_RESPONSE_JSON_SCHEMA, "new-game response")
 
@@ -2560,6 +2846,7 @@ def parse_gemini_new_game_response(raw_text: str) -> AiWorldSetupResult:
         data.get("selected_genre", data.get("genre", ""))
     ).strip()
     start_location = clean_player_location_name(data.get("start_location", ""))
+    calendar_settings = _parse_new_game_calendar_settings(data.get("calendar_settings"))
     starting_calendar = _parse_new_game_starting_calendar(
         data.get("starting_calendar", data.get("calendar"))
     )
@@ -2579,6 +2866,10 @@ def parse_gemini_new_game_response(raw_text: str) -> AiWorldSetupResult:
         _parse_new_game_starting_currency_balance(data)
     )
     raw_events = data.get("events", data.get("suggested_events", []))
+    suggested_actions = _parse_suggested_actions(
+        data.get("suggested_actions", []),
+        response_label="new-game response",
+    )
 
     if not world_summary:
         LOGGER.warning("Gemini new-game setup omitted world_summary.")
@@ -2586,11 +2877,18 @@ def parse_gemini_new_game_response(raw_text: str) -> AiWorldSetupResult:
 
     if not introductory_message:
         LOGGER.warning("Gemini new-game setup omitted introductory_message.")
-        introductory_message = "The adventure begins.\n\nWhat do you do now?"
+        introductory_message = "The adventure begins."
 
-    if not introductory_message.rstrip().endswith("What do you do now?"):
-        introductory_message = f"{introductory_message.rstrip()}\n\nWhat do you do now?"
-    introductory_message = format_story_message(introductory_message)
+    if not suggested_actions:
+        LOGGER.warning(
+            "Gemini new-game setup omitted suggested_actions; using fallback suggestions."
+        )
+        suggested_actions = list(FALLBACK_SUGGESTED_ACTIONS)
+
+    introductory_message = _format_visible_response(
+        introductory_message,
+        suggested_actions,
+    )
 
     if not isinstance(raw_events, list):
         LOGGER.warning("Gemini new-game events was not a list. Ignoring it.")
@@ -2609,6 +2907,7 @@ def parse_gemini_new_game_response(raw_text: str) -> AiWorldSetupResult:
         world_summary=world_summary,
         introductory_message=introductory_message,
         start_location=start_location,
+        calendar_settings=calendar_settings,
         starting_calendar=starting_calendar,
         start_weather=start_weather,
         selected_genre=selected_genre,
@@ -2621,8 +2920,9 @@ def parse_gemini_new_game_response(raw_text: str) -> AiWorldSetupResult:
         finalized_starting_currency_balance_base_units=(
             finalized_starting_currency_balance_base_units
         ),
+        suggested_actions=suggested_actions,
         suggested_events=suggested_events,
-        raw_text=raw_text,
+        raw_text=guarded_raw_text,
     )
 
 
@@ -2687,6 +2987,15 @@ def _derive_lore_key(text: str) -> str:
     """Derives a lore key from list-shaped legacy AI lore."""
 
     return str(text).split(":", 1)[0].strip()[:80]
+
+
+def _parse_new_game_calendar_settings(raw_calendar_settings: Any) -> dict[str, Any]:
+    """Parses optional AI-generated calendar settings."""
+
+    if not isinstance(raw_calendar_settings, dict) or not raw_calendar_settings:
+        return {}
+
+    return normalize_calendar_settings(raw_calendar_settings)
 
 
 def _parse_new_game_starting_calendar(raw_calendar: Any) -> dict[str, Any]:
@@ -3161,7 +3470,7 @@ def _optional_positive_int(value: Any) -> int | None:
 def _format_visible_response(response_text: str, suggested_actions: list[str]) -> str:
     """Combines response text and suggested actions for current UI display."""
 
-    formatted_response = format_story_message(response_text)
+    formatted_response = format_story_message(_strip_terminal_turn_prompt(response_text))
 
     if not suggested_actions:
         return formatted_response
@@ -3172,7 +3481,26 @@ def _format_visible_response(response_text: str, suggested_actions: list[str]) -
     if formatted_response.endswith(question):
         return f"{formatted_response}\n" + "\n".join(action_lines)
 
+    if not formatted_response:
+        return f"{question}\n" + "\n".join(action_lines)
+
     return f"{formatted_response}\n\n{question}\n" + "\n".join(action_lines)
+
+
+def _strip_terminal_turn_prompt(text: str) -> str:
+    """Removes Gemini-supplied end-of-turn prompt text before app formatting."""
+
+    clean_text = str(text).strip()
+
+    if not clean_text:
+        return ""
+
+    return re.sub(
+        r"(?:\s*\n*)what\s+do\s+you\s+do\s+now\?\s*$",
+        "",
+        clean_text,
+        flags=re.IGNORECASE,
+    ).strip()
 
 
 def format_story_message(text: str) -> str:
@@ -3183,27 +3511,126 @@ def format_story_message(text: str) -> str:
     if not clean_text:
         return ""
 
-    action_lines = [
-        line.strip()
-        for line in clean_text.splitlines()
-        if line.strip().startswith(("-", "*"))
-    ]
-    prose_lines = [
-        line.strip()
-        for line in clean_text.splitlines()
-        if line.strip() and not line.strip().startswith(("-", "*"))
-    ]
-    prose = " ".join(prose_lines)
-    sentences = _split_story_sentences(prose)
-    formatted = "\n\n".join(sentences)
+    formatted_blocks: list[str] = []
 
-    if action_lines:
-        question = "What do you do now?"
+    for block in _split_markdown_blocks(clean_text):
+        for sub_block in _split_mixed_markdown_block(block):
+            if _is_markdown_structural_block(sub_block):
+                formatted_blocks.append(sub_block.strip())
+                continue
 
-        if formatted.endswith(question):
-            formatted = f"{formatted}\n" + "\n".join(action_lines)
-        else:
-            formatted = f"{formatted}\n\n" + "\n".join(action_lines)
+            sentences = _split_story_sentences(" ".join(_clean_block_lines(sub_block)))
+
+            if sentences:
+                formatted_blocks.append("\n\n".join(sentences))
+
+    return _join_formatted_story_blocks(formatted_blocks)
+
+
+def _split_markdown_blocks(text: str) -> list[str]:
+    """Splits text into blank-line-separated Markdown blocks."""
+
+    blocks: list[str] = []
+    current_lines: list[str] = []
+
+    for raw_line in text.splitlines():
+        if raw_line.strip():
+            current_lines.append(raw_line.rstrip())
+            continue
+
+        if current_lines:
+            blocks.append("\n".join(current_lines))
+            current_lines = []
+
+    if current_lines:
+        blocks.append("\n".join(current_lines))
+
+    return blocks
+
+
+def _clean_block_lines(block: str) -> list[str]:
+    """Returns non-empty stripped lines from one Markdown block."""
+
+    return [line.strip() for line in block.splitlines() if line.strip()]
+
+
+def _split_mixed_markdown_block(block: str) -> list[str]:
+    """Splits blocks that mix prose with Markdown list/heading lines."""
+
+    sub_blocks: list[str] = []
+    current_lines: list[str] = []
+    current_is_structural: bool | None = None
+    in_fence = False
+
+    for raw_line in block.splitlines():
+        clean_line = raw_line.strip()
+        is_structural = _is_markdown_structural_line(clean_line, in_fence)
+
+        if clean_line.startswith("```"):
+            in_fence = not in_fence
+
+        if current_is_structural is None:
+            current_is_structural = is_structural
+        elif current_is_structural != is_structural:
+            if current_lines:
+                sub_blocks.append("\n".join(current_lines))
+            current_lines = []
+            current_is_structural = is_structural
+
+        current_lines.append(raw_line.rstrip())
+
+    if current_lines:
+        sub_blocks.append("\n".join(current_lines))
+
+    return sub_blocks
+
+
+def _is_markdown_structural_block(block: str) -> bool:
+    """Returns True when a block should keep its Markdown line structure."""
+
+    in_fence = False
+
+    for line in block.splitlines():
+        clean_line = line.strip()
+
+        if _is_markdown_structural_line(clean_line, in_fence):
+            return True
+
+        if clean_line.startswith("```"):
+            in_fence = not in_fence
+
+    return False
+
+
+def _is_markdown_structural_line(clean_line: str, in_fence: bool = False) -> bool:
+    """Returns True for Markdown lines whose structure should be preserved."""
+
+    return bool(
+        in_fence
+        or clean_line.startswith("```")
+        or re.match(r"^(#{1,6}\s+|[-*+]\s+|\d+[.)]\s+|>\s+|---+$)", clean_line)
+    )
+
+
+def _join_formatted_story_blocks(blocks: list[str]) -> str:
+    """Joins formatted story blocks while keeping action lists tight."""
+
+    clean_blocks = [block.strip() for block in blocks if block.strip()]
+
+    if not clean_blocks:
+        return ""
+
+    formatted = clean_blocks[0]
+
+    for block in clean_blocks[1:]:
+        separator = "\n\n"
+
+        if formatted.endswith("What do you do now?") and _is_markdown_structural_line(
+            block.splitlines()[0].strip()
+        ):
+            separator = "\n"
+
+        formatted = f"{formatted}{separator}{block}"
 
     return formatted.strip()
 

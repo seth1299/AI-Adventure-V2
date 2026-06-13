@@ -100,6 +100,8 @@ class ContextBuilderTests(unittest.TestCase):
         state.settings.values["ai.additional_context"] = (
             "Please respond only in the third person."
         )
+        state.settings.values["ai.narration_tense"] = "past"
+        state.settings.values["ai.narration_style"] = "third_person_limited"
         state.settings.values["world.summary"] = "Rainmarket is a canal city."
         state.settings.values["world.genre"] = "Realistic detective mystery"
         state.settings.values["world.game_style"] = "Realistic detective mystery"
@@ -145,6 +147,18 @@ class ContextBuilderTests(unittest.TestCase):
             packet["state"]["player_ai_preferences"]["additional_context"],
             "Please respond only in the third person.",
         )
+        self.assertEqual(
+            packet["state"]["player_ai_preferences"]["narration_tense_label"],
+            "Past Tense",
+        )
+        self.assertEqual(
+            packet["state"]["player_ai_preferences"]["narration_style_label"],
+            "Third-Person Limited",
+        )
+        self.assertIn(
+            "preserve fog of war",
+            packet["state"]["player_ai_preferences"]["narration_style_rules"],
+        )
         self.assertEqual(packet["state"]["scene"]["location"], "Old Road")
         self.assertEqual(packet["state"]["world_profile"]["summary"], "Rainmarket is a canal city.")
         self.assertEqual(packet["state"]["world_profile"]["genre"], "Realistic detective mystery")
@@ -178,6 +192,10 @@ class ContextBuilderTests(unittest.TestCase):
             packet["response_contract"]["character_scope"],
         )
         self.assertIn("player_ai_preferences", packet["response_contract"])
+        self.assertIn(
+            "narration_tense_label",
+            packet["response_contract"]["player_ai_preferences"],
+        )
         self.assertIn("active_tasks", packet["response_contract"])
         self.assertIn("mature_content", packet["response_contract"])
         self.assertIn(
@@ -275,6 +293,22 @@ class ContextBuilderTests(unittest.TestCase):
         self.assertIn(
             "not inventory coin items",
             packet["response_contract"]["currency_transactions"],
+        )
+        self.assertIn(
+            "Do not include 'What do you do now?'",
+            packet["response_contract"]["response"],
+        )
+        self.assertIn(
+            "Light Markdown is allowed",
+            packet["response_contract"]["response"],
+        )
+        self.assertIn(
+            "bold for important NPCs",
+            packet["response_contract"]["response"],
+        )
+        self.assertIn(
+            "Do not speak for the player character",
+            packet_json,
         )
         self.assertIn("multiple entries", packet["response_contract"]["events"])
         self.assertIn(

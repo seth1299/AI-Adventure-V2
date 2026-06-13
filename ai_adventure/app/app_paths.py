@@ -95,6 +95,12 @@ class AppPaths:
         return self.app_data_dir / "new_game_template.json"
 
     @property
+    def app_settings_path(self) -> Path:
+        """Returns the app-level settings file path."""
+
+        return self.app_data_dir / "settings.json"
+
+    @property
     def kokoro_model_path(self) -> Path:
         """Returns the best known Kokoro ONNX model path."""
 

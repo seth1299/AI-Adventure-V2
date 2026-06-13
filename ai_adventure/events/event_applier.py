@@ -18,7 +18,11 @@ from ai_adventure.alchemy.ingredients import (
     is_crafting_ingredient_category,
     normalize_recipe_ingredients,
 )
-from ai_adventure.context.creative_ideas import CreativeIdeasLibrary
+from ai_adventure.context.creative_guardrails import (
+    contains_banned_creative_term,
+    find_banned_creative_terms,
+    sanitize_banned_creative_terms_in_data,
+)
 from ai_adventure.currency import format_currency_amount
 from ai_adventure.locations import clean_player_location_name
 from ai_adventure.persistence.save_repository import SaveRepository
@@ -26,7 +30,6 @@ from ai_adventure.skills.rules import bonus_for_level, dc_for_difficulty
 
 
 LOGGER = logging.getLogger(__name__)
-_BANNED_CREATIVE_TERMS: set[str] | None = None
 _SKILL_CHECK_GATED_EVENT_TYPES = {
     "ActiveTaskCompletedEvent",
     "CurrencyChangedEvent",
@@ -107,7 +110,7 @@ class EventApplier:
                     payload,
                 )
             else:
-                result = self.apply_event(raw_event)
+                result = self.apply_event({"type": event_type, "payload": payload})
 
             if (
                 result.event_type == "SkillCheckRequestedEvent"
@@ -570,7 +573,7 @@ class EventApplier:
                 + ", ".join(unknown_ingredients),
             )
 
-        self.repository.add_alchemy_recipe(
+        self.repository.add_crafting_recipe(
             name=name,
             ingredients=ingredients,
             result=_first_text(payload, "result", "description"),
@@ -609,7 +612,7 @@ class EventApplier:
         if not uses:
             return _invalid(event_type, payload, "Reagent uses are required.")
 
-        self.repository.add_alchemy_reagent(
+        self.repository.add_crafting_item(
             name=name,
             description=description,
             location=location,
@@ -1049,7 +1052,40 @@ def normalize_event(raw_event: dict[str, Any]) -> tuple[str, dict[str, Any]]:
         if key not in {"type", "event_type", "eventType", "payload"} and key not in payload:
             payload[key] = value
 
+    payload = _sanitize_ai_event_payload(event_type, payload)
     return event_type, payload
+
+
+def _sanitize_ai_event_payload(
+    event_type: str,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    """Removes banned generated-name terms from AI event payloads."""
+
+    clean_payload = dict(payload)
+
+    if event_type == "NpcUpsertedEvent":
+        for key in ["display_name", "visible_name"]:
+            value = str(clean_payload.get(key, "")).strip()
+
+            if value and contains_banned_creative_term(value):
+                LOGGER.warning(
+                    "Removed banned generated NPC display_name %r before storage.",
+                    value,
+                )
+                clean_payload[key] = ""
+
+    banned_terms = find_banned_creative_terms(clean_payload)
+
+    if not banned_terms:
+        return clean_payload
+
+    LOGGER.warning(
+        "Sanitized banned creative term(s) from %s payload before storage: %s.",
+        event_type,
+        ", ".join(banned_terms),
+    )
+    return sanitize_banned_creative_terms_in_data(clean_payload)
 
 
 def _event_type_from_raw_event(raw_event: dict[str, Any]) -> str:
@@ -1709,18 +1745,6 @@ def _npc_known_facts(
 
 
 def _is_banned_creative_term(value: str) -> bool:
-    """Returns True when a value exactly matches a banned generated term."""
+    """Returns True when a value contains a banned generated term."""
 
-    global _BANNED_CREATIVE_TERMS
-
-    if _BANNED_CREATIVE_TERMS is None:
-        try:
-            _BANNED_CREATIVE_TERMS = {
-                term.casefold()
-                for term in CreativeIdeasLibrary.load_default().banned_terms
-            }
-        except Exception:
-            LOGGER.exception("Could not load banned creative terms.")
-            _BANNED_CREATIVE_TERMS = set()
-
-    return value.strip().casefold() in _BANNED_CREATIVE_TERMS
+    return contains_banned_creative_term(value)

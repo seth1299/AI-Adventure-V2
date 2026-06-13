@@ -205,25 +205,9 @@ class RecipeKnowledge:
 
 
 @dataclass
-class AlchemyNote:
-    """A freeform alchemy notebook note."""
-
-    id: int | None = None
-    title: str = ""
-    body: str = ""
-    created_at: str = ""
-
-    def to_dict(self) -> dict[str, Any]:
-        """Returns a JSON-serializable note dictionary."""
-
-        return asdict(self)
-
-
-@dataclass
 class AlchemyNotebookState:
     """The player's discovered alchemical knowledge."""
 
-    notes: list[AlchemyNote] = field(default_factory=list)
     known_reagents: list[ReagentKnowledge] = field(default_factory=list)
     known_recipes: list[RecipeKnowledge] = field(default_factory=list)
 
@@ -231,7 +215,6 @@ class AlchemyNotebookState:
         """Returns a JSON-serializable alchemy-state dictionary."""
 
         return {
-            "notes": [note.to_dict() for note in self.notes],
             "known_reagents": [reagent.to_dict() for reagent in self.known_reagents],
             "known_recipes": [recipe.to_dict() for recipe in self.known_recipes],
         }

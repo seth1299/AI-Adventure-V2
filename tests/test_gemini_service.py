@@ -1053,6 +1053,12 @@ class GeminiServiceTests(unittest.TestCase):
         self.assertIn("events", prompt)
         self.assertIn("NPC knowledge boundary", prompt)
         self.assertIn("must not reference private player state", prompt)
+        self.assertIn("narration_tense_label", prompt)
+        self.assertIn("narration_style_label", prompt)
+        self.assertIn("Omniscient narration", prompt)
+        self.assertIn("light Markdown", prompt)
+        self.assertIn("italics for inner thoughts", prompt)
+        self.assertIn("bold for the first mention", prompt)
         self.assertIn("display_name is the name", prompt)
         self.assertIn("multiple events with the same type", prompt)
         self.assertIn("one NpcUpsertedEvent for each", prompt)
@@ -1097,6 +1103,9 @@ class GeminiServiceTests(unittest.TestCase):
         self.assertIn("Do not use a fixed sentence count", prompt)
         self.assertIn("Routine movement, paying a known price", prompt)
         self.assertIn("do not create coin inventory", prompt)
+        self.assertIn("must not include 'What do you do now?'", prompt)
+        self.assertIn("Do not speak for the player character", prompt)
+        self.assertIn("continuation_request.active", prompt)
         self.assertNotIn("double-bracket", prompt)
         self.assertNotIn("legacy_tag", prompt)
         self.assertNotIn("do_not_emit_legacy_tag", prompt)
@@ -1126,6 +1135,66 @@ class GeminiServiceTests(unittest.TestCase):
         )
         self.assertEqual(result.suggested_actions[0], "Follow the road.")
         self.assertEqual(result.suggested_events[0]["type"], "FlagSetEvent")
+
+    def test_parse_json_response_sanitizes_banned_creative_terms(self) -> None:
+        raw_text = json.dumps(
+            {
+                "response": "The skyline of New Aethelgard catches the sun.",
+                "suggested_actions": [
+                    "Walk into New Aethelgard.",
+                    "Ask about Aethelgard's mayor.",
+                ],
+                "events": [
+                    {
+                        "type": "StatusUpdatedEvent",
+                        "payload": {
+                            "location": "New Aethelgard",
+                            "minutes_passed": "AUTO",
+                            "weather": "Clear",
+                        },
+                    }
+                ],
+                "out_of_game": False,
+            }
+        )
+
+        with self.assertLogs("ai_adventure.ai.gemini_service", level="WARNING") as logs:
+            result = parse_gemini_story_response(raw_text)
+
+        combined_output = json.dumps(
+            {
+                "narrative_text": result.narrative_text,
+                "suggested_actions": result.suggested_actions,
+                "suggested_events": result.suggested_events,
+                "raw_text": result.raw_text,
+            },
+            ensure_ascii=False,
+        )
+
+        self.assertIn("banned creative term", "\n".join(logs.output))
+        self.assertNotIn("Aethelgard", combined_output)
+        self.assertIn("skyline of the city", result.narrative_text)
+        self.assertEqual(
+            result.suggested_events[0]["payload"]["location"],
+            "the city",
+        )
+
+    def test_parse_json_response_strips_model_supplied_turn_prompt(self) -> None:
+        raw_text = json.dumps(
+            {
+                "response": "The road bends into fog. What do you do now?",
+                "suggested_actions": ["Follow the road."],
+                "events": [],
+                "out_of_game": False,
+            }
+        )
+
+        result = parse_gemini_story_response(raw_text)
+
+        self.assertEqual(
+            result.narrative_text,
+            "The road bends into fog.\n\nWhat do you do now?\n- Follow the road.",
+        )
 
     def test_story_response_adds_fallback_actions_and_status_event(self) -> None:
         raw_text = json.dumps(
@@ -1170,6 +1239,48 @@ class GeminiServiceTests(unittest.TestCase):
             result.suggested_events[0]["payload"]["minutes_passed"],
             "AUTO",
         )
+
+    def test_continuation_request_does_not_inject_new_turn_events(self) -> None:
+        raw_text = json.dumps(
+            {
+                "response": "The ink resolves into a second line of cramped notes.",
+                "suggested_actions": ["Read the cramped notes."],
+                "events": [],
+                "out_of_game": False,
+            }
+        )
+        self._install_fake_genai_client(raw_text)
+
+        try:
+            service = GeminiNarrationService(
+                GeminiSettings(api_key="test-key", model="gemini-2.5-flash")
+            )
+            result = service.generate_story_response(
+                {
+                    "packet_type": "story_turn",
+                    "player_command": "Open the book and search for clues.",
+                    "continuation_request": {"active": True},
+                    "state": {
+                        "scene": {
+                            "location": "Archive",
+                            "weather": "Still",
+                        },
+                        "skills": {
+                            "known_skills": [
+                                {
+                                    "name": "Investigation",
+                                    "description": "Finding clues in written evidence.",
+                                }
+                            ]
+                        },
+                    },
+                }
+            )
+        finally:
+            self._remove_fake_genai_client()
+
+        self.assertEqual(result.suggested_events, [])
+        self.assertIn("The ink resolves", result.narrative_text)
 
     def test_story_formatting_spaces_sentences_and_keeps_actions_tight(self) -> None:
         formatted = format_story_message(
@@ -1242,13 +1353,40 @@ class GeminiServiceTests(unittest.TestCase):
             ),
         )
 
+    def test_story_formatting_preserves_markdown_blocks(self) -> None:
+        formatted = format_story_message(
+            "# Discoveries\n\n"
+            "You meet **Mira Coppercup**. *Stay calm,* you think.\n\n"
+            "- Ask about rumors.\n"
+            "- Inspect the ledger."
+        )
+
+        self.assertIn("# Discoveries", formatted)
+        self.assertIn("**Mira Coppercup**", formatted)
+        self.assertIn("*Stay calm,* you think.", formatted)
+        self.assertIn("- Ask about rumors.", formatted)
+
     def test_build_and_parse_new_game_response(self) -> None:
         prompt = build_gemini_new_game_prompt(
             {
                 "packet_type": "new_game_setup",
-                "setup": {"title": "Rainmarket"},
+                "setup": {
+                    "title": "Rainmarket",
+                    "narration": {
+                        "tense": "future",
+                        "tense_label": "Future Tense",
+                        "style": "first_person_limited",
+                        "style_label": "First-Person Limited",
+                    },
+                },
             }
         )
+        self.assertIn("setup.narration.tense_label", prompt)
+        self.assertIn("setup.narration.style_label", prompt)
+        self.assertIn("Limited styles", prompt)
+        self.assertIn("light Markdown", prompt)
+        self.assertIn("world_summary", prompt)
+        self.assertIn("introductory_message may use", prompt)
         raw_text = json.dumps(
             {
                 "selected_genre": "Realistic detective mystery",
@@ -1260,6 +1398,28 @@ class GeminiServiceTests(unittest.TestCase):
                     "Economy": {"Crowns": "Crowns dominate official trade."},
                 },
                 "start_location": "Rainmarket Station, beneath the old canal clock",
+                "calendar_settings": {
+                    "days_per_week": 8,
+                    "weeks_per_month": 5,
+                    "months_per_year": 10,
+                    "seasons_per_year": 2,
+                    "day_names": [
+                        "Bell",
+                        "Canal",
+                        "Ledger",
+                        "Rain",
+                        "Market",
+                        "Lantern",
+                        "Lock",
+                        "Mist",
+                    ],
+                    "month_names": ["First Rain", "Second Rain"],
+                    "seasons": [
+                        {"name": "Wet", "weather_hint": "spring"},
+                        {"name": "Cold", "weather_hint": "winter"},
+                    ],
+                    "time_display": "24_hour",
+                },
                 "starting_calendar": {
                     "season_hint": "autumn",
                     "day_of_month": 1,
@@ -1329,6 +1489,11 @@ class GeminiServiceTests(unittest.TestCase):
                 "currency_description": "Crowns and moonmarks are common canal-city money.",
                 "starting_currency_balance_base_units": 49,
                 "introductory_message": "Rain falls on the station.",
+                "suggested_actions": [
+                    "Inspect the canal clock.",
+                    "Question the station porter.",
+                    "Review the case notebook.",
+                ],
                 "events": [{"type": "NpcUpsertedEvent", "payload": {}}],
             }
         )
@@ -1359,11 +1524,24 @@ class GeminiServiceTests(unittest.TestCase):
         self.assertIn("short and broad", prompt)
         self.assertIn("Y/N's Office", prompt)
         self.assertIn("does not need to start in a tavern", prompt)
-        self.assertIn("starting_items has no required minimum or maximum", prompt)
-        self.assertIn("Do not add, split, combine, or pad", prompt)
-        self.assertNotIn("starting_items must contain at least five", prompt)
+        self.assertIn("starting_items must contain at least five", prompt)
+        self.assertIn("has no maximum item count", prompt)
+        self.assertIn("invent enough additional concrete items", prompt)
         self.assertNotIn("starter_inventory_contract is present it defines", prompt)
-        self.assertNotIn("minItems", NEW_GAME_RESPONSE_JSON_SCHEMA["properties"]["starting_items"])
+        self.assertEqual(
+            NEW_GAME_RESPONSE_JSON_SCHEMA["properties"]["starting_items"]["minItems"],
+            5,
+        )
+        calendar_schema = NEW_GAME_RESPONSE_JSON_SCHEMA["properties"]["calendar_settings"]
+        for list_field in ("day_names", "month_names", "seasons"):
+            self.assertNotIn(
+                "minItems",
+                calendar_schema["properties"][list_field],
+            )
+            self.assertNotIn(
+                "maxItems",
+                calendar_schema["properties"][list_field],
+            )
         self.assertIn("do not use the alias starting_inventory", prompt)
         self.assertIn("source_index", prompt)
         self.assertIn("item_request text", prompt)
@@ -1377,6 +1555,8 @@ class GeminiServiceTests(unittest.TestCase):
         self.assertIn("do not need to be multiples or powers of 10", prompt)
         self.assertIn("Use CurrencyDefinedEvent only when a story event", prompt)
         self.assertIn("skills must contain every starting skill", prompt)
+        self.assertIn("Preserve explicit custom player input exactly", prompt)
+        self.assertIn("Do not rename, partially rename", prompt)
         self.assertIn("requires_ai_invention=true", prompt)
         self.assertIn("generalized gameplay capabilities", prompt)
         self.assertIn("Lore (Syndicate)", prompt)
@@ -1386,6 +1566,8 @@ class GeminiServiceTests(unittest.TestCase):
         self.assertNotIn("Signature Expertise", prompt)
         self.assertIn("current_calendar", prompt)
         self.assertIn("do not mention autumn winds", prompt)
+        self.assertIn("setup.calendar.ai_generated", prompt)
+        self.assertIn("invent calendar_settings", prompt)
         self.assertIn("do not use event_type", prompt)
         self.assertIn("API response schema defines the required JSON fields", prompt)
         self.assertNotIn("Return this JSON shape", prompt)
@@ -1396,6 +1578,8 @@ class GeminiServiceTests(unittest.TestCase):
         )
         self.assertEqual(result.start_location, "Rainmarket Station")
         self.assertEqual(result.selected_genre, "Realistic detective mystery")
+        self.assertEqual(result.calendar_settings["days_per_week"], 8)
+        self.assertEqual(result.calendar_settings["time_display"], "24_hour")
         self.assertEqual(result.starting_calendar["season_hint"], "autumn")
         self.assertEqual(result.start_weather, "Clear, cold autumn wind.")
         self.assertEqual(result.finalized_character["name"], "Iris Vale")
@@ -1411,7 +1595,8 @@ class GeminiServiceTests(unittest.TestCase):
             "Crowns and moonmarks are common canal-city money.",
         )
         self.assertEqual(result.finalized_starting_currency_balance_base_units, 49)
-        self.assertTrue(result.introductory_message.endswith("What do you do now?"))
+        self.assertIn("What do you do now?\n- Inspect the canal clock.", result.introductory_message)
+        self.assertEqual(result.suggested_actions[0], "Inspect the canal clock.")
         self.assertEqual(result.suggested_events[0]["type"], "NpcUpsertedEvent")
 
     def test_parse_new_game_starter_items_generalizes_setup_amount_names(self) -> None:
@@ -1489,6 +1674,117 @@ class GeminiServiceTests(unittest.TestCase):
             ["Fuel", "Food", "Water", "Ammo", "Rover Toolkit"],
         )
         self.assertEqual(result.finalized_starter_items[0]["quantity"], 20)
+
+    def test_parse_new_game_response_sanitizes_banned_creative_terms(self) -> None:
+        raw_text = json.dumps(
+            {
+                "selected_genre": "Detective mystery",
+                "world_summary": "New Aethelgard is a rain-heavy city.",
+                "world_lore": {
+                    "Locations": {
+                        "New Aethelgard": "New Aethelgard has old elevated rails."
+                    }
+                },
+                "start_location": "New Aethelgard Office",
+                "starting_calendar": {},
+                "weather": "Clear",
+                "character": {
+                    "name": "Mara Vale",
+                    "appearance": "A detective in a dark coat.",
+                    "backstory": "Known for cases across New Aethelgard.",
+                    "notes": "Avoids old Aethelgard habits.",
+                },
+                "skills": [
+                    {
+                        "name": "City Investigation",
+                        "description": "Reading clues in New Aethelgard alleys.",
+                        "level": 4,
+                    }
+                ],
+                "starting_items": [
+                    {
+                        "name": "Aethelgard Casebook",
+                        "category": "Tool",
+                        "quantity": 1,
+                        "description": "A notebook of New Aethelgard cases.",
+                        "value_base_units": 1,
+                        "source_index": -1,
+                    },
+                    {
+                        "name": "Rain Coat",
+                        "category": "Clothing",
+                        "quantity": 1,
+                        "description": "A coat for city rain.",
+                        "value_base_units": 1,
+                        "source_index": -1,
+                    },
+                    {
+                        "name": "Magnifier",
+                        "category": "Tool",
+                        "quantity": 1,
+                        "description": "A lens for evidence.",
+                        "value_base_units": 1,
+                        "source_index": -1,
+                    },
+                    {
+                        "name": "Rail Pass",
+                        "category": "Document",
+                        "quantity": 1,
+                        "description": "A pass for elevated trains.",
+                        "value_base_units": 1,
+                        "source_index": -1,
+                    },
+                    {
+                        "name": "Coffee Tin",
+                        "category": "Supply",
+                        "quantity": 1,
+                        "description": "Bitter coffee.",
+                        "value_base_units": 1,
+                        "source_index": -1,
+                    },
+                ],
+                "currency_denominations": [
+                    {"name": "Credit", "plural_name": "Credits", "value": 1}
+                ],
+                "currency_description": "Credits.",
+                "starting_currency_balance_base_units": 10,
+                "introductory_message": "The sun rises over New Aethelgard.",
+                "events": [
+                    {
+                        "type": "WorldLoreAddedEvent",
+                        "payload": {
+                            "section": "Locations",
+                            "key": "New Aethelgard",
+                            "text": "New Aethelgard is crowded at dawn.",
+                        },
+                    }
+                ],
+            }
+        )
+
+        with self.assertLogs("ai_adventure.ai.gemini_service", level="WARNING"):
+            result = parse_gemini_new_game_response(raw_text)
+
+        combined_output = json.dumps(
+            {
+                "world_summary": result.world_summary,
+                "world_lore": result.world_lore,
+                "start_location": result.start_location,
+                "character": result.finalized_character,
+                "skills": result.finalized_skills,
+                "starting_items": result.finalized_starter_items,
+                "introductory_message": result.introductory_message,
+                "events": result.suggested_events,
+                "raw_text": result.raw_text,
+            },
+            ensure_ascii=False,
+        )
+
+        self.assertNotIn("Aethelgard", combined_output)
+        self.assertNotIn("unnamed place", combined_output)
+        self.assertIn("sun rises over the city", result.introductory_message)
+        self.assertIn("What do you do now?\n-", result.introductory_message)
+        self.assertEqual(len(result.suggested_actions), 3)
 
     def test_parse_new_game_response_accepts_starting_inventory_alias(self) -> None:
         raw_text = json.dumps(

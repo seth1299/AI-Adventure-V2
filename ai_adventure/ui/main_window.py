@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import re
 import logging
+import importlib
 from pathlib import Path
 from typing import Any, Callable, Protocol
 
@@ -21,6 +23,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QCompleter,
     QDialog,
+    QDialogButtonBox,
     QFormLayout,
     QGridLayout,
     QGroupBox,
@@ -48,13 +51,19 @@ from PySide6.QtWidgets import (
     QWizardPage,
 )
 
-from ai_adventure.app.app_paths import AppPaths
 from ai_adventure.alchemy.ingredients import (
     COMMON_MEASUREMENT_UNITS,
     CRAFTING_INGREDIENT_CATEGORY_NAMES,
     format_recipe_ingredients,
     is_crafting_ingredient_category,
     normalize_recipe_ingredient,
+)
+from ai_adventure.app.app_paths import AppPaths
+from ai_adventure.app.features import is_tts_enabled
+from ai_adventure.app.user_settings import (
+    load_app_settings,
+    normalize_app_settings,
+    save_app_settings,
 )
 from ai_adventure.ai.gemini_service import (
     GeminiConfigurationError,
@@ -63,7 +72,11 @@ from ai_adventure.ai.gemini_service import (
 )
 from ai_adventure.audio.narration import NarrationPlayer
 from ai_adventure.audio.sound_manager import SoundManager, prepare_sound_directory
-from ai_adventure.audio.tts.tts_manager import create_tts_manager
+from ai_adventure.audio.voices import (
+    DEFAULT_NARRATOR_VOICE,
+    available_narrator_voices,
+    normalize_narrator_voice,
+)
 from ai_adventure.calendar_system import (
     DEFAULT_CALENDAR_SETTINGS,
     DEFAULT_START_ELAPSED_MINUTES,
@@ -83,11 +96,18 @@ from ai_adventure.events.event_applier import EventApplier
 from ai_adventure.new_game_setup import (
     GREGORIAN_CALENDAR_SETTINGS,
     SKILL_LEVEL_PLAN,
+    STARTER_INVENTORY_MIN_ITEMS,
     build_new_game_setup_packet,
     fallback_introductory_message,
     fallback_world_summary,
     normalize_new_game_setup,
-    parse_starter_items_text,
+)
+from ai_adventure.narration_preferences import (
+    DEFAULT_NARRATION_STYLE,
+    DEFAULT_NARRATION_TENSE,
+    NARRATION_STYLE_OPTIONS,
+    NARRATION_TENSE_OPTIONS,
+    normalize_narration_preferences,
 )
 from ai_adventure.new_game_templates import (
     load_new_game_templates,
@@ -103,6 +123,18 @@ from ai_adventure.persistence.save_repository import (
 LOGGER = logging.getLogger(__name__)
 GM_THINKING_TEXT = "GM is thinking..."
 STORY_REVEAL_STALL_TIMEOUT_MS = 8000
+CONTINUE_STORY_INSTRUCTION = (
+    "Continue the previous story response as though it had been longer originally. "
+    "Do not treat this as a new player action. Do not invent new player-character "
+    "dialogue or choices. Add concrete scene detail, NPC reaction, immediate "
+    "outcome, obstacles, discoveries, or consequences already implied by the "
+    "previous action."
+)
+TABLE_INLINE_EDITOR_HEIGHT = 30
+TABLE_INLINE_EDITOR_MIN_WIDTH = 132
+TABLE_INLINE_BUTTON_MIN_WIDTH = 96
+STARTER_ITEM_COLUMN_WIDTHS = (140, 132, 140, 220, 132, 100)
+CURRENCY_COLUMN_WIDTHS = (150, 160, 132, 100)
 THEME_NAMES = {"Light", "Dark"}
 SKILL_LEVEL_DESCRIPTIONS = {
     5: "Signature expertise - the character's strongest, defining capability.",
@@ -317,6 +349,29 @@ class _GeminiSkillCheckPlanWorker(QObject):
             self.finished.emit()
 
 
+def _create_narration_player(app_paths: AppPaths) -> NarrationPlayer | None:
+    """Creates the narration player only when TTS support is enabled."""
+
+    if not is_tts_enabled():
+        LOGGER.info("TTS narration disabled by application configuration.")
+        return None
+
+    try:
+        tts_module = importlib.import_module("ai_adventure.audio.tts.tts_manager")
+        create_tts_manager = getattr(tts_module, "create_tts_manager")
+    except Exception as error:
+        LOGGER.warning("Narrator is unavailable because TTS could not be loaded: %s", error)
+        return None
+
+    return NarrationPlayer(
+        create_tts_manager(
+            model_path=app_paths.kokoro_model_path,
+            voices_path=app_paths.kokoro_voices_path,
+            output_directory=app_paths.tts_output_dir,
+        )
+    )
+
+
 class MainWindow(QMainWindow):
     """
     Main application window.
@@ -334,15 +389,15 @@ class MainWindow(QMainWindow):
 
         self.app_paths = app_paths
         self.active_repository: SaveRepository | None = None
-        self.menu_theme = self._latest_saved_theme()
-        self.sound_manager = SoundManager(prepare_sound_directory(self.app_paths))
-        self.narration_player = NarrationPlayer(
-            create_tts_manager(
-                model_path=self.app_paths.kokoro_model_path,
-                voices_path=self.app_paths.kokoro_voices_path,
-                output_directory=self.app_paths.tts_output_dir,
-            )
+        self.tts_enabled = is_tts_enabled()
+        self.app_settings = load_app_settings(
+            self.app_paths.app_settings_path,
+            fallback_theme=self._latest_saved_theme(),
+            tts_enabled=self.tts_enabled,
         )
+        self.menu_theme = _normalize_theme_name(self.app_settings["theme"])
+        self.sound_manager = SoundManager(prepare_sound_directory(self.app_paths))
+        self.narration_player = _create_narration_player(self.app_paths)
 
         self.setWindowTitle("AI Adventure")
         self._set_app_icon()
@@ -355,6 +410,7 @@ class MainWindow(QMainWindow):
             saves_dir=self.app_paths.saves_dir,
             on_new_game=self.start_new_game_wizard,
             on_load_game=self.load_game_from_path,
+            on_settings=self.open_main_menu_settings,
         )
 
         self.game_shell = GameShell(
@@ -362,6 +418,7 @@ class MainWindow(QMainWindow):
             on_theme_changed=self._apply_active_theme,
             sound_manager=self.sound_manager,
             narration_player=self.narration_player,
+            tts_enabled=self.tts_enabled,
         )
 
         self.stack.addWidget(self.main_menu)
@@ -394,7 +451,14 @@ class MainWindow(QMainWindow):
         if not should_continue:
             return
 
-        wizard = NewGameWizard(self, template_setup=template_setup)
+        wizard = NewGameWizard(
+            self,
+            template_setup=template_setup,
+            tts_enabled=self.tts_enabled,
+            audio_defaults=self.app_settings["audio"],
+            voice_options=_narrator_voice_options(self.narration_player),
+            on_sample_voice=self._play_narrator_sample,
+        )
 
         while True:
             if wizard.exec() != QDialog.DialogCode.Accepted:
@@ -424,6 +488,22 @@ class MainWindow(QMainWindow):
                         "Could not create a new game.",
                     )
                     return
+
+    def open_main_menu_settings(self) -> None:
+        """Opens app-level settings from the Main Menu."""
+
+        dialog = MainMenuSettingsDialog(
+            self,
+            settings=self.app_settings,
+            tts_enabled=self.tts_enabled,
+            voice_options=_narrator_voice_options(self.narration_player),
+            on_sample_voice=self._play_narrator_sample,
+        )
+
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        self._apply_app_settings(dialog.build_settings(), persist=True)
 
     def _choose_new_game_template_setup(self) -> tuple[bool, dict[str, Any] | None]:
         """Asks whether a new game should start blank or from a saved template."""
@@ -541,7 +621,7 @@ class MainWindow(QMainWindow):
             True when the save was created and opened.
         """
 
-        clean_setup = normalize_new_game_setup(setup)
+        clean_setup = self._normalize_new_game_setup_for_runtime(setup)
 
         try:
             self._create_new_game_from_setup(clean_setup)
@@ -558,11 +638,14 @@ class MainWindow(QMainWindow):
     def _create_new_game_from_setup(self, clean_setup: dict[str, Any]) -> None:
         """Creates a new save from normalized setup and opens the shell."""
 
+        clean_setup = self._normalize_new_game_setup_for_runtime(clean_setup)
+
         repository = SaveRepository.create_new_save(
             self.app_paths.saves_dir,
             clean_setup["title"],
             setup=clean_setup,
         )
+        repository.set_setting("theme", self.menu_theme)
 
         save_new_game_template(self.app_paths.new_game_templates_path, clean_setup)
         self.open_repository(repository)
@@ -618,9 +701,28 @@ class MainWindow(QMainWindow):
             return
 
         self._apply_new_game_ai_state(repository, setup, result)
-        repository.set_world_summary(result.world_summary)
-        repository.set_world_lore(result.world_lore)
-        repository.append_history("story", result.introductory_message)
+        repository.set_world_summary(
+            _preserve_player_character_text(
+                result.world_summary,
+                setup,
+                result.finalized_character,
+            )
+        )
+        repository.set_world_lore(
+            _preserve_player_character_text(
+                result.world_lore,
+                setup,
+                result.finalized_character,
+            )
+        )
+        repository.append_history(
+            "story",
+            _preserve_player_character_text(
+                result.introductory_message,
+                setup,
+                result.finalized_character,
+            ),
+        )
 
         if result.suggested_events:
             event_results = EventApplier(repository).apply_events(result.suggested_events)
@@ -634,6 +736,30 @@ class MainWindow(QMainWindow):
                 skipped_count,
             )
 
+    def _normalize_new_game_setup_for_runtime(self, setup: dict[str, Any]) -> dict[str, Any]:
+        """Normalizes setup and disables narrator settings when TTS is unavailable."""
+
+        raw_setup = dict(setup) if isinstance(setup, dict) else {}
+        audio = dict(self.app_settings["audio"])
+
+        if isinstance(raw_setup.get("audio"), dict):
+            audio.update(raw_setup["audio"])
+
+        raw_setup["audio"] = audio
+        clean_setup = normalize_new_game_setup(raw_setup)
+
+        if self.tts_enabled:
+            return clean_setup
+
+        audio = dict(clean_setup["audio"])
+        audio["narrator_enabled"] = False
+        audio["tts_volume"] = 0
+        audio["tts_voice"] = DEFAULT_NARRATOR_VOICE
+
+        clean_setup = dict(clean_setup)
+        clean_setup["audio"] = audio
+        return clean_setup
+
     def _apply_new_game_ai_state(
         self,
         repository: SaveRepository,
@@ -644,6 +770,14 @@ class MainWindow(QMainWindow):
 
         if result.start_location:
             repository.set_state_value("location", result.start_location)
+
+        setup_calendar = setup.get("calendar", {})
+        if (
+            isinstance(setup_calendar, dict)
+            and bool(setup_calendar.get("ai_generated", False))
+            and getattr(result, "calendar_settings", {})
+        ):
+            repository.set_calendar_settings(result.calendar_settings)
 
         if result.starting_calendar:
             elapsed_minutes = resolve_starting_elapsed_minutes(
@@ -692,7 +826,10 @@ class MainWindow(QMainWindow):
                 ),
             )
 
-        character = result.finalized_character
+        character = _preserved_player_character_fields(
+            setup,
+            result.finalized_character,
+        )
 
         if character:
             if character.get("name"):
@@ -705,7 +842,7 @@ class MainWindow(QMainWindow):
                 repository.set_setting("player.notes", character["notes"])
 
         if _ai_skills_match_setup(result.finalized_skills, setup.get("skills", [])):
-            repository.replace_skills(result.finalized_skills)
+            repository.replace_skills(_deduplicated_ai_skills(result.finalized_skills))
         elif result.finalized_skills:
             LOGGER.warning(
                 "Skipped AI-finalized skills because they did not match the starting skill plan."
@@ -784,7 +921,7 @@ class MainWindow(QMainWindow):
 
         self.active_repository = None
         self.game_shell.set_repository(None)
-        apply_application_theme(self.menu_theme)
+        self._apply_app_settings(self.app_settings, persist=False)
         self.main_menu.refresh_saves()
         self.stack.setCurrentWidget(self.main_menu)
         self.setWindowTitle("AI Adventure")
@@ -793,13 +930,69 @@ class MainWindow(QMainWindow):
         """Applies the theme saved for the currently loaded adventure."""
 
         if self.active_repository is None:
-            apply_application_theme(self.menu_theme)
+            self._apply_app_settings(self.app_settings, persist=False)
             return
 
         self.menu_theme = _normalize_theme_name(
             self.active_repository.get_setting("theme", "Light")
         )
+        self.app_settings = normalize_app_settings(
+            {
+                **self.app_settings,
+                "theme": self.menu_theme,
+            },
+            fallback_theme=self.menu_theme,
+            tts_enabled=self.tts_enabled,
+        )
+        save_app_settings(self.app_paths.app_settings_path, self.app_settings)
         apply_application_theme(self.menu_theme)
+
+    def _apply_app_settings(self, settings: dict[str, Any], *, persist: bool) -> None:
+        """Applies app-level settings used when no save is active."""
+
+        self.app_settings = normalize_app_settings(
+            settings,
+            fallback_theme=self.menu_theme,
+            tts_enabled=self.tts_enabled,
+        )
+        self.menu_theme = _normalize_theme_name(self.app_settings["theme"])
+
+        if persist:
+            save_app_settings(self.app_paths.app_settings_path, self.app_settings)
+
+        apply_application_theme(self.menu_theme)
+        self._apply_menu_audio_settings()
+
+    def _apply_menu_audio_settings(self) -> None:
+        """Applies app-level audio settings while the Main Menu is active."""
+
+        audio = self.app_settings["audio"]
+
+        if self.sound_manager is not None:
+            self.sound_manager.set_music_volume(audio["music_volume"])
+            self.sound_manager.set_music_enabled(audio["music_enabled"])
+
+            if not audio["music_enabled"]:
+                self.sound_manager.stop_music(clear_current=False)
+
+        if self.narration_player is not None:
+            self.narration_player.set_volume(audio["tts_volume"])
+            if hasattr(self.narration_player, "set_voice"):
+                self.narration_player.set_voice(audio["tts_voice"])
+            self.narration_player.set_enabled(audio["narrator_enabled"])
+
+    def _play_narrator_sample(self, voice: str, volume: int) -> bool:
+        """Plays a local narrator voice sample."""
+
+        if self.narration_player is None or not hasattr(self.narration_player, "play_sample"):
+            return False
+
+        return bool(
+            self.narration_player.play_sample(
+                voice=normalize_narrator_voice(voice),
+                volume=volume,
+            )
+        )
 
     def _latest_saved_theme(self) -> str:
         """Reads the most recent save's theme for the Main Menu."""
@@ -816,20 +1009,190 @@ class MainWindow(QMainWindow):
         return "Light"
 
 
+class MainMenuSettingsDialog(QDialog):
+    """App-level settings available before a save is loaded."""
+
+    def __init__(
+        self,
+        parent: QWidget | None = None,
+        *,
+        settings: dict[str, Any],
+        tts_enabled: bool = True,
+        voice_options: dict[str, str] | None = None,
+        on_sample_voice: Callable[[str, int], bool] | None = None,
+    ) -> None:
+        super().__init__(parent)
+
+        self.tts_enabled = bool(tts_enabled)
+        self.voice_options = voice_options or available_narrator_voices()
+        self.on_sample_voice = on_sample_voice
+        clean_settings = normalize_app_settings(
+            settings,
+            tts_enabled=self.tts_enabled,
+        )
+        audio = clean_settings["audio"]
+
+        self.setWindowTitle("Settings")
+        self.resize(500, 340)
+
+        self.theme_combo = QComboBox()
+        self.theme_combo.addItems(["Light", "Dark"])
+        self.theme_combo.setCurrentText(clean_settings["theme"])
+
+        self.music_enabled_checkbox = QCheckBox("Music enabled")
+        self.music_enabled_checkbox.setChecked(bool(audio["music_enabled"]))
+
+        self.music_volume_slider = QSlider(Qt.Orientation.Horizontal)
+        self.music_volume_slider.setRange(0, 100)
+        self.music_volume_slider.setValue(int(audio["music_volume"]))
+        self.music_volume_label = QLabel(f"{self.music_volume_slider.value()}%")
+        self.music_volume_slider.valueChanged.connect(
+            lambda value: self.music_volume_label.setText(f"{value}%")
+        )
+
+        self.narrator_enabled_checkbox: QCheckBox | None = None
+        self.tts_volume_slider: QSlider | None = None
+        self.tts_volume_label: QLabel | None = None
+        self.tts_voice_combo: QComboBox | None = None
+        self.sample_voice_button: QPushButton | None = None
+        self._custom_calendar_settings = dict(GREGORIAN_CALENDAR_SETTINGS)
+
+        form = QFormLayout()
+        form.addRow("Theme Preference:", self.theme_combo)
+        form.addRow("Background Music:", self.music_enabled_checkbox)
+        form.addRow(
+            "Music Volume:",
+            _slider_row(self.music_volume_slider, self.music_volume_label),
+        )
+
+        if self.tts_enabled:
+            self.narrator_enabled_checkbox = QCheckBox("Narrator enabled")
+            self.narrator_enabled_checkbox.setChecked(bool(audio["narrator_enabled"]))
+            self.narrator_enabled_checkbox.toggled.connect(
+                lambda checked: self._sync_narrator_control_states(checked)
+            )
+
+            self.tts_volume_slider = QSlider(Qt.Orientation.Horizontal)
+            self.tts_volume_slider.setRange(0, 100)
+            self.tts_volume_slider.setValue(int(audio["tts_volume"]))
+            self.tts_volume_label = QLabel(f"{self.tts_volume_slider.value()}%")
+            self.tts_volume_slider.valueChanged.connect(
+                lambda value: self.tts_volume_label.setText(f"{value}%")
+            )
+
+            self.tts_voice_combo = QComboBox()
+            _populate_narrator_voice_combo(
+                self.tts_voice_combo,
+                audio["tts_voice"],
+                voice_options=self.voice_options,
+            )
+            self.sample_voice_button = QPushButton("Sample Voice")
+            self.sample_voice_button.clicked.connect(self._sample_voice)
+
+            form.addRow("Narrator:", self.narrator_enabled_checkbox)
+            form.addRow(
+                "Narrator Volume:",
+                _slider_row(self.tts_volume_slider, self.tts_volume_label),
+            )
+            form.addRow(
+                "Narrator Voice:",
+                _button_row(self.tts_voice_combo, self.sample_voice_button),
+            )
+            self._sync_narrator_control_states(
+                self.narrator_enabled_checkbox.isChecked()
+            )
+
+        save_button = QPushButton("Save")
+        save_button.clicked.connect(self.accept)
+        cancel_button = QPushButton("Cancel")
+        cancel_button.clicked.connect(self.reject)
+
+        button_row = QHBoxLayout()
+        button_row.addStretch()
+        button_row.addWidget(save_button)
+        button_row.addWidget(cancel_button)
+
+        layout = QVBoxLayout()
+        layout.addLayout(form)
+        layout.addStretch()
+        layout.addLayout(button_row)
+        self.setLayout(layout)
+
+    def build_settings(self) -> dict[str, Any]:
+        """Builds normalized app-level settings from dialog fields."""
+
+        return normalize_app_settings(
+            {
+                "theme": self.theme_combo.currentText(),
+                "audio": {
+                    "music_enabled": self.music_enabled_checkbox.isChecked(),
+                    "narrator_enabled": self._narrator_enabled_value(),
+                    "music_volume": self.music_volume_slider.value(),
+                    "tts_volume": self._tts_volume_value(),
+                    "tts_voice": self._tts_voice_value(),
+                },
+            },
+            tts_enabled=self.tts_enabled,
+        )
+
+    def _narrator_enabled_value(self) -> bool:
+        """Returns the requested narrator setting."""
+
+        if self.narrator_enabled_checkbox is None:
+            return False
+
+        return self.narrator_enabled_checkbox.isChecked()
+
+    def _tts_volume_value(self) -> int:
+        """Returns the requested narrator volume."""
+
+        if self.tts_volume_slider is None:
+            return 0
+
+        return self.tts_volume_slider.value()
+
+    def _tts_voice_value(self) -> str:
+        """Returns the selected narrator voice id."""
+
+        return normalize_narrator_voice(
+            _combo_current_data_text(self.tts_voice_combo, DEFAULT_NARRATOR_VOICE)
+        )
+
+    def _sync_narrator_control_states(self, checked: bool) -> None:
+        """Enables narrator-specific controls only when narration is enabled."""
+
+        if self.tts_volume_slider is not None:
+            self.tts_volume_slider.setEnabled(checked)
+        if self.tts_voice_combo is not None:
+            self.tts_voice_combo.setEnabled(checked)
+        if self.sample_voice_button is not None:
+            self.sample_voice_button.setEnabled(checked and self.on_sample_voice is not None)
+
+    def _sample_voice(self) -> None:
+        """Plays the selected voice sample."""
+
+        if self.on_sample_voice is None:
+            return
+
+        self.on_sample_voice(self._tts_voice_value(), self._tts_volume_value())
+
+
 class MainMenuScreen(QWidget):
-    """Main Menu with New Game and Load Game actions."""
+    """Main Menu with New Game, Load Game, and Settings actions."""
 
     def __init__(
         self,
         saves_dir: Path,
         on_new_game,
         on_load_game,
+        on_settings,
     ) -> None:
         """
         Args:
             saves_dir: Directory containing save folders.
             on_new_game: Callback for creating a new game.
             on_load_game: Callback for loading a save by database path.
+            on_settings: Callback for opening app-level settings.
         """
 
         super().__init__()
@@ -837,6 +1200,7 @@ class MainMenuScreen(QWidget):
         self.saves_dir = saves_dir
         self.on_new_game = on_new_game
         self.on_load_game = on_load_game
+        self.on_settings = on_settings
 
         title_label = QLabel("AI Adventure")
         title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -850,12 +1214,16 @@ class MainMenuScreen(QWidget):
         load_button = QPushButton("Load Game")
         load_button.clicked.connect(self._handle_load_game)
 
+        self.settings_button = QPushButton("Settings")
+        self.settings_button.clicked.connect(self.on_settings)
+
         layout = QVBoxLayout()
         layout.addStretch()
         layout.addWidget(title_label)
         layout.addSpacing(30)
 
         layout.addWidget(new_game_button)
+        layout.addWidget(self.settings_button)
 
         layout.addSpacing(30)
         layout.addWidget(QLabel("Existing Saves:"))
@@ -925,8 +1293,25 @@ class NewGameWizard(QWizard):
         parent: QWidget | None = None,
         *,
         template_setup: dict[str, Any] | None = None,
+        tts_enabled: bool = True,
+        audio_defaults: dict[str, Any] | None = None,
+        voice_options: dict[str, str] | None = None,
+        on_sample_voice: Callable[[str, int], bool] | None = None,
     ) -> None:
         super().__init__(parent)
+
+        self.tts_enabled = bool(tts_enabled)
+        self.voice_options = voice_options or available_narrator_voices()
+        self.on_sample_voice = on_sample_voice
+        self.audio_defaults = normalize_app_settings(
+            {"audio": audio_defaults or {}},
+            tts_enabled=self.tts_enabled,
+        )["audio"]
+        self.narrator_enabled_checkbox: QCheckBox | None = None
+        self.tts_volume_slider: QSlider | None = None
+        self.tts_volume_label: QLabel | None = None
+        self.tts_voice_combo: QComboBox | None = None
+        self.sample_voice_button: QPushButton | None = None
 
         self.setWindowTitle("New Game Wizard")
         self.resize(780, 620)
@@ -947,35 +1332,88 @@ class NewGameWizard(QWizard):
 
         self.setObjectName("newGameWizard")
         self.setWizardStyle(QWizard.WizardStyle.ModernStyle)
+        use_dark_theme = _application_uses_dark_theme()
+        colors = (
+            {
+                "window": "#202124",
+                "window_text": "#f1f3f4",
+                "base": "#121416",
+                "alternate_base": "#2a2d30",
+                "border": "#5b6268",
+                "muted_border": "#4b5258",
+                "placeholder": "#a9b0b6",
+                "button": "#303437",
+                "button_hover": "#3c4247",
+                "button_pressed": "#262a2d",
+                "button_disabled": "#25282b",
+                "disabled_text": "#8b949e",
+                "accent": "#4c8fcb",
+                "accent_dark": "#2f6fb0",
+                "drop_down": "#25292d",
+                "group": "#25282b",
+                "grid": "#3d444b",
+                "selection": "#2f6fb0",
+                "selection_text": "#ffffff",
+            }
+            if use_dark_theme
+            else {
+                "window": "#f5f7fb",
+                "window_text": "#111827",
+                "base": "#ffffff",
+                "alternate_base": "#eef2f7",
+                "border": "#64748b",
+                "muted_border": "#94a3b8",
+                "placeholder": "#4b5563",
+                "button": "#e5e7eb",
+                "button_hover": "#dbe4ee",
+                "button_pressed": "#cbd5e1",
+                "button_disabled": "#edf1f5",
+                "disabled_text": "#6b7280",
+                "accent": "#2563eb",
+                "accent_dark": "#1d4ed8",
+                "drop_down": "#e2e8f0",
+                "group": "#eef2f7",
+                "grid": "#cbd5e1",
+                "selection": "#1d4ed8",
+                "selection_text": "#ffffff",
+            }
+        )
 
         palette = self.palette()
-        palette.setColor(QPalette.ColorRole.Window, QColor("#f5f7fb"))
-        palette.setColor(QPalette.ColorRole.WindowText, QColor("#111827"))
-        palette.setColor(QPalette.ColorRole.Base, QColor("#ffffff"))
-        palette.setColor(QPalette.ColorRole.AlternateBase, QColor("#eef2f7"))
-        palette.setColor(QPalette.ColorRole.Text, QColor("#111827"))
-        palette.setColor(QPalette.ColorRole.PlaceholderText, QColor("#4b5563"))
-        palette.setColor(QPalette.ColorRole.Button, QColor("#e5e7eb"))
-        palette.setColor(QPalette.ColorRole.ButtonText, QColor("#111827"))
-        palette.setColor(QPalette.ColorRole.Highlight, QColor("#1d4ed8"))
-        palette.setColor(QPalette.ColorRole.HighlightedText, QColor("#ffffff"))
+        palette.setColor(QPalette.ColorRole.Window, QColor(colors["window"]))
+        palette.setColor(QPalette.ColorRole.WindowText, QColor(colors["window_text"]))
+        palette.setColor(QPalette.ColorRole.Base, QColor(colors["base"]))
+        palette.setColor(QPalette.ColorRole.AlternateBase, QColor(colors["alternate_base"]))
+        palette.setColor(QPalette.ColorRole.Text, QColor(colors["window_text"]))
+        palette.setColor(QPalette.ColorRole.PlaceholderText, QColor(colors["placeholder"]))
+        palette.setColor(QPalette.ColorRole.Button, QColor(colors["button"]))
+        palette.setColor(QPalette.ColorRole.ButtonText, QColor(colors["window_text"]))
+        palette.setColor(QPalette.ColorRole.Highlight, QColor(colors["selection"]))
+        palette.setColor(QPalette.ColorRole.HighlightedText, QColor(colors["selection_text"]))
+        palette.setColor(QPalette.ColorRole.ToolTipBase, QColor(colors["button"]))
+        palette.setColor(QPalette.ColorRole.ToolTipText, QColor(colors["window_text"]))
         self.setPalette(palette)
 
-        self.setStyleSheet(
-            """
+        stylesheet = """
             QWizard#newGameWizard {
-                background-color: #f5f7fb;
-                color: #111827;
+                background-color: {colors["window"]};
+                color: {colors["window_text"]};
             }
 
-            QWizard#newGameWizard QWizardPage {
-                background-color: #f5f7fb;
-                color: #111827;
+            QWizard#newGameWizard QWidget {
+                background-color: {colors["window"]};
+                color: {colors["window_text"]};
+            }
+
+            QWizard#newGameWizard QWizardPage,
+            QWizard#newGameWizard QFrame {
+                background-color: {colors["window"]};
+                color: {colors["window_text"]};
             }
 
             QWizard#newGameWizard QLabel {
                 background-color: transparent;
-                color: #111827;
+                color: {colors["window_text"]};
                 font-size: 13px;
             }
 
@@ -983,13 +1421,26 @@ class NewGameWizard(QWizard):
             QWizard#newGameWizard QTextEdit,
             QWizard#newGameWizard QComboBox,
             QWizard#newGameWizard QSpinBox {
-                background-color: #ffffff;
-                border: 1px solid #64748b;
+                background-color: {colors["base"]};
+                border: 1px solid {colors["border"]};
                 border-radius: 5px;
-                color: #111827;
+                color: {colors["window_text"]};
                 padding: 6px;
-                selection-background-color: #1d4ed8;
-                selection-color: #ffffff;
+                selection-background-color: {colors["selection"]};
+                selection-color: {colors["selection_text"]};
+            }
+
+            QWizard#newGameWizard QComboBox {
+                padding-right: 40px;
+            }
+
+            QWizard#newGameWizard QSpinBox {
+                padding-right: 36px;
+            }
+
+            QWizard#newGameWizard QLineEdit::placeholder,
+            QWizard#newGameWizard QTextEdit::placeholder {
+                color: {colors["placeholder"]};
             }
 
             QWizard#newGameWizard QTextEdit {
@@ -998,15 +1449,32 @@ class NewGameWizard(QWizard):
 
             QWizard#newGameWizard QCheckBox {
                 background-color: transparent;
-                color: #111827;
+                color: {colors["window_text"]};
                 spacing: 8px;
             }
 
+            QWizard#newGameWizard QCheckBox::indicator {
+                background-color: {colors["base"]};
+                border: 1px solid {colors["border"]};
+                border-radius: 3px;
+                height: 16px;
+                width: 16px;
+            }
+
+            QWizard#newGameWizard QCheckBox::indicator:hover {
+                border-color: {colors["accent"]};
+            }
+
+            QWizard#newGameWizard QCheckBox::indicator:checked {
+                background-color: {colors["accent"]};
+                border-color: {colors["accent_dark"]};
+            }
+
             QWizard#newGameWizard QGroupBox {
-                background-color: #eef2f7;
-                border: 1px solid #94a3b8;
+                background-color: {colors["group"]};
+                border: 1px solid {colors["muted_border"]};
                 border-radius: 6px;
-                color: #111827;
+                color: {colors["window_text"]};
                 font-weight: 600;
                 margin-top: 12px;
                 padding: 10px;
@@ -1015,6 +1483,8 @@ class NewGameWizard(QWizard):
             QWizard#newGameWizard QGroupBox::title {
                 subcontrol-origin: margin;
                 left: 10px;
+                background-color: {colors["group"]};
+                color: {colors["window_text"]};
                 padding: 0 4px;
             }
 
@@ -1023,16 +1493,20 @@ class NewGameWizard(QWizard):
                 border: 0;
             }
 
+            QWizard#newGameWizard QScrollArea > QWidget > QWidget {
+                background-color: {colors["window"]};
+            }
+
             QWizard#newGameWizard QSlider::groove:horizontal {
-                background-color: #d1d9e6;
-                border: 1px solid #94a3b8;
+                background-color: {colors["alternate_base"]};
+                border: 1px solid {colors["muted_border"]};
                 border-radius: 4px;
                 height: 8px;
             }
 
             QWizard#newGameWizard QSlider::handle:horizontal {
-                background-color: #2563eb;
-                border: 1px solid #1e40af;
+                background-color: {colors["accent"]};
+                border: 1px solid {colors["accent_dark"]};
                 border-radius: 7px;
                 margin: -4px 0;
                 width: 14px;
@@ -1042,94 +1516,119 @@ class NewGameWizard(QWizard):
             QWizard#newGameWizard QTextEdit:focus,
             QWizard#newGameWizard QComboBox:focus,
             QWizard#newGameWizard QSpinBox:focus {
-                border-color: #1d4ed8;
+                border-color: {colors["accent"]};
             }
 
-            QWizard#newGameWizard QComboBox::drop-down,
+            QWizard#newGameWizard QComboBox::drop-down {
+                background-color: {colors["drop_down"]};
+                border: 0;
+                border-left: 1px solid {colors["muted_border"]};
+                border-top-right-radius: 4px;
+                border-bottom-right-radius: 4px;
+                subcontrol-origin: border;
+                subcontrol-position: top right;
+                width: 32px;
+            }
+
+            QWizard#newGameWizard QComboBox::down-arrow {
+                image: none;
+                width: 0;
+                height: 0;
+                border-left: 5px solid transparent;
+                border-right: 5px solid transparent;
+                border-top: 6px solid {colors["window_text"]};
+            }
+
             QWizard#newGameWizard QSpinBox::up-button,
             QWizard#newGameWizard QSpinBox::down-button {
-                background-color: #e2e8f0;
-                border: 0;
-                width: 22px;
+                background-color: {colors["drop_down"]};
+                border-left: 1px solid {colors["muted_border"]};
+                subcontrol-origin: border;
+                width: 28px;
+            }
+
+            QWizard#newGameWizard QSpinBox::up-button {
+                border-top-right-radius: 4px;
+                border-bottom: 1px solid {colors["muted_border"]};
+                subcontrol-position: top right;
+                height: 14px;
+            }
+
+            QWizard#newGameWizard QSpinBox::down-button {
+                border-bottom-right-radius: 4px;
+                subcontrol-position: bottom right;
+                height: 14px;
+            }
+
+            QWizard#newGameWizard QComboBox QAbstractItemView {
+                background-color: {colors["base"]};
+                border: 1px solid {colors["border"]};
+                color: {colors["window_text"]};
+                selection-background-color: {colors["selection"]};
+                selection-color: {colors["selection_text"]};
             }
 
             QWizard#newGameWizard QTableWidget {
-                background-color: #ffffff;
-                alternate-background-color: #eef2f7;
-                border: 1px solid #64748b;
+                background-color: {colors["base"]};
+                alternate-background-color: {colors["alternate_base"]};
+                border: 1px solid {colors["border"]};
                 border-radius: 5px;
-                color: #111827;
-                gridline-color: #cbd5e1;
-                selection-background-color: #1d4ed8;
-                selection-color: #ffffff;
+                color: {colors["window_text"]};
+                gridline-color: {colors["grid"]};
+                selection-background-color: {colors["selection"]};
+                selection-color: {colors["selection_text"]};
             }
 
             QWizard#newGameWizard QHeaderView::section {
-                background-color: #e2e8f0;
+                background-color: {colors["drop_down"]};
                 border: 0;
-                border-right: 1px solid #cbd5e1;
-                color: #111827;
+                border-right: 1px solid {colors["grid"]};
+                color: {colors["window_text"]};
                 font-weight: 600;
                 padding: 7px;
             }
 
             QWizard#newGameWizard QPushButton {
-                background-color: #e5e7eb;
-                border: 1px solid #64748b;
+                background-color: {colors["button"]};
+                border: 1px solid {colors["border"]};
                 border-radius: 5px;
-                color: #111827;
+                color: {colors["window_text"]};
                 min-width: 76px;
                 padding: 6px 14px;
             }
 
             QWizard#newGameWizard QPushButton:hover {
-                background-color: #dbe4ee;
-                border-color: #475569;
+                background-color: {colors["button_hover"]};
+                border-color: {colors["muted_border"]};
             }
 
             QWizard#newGameWizard QPushButton:pressed {
-                background-color: #cbd5e1;
+                background-color: {colors["button_pressed"]};
             }
 
             QWizard#newGameWizard QPushButton:default {
-                background-color: #2563eb;
-                border-color: #1d4ed8;
-                color: #ffffff;
+                background-color: {colors["accent"]};
+                border-color: {colors["accent_dark"]};
+                color: {colors["selection_text"]};
             }
 
             QWizard#newGameWizard QPushButton:disabled {
-                background-color: #edf1f5;
-                border-color: #cbd5e1;
-                color: #6b7280;
+                background-color: {colors["button_disabled"]};
+                border-color: {colors["grid"]};
+                color: {colors["disabled_text"]};
             }
             """
-        )
+
+        for color_name, color_value in colors.items():
+            stylesheet = stylesheet.replace(f'{{colors["{color_name}"]}}', color_value)
+
+        self.setStyleSheet(stylesheet)
 
     def build_setup(self) -> dict[str, Any]:
         """Builds a normalized setup dictionary from wizard fields."""
 
         calendar_type = self.calendar_type_combo.currentData() or "gregorian"
-        calendar_settings: dict[str, Any] = {
-            "calendar_type": calendar_type,
-            "time_display": self.time_format_combo.currentData() or "12_hour",
-        }
-
-        if calendar_type == "custom":
-            calendar_settings.update(
-                {
-                    "days_per_week": self.days_per_week_input.value(),
-                    "weeks_per_month": self.weeks_per_month_input.value(),
-                    "months_per_year": self.months_per_year_input.value(),
-                    "seasons_per_year": self.seasons_per_year_input.value(),
-                    "day_names": _split_list(self.day_names_input.text()),
-                    "month_names": _split_list(self.month_names_input.text()),
-                    "seasons": _build_season_settings(
-                        names=_split_list(self.season_names_input.text()),
-                        hints=_split_list(self.season_hints_input.text()),
-                        count=self.seasons_per_year_input.value(),
-                    ),
-                }
-            )
+        calendar_settings = self._calendar_settings_for_setup(str(calendar_type))
 
         skills = [
             {
@@ -1152,15 +1651,18 @@ class NewGameWizard(QWizard):
                 "notes": self.character_notes_input.toPlainText(),
             },
             "skills": skills,
-            "starter_items": parse_starter_items_text(
-                self.starter_items_input.toPlainText()
-            ),
+            "starter_items": self._starter_items_from_table(),
             "calendar": calendar_settings,
             "audio": {
                 "music_enabled": self.music_enabled_checkbox.isChecked(),
-                "narrator_enabled": self.narrator_enabled_checkbox.isChecked(),
+                "narrator_enabled": self._narrator_enabled_value(),
                 "music_volume": self.music_volume_slider.value(),
-                "tts_volume": self.tts_volume_slider.value(),
+                "tts_volume": self._tts_volume_value(),
+                "tts_voice": self._tts_voice_value(),
+            },
+            "narration": {
+                "tense": self.narration_tense_combo.currentData(),
+                "style": self.narration_style_combo.currentData(),
             },
             "currency_denominations": self._currency_denominations_from_table(),
             "currency_description": self.currency_description_input.toPlainText(),
@@ -1179,12 +1681,15 @@ class NewGameWizard(QWizard):
         character = clean_setup["character"]
         calendar = clean_setup["calendar"]
         audio = clean_setup["audio"]
+        narration = clean_setup["narration"]
 
         self.title_input.setText(clean_setup["title"])
         self.genre_input.setText(clean_setup["specified_genre"])
         self.game_style_input.setPlainText(clean_setup["game_style"])
         self.start_location_input.setText(clean_setup["start_location"])
         self.world_context_input.setPlainText(clean_setup["world_context"])
+        _set_combo_to_data(self.narration_tense_combo, narration["tense"])
+        _set_combo_to_data(self.narration_style_combo, narration["style"])
 
         self.character_name_input.setText(character["name"])
         self.appearance_input.setPlainText(character["appearance"])
@@ -1196,9 +1701,11 @@ class NewGameWizard(QWizard):
             skill_input.setText(str(skill.get("name", "")))
             description_input.setText(str(skill.get("description", "")))
 
-        self.starter_items_input.setPlainText(
-            _format_starter_items_for_template(clean_setup["starter_items"])
-        )
+        self.starter_items_table.setRowCount(0)
+
+        for item in clean_setup["starter_items"]:
+            self._append_starter_item_row(item)
+
         self.currency_table.setRowCount(0)
 
         for denomination in clean_setup["currency_denominations"]:
@@ -1210,26 +1717,19 @@ class NewGameWizard(QWizard):
             self.calendar_type_combo,
             _calendar_type_from_settings(calendar),
         )
-        _set_combo_to_data(
-            self.time_format_combo,
-            str(calendar.get("time_display", "12_hour")),
-        )
-        self.days_per_week_input.setValue(int(calendar["days_per_week"]))
-        self.weeks_per_month_input.setValue(int(calendar["weeks_per_month"]))
-        self.months_per_year_input.setValue(int(calendar["months_per_year"]))
-        self.seasons_per_year_input.setValue(int(calendar["seasons_per_year"]))
-        self.day_names_input.setText(", ".join(str(name) for name in calendar["day_names"]))
-        self.month_names_input.setText(", ".join(str(name) for name in calendar["month_names"]))
-        self.season_names_input.setText(
-            ", ".join(str(season["name"]) for season in calendar["seasons"])
-        )
-        self.season_hints_input.setText(
-            ", ".join(str(season["weather_hint"]) for season in calendar["seasons"])
-        )
+        self._custom_calendar_settings = dict(calendar)
+        self._sync_calendar_settings_button()
         self.music_enabled_checkbox.setChecked(bool(audio["music_enabled"]))
-        self.narrator_enabled_checkbox.setChecked(bool(audio["narrator_enabled"]))
         self.music_volume_slider.setValue(int(audio["music_volume"]))
-        self.tts_volume_slider.setValue(int(audio["tts_volume"]))
+
+        if self.narrator_enabled_checkbox is not None:
+            self.narrator_enabled_checkbox.setChecked(bool(audio["narrator_enabled"]))
+
+        if self.tts_volume_slider is not None:
+            self.tts_volume_slider.setValue(int(audio["tts_volume"]))
+
+        if self.tts_voice_combo is not None:
+            _set_combo_to_data(self.tts_voice_combo, audio["tts_voice"])
 
     def _build_adventure_page(self) -> None:
         """Builds the adventure/world setup page."""
@@ -1256,6 +1756,14 @@ class NewGameWizard(QWizard):
             "Optional: deserted island, frozen sea, crime scene, ruined store..."
         )
 
+        self.narration_tense_combo = QComboBox()
+        _add_combo_options(self.narration_tense_combo, NARRATION_TENSE_OPTIONS)
+        _set_combo_to_data(self.narration_tense_combo, DEFAULT_NARRATION_TENSE)
+
+        self.narration_style_combo = QComboBox()
+        _add_combo_options(self.narration_style_combo, NARRATION_STYLE_OPTIONS)
+        _set_combo_to_data(self.narration_style_combo, DEFAULT_NARRATION_STYLE)
+
         self.world_context_input = QTextEdit()
         self.world_context_input.setPlaceholderText(
             "Named locations, factions, guilds, religions, political tensions, tone, themes..."
@@ -1266,6 +1774,8 @@ class NewGameWizard(QWizard):
         layout.addRow("Genre:", self.genre_input)
         layout.addRow("Game Style:", self.game_style_input)
         layout.addRow("Starting Location:", self.start_location_input)
+        layout.addRow("Narration Tense:", self.narration_tense_combo)
+        layout.addRow("Narration Style:", self.narration_style_combo)
         layout.addRow("World Details:", self.world_context_input)
         page.setLayout(layout)
 
@@ -1356,18 +1866,32 @@ class NewGameWizard(QWizard):
         page.setTitle("Inventory and Currency")
         page.setSubTitle("Add requested starter items and describe the world's money.")
 
-        self.starter_items_input = QTextEdit()
-        self.starter_items_input.setPlaceholderText(
-            "One item per line. Describe an item naturally, or use: "
-            "Name | Type | Amount | Description | Value"
+        self.starter_items_table = QTableWidget(0, 6)
+        self.starter_items_table.setHorizontalHeaderLabels(
+            ["Name", "Amount", "Category", "Description", "Value", ""]
         )
+        self.starter_items_table.setMinimumHeight(170)
+        self.starter_items_table.verticalHeader().setVisible(False)
+        self.starter_items_table.verticalHeader().setDefaultSectionSize(36)
+        self.starter_items_table.horizontalHeader().setStretchLastSection(False)
+        self.starter_items_table.setAlternatingRowColors(True)
+        self.starter_items_table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
+        self.starter_items_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        _set_table_column_widths(self.starter_items_table, STARTER_ITEM_COLUMN_WIDTHS)
 
-        self.currency_table = QTableWidget(0, 3)
-        self.currency_table.setHorizontalHeaderLabels(["Name", "Plural Name", "Base Value"])
+        add_item_button = QPushButton("Add Item")
+        add_item_button.clicked.connect(lambda: self._append_starter_item_row({}))
+
+        self.currency_table = QTableWidget(0, 4)
+        self.currency_table.setHorizontalHeaderLabels(["Name", "Plural Name", "Base Value", ""])
         self.currency_table.setMinimumHeight(180)
         self.currency_table.verticalHeader().setVisible(False)
-        self.currency_table.horizontalHeader().setStretchLastSection(True)
+        self.currency_table.verticalHeader().setDefaultSectionSize(36)
+        self.currency_table.horizontalHeader().setStretchLastSection(False)
         self.currency_table.setAlternatingRowColors(True)
+        self.currency_table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
+        self.currency_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        _set_table_column_widths(self.currency_table, CURRENCY_COLUMN_WIDTHS)
 
         add_currency_button = QPushButton("Add Currency")
         add_currency_button.clicked.connect(lambda: self._append_currency_row({}))
@@ -1378,7 +1902,8 @@ class NewGameWizard(QWizard):
         )
 
         layout = QFormLayout()
-        layout.addRow("Starter Items:", self.starter_items_input)
+        layout.addRow("Starter Items:", self.starter_items_table)
+        layout.addRow("", add_item_button)
         layout.addRow("Currencies:", self.currency_table)
         layout.addRow("", add_currency_button)
         layout.addRow("Economy Notes:", self.currency_description_input)
@@ -1391,57 +1916,248 @@ class NewGameWizard(QWizard):
 
         page = QWizardPage()
         page.setTitle("Audio")
-        page.setSubTitle("Choose narration and music preferences before the save starts.")
+        if self.tts_enabled:
+            page.setSubTitle("Choose narration and music preferences before the save starts.")
+        else:
+            page.setSubTitle("Choose music preferences before the save starts.")
 
         self.music_enabled_checkbox = QCheckBox("Music enabled")
-        self.music_enabled_checkbox.setChecked(True)
-
-        self.narrator_enabled_checkbox = QCheckBox("Narrator enabled")
-        self.narrator_enabled_checkbox.setChecked(True)
+        self.music_enabled_checkbox.setChecked(bool(self.audio_defaults["music_enabled"]))
 
         self.music_volume_slider = QSlider(Qt.Orientation.Horizontal)
         self.music_volume_slider.setRange(0, 100)
-        self.music_volume_slider.setValue(25)
-        self.music_volume_label = QLabel("25%")
+        self.music_volume_slider.setValue(int(self.audio_defaults["music_volume"]))
+        self.music_volume_label = QLabel(f"{self.music_volume_slider.value()}%")
         self.music_volume_slider.valueChanged.connect(
             lambda value: self.music_volume_label.setText(f"{value}%")
-        )
-
-        self.tts_volume_slider = QSlider(Qt.Orientation.Horizontal)
-        self.tts_volume_slider.setRange(0, 100)
-        self.tts_volume_slider.setValue(90)
-        self.tts_volume_label = QLabel("90%")
-        self.tts_volume_slider.valueChanged.connect(
-            lambda value: self.tts_volume_label.setText(f"{value}%")
         )
 
         layout = QFormLayout()
         layout.addRow("Background Music:", self.music_enabled_checkbox)
         layout.addRow("Music Volume:", _slider_row(self.music_volume_slider, self.music_volume_label))
-        layout.addRow("Narrator:", self.narrator_enabled_checkbox)
-        layout.addRow("Narrator Volume:", _slider_row(self.tts_volume_slider, self.tts_volume_label))
+
+        if self.tts_enabled:
+            self.narrator_enabled_checkbox = QCheckBox("Narrator enabled")
+            self.narrator_enabled_checkbox.setChecked(
+                bool(self.audio_defaults["narrator_enabled"])
+            )
+            self.narrator_enabled_checkbox.toggled.connect(
+                lambda checked: self._sync_narrator_control_states(checked)
+            )
+
+            self.tts_volume_slider = QSlider(Qt.Orientation.Horizontal)
+            self.tts_volume_slider.setRange(0, 100)
+            self.tts_volume_slider.setValue(int(self.audio_defaults["tts_volume"]))
+            self.tts_volume_label = QLabel(f"{self.tts_volume_slider.value()}%")
+            self.tts_volume_slider.valueChanged.connect(
+                lambda value: self.tts_volume_label.setText(f"{value}%")
+            )
+
+            self.tts_voice_combo = QComboBox()
+            _populate_narrator_voice_combo(
+                self.tts_voice_combo,
+                self.audio_defaults["tts_voice"],
+                voice_options=self.voice_options,
+            )
+            self.sample_voice_button = QPushButton("Sample Voice")
+            self.sample_voice_button.clicked.connect(self._sample_voice)
+
+            layout.addRow("Narrator:", self.narrator_enabled_checkbox)
+            layout.addRow(
+                "Narrator Volume:",
+                _slider_row(self.tts_volume_slider, self.tts_volume_label),
+            )
+            layout.addRow(
+                "Narrator Voice:",
+                _button_row(self.tts_voice_combo, self.sample_voice_button),
+            )
+            self._sync_narrator_control_states(
+                self.narrator_enabled_checkbox.isChecked()
+            )
+
         page.setLayout(layout)
 
         self.addPage(page)
+
+    def _narrator_enabled_value(self) -> bool:
+        """Returns the requested new-game narrator setting."""
+
+        if self.narrator_enabled_checkbox is None:
+            return False
+
+        return self.narrator_enabled_checkbox.isChecked()
+
+    def _tts_volume_value(self) -> int:
+        """Returns the requested new-game narrator volume."""
+
+        if self.tts_volume_slider is None:
+            return 0
+
+        return self.tts_volume_slider.value()
+
+    def _tts_voice_value(self) -> str:
+        """Returns the selected new-game narrator voice id."""
+
+        return normalize_narrator_voice(
+            _combo_current_data_text(self.tts_voice_combo, DEFAULT_NARRATOR_VOICE)
+        )
+
+    def _sync_narrator_control_states(self, checked: bool) -> None:
+        """Enables narrator-specific controls only when narration is enabled."""
+
+        if self.tts_volume_slider is not None:
+            self.tts_volume_slider.setEnabled(checked)
+        if self.tts_voice_combo is not None:
+            self.tts_voice_combo.setEnabled(checked)
+        if self.sample_voice_button is not None:
+            self.sample_voice_button.setEnabled(checked and self.on_sample_voice is not None)
+
+    def _sample_voice(self) -> None:
+        """Plays the selected narrator voice sample."""
+
+        if self.on_sample_voice is None:
+            return
+
+        self.on_sample_voice(self._tts_voice_value(), self._tts_volume_value())
+
+    def _append_starter_item_row(self, item: dict[str, Any]) -> None:
+        """Adds a starter item row to the wizard table."""
+
+        row = self.starter_items_table.rowCount()
+        self.starter_items_table.insertRow(row)
+        self.starter_items_table.setRowHeight(row, 36)
+        name_input = _table_line_edit(str(item.get("name", "")))
+        category_input = _table_line_edit(str(item.get("category", "Item") or "Item"))
+        description_input = _table_line_edit(str(item.get("description", "")))
+
+        quantity_input = _table_spin_box(1, 999_999)
+        quantity_input.setValue(_safe_int(item.get("quantity", 1), 1))
+
+        value_input = _table_spin_box(0, 1_000_000_000)
+        value_input.setValue(_safe_int(item.get("value_base_units", 0), 0))
+
+        remove_button = QPushButton("Remove")
+        remove_button.setMinimumWidth(TABLE_INLINE_BUTTON_MIN_WIDTH)
+        remove_button.setMinimumHeight(TABLE_INLINE_EDITOR_HEIGHT)
+        remove_button.clicked.connect(
+            lambda _checked=False, button=remove_button: self._remove_starter_item_row(button)
+        )
+
+        self.starter_items_table.setCellWidget(row, 0, name_input)
+        self.starter_items_table.setCellWidget(row, 1, quantity_input)
+        self.starter_items_table.setCellWidget(row, 2, category_input)
+        self.starter_items_table.setCellWidget(row, 3, description_input)
+        self.starter_items_table.setCellWidget(row, 4, value_input)
+        self.starter_items_table.setCellWidget(row, 5, remove_button)
+        _set_table_column_widths(self.starter_items_table, STARTER_ITEM_COLUMN_WIDTHS)
+
+    def _remove_starter_item_row(self, button: QPushButton) -> None:
+        """Removes the starter item row containing button."""
+
+        row = _row_for_cell_widget(self.starter_items_table, button)
+
+        if row >= 0:
+            self.starter_items_table.removeRow(row)
+
+    def _starter_items_from_table(self) -> list[dict[str, Any]]:
+        """Reads starter item rows from the wizard table."""
+
+        items: list[dict[str, Any]] = []
+
+        for row in range(self.starter_items_table.rowCount()):
+            name_widget = self.starter_items_table.cellWidget(row, 0)
+            quantity_widget = self.starter_items_table.cellWidget(row, 1)
+            category_widget = self.starter_items_table.cellWidget(row, 2)
+            description_widget = self.starter_items_table.cellWidget(row, 3)
+            value_widget = self.starter_items_table.cellWidget(row, 4)
+            name = name_widget.text().strip() if isinstance(name_widget, QLineEdit) else ""
+
+            if not name:
+                continue
+
+            items.append(
+                {
+                    "name": name,
+                    "category": (
+                        category_widget.text().strip()
+                        if isinstance(category_widget, QLineEdit)
+                        and category_widget.text().strip()
+                        else "Item"
+                    ),
+                    "quantity": (
+                        quantity_widget.value()
+                        if isinstance(quantity_widget, QSpinBox)
+                        else 1
+                    ),
+                    "description": (
+                        description_widget.text().strip()
+                        if isinstance(description_widget, QLineEdit)
+                        else ""
+                    ),
+                    "value_base_units": (
+                        value_widget.value()
+                        if isinstance(value_widget, QSpinBox)
+                        else 0
+                    ),
+                    "item_request": "",
+                    "requires_ai_invention": False,
+                }
+            )
+
+        return items
 
     def _append_currency_row(self, denomination: dict[str, Any]) -> None:
         """Adds a currency denomination row to the wizard table."""
 
         row = self.currency_table.rowCount()
         self.currency_table.insertRow(row)
+        self.currency_table.setRowHeight(row, 36)
 
         name = str(denomination.get("name", ""))
         plural_name = str(denomination.get("plural_name", ""))
+        name_input = _table_line_edit(name)
+        plural_name_input = _table_line_edit(plural_name)
         value = _safe_int(denomination.get("value", 1), 1)
-        value_input = QSpinBox()
-        value_input.setMinimum(1)
-        value_input.setMaximum(1_000_000_000)
+        value_input = _table_spin_box(1, 1_000_000_000)
         value_input.setValue(value)
         value_input.setEnabled(row != 0)
+        remove_button = QPushButton("Remove")
+        remove_button.setMinimumWidth(TABLE_INLINE_BUTTON_MIN_WIDTH)
+        remove_button.setMinimumHeight(TABLE_INLINE_EDITOR_HEIGHT)
+        remove_button.clicked.connect(
+            lambda _checked=False, button=remove_button: self._remove_currency_row(button)
+        )
 
-        self.currency_table.setItem(row, 0, QTableWidgetItem(name))
-        self.currency_table.setItem(row, 1, QTableWidgetItem(plural_name))
+        self.currency_table.setCellWidget(row, 0, name_input)
+        self.currency_table.setCellWidget(row, 1, plural_name_input)
         self.currency_table.setCellWidget(row, 2, value_input)
+        self.currency_table.setCellWidget(row, 3, remove_button)
+        self._sync_currency_base_value_row()
+        _set_table_column_widths(self.currency_table, CURRENCY_COLUMN_WIDTHS)
+
+    def _remove_currency_row(self, button: QPushButton) -> None:
+        """Removes the currency row containing button."""
+
+        row = _row_for_cell_widget(self.currency_table, button)
+
+        if row >= 0:
+            self.currency_table.removeRow(row)
+            self._sync_currency_base_value_row()
+
+    def _sync_currency_base_value_row(self) -> None:
+        """Keeps the first visible currency row as the baseline denomination."""
+
+        for row in range(self.currency_table.rowCount()):
+            value_widget = self.currency_table.cellWidget(row, 2)
+
+            if not isinstance(value_widget, QSpinBox):
+                continue
+
+            if row == 0:
+                value_widget.setValue(1)
+                value_widget.setEnabled(False)
+            else:
+                value_widget.setEnabled(True)
 
     def _currency_denominations_from_table(self) -> list[dict[str, Any]]:
         """Reads currency denomination rows from the wizard table."""
@@ -1449,14 +2165,16 @@ class NewGameWizard(QWizard):
         denominations: list[dict[str, Any]] = []
 
         for row in range(self.currency_table.rowCount()):
-            name_item = self.currency_table.item(row, 0)
-            plural_item = self.currency_table.item(row, 1)
+            name_widget = self.currency_table.cellWidget(row, 0)
+            plural_widget = self.currency_table.cellWidget(row, 1)
             value_widget = self.currency_table.cellWidget(row, 2)
 
             denominations.append(
                 {
-                    "name": name_item.text() if name_item is not None else "",
-                    "plural_name": plural_item.text() if plural_item is not None else "",
+                    "name": name_widget.text() if isinstance(name_widget, QLineEdit) else "",
+                    "plural_name": (
+                        plural_widget.text() if isinstance(plural_widget, QLineEdit) else ""
+                    ),
                     "value": (
                         value_widget.value()
                         if isinstance(value_widget, QSpinBox)
@@ -1472,65 +2190,68 @@ class NewGameWizard(QWizard):
 
         page = QWizardPage()
         page.setTitle("Calendar and Time")
-        page.setSubTitle("Choose the calendar and displayed time format.")
+        page.setSubTitle("Choose whether to use a standard, custom, or AI-generated calendar.")
 
         self.calendar_type_combo = QComboBox()
         self.calendar_type_combo.addItem("Default Gregorian Calendar", "gregorian")
         self.calendar_type_combo.addItem("Custom Calendar", "custom")
-
-        self.time_format_combo = QComboBox()
-        self.time_format_combo.addItem("12-hour A.M./P.M.", "12_hour")
-        self.time_format_combo.addItem("24-hour", "24_hour")
-        self.time_format_combo.addItem("Narrative", "narrative")
-
-        self.days_per_week_input = QSpinBox()
-        self.days_per_week_input.setRange(1, 14)
-        self.days_per_week_input.setValue(int(GREGORIAN_CALENDAR_SETTINGS["days_per_week"]))
-
-        self.weeks_per_month_input = QSpinBox()
-        self.weeks_per_month_input.setRange(1, 12)
-        self.weeks_per_month_input.setValue(int(GREGORIAN_CALENDAR_SETTINGS["weeks_per_month"]))
-
-        self.months_per_year_input = QSpinBox()
-        self.months_per_year_input.setRange(1, 24)
-        self.months_per_year_input.setValue(int(GREGORIAN_CALENDAR_SETTINGS["months_per_year"]))
-
-        self.seasons_per_year_input = QSpinBox()
-        self.seasons_per_year_input.setRange(1, 12)
-        self.seasons_per_year_input.setValue(int(GREGORIAN_CALENDAR_SETTINGS["seasons_per_year"]))
-
-        self.day_names_input = QLineEdit()
-        self.day_names_input.setText(", ".join(GREGORIAN_CALENDAR_SETTINGS["day_names"]))
-
-        self.month_names_input = QLineEdit()
-        self.month_names_input.setText(", ".join(GREGORIAN_CALENDAR_SETTINGS["month_names"]))
-
-        self.season_names_input = QLineEdit()
-        self.season_names_input.setText(
-            ", ".join(season["name"] for season in GREGORIAN_CALENDAR_SETTINGS["seasons"])
+        self.calendar_type_combo.addItem("AI-Generated Calendar", "ai_generated")
+        self.calendar_type_combo.currentIndexChanged.connect(
+            lambda _index: self._sync_calendar_settings_button()
         )
 
-        self.season_hints_input = QLineEdit()
-        self.season_hints_input.setText(
-            ", ".join(
-                season["weather_hint"] for season in GREGORIAN_CALENDAR_SETTINGS["seasons"]
-            )
-        )
+        self.calendar_settings_button = QPushButton("Calendar Settings...")
+        self.calendar_settings_button.clicked.connect(self._open_wizard_calendar_settings)
 
         layout = QFormLayout()
         layout.addRow("Calendar:", self.calendar_type_combo)
-        layout.addRow("Time Format:", self.time_format_combo)
-        layout.addRow("Days Per Week:", self.days_per_week_input)
-        layout.addRow("Weeks Per Month:", self.weeks_per_month_input)
-        layout.addRow("Months Per Year:", self.months_per_year_input)
-        layout.addRow("Seasons Per Year:", self.seasons_per_year_input)
-        layout.addRow("Day Names:", self.day_names_input)
-        layout.addRow("Month Names:", self.month_names_input)
-        layout.addRow("Season Names:", self.season_names_input)
-        layout.addRow("Season Weather Hints:", self.season_hints_input)
+        layout.addRow("Custom Settings:", self.calendar_settings_button)
         page.setLayout(layout)
 
         self.addPage(page)
+        self._sync_calendar_settings_button()
+
+    def _calendar_settings_for_setup(self, calendar_type: str) -> dict[str, Any]:
+        """Returns wizard calendar settings for the selected calendar mode."""
+
+        if calendar_type == "ai_generated":
+            return {
+                **GREGORIAN_CALENDAR_SETTINGS,
+                "calendar_type": "ai_generated",
+                "ai_generated": True,
+            }
+
+        if calendar_type == "custom":
+            return {
+                **self._custom_calendar_settings,
+                "calendar_type": "custom",
+                "ai_generated": False,
+            }
+
+        return {
+            **GREGORIAN_CALENDAR_SETTINGS,
+            "calendar_type": "gregorian",
+            "ai_generated": False,
+        }
+
+    def _sync_calendar_settings_button(self) -> None:
+        """Enables custom calendar editing only for custom new-game calendars."""
+
+        if not hasattr(self, "calendar_settings_button"):
+            return
+
+        is_custom = self.calendar_type_combo.currentData() == "custom"
+        self.calendar_settings_button.setEnabled(is_custom)
+
+    def _open_wizard_calendar_settings(self) -> None:
+        """Opens the shared calendar settings dialog for the custom wizard calendar."""
+
+        dialog = CalendarSettingsDialog(self._custom_calendar_settings, self)
+
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        self._custom_calendar_settings = dialog.build_settings()
 
 
 class GameShell(QWidget):
@@ -1543,6 +2264,7 @@ class GameShell(QWidget):
         on_theme_changed=None,
         sound_manager: SoundManager | None = None,
         narration_player: NarrationPlayer | None = None,
+        tts_enabled: bool = True,
     ) -> None:
         """
         Args:
@@ -1555,6 +2277,7 @@ class GameShell(QWidget):
         self.on_theme_changed = on_theme_changed
         self.sound_manager = sound_manager
         self.narration_player = narration_player
+        self.tts_enabled = bool(tts_enabled)
         self.repository: SaveRepository | None = None
 
         self.title_label = QLabel("No Save Loaded")
@@ -1586,6 +2309,9 @@ class GameShell(QWidget):
         self.settings_screen = SettingsScreen(
             on_audio_settings_changed=self._apply_audio_settings,
             on_theme_changed=self._apply_theme,
+            tts_enabled=self.tts_enabled,
+            voice_options=_narrator_voice_options(self.narration_player),
+            on_sample_voice=self._sample_narrator_voice,
         )
 
         self.screens: list[RepositoryBackedWidget] = [
@@ -1688,6 +2414,19 @@ class GameShell(QWidget):
             narration_player=self.narration_player,
         )
 
+    def _sample_narrator_voice(self, voice: str, volume: int) -> bool:
+        """Plays a local narrator voice sample."""
+
+        if self.narration_player is None or not hasattr(self.narration_player, "play_sample"):
+            return False
+
+        return bool(
+            self.narration_player.play_sample(
+                voice=normalize_narrator_voice(voice),
+                volume=volume,
+            )
+        )
+
     def _apply_theme(self) -> None:
         """Notifies the main window that save-specific theme settings changed."""
 
@@ -1743,9 +2482,15 @@ class StoryScreen(RepositoryBackedWidget):
         self.submit_button.clicked.connect(self._submit_player_action)
         self.player_input.returnPressed.connect(self._submit_player_action)
 
+        self.continue_button = QPushButton("Continue")
+        self.continue_button.setToolTip("Ask the GM to expand the latest response.")
+        self.continue_button.clicked.connect(self._continue_story_response)
+        self.continue_button.setEnabled(False)
+
         input_row = QHBoxLayout()
         input_row.addWidget(self.player_input)
         input_row.addWidget(self.submit_button)
+        input_row.addWidget(self.continue_button)
 
         layout = QVBoxLayout()
         layout.addLayout(status_row)
@@ -1771,6 +2516,7 @@ class StoryScreen(RepositoryBackedWidget):
             self.day_value.setText("-")
             self.time_value.setText("-")
             self.weather_value.setText("-")
+            self._update_continue_button_state()
             return
 
         state = StateManager(repository).load_state()
@@ -1787,7 +2533,7 @@ class StoryScreen(RepositoryBackedWidget):
             content = str(entry.get("content", ""))
 
             if kind == "player":
-                story_lines.append(f"> {content}")
+                story_lines.append(_player_command_markdown(content))
             elif kind == "story":
                 entry_id = _safe_int(entry.get("id"), -1)
 
@@ -1798,8 +2544,9 @@ class StoryScreen(RepositoryBackedWidget):
                     story_lines.append(format_story_message(content))
 
         output = "\n\n".join(story_lines)
-        self.story_output.setPlainText(output)
+        _set_markdown_text(self.story_output, output)
         self.story_output.moveCursor(self.story_output.textCursor().MoveOperation.End)
+        self._update_continue_button_state()
 
     def _submit_player_action(self) -> None:
         """Records a player action and requests AI narration when configured."""
@@ -1827,6 +2574,37 @@ class StoryScreen(RepositoryBackedWidget):
         context_packet = self._build_story_context_packet(repository, player_text)
 
         self._start_skill_check_planning_request(context_packet)
+
+    def _continue_story_response(self) -> None:
+        """Requests a fuller continuation of the latest story response."""
+
+        if self._waiting_for_gm:
+            return
+
+        repository = self.repository()
+
+        if repository is None:
+            return
+
+        latest_story = self._latest_story_entry()
+
+        if latest_story is None:
+            LOGGER.warning("Skipped story continuation without a prior story response.")
+            return
+
+        player_text = self._latest_player_command() or "Continue the previous narration."
+        self._pending_skill_check_event_results = []
+        self._set_waiting_for_gm(True)
+        self.refresh()
+
+        context_packet = self._build_story_context_packet(repository, player_text)
+        context_packet["continuation_request"] = {
+            "active": True,
+            "instruction": CONTINUE_STORY_INSTRUCTION,
+            "latest_story_response": str(latest_story.get("content", "")).strip()[:4000],
+        }
+
+        self._start_gemini_story_request(context_packet)
 
     def _build_story_context_packet(
         self,
@@ -2054,15 +2832,30 @@ class StoryScreen(RepositoryBackedWidget):
         self._waiting_for_gm = waiting
         self.player_input.setEnabled(not waiting)
         self.submit_button.setEnabled(not waiting)
+        self._update_continue_button_state()
 
         if waiting:
             self.player_input.setPlaceholderText(GM_THINKING_TEXT)
             self.player_input.setToolTip(GM_THINKING_TEXT)
             self.submit_button.setToolTip(GM_THINKING_TEXT)
+            self.continue_button.setToolTip(GM_THINKING_TEXT)
         else:
             self.player_input.setPlaceholderText(self._default_input_placeholder)
             self.player_input.setToolTip("")
             self.submit_button.setToolTip("")
+            self.continue_button.setToolTip("Ask the GM to expand the latest response.")
+
+    def _update_continue_button_state(self) -> None:
+        """Enables Continue only when there is a story response to expand."""
+
+        if not hasattr(self, "continue_button"):
+            return
+
+        self.continue_button.setEnabled(
+            not self._waiting_for_gm
+            and self.repository() is not None
+            and self._latest_story_entry() is not None
+        )
 
     def set_initial_generation_pending(self, pending: bool) -> None:
         """Toggles the story input while the opening scene is generated."""
@@ -2314,7 +3107,7 @@ class WorldScreen(RepositoryBackedWidget):
         summary = repository.get_world_summary().strip()
 
         if summary:
-            sections.append(f"World Overview\n\n{summary}")
+            sections.append(f"# World Overview\n\n{summary}")
 
         lore = repository.get_world_lore()
 
@@ -2325,15 +3118,15 @@ class WorldScreen(RepositoryBackedWidget):
                 continue
 
             body = "\n".join(
-                f"- {key}: {text}"
+                f"- **{key}:** {text}"
                 for key, text in sorted(entries.items())
             )
-            sections.append(f"{category}\n\n{body}")
+            sections.append(f"## {category}\n\n{body}")
 
         if not sections:
-            sections.append("No world information has been recorded yet.")
+            sections.append("_No world information has been recorded yet._")
 
-        self.world_output.setPlainText("\n\n".join(sections))
+        _set_markdown_text(self.world_output, "\n\n".join(sections))
 
 
 class CalendarScreen(RepositoryBackedWidget):
@@ -2356,11 +3149,16 @@ class CalendarScreen(RepositoryBackedWidget):
         next_button = QPushButton("Next")
         next_button.clicked.connect(self._show_next_month)
 
+        self.settings_button = QPushButton("Calendar Settings")
+        self.settings_button.clicked.connect(self._open_calendar_settings_dialog)
+        self.settings_button.setEnabled(False)
+
         navigation_row = QHBoxLayout()
         navigation_row.addWidget(previous_button)
         navigation_row.addStretch()
         navigation_row.addWidget(self.month_label)
         navigation_row.addStretch()
+        navigation_row.addWidget(self.settings_button)
         navigation_row.addWidget(today_button)
         navigation_row.addWidget(next_button)
 
@@ -2397,8 +3195,10 @@ class CalendarScreen(RepositoryBackedWidget):
             self.summary_label.setText("-")
             self.table.setRowCount(0)
             self.table.setColumnCount(0)
+            self.settings_button.setEnabled(False)
             return
 
+        self.settings_button.setEnabled(True)
         state = StateManager(repository).load_state()
         grid = build_month_grid(state.calendar.to_dict(), self.month_offset)
         self.month_offset = int(grid["month_offset"])
@@ -2450,6 +3250,130 @@ class CalendarScreen(RepositoryBackedWidget):
 
         self.month_offset += 1
         self.refresh()
+
+    def _open_calendar_settings_dialog(self) -> None:
+        """Opens the save-specific calendar settings dialog."""
+
+        repository = self.repository()
+
+        if repository is None:
+            return
+
+        dialog = CalendarSettingsDialog(repository.get_calendar_settings(), self)
+
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        self._save_calendar_settings(dialog.build_settings())
+
+    def _save_calendar_settings(self, settings: dict[str, Any]) -> None:
+        """Persists calendar settings and refreshes dependent screens."""
+
+        repository = self.repository()
+
+        if repository is None:
+            return
+
+        repository.set_calendar_settings(settings)
+        _refresh_repository_calendar_time(repository)
+        self.month_offset = 0
+        self.refresh()
+        self.notify_repository_changed()
+
+
+class CalendarSettingsDialog(QDialog):
+    """Dialog for editing save-specific calendar settings."""
+
+    def __init__(
+        self,
+        settings: dict[str, Any],
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+
+        self.setWindowTitle("Calendar Settings")
+        calendar_settings = dict(settings or DEFAULT_CALENDAR_SETTINGS)
+
+        self.days_per_week_input = QSpinBox()
+        self.days_per_week_input.setRange(1, 14)
+        self.days_per_week_input.setValue(int(calendar_settings["days_per_week"]))
+
+        self.weeks_per_month_input = QSpinBox()
+        self.weeks_per_month_input.setRange(1, 12)
+        self.weeks_per_month_input.setValue(int(calendar_settings["weeks_per_month"]))
+
+        self.months_per_year_input = QSpinBox()
+        self.months_per_year_input.setRange(1, 24)
+        self.months_per_year_input.setValue(int(calendar_settings["months_per_year"]))
+
+        self.seasons_per_year_input = QSpinBox()
+        self.seasons_per_year_input.setRange(1, 12)
+        self.seasons_per_year_input.setValue(int(calendar_settings["seasons_per_year"]))
+
+        self.day_names_input = QLineEdit(
+            ", ".join(str(name) for name in calendar_settings["day_names"])
+        )
+        self.month_names_input = QLineEdit(
+            ", ".join(str(name) for name in calendar_settings["month_names"])
+        )
+        self.season_names_input = QLineEdit(
+            ", ".join(str(season["name"]) for season in calendar_settings["seasons"])
+        )
+        self.season_hints_input = QLineEdit(
+            ", ".join(
+                str(season["weather_hint"]) for season in calendar_settings["seasons"]
+            )
+        )
+
+        self.time_display_combo = QComboBox()
+        self.time_display_combo.addItem("Narrative", "narrative")
+        self.time_display_combo.addItem("12-hour", "12_hour")
+        self.time_display_combo.addItem("24-hour", "24_hour")
+        _set_combo_to_data(
+            self.time_display_combo,
+            str(calendar_settings.get("time_display", "narrative")),
+        )
+
+        form = QFormLayout()
+        form.addRow("Days Per Week:", self.days_per_week_input)
+        form.addRow("Weeks Per Month:", self.weeks_per_month_input)
+        form.addRow("Months Per Year:", self.months_per_year_input)
+        form.addRow("Seasons Per Year:", self.seasons_per_year_input)
+        form.addRow("Day Names:", self.day_names_input)
+        form.addRow("Month Names:", self.month_names_input)
+        form.addRow("Season Names:", self.season_names_input)
+        form.addRow("Season Weather Hints:", self.season_hints_input)
+        form.addRow("Time Display:", self.time_display_combo)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+
+        layout = QVBoxLayout()
+        layout.addLayout(form)
+        layout.addWidget(buttons)
+        self.setLayout(layout)
+
+    def build_settings(self) -> dict[str, Any]:
+        """Builds normalized calendar settings from dialog controls."""
+
+        return {
+            "days_per_week": self.days_per_week_input.value(),
+            "weeks_per_month": self.weeks_per_month_input.value(),
+            "months_per_year": self.months_per_year_input.value(),
+            "seasons_per_year": self.seasons_per_year_input.value(),
+            "day_names": _split_list(self.day_names_input.text()),
+            "month_names": _split_list(self.month_names_input.text()),
+            "seasons": _build_season_settings(
+                names=_split_list(self.season_names_input.text()),
+                hints=_split_list(self.season_hints_input.text()),
+                count=self.seasons_per_year_input.value(),
+            ),
+            "time_display": self.time_display_combo.currentData() or "narrative",
+        }
 
 
 class InventoryScreen(RepositoryBackedWidget):
@@ -3053,7 +3977,7 @@ class AlchemyNotebookScreen(RepositoryBackedWidget):
     def _refresh_reagents(self, repository: SaveRepository) -> None:
         """Reloads the known crafting item/material table."""
 
-        reagents = repository.list_alchemy_reagents()
+        reagents = repository.list_crafting_items()
         selected_name = self.reagent_name_input.text().strip()
         reagents.sort(
             key=self._reagent_sort_key,
@@ -3084,7 +4008,7 @@ class AlchemyNotebookScreen(RepositoryBackedWidget):
     def _refresh_recipes(self, repository: SaveRepository) -> None:
         """Reloads the recipe table."""
 
-        recipes = repository.list_alchemy_recipes()
+        recipes = repository.list_crafting_recipes()
         recipes.sort(
             key=self._recipe_sort_key,
             reverse=_sort_descending(self._recipe_sort_order),
@@ -3113,7 +4037,7 @@ class AlchemyNotebookScreen(RepositoryBackedWidget):
             QMessageBox.warning(self, "Missing Name", "Item name is required.")
             return
 
-        repository.add_alchemy_reagent(
+        repository.add_crafting_item(
             name=name,
             description=self.reagent_description_input.text(),
             location=self.reagent_location_input.text(),
@@ -3352,7 +4276,7 @@ class AlchemyNotebookScreen(RepositoryBackedWidget):
             )
             return
 
-        repository.add_alchemy_recipe(
+        repository.add_crafting_recipe(
             name=name,
             ingredients=list(self._recipe_ingredient_rows),
             result=self.recipe_result_input.text(),
@@ -3518,11 +4442,22 @@ class SettingsScreen(RepositoryBackedWidget):
         self,
         on_audio_settings_changed=None,
         on_theme_changed=None,
+        tts_enabled: bool = True,
+        voice_options: dict[str, str] | None = None,
+        on_sample_voice: Callable[[str, int], bool] | None = None,
     ) -> None:
         super().__init__()
 
         self.on_audio_settings_changed = on_audio_settings_changed
         self.on_theme_changed = on_theme_changed
+        self.tts_enabled = bool(tts_enabled)
+        self.voice_options = voice_options or available_narrator_voices()
+        self.on_sample_voice = on_sample_voice
+        self.narrator_enabled_checkbox: QCheckBox | None = None
+        self.tts_volume_slider: QSlider | None = None
+        self.tts_volume_label: QLabel | None = None
+        self.tts_voice_combo: QComboBox | None = None
+        self.sample_voice_button: QPushButton | None = None
         self._loading_settings = False
         self._saving_settings = False
         self._autosave_timer = QTimer(self)
@@ -3534,13 +4469,23 @@ class SettingsScreen(RepositoryBackedWidget):
         self.theme_combo.addItems(["Light", "Dark"])
         self.theme_combo.currentIndexChanged.connect(lambda _index: self._save_settings())
 
+        self.narration_tense_combo = QComboBox()
+        _add_combo_options(self.narration_tense_combo, NARRATION_TENSE_OPTIONS)
+        _set_combo_to_data(self.narration_tense_combo, DEFAULT_NARRATION_TENSE)
+        self.narration_tense_combo.currentIndexChanged.connect(
+            lambda _index: self._save_settings()
+        )
+
+        self.narration_style_combo = QComboBox()
+        _add_combo_options(self.narration_style_combo, NARRATION_STYLE_OPTIONS)
+        _set_combo_to_data(self.narration_style_combo, DEFAULT_NARRATION_STYLE)
+        self.narration_style_combo.currentIndexChanged.connect(
+            lambda _index: self._save_settings()
+        )
+
         self.music_enabled_checkbox = QCheckBox("Music enabled")
         self.music_enabled_checkbox.setChecked(True)
         self.music_enabled_checkbox.toggled.connect(lambda _checked: self._save_settings())
-
-        self.narrator_enabled_checkbox = QCheckBox("Narrator enabled")
-        self.narrator_enabled_checkbox.setChecked(True)
-        self.narrator_enabled_checkbox.toggled.connect(lambda _checked: self._save_settings())
 
         self.music_volume_slider = QSlider(Qt.Orientation.Horizontal)
         self.music_volume_slider.setRange(0, 100)
@@ -3551,47 +4496,34 @@ class SettingsScreen(RepositoryBackedWidget):
         )
         self.music_volume_slider.sliderReleased.connect(self._save_settings)
 
-        self.tts_volume_slider = QSlider(Qt.Orientation.Horizontal)
-        self.tts_volume_slider.setRange(0, 100)
-        self.tts_volume_slider.setValue(90)
-        self.tts_volume_label = QLabel("90%")
-        self.tts_volume_slider.valueChanged.connect(
-            lambda value: self.tts_volume_label.setText(f"{value}%")
-        )
-        self.tts_volume_slider.sliderReleased.connect(self._save_settings)
+        if self.tts_enabled:
+            self.narrator_enabled_checkbox = QCheckBox("Narrator enabled")
+            self.narrator_enabled_checkbox.setChecked(True)
+            self.narrator_enabled_checkbox.toggled.connect(
+                self._handle_narrator_enabled_toggled
+            )
 
-        self.days_per_week_input = QSpinBox()
-        self.days_per_week_input.setRange(1, 14)
-        self.days_per_week_input.setValue(int(DEFAULT_CALENDAR_SETTINGS["days_per_week"]))
-        self.days_per_week_input.valueChanged.connect(lambda _value: self._save_settings())
+            self.tts_volume_slider = QSlider(Qt.Orientation.Horizontal)
+            self.tts_volume_slider.setRange(0, 100)
+            self.tts_volume_slider.setValue(90)
+            self.tts_volume_label = QLabel("90%")
+            self.tts_volume_slider.valueChanged.connect(
+                lambda value: self.tts_volume_label.setText(f"{value}%")
+            )
+            self.tts_volume_slider.sliderReleased.connect(self._save_settings)
 
-        self.weeks_per_month_input = QSpinBox()
-        self.weeks_per_month_input.setRange(1, 12)
-        self.weeks_per_month_input.setValue(int(DEFAULT_CALENDAR_SETTINGS["weeks_per_month"]))
-        self.weeks_per_month_input.valueChanged.connect(lambda _value: self._save_settings())
+            self.tts_voice_combo = QComboBox()
+            _populate_narrator_voice_combo(
+                self.tts_voice_combo,
+                DEFAULT_NARRATOR_VOICE,
+                voice_options=self.voice_options,
+            )
+            self.tts_voice_combo.currentIndexChanged.connect(
+                lambda _index: self._save_settings()
+            )
 
-        self.months_per_year_input = QSpinBox()
-        self.months_per_year_input.setRange(1, 24)
-        self.months_per_year_input.setValue(int(DEFAULT_CALENDAR_SETTINGS["months_per_year"]))
-        self.months_per_year_input.valueChanged.connect(lambda _value: self._save_settings())
-
-        self.seasons_per_year_input = QSpinBox()
-        self.seasons_per_year_input.setRange(1, 12)
-        self.seasons_per_year_input.setValue(int(DEFAULT_CALENDAR_SETTINGS["seasons_per_year"]))
-        self.seasons_per_year_input.valueChanged.connect(lambda _value: self._save_settings())
-
-        self.day_names_input = QLineEdit()
-        self.day_names_input.editingFinished.connect(self._save_settings)
-        self.day_names_input.textChanged.connect(lambda _text: self._schedule_settings_save())
-        self.month_names_input = QLineEdit()
-        self.month_names_input.editingFinished.connect(self._save_settings)
-        self.month_names_input.textChanged.connect(lambda _text: self._schedule_settings_save())
-        self.season_names_input = QLineEdit()
-        self.season_names_input.editingFinished.connect(self._save_settings)
-        self.season_names_input.textChanged.connect(lambda _text: self._schedule_settings_save())
-        self.season_hints_input = QLineEdit()
-        self.season_hints_input.editingFinished.connect(self._save_settings)
-        self.season_hints_input.textChanged.connect(lambda _text: self._schedule_settings_save())
+            self.sample_voice_button = QPushButton("Sample Voice")
+            self.sample_voice_button.clicked.connect(self._sample_voice)
 
         self.additional_ai_context_input = QTextEdit()
         self.additional_ai_context_input.setPlaceholderText(
@@ -3599,31 +4531,37 @@ class SettingsScreen(RepositoryBackedWidget):
         )
         self.additional_ai_context_input.textChanged.connect(self._schedule_settings_save)
 
-        self.time_display_combo = QComboBox()
-        self.time_display_combo.addItem("Narrative", "narrative")
-        self.time_display_combo.addItem("12-hour", "12_hour")
-        self.time_display_combo.addItem("24-hour", "24_hour")
-        self.time_display_combo.currentIndexChanged.connect(lambda _index: self._save_settings())
-
         self.currency_name_inputs: list[QLineEdit] = []
         self.currency_plural_inputs: list[QLineEdit] = []
         self.currency_value_inputs: list[QSpinBox] = []
 
         layout = QFormLayout()
         layout.addRow("Theme Preference:", self.theme_combo)
+        layout.addRow("Narration Tense:", self.narration_tense_combo)
+        layout.addRow("Narration Style:", self.narration_style_combo)
         layout.addRow("Background Music:", self.music_enabled_checkbox)
         layout.addRow("Music Volume:", _slider_row(self.music_volume_slider, self.music_volume_label))
-        layout.addRow("Narrator:", self.narrator_enabled_checkbox)
-        layout.addRow("Narrator Volume:", _slider_row(self.tts_volume_slider, self.tts_volume_label))
-        layout.addRow("Days Per Week:", self.days_per_week_input)
-        layout.addRow("Weeks Per Month:", self.weeks_per_month_input)
-        layout.addRow("Months Per Year:", self.months_per_year_input)
-        layout.addRow("Seasons Per Year:", self.seasons_per_year_input)
-        layout.addRow("Day Names:", self.day_names_input)
-        layout.addRow("Month Names:", self.month_names_input)
-        layout.addRow("Season Names:", self.season_names_input)
-        layout.addRow("Season Weather Hints:", self.season_hints_input)
-        layout.addRow("Time Display:", self.time_display_combo)
+
+        if self.narrator_enabled_checkbox is not None:
+            layout.addRow("Narrator:", self.narrator_enabled_checkbox)
+
+        if self.tts_volume_slider is not None and self.tts_volume_label is not None:
+            layout.addRow(
+                "Narrator Volume:",
+                _slider_row(self.tts_volume_slider, self.tts_volume_label),
+            )
+
+        if self.tts_voice_combo is not None and self.sample_voice_button is not None:
+            layout.addRow(
+                "Narrator Voice:",
+                _button_row(self.tts_voice_combo, self.sample_voice_button),
+            )
+            self._sync_narrator_control_states(
+                self.narrator_enabled_checkbox.isChecked()
+                if self.narrator_enabled_checkbox is not None
+                else False
+            )
+
         layout.addRow("Additional AI Context:", self.additional_ai_context_input)
 
         for index, denomination in enumerate(DEFAULT_CURRENCY_DENOMINATIONS):
@@ -3663,26 +4601,43 @@ class SettingsScreen(RepositoryBackedWidget):
         try:
             if repository is None:
                 self.theme_combo.setCurrentText("Light")
-                self.days_per_week_input.setValue(int(DEFAULT_CALENDAR_SETTINGS["days_per_week"]))
-                self.weeks_per_month_input.setValue(int(DEFAULT_CALENDAR_SETTINGS["weeks_per_month"]))
-                self.months_per_year_input.setValue(int(DEFAULT_CALENDAR_SETTINGS["months_per_year"]))
-                self.seasons_per_year_input.setValue(int(DEFAULT_CALENDAR_SETTINGS["seasons_per_year"]))
-                self.day_names_input.clear()
-                self.month_names_input.clear()
-                self.season_names_input.clear()
-                self.season_hints_input.clear()
+                _set_combo_to_data(self.narration_tense_combo, DEFAULT_NARRATION_TENSE)
+                _set_combo_to_data(self.narration_style_combo, DEFAULT_NARRATION_STYLE)
                 self.additional_ai_context_input.clear()
-                self.time_display_combo.setCurrentIndex(0)
                 self.music_enabled_checkbox.setChecked(True)
-                self.narrator_enabled_checkbox.setChecked(True)
                 self.music_volume_slider.setValue(25)
-                self.tts_volume_slider.setValue(90)
+
+                if self.narrator_enabled_checkbox is not None:
+                    self.narrator_enabled_checkbox.setChecked(True)
+
+                if self.tts_volume_slider is not None:
+                    self.tts_volume_slider.setValue(90)
+
+                if self.tts_voice_combo is not None:
+                    _set_combo_to_data(self.tts_voice_combo, DEFAULT_NARRATOR_VOICE)
+
+                self._sync_narrator_control_states(
+                    self.narrator_enabled_checkbox.isChecked()
+                    if self.narrator_enabled_checkbox is not None
+                    else False
+                )
                 return
 
             theme = repository.get_setting("theme", "Light")
             additional_ai_context = repository.get_setting("ai.additional_context", "")
+            narration_preferences = normalize_narration_preferences(
+                {
+                    "tense": repository.get_setting(
+                        "ai.narration_tense",
+                        DEFAULT_NARRATION_TENSE,
+                    ),
+                    "style": repository.get_setting(
+                        "ai.narration_style",
+                        DEFAULT_NARRATION_STYLE,
+                    ),
+                }
+            )
             denominations = repository.get_currency_denominations()
-            calendar_settings = repository.get_calendar_settings()
 
             if theme in ["Light", "Dark"]:
                 self.theme_combo.setCurrentText(str(theme))
@@ -3696,33 +4651,47 @@ class SettingsScreen(RepositoryBackedWidget):
                 self.currency_plural_inputs[index].setText(str(denomination["plural_name"]))
                 self.currency_value_inputs[index].setValue(int(denomination["value"]))
 
-            self.days_per_week_input.setValue(int(calendar_settings["days_per_week"]))
-            self.weeks_per_month_input.setValue(int(calendar_settings["weeks_per_month"]))
-            self.months_per_year_input.setValue(int(calendar_settings["months_per_year"]))
-            self.seasons_per_year_input.setValue(int(calendar_settings["seasons_per_year"]))
-            self.day_names_input.setText(", ".join(str(name) for name in calendar_settings["day_names"]))
-            self.month_names_input.setText(
-                ", ".join(str(name) for name in calendar_settings["month_names"])
+            _set_combo_to_data(
+                self.narration_tense_combo,
+                narration_preferences["tense"],
             )
-            self.season_names_input.setText(
-                ", ".join(str(season["name"]) for season in calendar_settings["seasons"])
+            _set_combo_to_data(
+                self.narration_style_combo,
+                narration_preferences["style"],
             )
-            self.season_hints_input.setText(
-                ", ".join(str(season["weather_hint"]) for season in calendar_settings["seasons"])
-            )
-            _set_combo_to_data(self.time_display_combo, str(calendar_settings["time_display"]))
             self.additional_ai_context_input.setPlainText(str(additional_ai_context))
             self.music_enabled_checkbox.setChecked(
                 _bool_setting(repository.get_setting("audio.music_enabled", True), True)
             )
-            self.narrator_enabled_checkbox.setChecked(
-                _bool_setting(repository.get_setting("audio.narrator_enabled", True), True)
-            )
             self.music_volume_slider.setValue(
                 _clamped_int(repository.get_setting("audio.music_volume", 25), 25, 0, 100)
             )
-            self.tts_volume_slider.setValue(
-                _clamped_int(repository.get_setting("audio.tts_volume", 90), 90, 0, 100)
+
+            if self.narrator_enabled_checkbox is not None:
+                self.narrator_enabled_checkbox.setChecked(
+                    _bool_setting(repository.get_setting("audio.narrator_enabled", True), True)
+                )
+
+            if self.tts_volume_slider is not None:
+                self.tts_volume_slider.setValue(
+                    _clamped_int(repository.get_setting("audio.tts_volume", 90), 90, 0, 100)
+                )
+
+            if self.tts_voice_combo is not None:
+                _set_combo_to_data(
+                    self.tts_voice_combo,
+                    normalize_narrator_voice(
+                        repository.get_setting(
+                            "audio.tts_voice",
+                            DEFAULT_NARRATOR_VOICE,
+                        )
+                    ),
+                )
+
+            self._sync_narrator_control_states(
+                self.narrator_enabled_checkbox.isChecked()
+                if self.narrator_enabled_checkbox is not None
+                else False
             )
         finally:
             self._loading_settings = False
@@ -3752,10 +4721,29 @@ class SettingsScreen(RepositoryBackedWidget):
                 "ai.additional_context",
                 self.additional_ai_context_input.toPlainText().strip(),
             )
+            repository.set_setting(
+                "ai.narration_tense",
+                self.narration_tense_combo.currentData() or DEFAULT_NARRATION_TENSE,
+            )
+            repository.set_setting(
+                "ai.narration_style",
+                self.narration_style_combo.currentData() or DEFAULT_NARRATION_STYLE,
+            )
             repository.set_setting("audio.music_enabled", self.music_enabled_checkbox.isChecked())
-            repository.set_setting("audio.narrator_enabled", self.narrator_enabled_checkbox.isChecked())
             repository.set_setting("audio.music_volume", self.music_volume_slider.value())
-            repository.set_setting("audio.tts_volume", self.tts_volume_slider.value())
+
+            if self.narrator_enabled_checkbox is not None:
+                repository.set_setting(
+                    "audio.narrator_enabled",
+                    self.narrator_enabled_checkbox.isChecked(),
+                )
+
+            if self.tts_volume_slider is not None:
+                repository.set_setting("audio.tts_volume", self.tts_volume_slider.value())
+
+            if self.tts_voice_combo is not None:
+                repository.set_setting("audio.tts_voice", self._tts_voice_value())
+
             repository.set_currency_denominations(
                 [
                     {
@@ -3772,35 +4760,6 @@ class SettingsScreen(RepositoryBackedWidget):
                     )
                 ]
             )
-            repository.set_calendar_settings(
-                {
-                    "days_per_week": self.days_per_week_input.value(),
-                    "weeks_per_month": self.weeks_per_month_input.value(),
-                    "months_per_year": self.months_per_year_input.value(),
-                    "seasons_per_year": self.seasons_per_year_input.value(),
-                    "day_names": _split_list(self.day_names_input.text()),
-                    "month_names": _split_list(self.month_names_input.text()),
-                    "seasons": _build_season_settings(
-                        names=_split_list(self.season_names_input.text()),
-                        hints=_split_list(self.season_hints_input.text()),
-                        count=self.seasons_per_year_input.value(),
-                    ),
-                    "time_display": self.time_display_combo.currentData() or "narrative",
-                }
-            )
-            elapsed_minutes = _safe_int(
-                repository.get_state_value(
-                    "elapsed_minutes",
-                    str(DEFAULT_START_ELAPSED_MINUTES),
-                ),
-                DEFAULT_START_ELAPSED_MINUTES,
-            )
-            calendar_snapshot = build_calendar_snapshot(
-                elapsed_minutes,
-                repository.get_calendar_settings(),
-            )
-            repository.set_state_value("time", calendar_snapshot["display_label"])
-
             if self.on_audio_settings_changed is not None:
                 self.on_audio_settings_changed()
             if self.on_theme_changed is not None:
@@ -3809,6 +4768,62 @@ class SettingsScreen(RepositoryBackedWidget):
             self._saving_settings = False
 
         self.notify_repository_changed()
+
+    def _handle_narrator_enabled_toggled(self, checked: bool) -> None:
+        """Saves narrator enabled changes and syncs dependent controls."""
+
+        self._sync_narrator_control_states(checked)
+        self._save_settings()
+
+    def _tts_voice_value(self) -> str:
+        """Returns the selected narrator voice id."""
+
+        return normalize_narrator_voice(
+            _combo_current_data_text(self.tts_voice_combo, DEFAULT_NARRATOR_VOICE)
+        )
+
+    def _sync_narrator_control_states(self, checked: bool) -> None:
+        """Enables narrator-specific controls only when narration is enabled."""
+
+        if self.tts_volume_slider is not None:
+            self.tts_volume_slider.setEnabled(checked)
+        if self.tts_voice_combo is not None:
+            self.tts_voice_combo.setEnabled(checked)
+        if self.sample_voice_button is not None:
+            self.sample_voice_button.setEnabled(checked and self.on_sample_voice is not None)
+
+    def _sample_voice(self) -> None:
+        """Plays the selected voice sample."""
+
+        if self.on_sample_voice is None:
+            return
+
+        self.on_sample_voice(self._tts_voice_value(), self._tts_volume_value())
+
+    def _tts_volume_value(self) -> int:
+        """Returns the selected narrator volume."""
+
+        if self.tts_volume_slider is None:
+            return 0
+
+        return self.tts_volume_slider.value()
+
+
+def _refresh_repository_calendar_time(repository: SaveRepository) -> None:
+    """Recomputes the saved display time from current calendar settings."""
+
+    elapsed_minutes = _safe_int(
+        repository.get_state_value(
+            "elapsed_minutes",
+            str(DEFAULT_START_ELAPSED_MINUTES),
+        ),
+        DEFAULT_START_ELAPSED_MINUTES,
+    )
+    calendar_snapshot = build_calendar_snapshot(
+        elapsed_minutes,
+        repository.get_calendar_settings(),
+    )
+    repository.set_state_value("time", calendar_snapshot["display_label"])
 
 
 def _apply_audio_settings_to_managers(
@@ -3826,6 +4841,9 @@ def _apply_audio_settings_to_managers(
     )
     music_volume = _clamped_int(repository.get_setting("audio.music_volume", 25), 25, 0, 100)
     tts_volume = _clamped_int(repository.get_setting("audio.tts_volume", 90), 90, 0, 100)
+    tts_voice = normalize_narrator_voice(
+        repository.get_setting("audio.tts_voice", DEFAULT_NARRATOR_VOICE)
+    )
 
     if sound_manager is not None:
         sound_manager.set_music_volume(music_volume)
@@ -3840,8 +4858,129 @@ def _apply_audio_settings_to_managers(
 
     if narration_player is not None and hasattr(narration_player, "set_volume"):
         narration_player.set_volume(tts_volume)
+    if narration_player is not None and hasattr(narration_player, "set_voice"):
+        narration_player.set_voice(tts_voice)
     if narration_player is not None and hasattr(narration_player, "set_enabled"):
         narration_player.set_enabled(narrator_enabled)
+
+
+def _preserved_player_character_fields(
+    setup: dict[str, Any],
+    ai_character: Any,
+) -> dict[str, str]:
+    """Returns character fields while preserving explicit player setup values."""
+
+    clean_setup = normalize_new_game_setup(setup)
+    setup_character = clean_setup["character"]
+    ai_character = ai_character if isinstance(ai_character, dict) else {}
+    preserved: dict[str, str] = {}
+
+    for key in ("name", "appearance", "backstory", "notes"):
+        setup_value = str(setup_character.get(key, "")).strip()
+        ai_value = str(ai_character.get(key, "")).strip()
+
+        if _is_player_provided_character_field(key, setup_value):
+            preserved[key] = setup_value
+        elif ai_value:
+            preserved[key] = ai_value
+        elif setup_value:
+            preserved[key] = setup_value
+
+    return preserved
+
+
+def _preserve_player_character_text(
+    value: Any,
+    setup: dict[str, Any],
+    ai_character: Any,
+) -> Any:
+    """Repairs generated text that renamed an explicitly supplied character."""
+
+    replacements = _player_character_name_replacements(setup, ai_character)
+
+    if not replacements:
+        return value
+
+    if isinstance(value, str):
+        clean_value = value
+
+        for source, target in replacements:
+            clean_value = _replace_whole_name(clean_value, source, target)
+
+        return clean_value
+
+    if isinstance(value, list):
+        return [
+            _preserve_player_character_text(item, setup, ai_character)
+            for item in value
+        ]
+
+    if isinstance(value, dict):
+        return {
+            _preserve_player_character_text(key, setup, ai_character)
+            if isinstance(key, str)
+            else key: _preserve_player_character_text(item, setup, ai_character)
+            for key, item in value.items()
+        }
+
+    return value
+
+
+def _player_character_name_replacements(
+    setup: dict[str, Any],
+    ai_character: Any,
+) -> list[tuple[str, str]]:
+    """Builds safe character-name replacements for AI-renamed setup text."""
+
+    clean_setup = normalize_new_game_setup(setup)
+    player_name = str(clean_setup["character"].get("name", "")).strip()
+
+    if not _is_player_provided_character_field("name", player_name):
+        return []
+
+    if not isinstance(ai_character, dict):
+        return []
+
+    ai_name = str(ai_character.get("name", "")).strip()
+
+    if not ai_name or ai_name.casefold() == player_name.casefold():
+        return []
+
+    replacements = [(ai_name, player_name)]
+    ai_first = ai_name.split()[0] if ai_name.split() else ""
+    player_first = player_name.split()[0] if player_name.split() else player_name
+
+    if ai_first and player_first and ai_first.casefold() != player_first.casefold():
+        replacements.append((ai_first, player_first))
+
+    return replacements
+
+
+def _is_player_provided_character_field(key: str, value: str) -> bool:
+    """Returns True when a character field is a custom player value."""
+
+    clean_value = str(value or "").strip()
+
+    if not clean_value:
+        return False
+
+    if key == "name" and clean_value == "Player Name":
+        return False
+
+    return True
+
+
+def _replace_whole_name(text: str, source: str, target: str) -> str:
+    """Replaces a generated name without touching substrings inside words."""
+
+    if not source:
+        return text
+
+    pattern = re.compile(
+        rf"(?<![A-Za-z0-9]){re.escape(source)}(?![A-Za-z0-9])",
+        flags=re.IGNORECASE,
+    )
+    return pattern.sub(target, text)
 
 
 def _normalize_theme_name(theme: str) -> str:
@@ -3849,6 +4988,17 @@ def _normalize_theme_name(theme: str) -> str:
 
     clean_theme = str(theme or "Light").strip()
     return clean_theme if clean_theme in THEME_NAMES else "Light"
+
+
+def _application_uses_dark_theme() -> bool:
+    """Returns True when the active Qt application palette is dark."""
+
+    app = QApplication.instance()
+
+    if not isinstance(app, QApplication):
+        return False
+
+    return app.palette().color(QPalette.ColorRole.Window).lightness() < 128
 
 
 def _next_available_save_title(saves_dir: Path, requested_title: str) -> str:
@@ -3925,14 +5075,28 @@ def _light_theme_stylesheet() -> str:
         }
         QComboBox, QSpinBox {
             min-height: 24px;
-            padding: 3px 28px 3px 6px;
+            padding: 3px 6px;
+        }
+        QComboBox {
+            padding-right: 40px;
+        }
+        QSpinBox {
+            padding-right: 36px;
         }
         QComboBox::drop-down {
             background-color: #e2e8f0;
             border-left: 1px solid #94a3b8;
-            subcontrol-origin: padding;
+            subcontrol-origin: border;
             subcontrol-position: top right;
-            width: 24px;
+            width: 32px;
+        }
+        QComboBox::down-arrow {
+            image: none;
+            width: 0;
+            height: 0;
+            border-left: 5px solid transparent;
+            border-right: 5px solid transparent;
+            border-top: 6px solid #111827;
         }
         QComboBox QAbstractItemView {
             background-color: #ffffff;
@@ -3944,14 +5108,16 @@ def _light_theme_stylesheet() -> str:
             background-color: #e2e8f0;
             border-left: 1px solid #94a3b8;
             subcontrol-origin: border;
-            width: 24px;
+            width: 28px;
         }
         QSpinBox::up-button {
             border-bottom: 1px solid #94a3b8;
             subcontrol-position: top right;
+            height: 14px;
         }
         QSpinBox::down-button {
             subcontrol-position: bottom right;
+            height: 14px;
         }
         QLineEdit:focus, QTextEdit:focus, QPlainTextEdit:focus, QComboBox:focus, QSpinBox:focus {
             border-color: #1d4ed8;
@@ -3959,6 +5125,20 @@ def _light_theme_stylesheet() -> str:
         QLabel, QCheckBox {
             background-color: transparent;
             color: #111827;
+        }
+        QCheckBox::indicator {
+            background-color: #ffffff;
+            border: 1px solid #64748b;
+            border-radius: 3px;
+            height: 16px;
+            width: 16px;
+        }
+        QCheckBox::indicator:hover {
+            border-color: #1d4ed8;
+        }
+        QCheckBox::indicator:checked {
+            background-color: #2563eb;
+            border-color: #1d4ed8;
         }
         QSlider::groove:horizontal {
             background-color: #d1d9e6;
@@ -4027,14 +5207,28 @@ def _dark_theme_stylesheet() -> str:
         }
         QComboBox, QSpinBox {
             min-height: 24px;
-            padding: 3px 28px 3px 6px;
+            padding: 3px 6px;
+        }
+        QComboBox {
+            padding-right: 40px;
+        }
+        QSpinBox {
+            padding-right: 36px;
         }
         QComboBox::drop-down {
             background-color: #303437;
             border-left: 1px solid #5b6268;
-            subcontrol-origin: padding;
+            subcontrol-origin: border;
             subcontrol-position: top right;
-            width: 24px;
+            width: 32px;
+        }
+        QComboBox::down-arrow {
+            image: none;
+            width: 0;
+            height: 0;
+            border-left: 5px solid transparent;
+            border-right: 5px solid transparent;
+            border-top: 6px solid #f1f3f4;
         }
         QComboBox QAbstractItemView {
             background-color: #121416;
@@ -4046,14 +5240,34 @@ def _dark_theme_stylesheet() -> str:
             background-color: #303437;
             border-left: 1px solid #5b6268;
             subcontrol-origin: border;
-            width: 24px;
+            width: 28px;
         }
         QSpinBox::up-button {
             border-bottom: 1px solid #5b6268;
             subcontrol-position: top right;
+            height: 14px;
         }
         QSpinBox::down-button {
             subcontrol-position: bottom right;
+            height: 14px;
+        }
+        QLabel, QCheckBox {
+            background-color: transparent;
+            color: #f1f3f4;
+        }
+        QCheckBox::indicator {
+            background-color: #121416;
+            border: 1px solid #5b6268;
+            border-radius: 3px;
+            height: 16px;
+            width: 16px;
+        }
+        QCheckBox::indicator:hover {
+            border-color: #4c8fcb;
+        }
+        QCheckBox::indicator:checked {
+            background-color: #4c8fcb;
+            border-color: #2f6fb0;
         }
         QPushButton {
             background-color: #303437;
@@ -4097,6 +5311,109 @@ def _slider_row(slider: QSlider, value_label: QLabel) -> QWidget:
     widget = QWidget()
     widget.setLayout(row)
     return widget
+
+
+def _button_row(*widgets: QWidget) -> QWidget:
+    """Builds a compact horizontal control row."""
+
+    row = QHBoxLayout()
+
+    for widget in widgets:
+        row.addWidget(widget)
+
+    row.addStretch()
+
+    container = QWidget()
+    container.setLayout(row)
+    return container
+
+
+def _narrator_voice_options(narration_player: Any | None = None) -> dict[str, str]:
+    """Returns known narrator voice display options."""
+
+    if narration_player is not None and hasattr(narration_player, "get_available_voices"):
+        try:
+            voices = narration_player.get_available_voices()
+        except Exception as error:
+            LOGGER.warning("Could not read narrator voice options: %s", error)
+        else:
+            if isinstance(voices, dict) and voices:
+                return {
+                    str(label): str(voice_id)
+                    for label, voice_id in voices.items()
+                    if str(label).strip() and str(voice_id).strip()
+                }
+
+    return available_narrator_voices()
+
+
+def _populate_narrator_voice_combo(
+    combo: QComboBox,
+    selected_voice: Any,
+    *,
+    voice_options: dict[str, str] | None = None,
+) -> None:
+    """Fills a narrator voice combo and selects a supported voice id."""
+
+    combo.clear()
+    combo.setMinimumWidth(220)
+    voices = voice_options or available_narrator_voices()
+
+    for label, voice_id in voices.items():
+        combo.addItem(label, voice_id)
+
+    _set_combo_to_data(combo, normalize_narrator_voice(selected_voice))
+
+
+def _combo_current_data_text(combo: QComboBox | None, default: str) -> str:
+    """Returns a combo box's current data as text."""
+
+    if combo is None:
+        return default
+
+    value = combo.currentData()
+    return str(value or default)
+
+
+def _row_for_cell_widget(table: QTableWidget, widget: QWidget) -> int:
+    """Returns the table row containing widget, or -1 when not found."""
+
+    for row in range(table.rowCount()):
+        for column in range(table.columnCount()):
+            if table.cellWidget(row, column) is widget:
+                return row
+
+    return -1
+
+
+def _table_line_edit(text: str) -> QLineEdit:
+    """Builds an inline table editor that focuses like a native text box."""
+
+    line_edit = QLineEdit()
+    line_edit.setText(text)
+    line_edit.setFrame(False)
+    line_edit.setMinimumWidth(TABLE_INLINE_EDITOR_MIN_WIDTH)
+    line_edit.setMinimumHeight(TABLE_INLINE_EDITOR_HEIGHT)
+    return line_edit
+
+
+def _table_spin_box(minimum: int, maximum: int) -> QSpinBox:
+    """Builds an inline table number editor with table-wide sizing."""
+
+    spin_box = QSpinBox()
+    spin_box.setMinimum(minimum)
+    spin_box.setMaximum(maximum)
+    spin_box.setMinimumWidth(TABLE_INLINE_EDITOR_MIN_WIDTH)
+    spin_box.setMinimumHeight(TABLE_INLINE_EDITOR_HEIGHT)
+    return spin_box
+
+
+def _set_table_column_widths(table: QTableWidget, widths: tuple[int, ...]) -> None:
+    """Applies stable table column widths so inline editors do not autoshrink."""
+
+    for column, width in enumerate(widths):
+        if column < table.columnCount():
+            table.setColumnWidth(column, width)
 
 
 def _bool_setting(value: Any, default: bool) -> bool:
@@ -4149,16 +5466,75 @@ def _ai_skills_match_setup(
     if ai_levels != setup_levels:
         return False
 
-    skill_names = [str(skill.get("name", "")).strip().casefold() for skill in ai_skills]
-
-    if len(skill_names) != len(set(skill_names)):
-        return False
-
     return all(
         str(skill.get("name", "")).strip()
         and str(skill.get("description", "")).strip()
         for skill in ai_skills
     )
+
+
+def _deduplicated_ai_skills(ai_skills: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Returns AI-finalized skills with unique names suitable for persistence."""
+
+    deduplicated_skills: list[dict[str, Any]] = []
+    seen_names: set[str] = set()
+
+    for raw_skill in ai_skills:
+        skill = dict(raw_skill)
+        name = str(skill.get("name", "")).strip()
+        folded_name = name.casefold()
+
+        if folded_name in seen_names:
+            try:
+                level = int(skill.get("level", 0))
+            except (TypeError, ValueError):
+                level = 0
+
+            name = _unique_ai_skill_name(
+                name,
+                seen_names,
+                suffix=_duplicate_skill_suffix(level),
+            )
+            skill["name"] = name
+            LOGGER.info("Renamed duplicate AI-finalized skill to %s.", name)
+
+        seen_names.add(name.casefold())
+        deduplicated_skills.append(skill)
+
+    return deduplicated_skills
+
+
+def _unique_ai_skill_name(base_name: str, seen_names: set[str], *, suffix: str) -> str:
+    """Builds a unique generated skill name from an AI duplicate."""
+
+    clean_base = base_name.strip() or "Generated Skill"
+    clean_suffix = suffix.strip() or "Alternate"
+    candidate = f"{clean_base} ({clean_suffix})"
+
+    if candidate.casefold() not in seen_names:
+        return candidate
+
+    index = 2
+
+    while True:
+        candidate = f"{clean_base} ({clean_suffix} {index})"
+
+        if candidate.casefold() not in seen_names:
+            return candidate
+
+        index += 1
+
+
+def _duplicate_skill_suffix(level: int) -> str:
+    """Returns a compact descriptor for duplicate generated skill names."""
+
+    return {
+        5: "Signature",
+        4: "Expert",
+        3: "Skilled",
+        2: "Trained",
+        1: "Familiar",
+    }.get(level, "Alternate")
 
 
 def _starter_items_for_save(
@@ -4171,9 +5547,6 @@ def _starter_items_for_save(
 
     if not isinstance(setup_items, list):
         setup_items = []
-
-    if not ai_items:
-        return []
 
     completed_items = [item for item in ai_items if isinstance(item, dict)]
     original_completed_count = len(completed_items)
@@ -4196,10 +5569,15 @@ def _starter_items_for_save(
         if index in used_source_indexes:
             continue
 
-        if not isinstance(setup_item, dict) or bool(setup_item.get("requires_ai_invention")):
+        if not isinstance(setup_item, dict):
             continue
 
-        fallback_item = _fallback_starter_item_from_setup(setup_item)
+        requires_ai_invention = bool(setup_item.get("requires_ai_invention"))
+
+        if requires_ai_invention and len(completed_items) >= STARTER_INVENTORY_MIN_ITEMS:
+            continue
+
+        fallback_item = _fallback_starter_item_from_setup(setup_item, source_index=index)
 
         if not fallback_item:
             continue
@@ -4212,17 +5590,39 @@ def _starter_items_for_save(
         completed_items.append(fallback_item)
         seen_names.add(folded_name)
 
+    while len(completed_items) < STARTER_INVENTORY_MIN_ITEMS:
+        fallback_item = _starter_inventory_top_up_item(seen_names)
+
+        if fallback_item is None:
+            break
+
+        completed_items.append(fallback_item)
+        seen_names.add(fallback_item["name"].casefold())
+
     if len(completed_items) > original_completed_count:
-        LOGGER.warning(
-            "Gemini omitted %s explicit starter item(s); preserved named setup "
-            "item(s) without applying a starter inventory count requirement.",
-            len(completed_items) - original_completed_count,
-        )
+        added_count = len(completed_items) - original_completed_count
+
+        if original_completed_count < STARTER_INVENTORY_MIN_ITEMS:
+            LOGGER.warning(
+                "Gemini returned fewer than %s complete starter item(s); added %s "
+                "fallback item(s) so the new save starts with enough inventory.",
+                STARTER_INVENTORY_MIN_ITEMS,
+                added_count,
+            )
+        else:
+            LOGGER.warning(
+                "Gemini omitted %s explicit starter item(s); preserved named setup item(s).",
+                added_count,
+            )
 
     return completed_items
 
 
-def _fallback_starter_item_from_setup(raw_item: Any) -> dict[str, Any] | None:
+def _fallback_starter_item_from_setup(
+    raw_item: Any,
+    *,
+    source_index: int = -1,
+) -> dict[str, Any] | None:
     """Builds a structured starter item from a wizard entry when AI output is partial."""
 
     if not isinstance(raw_item, dict):
@@ -4246,7 +5646,63 @@ def _fallback_starter_item_from_setup(raw_item: Any) -> dict[str, Any] | None:
         or item_request
         or "Player-requested starter item awaiting AI detail.",
         "value_base_units": max(0, _safe_int(raw_item.get("value_base_units"), 0)),
+        "source_index": source_index,
     }
+
+
+def _starter_inventory_top_up_item(seen_names: set[str]) -> dict[str, Any] | None:
+    """Returns a neutral fallback item for short AI starter inventories."""
+
+    fallback_items = [
+        {
+            "name": "Personal Pack",
+            "category": "Container",
+            "description": "A sturdy pack for keeping essential belongings close.",
+            "value_base_units": 5,
+        },
+        {
+            "name": "Packed Meal",
+            "category": "Supply",
+            "description": "Simple food set aside for the first stretch of travel.",
+            "value_base_units": 2,
+        },
+        {
+            "name": "Water Flask",
+            "category": "Supply",
+            "description": "A refillable flask of clean drinking water.",
+            "value_base_units": 2,
+        },
+        {
+            "name": "Utility Tool",
+            "category": "Tool",
+            "description": "A compact everyday tool for small repairs and practical tasks.",
+            "value_base_units": 4,
+        },
+        {
+            "name": "Weather-Ready Clothes",
+            "category": "Clothing",
+            "description": "Durable clothing suitable for uncertain conditions.",
+            "value_base_units": 6,
+        },
+        {
+            "name": "Personal Keepsake",
+            "category": "Personal",
+            "description": "A small memento connecting the character to their past.",
+            "value_base_units": 1,
+        },
+    ]
+
+    for fallback_item in fallback_items:
+        if fallback_item["name"].casefold() in seen_names:
+            continue
+
+        return {
+            **fallback_item,
+            "quantity": 1,
+            "source_index": -1,
+        }
+
+    return None
 
 
 def _starter_item_name_from_request(item_request: str) -> str:
@@ -4338,36 +5794,14 @@ def _append_ai_context_line(existing_context: str, line: str) -> str:
     return clean_line
 
 
-def _format_starter_items_for_template(items: list[dict[str, Any]]) -> str:
-    """Formats starter item dictionaries back into wizard text lines."""
-
-    lines: list[str] = []
-
-    for item in items:
-        name = str(item.get("name", "")).strip()
-        item_request = str(item.get("item_request", "")).strip()
-
-        if bool(item.get("requires_ai_invention")) and item_request:
-            lines.append(item_request)
-            continue
-
-        if not name:
-            continue
-
-        parts = [
-            name,
-            str(item.get("category", "Item")).strip() or "Item",
-            str(_safe_int(item.get("quantity"), 1)),
-            str(item.get("description", "")).strip(),
-            str(_safe_int(item.get("value_base_units"), 0)),
-        ]
-        lines.append(" | ".join(parts))
-
-    return "\n".join(lines)
-
-
 def _calendar_type_from_settings(settings: dict[str, Any]) -> str:
     """Infers which calendar option should be selected for saved settings."""
+
+    if bool(settings.get("ai_generated", False)):
+        return "ai_generated"
+
+    if str(settings.get("calendar_type", "")).strip().casefold() == "ai_generated":
+        return "ai_generated"
 
     for key, value in GREGORIAN_CALENDAR_SETTINGS.items():
         if key == "time_display":
@@ -4411,6 +5845,37 @@ def _set_combo_to_data(combo: QComboBox, value: str) -> None:
             return
 
     combo.setCurrentIndex(0)
+
+
+def _add_combo_options(combo: QComboBox, options: dict[str, str]) -> None:
+    """Adds keyed display options to a combo box."""
+
+    for value, label in options.items():
+        combo.addItem(label, value)
+
+
+def _set_markdown_text(text_edit: QTextEdit, markdown_text: str) -> None:
+    """Sets read-only body text as Markdown when the Qt runtime supports it."""
+
+    if hasattr(text_edit, "setMarkdown"):
+        text_edit.setMarkdown(str(markdown_text or ""))
+        return
+
+    text_edit.setPlainText(str(markdown_text or ""))
+
+
+def _player_command_markdown(command: str) -> str:
+    """Formats a player command as a Markdown blockquote."""
+
+    lines = [line.strip() for line in str(command or "").splitlines() if line.strip()]
+
+    if not lines:
+        return "> **You:**"
+
+    first_line, *remaining_lines = lines
+    quoted_lines = [f"> **You:** {first_line}"]
+    quoted_lines.extend(f"> {line}" for line in remaining_lines)
+    return "\n".join(quoted_lines)
 
 
 def _safe_int(value, default: int) -> int:

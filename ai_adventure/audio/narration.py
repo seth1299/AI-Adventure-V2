@@ -7,15 +7,50 @@ import threading
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
-from ai_adventure.audio.tts.tts_manager import TTSManager, TTSRequest
+from ai_adventure.audio.voices import (
+    DEFAULT_NARRATOR_VOICE,
+    NARRATOR_SAMPLE_TEXT,
+    normalize_narrator_voice,
+)
 
 
 LOGGER = logging.getLogger(__name__)
 
 TTS_CHANNEL_INDEX = 1
 MAX_CHUNK_LENGTH = 260
+
+
+@dataclass(frozen=True)
+class TTSRequest:
+    """A single text-to-speech synthesis request."""
+
+    text: str
+    voice: str
+    speed: float = 1.0
+    language: str = "en-us"
+
+
+class TTSManagerProtocol(Protocol):
+    """Runtime surface NarrationPlayer needs from a TTS manager."""
+
+    @property
+    def is_available(self) -> bool:
+        """Returns True when a TTS engine is ready."""
+        ...
+
+    def synthesize_to_file(self, request: TTSRequest) -> Path | None:
+        """Synthesizes speech using the active engine, if available."""
+        ...
+
+    def get_default_voice(self) -> str:
+        """Returns the active engine's default voice."""
+        ...
+
+    def get_available_voices(self) -> dict[str, str]:
+        """Returns display-name-to-engine voice mappings."""
+        ...
 
 
 @dataclass(frozen=True)
@@ -37,11 +72,11 @@ class GeneratedNarrationChunk:
 class NarrationPlayer:
     """Generates and plays text-to-speech narration in queued chunks."""
 
-    def __init__(self, tts_manager: TTSManager) -> None:
+    def __init__(self, tts_manager: TTSManagerProtocol) -> None:
         self.tts_manager = tts_manager
         self.enabled = True
         self.volume = 0.9
-        self.voice = tts_manager.get_default_voice()
+        self.voice = normalize_narrator_voice(tts_manager.get_default_voice())
         self.speed = 1.0
         self._pygame: Any = None
         self._initialized = False
@@ -98,10 +133,61 @@ class NarrationPlayer:
             except Exception as error:
                 LOGGER.warning("Failed to update active narrator volume: %s", error)
 
+    def set_voice(self, voice: str | None) -> None:
+        """Sets the active narrator voice."""
+
+        self.voice = normalize_narrator_voice(voice or self.get_default_voice())
+
+    def get_default_voice(self) -> str:
+        """Returns the active engine's default voice."""
+
+        return normalize_narrator_voice(self.tts_manager.get_default_voice())
+
+    def get_available_voices(self) -> dict[str, str]:
+        """Returns display-name-to-engine voice mappings."""
+
+        try:
+            return self.tts_manager.get_available_voices()
+        except Exception as error:
+            LOGGER.warning("Failed to read available narrator voices: %s", error)
+            return {}
+
+    def play_sample(
+        self,
+        *,
+        voice: str | None = None,
+        volume: float | int | None = None,
+        text: str = NARRATOR_SAMPLE_TEXT,
+    ) -> bool:
+        """Plays a local narrator sample without contacting the AI."""
+
+        previous_enabled = self.enabled
+
+        if volume is not None:
+            self.set_volume(volume)
+
+        self.set_enabled(True)
+
+        def restore_enabled() -> None:
+            if not previous_enabled:
+                self.set_enabled(False)
+
+        started = self.narrate(
+            text,
+            voice=voice,
+            on_complete=restore_enabled,
+        )
+
+        if not started:
+            restore_enabled()
+
+        return started
+
     def narrate(
         self,
         text: str,
         *,
+        voice: str | None = None,
         on_chunk_start: Callable[[str], None] | None = None,
         on_complete: Callable[[], None] | None = None,
     ) -> bool:
@@ -125,10 +211,11 @@ class NarrationPlayer:
             self._session_id += 1
             session_id = self._session_id
 
+        session_voice = normalize_narrator_voice(voice or self.voice or DEFAULT_NARRATOR_VOICE)
         audio_queue: queue.Queue[GeneratedNarrationChunk | None] = queue.Queue(maxsize=2)
         producer = threading.Thread(
             target=self._produce_chunks,
-            args=(session_id, chunks, audio_queue),
+            args=(session_id, chunks, audio_queue, session_voice),
             daemon=True,
         )
         consumer = threading.Thread(
@@ -157,6 +244,7 @@ class NarrationPlayer:
         session_id: int,
         chunks: list[NarrationChunk],
         audio_queue: queue.Queue[GeneratedNarrationChunk | None],
+        voice: str,
     ) -> None:
         """Generates audio files while earlier chunks are being played."""
 
@@ -172,7 +260,7 @@ class NarrationPlayer:
                     audio_path = self.tts_manager.synthesize_to_file(
                         TTSRequest(
                             text=chunk.tts_text,
-                            voice=self.voice,
+                            voice=voice,
                             speed=self.speed,
                         )
                     )

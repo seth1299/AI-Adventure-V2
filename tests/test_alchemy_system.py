@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -10,56 +9,36 @@ from ai_adventure.persistence.save_repository import SaveRepository
 
 
 class AlchemySystemTests(unittest.TestCase):
-    def test_existing_saves_gain_simplified_reagent_columns(self) -> None:
+    def test_new_saves_use_crafting_tables_without_legacy_alchemy_tables(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            save_path = Path(temp_dir) / "old.sqlite3"
-            connection = sqlite3.connect(save_path)
-            try:
-                connection.executescript(
-                    """
-                    CREATE TABLE metadata (
-                        key TEXT PRIMARY KEY,
-                        value TEXT NOT NULL
-                    );
-                    CREATE TABLE alchemy_reagents (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        name TEXT NOT NULL UNIQUE,
-                        uses_json TEXT NOT NULL DEFAULT '[]',
-                        notes TEXT NOT NULL DEFAULT '',
-                        discovered_at TEXT NOT NULL
-                    );
-                    INSERT INTO alchemy_reagents (
-                        name,
-                        uses_json,
-                        notes,
-                        discovered_at
-                    )
-                    VALUES ('Old Salt', '["preservation"]', 'Found under old stone.', '2026-05-31T00:00:00');
-                    """
-                )
-            finally:
-                connection.close()
+            repository = SaveRepository.create_new_save(Path(temp_dir), "Crafting Schema Test")
 
-            repository = SaveRepository(save_path)
-            reagents = repository.list_alchemy_reagents()
+            with repository._connect() as connection:
+                table_names = {
+                    str(row["name"])
+                    for row in connection.execute(
+                        "SELECT name FROM sqlite_master WHERE type = 'table'"
+                    ).fetchall()
+                }
 
-            self.assertEqual(reagents[0]["name"], "Old Salt")
-            self.assertEqual(reagents[0]["description"], "Found under old stone.")
-            self.assertEqual(reagents[0]["location"], "")
-            self.assertEqual(reagents[0]["uses"], ["preservation"])
+            self.assertIn("crafting_items", table_names)
+            self.assertIn("crafting_recipes", table_names)
+            self.assertNotIn("alchemy_notes", table_names)
+            self.assertNotIn("alchemy_reagents", table_names)
+            self.assertNotIn("alchemy_recipes", table_names)
 
     def test_reagent_discovery_persists_simplified_fields(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             repository = SaveRepository.create_new_save(Path(temp_dir), "Alchemy Test")
 
-            repository.add_alchemy_reagent(
+            repository.add_crafting_item(
                 name="Moon Salt",
                 description="Pale crystals that hum under moonlight.",
                 location="Moonlit stone basins",
                 uses=["cooling draughts", "mirror inks"],
             )
 
-            reagents = repository.list_alchemy_reagents()
+            reagents = repository.list_crafting_items()
 
             self.assertEqual(len(reagents), 1)
             self.assertEqual(reagents[0]["name"], "Moon Salt")
@@ -74,7 +53,7 @@ class AlchemySystemTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             repository = SaveRepository.create_new_save(Path(temp_dir), "Alchemy Test")
 
-            repository.add_alchemy_recipe(
+            repository.add_crafting_recipe(
                 name="Mistglass Tincture",
                 ingredients=[
                     {
@@ -94,7 +73,7 @@ class AlchemySystemTests(unittest.TestCase):
                 notes="Clouds if stirred too quickly.",
             )
 
-            recipes = repository.list_alchemy_recipes()
+            recipes = repository.list_crafting_recipes()
 
             self.assertEqual(len(recipes), 1)
             self.assertEqual(recipes[0]["name"], "Mistglass Tincture")
@@ -112,13 +91,13 @@ class AlchemySystemTests(unittest.TestCase):
     def test_state_manager_loads_reagents_and_recipes(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             repository = SaveRepository.create_new_save(Path(temp_dir), "Alchemy Test")
-            repository.add_alchemy_reagent(
+            repository.add_crafting_item(
                 name="Ash Fern",
                 description="Grey fronds that curl toward heat.",
                 location="Charcoal-rich forest clearings",
                 uses=["smoke readings"],
             )
-            repository.add_alchemy_recipe(
+            repository.add_crafting_recipe(
                 name="Ember Mnemonic",
                 ingredients=[
                     {

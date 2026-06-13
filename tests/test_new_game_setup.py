@@ -34,6 +34,10 @@ class NewGameSetupTests(unittest.TestCase):
                 "skills": [{"name": f"Skill {index}"} for index in range(15)],
                 "starter_items": [{"name": "Notebook"}],
                 "calendar": {"calendar_type": "gregorian"},
+                "narration": {
+                    "tense": "past",
+                    "style": "third_person_omniscient",
+                },
                 "specified_genre": "Realistic detective mystery",
                 "start_location": "Rainmarket Station",
             }
@@ -47,6 +51,29 @@ class NewGameSetupTests(unittest.TestCase):
         self.assertEqual(setup["specified_genre"], "Realistic detective mystery")
         self.assertEqual(setup["calendar"]["month_names"][0], "January")
         self.assertEqual(setup["calendar"]["time_display"], "12_hour")
+        self.assertEqual(setup["calendar"]["calendar_type"], "gregorian")
+        self.assertFalse(setup["calendar"]["ai_generated"])
+        self.assertEqual(setup["narration"]["tense"], "past")
+        self.assertEqual(setup["narration"]["tense_label"], "Past Tense")
+        self.assertEqual(setup["narration"]["style"], "third_person_omniscient")
+        self.assertEqual(
+            setup["narration"]["style_label"],
+            "Third-Person Omniscient",
+        )
+
+    def test_normalized_setup_preserves_ai_generated_calendar_mode(self) -> None:
+        setup = normalize_new_game_setup(
+            {
+                "calendar": {
+                    "calendar_type": "ai_generated",
+                    "time_display": "narrative",
+                }
+            }
+        )
+
+        self.assertEqual(setup["calendar"]["calendar_type"], "ai_generated")
+        self.assertTrue(setup["calendar"]["ai_generated"])
+        self.assertEqual(setup["calendar"]["time_display"], "narrative")
 
     def test_parse_starter_items_text_supports_plain_and_structured_lines(self) -> None:
         items = parse_starter_items_text(
@@ -89,9 +116,14 @@ class NewGameSetupTests(unittest.TestCase):
                     "world_context": "The city is controlled by canal guilds.",
                     "audio": {
                         "music_enabled": False,
-                        "narrator_enabled": False,
-                        "music_volume": 0,
-                        "tts_volume": 35,
+                    "narrator_enabled": False,
+                    "music_volume": 0,
+                    "tts_volume": 35,
+                    "tts_voice": "am_echo",
+                },
+                    "narration": {
+                        "tense": "future",
+                        "style": "first_person_limited",
                     },
                 }
             )
@@ -125,6 +157,12 @@ class NewGameSetupTests(unittest.TestCase):
             self.assertFalse(state.settings.values["audio.narrator_enabled"])
             self.assertEqual(state.settings.values["audio.music_volume"], 0)
             self.assertEqual(state.settings.values["audio.tts_volume"], 35)
+            self.assertEqual(state.settings.values["audio.tts_voice"], "am_echo")
+            self.assertEqual(state.settings.values["ai.narration_tense"], "future")
+            self.assertEqual(
+                state.settings.values["ai.narration_style"],
+                "first_person_limited",
+            )
             repository.set_world_lore(
                 {
                     "Locations": {
@@ -235,6 +273,16 @@ class NewGameSetupTests(unittest.TestCase):
         self.assertIn(
             "economy and currency denominations",
             packet["fields_requiring_ai_invention"],
+        )
+        self.assertEqual(packet["setup"]["narration"]["tense"], "present")
+        self.assertEqual(
+            packet["setup"]["narration"]["style"],
+            "second_person_limited",
+        )
+        self.assertIn("narration_preferences", packet["requirements"])
+        self.assertIn(
+            "setup.narration.tense_label",
+            packet["requirements"]["narration_preferences"],
         )
         self.assertIn("currency_generation", packet["requirements"])
         self.assertIn("at least one and at most four", packet["requirements"]["currency_generation"])
@@ -409,6 +457,9 @@ class NewGameSetupTests(unittest.TestCase):
         self.assertIn("ai_invention_policy", packet["requirements"])
         self.assertIn("character_generation", packet["requirements"])
         self.assertIn("should default to male", packet["requirements"]["character_generation"])
+        self.assertIn("preserve that field exactly", packet["requirements"]["character_generation"])
+        self.assertIn("light Markdown", packet["requirements"]["world_summary"])
+        self.assertIn("Light Markdown", packet["requirements"]["opening_scene"])
         self.assertIn("genre_generation", packet["requirements"])
         self.assertIn("Do not default to fantasy", packet["requirements"]["genre_generation"])
         self.assertIn("starting_location", packet["requirements"])
@@ -433,16 +484,17 @@ class NewGameSetupTests(unittest.TestCase):
         self.assertIn("creative_ideas", packet["requirements"])
         self.assertIn("high-priority style seeds", packet["requirements"]["creative_ideas"])
         self.assertIn("item_request", packet["requirements"]["starter_inventory"])
-        self.assertIn("no required minimum or maximum", packet["requirements"]["starter_inventory"])
-        self.assertIn("Do not add, split, combine, or pad", packet["requirements"]["starter_inventory"])
+        self.assertIn("at least five", packet["requirements"]["starter_inventory"])
+        self.assertIn("has no maximum count", packet["requirements"]["starter_inventory"])
         self.assertIn("starting_items", packet["requirements"]["starter_inventory"])
         self.assertIn("source_index", packet["requirements"]["starter_inventory"])
         self.assertIn("Fuel instead of Starting Fuel Amount", packet["requirements"]["starter_inventory"])
         self.assertIn("Put quantities in quantity, not name", packet["requirements"]["starter_inventory"])
         self.assertEqual(packet["starter_inventory_contract"]["requested_item_count"], 0)
+        self.assertEqual(packet["starter_inventory_contract"]["minimum_finalized_item_count"], 5)
         self.assertEqual(
             packet["starter_inventory_contract"]["count_rule"],
-            "No required minimum or maximum starting item count.",
+            "At least 5 finalized starting items are required; there is no maximum starting item count.",
         )
         self.assertEqual(packet["starter_inventory_contract"]["output_field"], "starting_items")
         self.assertIn("creative_ideas", packet)
@@ -486,6 +538,16 @@ class NewGameSetupTests(unittest.TestCase):
         self.assertEqual(packet["current_calendar"]["season_hint"], "spring")
         self.assertEqual(packet["current_weather"], "Clear")
         self.assertIn("calendar_weather_consistency", packet["requirements"])
+        self.assertIn("calendar_generation", packet["requirements"])
+
+    def test_setup_packet_marks_ai_generated_calendar_for_gemini(self) -> None:
+        setup = normalize_new_game_setup({"calendar": {"calendar_type": "ai_generated"}})
+
+        packet = build_new_game_setup_packet(setup)
+
+        self.assertTrue(packet["setup"]["calendar"]["ai_generated"])
+        self.assertEqual(packet["setup"]["calendar"]["calendar_type"], "ai_generated")
+        self.assertIn("invent calendar_settings", packet["requirements"]["calendar_generation"])
 
     def test_setup_packet_does_not_require_large_requested_starter_inventory_count(self) -> None:
         setup = normalize_new_game_setup(
@@ -504,10 +566,10 @@ class NewGameSetupTests(unittest.TestCase):
         self.assertEqual(packet["starter_inventory_contract"]["requested_item_count"], 12)
         self.assertEqual(
             packet["starter_inventory_contract"]["count_rule"],
-            "No required minimum or maximum starting item count.",
+            "At least 5 finalized starting items are required; there is no maximum starting item count.",
         )
         self.assertIn(
-            "no required minimum or maximum",
+            "has no maximum count",
             packet["requirements"]["starter_inventory"],
         )
         self.assertEqual(len(packet["setup"]["starter_items"]), 12)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 import sqlite3
@@ -487,6 +488,38 @@ class EventApplierTests(unittest.TestCase):
                 "The Gilded Tankard is a smoky tavern in Amberfell known for discreet contract work.",
             )
 
+    def test_event_payloads_sanitize_banned_creative_terms_before_storage(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = SaveRepository.create_new_save(Path(temp_dir), "Guardrail Test")
+
+            with self.assertLogs("ai_adventure.events.event_applier", level="WARNING"):
+                results = EventApplier(repository).apply_events(
+                    [
+                        {
+                            "type": "StatusUpdatedEvent",
+                            "payload": {
+                                "location": "New Aethelgard",
+                                "minutes_passed": "AUTO",
+                                "weather": "Clear",
+                            },
+                        },
+                        {
+                            "type": "WorldLoreAddedEvent",
+                            "payload": {
+                                "section": "Locations",
+                                "key": "New Aethelgard",
+                                "text": "New Aethelgard is a crowded city.",
+                            },
+                        },
+                    ]
+                )
+
+            stored_lore = json.dumps(repository.get_world_lore(), ensure_ascii=False)
+
+            self.assertEqual([result.status for result in results], ["applied", "applied"])
+            self.assertNotIn("Aethelgard", repository.get_state_value("location"))
+            self.assertNotIn("Aethelgard", stored_lore)
+
     def test_applies_alchemy_discovery_events(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             repository = SaveRepository.create_new_save(Path(temp_dir), "Event Test")
@@ -536,8 +569,8 @@ class EventApplierTests(unittest.TestCase):
                 ]
             )
 
-            reagents = repository.list_alchemy_reagents()
-            recipes = repository.list_alchemy_recipes()
+            reagents = repository.list_crafting_items()
+            recipes = repository.list_crafting_recipes()
 
             moonwater = next(reagent for reagent in reagents if reagent["name"] == "Moonwater")
 
@@ -583,7 +616,7 @@ class EventApplierTests(unittest.TestCase):
             )
 
             self.assertEqual(results[0].status, "skipped")
-            self.assertEqual(repository.list_alchemy_recipes(), [])
+            self.assertEqual(repository.list_crafting_recipes(), [])
 
     def test_applies_npc_profile_and_knowledge_events(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

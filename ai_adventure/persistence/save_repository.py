@@ -18,11 +18,16 @@ from ai_adventure.calendar_system import (
     build_calendar_snapshot,
     normalize_calendar_settings,
 )
+from ai_adventure.audio.voices import DEFAULT_NARRATOR_VOICE
 from ai_adventure.currency import (
     DEFAULT_CURRENCY_DENOMINATIONS,
     normalize_currency_denominations,
 )
 from ai_adventure.new_game_setup import normalize_new_game_setup
+from ai_adventure.narration_preferences import (
+    DEFAULT_NARRATION_STYLE,
+    DEFAULT_NARRATION_TENSE,
+)
 from ai_adventure.skills.rules import bonus_for_level, clamp_skill_level, level_for_xp
 
 
@@ -108,10 +113,13 @@ class SaveRepository:
         repository.set_setting("player.backstory", "")
         repository.set_setting("player.notes", "")
         repository.set_setting("ai.additional_context", "")
+        repository.set_setting("ai.narration_tense", DEFAULT_NARRATION_TENSE)
+        repository.set_setting("ai.narration_style", DEFAULT_NARRATION_STYLE)
         repository.set_setting("audio.music_enabled", True)
         repository.set_setting("audio.narrator_enabled", True)
         repository.set_setting("audio.music_volume", 25)
         repository.set_setting("audio.tts_volume", 90)
+        repository.set_setting("audio.tts_voice", DEFAULT_NARRATOR_VOICE)
         repository.set_setting("audio.current_music", "")
         repository.set_journal_notes("")
         repository.set_journal_share_with_ai(False)
@@ -201,6 +209,7 @@ class SaveRepository:
         start_location = clean_setup["start_location"]
         calendar_settings = clean_setup["calendar"]
         audio_settings = clean_setup["audio"]
+        narration_preferences = clean_setup["narration"]
         calendar_snapshot = build_calendar_snapshot(
             DEFAULT_START_ELAPSED_MINUTES,
             calendar_settings,
@@ -212,10 +221,13 @@ class SaveRepository:
         self.set_setting("player.backstory", character["backstory"])
         self.set_setting("player.notes", character["notes"])
         self.set_setting("ai.additional_context", clean_setup["ai_additional_context"])
+        self.set_setting("ai.narration_tense", narration_preferences["tense"])
+        self.set_setting("ai.narration_style", narration_preferences["style"])
         self.set_setting("audio.music_enabled", bool(audio_settings["music_enabled"]))
         self.set_setting("audio.narrator_enabled", bool(audio_settings["narrator_enabled"]))
         self.set_setting("audio.music_volume", int(audio_settings["music_volume"]))
         self.set_setting("audio.tts_volume", int(audio_settings["tts_volume"]))
+        self.set_setting("audio.tts_voice", audio_settings["tts_voice"])
         self.set_setting("audio.current_music", "")
         self.set_setting("new_game.setup", clean_setup)
         self.set_setting("world.setup_context", clean_setup["world_context"])
@@ -692,51 +704,6 @@ class SaveRepository:
 
         return [dict(row) for row in rows]
 
-    def add_alchemy_note(self, title: str, body: str) -> None:
-        """
-        Adds an alchemy notebook entry.
-
-        Args:
-            title: Note title.
-            body: Note body.
-        """
-
-        clean_title = title.strip()
-
-        if not clean_title:
-            LOGGER.error("Attempted to add alchemy note with blank title.")
-            return
-
-        with self._connect() as connection:
-            connection.execute(
-                """
-                INSERT INTO alchemy_notes (title, body, created_at)
-                VALUES (?, ?, ?)
-                """,
-                (clean_title, body.strip(), datetime.now().isoformat(timespec="seconds")),
-            )
-
-        self.append_history("alchemy", f"Added alchemy note: {clean_title}.")
-
-    def list_alchemy_notes(self) -> list[dict[str, Any]]:
-        """
-        Reads all alchemy notes.
-
-        Returns:
-            List of alchemy note dictionaries.
-        """
-
-        with self._connect() as connection:
-            rows = connection.execute(
-                """
-                SELECT id, title, body, created_at
-                FROM alchemy_notes
-                ORDER BY id DESC
-                """
-            ).fetchall()
-
-        return [dict(row) for row in rows]
-
     def remove_inventory_item(self, name: str, quantity: int) -> None:
         """
         Removes or decreases inventory items by name.
@@ -883,7 +850,7 @@ class SaveRepository:
 
         self.append_history("inventory", f"Modified inventory item: {clean_target}.")
 
-    def add_alchemy_reagent(
+    def add_crafting_item(
         self,
         *,
         name: str,
@@ -905,7 +872,7 @@ class SaveRepository:
         clean_name = name.strip()
 
         if not clean_name:
-            LOGGER.error("Attempted to add alchemy reagent with blank name.")
+            LOGGER.error("Attempted to add crafting item/material with blank name.")
             return
 
         discovered_at = datetime.now().isoformat(timespec="seconds")
@@ -916,27 +883,24 @@ class SaveRepository:
         with self._connect() as connection:
             connection.execute(
                 """
-                INSERT INTO alchemy_reagents (
+                INSERT INTO crafting_items (
                     name,
                     description,
                     location,
                     uses_json,
-                    notes,
                     discovered_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?)
                 ON CONFLICT(name) DO UPDATE SET
                     description = excluded.description,
                     location = excluded.location,
-                    uses_json = excluded.uses_json,
-                    notes = excluded.notes
+                    uses_json = excluded.uses_json
                 """,
                 (
                     clean_name,
                     clean_description,
                     clean_location,
                     _encode_string_list(clean_uses),
-                    notes.strip(),
                     discovered_at,
                 ),
             )
@@ -948,14 +912,14 @@ class SaveRepository:
                 value_base_units=0,
             )
 
-        self.append_history("alchemy", f"Discovered reagent: {clean_name}.")
+        self.append_history("crafting", f"Discovered crafting item/material: {clean_name}.")
 
-    def list_alchemy_reagents(self) -> list[dict[str, Any]]:
+    def list_crafting_items(self) -> list[dict[str, Any]]:
         """
         Reads discovered useful crafting items/materials.
 
         Returns:
-            List of reagent dictionaries.
+            List of crafting item/material dictionaries.
         """
 
         with self._connect() as connection:
@@ -967,9 +931,8 @@ class SaveRepository:
                     description,
                     location,
                     uses_json,
-                    notes,
                     discovered_at
-                FROM alchemy_reagents
+                FROM crafting_items
                 ORDER BY name COLLATE NOCASE
                 """
             ).fetchall()
@@ -981,7 +944,7 @@ class SaveRepository:
                 {
                     "id": row["id"],
                     "name": row["name"],
-                    "description": row["description"] or row["notes"],
+                    "description": row["description"],
                     "location": row["location"],
                     "uses": _decode_string_list(row["uses_json"], "uses"),
                     "discovered_at": row["discovered_at"],
@@ -990,7 +953,7 @@ class SaveRepository:
 
         return reagents
 
-    def add_alchemy_recipe(
+    def add_crafting_recipe(
         self,
         *,
         name: str,
@@ -999,11 +962,11 @@ class SaveRepository:
         notes: str = "",
     ) -> None:
         """
-        Adds or updates a discovered alchemical recipe.
+        Adds or updates a discovered crafting recipe.
 
         Args:
             name: Recipe name.
-            ingredients: Known reagent ingredients.
+            ingredients: Known item/material ingredients.
             result: Recipe result.
             notes: Freeform notes.
         """
@@ -1011,7 +974,7 @@ class SaveRepository:
         clean_name = name.strip()
 
         if not clean_name:
-            LOGGER.error("Attempted to add alchemy recipe with blank name.")
+            LOGGER.error("Attempted to add crafting recipe with blank name.")
             return
 
         discovered_at = datetime.now().isoformat(timespec="seconds")
@@ -1020,7 +983,7 @@ class SaveRepository:
         with self._connect() as connection:
             connection.execute(
                 """
-                INSERT INTO alchemy_recipes (
+                INSERT INTO crafting_recipes (
                     name,
                     ingredients_json,
                     result,
@@ -1042,11 +1005,11 @@ class SaveRepository:
                 ),
             )
 
-        self.append_history("alchemy", f"Discovered recipe: {clean_name}.")
+        self.append_history("crafting", f"Discovered recipe: {clean_name}.")
 
-    def list_alchemy_recipes(self) -> list[dict[str, Any]]:
+    def list_crafting_recipes(self) -> list[dict[str, Any]]:
         """
-        Reads discovered alchemical recipes.
+        Reads discovered crafting recipes.
 
         Returns:
             List of recipe dictionaries.
@@ -1062,7 +1025,7 @@ class SaveRepository:
                     result,
                     notes,
                     discovered_at
-                FROM alchemy_recipes
+                FROM crafting_recipes
                 ORDER BY name COLLATE NOCASE
                 """
             ).fetchall()
@@ -2615,24 +2578,16 @@ class SaveRepository:
                     updated_at TEXT NOT NULL
                 );
 
-                CREATE TABLE IF NOT EXISTS alchemy_notes (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    title TEXT NOT NULL,
-                    body TEXT NOT NULL DEFAULT '',
-                    created_at TEXT NOT NULL
-                );
-
-                CREATE TABLE IF NOT EXISTS alchemy_reagents (
+                CREATE TABLE IF NOT EXISTS crafting_items (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     name TEXT NOT NULL UNIQUE,
                     description TEXT NOT NULL DEFAULT '',
                     location TEXT NOT NULL DEFAULT '',
                     uses_json TEXT NOT NULL DEFAULT '[]',
-                    notes TEXT NOT NULL DEFAULT '',
                     discovered_at TEXT NOT NULL
                 );
 
-                CREATE TABLE IF NOT EXISTS alchemy_recipes (
+                CREATE TABLE IF NOT EXISTS crafting_recipes (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     name TEXT NOT NULL UNIQUE,
                     ingredients_json TEXT NOT NULL DEFAULT '[]',
@@ -2715,6 +2670,10 @@ class SaveRepository:
                     key TEXT PRIMARY KEY,
                     value_json TEXT NOT NULL
                 );
+
+                DROP TABLE IF EXISTS alchemy_notes;
+                DROP TABLE IF EXISTS alchemy_reagents;
+                DROP TABLE IF EXISTS alchemy_recipes;
                 """
             )
             _ensure_column(
@@ -2733,30 +2692,6 @@ class SaveRepository:
                 connection,
                 "npcs",
                 "player_facing_information",
-                "TEXT NOT NULL DEFAULT ''",
-            )
-            _ensure_column(
-                connection,
-                "alchemy_reagents",
-                "description",
-                "TEXT NOT NULL DEFAULT ''",
-            )
-            _ensure_column(
-                connection,
-                "alchemy_reagents",
-                "location",
-                "TEXT NOT NULL DEFAULT ''",
-            )
-            _ensure_column(
-                connection,
-                "alchemy_reagents",
-                "uses_json",
-                "TEXT NOT NULL DEFAULT '[]'",
-            )
-            _ensure_column(
-                connection,
-                "alchemy_reagents",
-                "notes",
                 "TEXT NOT NULL DEFAULT ''",
             )
             _ensure_column(

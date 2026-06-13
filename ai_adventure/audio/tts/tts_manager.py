@@ -9,6 +9,11 @@ from pathlib import Path
 from collections.abc import Callable
 from typing import ClassVar
 
+from ai_adventure.audio.voices import (
+    DEFAULT_NARRATOR_VOICE,
+    KOKORO_VOICES,
+)
+
 
 LOGGER = logging.getLogger(__name__)
 
@@ -46,37 +51,8 @@ class TTSEngine(ABC):
 class KokoroOnnxTTSEngine(TTSEngine):
     """Local Kokoro-ONNX TTS engine."""
 
-    DEFAULT_VOICE: ClassVar[str] = "af_sarah"
-    AVAILABLE_VOICES: ClassVar[dict[str, str]] = {
-        "Heart (Female, US)": "af_heart",
-        "Alloy (Female, US)": "af_alloy",
-        "Aoede (Female, US)": "af_aoede",
-        "Bella (Female, US)": "af_bella",
-        "Jessica (Female, US)": "af_jessica",
-        "Kore (Female, US)": "af_kore",
-        "Nicole (Female, US)": "af_nicole",
-        "Nova (Female, US)": "af_nova",
-        "River (Female, US)": "af_river",
-        "Sarah (Female, US)": "af_sarah",
-        "Sky (Female, US)": "af_sky",
-        "Adam (Male, US)": "am_adam",
-        "Echo (Male, US)": "am_echo",
-        "Eric (Male, US)": "am_eric",
-        "Fenrir (Male, US)": "am_fenrir",
-        "Liam (Male, US)": "am_liam",
-        "Michael (Male, US)": "am_michael",
-        "Onyx (Male, US)": "am_onyx",
-        "Puck (Male, US)": "am_puck",
-        "Santa (Male, US)": "am_santa",
-        "Alice (Female, UK)": "bf_alice",
-        "Emma (Female, UK)": "bf_emma",
-        "Isabella (Female, UK)": "bf_isabella",
-        "Lily (Female, UK)": "bf_lily",
-        "Daniel (Male, UK)": "bm_daniel",
-        "Fable (Male, UK)": "bm_fable",
-        "George (Male, UK)": "bm_george",
-        "Lewis (Male, UK)": "bm_lewis",
-    }
+    DEFAULT_VOICE: ClassVar[str] = DEFAULT_NARRATOR_VOICE
+    AVAILABLE_VOICES: ClassVar[dict[str, str]] = KOKORO_VOICES
     LANGUAGE_BY_VOICE_PREFIX: ClassVar[dict[str, str]] = {
         "a": "en-us",
         "b": "en-gb",

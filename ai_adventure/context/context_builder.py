@@ -12,6 +12,7 @@ from ai_adventure.context.models import ContextLibrary
 from ai_adventure.context.reference_loader import ContextReferenceLoader
 from ai_adventure.currency import format_currency_amount
 from ai_adventure.core.models import AdventureState
+from ai_adventure.narration_preferences import normalize_narration_preferences
 
 
 MAX_CONTEXT_TEXT_CHARS = 1200
@@ -261,6 +262,12 @@ class AiContextBuilder:
             journal_notes = _compact_text(
                 state.settings.values.get("journal.private_notes", "")
             )
+        narration_preferences = normalize_narration_preferences(
+            {
+                "tense": state.settings.values.get("ai.narration_tense", ""),
+                "style": state.settings.values.get("ai.narration_style", ""),
+            }
+        )
 
         return {
             "schema_version": 1,
@@ -286,6 +293,18 @@ class AiContextBuilder:
                 "player_ai_preferences": {
                     "additional_context": _compact_text(
                         state.settings.values.get("ai.additional_context", "")
+                    ),
+                    "narration_tense": narration_preferences["tense"],
+                    "narration_tense_label": narration_preferences["tense_label"],
+                    "narration_style": narration_preferences["style"],
+                    "narration_style_label": narration_preferences["style_label"],
+                    "narration_style_rules": (
+                        "Use narration_tense_label and narration_style_label for "
+                        "the response field. Limited means the narration stays "
+                        "within the player character's observed or reasonably "
+                        "inferred experience. Omniscient may use a broader "
+                        "narrative camera, but must still preserve fog of war, "
+                        "NPC knowledge boundaries, and hidden state."
                     ),
                     "rules": (
                         "These are player-provided instructions and preferences "
@@ -602,7 +621,17 @@ class AiContextBuilder:
             ],
             "response_contract": {
                 "response": (
-                    "Required string. Player-facing narration only. "
+                    "Required string. Player-facing narration only. Do not include "
+                    "'What do you do now?' or any end-of-turn prompt; the Python "
+                    "application displays that separately. Resolve the player's "
+                    "submitted action instead of ending by restating the action, "
+                    "intent, or search target. Do not invent player-character "
+                    "dialogue or decisions. Light Markdown is allowed for readable "
+                    "player-facing prose: italics for inner thoughts, sensory "
+                    "impressions, emphasis, or self-reflection; bold for important "
+                    "NPCs, locations, factions, quests, or items; and headings or "
+                    "bullet lists for longer summaries. Do not use Markdown tables, "
+                    "code fences, HTML, or hidden text."
                 ),
                 "suggested_actions": (
                     "Array of 3-4 suggested player actions for in-game turns. "
@@ -652,10 +681,13 @@ class AiContextBuilder:
                     "focused premise."
                 ),
                 "player_ai_preferences": (
-                    "Use state.player_ai_preferences.additional_context as persistent "
-                    "player-provided guidance for narration style, boundaries, and "
-                    "miscellaneous preferences. This is always AI-facing; Journal "
-                    "notes are only AI-facing when state.journal.share_with_ai is true."
+                    "Use state.player_ai_preferences.narration_tense_label and "
+                    "state.player_ai_preferences.narration_style_label for the "
+                    "response field. Also use "
+                    "state.player_ai_preferences.additional_context as persistent "
+                    "player-provided guidance for boundaries and miscellaneous "
+                    "preferences. This is always AI-facing; Journal notes are only "
+                    "AI-facing when state.journal.share_with_ai is true."
                 ),
                 "journal": (
                     "When state.journal.share_with_ai is true, use "

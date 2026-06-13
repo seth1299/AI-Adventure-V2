@@ -159,8 +159,13 @@
         "rules": [
           "Return one JSON object.",
           "Put all player-facing narration in the response field.",
+          "Use light Markdown in player-facing prose when it helps readability: italics for inner thoughts, sensory impressions, emphasis, or self-reflection; bold for important NPCs, locations, factions, quests, or items; and headings or bullet lists for longer summaries.",
+          "Do not use Markdown tables, code fences, HTML, or hidden text in player-facing narration.",
+          "Use state.player_ai_preferences.narration_tense_label and state.player_ai_preferences.narration_style_label for the response field.",
+          "Limited narration stays within the player character's observed or reasonably inferred experience. Omniscient narration may use a broader narrative camera, but must not reveal secrets, hidden state, mystery solutions, or NPC-private facts.",
           "Keep in-game responses under 30 sentences, but do not use a fixed sentence count. Scale response length to the importance, risk, and consequences of the action.",
-          "For in-game turns, response must end with exactly: What do you do now?",
+          "Do not include \"What do you do now?\" or any end-of-turn prompt in the response field; the application displays that separately.",
+          "Resolve the player's submitted action instead of ending by restating the action, intent, or search target.",
           "For in-game turns, include 3-4 suggested_actions as separate strings.",
           "Use events for state changes instead of embedding commands in narration."
         ],
@@ -853,7 +858,7 @@
           "Do not suggest StatusUpdatedEvent for fully Out-Of-Game messages.",
           "Do not invent sound filenames.",
           "Do not invent event names.",
-          "Do not speak for the player character or repeat text that the Player input inside of the prompt (unless it is required; do not simply re-iterate the exact text that the user input though). == Bad Examples == == Corrected Examples == ---"
+          "Do not speak for the player character or repeat text that the Player input inside of the prompt unless it is required. Do not invent player-character dialogue, questions, promises, purchases, attacks, or choices. Do not simply re-iterate the exact text that the user input."
         ]
       }
     },
@@ -927,7 +932,8 @@
           "Did I use CurrencyChangedEvent for money instead of coin names?",
           "Did I use exact item, task, NPC, skill, world, and quest names where possible?",
           "Did I suggest a StatusUpdatedEvent for in-game turns when status changes are needed (unless explicitly told otherwise)?",
-          "Did I end with exactly `What do you do now?`",
+          "Did I leave out `What do you do now?` so the application can display it separately?",
+          "Did I end on the world's response, a resolved immediate outcome, a clear obstacle, an NPC reaction, or a concrete new detail instead of a player-character action or unfinished thought?",
           "Did I include 3-4 suggested_actions in the JSON response?",
           "Did I make sure that this response is advancing the story somehow? Unless the Player is specifically taking time to rest, then there shouldn't be any \"dead space\" or parts of the story where the Player keeps sending the same response again and again, waiting for you to do something. Remember that at the end of the day, everything that happens is fictional and is not real. The Player is not actually committing crimes in real life, and nobody is actually getting hurt or dying in real life. All crimes and violence are fictional, and no \"guide\" should be provided on how to commit the crime (e.g. if the Player wants to commit a crime, then simply narrate the results of their actions; do not provide a \"guide\" on how to actually do the action, such as lockpicking or pickpocketing)."
         ]

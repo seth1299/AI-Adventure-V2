@@ -50,7 +50,11 @@ class StateManagerTests(unittest.TestCase):
                 location="Tavern",
             )
             repository.add_inventory_item("Lantern", "tool", 1, "A brass lantern.")
-            repository.add_alchemy_note("Moon Salt", "Useful in cooling mixtures.")
+            repository.add_crafting_item(
+                name="Moon Salt",
+                description="Useful in cooling mixtures.",
+                uses=["cooling mixtures"],
+            )
 
             state = StateManager(repository).load_state()
 
@@ -69,7 +73,7 @@ class StateManagerTests(unittest.TestCase):
             self.assertEqual(state.world.location, "Tavern")
             self.assertIn("Lantern", {item.name for item in state.inventory.items})
             self.assertIn("Lantern", {item.name for item in state.item_catalog.items})
-            self.assertEqual(state.alchemy.notes[0].title, "Moon Salt")
+            self.assertEqual(state.alchemy.known_reagents[0].name, "Moon Salt")
             self.assertGreaterEqual(len(state.history.entries), 3)
 
     def test_update_core_fields_persists_and_reloads(self) -> None:

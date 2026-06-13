@@ -12,7 +12,6 @@ from ai_adventure.core.models import (
     AdventureState,
     ActiveTask,
     ActiveTasksState,
-    AlchemyNote,
     AlchemyNotebookState,
     CalendarState,
     CurrencyState,
@@ -174,21 +173,10 @@ class StateManager:
     def _load_alchemy(self) -> AlchemyNotebookState:
         """Loads typed alchemy notebook state."""
 
-        notes: list[AlchemyNote] = []
         known_reagents: list[ReagentKnowledge] = []
         known_recipes: list[RecipeKnowledge] = []
 
-        for row in self.repository.list_alchemy_notes():
-            notes.append(
-                AlchemyNote(
-                    id=_read_optional_int(row, "id"),
-                    title=_read_string(row, "title", ""),
-                    body=_read_string(row, "body", ""),
-                    created_at=_read_string(row, "created_at", ""),
-                )
-            )
-
-        for row in self.repository.list_alchemy_reagents():
+        for row in self.repository.list_crafting_items():
             known_reagents.append(
                 ReagentKnowledge(
                     id=_read_optional_int(row, "id"),
@@ -200,7 +188,7 @@ class StateManager:
                 )
             )
 
-        for row in self.repository.list_alchemy_recipes():
+        for row in self.repository.list_crafting_recipes():
             known_recipes.append(
                 RecipeKnowledge(
                     id=_read_optional_int(row, "id"),
@@ -221,7 +209,6 @@ class StateManager:
             )
 
         return AlchemyNotebookState(
-            notes=notes,
             known_reagents=known_reagents,
             known_recipes=known_recipes,
         )

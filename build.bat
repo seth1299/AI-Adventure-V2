@@ -28,7 +28,16 @@ if not exist "%TTS_VOICES%" (
     exit /b 1
 )
 
-%PYTHON% -m PyInstaller ^
+for /f "delims=" %%I in ('"%PYTHON%" -m site --user-site 2^>nul') do set "PYTHON_USER_SITE=%%I"
+if defined PYTHON_USER_SITE if exist "%PYTHON_USER_SITE%" (
+    if defined PYTHONPATH (
+        set "PYTHONPATH=%PYTHON_USER_SITE%;%PYTHONPATH%"
+    ) else (
+        set "PYTHONPATH=%PYTHON_USER_SITE%"
+    )
+)
+
+"%PYTHON%" -m PyInstaller ^
     --log-level ERROR ^
     --noconfirm ^
     --noconsole ^
@@ -48,6 +57,7 @@ if not exist "%TTS_VOICES%" (
     --collect-all "espeakng_loader" ^
     --collect-all "onnxruntime" ^
     --collect-all "soundfile" ^
+    --hidden-import "ai_adventure.audio.tts.tts_manager" ^
     --hidden-import "google.genai" ^
     --hidden-import "PySide6.QtCore" ^
     --hidden-import "PySide6.QtGui" ^
@@ -61,5 +71,5 @@ if errorlevel 1 (
 )
 
 echo.
-echo Build complete: "dist\%APP_NAME%\%APP_NAME%.exe"
+echo Build complete: "dist\%APP_NAME%.exe"
 exit /b 0

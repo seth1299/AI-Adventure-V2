@@ -8,14 +8,17 @@ from ai_adventure.calendar_system import (
     build_calendar_snapshot,
     normalize_calendar_settings,
 )
+from ai_adventure.audio.voices import normalize_narrator_voice
 from ai_adventure.context.creative_ideas import CreativeIdeasLibrary
 from ai_adventure.currency import (
     describe_currency_denominations,
     normalize_currency_denominations,
 )
+from ai_adventure.narration_preferences import normalize_narration_preferences
 
 
 SKILL_LEVEL_PLAN = [5, 4, 4, 3, 3, 3, 2, 2, 2, 2, 1, 1, 1, 1, 1]
+STARTER_INVENTORY_MIN_ITEMS = 5
 
 CHARACTER_GENDER_PRESENTATION_HINTS = [
     "female-coded",
@@ -104,6 +107,9 @@ def normalize_new_game_setup(raw_setup: Any) -> dict[str, Any]:
     )
     calendar_settings = _calendar_from_setup(raw_setup.get("calendar", {}))
     audio_settings = _audio_from_setup(raw_setup.get("audio", {}))
+    narration_preferences = normalize_narration_preferences(
+        raw_setup.get("narration", {})
+    )
     skills = _normalize_skills(raw_setup.get("skills", []))
     starter_items = _normalize_starter_items(raw_setup.get("starter_items", []))
 
@@ -119,6 +125,7 @@ def normalize_new_game_setup(raw_setup: Any) -> dict[str, Any]:
         "starter_items": starter_items,
         "calendar": calendar_settings,
         "audio": audio_settings,
+        "narration": narration_preferences,
         "time_display": calendar_settings["time_display"],
         "currency_denominations": currency_denominations,
         "currency_description": currency_description,
@@ -145,6 +152,7 @@ def _audio_from_setup(raw_audio: Any) -> dict[str, Any]:
         "narrator_enabled": _safe_bool(raw_audio.get("narrator_enabled"), True),
         "music_volume": _clamped_int(raw_audio.get("music_volume"), 25, 0, 100),
         "tts_volume": _clamped_int(raw_audio.get("tts_volume"), 90, 0, 100),
+        "tts_voice": normalize_narrator_voice(raw_audio.get("tts_voice")),
     }
 
 
@@ -243,11 +251,24 @@ def build_new_game_setup_packet(
                 "Write a few paragraphs describing at least the basics of the "
                 "world or city, prominent NPCs, locations of interest, religions, "
                 "and economy. Incorporate player-provided names, factions, "
-                "guilds, locations, style, calendar, and currency when present."
+                "guilds, locations, style, calendar, and currency when present. "
+                "Use light Markdown headings, bold important names, italics, and "
+                "bullet lists when they improve readability."
             ),
             "opening_scene": (
                 "Write an introductory player-facing scene at the requested "
-                "starting location. End with 'What do you do now?'"
+                "starting location. Use setup.narration.tense_label and "
+                "setup.narration.style_label for the prose. Light Markdown is "
+                "allowed for italics, bold important names, and readable lists. "
+                "End with 'What do you do now?'"
+            ),
+            "narration_preferences": (
+                "Use setup.narration.tense_label and setup.narration.style_label "
+                "for introductory_message and other player-facing prose. Limited "
+                "styles should stay within the player character's observed or "
+                "reasonably inferred experience. Omniscient styles may use a "
+                "broader narrative camera, but must not reveal secrets, hidden "
+                "state, mystery solutions, or NPC-private facts."
             ),
             "calendar_weather_consistency": (
                 "Opening prose must match current_calendar and current_weather unless "
@@ -256,6 +277,14 @@ def build_new_game_setup_packet(
                 "rain, snow, storms, dawn, evening, or similar seasonal/time/weather "
                 "details, those details must match the structured starting_calendar "
                 "and weather you return."
+            ),
+            "calendar_generation": (
+                "If setup.calendar.ai_generated is true, invent calendar_settings "
+                "for the new world using clear day names, month names, seasons, "
+                "season weather hints, and time_display. The calendar should fit "
+                "the selected genre, world culture, climate, and playstyle. If "
+                "setup.calendar.ai_generated is false, use the provided calendar "
+                "settings and return calendar_settings as an empty object."
             ),
             "events": (
                 "Use structured events for any initial NPCs, active tasks, "
@@ -280,7 +309,10 @@ def build_new_game_setup_packet(
                 "mean the player character should default to male. Follow "
                 "character_generation_guidance.gender_presentation_hint for invented "
                 "character details, and use creative_ideas.player_character_name_examples "
-                "as a balanced name pool when useful."
+                "as a balanced name pool when useful. If the player supplied a custom "
+                "character name, appearance, backstory, or notes value, preserve that "
+                "field exactly instead of rewriting, renaming, embellishing, or "
+                "reinterpreting it."
             ),
             "genre_generation": (
                 "If setup.specified_genre is blank/default, choose a specific genre "
@@ -348,10 +380,11 @@ def build_new_game_setup_packet(
             ),
             "starter_inventory": (
                 "Return finalized inventory in the starting_items field, never in "
-                "starting_inventory. starting_items has no required minimum or "
-                "maximum count; return only the tracked possessions that naturally "
-                "fit the finalized character and opening situation. Do not add, "
-                "split, combine, or pad items to satisfy a quota. "
+                "starting_inventory. starting_items must contain at least five "
+                "total tracked possessions and has no maximum count. Include any "
+                "player-requested items, then invent enough additional concrete "
+                "items that fit the finalized character, genre, starting location, "
+                "weather, and opening situation to reach the minimum. "
                 "Preserve any player-provided starter items with "
                 "requires_ai_invention=false. "
                 "When a setup.starter_items entry has requires_ai_invention=true or "
@@ -407,7 +440,11 @@ def build_new_game_setup_packet(
         "fields_requiring_ai_invention": _fields_requiring_ai_invention(clean_setup),
         "starter_inventory_contract": {
             "requested_item_count": starter_item_count,
-            "count_rule": "No required minimum or maximum starting item count.",
+            "minimum_finalized_item_count": STARTER_INVENTORY_MIN_ITEMS,
+            "count_rule": (
+                "At least 5 finalized starting items are required; there is no "
+                "maximum starting item count."
+            ),
             "output_field": "starting_items",
             "alias_not_allowed": "starting_inventory",
             "source_index_rule": (
@@ -684,10 +721,20 @@ def _calendar_from_setup(raw_calendar: Any) -> dict[str, Any]:
     if not isinstance(raw_calendar, dict):
         raw_calendar = {}
 
-    if not raw_calendar or str(raw_calendar.get("calendar_type", "")).casefold() == "gregorian":
+    calendar_type = str(raw_calendar.get("calendar_type", "")).strip().casefold()
+
+    if calendar_type == "ai_generated":
         settings = dict(GREGORIAN_CALENDAR_SETTINGS)
+        settings["calendar_type"] = "ai_generated"
+        settings["ai_generated"] = True
+    elif not raw_calendar or calendar_type == "gregorian":
+        settings = dict(GREGORIAN_CALENDAR_SETTINGS)
+        settings["calendar_type"] = "gregorian"
+        settings["ai_generated"] = False
     else:
         settings = {**GREGORIAN_CALENDAR_SETTINGS, **raw_calendar}
+        settings["calendar_type"] = "custom"
+        settings["ai_generated"] = False
 
     settings["time_display"] = str(
         raw_calendar.get("time_display")
@@ -696,7 +743,10 @@ def _calendar_from_setup(raw_calendar: Any) -> dict[str, Any]:
         or "12_hour"
     )
 
-    return normalize_calendar_settings(settings)
+    clean_settings = normalize_calendar_settings(settings)
+    clean_settings["calendar_type"] = str(settings.get("calendar_type", "custom"))
+    clean_settings["ai_generated"] = bool(settings.get("ai_generated", False))
+    return clean_settings
 
 
 def _build_ai_additional_context(
