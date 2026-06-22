@@ -15,9 +15,11 @@ from ai_adventure.alchemy.ingredients import (
 )
 from ai_adventure.calendar_system import normalize_calendar_settings
 from ai_adventure.context.creative_guardrails import (
+    default_banned_creative_terms,
     find_banned_creative_terms,
     sanitize_banned_creative_terms_in_data,
 )
+from ai_adventure.context.naming import GENERIC_PROPER_NOUN_PLACEHOLDER_RULE
 from ai_adventure.currency import normalize_currency_denominations
 from ai_adventure.locations import clean_player_location_name
 from ai_adventure.new_game_setup import STARTER_INVENTORY_MIN_ITEMS
@@ -32,6 +34,7 @@ LOGGER = logging.getLogger(__name__)
 
 
 DEFAULT_GEMINI_MODEL = "gemini-3.1-flash-lite"
+CREATIVE_TERM_REPAIR_ATTEMPTS = 4
 FALLBACK_SUGGESTED_ACTIONS = [
     "Look around and take stock of the situation.",
     "Check your inventory, tasks, or surroundings.",
@@ -53,6 +56,7 @@ KNOWN_EVENT_TYPE_NAMES = [
     "InventoryItemAddedEvent",
     "InventoryItemRemovedEvent",
     "InventoryItemModifiedEvent",
+    "CombatStartedEvent",
     "RecipeDiscoveredEvent",
     "ReagentDiscoveredEvent",
     "CurrencyChangedEvent",
@@ -221,6 +225,17 @@ EVENT_RESPONSE_SCHEMA: dict[str, Any] = {
                 "description": {"type": "string"},
                 "amount": {"type": "integer", "minimum": 1},
                 "value_base_units": {"type": "integer", "minimum": 1},
+                "weapon_hands": {
+                    "type": "string",
+                    "enum": ["one-handed", "two-handed", ""],
+                },
+                "damage": {"type": "string"},
+                "damage_type": {"type": "string"},
+                "covers_body_parts": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                },
+                "armor_rating": INT_OR_SKIP_SCHEMA,
             },
             ["item_type", "item_name", "description", "amount", "value_base_units"],
         ),
@@ -237,11 +252,71 @@ EVENT_RESPONSE_SCHEMA: dict[str, Any] = {
             {
                 "target_name": {"type": "string"},
                 "new_name": {"type": "string"},
+                "new_category": {"type": "string"},
                 "new_description": {"type": "string"},
                 "new_amount": INT_OR_SKIP_SCHEMA,
                 "new_value_base_units": INT_OR_SKIP_SCHEMA,
+                "weapon_hands": {
+                    "type": "string",
+                    "enum": ["one-handed", "two-handed", ""],
+                },
+                "damage": {"type": "string"},
+                "damage_type": {"type": "string"},
+                "covers_body_parts": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                },
+                "armor_rating": INT_OR_SKIP_SCHEMA,
             },
             ["target_name"],
+        ),
+        _event_response_schema(
+            "CombatStartedEvent",
+            {
+                "description": {"type": "string"},
+                "enemies": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string"},
+                            "health": {"type": "integer", "minimum": 1},
+                            "armor_rating": {"type": "integer", "minimum": 1},
+                            "damage": {"type": "string"},
+                            "loot": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                            },
+                            "status_effects": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                            },
+                        },
+                        "required": ["name", "health", "armor_rating", "damage", "loot"],
+                        "additionalProperties": False,
+                    },
+                },
+                "allies": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string"},
+                            "health": {"type": "integer", "minimum": 1},
+                            "armor_rating": {"type": "integer", "minimum": 1},
+                            "damage": {"type": "string"},
+                            "status_effects": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                            },
+                        },
+                        "required": ["name", "health", "armor_rating", "damage"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            ["description", "enemies"],
         ),
         _event_response_schema(
             "RecipeDiscoveredEvent",
@@ -1105,6 +1180,7 @@ def load_gemini_settings(env_path: Path | None = None) -> GeminiSettings:
         api_key=(
             os.getenv("GEMINI_API_KEY")
             or env_values.get("GEMINI_API_KEY")
+            
             or ""
         ).strip(),
         model=model,
@@ -1207,7 +1283,8 @@ def build_gemini_story_prompt(context_packet: dict[str, Any]) -> str:
         "mystery solutions, private plans, or GM-only facts in "
         "player_facing_information. Do not put hidden NPC or mystery information "
         "in suggested events unless the player has learned it.\n\n"
-        "Creative naming boundary:\n"
+        "Creative naming boundary (hard requirement):\n"
+        "- This is a highest-priority output rule, not optional style guidance.\n"
         "- If the context packet includes creative_ideas, treat those examples as "
         "high-priority style seeds for newly invented names and setting details.\n"
         "- Prefer creative_ideas examples or close stylistic relatives over broad "
@@ -1217,6 +1294,10 @@ def build_gemini_story_prompt(context_packet: dict[str, Any]) -> str:
         "hyphenation variants, or obvious reskins for newly invented proper nouns. "
         "Banned terms may appear only when already established in saved state or "
         "explicitly provided by the player.\n\n"
+        "- Before returning JSON, scan every string key and value you wrote. If any "
+        "newly invented name contains a banned term or close variant, replace it "
+        "with a fresh non-banned name before responding.\n\n"
+        f"- {GENERIC_PROPER_NOUN_PLACEHOLDER_RULE}\n\n"
         f"Exact banned proper nouns for newly invented content: {banned_terms_text}\n\n"
         "Return one JSON object and no surrounding Markdown. The API response "
         "schema defines the required top-level fields.\n\n"
@@ -1302,9 +1383,21 @@ def build_gemini_story_prompt(context_packet: dict[str, Any]) -> str:
         "dice, raw roll numbers, totals, DCs, or game mechanics in the story.\n"
         "- Every InventoryItemAddedEvent payload must include value_base_units "
         "as an integer of at least 1.\n"
+        "- For weapons, set item_type='Weapon' and include weapon_hands "
+        "('one-handed' or 'two-handed') plus damage as a dice expression such "
+        "as 1d6, 1d8, or 2d6. For armor or shields, set item_type='Armor', "
+        "include covers_body_parts, and include armor_rating as the armor bonus "
+        "that item contributes. Use category/item_type values of Weapon and "
+        "Armor clearly so the Character sheet can equip them.\n"
         "- state.item_catalog.items is the master list of known item definitions. "
         "Use it to remember item descriptions after items leave inventory, but "
         "only state.inventory.items are current possessions.\n"
+        "- If a situation becomes an actual fight, suggest CombatStartedEvent "
+        "with concrete enemies, optional allied combatants, health, armor_rating, "
+        "damage dice, and loot. Do not narrate attack rolls, turn-by-turn combat, "
+        "damage totals, deaths, victory, defeat, or loot recovery after combat "
+        "starts. The Python application handles combat deterministically in the "
+        "Combat tab and blocks Story input until combat is resolved.\n"
         "- ReagentDiscoveredEvent records Crafting tab knowledge for useful "
         "items/materials only and uses exactly name, description, location, "
         "and uses. If the player physically collects, harvests, picks up, or "
@@ -1363,11 +1456,26 @@ def build_gemini_new_game_prompt(setup_packet: dict[str, Any]) -> str:
     """
 
     packet_json = json.dumps(setup_packet, indent=2)
+    banned_terms = _banned_terms_from_context(setup_packet)
+    banned_terms_text = ", ".join(banned_terms) if banned_terms else "(none provided)"
 
     return (
         "You are creating the initial world setup for AI Adventure.\n"
         "Use only the structured setup packet below as confirmed setup input. "
         "Synthesize the player's choices into a coherent playable world.\n\n"
+        "Creative naming boundary (hard requirement):\n"
+        "- This is a highest-priority output rule, not optional style guidance.\n"
+        "- Never use creative_ideas.banned_terms, close spelling variants, "
+        "hyphenation variants, or obvious reskins for newly invented proper nouns.\n"
+        "- This includes the player character name, NPC names, locations, taverns, "
+        "regions, factions, religions, shops, guilds, landmarks, items, skills, "
+        "calendar names, and event payload names.\n"
+        "- Before returning JSON, scan every string key and value you wrote. If any "
+        "newly invented name contains a banned term or close variant, replace it "
+        "with a fresh non-banned name before responding.\n"
+        "- Banned terms may appear only when explicitly provided by the player as "
+        "confirmed setup input.\n\n"
+        f"Exact banned proper nouns for newly invented content: {banned_terms_text}\n\n"
         "Requirements:\n"
         "- Return one JSON object and no surrounding Markdown.\n"
         "- If the setup packet includes fields_requiring_ai_invention, treat those "
@@ -1379,11 +1487,8 @@ def build_gemini_new_game_prompt(setup_packet: dict[str, Any]) -> str:
         "examples or close stylistic relatives over broad training-data fantasy "
         "defaults, while adapting them so the new game feels distinct.\n"
         "- Never use creative_ideas.banned_terms, close spelling variants, "
-        "hyphenation variants, or obvious reskins for newly invented proper nouns. "
-        "This includes the player character name, NPC names, locations, taverns, "
-        "regions, factions, religions, shops, guilds, and landmarks. Banned terms "
-        "may appear only when explicitly provided by the player as confirmed setup "
-        "input.\n"
+        "hyphenation variants, or obvious reskins for newly invented proper nouns.\n"
+        f"- {GENERIC_PROPER_NOUN_PLACEHOLDER_RULE}\n"
         "- Mature fictional content is allowed when it fits the selected genre, "
         "world, opening location, and player setup. Assume the player character "
         "and player are adults of legal drinking age unless the character setup "
@@ -1465,6 +1570,10 @@ def build_gemini_new_game_prompt(setup_packet: dict[str, Any]) -> str:
         "clear day names, month names, season names, season weather hints, and "
         "a time_display value. Keep the calendar playable: days_per_week 1-14, "
         "weeks_per_month 1-12, months_per_year 1-24, and seasons_per_year 1-12. "
+        "Do not copy the default Gregorian calendar, weekday names, January-"
+        "through-December month names, Spring/Summer/Autumn/Winter as the full "
+        "season list, or generic Month 1/Month 2 placeholder names when AI "
+        "generation is requested. "
         "If setup.calendar.ai_generated is false, return calendar_settings as an "
         "empty object and use the provided calendar.\n"
         "- character must finalize the player character profile. If character name, "
@@ -1521,13 +1630,15 @@ def build_gemini_new_game_prompt(setup_packet: dict[str, Any]) -> str:
         "in that baseline unit and do not need to be multiples or powers of 10. "
         "For example, fantasy worlds may use copper/silver/gold-style coinage, "
         "realistic modern worlds may use dollars, and futuristic or space worlds "
-        "may use credits. If setup.currency_denominations already contains "
-        "player-provided values, preserve them.\n"
+        "may use credits. Use setup.economy_examples as common-price calibration "
+        "for ordinary goods when it is present. If setup.currency_denominations "
+        "already contains player-provided values, preserve them.\n"
         "- starting_currency_balance_base_units must be a reasonable starting money "
         "amount for the finalized character, genre, and economy. This is the "
         "player's actual starting money stored in game_state/currency.balance as "
-        "one integer in the baseline currency unit. Do not create coin or purse "
-        "items in starting_items to represent spendable money.\n"
+        "one integer in the baseline currency unit. Account for any "
+        "setup.economy_examples common-price rows when choosing it. Do not create "
+        "coin or purse items in starting_items to represent spendable money.\n"
         "- The API response schema defines the required output fields and event "
         "envelope. Use type and payload for each event; do not use event_type as "
         "the top-level event type key.\n"
@@ -1578,54 +1689,130 @@ def _repair_gemini_creative_terms(
 ) -> str:
     """Asks Gemini to rewrite a response when it uses banned generated names."""
 
-    banned_terms = find_banned_creative_terms(raw_text)
+    candidate_text = raw_text
+    banned_terms = find_banned_creative_terms(candidate_text)
 
     if not banned_terms:
         return raw_text
 
+    forbidden_terms = _forbidden_creative_terms_for_repair(banned_terms)
+
+    for attempt in range(1, CREATIVE_TERM_REPAIR_ATTEMPTS + 1):
+        LOGGER.warning(
+            "Gemini %s contained banned creative term(s): %s. "
+            "Requesting repair attempt %s/%s.",
+            response_label,
+            ", ".join(banned_terms),
+            attempt,
+            CREATIVE_TERM_REPAIR_ATTEMPTS,
+        )
+        repair_prompt = _creative_terms_repair_prompt(
+            candidate_text,
+            response_label=response_label,
+            observed_terms=banned_terms,
+            forbidden_terms=forbidden_terms,
+            attempt=attempt,
+        )
+
+        try:
+            response = client.models.generate_content(
+                model=model,
+                contents=repair_prompt,
+                config=_structured_output_config(schema),  # type: ignore[arg-type]
+            )
+        except Exception:
+            LOGGER.exception(
+                "Gemini %s repair attempt %s/%s failed.",
+                response_label,
+                attempt,
+                CREATIVE_TERM_REPAIR_ATTEMPTS,
+            )
+            return str(_sanitize_gemini_creative_terms(candidate_text, response_label))
+
+        repaired_text = str(getattr(response, "text", "") or "").strip()
+
+        if not repaired_text:
+            LOGGER.warning(
+                "Gemini %s repair attempt %s/%s returned an empty response.",
+                response_label,
+                attempt,
+                CREATIVE_TERM_REPAIR_ATTEMPTS,
+            )
+            continue
+
+        repaired_banned_terms = find_banned_creative_terms(repaired_text)
+
+        if not repaired_banned_terms:
+            LOGGER.info(
+                "Gemini %s repair attempt %s/%s removed banned creative terms.",
+                response_label,
+                attempt,
+                CREATIVE_TERM_REPAIR_ATTEMPTS,
+            )
+            return repaired_text
+
+        LOGGER.warning(
+            "Gemini %s repair attempt %s/%s still contained banned creative term(s): %s.",
+            response_label,
+            attempt,
+            CREATIVE_TERM_REPAIR_ATTEMPTS,
+            ", ".join(repaired_banned_terms),
+        )
+        candidate_text = repaired_text
+        banned_terms = repaired_banned_terms
+
     LOGGER.warning(
-        "Gemini %s contained banned creative term(s): %s. Requesting a repair.",
+        "Gemini %s still contained banned creative terms after %s repair attempts. "
+        "Sanitizing the latest response.",
         response_label,
-        ", ".join(banned_terms),
+        CREATIVE_TERM_REPAIR_ATTEMPTS,
     )
-    repair_prompt = (
-        "Rewrite the JSON response below so it preserves the same facts, tone, "
-        "structure, and player-facing intent, but replaces every forbidden "
-        "newly generated proper noun with a fresh original alternative. Do not "
-        "use placeholders such as unnamed place, unnamed person, the city, the "
-        "person, Local Item, or Local Skill unless the original text was already "
-        "generic. Return only one JSON object that matches the configured schema.\n\n"
-        f"Forbidden terms: {', '.join(banned_terms)}\n\n"
+    return str(_sanitize_gemini_creative_terms(candidate_text, response_label))
+
+
+def _forbidden_creative_terms_for_repair(observed_terms: list[str]) -> list[str]:
+    """Returns the full repair-time forbidden list, preserving observed terms."""
+
+    terms = list(default_banned_creative_terms()) or list(observed_terms)
+    seen = {term.casefold() for term in terms}
+
+    for term in observed_terms:
+        folded = term.casefold()
+
+        if folded not in seen:
+            terms.append(term)
+            seen.add(folded)
+
+    return terms
+
+
+def _creative_terms_repair_prompt(
+    raw_text: str,
+    *,
+    response_label: str,
+    observed_terms: list[str],
+    forbidden_terms: list[str],
+    attempt: int,
+) -> str:
+    """Builds a compact repair prompt with the full banned-name list."""
+
+    return (
+        f"Repair AI Adventure {response_label} JSON. Attempt {attempt}.\n\n"
+        "Hard rule: the repaired JSON must not contain any forbidden term, close "
+        "spelling variant, hyphenation variant, or obvious reskin anywhere in a "
+        "string key or value.\n"
+        "When replacing a forbidden NPC, location, faction, item, skill, calendar, "
+        "or other proper noun, invent a fresh genre-appropriate name from scratch. "
+        "Do not use placeholders such as unnamed place, unnamed person, the city, "
+        "the person, Local Item, or Local Skill unless the original text was already "
+        "generic.\n"
+        "Preserve the same facts, tone, structure, and player-facing intent. Return "
+        "only one JSON object that matches the configured schema.\n\n"
+        f"Observed offending terms in the current JSON: {', '.join(observed_terms)}\n"
+        f"Full forbidden terms list: {', '.join(forbidden_terms)}\n\n"
         "JSON response to repair:\n"
         f"{raw_text}"
     )
-
-    try:
-        response = client.models.generate_content(
-            model=model,
-            contents=repair_prompt,
-            config=_structured_output_config(schema),  # type: ignore[arg-type]
-        )
-    except Exception:
-        LOGGER.exception("Gemini %s repair request failed.", response_label)
-        return str(_sanitize_gemini_creative_terms(raw_text, response_label))
-
-    repaired_text = str(getattr(response, "text", "") or "").strip()
-
-    if repaired_text and not find_banned_creative_terms(repaired_text):
-        LOGGER.info("Gemini %s repair removed banned creative terms.", response_label)
-        return repaired_text
-
-    if repaired_text:
-        LOGGER.warning(
-            "Gemini %s repair still contained banned creative term(s): %s.",
-            response_label,
-            ", ".join(find_banned_creative_terms(repaired_text)),
-        )
-    else:
-        LOGGER.warning("Gemini %s repair returned an empty response.", response_label)
-
-    return str(_sanitize_gemini_creative_terms(raw_text, response_label))
 
 
 def _sanitize_gemini_creative_terms(value: Any, response_label: str) -> Any:

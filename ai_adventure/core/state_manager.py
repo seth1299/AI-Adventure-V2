@@ -7,6 +7,11 @@ from ai_adventure.calendar_system import (
     DEFAULT_START_ELAPSED_MINUTES,
     build_calendar_snapshot,
 )
+from ai_adventure.combat import (
+    DEFAULT_BASE_ARMOR_RATING,
+    DEFAULT_PLAYER_MAX_HEALTH,
+    normalize_equipment,
+)
 from ai_adventure.core.models import (
     AdventureMetadata,
     AdventureState,
@@ -64,10 +69,16 @@ class StateManager:
 
         state_snapshot = self.repository.get_state_snapshot()
         settings = self._load_settings()
+        inventory = self._load_inventory()
         calendar_snapshot = build_calendar_snapshot(
             _read_int(state_snapshot, "elapsed_minutes", DEFAULT_START_ELAPSED_MINUTES),
             self.repository.get_calendar_settings(),
         )
+        equipment = normalize_equipment(
+            settings.values.get("player.equipment", {}),
+            [item.to_dict() for item in inventory.items],
+        )
+        health_max = _read_int(settings.values, "player.health_max", DEFAULT_PLAYER_MAX_HEALTH)
 
         return AdventureState(
             metadata=AdventureMetadata(
@@ -79,6 +90,24 @@ class StateManager:
                 backstory=str(settings.values.get("player.backstory", "")),
                 condition=_read_string(state_snapshot, "condition", "Healthy"),
                 notes=str(settings.values.get("player.notes", "")),
+                health_current=max(
+                    0,
+                    min(
+                        _read_int(
+                            settings.values,
+                            "player.health_current",
+                            health_max,
+                        ),
+                        health_max,
+                    ),
+                ),
+                health_max=health_max,
+                armor_rating=_read_int(
+                    settings.values,
+                    "player.armor_rating",
+                    DEFAULT_BASE_ARMOR_RATING,
+                ),
+                equipment=equipment,
             ),
             world=WorldState(
                 location=_read_string(state_snapshot, "location", "Tavern"),
@@ -86,7 +115,7 @@ class StateManager:
                 weather=_read_string(state_snapshot, "weather", "Clear"),
                 flags=self._load_flags(state_snapshot),
             ),
-            inventory=self._load_inventory(),
+            inventory=inventory,
             item_catalog=self._load_item_catalog(),
             currency=CurrencyState(
                 balance_base_units=_read_int(state_snapshot, "currency.balance", 0),
@@ -145,6 +174,9 @@ class StateManager:
                     quantity=_read_int(row, "quantity", 1),
                     description=_read_string(row, "description", ""),
                     value_base_units=_read_int(row, "value_base_units", 0),
+                    metadata=dict(row.get("metadata", {}))
+                    if isinstance(row.get("metadata"), dict)
+                    else {},
                 )
             )
 
@@ -163,6 +195,9 @@ class StateManager:
                     category=_read_string(row, "category", ""),
                     description=_read_string(row, "description", ""),
                     value_base_units=_read_int(row, "value_base_units", 0),
+                    metadata=dict(row.get("metadata", {}))
+                    if isinstance(row.get("metadata"), dict)
+                    else {},
                     first_seen_at=_read_string(row, "first_seen_at", ""),
                     updated_at=_read_string(row, "updated_at", ""),
                 )

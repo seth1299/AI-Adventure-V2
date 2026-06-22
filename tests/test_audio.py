@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import sys
+import types
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -11,7 +13,16 @@ from ai_adventure.audio.narration import (
     normalize_tts_time_text,
     sanitize_tts_text,
 )
+from ai_adventure.audio.ssmd import strip_ssmd_markup_for_plain_tts
+from ai_adventure.audio.tts_settings import (
+    build_voice_blend_spec,
+    merge_custom_voices,
+    normalize_custom_voices,
+    normalize_narrator_voice_spec,
+    parse_voice_blend_spec,
+)
 from ai_adventure.audio.sound_manager import prepare_sound_directory
+from ai_adventure.audio.tts.tts_manager import PyKokoroTTSEngine
 
 
 class AudioTests(unittest.TestCase):
@@ -35,17 +46,20 @@ class AudioTests(unittest.TestCase):
         )
 
         self.assertGreater(len(chunks), 1)
-        self.assertEqual(chunks[0], "First sentence.")
+        self.assertEqual(chunks[0], "First sentence. Second")
 
     def test_sanitize_tts_text_converts_clock_times_for_speech(self) -> None:
         text = sanitize_tts_text(
             "The bell rings at 7:00 A.M. The gates close at 18:05."
         )
 
-        self.assertIn("seven in the morning", text)
-        self.assertIn("six oh five in the evening", text)
-        self.assertNotIn(":", text)
-        self.assertNotIn("A.M.", text)
+        self.assertIn("[7:00 A.M.](as: time)", text)
+        self.assertIn("[18:05](as: time)", text)
+
+        plain_text = strip_ssmd_markup_for_plain_tts(text)
+
+        self.assertIn("seven in the morning", plain_text)
+        self.assertIn("six oh five in the evening", plain_text)
 
     def test_normalize_tts_time_text_handles_midnight_noon_and_minutes(self) -> None:
         text = normalize_tts_time_text(
@@ -59,8 +73,151 @@ class AudioTests(unittest.TestCase):
     def test_narration_chunks_keep_display_text_separate_from_tts_text(self) -> None:
         chunks = build_narration_chunks("The bell rings at 7:00 A.M. What do you do now?")
 
-        self.assertEqual(chunks[0].display_text, "The bell rings at 7:00 A.M.")
-        self.assertEqual(chunks[0].tts_text, "The bell rings at seven in the morning")
+        self.assertEqual(
+            chunks[0].display_text,
+            "The bell rings at 7:00 A.M. What do you do now?",
+        )
+        self.assertEqual(
+            chunks[0].tts_text,
+            "The bell rings at [7:00 A.M.](as: time) What do you do now?",
+        )
+
+    def test_voice_blend_specs_round_trip_for_tts_engines(self) -> None:
+        blend = parse_voice_blend_spec("af_sarah:65,am_echo:35")
+
+        self.assertEqual(blend["voice_a"], "af_sarah")
+        self.assertEqual(blend["voice_b"], "am_echo")
+        self.assertEqual(blend["voice_a_weight"], 65)
+        self.assertEqual(build_voice_blend_spec(blend), "af_sarah:65,am_echo:35")
+        self.assertEqual(
+            normalize_narrator_voice_spec("af_sarah:65,am_echo:35"),
+            "af_sarah:65,am_echo:35",
+        )
+
+    def test_custom_voice_normalization_preserves_volume_and_speed(self) -> None:
+        voices = normalize_custom_voices(
+            [
+                {
+                    "name": "Storm Blend",
+                    "voice_a": "af_sarah",
+                    "voice_b": "am_echo",
+                    "voice_a_weight": 70,
+                    "tts_volume": 42,
+                    "tts_speed": 135,
+                }
+            ]
+        )
+
+        self.assertEqual(voices[0]["name"], "Storm Blend")
+        self.assertEqual(voices[0]["voice_a"], "af_sarah")
+        self.assertEqual(voices[0]["voice_a_weight"], 70)
+        self.assertEqual(voices[0]["voice_b_weight"], 30)
+        self.assertEqual(voices[0]["tts_volume"], 42)
+        self.assertEqual(voices[0]["tts_speed"], 135)
+
+    def test_merge_custom_voices_preserves_first_matching_name(self) -> None:
+        voices = merge_custom_voices(
+            [
+                {
+                    "name": "Storm Blend",
+                    "voice_a": "af_sarah",
+                    "voice_b": "am_echo",
+                    "voice_a_weight": 70,
+                }
+            ],
+            [
+                {
+                    "name": "Storm Blend",
+                    "voice_a": "am_echo",
+                    "voice_b": "af_sarah",
+                    "voice_a_weight": 20,
+                },
+                {
+                    "name": "Rain Blend",
+                    "voice_a": "am_echo",
+                    "voice_b": "af_sarah",
+                    "voice_a_weight": 55,
+                },
+            ],
+        )
+
+        self.assertEqual([voice["name"] for voice in voices], ["Storm Blend", "Rain Blend"])
+        self.assertEqual(voices[0]["voice_a_weight"], 70)
+
+    def test_pykokoro_engine_forces_q8_model_quality(self) -> None:
+        captured_configs = []
+        loaded_spacy_models = []
+
+        class FakePipelineConfig:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+                captured_configs.append(kwargs)
+
+        class FakeGenerationConfig:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+        class FakePipeline:
+            def __init__(self, config):
+                self.config = config
+
+        class FakeVoiceBlend:
+            @staticmethod
+            def parse(spec):
+                return spec
+
+        class FakeTokenizerConfig:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+        fake_spacy = types.ModuleType("spacy")
+        fake_spacy.load = loaded_spacy_models.append
+        fake_pykokoro = types.ModuleType("pykokoro")
+        fake_pykokoro.KokoroPipeline = FakePipeline
+        fake_pykokoro.PipelineConfig = FakePipelineConfig
+        fake_generation_config = types.ModuleType("pykokoro.generation_config")
+        fake_generation_config.GenerationConfig = FakeGenerationConfig
+        fake_tokenizer = types.ModuleType("pykokoro.tokenizer")
+        fake_tokenizer.TokenizerConfig = FakeTokenizerConfig
+        fake_voice_manager = types.ModuleType("pykokoro.voice_manager")
+        fake_voice_manager.VoiceBlend = FakeVoiceBlend
+        original_modules = {
+            name: sys.modules.get(name)
+            for name in (
+                "spacy",
+                "pykokoro",
+                "pykokoro.generation_config",
+                "pykokoro.tokenizer",
+                "pykokoro.voice_manager",
+            )
+        }
+
+        try:
+            sys.modules["spacy"] = fake_spacy
+            sys.modules["pykokoro"] = fake_pykokoro
+            sys.modules["pykokoro.generation_config"] = fake_generation_config
+            sys.modules["pykokoro.tokenizer"] = fake_tokenizer
+            sys.modules["pykokoro.voice_manager"] = fake_voice_manager
+            engine = PyKokoroTTSEngine()
+            engine._pipeline_for("af_sarah", 1.0, "en-us")
+
+            self.assertEqual(loaded_spacy_models, ["en_core_web_sm"])
+            self.assertEqual(engine.model_quality, "q8")
+            self.assertEqual(captured_configs[0]["model_quality"], "q8")
+            self.assertEqual(
+                captured_configs[0]["tokenizer_config"].kwargs["spacy_model"],
+                "en_core_web_sm",
+            )
+            self.assertEqual(
+                captured_configs[0]["tokenizer_config"].kwargs["spacy_model_size"],
+                "sm",
+            )
+        finally:
+            for name, module in original_modules.items():
+                if module is None:
+                    sys.modules.pop(name, None)
+                else:
+                    sys.modules[name] = module
 
     def test_packaged_audio_paths_resolve_to_current_folder_layout(self) -> None:
         with TemporaryDirectory() as temp_dir:

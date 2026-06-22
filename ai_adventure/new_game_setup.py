@@ -8,8 +8,9 @@ from ai_adventure.calendar_system import (
     build_calendar_snapshot,
     normalize_calendar_settings,
 )
-from ai_adventure.audio.voices import normalize_narrator_voice
+from ai_adventure.audio.tts_settings import normalize_tts_audio_fields
 from ai_adventure.context.creative_ideas import CreativeIdeasLibrary
+from ai_adventure.context.naming import GENERIC_PROPER_NOUN_PLACEHOLDER_RULE
 from ai_adventure.currency import (
     describe_currency_denominations,
     normalize_currency_denominations,
@@ -75,6 +76,42 @@ GREGORIAN_CALENDAR_SETTINGS: dict[str, Any] = {
     ],
     "time_display": "12_hour",
 }
+AI_GENERATED_CALENDAR_FALLBACK_SETTINGS: dict[str, Any] = {
+    "days_per_week": 8,
+    "weeks_per_month": 5,
+    "months_per_year": 10,
+    "seasons_per_year": 5,
+    "day_names": [
+        "Dawn",
+        "Bell",
+        "Hearth",
+        "Market",
+        "Lantern",
+        "Tide",
+        "Star",
+        "Rest",
+    ],
+    "month_names": [
+        "First Rise",
+        "Greenwake",
+        "Highsun",
+        "Goldleaf",
+        "Longshade",
+        "Deepfrost",
+        "Raincall",
+        "Bloomturn",
+        "Redharvest",
+        "Yearsend",
+    ],
+    "seasons": [
+        {"name": "Waking", "weather_hint": "spring"},
+        {"name": "Highlight", "weather_hint": "summer"},
+        {"name": "Harvest", "weather_hint": "autumn"},
+        {"name": "Frost", "weather_hint": "winter"},
+        {"name": "Rainmoot", "weather_hint": "rainy"},
+    ],
+    "time_display": "narrative",
+}
 
 
 def normalize_new_game_setup(raw_setup: Any) -> dict[str, Any]:
@@ -98,8 +135,13 @@ def normalize_new_game_setup(raw_setup: Any) -> dict[str, Any]:
         raw_setup.get("currency_denominations", []),
         fallback_denominations=[],
     )
+    economy_examples = normalize_economy_examples(
+        raw_setup.get("economy_examples", raw_setup.get("economy_notes", []))
+    )
+    economy_examples_description = describe_economy_examples(economy_examples)
+    raw_currency_description = _clean_text(raw_setup.get("currency_description"))
     currency_description = (
-        _clean_text(raw_setup.get("currency_description"))
+        _combine_currency_description(raw_currency_description, economy_examples_description)
         or describe_currency_denominations(
             currency_denominations,
             fallback_denominations=[],
@@ -129,6 +171,7 @@ def normalize_new_game_setup(raw_setup: Any) -> dict[str, Any]:
         "time_display": calendar_settings["time_display"],
         "currency_denominations": currency_denominations,
         "currency_description": currency_description,
+        "economy_examples": economy_examples,
         "specified_genre": specified_genre,
         "game_style": game_style,
         "start_location": start_location,
@@ -149,10 +192,8 @@ def _audio_from_setup(raw_audio: Any) -> dict[str, Any]:
 
     return {
         "music_enabled": _safe_bool(raw_audio.get("music_enabled"), True),
-        "narrator_enabled": _safe_bool(raw_audio.get("narrator_enabled"), True),
         "music_volume": _clamped_int(raw_audio.get("music_volume"), 25, 0, 100),
-        "tts_volume": _clamped_int(raw_audio.get("tts_volume"), 90, 0, 100),
-        "tts_voice": normalize_narrator_voice(raw_audio.get("tts_voice")),
+        **normalize_tts_audio_fields(raw_audio),
     }
 
 
@@ -282,8 +323,11 @@ def build_new_game_setup_packet(
                 "If setup.calendar.ai_generated is true, invent calendar_settings "
                 "for the new world using clear day names, month names, seasons, "
                 "season weather hints, and time_display. The calendar should fit "
-                "the selected genre, world culture, climate, and playstyle. If "
-                "setup.calendar.ai_generated is false, use the provided calendar "
+                "the selected genre, world culture, climate, and playstyle. Do "
+                "not copy the default Gregorian calendar, weekday names, January-"
+                "through-December month names, or generic Month 1/Month 2 style "
+                "placeholder names when AI generation is requested. If setup."
+                "calendar.ai_generated is false, use the provided calendar "
                 "settings and return calendar_settings as an empty object."
             ),
             "events": (
@@ -413,16 +457,18 @@ def build_new_game_setup_packet(
                 "or credits for futuristic and space settings. One denomination must "
                 "be the baseline unit with value=1. Other values are exchange rates "
                 "in that baseline unit and do not need to be multiples or powers of "
-                "10. Preserve explicit player-provided setup.currency_denominations "
-                "instead of replacing them."
+                "10. Use setup.economy_examples as common-price calibration for "
+                "the value of ordinary goods when it is present. Preserve explicit "
+                "player-provided setup.currency_denominations instead of replacing them."
             ),
             "starting_currency_balance": (
                 "Return starting_currency_balance_base_units as the player "
                 "character's actual starting money. It will be written to "
                 "game_state/currency.balance as one integer in the baseline "
                 "currency unit. Choose an amount that fits the finalized "
-                "character, genre, starting situation, and economy. Do not create "
-                "coin, purse, cash, wallet, or credit inventory items to represent "
+                "character, genre, starting situation, economy, and any "
+                "setup.economy_examples common-price rows. Do not create coin, "
+                "purse, cash, wallet, or credit inventory items to represent "
                 "spendable money."
             ),
             "creative_ideas": (
@@ -430,11 +476,16 @@ def build_new_game_setup_packet(
                 "names, locations, cultures, religions, foods, drinks, species, "
                 "alchemy ingredients, magic styles, and other world details. "
                 "Strongly prefer the examples or close stylistic relatives over "
-                "generic training-data fantasy defaults. Never use any term listed "
-                "in creative_ideas.banned_terms, nor obvious spelling, hyphenation, "
-                "or reskin variants, for newly generated player characters, NPCs, "
-                "locations, factions, religions, taverns, regions, or similar "
-                "proper nouns."
+                "generic training-data fantasy defaults. The banned_terms list is "
+                "a hard exclusion list, not optional style guidance: never use any "
+                "term listed in creative_ideas.banned_terms, nor obvious spelling, "
+                "hyphenation, or reskin variants, for newly generated player "
+                "characters, NPCs, locations, factions, religions, taverns, regions, "
+                "items, skills, calendar names, event payload names, or similar "
+                "proper nouns. Before returning JSON, scan every string key and "
+                "value and replace any newly invented banned term with a fresh "
+                "non-banned name. "
+                f"{GENERIC_PROPER_NOUN_PLACEHOLDER_RULE}"
             ),
         },
         "fields_requiring_ai_invention": _fields_requiring_ai_invention(clean_setup),
@@ -622,14 +673,32 @@ def _normalize_skills(raw_skills: Any) -> list[dict[str, Any]]:
     """Normalizes skills into the required level spread."""
 
     input_skills = raw_skills if isinstance(raw_skills, list) else []
-    normalized: list[dict[str, Any]] = []
+    normalized: list[dict[str, Any] | None] = [None for _level in SKILL_LEVEL_PLAN]
+    next_position = 0
 
-    for index, level in enumerate(SKILL_LEVEL_PLAN):
-        raw_skill = input_skills[index] if index < len(input_skills) else {}
-
+    for raw_skill in input_skills[: len(SKILL_LEVEL_PLAN)]:
         if not isinstance(raw_skill, dict):
             raw_skill = {"name": str(raw_skill)}
 
+        requested_level = _safe_int(raw_skill.get("level"), 0)
+        target_index = -1
+
+        if requested_level in SKILL_LEVEL_PLAN:
+            for index, level in enumerate(SKILL_LEVEL_PLAN):
+                if level == requested_level and normalized[index] is None:
+                    target_index = index
+                    break
+
+        if target_index < 0:
+            while next_position < len(normalized) and normalized[next_position] is not None:
+                next_position += 1
+
+            if next_position >= len(normalized):
+                break
+
+            target_index = next_position
+
+        level = SKILL_LEVEL_PLAN[target_index]
         name = _clean_text(raw_skill.get("name"))
         description = _clean_text(raw_skill.get("description"))
         requires_ai_invention = bool(raw_skill.get("requires_ai_invention"))
@@ -637,16 +706,26 @@ def _normalize_skills(raw_skills: Any) -> list[dict[str, Any]]:
         if not name or not description:
             requires_ai_invention = True
 
-        normalized.append(
-            {
-                "name": name,
-                "description": description,
-                "level": level,
-                "requires_ai_invention": requires_ai_invention,
-            }
-        )
+        normalized[target_index] = {
+            "name": name,
+            "description": description,
+            "level": level,
+            "requires_ai_invention": requires_ai_invention,
+        }
 
-    return normalized
+    for index, skill in enumerate(normalized):
+        if skill is not None:
+            continue
+
+        level = SKILL_LEVEL_PLAN[index]
+        normalized[index] = {
+            "name": "",
+            "description": "",
+            "level": level,
+            "requires_ai_invention": True,
+        }
+
+    return [skill for skill in normalized if skill is not None]
 
 
 def _normalize_starter_items(raw_items: Any) -> list[dict[str, Any]]:
@@ -694,6 +773,67 @@ def _normalize_starter_items(raw_items: Any) -> list[dict[str, Any]]:
     return items
 
 
+def normalize_economy_examples(raw_examples: Any) -> list[dict[str, Any]]:
+    """Returns clean common-price examples measured in base currency units."""
+
+    if not isinstance(raw_examples, list):
+        return []
+
+    examples: list[dict[str, Any]] = []
+    seen_names: set[str] = set()
+
+    for raw_example in raw_examples:
+        if not isinstance(raw_example, dict):
+            continue
+
+        name = _clean_text(
+            raw_example.get("name", raw_example.get("item_name", raw_example.get("item")))
+        )
+        value = _safe_int(
+            raw_example.get(
+                "value_base_units",
+                raw_example.get("base_unit_value", raw_example.get("value")),
+            ),
+            0,
+        )
+        name_key = name.casefold()
+
+        if not name or value <= 0 or name_key in seen_names:
+            continue
+
+        examples.append({"name": name, "value_base_units": value})
+        seen_names.add(name_key)
+
+    return examples
+
+
+def describe_economy_examples(examples: Any) -> str:
+    """Returns concise AI-facing prose for common-price examples."""
+
+    clean_examples = normalize_economy_examples(examples)
+
+    if not clean_examples:
+        return ""
+
+    parts = [
+        f"{example['name']} costs {example['value_base_units']} base units"
+        for example in clean_examples
+    ]
+    return "Common price examples: " + "; ".join(parts) + "."
+
+
+def _combine_currency_description(description: str, economy_examples_description: str) -> str:
+    """Combines legacy currency notes with structured price examples."""
+
+    if description and economy_examples_description:
+        if economy_examples_description in description:
+            return description
+
+        return f"{description}\n{economy_examples_description}"
+
+    return description or economy_examples_description
+
+
 def _looks_like_item_request(text: str) -> bool:
     """Returns True when a starter-item line reads like an AI design brief."""
 
@@ -716,7 +856,7 @@ def _looks_like_item_request(text: str) -> bool:
 
 
 def _calendar_from_setup(raw_calendar: Any) -> dict[str, Any]:
-    """Normalizes setup calendar settings, defaulting to Gregorian-style names."""
+    """Normalizes setup calendar settings."""
 
     if not isinstance(raw_calendar, dict):
         raw_calendar = {}
@@ -724,7 +864,7 @@ def _calendar_from_setup(raw_calendar: Any) -> dict[str, Any]:
     calendar_type = str(raw_calendar.get("calendar_type", "")).strip().casefold()
 
     if calendar_type == "ai_generated":
-        settings = dict(GREGORIAN_CALENDAR_SETTINGS)
+        settings = _copy_calendar_settings(AI_GENERATED_CALENDAR_FALLBACK_SETTINGS)
         settings["calendar_type"] = "ai_generated"
         settings["ai_generated"] = True
     elif not raw_calendar or calendar_type == "gregorian":
@@ -747,6 +887,80 @@ def _calendar_from_setup(raw_calendar: Any) -> dict[str, Any]:
     clean_settings["calendar_type"] = str(settings.get("calendar_type", "custom"))
     clean_settings["ai_generated"] = bool(settings.get("ai_generated", False))
     return clean_settings
+
+
+def calendar_looks_like_default_gregorian(raw_calendar: Any) -> bool:
+    """Returns True when calendar output is the default Gregorian placeholder."""
+
+    if not isinstance(raw_calendar, dict) or not raw_calendar:
+        return False
+
+    calendar = normalize_calendar_settings(raw_calendar)
+    gregorian = normalize_calendar_settings(GREGORIAN_CALENDAR_SETTINGS)
+    same_shape = all(
+        int(calendar[key]) == int(gregorian[key])
+        for key in [
+            "days_per_week",
+            "weeks_per_month",
+            "months_per_year",
+            "seasons_per_year",
+        ]
+    )
+
+    if not same_shape:
+        return False
+
+    day_names = _folded_names(calendar["day_names"])
+    month_names = _folded_names(calendar["month_names"])
+    season_names = _folded_names([season["name"] for season in calendar["seasons"]])
+    gregorian_days = _folded_names(gregorian["day_names"])
+    gregorian_months = _folded_names(gregorian["month_names"])
+    generic_months = _folded_names([f"Month {index}" for index in range(1, 13)])
+    gregorian_seasons = _folded_names([season["name"] for season in gregorian["seasons"]])
+
+    return (
+        day_names == gregorian_days
+        and (month_names == gregorian_months or month_names == generic_months)
+        and season_names == gregorian_seasons
+    )
+
+
+def ai_generated_calendar_settings_or_fallback(raw_calendar: Any) -> dict[str, Any]:
+    """Returns AI calendar settings, replacing default Gregorian output."""
+
+    if calendar_looks_like_default_gregorian(raw_calendar):
+        return _copy_calendar_settings(AI_GENERATED_CALENDAR_FALLBACK_SETTINGS)
+
+    clean_calendar = normalize_calendar_settings(raw_calendar)
+
+    if calendar_looks_like_default_gregorian(clean_calendar):
+        return _copy_calendar_settings(AI_GENERATED_CALENDAR_FALLBACK_SETTINGS)
+
+    return clean_calendar
+
+
+def _copy_calendar_settings(settings: dict[str, Any]) -> dict[str, Any]:
+    """Returns a deep-enough copy of calendar settings for mutation."""
+
+    return {
+        **settings,
+        "day_names": list(settings.get("day_names", [])),
+        "month_names": list(settings.get("month_names", [])),
+        "seasons": [
+            dict(season)
+            for season in settings.get("seasons", [])
+            if isinstance(season, dict)
+        ],
+    }
+
+
+def _folded_names(values: Any) -> list[str]:
+    """Returns case-insensitive names for calendar comparisons."""
+
+    if not isinstance(values, list):
+        return []
+
+    return [str(value).strip().casefold() for value in values]
 
 
 def _build_ai_additional_context(

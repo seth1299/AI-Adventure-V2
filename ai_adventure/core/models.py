@@ -25,6 +25,10 @@ class PlayerState:
     backstory: str = ""
     condition: str = "Healthy"
     notes: str = ""
+    health_current: int = 20
+    health_max: int = 20
+    armor_rating: int = 10
+    equipment: dict[str, str] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         """Returns a JSON-serializable player-state dictionary."""
@@ -57,6 +61,7 @@ class InventoryItem:
     quantity: int = 1
     description: str = ""
     value_base_units: int = 0
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         """Returns a JSON-serializable inventory-item dictionary."""
@@ -85,6 +90,7 @@ class ItemCatalogEntry:
     category: str = ""
     description: str = ""
     value_base_units: int = 0
+    metadata: dict[str, Any] = field(default_factory=dict)
     first_seen_at: str = ""
     updated_at: str = ""
 

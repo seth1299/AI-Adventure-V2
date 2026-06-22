@@ -960,6 +960,71 @@ class GeminiServiceTests(unittest.TestCase):
         self.assertEqual(sorted(schema_event_types), sorted(KNOWN_EVENT_TYPE_NAMES))
         self.assertEqual(len(schema_event_types), len(set(schema_event_types)))
 
+    def test_story_schema_accepts_combat_started_event(self) -> None:
+        valid_response = {
+            "response": "The ambush begins.",
+            "suggested_actions": [],
+            "events": [
+                {
+                    "type": "CombatStartedEvent",
+                    "payload": {
+                        "description": "Two bandits rush from the alley.",
+                        "enemies": [
+                            {
+                                "name": "Bandit",
+                                "health": 8,
+                                "armor_rating": 12,
+                                "damage": "1d6",
+                                "loot": ["Rusty Knife"],
+                            }
+                        ],
+                        "allies": [
+                            {
+                                "name": "Mira",
+                                "health": 10,
+                                "armor_rating": 11,
+                                "damage": "1d4",
+                            }
+                        ],
+                    },
+                }
+            ],
+            "out_of_game": False,
+        }
+        missing_enemy_stats_response = {
+            "response": "The ambush begins.",
+            "suggested_actions": [],
+            "events": [
+                {
+                    "type": "CombatStartedEvent",
+                    "payload": {
+                        "description": "A bandit rushes from the alley.",
+                        "enemies": [
+                            {
+                                "name": "Bandit",
+                                "health": 8,
+                                "damage": "1d6",
+                                "loot": ["Rusty Knife"],
+                            }
+                        ],
+                    },
+                }
+            ],
+            "out_of_game": False,
+        }
+
+        self.assertEqual(
+            _json_schema_shape_errors(valid_response, STORY_RESPONSE_JSON_SCHEMA),
+            [],
+        )
+        self.assertIn(
+            "$.events[0] did not match any allowed schema",
+            _json_schema_shape_errors(
+                missing_enemy_stats_response,
+                STORY_RESPONSE_JSON_SCHEMA,
+            ),
+        )
+
     def test_default_rule_event_contracts_are_schema_supported(self) -> None:
         rules_path = (
             Path(__file__).resolve().parents[1]
@@ -1038,6 +1103,157 @@ class GeminiServiceTests(unittest.TestCase):
             "OFF",
         )
 
+    def test_new_game_repairs_banned_terms_until_response_is_clean(self) -> None:
+        def response_for(
+            *,
+            world_summary: str,
+            start_location: str,
+            npc_name: str,
+            item_name: str,
+            intro: str,
+        ) -> str:
+            return json.dumps(
+                {
+                    "selected_genre": "Detective mystery",
+                    "world_summary": world_summary,
+                    "world_lore": {
+                        "Locations": {
+                            start_location: f"{start_location} overlooks the tram line."
+                        },
+                        "Prominent NPCs": {
+                            npc_name: f"{npc_name} handles the morning desk."
+                        },
+                    },
+                    "start_location": start_location,
+                    "starting_calendar": {},
+                    "weather": "Rain",
+                    "character": {
+                        "name": "Mara Vale",
+                        "appearance": "A detective in a dark coat.",
+                        "backstory": f"Known for cases near {start_location}.",
+                        "notes": "Keeps careful notes.",
+                    },
+                    "skills": [
+                        {
+                            "name": "Investigation",
+                            "description": "Reading clues in crowded streets.",
+                            "level": 4,
+                        }
+                    ],
+                    "starting_items": [
+                        {
+                            "name": item_name if index == 0 else f"Case Item {index}",
+                            "category": "Tool",
+                            "quantity": 1,
+                            "description": "Useful enough to keep.",
+                            "value_base_units": index + 1,
+                            "source_index": -1,
+                        }
+                        for index in range(5)
+                    ],
+                    "currency_denominations": [
+                        {"name": "Credit", "plural_name": "Credits", "value": 1}
+                    ],
+                    "currency_description": "Credits.",
+                    "starting_currency_balance_base_units": 10,
+                    "introductory_message": intro,
+                    "suggested_actions": [
+                        "Check the case file.",
+                        "Question the desk clerk.",
+                        "Step into the rain.",
+                    ],
+                    "events": [
+                        {
+                            "type": "NpcUpsertedEvent",
+                            "payload": {
+                                "npc_id": "desk_clerk",
+                                "display_name": npc_name,
+                                "role": "Desk clerk",
+                                "location": start_location,
+                                "public_description": "A clerk with sharp eyes.",
+                                "player_facing_information": "Handles the morning desk.",
+                                "knowledge_scope": ["Station routine"],
+                                "known_facts": ["Rain delays the tram line."],
+                            },
+                        }
+                    ],
+                }
+            )
+
+        fake_client_class = self._install_fake_genai_client(
+            [
+                response_for(
+                    world_summary="Oakhaven is a rain-heavy city.",
+                    start_location="Oakhaven Office",
+                    npc_name="Mira Cross",
+                    item_name="Oakhaven Casebook",
+                    intro="Rain taps the Oakhaven office window. What do you do now?",
+                ),
+                response_for(
+                    world_summary="Elias watches the Silas Vane district.",
+                    start_location="Silas Vane Office",
+                    npc_name="Elias Vane",
+                    item_name="Vane Casebook",
+                    intro="Rain taps the Silas Vane office window. What do you do now?",
+                ),
+                response_for(
+                    world_summary="Brassgate is a rain-heavy city.",
+                    start_location="Brassgate Office",
+                    npc_name="Mira Cross",
+                    item_name="Brassgate Casebook",
+                    intro="Rain taps the Brassgate office window. What do you do now?",
+                ),
+            ]
+        )
+
+        try:
+            service = GeminiNarrationService(
+                GeminiSettings(api_key="test-key", model="gemini-2.5-flash")
+            )
+            with self.assertLogs("ai_adventure.ai.gemini_service", level="WARNING") as logs:
+                result = service.generate_new_game_world(
+                    {
+                        "packet_type": "new_game_setup",
+                        "creative_ideas": {
+                            "banned_terms": ["Oakhaven", "Elias", "Silas", "Vane"]
+                        },
+                    }
+                )
+        finally:
+            self._remove_fake_genai_client()
+
+        calls = fake_client_class.last_client.models.calls
+        first_repair_prompt = str(calls[1]["contents"])
+        second_repair_prompt = str(calls[2]["contents"])
+        combined_output = json.dumps(
+            {
+                "world_summary": result.world_summary,
+                "world_lore": result.world_lore,
+                "start_location": result.start_location,
+                "starting_items": result.finalized_starter_items,
+                "introductory_message": result.introductory_message,
+                "events": result.suggested_events,
+                "raw_text": result.raw_text,
+            },
+            ensure_ascii=False,
+        )
+
+        self.assertEqual(len(calls), 3)
+        self.assertIn("Attempt 1", first_repair_prompt)
+        self.assertIn("Full forbidden terms list", first_repair_prompt)
+        self.assertIn("Elias", first_repair_prompt)
+        self.assertIn("Silas", first_repair_prompt)
+        self.assertIn("Vane", first_repair_prompt)
+        self.assertIn("Attempt 2", second_repair_prompt)
+        self.assertIn(
+            "Observed offending terms in the current JSON: Elias, Silas, Vane",
+            second_repair_prompt,
+        )
+        self.assertIn("repair attempt 1/4 still contained", "\n".join(logs.output))
+        self.assertIn("Brassgate", result.world_summary)
+        for term in ("Oakhaven", "Elias", "Silas", "Vane"):
+            self.assertNotIn(term, combined_output)
+
     def test_build_prompt_contains_strict_json_contract(self) -> None:
         prompt = build_gemini_story_prompt(
             {
@@ -1079,8 +1295,13 @@ class GeminiServiceTests(unittest.TestCase):
         self.assertIn("fictional in-world terms", prompt)
         self.assertIn("do not use real-world slurs", prompt)
         self.assertIn("Creative naming boundary", prompt)
+        self.assertIn("hard requirement", prompt)
         self.assertIn("Never use creative_ideas.banned_terms", prompt)
+        self.assertIn("scan every string key and value", prompt)
         self.assertIn("Exact banned proper nouns", prompt)
+        self.assertIn("bare category labels as final proper nouns", prompt)
+        self.assertIn("the Police Department", prompt)
+        self.assertIn("The Blue Wall", prompt)
         self.assertIn("Elara", prompt)
         self.assertIn("reuse that exact npc_id/internal identifier", prompt)
         self.assertIn("Spoken dialogue must use double quotation marks", prompt)
@@ -1090,7 +1311,13 @@ class GeminiServiceTests(unittest.TestCase):
         self.assertIn("payload.base_unit_amount", prompt)
         self.assertIn("Never use net_base_unit_amount", prompt)
         self.assertIn("Every InventoryItemAddedEvent payload must include value_base_units", prompt)
+        self.assertIn("weapon_hands", prompt)
+        self.assertIn("covers_body_parts", prompt)
+        self.assertIn("armor_rating", prompt)
         self.assertIn("state.item_catalog.items is the master list", prompt)
+        self.assertIn("CombatStartedEvent", prompt)
+        self.assertIn("damage dice", prompt)
+        self.assertIn("Combat tab", prompt)
         self.assertIn("ReagentDiscoveredEvent records Crafting tab knowledge", prompt)
         self.assertIn("useful items/materials", prompt)
         self.assertIn("RecipeDiscoveredEvent ingredients must be structured entries", prompt)
@@ -1505,7 +1732,13 @@ class GeminiServiceTests(unittest.TestCase):
         self.assertIn("fields_requiring_ai_invention", prompt)
         self.assertIn("blank/default placeholders", prompt)
         self.assertIn("high-priority style seeds", prompt)
+        self.assertIn("hard requirement", prompt)
         self.assertIn("Never use creative_ideas.banned_terms", prompt)
+        self.assertIn("scan every string key and value", prompt)
+        self.assertIn("Exact banned proper nouns", prompt)
+        self.assertIn("bare category labels as final proper nouns", prompt)
+        self.assertIn("the Police Department", prompt)
+        self.assertIn("The Blue Wall", prompt)
         self.assertIn("gender_presentation_hint", prompt)
         self.assertIn("does not imply male", prompt)
         self.assertIn("selected_genre", prompt)
@@ -1568,6 +1801,9 @@ class GeminiServiceTests(unittest.TestCase):
         self.assertIn("do not mention autumn winds", prompt)
         self.assertIn("setup.calendar.ai_generated", prompt)
         self.assertIn("invent calendar_settings", prompt)
+        self.assertIn("Do not copy the default Gregorian calendar", prompt)
+        self.assertIn("January-through-December", prompt)
+        self.assertIn("Month 1/Month 2 placeholder", prompt)
         self.assertIn("do not use event_type", prompt)
         self.assertIn("API response schema defines the required JSON fields", prompt)
         self.assertNotIn("Return this JSON shape", prompt)
@@ -1851,14 +2087,21 @@ class GeminiServiceTests(unittest.TestCase):
         self.assertEqual(result.narrative_text, "A plain narration response.")
         self.assertEqual(result.suggested_events, [])
 
-    def _install_fake_genai_client(self, response_text: str) -> type:
+    def _install_fake_genai_client(self, response_text: str | list[str]) -> type:
+        response_texts = (
+            [response_text]
+            if isinstance(response_text, str)
+            else [str(text) for text in response_text]
+        )
+
         class FakeModels:
             def __init__(self) -> None:
                 self.calls: list[dict[str, object]] = []
 
             def generate_content(self, **kwargs: object) -> object:
+                response_index = min(len(self.calls), len(response_texts) - 1)
                 self.calls.append(kwargs)
-                return types.SimpleNamespace(text=response_text)
+                return types.SimpleNamespace(text=response_texts[response_index])
 
         class FakeClient:
             last_client: object | None = None

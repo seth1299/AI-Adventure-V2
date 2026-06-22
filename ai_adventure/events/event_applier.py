@@ -23,6 +23,13 @@ from ai_adventure.context.creative_guardrails import (
     find_banned_creative_terms,
     sanitize_banned_creative_terms_in_data,
 )
+from ai_adventure.combat import (
+    DEFAULT_BASE_ARMOR_RATING,
+    DEFAULT_PLAYER_MAX_HEALTH,
+    armor_rating_from_equipment,
+    equipped_weapon_damage,
+    normalize_damage_expression,
+)
 from ai_adventure.currency import format_currency_amount
 from ai_adventure.locations import clean_player_location_name
 from ai_adventure.persistence.save_repository import SaveRepository
@@ -152,6 +159,9 @@ class EventApplier:
             if event_type == "InventoryItemModifiedEvent":
                 return self._apply_inventory_item_modified(event_type, payload)
 
+            if event_type == "CombatStartedEvent":
+                return self._apply_combat_started(event_type, payload)
+
             if event_type == "SkillUpsertedEvent":
                 return self._apply_skill_upserted(event_type, payload)
 
@@ -249,6 +259,7 @@ class EventApplier:
             quantity=quantity,
             description=description,
             value_base_units=value_base_units,
+            metadata=payload,
         )
 
         return AppliedEventResult(
@@ -304,15 +315,107 @@ class EventApplier:
         self.repository.modify_inventory_item(
             target_name=target_name,
             new_name=_first_text(payload, "new_name"),
+            category=_first_text(payload, "new_category", "category"),
             description=_first_text(payload, "new_description", "description"),
             quantity=quantity,
             value_base_units=value_base_units,
+            metadata=payload,
         )
 
         return AppliedEventResult(
             event_type,
             "applied",
             f"Modified inventory item: {target_name}.",
+            payload,
+        )
+
+    def _apply_combat_started(
+        self,
+        event_type: str,
+        payload: dict[str, Any],
+    ) -> AppliedEventResult:
+        """Applies CombatStartedEvent."""
+
+        if self.repository.is_combat_active():
+            return AppliedEventResult(
+                event_type,
+                "skipped",
+                "Combat is already active.",
+                payload,
+            )
+
+        enemies = _combatants_from_payload(payload.get("enemies", []), team="enemy")
+
+        if not enemies:
+            enemy_name = _first_text(payload, "enemy_name", "opponent_name") or "Enemy"
+            enemies = [
+                _combatant_from_payload(
+                    {
+                        "name": enemy_name,
+                        "health": _first_int(payload, 8, "enemy_health", "health"),
+                        "armor_rating": _first_int(
+                            payload,
+                            10,
+                            "enemy_armor_rating",
+                            "armor_rating",
+                        ),
+                        "damage": _first_text(payload, "enemy_damage", "damage") or "1d6",
+                        "loot": payload.get("loot", []),
+                    },
+                    team="enemy",
+                    index=1,
+                )
+            ]
+
+        allies = _combatants_from_payload(payload.get("allies", []), team="party", start_index=2)
+        inventory_items = self.repository.list_inventory_items()
+        equipment = self.repository.get_player_equipment()
+        player_health_max = _safe_positive_int(
+            self.repository.get_setting("player.health_max", DEFAULT_PLAYER_MAX_HEALTH),
+            DEFAULT_PLAYER_MAX_HEALTH,
+        )
+        player_health_current = max(
+            0,
+            min(
+                _safe_positive_int(
+                    self.repository.get_setting("player.health_current", player_health_max),
+                    player_health_max,
+                ),
+                player_health_max,
+            ),
+        )
+        player = {
+            "id": "player",
+            "name": str(self.repository.get_setting("player_name", "Player")).strip() or "Player",
+            "team": "party",
+            "current_health": player_health_current,
+            "max_health": player_health_max,
+            "armor_rating": armor_rating_from_equipment(
+                equipment,
+                inventory_items,
+                base_armor_rating=DEFAULT_BASE_ARMOR_RATING,
+            ),
+            "damage": equipped_weapon_damage(equipment, inventory_items),
+            "status_effects": [],
+            "loot": [],
+            "defeated": player_health_current <= 0,
+        }
+        combat_state = {
+            "active": True,
+            "round": 1,
+            "turn_index": 0,
+            "combatants": [player, *allies, *enemies],
+            "log": [
+                str(payload.get("description", "") or "Combat begins.").strip(),
+            ],
+        }
+        self.repository.set_combat_state(combat_state)
+        self.repository.append_history("system", "Combat started.")
+
+        return AppliedEventResult(
+            event_type,
+            "applied",
+            f"Started combat with {len(enemies)} enemy combatant(s).",
             payload,
         )
 
@@ -1126,6 +1229,97 @@ def _first_text(payload: dict[str, Any], *keys: str) -> str:
             return clean_value
 
     return ""
+
+
+def _combatants_from_payload(
+    raw_combatants: Any,
+    *,
+    team: str,
+    start_index: int = 1,
+) -> list[dict[str, Any]]:
+    """Normalizes a list of combatants from an event payload."""
+
+    if not isinstance(raw_combatants, list):
+        return []
+
+    combatants: list[dict[str, Any]] = []
+
+    for offset, raw_combatant in enumerate(raw_combatants):
+        if not isinstance(raw_combatant, dict):
+            continue
+
+        combatants.append(
+            _combatant_from_payload(
+                raw_combatant,
+                team=team,
+                index=start_index + offset,
+            )
+        )
+
+    return combatants
+
+
+def _combatant_from_payload(
+    raw_combatant: dict[str, Any],
+    *,
+    team: str,
+    index: int,
+) -> dict[str, Any]:
+    """Normalizes one combatant from an event payload."""
+
+    name = str(raw_combatant.get("name", raw_combatant.get("enemy_name", ""))).strip()
+    name = name or ("Enemy" if team == "enemy" else "Ally")
+    max_health = _safe_positive_int(
+        raw_combatant.get("max_health", raw_combatant.get("health")),
+        8 if team == "enemy" else 12,
+    )
+    current_health = _safe_positive_int(
+        raw_combatant.get("current_health", max_health),
+        max_health,
+    )
+    return {
+        "id": f"{team}-{index}-{_slug_for_event_id(name)}",
+        "name": name,
+        "team": team,
+        "current_health": max(0, min(current_health, max_health)),
+        "max_health": max_health,
+        "armor_rating": _safe_positive_int(raw_combatant.get("armor_rating"), 10),
+        "damage": normalize_damage_expression(raw_combatant.get("damage"), default="1d6"),
+        "status_effects": _text_list(raw_combatant.get("status_effects", [])),
+        "loot": _text_list(raw_combatant.get("loot", [])),
+        "defeated": False,
+    }
+
+
+def _safe_positive_int(value: Any, default: int) -> int:
+    """Reads a positive integer with fallback."""
+
+    clean_value = _safe_int(value, default=default)
+
+    if clean_value is None or clean_value <= 0:
+        return default
+
+    return clean_value
+
+
+def _text_list(value: Any) -> list[str]:
+    """Normalizes a text or list value into clean text entries."""
+
+    if isinstance(value, str):
+        raw_values = re.split(r"[,;]+", value)
+    elif isinstance(value, list):
+        raw_values = value
+    else:
+        raw_values = []
+
+    return [str(item).strip() for item in raw_values if str(item).strip()]
+
+
+def _slug_for_event_id(value: str) -> str:
+    """Returns a compact event-combatant id fragment."""
+
+    slug = re.sub(r"[^a-zA-Z0-9]+", "-", str(value or "").strip().lower()).strip("-")
+    return slug or "combatant"
 
 
 def _blocking_skill_check_failure(

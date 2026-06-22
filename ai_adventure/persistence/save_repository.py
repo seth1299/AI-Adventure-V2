@@ -18,7 +18,9 @@ from ai_adventure.calendar_system import (
     build_calendar_snapshot,
     normalize_calendar_settings,
 )
+from ai_adventure.audio.tts_settings import normalize_tts_audio_fields
 from ai_adventure.audio.voices import DEFAULT_NARRATOR_VOICE
+from ai_adventure.combat import normalize_combat_state, normalize_equipment, normalize_item_metadata
 from ai_adventure.currency import (
     DEFAULT_CURRENCY_DENOMINATIONS,
     normalize_currency_denominations,
@@ -120,6 +122,13 @@ class SaveRepository:
         repository.set_setting("audio.music_volume", 25)
         repository.set_setting("audio.tts_volume", 90)
         repository.set_setting("audio.tts_voice", DEFAULT_NARRATOR_VOICE)
+        repository.set_setting("audio.tts_speed", 100)
+        repository.set_setting("audio.tts_voice_mode", "preset")
+        repository.set_setting(
+            "audio.tts_voice_blend",
+            normalize_tts_audio_fields({})["tts_voice_blend"],
+        )
+        repository.set_setting("audio.tts_custom_voices", [])
         repository.set_setting("audio.current_music", "")
         repository.set_journal_notes("")
         repository.set_journal_share_with_ai(False)
@@ -228,6 +237,10 @@ class SaveRepository:
         self.set_setting("audio.music_volume", int(audio_settings["music_volume"]))
         self.set_setting("audio.tts_volume", int(audio_settings["tts_volume"]))
         self.set_setting("audio.tts_voice", audio_settings["tts_voice"])
+        self.set_setting("audio.tts_speed", int(audio_settings["tts_speed"]))
+        self.set_setting("audio.tts_voice_mode", audio_settings["tts_voice_mode"])
+        self.set_setting("audio.tts_voice_blend", audio_settings["tts_voice_blend"])
+        self.set_setting("audio.tts_custom_voices", audio_settings["tts_custom_voices"])
         self.set_setting("audio.current_music", "")
         self.set_setting("new_game.setup", clean_setup)
         self.set_setting("world.setup_context", clean_setup["world_context"])
@@ -449,6 +462,7 @@ class SaveRepository:
         quantity: int,
         description: str,
         value_base_units: int = 0,
+        metadata: Any | None = None,
     ) -> None:
         """
         Adds an inventory item.
@@ -459,6 +473,7 @@ class SaveRepository:
             quantity: Quantity to add.
             description: Short item description.
             value_base_units: Item value in baseline currency units.
+            metadata: Optional structured equipment/combat metadata.
         """
 
         clean_name = name.strip()
@@ -476,11 +491,18 @@ class SaveRepository:
             quantity = 1
 
         clean_value = max(0, _safe_int(value_base_units, default=0) or 0)
+        clean_metadata = normalize_item_metadata(
+            metadata,
+            name=clean_name,
+            category=category,
+            description=description,
+        )
+        metadata_json = _encode_json_dict(clean_metadata)
 
         with self._connect() as connection:
             rows = connection.execute(
                 """
-                SELECT id, category, quantity, description, value_base_units
+                SELECT id, category, quantity, description, value_base_units, metadata_json
                 FROM inventory_items
                 WHERE name = ? COLLATE NOCASE
                 ORDER BY id ASC
@@ -497,13 +519,19 @@ class SaveRepository:
                 updated_description = description.strip() or str(primary_row["description"])
                 updated_quantity = existing_quantity + quantity
                 updated_value = clean_value if clean_value > 0 else existing_value
+                updated_metadata = (
+                    metadata_json
+                    if clean_metadata.get("item_type") != "Item"
+                    else str(primary_row["metadata_json"])
+                )
                 connection.execute(
                     """
                     UPDATE inventory_items
                     SET category = ?,
                         quantity = ?,
                         description = ?,
-                        value_base_units = ?
+                        value_base_units = ?,
+                        metadata_json = ?
                     WHERE id = ?
                     """,
                     (
@@ -511,6 +539,7 @@ class SaveRepository:
                         updated_quantity,
                         updated_description,
                         updated_value,
+                        updated_metadata,
                         primary_row["id"],
                     ),
                 )
@@ -529,9 +558,10 @@ class SaveRepository:
                         category,
                         quantity,
                         description,
-                        value_base_units
+                        value_base_units,
+                        metadata_json
                     )
-                    VALUES (?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?)
                     """,
                     (
                         clean_name,
@@ -539,6 +569,7 @@ class SaveRepository:
                         quantity,
                         description.strip(),
                         clean_value,
+                        metadata_json,
                     ),
                 )
 
@@ -548,6 +579,7 @@ class SaveRepository:
                 category=category,
                 description=description,
                 value_base_units=clean_value,
+                metadata=clean_metadata,
             )
 
         self.append_history("inventory", f"Added {quantity} x {clean_name}.")
@@ -563,13 +595,20 @@ class SaveRepository:
         with self._connect() as connection:
             rows = connection.execute(
                 """
-                SELECT id, name, category, quantity, description, value_base_units
+                SELECT
+                    id,
+                    name,
+                    category,
+                    quantity,
+                    description,
+                    value_base_units,
+                    metadata_json
                 FROM inventory_items
                 ORDER BY name COLLATE NOCASE
                 """
             ).fetchall()
 
-        return [dict(row) for row in rows]
+        return [_inventory_row_to_dict(row) for row in rows]
 
     def replace_inventory_items(self, items: list[dict[str, Any]]) -> None:
         """
@@ -613,6 +652,12 @@ class SaveRepository:
                     "quantity": max(1, quantity),
                     "description": str(raw_item.get("description", "")).strip(),
                     "value_base_units": max(0, value_base_units),
+                    "metadata": normalize_item_metadata(
+                        raw_item.get("metadata", raw_item),
+                        name=name,
+                        category=str(raw_item.get("category", "Item")),
+                        description=str(raw_item.get("description", "")),
+                    ),
                 }
             )
             seen_names.add(name.casefold())
@@ -630,9 +675,10 @@ class SaveRepository:
                     category,
                     quantity,
                     description,
-                    value_base_units
+                    value_base_units,
+                    metadata_json
                 )
-                VALUES (?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?)
                 """,
                 [
                     (
@@ -641,6 +687,7 @@ class SaveRepository:
                         item["quantity"],
                         item["description"],
                         item["value_base_units"],
+                        _encode_json_dict(item["metadata"]),
                     )
                     for item in clean_items
                 ],
@@ -652,6 +699,7 @@ class SaveRepository:
                     category=item["category"],
                     description=item["description"],
                     value_base_units=item["value_base_units"],
+                    metadata=item["metadata"],
                 )
 
         self.append_history("inventory", "Starting inventory finalized.")
@@ -663,6 +711,7 @@ class SaveRepository:
         category: str = "",
         description: str = "",
         value_base_units: int = 0,
+        metadata: Any | None = None,
     ) -> None:
         """Adds or updates one remembered item definition."""
 
@@ -681,6 +730,7 @@ class SaveRepository:
                 category=category,
                 description=description,
                 value_base_units=clean_value,
+                metadata=metadata,
             )
 
     def list_item_catalog(self) -> list[dict[str, Any]]:
@@ -695,6 +745,7 @@ class SaveRepository:
                     category,
                     description,
                     value_base_units,
+                    metadata_json,
                     first_seen_at,
                     updated_at
                 FROM item_catalog
@@ -702,7 +753,7 @@ class SaveRepository:
                 """
             ).fetchall()
 
-        return [dict(row) for row in rows]
+        return [_item_catalog_row_to_dict(row) for row in rows]
 
     def remove_inventory_item(self, name: str, quantity: int) -> None:
         """
@@ -760,9 +811,11 @@ class SaveRepository:
         *,
         target_name: str,
         new_name: str | None = None,
+        category: str | None = None,
         description: str | None = None,
         quantity: int | None = None,
         value_base_units: int | None = None,
+        metadata: Any | None = None,
     ) -> None:
         """
         Modifies one inventory item by name.
@@ -770,9 +823,11 @@ class SaveRepository:
         Args:
             target_name: Existing item name.
             new_name: Optional replacement name.
+            category: Optional replacement category.
             description: Optional replacement description.
             quantity: Optional replacement quantity.
             value_base_units: Optional replacement value in baseline currency units.
+            metadata: Optional replacement metadata.
         """
 
         clean_target = target_name.strip()
@@ -784,7 +839,7 @@ class SaveRepository:
         with self._connect() as connection:
             row = connection.execute(
                 """
-                SELECT id, name, category, description, quantity, value_base_units
+                SELECT id, name, category, description, quantity, value_base_units, metadata_json
                 FROM inventory_items
                 WHERE name = ?
                 ORDER BY id ASC
@@ -798,6 +853,11 @@ class SaveRepository:
                 return
 
             updated_name = new_name.strip() if new_name and new_name.strip() else row["name"]
+            updated_category = (
+                category.strip()
+                if category is not None and category.strip()
+                else row["category"]
+            )
             updated_description = (
                 description.strip()
                 if description is not None and description.strip()
@@ -805,6 +865,16 @@ class SaveRepository:
             )
             updated_quantity = int(row["quantity"])
             updated_value = int(row["value_base_units"])
+            updated_metadata = (
+                normalize_item_metadata(
+                    metadata,
+                    name=str(updated_name),
+                    category=str(updated_category),
+                    description=str(updated_description),
+                )
+                if metadata is not None or category is not None or description is not None
+                else _decode_json_dict(row["metadata_json"], "inventory item metadata")
+            )
 
             if quantity is not None:
                 if quantity <= 0:
@@ -829,23 +899,31 @@ class SaveRepository:
             connection.execute(
                 """
                 UPDATE inventory_items
-                SET name = ?, description = ?, quantity = ?, value_base_units = ?
+                SET name = ?,
+                    category = ?,
+                    description = ?,
+                    quantity = ?,
+                    value_base_units = ?,
+                    metadata_json = ?
                 WHERE id = ?
                 """,
                 (
                     updated_name,
+                    updated_category,
                     updated_description,
                     updated_quantity,
                     updated_value,
+                    _encode_json_dict(updated_metadata),
                     row["id"],
                 ),
             )
             _upsert_item_catalog_entry(
                 connection,
                 name=updated_name,
-                category=str(row["category"]),
+                category=str(updated_category),
                 description=updated_description,
                 value_base_units=updated_value,
+                metadata=updated_metadata,
             )
 
         self.append_history("inventory", f"Modified inventory item: {clean_target}.")
@@ -2522,6 +2600,38 @@ class SaveRepository:
             )
         )
 
+    def get_player_equipment(self) -> dict[str, str]:
+        """Reads current player equipment."""
+
+        return normalize_equipment(
+            self.get_setting("player.equipment", {}),
+            self.list_inventory_items(),
+        )
+
+    def set_player_equipment(self, equipment: Any) -> dict[str, str]:
+        """Stores current player equipment and returns the normalized result."""
+
+        clean_equipment = normalize_equipment(equipment, self.list_inventory_items())
+        self.set_setting("player.equipment", clean_equipment)
+        return clean_equipment
+
+    def get_combat_state(self) -> dict[str, Any]:
+        """Reads the saved deterministic combat state."""
+
+        return normalize_combat_state(self.get_setting("combat.state", {}))
+
+    def set_combat_state(self, combat_state: Any) -> dict[str, Any]:
+        """Stores the deterministic combat state."""
+
+        clean_state = normalize_combat_state(combat_state)
+        self.set_setting("combat.state", clean_state)
+        return clean_state
+
+    def is_combat_active(self) -> bool:
+        """Returns whether an unresolved deterministic combat is active."""
+
+        return bool(self.get_combat_state().get("active", False))
+
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
         """
@@ -2565,7 +2675,8 @@ class SaveRepository:
                     category TEXT NOT NULL DEFAULT '',
                     quantity INTEGER NOT NULL DEFAULT 1,
                     description TEXT NOT NULL DEFAULT '',
-                    value_base_units INTEGER NOT NULL DEFAULT 0
+                    value_base_units INTEGER NOT NULL DEFAULT 0,
+                    metadata_json TEXT NOT NULL DEFAULT '{}'
                 );
 
                 CREATE TABLE IF NOT EXISTS item_catalog (
@@ -2574,6 +2685,7 @@ class SaveRepository:
                     category TEXT NOT NULL DEFAULT '',
                     description TEXT NOT NULL DEFAULT '',
                     value_base_units INTEGER NOT NULL DEFAULT 0,
+                    metadata_json TEXT NOT NULL DEFAULT '{}',
                     first_seen_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
@@ -2684,6 +2796,18 @@ class SaveRepository:
             )
             _ensure_column(
                 connection,
+                "inventory_items",
+                "metadata_json",
+                "TEXT NOT NULL DEFAULT '{}'",
+            )
+            _ensure_column(
+                connection,
+                "item_catalog",
+                "metadata_json",
+                "TEXT NOT NULL DEFAULT '{}'",
+            )
+            _ensure_column(
+                connection,
                 "npcs",
                 "display_name",
                 "TEXT NOT NULL DEFAULT ''",
@@ -2708,7 +2832,14 @@ class SaveRepository:
 
         rows = connection.execute(
             """
-            SELECT id, name, category, quantity, description, value_base_units
+            SELECT
+                id,
+                name,
+                category,
+                quantity,
+                description,
+                value_base_units,
+                metadata_json
             FROM inventory_items
             ORDER BY name COLLATE NOCASE, id ASC
             """
@@ -2742,13 +2873,23 @@ class SaveRepository:
                 "",
             )
             merged_value = max(int(row["value_base_units"]) for row in matching_rows)
+            merged_metadata = next(
+                (
+                    str(row["metadata_json"])
+                    for row in matching_rows
+                    if str(row["metadata_json"]).strip()
+                    and str(row["metadata_json"]).strip() != "{}"
+                ),
+                "{}",
+            )
             connection.execute(
                 """
                 UPDATE inventory_items
                 SET category = ?,
                     quantity = ?,
                     description = ?,
-                    value_base_units = ?
+                    value_base_units = ?,
+                    metadata_json = ?
                 WHERE id = ?
                 """,
                 (
@@ -2756,6 +2897,7 @@ class SaveRepository:
                     merged_quantity,
                     merged_description,
                     merged_value,
+                    merged_metadata,
                     primary_row["id"],
                 ),
             )
@@ -2770,7 +2912,7 @@ class SaveRepository:
 
         rows = connection.execute(
             """
-            SELECT name, category, description, value_base_units
+            SELECT name, category, description, value_base_units, metadata_json
             FROM inventory_items
             ORDER BY id ASC
             """
@@ -2783,6 +2925,7 @@ class SaveRepository:
                 category=str(row["category"]),
                 description=str(row["description"]),
                 value_base_units=int(row["value_base_units"]),
+                metadata=_decode_json_dict(row["metadata_json"], "inventory item metadata"),
             )
 
 
@@ -3110,6 +3253,7 @@ def _upsert_item_catalog_entry(
     category: str = "",
     description: str = "",
     value_base_units: int = 0,
+    metadata: Any | None = None,
 ) -> None:
     """Adds or updates the durable item definition catalog."""
 
@@ -3121,10 +3265,17 @@ def _upsert_item_catalog_entry(
     clean_category = category.strip()
     clean_description = description.strip()
     clean_value = max(0, _safe_int(value_base_units, default=0) or 0)
+    clean_metadata = normalize_item_metadata(
+        metadata,
+        name=clean_name,
+        category=clean_category,
+        description=clean_description,
+    )
+    metadata_json = _encode_json_dict(clean_metadata)
     now = datetime.now().isoformat(timespec="seconds")
     row = connection.execute(
         """
-        SELECT id, category, description, value_base_units, first_seen_at
+        SELECT id, category, description, value_base_units, metadata_json, first_seen_at
         FROM item_catalog
         WHERE name = ? COLLATE NOCASE
         ORDER BY id ASC
@@ -3141,12 +3292,21 @@ def _upsert_item_catalog_entry(
                 category,
                 description,
                 value_base_units,
+                metadata_json,
                 first_seen_at,
                 updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
-            (clean_name, clean_category, clean_description, clean_value, now, now),
+            (
+                clean_name,
+                clean_category,
+                clean_description,
+                clean_value,
+                metadata_json,
+                now,
+                now,
+            ),
         )
         return
 
@@ -3157,6 +3317,7 @@ def _upsert_item_catalog_entry(
             category = ?,
             description = ?,
             value_base_units = ?,
+            metadata_json = ?,
             updated_at = ?
         WHERE id = ?
         """,
@@ -3165,10 +3326,54 @@ def _upsert_item_catalog_entry(
             clean_category or str(row["category"]),
             clean_description or str(row["description"]),
             clean_value if clean_value > 0 else int(row["value_base_units"]),
+            metadata_json
+            if clean_metadata.get("item_type") != "Item"
+            else str(row["metadata_json"]),
             now,
             row["id"],
         ),
     )
+
+
+def _inventory_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    """Converts an inventory row to a plain dictionary."""
+
+    metadata = _decode_json_dict(row["metadata_json"], "inventory item metadata")
+    return {
+        "id": row["id"],
+        "name": row["name"],
+        "category": row["category"],
+        "quantity": row["quantity"],
+        "description": row["description"],
+        "value_base_units": row["value_base_units"],
+        "metadata": normalize_item_metadata(
+            metadata,
+            name=str(row["name"]),
+            category=str(row["category"]),
+            description=str(row["description"]),
+        ),
+    }
+
+
+def _item_catalog_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    """Converts an item catalog row to a plain dictionary."""
+
+    metadata = _decode_json_dict(row["metadata_json"], "item catalog metadata")
+    return {
+        "id": row["id"],
+        "name": row["name"],
+        "category": row["category"],
+        "description": row["description"],
+        "value_base_units": row["value_base_units"],
+        "metadata": normalize_item_metadata(
+            metadata,
+            name=str(row["name"]),
+            category=str(row["category"]),
+            description=str(row["description"]),
+        ),
+        "first_seen_at": row["first_seen_at"],
+        "updated_at": row["updated_at"],
+    }
 
 
 def _npc_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
@@ -3206,6 +3411,12 @@ def _encode_string_list(values: list[str]) -> str:
     return json.dumps(clean_values)
 
 
+def _encode_json_dict(value: Any) -> str:
+    """Encodes a JSON dictionary."""
+
+    return json.dumps(value if isinstance(value, dict) else {}, sort_keys=True)
+
+
 def _decode_string_list(raw_json: Any, label: str) -> list[str]:
     """Decodes a JSON string list, logging and recovering from invalid data."""
 
@@ -3224,6 +3435,22 @@ def _decode_string_list(raw_json: Any, label: str) -> list[str]:
         for value in values
         if str(value).strip()
     ]
+
+
+def _decode_json_dict(raw_json: Any, label: str) -> dict[str, Any]:
+    """Decodes a JSON dictionary."""
+
+    try:
+        value = json.loads(str(raw_json or "{}"))
+    except json.JSONDecodeError:
+        LOGGER.exception("Invalid JSON dictionary for %s.", label)
+        return {}
+
+    if not isinstance(value, dict):
+        LOGGER.warning("%s JSON was not a dictionary.", label)
+        return {}
+
+    return value
 
 
 def _decode_json_list(raw_json: Any, label: str) -> list[Any]:

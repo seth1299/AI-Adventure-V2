@@ -69,6 +69,81 @@ class EventApplierTests(unittest.TestCase):
                 {item["name"] for item in repository.list_inventory_items()},
             )
 
+    def test_combat_started_event_persists_combat_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = SaveRepository.create_new_save(Path(temp_dir), "Combat Event Test")
+            repository.add_inventory_item(
+                "Spear",
+                "Weapon",
+                1,
+                "A sturdy one-handed spear.",
+                6,
+                metadata={
+                    "item_type": "Weapon",
+                    "weapon_hands": "one-handed",
+                    "damage": "1d8",
+                },
+            )
+            repository.set_player_equipment({"Main Hand": "Spear"})
+            repository.set_setting("player.health_current", 18)
+            repository.set_setting("player.health_max", 24)
+
+            results = EventApplier(repository).apply_events(
+                [
+                    {
+                        "type": "CombatStartedEvent",
+                        "payload": {
+                            "description": "Two bandits draw blades.",
+                            "enemies": [
+                                {
+                                    "name": "Bandit",
+                                    "health": 7,
+                                    "armor_rating": 12,
+                                    "damage": "1d6+1",
+                                    "loot": ["Rusty Knife", "Copper Ring"],
+                                }
+                            ],
+                            "allies": [
+                                {
+                                    "name": "Mira",
+                                    "health": 10,
+                                    "armor_rating": 11,
+                                    "damage": "1d4",
+                                }
+                            ],
+                        },
+                    }
+                ]
+            )
+            combat_state = repository.get_combat_state()
+            player = combat_state["combatants"][0]
+            ally = combat_state["combatants"][1]
+            enemy = combat_state["combatants"][2]
+
+            self.assertEqual(results[0].status, "applied")
+            self.assertTrue(combat_state["active"])
+            self.assertEqual(combat_state["round"], 1)
+            self.assertEqual(player["name"], "Player Name")
+            self.assertEqual(player["team"], "party")
+            self.assertEqual(player["current_health"], 18)
+            self.assertEqual(player["max_health"], 24)
+            self.assertEqual(player["damage"], "1d8")
+            self.assertEqual(ally["name"], "Mira")
+            self.assertEqual(ally["team"], "party")
+            self.assertEqual(enemy["name"], "Bandit")
+            self.assertEqual(enemy["team"], "enemy")
+            self.assertEqual(enemy["current_health"], 7)
+            self.assertEqual(enemy["armor_rating"], 12)
+            self.assertEqual(enemy["damage"], "1d6+1")
+            self.assertEqual(enemy["loot"], ["Rusty Knife", "Copper Ring"])
+            self.assertEqual(combat_state["log"], ["Two bandits draw blades."])
+
+            skipped = EventApplier(repository).apply_event(
+                {"type": "CombatStartedEvent", "payload": {"enemy_name": "Second Bandit"}}
+            )
+
+            self.assertEqual(skipped.status, "skipped")
+
     def test_applies_status_flag_and_currency_events(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             repository = SaveRepository.create_new_save(Path(temp_dir), "Event Test")

@@ -27,7 +27,7 @@
         "rules": [
           "Return valid JSON only, with no Markdown fence.",
           "Only put player-facing text in response.",
-                    "Use supported events for inventory, world, quest, task, skill, currency, recipe, reagent, NPC, music, spell, note, flag, and status changes.",
+          "Use supported events for inventory, world, quest, task, skill, currency, combat, recipe, reagent, NPC, music, spell, note, flag, and status changes.",
           "The Python application validates events before committing state."
         ]
       }
@@ -98,7 +98,8 @@
           "Do not enclose normal item names in quotation marks.",
           "Only use quotation marks around an item name if it is a unique brand name, title, inscription, nickname, or personalized object name.",
           "When inventing new proper nouns, treat creative_ideas as the preferred naming source and avoid broad training-data fantasy defaults.",
-          "Before introducing any new personal name or proper noun, check the exact creative_ideas.banned_terms list. Never use those terms, close spelling variants, hyphenation variants, or obvious reskins for newly invented people, places, factions, religions, taverns, regions, shops, guilds, or landmarks unless already established.",
+          "The exact creative_ideas.banned_terms list is a hard exclusion list, not optional style guidance. Before introducing any new personal name or proper noun, check the list. Never use those terms, close spelling variants, hyphenation variants, or obvious reskins for newly invented people, places, factions, religions, taverns, regions, shops, guilds, landmarks, items, skills, calendar names, or event payload names unless already established or explicitly provided by the player. Before returning JSON, scan every string key and value and replace any newly invented banned term with a fresh non-banned name.",
+          "Do not use bare category labels as final proper nouns for meaningful institutions, factions, shops, taverns, roads, landmarks, districts, or locations. Names such as 'the Police Department', 'the Church', 'the Market', 'the Tavern', 'the Guild', 'the Harbor', 'the Hospital', 'the Academy', 'the Manor', and 'the Warehouse' are placeholders unless the player explicitly supplied that exact name. Give each important entity an in-world proper name, official office/precinct name, or local nickname; if the prose says it is known locally by a nickname, use that nickname or a concrete official name as the durable lore key. For example, prefer 'The Blue Wall' or 'Heights Central Precinct' over 'the Police Department' when writing lore keys.",
           "Prefer culturally distinct names with varied roots. For settlements, use geography, trade, history, climate, or local superstition as inspiration.",
           "Do not reuse a proper noun for a new character, settlement, faction, or landmark unless it is intentionally the same entity."
         ]
@@ -225,12 +226,11 @@
       "priority": 60,
       "content": {
         "rules": [
-          "For fighting and combat, use abstraction and relevant SkillUpsertedEvent structured events when necessary, perhaps assigning higher \"difficulty ratings\" to enemies that have stronger/heavier armor (or are just hard to pin down / have cover).",
-          "Don't get bogged down in trying to come up with complex weapon stats or \"attack rolls\" or \"armor class\" (unless that is a specific \"Status\" that the Player has specifically requested that you track).",
-          "You can still give weapons typical damages and/or damage types, but do not try to go and give them each a bunch of different stats that you would have to track.",
-          "Remember that the Player is not the only one in fights/combats and that other NPCs also get to make attacks and can also take damage/die (such as the Player's allies).",
-          "Do not give the Player's allies \"plot armor\" during combats just because they are friends with the Player Character.",
-          "Similarly, do not give the Player \"plot armor\" during combats. ---"
+          "When a situation becomes an actual fight, suggest CombatStartedEvent with concrete enemy combatants, optional allied combatants, health, armor_rating, damage dice, and loot.",
+          "After combat starts, do not narrate attack rolls, turn-by-turn attacks, damage totals, deaths, victory, defeat, or loot recovery as if they are resolved by the AI. The Python Combat tab resolves those mechanics deterministically and persists the active turn state.",
+          "Weapons should be created as Weapon items with weapon_hands and damage dice. Armor and shields should be created as Armor items with covers_body_parts and armor_rating so the Character sheet can equip them.",
+          "Remember that the Player is not the only one in fights/combats and that other NPCs can also attack, take damage, and die, including Player allies.",
+          "Do not give the Player, allies, or enemies plot armor during combats."
         ]
       }
     },
@@ -431,7 +431,12 @@
           "item_name",
           "description",
           "amount",
-          "value_base_units"
+          "value_base_units",
+          "weapon_hands",
+          "damage",
+          "damage_type",
+          "covers_body_parts",
+          "armor_rating"
         ],
         "purpose": "Adds an item to the player's inventory.",
         "rules": [
@@ -441,6 +446,8 @@
           "`Description` should explain what the item is and include in structured event data important state information, such as what sort of ammunition is used for a bow or a gun.",
           "`Amount` must be a positive integer.",
           "`ValueBaseUnits` is required for every InventoryItemAddedEvent and must be an integer of at least 1, measured in the baseline currency unit from state.currency.baseline_unit.",
+          "Weapon items should include weapon_hands and damage dice such as 1d6 or 2d6.",
+          "Armor and shield items should include covers_body_parts and armor_rating.",
           "Quest-related items should use `Quest Item` as the item type.",
           "Raw materials and refined materials should use different item types when relevant.",
           "Food, tools, weapons, ammo, armor, clothes, containers, crafting materials, books, documents, and valuables should be classified clearly."
@@ -487,9 +494,15 @@
         "payload_fields": [
           "target_name",
           "new_name",
+          "new_category",
           "new_description",
           "new_amount",
-          "new_value_base_units"
+          "new_value_base_units",
+          "weapon_hands",
+          "damage",
+          "damage_type",
+          "covers_body_parts",
+          "armor_rating"
         ],
         "purpose": "Changes the name, description, or amount of an existing inventory item without fully removing and re-adding it.",
         "rules": [
@@ -500,6 +513,31 @@
           "`NewAmount` must be an integer, `SAME`, or `SKIP`.",
           "`NewValueBaseUnits` may update the item value as an integer measured in the baseline currency unit.",
           "Do not use this to create a brand-new item. Use InventoryItemAddedEvent for that."
+        ]
+      }
+    },
+    {
+      "id": "event.combat_started",
+      "title": "CombatStartedEvent Contract",
+      "category": "event_contract",
+      "tags": [
+        "events",
+        "combat"
+      ],
+      "priority": 75,
+      "content": {
+        "event_type": "CombatStartedEvent",
+        "payload_fields": [
+          "description",
+          "enemies",
+          "allies"
+        ],
+        "purpose": "Starts deterministic app-managed combat in the Combat tab.",
+        "rules": [
+          "Suggest CombatStartedEvent when a scene becomes an actual fight that should use turns, health, armor, weapons, loot, and deterministic damage.",
+          "Each enemy should include name, health, armor_rating, damage dice, and loot.",
+          "Allies are optional but should include name, health, armor_rating, and damage dice when present.",
+          "After suggesting CombatStartedEvent, do not narrate attack rolls, damage totals, death, victory, defeat, or loot recovery as resolved story facts. The Python Combat tab handles those mechanics and persists whose turn it is."
         ]
       }
     },

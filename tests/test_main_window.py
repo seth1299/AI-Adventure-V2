@@ -16,24 +16,38 @@ if importlib.util.find_spec("PySide6") is None:
 
 from PySide6.QtCore import QEvent, Qt
 from PySide6.QtGui import QPalette
-from PySide6.QtWidgets import QApplication, QDialog, QGroupBox, QLabel, QLineEdit, QTableWidget
+from PySide6.QtWidgets import (
+    QApplication,
+    QDialog,
+    QGroupBox,
+    QLabel,
+    QLineEdit,
+    QMessageBox,
+    QTableWidget,
+)
 
 from ai_adventure.app.app_paths import AppPaths
 from ai_adventure.app.user_settings import load_app_settings
 from ai_adventure.audio.voices import DEFAULT_NARRATOR_VOICE
 from ai_adventure.calendar_system import DEFAULT_CALENDAR_SETTINGS
 from ai_adventure.new_game_setup import GREGORIAN_CALENDAR_SETTINGS, normalize_new_game_setup
+from ai_adventure.new_game_templates import load_new_game_templates
 from ai_adventure.persistence.save_repository import SaveRepository
 from ai_adventure.ui.main_window import (
     AlchemyNotebookScreen,
     CalendarSettingsDialog,
+    CharacterScreen,
+    CombatScreen,
+    CustomVoiceDialog,
     GameShell,
     HistoryScreen,
     MainMenuSettingsDialog,
     MainWindow,
+    NewGameTemplateManagerDialog,
     NewGameWizard,
     SettingsScreen,
     StoryScreen,
+    TTSSettingsDialog,
     WorldScreen,
     _preserve_player_character_text,
     _set_combo_to_data,
@@ -48,6 +62,7 @@ class FakeNarrationPlayer:
         self.enabled = True
         self.volume = None
         self.voice = DEFAULT_NARRATOR_VOICE
+        self.speed = 1.0
         self.samples = []
 
     def narrate(self, text, *, voice=None, on_chunk_start=None, on_complete=None):
@@ -75,8 +90,13 @@ class FakeNarrationPlayer:
     def set_voice(self, voice):
         self.voice = voice or DEFAULT_NARRATOR_VOICE
 
-    def play_sample(self, *, voice=None, volume=None, text=""):
-        self.samples.append({"voice": voice, "volume": volume, "text": text})
+    def set_speed(self, speed):
+        self.speed = speed
+
+    def play_sample(self, *, voice=None, volume=None, speed=None, text=""):
+        self.samples.append(
+            {"voice": voice, "volume": volume, "speed": speed, "text": text}
+        )
         return True
 
     def play_chunk(self, text: str) -> None:
@@ -442,6 +462,195 @@ class MainWindowTests(unittest.TestCase):
             self.assertNotIn("*Stay calm,*", plain_text)
             screen.close()
 
+    def test_story_screen_blocks_input_during_active_combat(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            QApplication.instance() or QApplication([])
+            repository = SaveRepository.create_new_save(Path(temp_dir), "Combat Lock Test")
+            repository.set_combat_state(
+                {
+                    "active": True,
+                    "round": 1,
+                    "turn_index": 0,
+                    "combatants": [
+                        {
+                            "id": "player",
+                            "name": "Player",
+                            "team": "party",
+                            "current_health": 20,
+                            "max_health": 20,
+                            "armor_rating": 10,
+                            "damage": "1d4",
+                        },
+                        {
+                            "id": "enemy-1-wolf",
+                            "name": "Wolf",
+                            "team": "enemy",
+                            "current_health": 4,
+                            "max_health": 4,
+                            "armor_rating": 10,
+                            "damage": "1d6",
+                        },
+                    ],
+                }
+            )
+            screen = StoryScreen()
+            screen.set_repository(repository)
+
+            self.assertFalse(screen.player_input.isEnabled())
+            self.assertFalse(screen.submit_button.isEnabled())
+            self.assertEqual(screen.player_input.placeholderText(), "Combat is active...")
+            self.assertIn("Resolve the active combat", screen.player_input.toolTip())
+
+            combat_state = repository.get_combat_state()
+            combat_state["active"] = False
+            repository.set_combat_state(combat_state)
+            screen.refresh()
+
+            self.assertTrue(screen.player_input.isEnabled())
+            self.assertTrue(screen.submit_button.isEnabled())
+            self.assertEqual(screen.player_input.placeholderText(), "Enter a player action...")
+            screen.close()
+
+    def test_character_sheet_equips_weapon_armor_and_saves_stats(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            QApplication.instance() or QApplication([])
+            repository = SaveRepository.create_new_save(Path(temp_dir), "Character Sheet Test")
+            repository.add_inventory_item(
+                "Longsword",
+                "Weapon",
+                1,
+                "A balanced one-handed blade.",
+                15,
+                metadata={
+                    "item_type": "Weapon",
+                    "weapon_hands": "one-handed",
+                    "damage": "1d8",
+                },
+            )
+            repository.add_inventory_item(
+                "Leather Armor",
+                "Armor",
+                1,
+                "Flexible armor that protects the torso, arms, and legs.",
+                20,
+                metadata={
+                    "item_type": "Armor",
+                    "covers_body_parts": ["Torso", "Arms", "Legs"],
+                    "armor_rating": 2,
+                },
+            )
+            repository.add_inventory_item(
+                "Tower Shield",
+                "Armor",
+                1,
+                "A broad shield carried in the off hand.",
+                10,
+                metadata={
+                    "item_type": "Armor",
+                    "covers_body_parts": ["Off Hand"],
+                    "armor_rating": 2,
+                },
+            )
+            screen = CharacterScreen()
+            screen.set_repository(repository)
+
+            _set_combo_to_data(screen.equipment_combos["Main Hand"], "Longsword")
+            _set_combo_to_data(screen.equipment_combos["Off Hand"], "Tower Shield")
+            _set_combo_to_data(screen.equipment_combos["Torso"], "Leather Armor")
+            _set_combo_to_data(screen.equipment_combos["Arms"], "Leather Armor")
+            screen.health_max_input.setValue(20)
+            screen.health_current_input.setValue(15)
+
+            with patch("ai_adventure.ui.main_window.QMessageBox.information"):
+                screen._save_character()
+
+            equipment = repository.get_player_equipment()
+
+            self.assertEqual(equipment["Main Hand"], "Longsword")
+            self.assertEqual(equipment["Off Hand"], "Tower Shield")
+            self.assertEqual(equipment["Torso"], "Leather Armor")
+            self.assertEqual(equipment["Arms"], "Leather Armor")
+            self.assertEqual(repository.get_setting("player.health_current"), 15)
+            self.assertEqual(repository.get_setting("player.health_max"), 20)
+            self.assertEqual(repository.get_setting("player.armor_rating"), 14)
+            self.assertEqual(screen.armor_rating_label.text(), "14")
+            self.assertEqual(screen.weapon_damage_label.text(), "1d8")
+            screen.close()
+
+    def test_character_sheet_rejects_off_hand_when_main_weapon_is_two_handed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            QApplication.instance() or QApplication([])
+            repository = SaveRepository.create_new_save(Path(temp_dir), "Two Handed Test")
+            repository.add_inventory_item(
+                "Greatsword",
+                "Weapon",
+                1,
+                "A two-handed weapon.",
+                25,
+                metadata={
+                    "item_type": "Weapon",
+                    "weapon_hands": "two-handed",
+                    "damage": "2d6",
+                },
+            )
+            repository.add_inventory_item(
+                "Round Shield",
+                "Armor",
+                1,
+                "A shield carried in the off hand.",
+                8,
+                metadata={
+                    "item_type": "Armor",
+                    "covers_body_parts": ["Off Hand"],
+                    "armor_rating": 2,
+                },
+            )
+            screen = CharacterScreen()
+            screen.set_repository(repository)
+
+            _set_combo_to_data(screen.equipment_combos["Off Hand"], "Round Shield")
+            _set_combo_to_data(screen.equipment_combos["Main Hand"], "Greatsword")
+
+            with patch("ai_adventure.ui.main_window.QMessageBox.information"):
+                screen._save_character()
+
+            equipment = repository.get_player_equipment()
+
+            self.assertEqual(equipment["Main Hand"], "Greatsword")
+            self.assertEqual(equipment["Off Hand"], "")
+            self.assertEqual(repository.get_setting("player.armor_rating"), 10)
+            self.assertEqual(screen.weapon_damage_label.text(), "2d6")
+            screen.close()
+
+    def test_combat_screen_resolves_victory_and_grants_loot(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            QApplication.instance() or QApplication([])
+            repository = SaveRepository.create_new_save(Path(temp_dir), "Combat UI Test")
+            screen = CombatScreen()
+            screen.set_repository(repository)
+            screen.name_input.setText("Wolf")
+            screen.health_input.setValue(1)
+            screen.armor_input.setValue(1)
+            screen.damage_input.setText("1d1")
+            screen.loot_input.setText("Wolf Fang")
+
+            screen._start_combat()
+
+            self.assertTrue(repository.is_combat_active())
+            self.assertTrue(screen.attack_button.isEnabled())
+
+            with patch("ai_adventure.ui.main_window.random.randint", return_value=20):
+                screen._resolve_current_turn()
+
+            items = repository.list_inventory_items()
+            combat_state = repository.get_combat_state()
+
+            self.assertFalse(combat_state["active"])
+            self.assertIn("Wolf Fang", {item["name"] for item in items})
+            self.assertIn("Combat resolved: victory.", "\n".join(combat_state["log"]))
+            self.assertEqual(repository.get_setting("player.health_current"), 20)
+            screen.close()
+
     def test_world_screen_renders_markdown_summary_and_lore(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             QApplication.instance() or QApplication([])
@@ -576,6 +785,55 @@ class MainWindowTests(unittest.TestCase):
             self.assertEqual(calendar_settings["day_names"][0], "Bell")
             self.assertEqual(calendar_settings["time_display"], "24_hour")
             self.assertIn("08:00", repository.get_state_value("time"))
+            window.close()
+
+    def test_ai_generated_calendar_rejects_default_gregorian_ai_output(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            QApplication.instance() or QApplication([])
+            temp_path = Path(temp_dir)
+            (temp_path / "saves").mkdir(parents=True, exist_ok=True)
+            (temp_path / "logs").mkdir(parents=True, exist_ok=True)
+            setup = normalize_new_game_setup(
+                {"title": "AI Calendar", "calendar": {"calendar_type": "ai_generated"}}
+            )
+            repository = SaveRepository.create_new_save(
+                temp_path,
+                "AI Calendar",
+                setup=setup,
+            )
+            window = MainWindow(
+                app_paths=AppPaths(
+                    app_data_dir=temp_path,
+                    saves_dir=temp_path / "saves",
+                    logs_dir=temp_path / "logs",
+                    log_file=temp_path / "logs" / "ai_adventure.log",
+                )
+            )
+
+            window._apply_new_game_ai_state(
+                repository,
+                setup,
+                SimpleNamespace(
+                    start_location="",
+                    calendar_settings=GREGORIAN_CALENDAR_SETTINGS,
+                    starting_calendar={"day_of_month": 1, "time_of_day_minutes": 480},
+                    start_weather="",
+                    finalized_starting_currency_balance_base_units=None,
+                    finalized_currency_denominations=[],
+                    finalized_currency_description="",
+                    selected_genre="",
+                    finalized_character={},
+                    finalized_skills=[],
+                    finalized_starter_items=[],
+                ),
+            )
+
+            calendar_settings = repository.get_calendar_settings()
+
+            self.assertEqual(calendar_settings["days_per_week"], 8)
+            self.assertEqual(calendar_settings["day_names"][0], "Dawn")
+            self.assertNotEqual(calendar_settings["month_names"][0], "January")
+            self.assertIn("Dawn", repository.get_state_value("time"))
             window.close()
 
     def test_ai_new_game_state_preserves_player_provided_character_fields(self) -> None:
@@ -1092,14 +1350,113 @@ class MainWindowTests(unittest.TestCase):
 
             shell.settings_screen.music_volume_slider.setValue(42)
             shell.settings_screen.music_volume_slider.sliderReleased.emit()
-            _set_combo_to_data(shell.settings_screen.tts_voice_combo, "am_echo")
+            shell.settings_screen._save_tts_settings(
+                {
+                    "narrator_enabled": True,
+                    "tts_volume": 88,
+                    "tts_voice": "am_echo",
+                    "tts_speed": 125,
+                    "tts_voice_mode": "preset",
+                }
+            )
             QApplication.processEvents()
 
             self.assertEqual(repository.get_setting("audio.music_volume"), 42)
             self.assertEqual(repository.get_setting("audio.tts_voice"), "am_echo")
+            self.assertEqual(repository.get_setting("audio.tts_speed"), 125)
             self.assertFalse(hasattr(shell.settings_screen, "days_per_week_input"))
             self.assertEqual(shell.calendar_screen.table.columnCount(), 7)
             shell.close()
+
+    def test_settings_currency_rows_match_active_save_denominations(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            QApplication.instance() or QApplication([])
+            repository = SaveRepository.create_new_save(Path(temp_dir), "Currency Settings Test")
+            repository.set_currency_denominations(
+                [{"name": "Credit", "plural_name": "Credits", "value": 1}]
+            )
+            screen = SettingsScreen()
+            screen.set_repository(repository)
+
+            self.assertEqual(len(screen.currency_name_inputs), 1)
+            self.assertEqual(screen.currency_name_inputs[0].text(), "Credit")
+            self.assertEqual(screen.currency_plural_inputs[0].text(), "Credits")
+            self.assertFalse(screen.currency_value_inputs[0].isEnabled())
+            self.assertTrue(screen.add_settings_currency_button.isEnabled())
+
+            screen.add_settings_currency_button.click()
+            self.assertEqual(len(screen.currency_name_inputs), 2)
+            screen.currency_name_inputs[1].setText("Marker")
+            screen.currency_plural_inputs[1].setText("Markers")
+            screen.currency_value_inputs[1].setValue(5)
+            screen._save_settings()
+
+            denominations = repository.get_currency_denominations()
+            self.assertEqual([denomination["name"] for denomination in denominations], ["Credit", "Marker"])
+            self.assertEqual(denominations[1]["value"], 5)
+
+            screen.currency_remove_buttons[1].click()
+            denominations = repository.get_currency_denominations()
+            self.assertEqual([denomination["name"] for denomination in denominations], ["Credit"])
+            self.assertEqual(len(screen.currency_name_inputs), 1)
+            screen.close()
+
+    def test_settings_custom_voice_dialog_persists_to_save_and_app_defaults(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            QApplication.instance() or QApplication([])
+            repository = SaveRepository.create_new_save(Path(temp_dir), "Voice Defaults Test")
+            app_tts_settings = []
+            screen = SettingsScreen(
+                on_app_tts_settings_saved=app_tts_settings.append,
+                voice_options={
+                    "Sarah (Female, US)": "af_sarah",
+                    "Echo (Male, US)": "am_echo",
+                },
+            )
+            screen.set_repository(repository)
+            saved_voice_audio = {
+                "narrator_enabled": True,
+                "tts_volume": 43,
+                "tts_voice": "af_sarah",
+                "tts_speed": 133,
+                "tts_voice_mode": "blend",
+                "tts_voice_blend": {
+                    "name": "Storm Blend",
+                    "voice_a": "af_sarah",
+                    "voice_b": "am_echo",
+                    "voice_a_weight": 71,
+                    "tts_volume": 43,
+                    "tts_speed": 133,
+                },
+                "tts_custom_voices": [
+                    {
+                        "name": "Storm Blend",
+                        "voice_a": "af_sarah",
+                        "voice_b": "am_echo",
+                        "voice_a_weight": 71,
+                        "tts_volume": 43,
+                        "tts_speed": 133,
+                    }
+                ],
+            }
+            fake_dialog = SimpleNamespace(
+                custom_voice_library_changed=True,
+                exec=lambda: QDialog.DialogCode.Accepted,
+                build_audio_settings=lambda: saved_voice_audio,
+            )
+
+            with patch(
+                "ai_adventure.ui.main_window.CustomVoiceDialog",
+                return_value=fake_dialog,
+            ):
+                screen.custom_voice_button.click()
+
+            self.assertEqual(
+                repository.get_setting("audio.tts_custom_voices")[0]["name"],
+                "Storm Blend",
+            )
+            self.assertEqual(app_tts_settings[0]["tts_custom_voices"][0]["name"], "Storm Blend")
+            screen.close()
 
     def test_calendar_screen_settings_dialog_persists_and_refreshes_tabs(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1209,22 +1566,84 @@ class MainWindowTests(unittest.TestCase):
     def test_settings_sample_voice_uses_selected_voice_and_volume(self) -> None:
         QApplication.instance() or QApplication([])
         samples = []
-        screen = SettingsScreen(
+        dialog = TTSSettingsDialog(
+            audio_settings={
+                "narrator_enabled": True,
+                "tts_volume": 90,
+                "tts_voice": "af_sarah",
+                "tts_speed": 100,
+            },
             voice_options={
                 "Sarah (Female, US)": "af_sarah",
                 "Echo (Male, US)": "am_echo",
             },
-            on_sample_voice=lambda voice, volume: samples.append((voice, volume)) or True,
+            on_sample_voice=lambda voice, volume, speed: samples.append(
+                (voice, volume, speed)
+            )
+            or True,
         )
 
         try:
-            _set_combo_to_data(screen.tts_voice_combo, "am_echo")
-            screen.tts_volume_slider.setValue(41)
-            screen.sample_voice_button.click()
+            widget = dialog.tts_settings_widget
+            _set_combo_to_data(widget.tts_voice_combo, "am_echo")
+            widget.tts_volume_slider.setValue(41)
+            widget.tts_speed_slider.setValue(125)
+            widget.sample_voice_button.click()
 
-            self.assertEqual(samples, [("am_echo", 41)])
+            self.assertEqual(samples, [("am_echo", 41, 125)])
         finally:
-            screen.close()
+            dialog.close()
+
+    def test_tts_settings_widget_hides_options_until_narrator_is_enabled(self) -> None:
+        QApplication.instance() or QApplication([])
+        dialog = TTSSettingsDialog(
+            audio_settings={
+                "narrator_enabled": False,
+                "tts_volume": 90,
+                "tts_voice": "af_sarah",
+                "tts_speed": 100,
+                "tts_voice_mode": "preset",
+            },
+            voice_options={
+                "Sarah (Female, US)": "af_sarah",
+                "Echo (Male, US)": "am_echo",
+            },
+        )
+
+        try:
+            widget = dialog.tts_settings_widget
+            form = widget.layout()
+
+            self.assertEqual(widget.tts_volume_slider.value(), 90)
+            self.assertEqual(widget.tts_volume_label.text(), "90%")
+            self.assertTrue(widget.tts_volume_row.isHidden())
+            self.assertTrue(widget.tts_speed_row.isHidden())
+            self.assertTrue(widget.voice_mode_combo.isHidden())
+            self.assertTrue(widget.preset_voice_combo.isHidden())
+            self.assertTrue(widget.custom_voice_row.isHidden())
+            self.assertTrue(widget.voice_button_row.isHidden())
+            self.assertEqual(
+                form.labelForField(widget.custom_voice_row).text(),
+                "Custom Voice:",
+            )
+            self.assertFalse(hasattr(widget, "custom_voice_name_input"))
+
+            widget.narrator_enabled_checkbox.setChecked(True)
+
+            self.assertFalse(widget.tts_volume_row.isHidden())
+            self.assertFalse(widget.tts_speed_row.isHidden())
+            self.assertFalse(widget.voice_mode_combo.isHidden())
+            self.assertFalse(widget.preset_voice_combo.isHidden())
+            self.assertTrue(widget.custom_voice_row.isHidden())
+            self.assertFalse(widget.voice_button_row.isHidden())
+
+            _set_combo_to_data(widget.voice_mode_combo, "blend")
+
+            self.assertTrue(widget.preset_voice_combo.isHidden())
+            self.assertFalse(widget.custom_voice_row.isHidden())
+            self.assertTrue(widget.custom_voice_button.isEnabled())
+        finally:
+            dialog.close()
 
     def test_main_menu_exposes_settings_button(self) -> None:
         QApplication.instance() or QApplication([])
@@ -1242,9 +1661,94 @@ class MainWindowTests(unittest.TestCase):
             window = MainWindow(app_paths=app_paths)
 
             self.assertEqual(window.main_menu.settings_button.text(), "Settings")
+            self.assertEqual(window.main_menu.templates_button.text(), "New Game Templates")
 
             window.close()
             apply_application_theme("Light")
+
+    def test_new_game_template_manager_saves_renames_and_deletes_partial_template(self) -> None:
+        QApplication.instance() or QApplication([])
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            template_path = Path(temp_dir) / "new_game_templates.json"
+            dialog = NewGameTemplateManagerDialog(template_path=template_path)
+
+            try:
+                dialog.template_name_input.setText("Mystery Shell")
+                dialog.save_title_input.clear()
+                dialog.genre_input.setText("Cozy mystery")
+                dialog.character_name_input.clear()
+                dialog.skill_inputs[0][1].setText("Observation")
+                dialog.skill_inputs[0][2].setText("Spotting small clues.")
+                level_three_index = next(
+                    index
+                    for index, (level, _skill_input, _description_input) in enumerate(
+                        dialog.skill_inputs
+                    )
+                    if level == 3
+                )
+                dialog.skill_inputs[level_three_index][1].setText("Deduction")
+                dialog.skill_inputs[level_three_index][2].setText("Connecting subtle evidence.")
+                _set_combo_to_data(dialog.narration_tense_combo, "past")
+                _set_combo_to_data(dialog.narration_style_combo, "third_person_limited")
+                dialog._append_starter_item_row(
+                    {
+                        "name": "Notebook",
+                        "category": "Tool",
+                        "quantity": 1,
+                        "description": "Case notes.",
+                        "value_base_units": 4,
+                    }
+                )
+                dialog._append_currency_row({"name": "Coin", "plural_name": "Coins", "value": 1})
+                dialog._append_economy_example_row(
+                    {"name": "Bread", "value_base_units": 2}
+                )
+                _set_combo_to_data(dialog.calendar_type_combo, "ai_generated")
+                dialog._save_template()
+
+                templates = load_new_game_templates(template_path, normalize_setups=False)
+
+                self.assertEqual([template.name for template in templates], ["Mystery Shell"])
+                self.assertEqual(templates[0].setup["title"], "")
+                self.assertEqual(templates[0].setup["character"]["name"], "")
+                self.assertEqual(templates[0].setup["specified_genre"], "Cozy mystery")
+                self.assertEqual(templates[0].setup["narration"]["tense"], "past")
+                self.assertEqual(
+                    templates[0].setup["narration"]["style"],
+                    "third_person_limited",
+                )
+                self.assertEqual(templates[0].setup["skills"][0]["name"], "Observation")
+                self.assertEqual(templates[0].setup["skills"][0]["level"], 5)
+                self.assertEqual(templates[0].setup["skills"][1]["name"], "Deduction")
+                self.assertEqual(templates[0].setup["skills"][1]["level"], 3)
+                self.assertEqual(dialog.skill_inputs[1][1].text(), "")
+                self.assertEqual(dialog.skill_inputs[2][1].text(), "")
+                self.assertEqual(dialog.skill_inputs[level_three_index][1].text(), "Deduction")
+                self.assertEqual(templates[0].setup["starter_items"][0]["name"], "Notebook")
+                self.assertEqual(
+                    templates[0].setup["currency_denominations"][0]["name"],
+                    "Coin",
+                )
+                self.assertEqual(templates[0].setup["economy_examples"][0]["name"], "Bread")
+                self.assertIn("Bread costs 2 base units", templates[0].setup["currency_description"])
+                self.assertEqual(templates[0].setup["calendar"]["calendar_type"], "ai_generated")
+
+                dialog.template_name_input.setText("Rainy Mystery Shell")
+                dialog._save_template()
+
+                templates = load_new_game_templates(template_path, normalize_setups=False)
+                self.assertEqual([template.name for template in templates], ["Rainy Mystery Shell"])
+
+                with patch(
+                    "ai_adventure.ui.main_window.QMessageBox.question",
+                    return_value=QMessageBox.StandardButton.Yes,
+                ):
+                    dialog._delete_template()
+
+                self.assertEqual(load_new_game_templates(template_path, normalize_setups=False), [])
+            finally:
+                dialog.close()
 
     def test_main_menu_settings_apply_and_persist_without_save(self) -> None:
         app = QApplication.instance() or QApplication([])
@@ -1267,12 +1771,13 @@ class MainWindowTests(unittest.TestCase):
                     "audio": {
                         "music_enabled": False,
                         "narrator_enabled": False,
-                        "music_volume": 7,
-                        "tts_volume": 20,
-                        "tts_voice": "am_echo",
-                    },
+                    "music_volume": 7,
+                    "tts_volume": 20,
+                    "tts_voice": "am_echo",
+                    "tts_speed": 130,
                 },
-                persist=True,
+            },
+            persist=True,
             )
 
             saved_settings = load_app_settings(app_paths.app_settings_path)
@@ -1281,6 +1786,7 @@ class MainWindowTests(unittest.TestCase):
             self.assertFalse(saved_settings["audio"]["music_enabled"])
             self.assertEqual(saved_settings["audio"]["music_volume"], 7)
             self.assertEqual(saved_settings["audio"]["tts_voice"], "am_echo")
+            self.assertEqual(saved_settings["audio"]["tts_speed"], 130)
             self.assertEqual(window.menu_theme, "Dark")
             self.assertFalse(window.sound_manager.music_enabled)
             self.assertEqual(window.sound_manager.music_volume, 0.07)
@@ -1288,6 +1794,68 @@ class MainWindowTests(unittest.TestCase):
                 app.palette().color(QPalette.ColorRole.Window).name(),
                 "#202124",
             )
+
+            window.close()
+            apply_application_theme("Light")
+
+    def test_main_window_persists_custom_voice_defaults_to_app_settings(self) -> None:
+        QApplication.instance() or QApplication([])
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            app_paths = AppPaths(
+                app_data_dir=temp_path,
+                saves_dir=temp_path / "saves",
+                logs_dir=temp_path / "logs",
+                log_file=temp_path / "logs" / "ai_adventure.log",
+            )
+            app_paths.saves_dir.mkdir(parents=True, exist_ok=True)
+            app_paths.logs_dir.mkdir(parents=True, exist_ok=True)
+            window = MainWindow(app_paths=app_paths)
+
+            window._persist_app_tts_settings(
+                {
+                    "narrator_enabled": True,
+                    "tts_volume": 41,
+                    "tts_voice": "af_sarah",
+                    "tts_speed": 132,
+                    "tts_voice_mode": "blend",
+                    "tts_voice_blend": {
+                        "name": "Storm Blend",
+                        "voice_a": "af_sarah",
+                        "voice_b": "am_echo",
+                        "voice_a_weight": 72,
+                        "tts_volume": 41,
+                        "tts_speed": 132,
+                    },
+                    "tts_custom_voices": [
+                        {
+                            "name": "Storm Blend",
+                            "voice_a": "af_sarah",
+                            "voice_b": "am_echo",
+                            "voice_a_weight": 72,
+                            "tts_volume": 41,
+                            "tts_speed": 132,
+                        }
+                    ],
+                }
+            )
+
+            saved_settings = load_app_settings(app_paths.app_settings_path)
+
+            self.assertEqual(
+                saved_settings["audio"]["tts_custom_voices"][0]["name"],
+                "Storm Blend",
+            )
+            self.assertEqual(
+                saved_settings["audio"]["tts_custom_voices"][0]["tts_volume"],
+                41,
+            )
+            self.assertEqual(
+                saved_settings["audio"]["tts_custom_voices"][0]["tts_speed"],
+                132,
+            )
+            self.assertEqual(saved_settings["audio"]["tts_voice_mode"], "blend")
 
             window.close()
             apply_application_theme("Light")
@@ -1303,6 +1871,7 @@ class MainWindowTests(unittest.TestCase):
                     "music_volume": 25,
                     "tts_volume": 90,
                     "tts_voice": "af_sarah",
+                    "tts_speed": 100,
                 },
             },
             tts_enabled=True,
@@ -1318,6 +1887,7 @@ class MainWindowTests(unittest.TestCase):
             dialog.music_volume_slider.setValue(12)
             dialog.narrator_enabled_checkbox.setChecked(False)
             dialog.tts_volume_slider.setValue(34)
+            dialog.tts_settings_widget.tts_speed_slider.setValue(135)
             _set_combo_to_data(dialog.tts_voice_combo, "am_echo")
 
             settings = dialog.build_settings()
@@ -1328,6 +1898,7 @@ class MainWindowTests(unittest.TestCase):
             self.assertFalse(settings["audio"]["narrator_enabled"])
             self.assertEqual(settings["audio"]["tts_volume"], 34)
             self.assertEqual(settings["audio"]["tts_voice"], "am_echo")
+            self.assertEqual(settings["audio"]["tts_speed"], 135)
         finally:
             dialog.close()
 
@@ -1343,6 +1914,7 @@ class MainWindowTests(unittest.TestCase):
                     "music_volume": 25,
                     "tts_volume": 90,
                     "tts_voice": "af_sarah",
+                    "tts_speed": 100,
                 },
             },
             tts_enabled=True,
@@ -1359,6 +1931,145 @@ class MainWindowTests(unittest.TestCase):
             dialog.sample_voice_button.click()
 
             self.assertEqual(samples, [("am_echo", 37)])
+        finally:
+            dialog.close()
+
+    def test_custom_voice_dialog_links_blend_sliders_and_saves_as(self) -> None:
+        QApplication.instance() or QApplication([])
+        dialog = CustomVoiceDialog(
+            audio_settings={
+                "narrator_enabled": True,
+                "tts_voice_mode": "blend",
+                "tts_voice_blend": {
+                    "name": "Rain Voice",
+                    "voice_a": "af_sarah",
+                    "voice_b": "am_echo",
+                    "voice_a_weight": 50,
+                },
+            },
+            voice_options={
+                "Sarah (Female, US)": "af_sarah",
+                "Echo (Male, US)": "am_echo",
+            },
+        )
+
+        try:
+            dialog.voice_a_weight_slider.setValue(65)
+            self.assertEqual(dialog.voice_a_weight_slider.value(), 65)
+            self.assertEqual(dialog.voice_b_weight_slider.value(), 35)
+
+            dialog.voice_b_weight_slider.setValue(20)
+            self.assertEqual(dialog.voice_a_weight_slider.value(), 80)
+            self.assertEqual(dialog.voice_b_weight_slider.value(), 20)
+
+            dialog.tts_volume_slider.setValue(42)
+            dialog.tts_speed_slider.setValue(135)
+            _set_combo_to_data(dialog.voice_a_combo, "af_sarah")
+            _set_combo_to_data(dialog.voice_b_combo, "am_echo")
+
+            with patch(
+                "ai_adventure.ui.main_window.QInputDialog.getText",
+                return_value=("Storm Blend", True),
+            ):
+                dialog.save_custom_voice_as_button.click()
+
+            settings = dialog.build_audio_settings()
+
+            self.assertEqual(settings["tts_voice_mode"], "blend")
+            self.assertEqual(settings["tts_voice_blend"]["voice_a_weight"], 80)
+            self.assertEqual(settings["tts_voice_blend"]["voice_b_weight"], 20)
+            self.assertIn("Storm Blend", dialog.custom_voice_combo.currentText())
+            self.assertEqual(settings["tts_custom_voices"][0]["name"], "Storm Blend")
+            self.assertEqual(settings["tts_custom_voices"][0]["tts_volume"], 42)
+            self.assertEqual(settings["tts_custom_voices"][0]["tts_speed"], 135)
+            self.assertTrue(dialog.custom_voice_library_changed)
+        finally:
+            dialog.close()
+
+    def test_custom_voice_dialog_loads_custom_voice_volume_and_speed(self) -> None:
+        QApplication.instance() or QApplication([])
+        dialog = CustomVoiceDialog(
+            audio_settings={
+                "narrator_enabled": True,
+                "tts_volume": 90,
+                "tts_speed": 100,
+                "tts_voice_mode": "blend",
+                "tts_custom_voices": [
+                    {
+                        "name": "Storm Blend",
+                        "voice_a": "af_sarah",
+                        "voice_b": "am_echo",
+                        "voice_a_weight": 65,
+                        "tts_volume": 38,
+                        "tts_speed": 145,
+                    }
+                ],
+            },
+            voice_options={
+                "Sarah (Female, US)": "af_sarah",
+                "Echo (Male, US)": "am_echo",
+            },
+        )
+
+        try:
+            dialog.custom_voice_combo.setCurrentIndex(1)
+            dialog.load_custom_voice_button.click()
+
+            self.assertIn("Storm Blend", dialog.current_voice_label.text())
+            self.assertEqual(dialog.voice_a_weight_slider.value(), 65)
+            self.assertEqual(dialog.voice_b_weight_slider.value(), 35)
+            self.assertEqual(dialog.tts_volume_slider.value(), 38)
+            self.assertEqual(dialog.tts_speed_slider.value(), 145)
+        finally:
+            dialog.close()
+
+    def test_custom_voice_dialog_saves_loaded_voice_and_renames_explicitly(self) -> None:
+        QApplication.instance() or QApplication([])
+        dialog = CustomVoiceDialog(
+            audio_settings={
+                "narrator_enabled": True,
+                "tts_voice_mode": "blend",
+                "tts_voice_blend": {
+                    "name": "Storm Blend",
+                    "voice_a": "af_sarah",
+                    "voice_b": "am_echo",
+                    "voice_a_weight": 65,
+                },
+                "tts_custom_voices": [
+                    {
+                        "name": "Storm Blend",
+                        "voice_a": "af_sarah",
+                        "voice_b": "am_echo",
+                        "voice_a_weight": 65,
+                    }
+                ],
+            },
+            voice_options={
+                "Sarah (Female, US)": "af_sarah",
+                "Echo (Male, US)": "am_echo",
+            },
+        )
+
+        try:
+            self.assertTrue(dialog.save_custom_voice_button.isEnabled())
+            self.assertFalse(hasattr(dialog, "custom_voice_name_input"))
+
+            dialog.voice_a_weight_slider.setValue(70)
+            dialog.save_custom_voice_button.click()
+
+            settings = dialog.build_audio_settings()
+            self.assertEqual(settings["tts_custom_voices"][0]["name"], "Storm Blend")
+            self.assertEqual(settings["tts_custom_voices"][0]["voice_a_weight"], 70)
+
+            with patch(
+                "ai_adventure.ui.main_window.QInputDialog.getText",
+                return_value=("Rain Blend", True),
+            ):
+                dialog.rename_custom_voice_button.click()
+
+            settings = dialog.build_audio_settings()
+            self.assertEqual(settings["tts_custom_voices"][0]["name"], "Rain Blend")
+            self.assertNotIn("Storm Blend", [voice["name"] for voice in settings["tts_custom_voices"]])
         finally:
             dialog.close()
 
@@ -1804,6 +2515,7 @@ class MainWindowTests(unittest.TestCase):
                     "music_volume": 10,
                     "tts_volume": 30,
                     "tts_voice": "am_echo",
+                    "tts_speed": 140,
                 },
                 "narration": {
                     "tense": "past",
@@ -1813,7 +2525,9 @@ class MainWindowTests(unittest.TestCase):
                     {"name": "Bit", "plural_name": "Bits", "value": 1},
                     {"name": "Crown", "plural_name": "Crowns", "value": 12},
                 ],
-                "currency_description": "Crowns dominate city trade.",
+                "economy_examples": [
+                    {"name": "Bread", "value_base_units": 2},
+                ],
                 "specified_genre": "Realistic detective mystery",
                 "game_style": "Quiet investigation.",
                 "start_location": "Rainmarket Station",
@@ -1833,6 +2547,9 @@ class MainWindowTests(unittest.TestCase):
         self.assertEqual(wizard.starter_items_table.cellWidget(0, 4).value(), 4)
         self.assertEqual(wizard.currency_table.rowCount(), 2)
         self.assertEqual(wizard.currency_table.cellWidget(1, 0).text(), "Crown")
+        self.assertEqual(wizard.economy_examples_table.rowCount(), 1)
+        self.assertEqual(wizard.economy_examples_table.cellWidget(0, 0).text(), "Bread")
+        self.assertEqual(wizard.economy_examples_table.cellWidget(0, 1).value(), 2)
         self.assertEqual(wizard.calendar_type_combo.currentData(), "gregorian")
         self.assertFalse(wizard.calendar_settings_button.isEnabled())
         self.assertEqual(wizard.narration_tense_combo.currentData(), "past")
@@ -1844,6 +2561,7 @@ class MainWindowTests(unittest.TestCase):
         self.assertFalse(wizard.narrator_enabled_checkbox.isChecked())
         self.assertEqual(wizard.music_volume_slider.value(), 10)
         self.assertEqual(wizard.tts_volume_slider.value(), 30)
+        self.assertEqual(wizard.tts_speed_slider.value(), 140)
         self.assertEqual(wizard.tts_voice_combo.currentData(), "am_echo")
         setup = wizard.build_setup()
         self.assertEqual(setup["skills"][0]["description"], "Skill 0 description.")
@@ -1858,9 +2576,33 @@ class MainWindowTests(unittest.TestCase):
         self.assertEqual(setup["audio"]["music_volume"], 10)
         self.assertEqual(setup["audio"]["tts_volume"], 30)
         self.assertEqual(setup["audio"]["tts_voice"], "am_echo")
+        self.assertEqual(setup["audio"]["tts_speed"], 140)
         self.assertEqual(setup["narration"]["tense"], "past")
         self.assertEqual(setup["narration"]["style"], "third_person_omniscient")
+        self.assertEqual(setup["economy_examples"][0]["name"], "Bread")
+        self.assertIn("Bread costs 2 base units", setup["currency_description"])
         wizard.close()
+
+    def test_new_game_wizard_accepts_partial_template_shell(self) -> None:
+        QApplication.instance() or QApplication([])
+        wizard = NewGameWizard(
+            template_setup={
+                "title": "",
+                "character": {"name": ""},
+                "specified_genre": "Cozy mystery",
+                "starter_items": ["A clue kit with several ordinary investigative tools"],
+            }
+        )
+
+        try:
+            self.assertEqual(wizard.title_input.text(), "New Adventure")
+            self.assertEqual(wizard.character_name_input.text(), "Player Name")
+            self.assertEqual(wizard.genre_input.text(), "Cozy mystery")
+            self.assertEqual(wizard.starter_items_table.rowCount(), 1)
+            self.assertEqual(wizard.starter_items_table.cellWidget(0, 0).text(), "")
+            self.assertEqual(wizard.starter_items_table.cellWidget(0, 3).text(), "")
+        finally:
+            wizard.close()
 
     def test_new_game_wizard_uses_shared_calendar_settings_dialog_for_custom_calendar(self) -> None:
         QApplication.instance() or QApplication([])
@@ -1964,6 +2706,13 @@ class MainWindowTests(unittest.TestCase):
             self.assertEqual(wizard.currency_table.cellWidget(0, 0).text(), "Crown")
             self.assertFalse(wizard.currency_table.cellWidget(0, 2).isEnabled())
             self.assertEqual(wizard.currency_table.cellWidget(0, 2).value(), 1)
+
+            wizard._append_economy_example_row({"name": "Bread", "value_base_units": 2})
+            self.assertEqual(wizard.economy_examples_table.rowCount(), 1)
+            self.assertEqual(wizard.economy_examples_table.cellWidget(0, 0).text(), "Bread")
+            self.assertEqual(wizard.economy_examples_table.cellWidget(0, 1).value(), 2)
+            wizard.economy_examples_table.cellWidget(0, 2).click()
+            self.assertEqual(wizard.economy_examples_table.rowCount(), 0)
         finally:
             wizard.close()
 
@@ -1978,6 +2727,7 @@ class MainWindowTests(unittest.TestCase):
                     "music_volume": 25,
                     "tts_volume": 90,
                     "tts_voice": "am_echo",
+                    "tts_speed": 120,
                 },
             },
         )
@@ -1988,6 +2738,7 @@ class MainWindowTests(unittest.TestCase):
 
             self.assertIsNone(wizard.narrator_enabled_checkbox)
             self.assertIsNone(wizard.tts_volume_slider)
+            self.assertIsNone(wizard.tts_speed_slider)
             self.assertIsNone(wizard.tts_voice_combo)
             self.assertIsNone(wizard.sample_voice_button)
             self.assertNotIn("Narrator:", labels)
@@ -2008,6 +2759,7 @@ class MainWindowTests(unittest.TestCase):
                 "music_volume": 8,
                 "tts_volume": 22,
                 "tts_voice": "am_echo",
+                "tts_speed": 125,
             }
         )
 
@@ -2016,9 +2768,120 @@ class MainWindowTests(unittest.TestCase):
             self.assertFalse(wizard.narrator_enabled_checkbox.isChecked())
             self.assertEqual(wizard.music_volume_slider.value(), 8)
             self.assertEqual(wizard.tts_volume_slider.value(), 22)
+            self.assertEqual(wizard.tts_speed_slider.value(), 125)
             self.assertEqual(wizard.tts_voice_combo.currentData(), "am_echo")
         finally:
             wizard.close()
+
+    def test_new_game_wizard_persists_saved_custom_voice_for_next_wizard(self) -> None:
+        QApplication.instance() or QApplication([])
+        saved_audio_settings = []
+        wizard = NewGameWizard(
+            audio_defaults={
+                "music_enabled": True,
+                "narrator_enabled": True,
+                "music_volume": 25,
+                "tts_volume": 90,
+                "tts_speed": 100,
+                "tts_voice_mode": "blend",
+            },
+            voice_options={
+                "Sarah (Female, US)": "af_sarah",
+                "Echo (Male, US)": "am_echo",
+            },
+            on_tts_settings_saved=saved_audio_settings.append,
+        )
+
+        try:
+            widget = wizard.tts_settings_widget
+            saved_voice_audio = {
+                "narrator_enabled": True,
+                "tts_volume": 41,
+                "tts_voice": "af_sarah",
+                "tts_speed": 132,
+                "tts_voice_mode": "blend",
+                "tts_voice_blend": {
+                    "name": "Storm Blend",
+                    "voice_a": "af_sarah",
+                    "voice_b": "am_echo",
+                    "voice_a_weight": 72,
+                    "tts_volume": 41,
+                    "tts_speed": 132,
+                },
+                "tts_custom_voices": [
+                    {
+                        "name": "Storm Blend",
+                        "voice_a": "af_sarah",
+                        "voice_b": "am_echo",
+                        "voice_a_weight": 72,
+                        "tts_volume": 41,
+                        "tts_speed": 132,
+                    }
+                ],
+            }
+            fake_dialog = SimpleNamespace(
+                custom_voice_library_changed=True,
+                exec=lambda: QDialog.DialogCode.Accepted,
+                build_audio_settings=lambda: saved_voice_audio,
+            )
+
+            with patch(
+                "ai_adventure.ui.main_window.CustomVoiceDialog",
+                return_value=fake_dialog,
+            ):
+                widget.custom_voice_button.click()
+
+            self.assertEqual(len(saved_audio_settings), 1)
+            self.assertEqual(
+                saved_audio_settings[0]["tts_custom_voices"][0]["name"],
+                "Storm Blend",
+            )
+            self.assertEqual(
+                saved_audio_settings[0]["tts_custom_voices"][0]["tts_volume"],
+                41,
+            )
+            self.assertEqual(
+                saved_audio_settings[0]["tts_custom_voices"][0]["tts_speed"],
+                132,
+            )
+        finally:
+            wizard.close()
+
+        next_wizard = NewGameWizard(
+            audio_defaults={
+                "music_enabled": True,
+                "music_volume": 25,
+                **saved_audio_settings[0],
+            },
+            voice_options={
+                "Sarah (Female, US)": "af_sarah",
+                "Echo (Male, US)": "am_echo",
+            },
+        )
+
+        try:
+            next_widget = next_wizard.tts_settings_widget
+            self.assertEqual(len(next_widget.custom_voices), 1)
+            self.assertIn("Storm Blend", next_widget.custom_voice_summary_label.text())
+
+            dialog = CustomVoiceDialog(
+                audio_settings=next_widget.build_audio_settings(),
+                voice_options={
+                    "Sarah (Female, US)": "af_sarah",
+                    "Echo (Male, US)": "am_echo",
+                },
+            )
+            dialog.custom_voice_combo.setCurrentIndex(1)
+            dialog.load_custom_voice_button.click()
+
+            self.assertIn("Storm Blend", dialog.current_voice_label.text())
+            self.assertEqual(dialog.voice_a_weight_slider.value(), 72)
+            self.assertEqual(dialog.voice_b_weight_slider.value(), 28)
+            self.assertEqual(next_widget.tts_volume_slider.value(), 41)
+            self.assertEqual(next_widget.tts_speed_slider.value(), 132)
+            dialog.close()
+        finally:
+            next_wizard.close()
 
     def test_new_game_wizard_sample_voice_uses_selected_voice_and_volume(self) -> None:
         QApplication.instance() or QApplication([])

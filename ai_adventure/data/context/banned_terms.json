@@ -3,7 +3,7 @@
   "source": "Converted from ai_adventure/data/old_banned_terms_example_list.txt with Alden added from current user preference.",
   "usage": {
     "purpose": "Terms that the AI must not newly invent for player characters, NPCs, locations, factions, religions, taverns, regions, or similar proper nouns.",
-    "rule": "Never use these terms, close spelling variants, hyphenation variants, or obvious reskins for newly generated names. They may appear only when already established in saved state or explicitly provided by the player."
+    "rule": "Hard exclusion list: never use these terms, close spelling variants, hyphenation variants, or obvious reskins for newly generated names. Before returning JSON, scan every string key and value and replace any newly invented banned term with a fresh non-banned name. They may appear only when already established in saved state or explicitly provided by the player."
   },
   "terms": [
     "Alden",

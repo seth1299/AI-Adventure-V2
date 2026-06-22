@@ -7,8 +7,13 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
 from collections.abc import Callable
-from typing import ClassVar
+from typing import Any, ClassVar
 
+from ai_adventure.audio.ssmd import strip_ssmd_markup_for_plain_tts
+from ai_adventure.audio.tts_settings import (
+    normalize_narrator_voice_spec,
+    parse_voice_blend_spec,
+)
 from ai_adventure.audio.voices import (
     DEFAULT_NARRATOR_VOICE,
     KOKORO_VOICES,
@@ -16,6 +21,8 @@ from ai_adventure.audio.voices import (
 
 
 LOGGER = logging.getLogger(__name__)
+PYKOKORO_MODEL_QUALITY = "q8"
+PYKOKORO_SPACY_MODEL = "en_core_web_sm"
 
 
 @dataclass(frozen=True)
@@ -46,6 +53,108 @@ class TTSEngine(ABC):
     @abstractmethod
     def synthesize_to_file(self, request: TTSRequest) -> Path:
         """Synthesizes request text to an audio file."""
+
+
+class PyKokoroTTSEngine(TTSEngine):
+    """PyKokoro pipeline TTS engine with SSMD and voice blending support."""
+
+    DEFAULT_VOICE: ClassVar[str] = DEFAULT_NARRATOR_VOICE
+    AVAILABLE_VOICES: ClassVar[dict[str, str]] = KOKORO_VOICES
+
+    def __init__(
+        self,
+        *,
+        output_directory: str | Path | None = None,
+        model_quality: str = PYKOKORO_MODEL_QUALITY,
+    ) -> None:
+        """Initializes the PyKokoro pipeline wrappers."""
+
+        from pykokoro import KokoroPipeline, PipelineConfig
+        from pykokoro.generation_config import GenerationConfig
+        from pykokoro.tokenizer import TokenizerConfig
+        from pykokoro.voice_manager import VoiceBlend
+
+        _load_pykokoro_spacy_model()
+        self.output_directory = Path(output_directory or tempfile.gettempdir())
+        self.output_directory.mkdir(parents=True, exist_ok=True)
+        self._KokoroPipeline = KokoroPipeline
+        self._PipelineConfig = PipelineConfig
+        self._GenerationConfig = GenerationConfig
+        self._TokenizerConfig = TokenizerConfig
+        self._VoiceBlend = VoiceBlend
+        self.model_quality = _normalize_pykokoro_model_quality(model_quality)
+        self._pipeline_cache: dict[tuple[str, float, str], Any] = {}
+        LOGGER.info("PyKokoro TTS initialized with %s model quality.", self.model_quality)
+
+    def get_available_voices(self) -> dict[str, str]:
+        """Returns Kokoro voice choices."""
+
+        return dict(self.AVAILABLE_VOICES)
+
+    def synthesize_to_file(self, request: TTSRequest) -> Path:
+        """Synthesizes SSMD-aware text into a WAV file."""
+
+        import soundfile as sf
+
+        clean_text = str(request.text or "").strip()
+        if not clean_text:
+            raise ValueError("Cannot synthesize empty text.")
+
+        output_path = self.output_directory / f"ai_adventure_tts_{uuid.uuid4().hex}.wav"
+        voice_spec = normalize_narrator_voice_spec(request.voice or self.DEFAULT_VOICE)
+        speed = max(0.5, min(2.0, float(request.speed)))
+        language_code = str(request.language or "en-us").strip() or "en-us"
+        pipeline = self._pipeline_for(voice_spec, speed, language_code)
+        result = pipeline.run(clean_text)
+        sf.write(
+            str(output_path),
+            result.audio,
+            int(getattr(result, "sample_rate", 24000) or 24000),
+        )
+        return output_path
+
+    def _pipeline_for(self, voice_spec: str, speed: float, language_code: str) -> Any:
+        """Returns a cached pipeline for one voice/speed/language tuple."""
+
+        cache_key = (voice_spec, round(speed, 3), language_code)
+
+        if cache_key in self._pipeline_cache:
+            return self._pipeline_cache[cache_key]
+
+        generation = self._GenerationConfig(
+            lang=language_code,
+            speed=speed,
+            pause_mode="auto",
+            pause_clause=0.25,
+            pause_sentence=0.55,
+            pause_paragraph=0.95,
+            pause_variance=0.05,
+        )
+        config = self._PipelineConfig(
+            voice=self._voice_for_spec(voice_spec),
+            model_quality=self.model_quality,
+            generation=generation,
+            tokenizer_config=self._TokenizerConfig(
+                spacy_model=PYKOKORO_SPACY_MODEL,
+                spacy_model_size="sm",
+            ),
+        )
+        pipeline = self._KokoroPipeline(config)
+        self._pipeline_cache[cache_key] = pipeline
+        return pipeline
+
+    def _voice_for_spec(self, voice_spec: str) -> Any:
+        """Returns a PyKokoro voice id or VoiceBlend."""
+
+        blend = parse_voice_blend_spec(voice_spec)
+
+        if blend is None:
+            return voice_spec
+
+        return self._VoiceBlend.parse(
+            f"{blend['voice_a']}:{blend['voice_a_weight']},"
+            f"{blend['voice_b']}:{blend['voice_b_weight']}"
+        )
 
 
 class KokoroOnnxTTSEngine(TTSEngine):
@@ -99,25 +208,45 @@ class KokoroOnnxTTSEngine(TTSEngine):
 
         import soundfile as sf
 
-        clean_text = str(request.text or "").strip()
+        clean_text = strip_ssmd_markup_for_plain_tts(str(request.text or "").strip())
         if not clean_text:
             raise ValueError("Cannot synthesize empty text.")
 
         output_path = self.output_directory / f"ai_adventure_tts_{uuid.uuid4().hex}.wav"
-        voice_id = str(request.voice or "").strip() or self.DEFAULT_VOICE
+        voice_id = normalize_narrator_voice_spec(request.voice or self.DEFAULT_VOICE)
+        voice = self._voice_for_spec(voice_id)
+        language_voice_id = (
+            str(parse_voice_blend_spec(voice_id)["voice_a"])
+            if parse_voice_blend_spec(voice_id) is not None
+            else voice_id
+        )
         language_code = self.LANGUAGE_BY_VOICE_PREFIX.get(
-            voice_id[:1].lower(),
+            language_voice_id[:1].lower(),
             str(request.language or "en-us").strip() or "en-us",
         )
 
         samples, sample_rate = self._kokoro.create(
             clean_text,
-            voice=voice_id,
-            speed=max(0.25, min(2.0, float(request.speed))),
+            voice=voice,
+            speed=max(0.5, min(2.0, float(request.speed))),
             lang=language_code,
         )
         sf.write(str(output_path), samples, sample_rate)
         return output_path
+
+    def _voice_for_spec(self, voice_spec: str) -> Any:
+        """Returns either a voice id or a blended Kokoro style vector."""
+
+        blend = parse_voice_blend_spec(voice_spec)
+
+        if blend is None:
+            return voice_spec
+
+        voice_a = self._kokoro.get_voice_style(str(blend["voice_a"]))
+        voice_b = self._kokoro.get_voice_style(str(blend["voice_b"]))
+        weight_a = float(blend["voice_a_weight"]) / 100.0
+        weight_b = 1.0 - weight_a
+        return (voice_a * weight_a + voice_b * weight_b).astype("float32")
 
 
 class TTSManager:
@@ -201,7 +330,7 @@ def create_tts_manager(
     """Creates the default local Kokoro TTS manager."""
 
     return TTSManager(
-        engine_factory=lambda: KokoroOnnxTTSEngine(
+        engine_factory=lambda: _create_preferred_tts_engine(
             model_path=model_path,
             voices_path=voices_path,
             output_directory=output_directory,
@@ -209,3 +338,44 @@ def create_tts_manager(
         default_voice=KokoroOnnxTTSEngine.DEFAULT_VOICE,
         available_voices=KokoroOnnxTTSEngine.AVAILABLE_VOICES,
     )
+
+
+def _create_preferred_tts_engine(
+    *,
+    model_path: str | Path,
+    voices_path: str | Path,
+    output_directory: str | Path,
+) -> TTSEngine:
+    """Creates PyKokoro when available, otherwise falls back to kokoro-onnx."""
+
+    try:
+        return PyKokoroTTSEngine(output_directory=output_directory)
+    except ImportError as error:
+        LOGGER.info("PyKokoro is unavailable; using kokoro-onnx fallback: %s", error)
+    except Exception as error:
+        LOGGER.warning("PyKokoro initialization failed; using kokoro-onnx fallback: %s", error)
+
+    return KokoroOnnxTTSEngine(
+        model_path=model_path,
+        voices_path=voices_path,
+        output_directory=output_directory,
+    )
+
+
+def _normalize_pykokoro_model_quality(value: str) -> str:
+    """Returns a supported PyKokoro model quality, defaulting to Q8."""
+
+    clean_value = str(value or "").strip().casefold()
+
+    if clean_value in {"fp32", "fp16", "q8", "q4", "uint8"}:
+        return clean_value
+
+    return PYKOKORO_MODEL_QUALITY
+
+
+def _load_pykokoro_spacy_model() -> None:
+    """Preloads the spaCy model PyKokoro needs for English tokenization."""
+
+    import spacy
+
+    spacy.load(PYKOKORO_SPACY_MODEL)

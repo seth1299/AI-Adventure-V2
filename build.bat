@@ -53,6 +53,7 @@ if defined PYTHON_USER_SITE if exist "%PYTHON_USER_SITE%" (
     --add-data "%TTS_VOICES%;ai_adventure\audio\tts" ^
     --icon "%APP_ICON%" ^
     --collect-all "kokoro_onnx" ^
+    --collect-all "pykokoro" ^
     --collect-all "language_tags" ^
     --collect-all "espeakng_loader" ^
     --collect-all "onnxruntime" ^

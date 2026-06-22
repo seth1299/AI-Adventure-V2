@@ -7,13 +7,16 @@ from pathlib import Path
 from ai_adventure.new_game_setup import (
     CHARACTER_GENDER_PRESENTATION_HINTS,
     SKILL_LEVEL_PLAN,
+    ai_generated_calendar_settings_or_fallback,
     build_new_game_setup_packet,
+    calendar_looks_like_default_gregorian,
     fallback_introductory_message,
     fallback_world_summary,
     normalize_new_game_setup,
     parse_starter_items_text,
 )
 from ai_adventure.new_game_templates import (
+    delete_new_game_template,
     load_new_game_template,
     load_new_game_templates,
     save_new_game_template,
@@ -61,6 +64,32 @@ class NewGameSetupTests(unittest.TestCase):
             "Third-Person Omniscient",
         )
 
+    def test_normalized_setup_preserves_explicit_sparse_skill_levels(self) -> None:
+        setup = normalize_new_game_setup(
+            {
+                "skills": [
+                    {
+                        "name": "Observation",
+                        "description": "Spotting small clues.",
+                        "level": 5,
+                    },
+                    {
+                        "name": "Deduction",
+                        "description": "Connecting subtle evidence.",
+                        "level": 3,
+                    },
+                ]
+            }
+        )
+
+        self.assertEqual([skill["level"] for skill in setup["skills"]], SKILL_LEVEL_PLAN)
+        self.assertEqual(setup["skills"][0]["name"], "Observation")
+        self.assertEqual(setup["skills"][1]["name"], "")
+        self.assertEqual(setup["skills"][2]["name"], "")
+        self.assertEqual(setup["skills"][3]["name"], "Deduction")
+        self.assertEqual(setup["skills"][3]["level"], 3)
+        self.assertFalse(setup["skills"][3]["requires_ai_invention"])
+
     def test_normalized_setup_preserves_ai_generated_calendar_mode(self) -> None:
         setup = normalize_new_game_setup(
             {
@@ -74,6 +103,53 @@ class NewGameSetupTests(unittest.TestCase):
         self.assertEqual(setup["calendar"]["calendar_type"], "ai_generated")
         self.assertTrue(setup["calendar"]["ai_generated"])
         self.assertEqual(setup["calendar"]["time_display"], "narrative")
+        self.assertNotEqual(setup["calendar"]["day_names"][0], "Monday")
+        self.assertNotEqual(setup["calendar"]["month_names"][0], "January")
+        self.assertFalse(calendar_looks_like_default_gregorian(setup["calendar"]))
+
+    def test_ai_generated_calendar_fallback_rejects_default_gregorian_output(self) -> None:
+        fallback = ai_generated_calendar_settings_or_fallback(
+            {
+                "days_per_week": 7,
+                "weeks_per_month": 4,
+                "months_per_year": 12,
+                "seasons_per_year": 4,
+                "day_names": [
+                    "Monday",
+                    "Tuesday",
+                    "Wednesday",
+                    "Thursday",
+                    "Friday",
+                    "Saturday",
+                    "Sunday",
+                ],
+                "month_names": [
+                    "January",
+                    "February",
+                    "March",
+                    "April",
+                    "May",
+                    "June",
+                    "July",
+                    "August",
+                    "September",
+                    "October",
+                    "November",
+                    "December",
+                ],
+                "seasons": [
+                    {"name": "Spring", "weather_hint": "spring"},
+                    {"name": "Summer", "weather_hint": "summer"},
+                    {"name": "Autumn", "weather_hint": "autumn"},
+                    {"name": "Winter", "weather_hint": "winter"},
+                ],
+                "time_display": "12_hour",
+            }
+        )
+
+        self.assertEqual(fallback["days_per_week"], 8)
+        self.assertEqual(fallback["day_names"][0], "Dawn")
+        self.assertEqual(fallback["month_names"][0], "First Rise")
 
     def test_parse_starter_items_text_supports_plain_and_structured_lines(self) -> None:
         items = parse_starter_items_text(
@@ -120,6 +196,7 @@ class NewGameSetupTests(unittest.TestCase):
                     "music_volume": 0,
                     "tts_volume": 35,
                     "tts_voice": "am_echo",
+                    "tts_speed": 125,
                 },
                     "narration": {
                         "tense": "future",
@@ -158,6 +235,7 @@ class NewGameSetupTests(unittest.TestCase):
             self.assertEqual(state.settings.values["audio.music_volume"], 0)
             self.assertEqual(state.settings.values["audio.tts_volume"], 35)
             self.assertEqual(state.settings.values["audio.tts_voice"], "am_echo")
+            self.assertEqual(state.settings.values["audio.tts_speed"], 125)
             self.assertEqual(state.settings.values["ai.narration_tense"], "future")
             self.assertEqual(
                 state.settings.values["ai.narration_style"],
@@ -264,12 +342,39 @@ class NewGameSetupTests(unittest.TestCase):
         self.assertEqual(setup["currency_denominations"][1]["name"], "Crown")
         self.assertIn("Crown (12 base units)", setup["currency_description"])
 
+    def test_economy_examples_generate_currency_description_guidance(self) -> None:
+        setup = normalize_new_game_setup(
+            {
+                "economy_examples": [
+                    {"name": "Bread", "value_base_units": 2},
+                    {"name": "Lantern Oil", "value": 7},
+                    {"name": "", "value_base_units": 9},
+                ],
+            }
+        )
+        packet = build_new_game_setup_packet(setup)
+
+        self.assertEqual(
+            setup["economy_examples"],
+            [
+                {"name": "Bread", "value_base_units": 2},
+                {"name": "Lantern Oil", "value_base_units": 7},
+            ],
+        )
+        self.assertIn("Bread costs 2 base units", setup["currency_description"])
+        self.assertIn("setup.economy_examples", packet["requirements"]["currency_generation"])
+        self.assertIn(
+            "setup.economy_examples",
+            packet["requirements"]["starting_currency_balance"],
+        )
+
     def test_blank_currency_setup_is_reserved_for_ai_generation(self) -> None:
         setup = normalize_new_game_setup({})
         packet = build_new_game_setup_packet(setup)
 
         self.assertEqual(setup["currency_denominations"], [])
         self.assertEqual(setup["currency_description"], "")
+        self.assertEqual(setup["economy_examples"], [])
         self.assertIn(
             "economy and currency denominations",
             packet["fields_requiring_ai_invention"],
@@ -384,6 +489,36 @@ class NewGameSetupTests(unittest.TestCase):
             self.assertEqual(templates[0].name, "Legacy Template")
             self.assertEqual(templates[0].setup["character"]["name"], "Iris Vale")
 
+    def test_new_game_templates_can_store_partial_shells(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            template_path = Path(temp_dir) / "new_game_templates.json"
+
+            self.assertTrue(
+                save_new_game_template(
+                    template_path,
+                    {
+                        "title": "",
+                        "character": {"name": ""},
+                        "specified_genre": "Cozy mystery",
+                    },
+                    template_name="Cozy Shell",
+                    normalize_setup=False,
+                )
+            )
+
+            raw_templates = load_new_game_templates(template_path, normalize_setups=False)
+            normalized_templates = load_new_game_templates(template_path)
+
+            self.assertEqual(raw_templates[0].name, "Cozy Shell")
+            self.assertEqual(raw_templates[0].setup["title"], "")
+            self.assertEqual(raw_templates[0].setup["character"]["name"], "")
+            self.assertEqual(normalized_templates[0].setup["title"], "New Adventure")
+            self.assertEqual(normalized_templates[0].setup["character"]["name"], "Player Name")
+            self.assertEqual(normalized_templates[0].setup["specified_genre"], "Cozy mystery")
+
+            self.assertTrue(delete_new_game_template(template_path, "Cozy Shell"))
+            self.assertEqual(load_new_game_templates(template_path, normalize_setups=False), [])
+
     def test_repository_can_replace_setup_inventory_with_ai_items(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             setup = normalize_new_game_setup(
@@ -483,6 +618,14 @@ class NewGameSetupTests(unittest.TestCase):
         )
         self.assertIn("creative_ideas", packet["requirements"])
         self.assertIn("high-priority style seeds", packet["requirements"]["creative_ideas"])
+        self.assertIn("hard exclusion list", packet["requirements"]["creative_ideas"])
+        self.assertIn("scan every string key and value", packet["requirements"]["creative_ideas"])
+        self.assertIn(
+            "bare category labels as final proper nouns",
+            packet["requirements"]["creative_ideas"],
+        )
+        self.assertIn("the Police Department", packet["requirements"]["creative_ideas"])
+        self.assertIn("The Blue Wall", packet["requirements"]["creative_ideas"])
         self.assertIn("item_request", packet["requirements"]["starter_inventory"])
         self.assertIn("at least five", packet["requirements"]["starter_inventory"])
         self.assertIn("has no maximum count", packet["requirements"]["starter_inventory"])

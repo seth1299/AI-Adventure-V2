@@ -93,6 +93,7 @@
         "guidelines": [
           "When an action's success, failure, speed, quality, consequences, resource cost, or discovery quality are uncertain, suggest SkillCheckRequestedEvent before narrating a final outcome.",
           "Foraging, harvesting, searching, researching, identifying, crafting, alchemy experiments, persuasion, stealth, combat, and named skill use require SkillCheckRequestedEvent unless the action is trivial and risk-free.",
+          "When a scene becomes an actual fight, suggest CombatStartedEvent with enemy/allied combatants, health, armor_rating, damage dice, and loot, then let the Python Combat tab resolve turns, damage, victory, defeat, and loot.",
           "Routine movement, paying a known price, receiving ordinary goods, eating, drinking, and casual conversation are not skill checks unless the player adds a contested, risky, hidden, time-sensitive, or deceptive goal.",
           "Use SkillXpAddedEvent only after meaningful use, training, study, or practice.",
           "Do not use SkillXpAddedEvent as a substitute for resolving an uncertain action.",

@@ -7,8 +7,8 @@ from typing import Any
 
 from ai_adventure.audio.voices import (
     DEFAULT_NARRATOR_VOICE,
-    normalize_narrator_voice,
 )
+from ai_adventure.audio.tts_settings import normalize_tts_audio_fields
 
 
 LOGGER = logging.getLogger(__name__)
@@ -21,6 +21,16 @@ DEFAULT_APP_SETTINGS = {
         "music_volume": 25,
         "tts_volume": 90,
         "tts_voice": DEFAULT_NARRATOR_VOICE,
+        "tts_speed": 100,
+        "tts_voice_mode": "preset",
+        "tts_voice_blend": {
+            "name": "Custom Voice",
+            "voice_a": DEFAULT_NARRATOR_VOICE,
+            "voice_b": "am_echo",
+            "voice_a_weight": 50,
+            "voice_b_weight": 50,
+        },
+        "tts_custom_voices": [],
     },
 }
 
@@ -96,19 +106,10 @@ def _normalize_audio(raw_audio: Any, *, tts_enabled: bool) -> dict[str, Any]:
     if not isinstance(raw_audio, dict):
         raw_audio = {}
 
-    narrator_enabled = _safe_bool(raw_audio.get("narrator_enabled"), True)
-    tts_volume = _clamped_int(raw_audio.get("tts_volume"), 90, 0, 100)
-
-    if not tts_enabled:
-        narrator_enabled = False
-        tts_volume = 0
-
     return {
         "music_enabled": _safe_bool(raw_audio.get("music_enabled"), True),
-        "narrator_enabled": narrator_enabled,
         "music_volume": _clamped_int(raw_audio.get("music_volume"), 25, 0, 100),
-        "tts_volume": tts_volume,
-        "tts_voice": normalize_narrator_voice(raw_audio.get("tts_voice")),
+        **normalize_tts_audio_fields(raw_audio, tts_enabled=tts_enabled),
     }
 
 

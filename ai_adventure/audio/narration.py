@@ -9,17 +9,25 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
+from ai_adventure.audio.ssmd import (
+    apply_ssmd_say_as_tags,
+    apply_structural_pause_markers,
+    normalize_tts_time_text as _normalize_plain_tts_time_text,
+)
+from ai_adventure.audio.tts_settings import (
+    normalize_narrator_voice_spec,
+    tts_speed_multiplier,
+)
 from ai_adventure.audio.voices import (
     DEFAULT_NARRATOR_VOICE,
     NARRATOR_SAMPLE_TEXT,
-    normalize_narrator_voice,
 )
 
 
 LOGGER = logging.getLogger(__name__)
 
 TTS_CHANNEL_INDEX = 1
-MAX_CHUNK_LENGTH = 260
+MAX_CHUNK_LENGTH = 900
 
 
 @dataclass(frozen=True)
@@ -76,7 +84,7 @@ class NarrationPlayer:
         self.tts_manager = tts_manager
         self.enabled = True
         self.volume = 0.9
-        self.voice = normalize_narrator_voice(tts_manager.get_default_voice())
+        self.voice = normalize_narrator_voice_spec(tts_manager.get_default_voice())
         self.speed = 1.0
         self._pygame: Any = None
         self._initialized = False
@@ -136,12 +144,29 @@ class NarrationPlayer:
     def set_voice(self, voice: str | None) -> None:
         """Sets the active narrator voice."""
 
-        self.voice = normalize_narrator_voice(voice or self.get_default_voice())
+        self.voice = normalize_narrator_voice_spec(voice or self.get_default_voice())
+
+    def set_speed(self, speed: float | int | None) -> None:
+        """Sets the TTS generation speed."""
+
+        if speed is None:
+            return
+
+        try:
+            parsed_speed = float(speed)
+        except (TypeError, ValueError):
+            LOGGER.warning("Invalid TTS speed value: %r", speed)
+            return
+
+        if parsed_speed > 2.0:
+            parsed_speed = tts_speed_multiplier(parsed_speed)
+
+        self.speed = max(0.5, min(2.0, parsed_speed))
 
     def get_default_voice(self) -> str:
         """Returns the active engine's default voice."""
 
-        return normalize_narrator_voice(self.tts_manager.get_default_voice())
+        return normalize_narrator_voice_spec(self.tts_manager.get_default_voice())
 
     def get_available_voices(self) -> dict[str, str]:
         """Returns display-name-to-engine voice mappings."""
@@ -157,6 +182,7 @@ class NarrationPlayer:
         *,
         voice: str | None = None,
         volume: float | int | None = None,
+        speed: float | int | None = None,
         text: str = NARRATOR_SAMPLE_TEXT,
     ) -> bool:
         """Plays a local narrator sample without contacting the AI."""
@@ -165,6 +191,8 @@ class NarrationPlayer:
 
         if volume is not None:
             self.set_volume(volume)
+        if speed is not None:
+            self.set_speed(speed)
 
         self.set_enabled(True)
 
@@ -211,7 +239,9 @@ class NarrationPlayer:
             self._session_id += 1
             session_id = self._session_id
 
-        session_voice = normalize_narrator_voice(voice or self.voice or DEFAULT_NARRATOR_VOICE)
+        session_voice = normalize_narrator_voice_spec(
+            voice or self.voice or DEFAULT_NARRATOR_VOICE
+        )
         audio_queue: queue.Queue[GeneratedNarrationChunk | None] = queue.Queue(maxsize=2)
         producer = threading.Thread(
             target=self._produce_chunks,
@@ -348,10 +378,21 @@ class NarrationPlayer:
 
 
 def sanitize_tts_text(text: str) -> str:
-    """Removes prompt artifacts and UI-only suggestions before TTS synthesis."""
+    """Removes UI-only text and prepares SSMD text for TTS synthesis."""
 
     clean_text = sanitize_narration_display_text(text)
-    return normalize_tts_time_text(clean_text).strip()
+    return prepare_ssmd_tts_text(clean_text)
+
+
+def prepare_ssmd_tts_text(text: str) -> str:
+    """Adds supported SSMD normalization and pause markers."""
+
+    clean_text = str(text or "").strip()
+
+    if not clean_text:
+        return ""
+
+    return apply_ssmd_say_as_tags(apply_structural_pause_markers(clean_text)).strip()
 
 
 def sanitize_narration_display_text(text: str) -> str:
@@ -376,8 +417,12 @@ def sanitize_narration_display_text(text: str) -> str:
 
     clean_text = "\n".join(lines)
     clean_text = re.sub(r"^\s{0,3}#{1,6}\s*", "", clean_text, flags=re.MULTILINE)
-    clean_text = re.sub(r"\s+", " ", clean_text)
-    return clean_text.strip()
+    paragraphs = [
+        re.sub(r"[ \t]+", " ", paragraph.strip())
+        for paragraph in re.split(r"\n\s*\n+", clean_text)
+        if paragraph.strip()
+    ]
+    return "\n\n".join(paragraphs).strip()
 
 
 def build_narration_chunks(
@@ -395,7 +440,7 @@ def build_narration_chunks(
     return [
         NarrationChunk(
             display_text=display_chunk,
-            tts_text=normalize_tts_time_text(display_chunk),
+            tts_text=prepare_ssmd_tts_text(display_chunk),
         )
         for display_chunk in display_chunks
     ]
@@ -409,20 +454,20 @@ def chunk_tts_text(text: str, *, max_length: int = MAX_CHUNK_LENGTH) -> list[str
     if not clean_text:
         return []
 
-    sentences = re.split(r"(?<=[.!?])\s+|\n+", clean_text)
+    blocks = re.split(r"\n\s*\n+", clean_text)
     chunks: list[str] = []
 
-    for sentence in sentences:
-        sentence = sentence.strip()
+    for block in blocks:
+        block = block.strip()
 
-        if not sentence:
+        if not block:
             continue
 
-        if len(sentence) > max_length:
-            chunks.extend(_split_long_text(sentence, max_length=max_length))
+        if len(block) > max_length:
+            chunks.extend(_split_long_text(block, max_length=max_length))
             continue
 
-        chunks.append(sentence)
+        chunks.append(block)
 
     return chunks
 
@@ -430,113 +475,7 @@ def chunk_tts_text(text: str, *, max_length: int = MAX_CHUNK_LENGTH) -> list[str
 def normalize_tts_time_text(text: str) -> str:
     """Converts clock-style times into text that TTS engines pronounce naturally."""
 
-    clean_text = str(text or "")
-    clean_text = _TWELVE_HOUR_TIME_RE.sub(_replace_12_hour_time, clean_text)
-    clean_text = _TWENTY_FOUR_HOUR_TIME_RE.sub(_replace_24_hour_time, clean_text)
-    return clean_text
-
-
-_TWELVE_HOUR_TIME_RE = re.compile(
-    r"\b(1[0-2]|0?[1-9]):([0-5]\d)\s*([AaPp])\.?\s*[Mm]\.?(?=$|[^A-Za-z0-9_])"
-)
-_TWENTY_FOUR_HOUR_TIME_RE = re.compile(r"\b([01]?\d|2[0-3]):([0-5]\d)\b")
-_NUMBER_WORDS_0_TO_59 = {
-    0: "zero",
-    1: "one",
-    2: "two",
-    3: "three",
-    4: "four",
-    5: "five",
-    6: "six",
-    7: "seven",
-    8: "eight",
-    9: "nine",
-    10: "ten",
-    11: "eleven",
-    12: "twelve",
-    13: "thirteen",
-    14: "fourteen",
-    15: "fifteen",
-    16: "sixteen",
-    17: "seventeen",
-    18: "eighteen",
-    19: "nineteen",
-    20: "twenty",
-    30: "thirty",
-    40: "forty",
-    50: "fifty",
-}
-
-
-def _replace_12_hour_time(match: re.Match[str]) -> str:
-    """Returns spoken text for one 12-hour clock match."""
-
-    hour = int(match.group(1))
-    minute = int(match.group(2))
-    suffix = match.group(3).lower()
-    period = "morning" if suffix == "a" else "afternoon"
-
-    if suffix == "p":
-        if hour == 12:
-            period = "afternoon"
-        elif 5 <= hour <= 11:
-            period = "evening"
-
-    if suffix == "a" and hour == 12:
-        period = "at night"
-        return _spoken_time(hour, minute, period)
-
-    return _spoken_time(hour, minute, f"in the {period}")
-
-
-def _replace_24_hour_time(match: re.Match[str]) -> str:
-    """Returns spoken text for one 24-hour clock match."""
-
-    hour_24 = int(match.group(1))
-    minute = int(match.group(2))
-    display_hour = hour_24 % 12 or 12
-
-    if 5 <= hour_24 < 12:
-        period = "in the morning"
-    elif 12 <= hour_24 < 17:
-        period = "in the afternoon"
-    elif 17 <= hour_24 < 22:
-        period = "in the evening"
-    else:
-        period = "at night"
-
-    return _spoken_time(display_hour, minute, period)
-
-
-def _spoken_time(hour: int, minute: int, period: str) -> str:
-    """Formats an already-parsed clock time for speech."""
-
-    if hour == 12 and minute == 0 and period == "at night":
-        return "midnight"
-
-    if hour == 12 and minute == 0 and period == "in the afternoon":
-        return "noon"
-
-    hour_text = _number_word(hour)
-
-    if minute == 0:
-        return f"{hour_text} {period}"
-
-    if minute < 10:
-        return f"{hour_text} oh {_number_word(minute)} {period}"
-
-    return f"{hour_text} {_number_word(minute)} {period}"
-
-
-def _number_word(number: int) -> str:
-    """Returns a plain English word for numbers from 0 through 59."""
-
-    if number in _NUMBER_WORDS_0_TO_59:
-        return _NUMBER_WORDS_0_TO_59[number]
-
-    tens = number - (number % 10)
-    ones = number % 10
-    return f"{_NUMBER_WORDS_0_TO_59[tens]} {_NUMBER_WORDS_0_TO_59[ones]}"
+    return _normalize_plain_tts_time_text(text)
 
 
 def _split_long_text(text: str, *, max_length: int) -> list[str]:

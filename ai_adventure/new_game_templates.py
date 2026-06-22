@@ -25,6 +25,7 @@ def load_new_game_templates(
     template_path: Path,
     *,
     legacy_template_path: Path | None = None,
+    normalize_setups: bool = True,
 ) -> list[NewGameTemplate]:
     """Loads reusable new-game setup templates."""
 
@@ -42,7 +43,7 @@ def load_new_game_templates(
         LOGGER.exception("Failed to load new-game templates from %s.", source_path)
         return []
 
-    templates = _parse_template_payload(data, source_path)
+    templates = _parse_template_payload(data, source_path, normalize_setups=normalize_setups)
     templates.sort(key=lambda template: template.name.casefold())
     return templates
 
@@ -63,18 +64,53 @@ def save_new_game_template(
     setup: dict[str, Any],
     *,
     template_name: str | None = None,
+    normalize_setup: bool = True,
 ) -> bool:
     """Adds or updates a reusable new-game setup template."""
 
-    clean_setup = normalize_new_game_setup(setup)
+    clean_setup = _template_setup_payload(setup, normalize_setup=normalize_setup)
     clean_name = _template_name(template_name, clean_setup)
     templates = [
         template
-        for template in load_new_game_templates(template_path)
+        for template in load_new_game_templates(template_path, normalize_setups=False)
         if template.name.casefold() != clean_name.casefold()
     ]
     templates.append(NewGameTemplate(clean_name, clean_setup))
     templates.sort(key=lambda template: template.name.casefold())
+
+    return write_new_game_templates(template_path, templates)
+
+
+def delete_new_game_template(template_path: Path, template_name: str) -> bool:
+    """Removes a reusable new-game setup template by display name."""
+
+    clean_name = str(template_name or "").strip().casefold()
+
+    if not clean_name:
+        return False
+
+    templates = [
+        template
+        for template in load_new_game_templates(template_path, normalize_setups=False)
+        if template.name.casefold() != clean_name
+    ]
+    return write_new_game_templates(template_path, templates)
+
+
+def write_new_game_templates(
+    template_path: Path,
+    templates: list[NewGameTemplate],
+) -> bool:
+    """Writes reusable new-game setup templates to disk."""
+
+    clean_templates = [
+        NewGameTemplate(
+            _template_name(template.name, template.setup),
+            _template_setup_payload(template.setup, normalize_setup=False),
+        )
+        for template in templates
+    ]
+    clean_templates.sort(key=lambda template: template.name.casefold())
 
     payload = {
         "schema_version": TEMPLATE_SCHEMA_VERSION,
@@ -83,7 +119,7 @@ def save_new_game_template(
                 "name": template.name,
                 "setup": template.setup,
             }
-            for template in templates
+            for template in clean_templates
         ],
     }
 
@@ -100,7 +136,12 @@ def save_new_game_template(
     return True
 
 
-def _parse_template_payload(data: Any, source_path: Path) -> list[NewGameTemplate]:
+def _parse_template_payload(
+    data: Any,
+    source_path: Path,
+    *,
+    normalize_setups: bool,
+) -> list[NewGameTemplate]:
     """Normalizes both current multi-template and legacy single-template files."""
 
     if not isinstance(data, dict):
@@ -113,7 +154,12 @@ def _parse_template_payload(data: Any, source_path: Path) -> list[NewGameTemplat
         templates: list[NewGameTemplate] = []
 
         for index, raw_template in enumerate(raw_templates):
-            template = _parse_template_entry(raw_template, source_path, index)
+            template = _parse_template_entry(
+                raw_template,
+                source_path,
+                index,
+                normalize_setups=normalize_setups,
+            )
 
             if template is not None:
                 templates.append(template)
@@ -126,7 +172,7 @@ def _parse_template_payload(data: Any, source_path: Path) -> list[NewGameTemplat
         LOGGER.warning("Ignored new-game template without setup at %s.", source_path)
         return []
 
-    clean_setup = normalize_new_game_setup(raw_setup)
+    clean_setup = _template_setup_payload(raw_setup, normalize_setup=normalize_setups)
     return [NewGameTemplate(_template_name(data.get("name"), clean_setup), clean_setup)]
 
 
@@ -134,6 +180,8 @@ def _parse_template_entry(
     raw_template: Any,
     source_path: Path,
     index: int,
+    *,
+    normalize_setups: bool,
 ) -> NewGameTemplate | None:
     """Parses one template entry."""
 
@@ -147,8 +195,36 @@ def _parse_template_entry(
         LOGGER.warning("Ignored new-game template %s without setup in %s.", index, source_path)
         return None
 
-    clean_setup = normalize_new_game_setup(raw_setup)
+    clean_setup = _template_setup_payload(raw_setup, normalize_setup=normalize_setups)
     return NewGameTemplate(_template_name(raw_template.get("name"), clean_setup), clean_setup)
+
+
+def _template_setup_payload(setup: Any, *, normalize_setup: bool) -> dict[str, Any]:
+    """Returns a template setup payload, optionally keeping partial fields partial."""
+
+    if normalize_setup:
+        return normalize_new_game_setup(setup)
+
+    if not isinstance(setup, dict):
+        return {}
+
+    clean_setup = _json_safe_value(setup)
+    return clean_setup if isinstance(clean_setup, dict) else {}
+
+
+def _json_safe_value(value: Any) -> Any:
+    """Returns a JSON-safe copy without filling missing template fields."""
+
+    if isinstance(value, dict):
+        return {str(key): _json_safe_value(item) for key, item in value.items()}
+
+    if isinstance(value, list):
+        return [_json_safe_value(item) for item in value]
+
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+
+    return str(value)
 
 
 def _template_name(template_name: Any, setup: dict[str, Any]) -> str:

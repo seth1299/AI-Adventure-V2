@@ -9,7 +9,9 @@ from ai_adventure.alchemy.ingredients import (
 from ai_adventure.alchemy.rulebook import AlchemyRulebook, AlchemyRulebookLoader
 from ai_adventure.context.creative_ideas import CreativeIdeasLibrary
 from ai_adventure.context.models import ContextLibrary
+from ai_adventure.context.naming import GENERIC_PROPER_NOUN_PLACEHOLDER_RULE
 from ai_adventure.context.reference_loader import ContextReferenceLoader
+from ai_adventure.combat import normalize_combat_state
 from ai_adventure.currency import format_currency_amount
 from ai_adventure.core.models import AdventureState
 from ai_adventure.narration_preferences import normalize_narration_preferences
@@ -268,6 +270,7 @@ class AiContextBuilder:
                 "style": state.settings.values.get("ai.narration_style", ""),
             }
         )
+        combat_state = normalize_combat_state(state.settings.values.get("combat.state", {}))
 
         return {
             "schema_version": 1,
@@ -289,6 +292,10 @@ class AiContextBuilder:
                         max_chars=MAX_SHORT_CONTEXT_TEXT_CHARS,
                     ),
                     "notes": _compact_text(state.player.notes),
+                    "health_current": state.player.health_current,
+                    "health_max": state.player.health_max,
+                    "armor_rating": state.player.armor_rating,
+                    "equipment": state.player.equipment,
                 },
                 "player_ai_preferences": {
                     "additional_context": _compact_text(
@@ -364,6 +371,7 @@ class AiContextBuilder:
                             "quantity": item.quantity,
                             "description": _compact_text(item.description),
                             "value_base_units": item.value_base_units,
+                            "metadata": _compact_context_value(item.metadata),
                         }
                         for item in state.inventory.items[:MAX_INVENTORY_CONTEXT_ITEMS]
                     ],
@@ -375,6 +383,7 @@ class AiContextBuilder:
                             "category": item.category,
                             "description": _compact_text(item.description),
                             "value_base_units": item.value_base_units,
+                            "metadata": _compact_context_value(item.metadata),
                         }
                         for item in state.item_catalog.items[:MAX_ITEM_CATALOG_CONTEXT_ITEMS]
                     ],
@@ -425,6 +434,22 @@ class AiContextBuilder:
                         "one 100-base-unit coin is still base_unit_amount -35; the "
                         "application displays the remaining 65 base units as the "
                         "appropriate denominations."
+                    ),
+                },
+                "combat": {
+                    "active": bool(combat_state.get("active", False)),
+                    "round": combat_state.get("round", 1),
+                    "turn_index": combat_state.get("turn_index", 0),
+                    "combatants": [
+                        _compact_context_value(combatant)
+                        for combatant in combat_state.get("combatants", [])
+                    ],
+                    "rules": (
+                        "When a fight starts, suggest CombatStartedEvent with "
+                        "enemy/allied combatants, health, armor_rating, damage "
+                        "dice, and loot. Do not resolve attacks, turns, damage, "
+                        "victory, defeat, or loot in story prose after combat "
+                        "starts; the Python Combat tab handles those mechanics."
                     ),
                 },
                 "alchemy": {
@@ -715,8 +740,10 @@ class AiContextBuilder:
                 ),
                 "item_catalog": (
                     "Use state.item_catalog.items as the master list of remembered "
-                    "item definitions. It preserves descriptions, categories, and "
-                    "values for items even after they leave inventory. Do not treat "
+                    "item definitions. It preserves descriptions, categories, values, "
+                    "and equipment metadata for items even after they leave inventory. "
+                    "Use Weapon metadata for weapon_hands and damage dice. Use Armor "
+                    "metadata for covers_body_parts and armor_rating. Do not treat "
                     "catalog entries as possessions unless they also appear in "
                     "state.inventory.items. Recipe ingredients may only use "
                     "catalog items whose category is one of "
@@ -732,10 +759,14 @@ class AiContextBuilder:
                     "food, drinks, magic, alchemy ingredients, species, or similar "
                     "invented details. Prefer the provided examples or close "
                     "stylistic relatives over generic training-data fantasy "
-                    "defaults. Never use creative_ideas.banned_terms or obvious "
-                    "spelling, hyphenation, or reskin variants for newly invented "
-                    "proper nouns. These examples are not established canon and "
-                    "must not override player-provided or saved world facts."
+                    "defaults. The banned_terms list is a hard exclusion list, "
+                    "not optional style guidance: never use creative_ideas.banned_terms "
+                    "or obvious spelling, hyphenation, or reskin variants for newly "
+                    "invented proper nouns. Before returning JSON, scan every string "
+                    "key and value and replace any newly invented banned term with "
+                    "a fresh non-banned name. These examples are not established "
+                    "canon and must not override player-provided or saved world facts. "
+                    f"{GENERIC_PROPER_NOUN_PLACEHOLDER_RULE}"
                 ),
                 "npc_memory": (
                     "Use NpcUpsertedEvent when a new meaningful NPC appears or an "
@@ -762,6 +793,12 @@ class AiContextBuilder:
                     "not model making change as separate coin items; the application "
                     "formats the resulting integer balance into coin denominations."
                 ),
+                "combat_handoff": (
+                    "When a fight begins, suggest CombatStartedEvent with concrete "
+                    "enemy/allied combatants, health, armor_rating, damage dice, and "
+                    "loot. After that, do not resolve attacks, turns, damage, victory, "
+                    "defeat, or loot in story prose; the Combat tab owns those mechanics."
+                ),
                 "out_of_game": "Boolean. True only for fully out-of-game answers.",
                 "event_shape": {
                     "type": "Required event type name.",
@@ -775,6 +812,7 @@ class AiContextBuilder:
                     "InventoryItemAddedEvent",
                     "InventoryItemRemovedEvent",
                     "InventoryItemModifiedEvent",
+                    "CombatStartedEvent",
                     "RecipeDiscoveredEvent",
                     "ReagentDiscoveredEvent",
                     "CurrencyChangedEvent",

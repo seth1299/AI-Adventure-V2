@@ -55,6 +55,10 @@ class ContextBuilderTests(unittest.TestCase):
                 backstory="Raised by caravan healers.",
                 condition="Curious",
                 notes="Distrusts locked doors.",
+                health_current=17,
+                health_max=24,
+                armor_rating=13,
+                equipment={"Main Hand": "Lantern"},
             ),
             world=WorldState(location="Old Road", time="Dusk", weather="Rain"),
             inventory=InventoryState(
@@ -64,6 +68,7 @@ class ContextBuilderTests(unittest.TestCase):
                         category="tool",
                         quantity=1,
                         description="A brass lantern.",
+                        metadata={"item_type": "Tool"},
                     )
                 ]
             ),
@@ -74,6 +79,7 @@ class ContextBuilderTests(unittest.TestCase):
                         category="tool",
                         description="A brass lantern.",
                         value_base_units=12,
+                        metadata={"item_type": "Tool"},
                     )
                 ]
             ),
@@ -107,6 +113,32 @@ class ContextBuilderTests(unittest.TestCase):
         state.settings.values["world.game_style"] = "Realistic detective mystery"
         state.settings.values["world.setup_context"] = "Canal guilds control the docks."
         state.settings.values["currency.description"] = "Crowns and half-crowns."
+        state.settings.values["combat.state"] = {
+            "active": True,
+            "round": 2,
+            "turn_index": 1,
+            "combatants": [
+                {
+                    "id": "player",
+                    "name": "Mira",
+                    "team": "party",
+                    "current_health": 17,
+                    "max_health": 24,
+                    "armor_rating": 13,
+                    "damage": "1d4",
+                },
+                {
+                    "id": "enemy-1-bandit",
+                    "name": "Bandit",
+                    "team": "enemy",
+                    "current_health": 6,
+                    "max_health": 8,
+                    "armor_rating": 12,
+                    "damage": "1d6",
+                    "loot": ["Rusty Knife"],
+                },
+            ],
+        }
 
         packet = builder.build_story_context(
             state,
@@ -143,6 +175,10 @@ class ContextBuilderTests(unittest.TestCase):
         self.assertEqual(packet["state"]["player"]["appearance"], "A road-worn apothecary in a green cloak.")
         self.assertEqual(packet["state"]["player"]["backstory"], "Raised by caravan healers.")
         self.assertEqual(packet["state"]["player"]["notes"], "Distrusts locked doors.")
+        self.assertEqual(packet["state"]["player"]["health_current"], 17)
+        self.assertEqual(packet["state"]["player"]["health_max"], 24)
+        self.assertEqual(packet["state"]["player"]["armor_rating"], 13)
+        self.assertEqual(packet["state"]["player"]["equipment"]["Main Hand"], "Lantern")
         self.assertEqual(
             packet["state"]["player_ai_preferences"]["additional_context"],
             "Please respond only in the third person.",
@@ -222,8 +258,16 @@ class ContextBuilderTests(unittest.TestCase):
         self.assertEqual(packet["state"]["audio"]["current_music"], "Town Village City.mp3")
         self.assertEqual(packet["state"]["inventory"]["items"][0]["name"], "Lantern")
         self.assertEqual(packet["state"]["inventory"]["items"][0]["value_base_units"], 0)
+        self.assertEqual(
+            packet["state"]["inventory"]["items"][0]["metadata"]["item_type"],
+            "Tool",
+        )
         self.assertEqual(packet["state"]["item_catalog"]["items"][0]["name"], "Lantern")
         self.assertNotIn("quantity", packet["state"]["item_catalog"]["items"][0])
+        self.assertEqual(
+            packet["state"]["item_catalog"]["items"][0]["metadata"]["item_type"],
+            "Tool",
+        )
         self.assertIn("item_catalog", packet["response_contract"])
         self.assertIn(
             "Material, Ingredient, Reagent, Crafting Item",
@@ -280,6 +324,23 @@ class ContextBuilderTests(unittest.TestCase):
             "preferred source",
             packet["response_contract"]["creative_ideas"],
         )
+        self.assertIn(
+            "hard exclusion list",
+            packet["response_contract"]["creative_ideas"],
+        )
+        self.assertIn(
+            "scan every string key and value",
+            packet["response_contract"]["creative_ideas"],
+        )
+        self.assertIn(
+            "bare category labels as final proper nouns",
+            packet["response_contract"]["creative_ideas"],
+        )
+        self.assertIn(
+            "the Police Department",
+            packet["response_contract"]["creative_ideas"],
+        )
+        self.assertIn("The Blue Wall", packet["response_contract"]["creative_ideas"])
         packet_json = json.dumps(packet)
         self.assertNotIn("double-bracket", packet_json)
         self.assertNotIn("legacy_tag", packet_json)
@@ -320,6 +381,11 @@ class ContextBuilderTests(unittest.TestCase):
         self.assertNotIn("disposition", packet["state"]["npcs"]["relevant"][0])
         self.assertIn("ActiveTaskUpsertedEvent", packet["response_contract"]["known_event_types"])
         self.assertIn("ActiveTaskCompletedEvent", packet["response_contract"]["known_event_types"])
+        self.assertIn("CombatStartedEvent", packet["response_contract"]["known_event_types"])
+        self.assertTrue(packet["state"]["combat"]["active"])
+        self.assertEqual(packet["state"]["combat"]["round"], 2)
+        self.assertEqual(packet["state"]["combat"]["combatants"][1]["name"], "Bandit")
+        self.assertIn("CombatStartedEvent", packet["response_contract"]["combat_handoff"])
         self.assertIn(
             "Do not leave visible task fields blank",
             packet["state"]["active_tasks"]["rules"]["field_completion_rule"],
