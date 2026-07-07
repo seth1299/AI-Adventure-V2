@@ -18,12 +18,14 @@ if importlib.util.find_spec("PySide6") is None:
 from PySide6.QtCore import QEvent, QObject, Qt
 from PySide6.QtGui import QPalette
 from PySide6.QtWidgets import (
+    QAbstractSpinBox,
     QApplication,
     QCheckBox,
     QComboBox,
     QDialog,
     QFormLayout,
     QGroupBox,
+    QHeaderView,
     QLabel,
     QLineEdit,
     QMessageBox,
@@ -46,6 +48,7 @@ from ai_adventure.persistence.save_repository import SaveRepository
 from ai_adventure.ui.main_window import (
     AISettingsDialog,
     AlchemyNotebookScreen,
+    CalendarScreen,
     CalendarSettingsDialog,
     CharacterScreen,
     CombatScreen,
@@ -62,7 +65,6 @@ from ai_adventure.ui.main_window import (
     StoryScreen,
     TTSSettingsDialog,
     TravelScreen,
-    WorldScreen,
     _next_available_save_title,
     _player_command_markdown,
     _preserve_player_character_text,
@@ -197,7 +199,7 @@ class MainWindowTests(unittest.TestCase):
                     for index in range(window.game_shell.tabs.count())
                 ]
                 self.assertIn("Character", tab_names)
-                self.assertIn("World", tab_names)
+                self.assertNotIn("World", tab_names)
                 self.assertIn("Travel", tab_names)
                 self.assertIn("Active Tasks", tab_names)
                 self.assertIn("Crafting", tab_names)
@@ -225,8 +227,28 @@ class MainWindowTests(unittest.TestCase):
 
                 for table in sortable_tables:
                     self.assertFalse(table.isSortingEnabled())
+                    self.assertTrue(table.wordWrap())
                     self.assertTrue(table.horizontalHeader().sectionsClickable())
                     self.assertTrue(table.horizontalHeader().isSortIndicatorShown())
+
+                self.assertEqual(
+                    window.game_shell.inventory_screen.table.horizontalHeader().sectionResizeMode(4),
+                    QHeaderView.ResizeMode.Stretch,
+                )
+                self.assertEqual(
+                    window.game_shell.npcs_screen.table.horizontalHeader().sectionResizeMode(2),
+                    QHeaderView.ResizeMode.Stretch,
+                )
+                self.assertEqual(
+                    window.game_shell.active_tasks_screen.table.horizontalHeader().sectionResizeMode(3),
+                    QHeaderView.ResizeMode.Stretch,
+                )
+                self.assertEqual(
+                    window.game_shell.skills_screen.skills_table.horizontalHeader().sectionResizeMode(2),
+                    QHeaderView.ResizeMode.ResizeToContents,
+                )
+                self.assertTrue(window.game_shell.alchemy_screen.reagent_table.wordWrap())
+                self.assertTrue(window.game_shell.alchemy_screen.recipe_table.wordWrap())
 
                 self.assertFalse(window.game_shell.calendar_screen.table.isSortingEnabled())
                 self.assertEqual(
@@ -257,8 +279,7 @@ class MainWindowTests(unittest.TestCase):
             screen.journal_input.setPlainText("Tell the AI this theory.")
             screen.share_with_ai_checkbox.setChecked(True)
 
-            with patch("ai_adventure.ui.main_window.QMessageBox.information"):
-                screen._save_journal()
+            screen._autosave_journal()
 
             self.assertEqual(repository.get_journal_notes(), "Tell the AI this theory.")
             self.assertTrue(repository.get_journal_share_with_ai())
@@ -1283,6 +1304,37 @@ class MainWindowTests(unittest.TestCase):
             character.close()
             combat.close()
 
+    def test_character_screen_autosaves_text_changes_and_omits_body_ascii_art(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            _ensure_qt_application()
+            repository = SaveRepository.create_new_save(
+                Path(temp_dir),
+                "Character Autosave Test",
+            )
+            screen = CharacterScreen(playtesting_tools=True)
+            screen.set_repository(repository)
+
+            try:
+                self.assertFalse(hasattr(screen, "body_map_label"))
+
+                screen.name_input.setText("Mira Stone")
+                screen.name_input.editingFinished.emit()
+
+                screen.notes_input.setPlainText("Keeps a private map.")
+                screen.eventFilter(
+                    screen.notes_input,
+                    QEvent(QEvent.Type.FocusOut),
+                )
+                QApplication.processEvents()
+
+                self.assertEqual(repository.get_setting("player_name"), "Mira Stone")
+                self.assertEqual(
+                    repository.get_setting("player.notes"),
+                    "Keeps a private map.",
+                )
+            finally:
+                screen.close()
+
     def test_playtesting_shell_only_exposes_manual_test_tabs(self) -> None:
         _ensure_qt_application()
         shell = GameShell(
@@ -1365,32 +1417,6 @@ class MainWindowTests(unittest.TestCase):
             self.assertEqual(item["quantity"], 30)
             screen.close()
 
-    def test_world_screen_renders_markdown_summary_and_lore(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            _ensure_qt_application()
-            repository = SaveRepository.create_new_save(Path(temp_dir), "Markdown World Test")
-            repository.set_world_summary("The city of **Rainmarket** watches the canals.")
-            repository.set_world_lore(
-                {
-                    "Locations": {
-                        "Rainmarket Station": "A rail hub with *old brass clocks*."
-                    },
-                    "Culture": {"Canal custom": "Boats yield to funeral barges."},
-                }
-            )
-            screen = WorldScreen()
-            screen.set_repository(repository)
-
-            plain_text = screen.world_output.toPlainText()
-
-            self.assertIn("World Overview", plain_text)
-            self.assertIn("The city of Rainmarket watches the canals.", plain_text)
-            self.assertIn("Culture", plain_text)
-            self.assertIn("Canal custom: Boats yield to funeral barges.", plain_text)
-            self.assertNotIn("Rainmarket Station", plain_text)
-            self.assertNotIn("**Rainmarket**", plain_text)
-            screen.close()
-
     def test_travel_screen_displays_calculated_estimate_and_submits_context(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             _ensure_qt_application()
@@ -1422,8 +1448,16 @@ class MainWindowTests(unittest.TestCase):
             )
             screen.set_repository(repository)
 
+            self.assertEqual(
+                screen.location_list.currentItem().text(),
+                "Canal Gate (Currently here)",
+            )
+            self.assertFalse(screen.travel_button.isEnabled())
+
             for row in range(screen.location_list.count()):
-                if screen.location_list.item(row).text() == "North Lock":
+                item = screen.location_list.item(row)
+                location = item.data(Qt.ItemDataRole.UserRole)
+                if isinstance(location, dict) and location.get("name") == "North Lock":
                     screen.location_list.setCurrentRow(row)
                     break
 
@@ -1872,6 +1906,93 @@ class MainWindowTests(unittest.TestCase):
             self.assertEqual(len(skill_names), len(set(skill_names)))
             window.close()
 
+    def test_ai_new_game_state_preserves_exact_location_and_named_skills(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            _ensure_qt_application()
+            temp_path = Path(temp_dir)
+            (temp_path / "saves").mkdir(parents=True, exist_ok=True)
+            (temp_path / "logs").mkdir(parents=True, exist_ok=True)
+            setup = normalize_new_game_setup(
+                {
+                    "title": "Exact Start",
+                    "start_location": "Kit's Abandoned Loft",
+                    "start_location_mode": "exact",
+                    "skills": [
+                        {"name": "Stealth", "level": 5},
+                        {"name": "Sleight of Hand", "level": 4},
+                    ],
+                }
+            )
+            repository = SaveRepository.create_new_save(
+                temp_path,
+                "Exact Start",
+                setup=setup,
+            )
+            window = MainWindow(
+                app_paths=AppPaths(
+                    app_data_dir=temp_path,
+                    saves_dir=temp_path / "saves",
+                    logs_dir=temp_path / "logs",
+                    log_file=temp_path / "logs" / "ai_adventure.log",
+                )
+            )
+            ai_skills = []
+            for index, skill in enumerate(setup["skills"]):
+                ai_skills.append(
+                    {
+                        "name": (
+                            "Rafter-Shadowing"
+                            if index < 2
+                            else f"Generated Skill {index}"
+                        ),
+                        "description": "Moving unseen in cramped urban spaces.",
+                        "level": skill["level"],
+                    }
+                )
+
+            window._apply_new_game_ai_state(
+                repository,
+                setup,
+                SimpleNamespace(
+                    start_location="Rafters of Rook's End",
+                    locations=[
+                        {
+                            "name": "Rafters of Rook's End",
+                            "description": "A hidden sleeping place.",
+                            "x_miles": 0,
+                            "y_miles": 0,
+                            "terrain": "Urban",
+                            "travel_multiplier": 1.0,
+                            "travel_notes": "",
+                        }
+                    ],
+                    starting_calendar={},
+                    start_weather="",
+                    finalized_starting_currency_balance_base_units=None,
+                    finalized_currency_denominations=[],
+                    finalized_currency_description="",
+                    selected_genre="",
+                    finalized_character={},
+                    finalized_skills=ai_skills,
+                    finalized_starter_items=[],
+                ),
+            )
+
+            self.assertEqual(
+                repository.get_state_value("location"),
+                "Kit's Abandoned Loft",
+            )
+            self.assertIsNotNone(repository.find_travel_location("Kit's Abandoned Loft"))
+            self.assertIsNone(repository.find_travel_location("Rafters of Rook's End"))
+            skill_names = [skill["name"] for skill in repository.list_skills()]
+            self.assertEqual(skill_names[:2], ["Stealth", "Sleight of Hand"])
+            self.assertNotIn("Rafter-Shadowing", skill_names[:2])
+            self.assertEqual(
+                repository.list_skills()[0]["description"],
+                "Moving unseen in cramped urban spaces.",
+            )
+            window.close()
+
     def test_ai_new_game_state_accepts_partial_ai_starter_inventory(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             _ensure_qt_application()
@@ -2210,10 +2331,21 @@ class MainWindowTests(unittest.TestCase):
             self.assertEqual(screen.currency_name_inputs[0].text(), "Credit")
             self.assertEqual(screen.currency_plural_inputs[0].text(), "Credits")
             self.assertFalse(screen.currency_value_inputs[0].isEnabled())
+            self.assertEqual(screen.currency_value_inputs[0].value(), 1)
+            self.assertEqual(
+                screen.currency_value_inputs[0].buttonSymbols(),
+                QAbstractSpinBox.ButtonSymbols.NoButtons,
+            )
+            self.assertTrue(screen.currency_remove_buttons[0].isHidden())
             self.assertTrue(screen.add_settings_currency_button.isEnabled())
 
             screen.add_settings_currency_button.click()
             self.assertEqual(len(screen.currency_name_inputs), 2)
+            self.assertEqual(
+                screen.currency_value_inputs[1].buttonSymbols(),
+                QAbstractSpinBox.ButtonSymbols.UpDownArrows,
+            )
+            self.assertFalse(screen.currency_remove_buttons[1].isHidden())
             screen.currency_name_inputs[1].setText("Marker")
             screen.currency_plural_inputs[1].setText("Markers")
             screen.currency_value_inputs[1].setValue(5)
@@ -2328,6 +2460,38 @@ class MainWindowTests(unittest.TestCase):
             self.assertEqual(shell.calendar_screen.table.columnCount(), 8)
             self.assertEqual(changed_sources, [shell.calendar_screen])
             shell.close()
+
+    def test_calendar_screen_centers_month_and_summary_on_dedicated_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            _ensure_qt_application()
+            repository = SaveRepository.create_new_save(Path(temp_dir), "Calendar Layout Test")
+            screen = CalendarScreen()
+            screen.set_repository(repository)
+
+            try:
+                layout = screen.layout()
+                self.assertIsNotNone(layout)
+                self.assertIs(layout.itemAt(1).widget(), screen.month_label)
+                self.assertIs(layout.itemAt(2).widget(), screen.summary_label)
+                self.assertEqual(
+                    screen.month_label.alignment(),
+                    Qt.AlignmentFlag.AlignCenter,
+                )
+                self.assertEqual(
+                    screen.summary_label.alignment(),
+                    Qt.AlignmentFlag.AlignCenter,
+                )
+                self.assertEqual(
+                    screen.table.horizontalHeader().sectionResizeMode(0),
+                    QHeaderView.ResizeMode.Stretch,
+                )
+                self.assertIsNotNone(screen.table.cellWidget(0, 0))
+                self.assertEqual(
+                    screen.table.cellWidget(0, 0).objectName(),
+                    "currentCalendarDay",
+                )
+            finally:
+                screen.close()
 
     def test_calendar_settings_dialog_builds_calendar_settings(self) -> None:
         _ensure_qt_application()
@@ -2552,8 +2716,9 @@ class MainWindowTests(unittest.TestCase):
 
             try:
                 dialog.template_name_input.setText("Mystery Shell")
-                dialog.save_title_input.clear()
                 dialog.genre_input.setText("Cozy mystery")
+                dialog.start_location_input.setText("Rainy Office")
+                _set_combo_to_data(dialog.start_location_mode_combo, "exact")
                 dialog.character_name_input.clear()
                 dialog.skill_inputs[0][1].setText("Observation")
                 dialog.skill_inputs[0][2].setText("Spotting small clues.")
@@ -2587,9 +2752,11 @@ class MainWindowTests(unittest.TestCase):
                 templates = load_new_game_templates(template_path, normalize_setups=False)
 
                 self.assertEqual([template.name for template in templates], ["Mystery Shell"])
-                self.assertEqual(templates[0].setup["title"], "")
+                self.assertEqual(templates[0].setup["title"], "Mystery Shell")
                 self.assertEqual(templates[0].setup["character"]["name"], "")
                 self.assertEqual(templates[0].setup["specified_genre"], "Cozy mystery")
+                self.assertEqual(templates[0].setup["start_location"], "Rainy Office")
+                self.assertEqual(templates[0].setup["start_location_mode"], "exact")
                 self.assertEqual(templates[0].setup["narration"]["tense"], "past")
                 self.assertEqual(
                     templates[0].setup["narration"]["style"],
@@ -3401,6 +3568,17 @@ class MainWindowTests(unittest.TestCase):
                         "value_base_units": 4,
                     }
                 ],
+                "starting_task": {
+                    "mode": "custom",
+                    "task": {
+                        "name": "Find the Canal Ledger",
+                        "description": "Recover the missing tax ledger.",
+                        "requester": "Archivist Pell",
+                        "location": "",
+                        "reward": "Guild favor",
+                        "due_date": "",
+                    },
+                },
                 "calendar": {"calendar_type": "gregorian", "time_display": "24_hour"},
                 "audio": {
                     "music_enabled": False,
@@ -3433,6 +3611,7 @@ class MainWindowTests(unittest.TestCase):
                 "specified_genre": "Realistic detective mystery",
                 "game_style": "Quiet investigation.",
                 "start_location": "Rainmarket Station",
+                "start_location_mode": "exact",
                 "world_context": "Canal guilds control the docks.",
             }
         )
@@ -3447,12 +3626,22 @@ class MainWindowTests(unittest.TestCase):
         self.assertEqual(_table_cell(wizard.starter_items_table, 0, 2, QLineEdit).text(), "Tool")
         self.assertEqual(_table_cell(wizard.starter_items_table, 0, 3, QLineEdit).text(), "Case notes.")
         self.assertEqual(_table_cell(wizard.starter_items_table, 0, 4, QSpinBox).value(), 4)
+        self.assertEqual(wizard.starting_task_mode_combo.currentData(), "custom")
+        self.assertTrue(wizard.starting_task_custom_group.isVisible())
+        self.assertEqual(wizard.starting_task_name_input.text(), "Find the Canal Ledger")
+        self.assertEqual(
+            wizard.starting_task_description_input.toPlainText(),
+            "Recover the missing tax ledger.",
+        )
+        self.assertEqual(wizard.starting_task_requester_input.text(), "Archivist Pell")
+        self.assertEqual(wizard.starting_task_reward_input.text(), "Guild favor")
         self.assertEqual(wizard.currency_table.rowCount(), 2)
         self.assertEqual(_table_cell(wizard.currency_table, 1, 0, QLineEdit).text(), "Crown")
         self.assertEqual(wizard.economy_examples_table.rowCount(), 1)
         self.assertEqual(_table_cell(wizard.economy_examples_table, 0, 0, QLineEdit).text(), "Bread")
         self.assertEqual(_table_cell(wizard.economy_examples_table, 0, 1, QSpinBox).value(), 2)
         self.assertEqual(wizard.calendar_type_combo.currentData(), "gregorian")
+        self.assertEqual(wizard.start_location_mode_combo.currentData(), "exact")
         self.assertFalse(wizard.calendar_settings_button.isEnabled())
         self.assertEqual(wizard.narration_tense_combo.currentData(), "past")
         self.assertEqual(
@@ -3477,6 +3666,14 @@ class MainWindowTests(unittest.TestCase):
         self.assertEqual(setup["starter_items"][0]["quantity"], 1)
         self.assertEqual(setup["starter_items"][0]["description"], "Case notes.")
         self.assertEqual(setup["starter_items"][0]["value_base_units"], 4)
+        self.assertEqual(setup["starting_task"]["mode"], "custom")
+        self.assertEqual(
+            setup["starting_task"]["task"]["name"],
+            "Find the Canal Ledger",
+        )
+        self.assertTrue(
+            setup["starting_task"]["task"]["requires_ai_invention"],
+        )
         self.assertFalse(setup["audio"]["music_enabled"])
         self.assertFalse(setup["audio"]["narrator_enabled"])
         self.assertEqual(setup["audio"]["music_volume"], 10)
@@ -3497,6 +3694,7 @@ class MainWindowTests(unittest.TestCase):
             "Favor investigative tension.",
         )
         self.assertEqual(setup["economy_examples"][0]["name"], "Bread")
+        self.assertEqual(setup["start_location_mode"], "exact")
         self.assertIn("Bread costs 2 base units", setup["currency_description"])
         wizard.close()
 
@@ -3660,8 +3858,20 @@ class MainWindowTests(unittest.TestCase):
             crown_currency_value = _table_cell(wizard.currency_table, 1, 2, QSpinBox)
             crown_currency_name = _table_cell(wizard.currency_table, 1, 0, QLineEdit)
             base_currency_remove = _table_cell(wizard.currency_table, 0, 3, QPushButton)
+            crown_currency_remove = _table_cell(wizard.currency_table, 1, 3, QPushButton)
             self.assertFalse(base_currency_value.isEnabled())
+            self.assertEqual(base_currency_value.value(), 1)
+            self.assertEqual(
+                base_currency_value.buttonSymbols(),
+                QAbstractSpinBox.ButtonSymbols.NoButtons,
+            )
+            self.assertTrue(base_currency_remove.isHidden())
             self.assertTrue(crown_currency_value.isEnabled())
+            self.assertEqual(
+                crown_currency_value.buttonSymbols(),
+                QAbstractSpinBox.ButtonSymbols.UpDownArrows,
+            )
+            self.assertFalse(crown_currency_remove.isHidden())
             self.assertEqual(
                 crown_currency_value.minimumWidth(),
                 crown_currency_name.minimumWidth(),
@@ -3672,11 +3882,17 @@ class MainWindowTests(unittest.TestCase):
             crown_currency_value.stepUp()
             self.assertEqual(crown_currency_value.value(), 12)
             base_currency_remove.click()
+            self.assertEqual(wizard.currency_table.rowCount(), 2)
+            crown_currency_remove.click()
             self.assertEqual(wizard.currency_table.rowCount(), 1)
-            self.assertEqual(_table_cell(wizard.currency_table, 0, 0, QLineEdit).text(), "Crown")
+            self.assertEqual(_table_cell(wizard.currency_table, 0, 0, QLineEdit).text(), "Bit")
             remaining_currency_value = _table_cell(wizard.currency_table, 0, 2, QSpinBox)
             self.assertFalse(remaining_currency_value.isEnabled())
             self.assertEqual(remaining_currency_value.value(), 1)
+            self.assertEqual(
+                remaining_currency_value.buttonSymbols(),
+                QAbstractSpinBox.ButtonSymbols.NoButtons,
+            )
 
             wizard._append_economy_example_row({"name": "Bread", "value_base_units": 2})
             self.assertEqual(wizard.economy_examples_table.rowCount(), 1)

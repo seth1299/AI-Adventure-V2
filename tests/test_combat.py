@@ -4,6 +4,8 @@ import unittest
 
 from ai_adventure.combat import (
     BODY_PARTS,
+    DEFAULT_TWO_HANDED_DAMAGE,
+    DEFAULT_WEAPON_DAMAGE,
     attack_hit_probability,
     calculate_team_threat_levels,
     normalize_equipment,
@@ -22,6 +24,39 @@ class _SequenceRng:
 
 
 class CombatRuleTests(unittest.TestCase):
+    def test_weapon_metadata_raises_damage_that_is_not_better_than_unarmed(self) -> None:
+        weak_one_handed = normalize_item_metadata(
+            {
+                "item_type": "Weapon",
+                "weapon_hands": "one-handed",
+                "damage": "1d4",
+            },
+            name="Rusty Dagger",
+            category="Weapon",
+        )
+        weak_two_handed = normalize_item_metadata(
+            {
+                "item_type": "Weapon",
+                "weapon_hands": "two-handed",
+                "damage": "1d4",
+            },
+            name="Cracked Greatclub",
+            category="Weapon",
+        )
+        stronger_weapon = normalize_item_metadata(
+            {
+                "item_type": "Weapon",
+                "weapon_hands": "one-handed",
+                "damage": "1d6+1",
+            },
+            name="Fine Saber",
+            category="Weapon",
+        )
+
+        self.assertEqual(weak_one_handed["damage"], DEFAULT_WEAPON_DAMAGE)
+        self.assertEqual(weak_two_handed["damage"], DEFAULT_TWO_HANDED_DAMAGE)
+        self.assertEqual(stronger_weapon["damage"], "1d6+1")
+
     def test_container_metadata_preserves_exact_contents_and_security(self) -> None:
         metadata = normalize_item_metadata(
             {

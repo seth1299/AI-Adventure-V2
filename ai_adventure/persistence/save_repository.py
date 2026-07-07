@@ -2591,73 +2591,6 @@ class SaveRepository:
 
         return str(self.get_setting("world.summary", ""))
 
-    def set_world_lore(self, lore: Any) -> None:
-        """
-        Stores grouped player-facing world lore.
-
-        Args:
-            lore: Mapping of category names to lore entry strings.
-        """
-
-        self.set_setting("world.lore", _normalize_world_lore(lore))
-
-    def get_world_lore(self) -> dict[str, dict[str, str]]:
-        """
-        Reads grouped player-facing world lore.
-
-        Returns:
-            Mapping of category names to keyed lore entry strings.
-        """
-
-        return _normalize_world_lore(self.get_setting("world.lore", {}))
-
-    def add_world_lore_entry(self, category: str, key: str, text: str) -> None:
-        """
-        Adds a player-facing world lore entry to a category.
-
-        Args:
-            category: Player-facing lore category.
-            key: Stable entry key, such as a location/faction/religion name.
-            text: Lore text.
-        """
-
-        clean_category = str(category or "World").strip() or "World"
-        clean_key = str(key or "").strip() or _derive_world_lore_key(text)
-        clean_text = str(text or "").strip()
-
-        if not clean_key or not clean_text:
-            LOGGER.warning("Skipped incomplete world lore entry.")
-            return
-
-        lore = self.get_world_lore()
-        entries = lore.setdefault(clean_category, {})
-        entries.setdefault(clean_key, clean_text)
-        self.set_world_lore(lore)
-
-    def change_world_lore_entry(self, category: str, key: str, text: str) -> None:
-        """
-        Changes one existing keyed player-facing world lore entry.
-
-        Args:
-            category: Player-facing lore category.
-            key: Existing entry key to change.
-            text: Full replacement lore text.
-        """
-
-        clean_category = str(category or "World").strip() or "World"
-        clean_key = str(key or "").strip()
-        clean_text = str(text or "").strip()
-
-        if not clean_key or not clean_text:
-            LOGGER.warning("Skipped incomplete changed world lore entry.")
-            return
-
-        lore = self.get_world_lore()
-        entries = lore.setdefault(clean_category, {})
-        entries[clean_key] = clean_text
-
-        self.set_world_lore(lore)
-
     def get_travel_locations(self) -> list[dict[str, Any]]:
         """Reads structured player-known locations used by the Travel screen."""
 
@@ -2677,7 +2610,7 @@ class SaveRepository:
         )
 
     def ensure_travel_locations(self) -> list[dict[str, Any]]:
-        """Bootstraps travel data from the current scene and legacy Locations lore."""
+        """Bootstraps travel data from the current scene when needed."""
 
         locations = normalize_known_locations(self.get_setting("travel.locations", []))
         indexes_by_name = {
@@ -2699,25 +2632,6 @@ class SaveRepository:
                 )
             )
             changed = True
-
-        for category, entries in self.get_world_lore().items():
-            if str(category).casefold() != "locations" or not isinstance(entries, dict):
-                continue
-
-            for raw_name, raw_description in entries.items():
-                name = clean_player_location_name(raw_name)
-
-                if not name or name.casefold() in indexes_by_name:
-                    continue
-
-                indexes_by_name[name.casefold()] = len(locations)
-                locations.append(
-                    KnownLocation(
-                        name=name,
-                        description=str(raw_description).strip(),
-                    )
-                )
-                changed = True
 
         if changed:
             self.set_travel_locations([location.to_dict() for location in locations])
@@ -3988,66 +3902,6 @@ def _decode_json_list(raw_json: Any, label: str) -> list[Any]:
         return []
 
     return values
-
-
-def _normalize_world_lore(raw_lore: Any) -> dict[str, dict[str, str]]:
-    """Normalizes grouped player-facing world lore."""
-
-    if not isinstance(raw_lore, dict):
-        return {}
-
-    lore: dict[str, dict[str, str]] = {}
-
-    for raw_category, raw_entries in raw_lore.items():
-        category = str(raw_category).strip()
-
-        if not category:
-            continue
-
-        if isinstance(raw_entries, dict):
-            entries = {
-                str(key).strip(): str(value).strip()
-                for key, value in raw_entries.items()
-                if str(key).strip() and str(value).strip()
-            }
-        elif isinstance(raw_entries, str):
-            clean_entry = raw_entries.strip()
-            entries = (
-                {_derive_world_lore_key(clean_entry): clean_entry}
-                if clean_entry
-                else {}
-            )
-        elif isinstance(raw_entries, list):
-            entries = {}
-
-            for entry in raw_entries:
-                clean_entry = str(entry).strip()
-
-                if clean_entry:
-                    entries[_derive_world_lore_key(clean_entry)] = clean_entry
-        else:
-            entries = {}
-
-        if entries:
-            lore[category] = entries
-
-    return lore
-
-
-def _derive_world_lore_key(text: Any) -> str:
-    """Derives a stable-ish lore key from text when older data lacks one."""
-
-    clean_text = str(text or "").strip()
-
-    if not clean_text:
-        return ""
-
-    key = clean_text.split(":", 1)[0].strip()
-
-    if key:
-        return key[:80]
-
-    return clean_text[:80]
 
 
 def _bounded_float(value: Any, *, default: float, minimum: float, maximum: float) -> float:

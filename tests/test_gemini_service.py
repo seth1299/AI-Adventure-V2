@@ -1525,7 +1525,6 @@ class GeminiServiceTests(unittest.TestCase):
                 {
                     "selected_genre": "Solar noir",
                     "world_summary": "A city under glass.",
-                    "world_lore": {},
                     "gm_secrets": [],
                     "locations": [],
                     "start_location": "Dawn Gate",
@@ -1642,14 +1641,18 @@ class GeminiServiceTests(unittest.TestCase):
                 {
                     "selected_genre": "Detective mystery",
                     "world_summary": world_summary,
-                    "world_lore": {
-                        "Locations": {
-                            start_location: f"{start_location} overlooks the tram line."
-                        },
-                        "Prominent NPCs": {
-                            npc_name: f"{npc_name} handles the morning desk."
-                        },
-                    },
+                    "locations": [
+                        {
+                            "name": start_location,
+                            "description": f"{start_location} overlooks the tram line.",
+                            "x_miles": 0,
+                            "y_miles": 0,
+                            "terrain": "Rainy streets",
+                            "travel_multiplier": 1.0,
+                            "travel_notes": "Morning tram traffic is heavy.",
+                        }
+                    ],
+                    "gm_secrets": [],
                     "start_location": start_location,
                     "starting_calendar": {},
                     "weather": "Rain",
@@ -1754,7 +1757,7 @@ class GeminiServiceTests(unittest.TestCase):
         combined_output = json.dumps(
             {
                 "world_summary": result.world_summary,
-                "world_lore": result.world_lore,
+                "locations": result.locations,
                 "start_location": result.start_location,
                 "starting_items": result.finalized_starter_items,
                 "introductory_message": result.introductory_message,
@@ -1851,6 +1854,8 @@ class GeminiServiceTests(unittest.TestCase):
         self.assertIn("ContainerContentsTakenEvent", prompt)
         self.assertIn("Python then transfers the exact stored contents once", prompt)
         self.assertIn("weapon_hands", prompt)
+        self.assertIn("average damage strictly higher", prompt)
+        self.assertIn("unarmed base damage of 1d4", prompt)
         self.assertIn("covers_body_parts", prompt)
         self.assertIn("armor_rating", prompt)
         self.assertIn("state.item_catalog.items is the master list", prompt)
@@ -1968,6 +1973,32 @@ class GeminiServiceTests(unittest.TestCase):
             result.narrative_text,
             "The road bends into fog.\n\nWhat do you do now?\n- Follow the road.",
         )
+
+    def test_parse_json_response_uses_contextual_turn_prompt(self) -> None:
+        raw_text = json.dumps(
+            {
+                "response": "The clue glittered under the desk.",
+                "suggested_actions": ["Pocket the clue."],
+                "events": [],
+                "out_of_game": False,
+            }
+        )
+
+        result = parse_gemini_story_response(
+            raw_text,
+            context_packet={
+                "state": {
+                    "player": {"name": "Iris Vale"},
+                    "player_ai_preferences": {
+                        "narration_tense": "past",
+                        "narration_style": "first_person_limited",
+                    },
+                }
+            },
+        )
+
+        self.assertIn("What did I do next?", result.narrative_text)
+        self.assertNotIn("What do you do now?", result.narrative_text)
 
     def test_story_response_adds_fallback_actions_and_status_event(self) -> None:
         raw_text = json.dumps(
@@ -2185,6 +2216,13 @@ class GeminiServiceTests(unittest.TestCase):
                 "packet_type": "new_game_setup",
                 "setup": {
                     "title": "Rainmarket",
+                    "starting_task": {
+                        "mode": "custom",
+                        "task": {
+                            "name": "Find the Canal Ledger",
+                            "description": "",
+                        },
+                    },
                     "narration": {
                         "tense": "future",
                         "tense_label": "Future Tense",
@@ -2201,16 +2239,15 @@ class GeminiServiceTests(unittest.TestCase):
         self.assertIn("world_summary", prompt)
         self.assertIn("locations must be a player-known array", prompt)
         self.assertIn("introductory_message may use", prompt)
+        self.assertIn("setup.starting_task.mode", prompt)
+        self.assertIn("ActiveTaskUpsertedEvent", prompt)
+        self.assertIn("setup_packet.turn_prompt", prompt)
+        self.assertIn("start_location_mode is exact", prompt)
+        self.assertIn("copy that exact skill name", prompt)
         raw_text = json.dumps(
             {
                 "selected_genre": "Realistic detective mystery",
                 "world_summary": "Rainmarket is a canal city.",
-                "world_lore": {
-                    "Locations": {
-                        "Rainmarket Station": "Rainmarket Station anchors the canal district."
-                    },
-                    "Economy": {"Crowns": "Crowns dominate official trade."},
-                },
                 "gm_secrets": [
                     {
                         "secret_id": "station_master_is_villain",
@@ -2224,7 +2261,10 @@ class GeminiServiceTests(unittest.TestCase):
                 "locations": [
                     {
                         "name": "Rainmarket Station",
-                        "description": "A crowded canal-side transit hub.",
+                        "description": (
+                            "A crowded canal-side transit hub where official trade "
+                            "uses Crowns and station bells set local custom."
+                        ),
                         "x_miles": 12,
                         "y_miles": -4,
                         "terrain": "Canal streets",
@@ -2358,6 +2398,7 @@ class GeminiServiceTests(unittest.TestCase):
         result = parse_gemini_new_game_response(raw_text)
 
         self.assertIn("world_summary", prompt)
+        self.assertNotIn("world_lore", prompt)
         self.assertIn("Rainmarket", prompt)
         self.assertIn("fields_requiring_ai_invention", prompt)
         self.assertIn("blank/default placeholders", prompt)
@@ -2395,6 +2436,8 @@ class GeminiServiceTests(unittest.TestCase):
         self.assertIn("starting_items must contain at least five", prompt)
         self.assertIn("has no maximum item count", prompt)
         self.assertIn("invent enough additional concrete items", prompt)
+        self.assertIn("Do not return starter weapons with damage of 1d4", prompt)
+        self.assertIn("at least 1d6 for ordinary one-handed weapons", prompt)
         self.assertNotIn("starter_inventory_contract is present it defines", prompt)
         self.assertEqual(
             NEW_GAME_RESPONSE_JSON_SCHEMA["properties"]["starting_items"]["minItems"],
@@ -2451,10 +2494,8 @@ class GeminiServiceTests(unittest.TestCase):
         self.assertIn("API response schema defines the required JSON fields", prompt)
         self.assertNotIn("Return this JSON shape", prompt)
         self.assertEqual(result.world_summary, "Rainmarket is a canal city.")
-        self.assertEqual(
-            result.world_lore["Locations"]["Rainmarket Station"],
-            "Rainmarket Station anchors the canal district.",
-        )
+        self.assertNotIn("world_lore", NEW_GAME_RESPONSE_JSON_SCHEMA["properties"])
+        self.assertIn("Crowns", result.locations[0]["description"])
         self.assertEqual(
             result.gm_secrets[0]["secret_id"],
             "station_master_is_villain",
@@ -2483,12 +2524,46 @@ class GeminiServiceTests(unittest.TestCase):
         self.assertEqual(result.suggested_actions[0], "Inspect the canal clock.")
         self.assertEqual(result.suggested_events[0]["type"], "NpcUpsertedEvent")
 
+    def test_parse_new_game_response_uses_setup_turn_prompt(self) -> None:
+        raw_text = json.dumps(
+            {
+                "selected_genre": "Fantasy",
+                "world_summary": "A small city of rooftops.",
+                "gm_secrets": [],
+                "start_location": "Kit's Abandoned Loft",
+                "starting_calendar": {},
+                "weather": "Clear",
+                "character": {
+                    "name": "Kit",
+                    "appearance": "Practical clothes.",
+                    "backstory": "Streetwise.",
+                    "notes": "Careful.",
+                },
+                "skills": [],
+                "starting_items": [],
+                "currency_denominations": [{"name": "Copper", "plural_name": "Coppers", "value": 1}],
+                "currency_description": "Copper coins.",
+                "starting_currency_balance_base_units": 4,
+                "introductory_message": "Kit wakes in the loft.",
+                "suggested_actions": ["Check the window."],
+                "locations": [],
+                "events": [],
+            }
+        )
+
+        result = parse_gemini_new_game_response(
+            raw_text,
+            setup_packet={"turn_prompt": "What does Kit do now?"},
+        )
+
+        self.assertIn("What does Kit do now?", result.introductory_message)
+        self.assertNotIn("What do you do now?", result.introductory_message)
+
     def test_parse_new_game_starter_items_generalizes_setup_amount_names(self) -> None:
         raw_text = json.dumps(
             {
                 "selected_genre": "Frontier survival",
                 "world_summary": "A route across dry country.",
-                "world_lore": {},
                 "gm_secrets": [],
                 "start_location": "Fuel Depot",
                 "starting_calendar": {},
@@ -2565,11 +2640,17 @@ class GeminiServiceTests(unittest.TestCase):
             {
                 "selected_genre": "Detective mystery",
                 "world_summary": "New Aethelgard is a rain-heavy city.",
-                "world_lore": {
-                    "Locations": {
-                        "New Aethelgard": "New Aethelgard has old elevated rails."
+                "locations": [
+                    {
+                        "name": "New Aethelgard",
+                        "description": "New Aethelgard has old elevated rails.",
+                        "x_miles": 0,
+                        "y_miles": 0,
+                        "terrain": "City streets",
+                        "travel_multiplier": 1.0,
+                        "travel_notes": "Elevated trains cross the district.",
                     }
-                },
+                ],
                 "start_location": "New Aethelgard Office",
                 "starting_calendar": {},
                 "weather": "Clear",
@@ -2651,7 +2732,7 @@ class GeminiServiceTests(unittest.TestCase):
         combined_output = json.dumps(
             {
                 "world_summary": result.world_summary,
-                "world_lore": result.world_lore,
+                "locations": result.locations,
                 "start_location": result.start_location,
                 "character": result.finalized_character,
                 "skills": result.finalized_skills,
@@ -2674,7 +2755,6 @@ class GeminiServiceTests(unittest.TestCase):
             {
                 "selected_genre": "Expedition",
                 "world_summary": "A long road waits.",
-                "world_lore": {},
                 "start_location": "Trailhead",
                 "starting_calendar": {},
                 "weather": "Clear",

@@ -27,7 +27,7 @@
         "rules": [
           "Return valid JSON only, with no Markdown fence.",
           "Only put player-facing text in response.",
-          "Use supported events for inventory, world lore, active tasks, skills, currency, combat, recipes, reagents, NPCs, music, spells, flags, travel, locations, and status changes.",
+          "Use supported events for inventory, active tasks, skills, currency, combat, recipes, reagents, NPCs, music, spells, flags, travel, locations, and status changes.",
           "The Python application validates events before committing state."
         ]
       }
@@ -167,7 +167,7 @@
           "Apply state.player_ai_preferences.model_tone_instruction, response_length_instruction, and model_content_rules to player-facing prose. Unchecked content categories must not appear.",
           "Limited narration stays within the player character's observed or reasonably inferred experience. Omniscient narration may use a broader narrative camera, but must not reveal secrets, hidden state, mystery solutions, or NPC-private facts.",
           "Follow state.player_ai_preferences.response_length_instruction and any output-token cap defined by that mode. Within the selected mode, scale response length to the importance, risk, and consequences of the action.",
-          "Do not include \"What do you do now?\" or any end-of-turn prompt in the response field; the application displays that separately.",
+          "Do not include \"What do you do now?\" or any tense/person-specific end-of-turn prompt in the response field; the application displays that separately based on the selected narration tense and style.",
           "Resolve the player's submitted action instead of ending by restating the action, intent, or search target.",
           "For in-game turns, include 3-4 suggested_actions as separate strings.",
           "Use events for state changes instead of embedding commands in narration."
@@ -231,7 +231,7 @@
         "rules": [
           "When a situation becomes an actual fight, suggest CombatStartedEvent with concrete enemy combatants, optional allied combatants, health, armor_rating, to_hit_bonus, initiative_bonus, personality, complete ammunition/clip fields, damage dice, and loot.",
           "After combat starts, do not narrate attack rolls, turn-by-turn attacks, reloading, damage totals, deaths, victory, defeat, or loot recovery as if they are resolved by the AI. Python rolls initiative, calculates each team's Threat Levels from maximum health, armor rating, and average damage, uses those percentages for non-intelligent NPC targeting, preserves tactical targeting for intelligent NPCs, and resolves attacks and reloading.",
-          "Weapons should be created as Weapon items with weapon_hands and damage dice. Ranged weapons may include attack_range_feet, ammunition_type_required, clip_size, and bullets_per_attack. Ammunition items use item_type Ammunition and matching ammunition_type metadata. Armor and shields should be created as Armor items with covers_body_parts and armor_rating so the Character sheet can equip them.",
+          "Weapons should be created as Weapon items with weapon_hands and damage dice. Any player weapon must have average damage strictly higher than the player's unarmed base damage of 1d4; do not create player weapons with damage of 1d4 or anything weaker. Use at least 1d6 for ordinary one-handed weapons and at least 1d10 for ordinary two-handed weapons unless a stronger fitting expression is appropriate. Ranged weapons may include attack_range_feet, ammunition_type_required, clip_size, and bullets_per_attack. Ammunition items use item_type Ammunition and matching ammunition_type metadata. Armor and shields should be created as Armor items with covers_body_parts and armor_rating so the Character sheet can equip them.",
           "Remember that the Player is not the only one in fights/combats and that other NPCs can also attack, take damage, and die, including Player allies.",
           "Do not give the Player, allies, or enemies plot armor during combats."
         ]
@@ -328,6 +328,7 @@
         "rules": [
           "Suggest SkillUpsertedEvent when the player attempts, learns, trains, or reveals a skill that is not already known.",
           "`Skill Name` should be short, generalized, and useful across many checks.",
+          "Preserve player-provided starting skill names exactly; do not replace them with narrower, more local, hyphenated, or hyper-specific variants.",
           "Avoid one-off proper-noun skills, tiny item-maintenance tasks, and narrow lore phrases as skill names.",
           "Put local flavor, culture, equipment, and backstory specifics in `Skill Description` instead of the skill name.",
           "For specific lore domains, use the shape `Lore (Specific Domain)`, such as `Lore (Syndicate)` or `Lore (Merchant Law)`, rather than `Syndicate Lore`.",
@@ -460,7 +461,7 @@
           "`Description` should explain what the item is and include in structured event data important state information, such as what sort of ammunition is used for a bow or a gun.",
           "`Amount` must be a positive integer.",
           "`ValueBaseUnits` is required for every InventoryItemAddedEvent and must be an integer of at least 1, measured in the baseline currency unit from state.currency.baseline_unit.",
-          "Weapon items should include weapon_hands and damage dice such as 1d6 or 2d6. Ranged weapons may also include attack_range_feet, ammunition_type_required, clip_size, and bullets_per_attack.",
+          "Weapon items should include weapon_hands and damage dice such as 1d6 or 2d6. Any player weapon must have average damage strictly higher than the player's unarmed base damage of 1d4; do not create player weapons with damage of 1d4 or anything weaker. Use at least 1d6 for ordinary one-handed weapons and at least 1d10 for ordinary two-handed weapons unless a stronger fitting expression is appropriate. Ranged weapons may also include attack_range_feet, ammunition_type_required, clip_size, and bullets_per_attack.",
           "Ammunition items should use item_type Ammunition and ammunition_type matching the weapon's ammunition_type_required.",
           "Armor and shield items should include covers_body_parts and armor_rating.",
           "A pouch, purse, chest, box, bag, crate, case, sack, satchel, or similar item that can hold unrevealed contents must use item_type Container and include complete container metadata.",
@@ -675,7 +676,7 @@
           "`Location` should describe where the item or material is found.",
           "`Uses` must be an array of short practical uses.",
           "ReagentDiscoveredEvent records crafting knowledge and the app remembers that item as a Material for recipe ingredient selection. If the player physically collects, harvests, picks up, or stores the item/material, also suggest InventoryItemAddedEvent for the same item/material.",
-          "Use WorldLoreUpsertedEvent only for broader plant, material, or world facts that are not structured practical crafting knowledge. If the player learns practical item/material uses, use ReagentDiscoveredEvent."
+          "If the player learns practical item/material uses, use ReagentDiscoveredEvent. If the player learns a place where the item/material is found, include that place in the ReagentDiscoveredEvent location field and use LocationUpsertedEvent only when the place itself should appear in the Travel tab."
         ]
       }
     },
@@ -696,44 +697,6 @@
           "If the player experiments without a recipe, judge the attempt logically.",
           "If an experiment succeeds, suggest the relevant SkillUpsertedEvent if needed, then RecipeDiscoveredEvent, then InventoryItemAddedEvent for the product.",
           "If a blueprint, pattern, scroll, mold, or other design object is consumed during crafting, suggest InventoryItemRemovedEvent for that object."
-        ]
-      }
-    },
-    {
-      "id": "event.upsert_world",
-      "title": "WorldLoreUpsertedEvent Contract",
-      "category": "event_contract",
-      "tags": [
-        "events",
-        "world",
-        "lore"
-      ],
-      "priority": 70,
-      "content": {
-        "event_type": "WorldLoreUpsertedEvent",
-        "payload_fields": [
-          "section",
-          "key",
-          "text"
-        ],
-        "purpose": "Creates or replaces one factual player-known World panel entry under the correct section.",
-        "rules": [
-          "Suggest WorldLoreUpsertedEvent when the player discovers, corrects, or clarifies a named NPC, faction, shop, landmark, custom, creature, plant, monster, weather hazard, magical phenomenon, historical fact, cultural fact, piece of lore, or other significant world information. Use LocationUpsertedEvent for a location.",
-          "This event is for player-learned facts, not omniscient facts.",
-          "Partial knowledge is valid. If the player learns that a named thing exists and learns even one useful fact about it, suggest a WorldLoreUpsertedEvent for that visible fact.",
-          "Do not skip a useful visible world update merely because the player has not learned every detail about the entity yet.",
-          "If a fact contains both player-known information and hidden information, split it. Put only the visible/player-known part in WorldLoreUpsertedEvent, and store the hidden details with SecretUpsertedEvent.",
-          "The text should be concise, factual, and encyclopedia-like.",
-          "`Key` is the stable entry name, such as a faction, religion, law, custom, currency, or concept name. Locations belong in the Travel tab through LocationUpsertedEvent.",
-          "`Text` is the full updated player-facing lore text for that key.",
-          "Use one WorldLoreUpsertedEvent per newly learned or changed entity or concept when multiple distinct facts are learned in the same response.",
-          "Do not put hidden secrets the player has not learned into player-visible structured event fields. Use SecretUpsertedEvent for the AI-only record.",
-          "Avoid time-relative wording such as tonight, tomorrow, yesterday, earlier today, or currently.",
-          "Write durable and consistent facts that will still make sense later.",
-          "If the section is unclear, use Uncategorized.",
-          "Use the same event whether the entry is new or already exists; it upserts the full replacement text. Use LocationUpsertedEvent for locations.",
-          "Do not create parenthetical sub-entries such as `Glass-Gales (Survival Tactics)`, `Mirror-Wards (Dismantling)`, or `Stone-Strider Goat (Behavior)`. Fold that information into the existing entry's full replacement text.",
-          "Research topics, survival tactics, warning signs, uses, weaknesses, behaviors, and other subtopics must be folded into the existing entry's lore text."
         ]
       }
     },
@@ -767,8 +730,8 @@
           "reveal_condition states how the player could plausibly learn the truth. Use an empty string only when no condition is established yet.",
           "related_npc_ids and related_locations are arrays. Use empty arrays when the secret is not tied to a known NPC or place.",
           "Use status active while the truth is hidden, revealed once the player learns it, and retired when it is no longer true or useful.",
-          "Never copy an active secret into visible narration, suggested actions, player-facing NPC fields, World Lore, Travel fields, tasks, or other player-visible state.",
-          "When the player learns a secret, mark it revealed and also suggest the appropriate player-known NPC, World Lore, Location, task, flag, or other event for the newly learned fact."
+          "Never copy an active secret into visible narration, suggested actions, player-facing NPC fields, Travel fields, tasks, or other player-visible state.",
+          "When the player learns a secret, mark it revealed and also suggest the appropriate player-known NPC, Location, task, flag, item/material, or other supported event for the newly learned fact."
         ]
       }
     },
@@ -798,9 +761,9 @@
         "rules": [
           "Use this when the player learns a location or learns new player-visible details about a known location.",
           "Coordinates are relative map miles. Keep them consistent with state.travel.locations and use x_miles=0 and y_miles=0 for the starting map origin.",
-          "Description, terrain, and travel_notes must contain only player-known facts. Do not include secret routes, hidden dangers, mystery solutions, or GM-only information.",
+          "Description, terrain, and travel_notes must contain only player-known facts. Put player-known local religion, culture, economy, factions, laws, customs, landmarks, and practical context for that place in description or travel_notes. Do not include secret routes, hidden dangers, mystery solutions, or GM-only information.",
           "travel_multiplier must be positive. Use values below 1 for terrain that slows ordinary travel and values above 1 only for reliably faster routes.",
-          "Do not use WorldLoreUpsertedEvent for locations that belong in the Travel tab."
+          "Use NpcUpsertedEvent for people the player can recognize or remember at this location."
         ]
       }
     },
@@ -1055,7 +1018,7 @@
           "Did I use CurrencyChangedEvent for money instead of coin names?",
           "Did I use exact item, task, NPC, skill, world, and quest names where possible?",
           "Did I suggest a StatusUpdatedEvent for in-game turns when status changes are needed (unless explicitly told otherwise)?",
-          "Did I leave out `What do you do now?` so the application can display it separately?",
+          "Did I leave out the end-of-turn prompt so the application can display the tense/person-specific version separately?",
           "Did I end on the world's response, a resolved immediate outcome, a clear obstacle, an NPC reaction, or a concrete new detail instead of a player-character action or unfinished thought?",
           "Did I include 3-4 suggested_actions in the JSON response?",
           "Did I make sure that this response is advancing the story somehow? Unless the Player is specifically taking time to rest, then there shouldn't be any \"dead space\" or parts of the story where the Player keeps sending the same response again and again, waiting for you to do something. Remember that at the end of the day, everything that happens is fictional and is not real. The Player is not actually committing crimes in real life, and nobody is actually getting hurt or dying in real life. All crimes and violence are fictional, and no \"guide\" should be provided on how to commit the crime (e.g. if the Player wants to commit a crime, then simply narrate the results of their actions; do not provide a \"guide\" on how to actually do the action, such as lockpicking or pickpocketing)."

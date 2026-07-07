@@ -310,7 +310,8 @@ class ContextBuilderTests(unittest.TestCase):
         )
         self.assertIn("background_music", packet["response_contract"])
         self.assertIn("MusicChangedEvent", packet["response_contract"]["known_event_types"])
-        self.assertIn("WorldLoreUpsertedEvent", packet["response_contract"]["known_event_types"])
+        self.assertNotIn("WorldLoreUpsertedEvent", packet["response_contract"]["known_event_types"])
+        self.assertIn("LocationUpsertedEvent", packet["response_contract"]["known_event_types"])
         self.assertIn("SecretUpsertedEvent", packet["response_contract"]["known_event_types"])
         self.assertIn("ContainerOpenedEvent", packet["response_contract"]["known_event_types"])
         self.assertIn(
@@ -674,7 +675,8 @@ class ContextBuilderTests(unittest.TestCase):
         self.assertIn("event.status", section_ids)
         self.assertIn("event.add", section_ids)
         self.assertIn("event.active_task", section_ids)
-        self.assertIn("event.upsert_world", section_ids)
+        self.assertIn("event.upsert_location", section_ids)
+        self.assertNotIn("event.upsert_world", section_ids)
 
 
 if __name__ == "__main__":

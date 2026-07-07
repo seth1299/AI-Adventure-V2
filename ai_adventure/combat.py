@@ -67,9 +67,9 @@ def normalize_item_metadata(
             or ""
         ).strip()
         clean_metadata["weapon_hands"] = hands
-        clean_metadata["damage"] = normalize_damage_expression(
+        clean_metadata["damage"] = weapon_damage_above_unarmed(
             metadata.get("damage", metadata.get("damage_expression")),
-            default=DEFAULT_TWO_HANDED_DAMAGE if hands == "two-handed" else DEFAULT_WEAPON_DAMAGE,
+            weapon_hands=hands,
         )
         clean_metadata["damage_type"] = str(metadata.get("damage_type", "") or "").strip()
         clean_metadata["attack_skill"] = attack_skill
@@ -355,6 +355,26 @@ def normalize_damage_expression(raw_damage: Any, *, default: str = DEFAULT_WEAPO
         expression += f"+{bonus}"
     elif bonus < 0:
         expression += str(bonus)
+
+    return expression
+
+
+def weapon_damage_above_unarmed(
+    raw_damage: Any,
+    *,
+    weapon_hands: str = "one-handed",
+) -> str:
+    """Returns weapon damage that is strictly better than base unarmed damage."""
+
+    default = (
+        DEFAULT_TWO_HANDED_DAMAGE
+        if str(weapon_hands).casefold() == "two-handed"
+        else DEFAULT_WEAPON_DAMAGE
+    )
+    expression = normalize_damage_expression(raw_damage, default=default)
+
+    if average_damage(expression) <= average_damage(DEFAULT_UNARMED_DAMAGE):
+        return default
 
     return expression
 

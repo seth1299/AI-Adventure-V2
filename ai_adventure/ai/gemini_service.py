@@ -92,7 +92,6 @@ KNOWN_EVENT_TYPE_NAMES = [
     "FlagSetEvent",
     "LocationUpsertedEvent",
     "TravelModeChangedEvent",
-    "WorldLoreUpsertedEvent",
     "ActiveTaskUpsertedEvent",
     "ActiveTaskCompletedEvent",
     "SpellLearnedEvent",
@@ -671,15 +670,6 @@ EVENT_RESPONSE_SCHEMA: dict[str, Any] = {
             ["mode", "speed_multiplier"],
         ),
         _event_response_schema(
-            "WorldLoreUpsertedEvent",
-            {
-                "section": {"type": "string"},
-                "key": {"type": "string"},
-                "text": {"type": "string"},
-            },
-            ["section", "key", "text"],
-        ),
-        _event_response_schema(
             "ActiveTaskUpsertedEvent",
             {
                 "name": {"type": "string"},
@@ -806,8 +796,9 @@ STORY_RESPONSE_JSON_SCHEMA: dict[str, Any] = {
         "response": {
             "type": "string",
             "description": (
-                "Player-facing narration only. Do not include the app prompt "
-                "'What do you do now?'; the application appends that separately."
+                "Player-facing narration only. Do not include the app's "
+                "tense/person-specific end-of-turn prompt; the application "
+                "appends that separately."
             ),
         },
         "suggested_actions": {
@@ -868,14 +859,6 @@ NEW_GAME_RESPONSE_JSON_SCHEMA: dict[str, Any] = {
     "properties": {
         "selected_genre": {"type": "string"},
         "world_summary": {"type": "string"},
-        "world_lore": {
-            "type": "object",
-            "description": "Player-known lore grouped by category and durable entry name.",
-            "additionalProperties": {
-                "type": "object",
-                "additionalProperties": {"type": "string"},
-            },
-        },
         "locations": {
             "type": "array",
             "description": "Player-known map-aware locations for the Travel tab.",
@@ -1066,7 +1049,6 @@ NEW_GAME_RESPONSE_JSON_SCHEMA: dict[str, Any] = {
     "required": [
         "selected_genre",
         "world_summary",
-        "world_lore",
         "gm_secrets",
         "start_location",
         "starting_calendar",
@@ -1128,7 +1110,6 @@ class AiWorldSetupResult:
     starting_calendar: dict[str, Any] = field(default_factory=dict)
     start_weather: str = ""
     selected_genre: str = ""
-    world_lore: dict[str, dict[str, str]] = field(default_factory=dict)
     locations: list[dict[str, Any]] = field(default_factory=list)
     gm_secrets: list[dict[str, Any]] = field(default_factory=list)
     finalized_character: dict[str, str] = field(default_factory=dict)
@@ -1223,7 +1204,7 @@ class GeminiNarrationService:
                 raw_text=raw_text,
             )
 
-        result = parse_gemini_story_response(raw_text)
+        result = parse_gemini_story_response(raw_text, context_packet=context_packet)
         result = _drop_unwarranted_skill_check_events(result, context_packet)
         result = _drop_duplicate_resolved_skill_check_events(result, context_packet)
         result = _ensure_in_game_suggested_actions(result, context_packet)
@@ -1365,7 +1346,7 @@ class GeminiNarrationService:
                 raw_text=raw_text,
             )
 
-        return parse_gemini_new_game_response(raw_text)
+        return parse_gemini_new_game_response(raw_text, setup_packet=setup_packet)
 
 
 def load_gemini_settings(env_path: Path | None = None) -> GeminiSettings:
@@ -1543,10 +1524,11 @@ def build_gemini_story_prompt(context_packet: dict[str, Any]) -> str:
         "record. Use status='active' while hidden, 'revealed' once the player learns "
         "it, and 'retired' when it is no longer true or useful.\n"
         "- When a secret becomes revealed, also suggest the appropriate player-known "
-        "NPC, World Lore, Location, task, flag, or other event so the learned fact "
-        "continues to exist outside private secret memory.\n"
+        "NpcUpsertedEvent, LocationUpsertedEvent, ActiveTaskUpsertedEvent, "
+        "FlagSetEvent, item/material event, or other supported public event so "
+        "the learned fact continues to exist outside private secret memory.\n"
         "- Never copy active secret details into response, suggested_actions, "
-        "player_facing_information, public_description, world lore, travel fields, "
+        "player_facing_information, public_description, travel fields, "
         "tasks, or other player-visible fields unless the current turn reveals them.\n\n"
         "Creative naming boundary (hard requirement):\n"
         "- This is a highest-priority output rule, not optional style guidance.\n"
@@ -1599,8 +1581,9 @@ def build_gemini_story_prompt(context_packet: dict[str, Any]) -> str:
         "questions, but the player character's next words and decisions belong "
         "to the player.\n"
         "- The response field must not include 'What do you do now?' or any "
-        "variant of an end-of-turn prompt. The Python application displays that "
-        "prompt after your response when appropriate.\n"
+        "tense/person-specific end-of-turn prompt. The Python application "
+        "displays that prompt after your response when appropriate, based on "
+        "narration tense and style.\n"
         "- Do not end the response with a player-character action or player-"
         "character dialogue as though the player still needs to finish the same "
         "thought. End on the world's response, a resolved immediate outcome, a "
@@ -1631,8 +1614,11 @@ def build_gemini_story_prompt(context_packet: dict[str, Any]) -> str:
         "and y_miles coordinates use a shared map measured in miles; do not invent "
         "a conflicting distance for known locations. When the player learns a new "
         "meaningful location, suggest LocationUpsertedEvent with all player-known "
-        "description, map coordinates, terrain, travel_multiplier, and travel_notes "
-        "instead of WorldLoreUpsertedEvent. Use TravelModeChangedEvent when a horse, "
+        "description, map coordinates, terrain, travel_multiplier, and travel_notes. "
+        "Put player-known local culture, religion, economy, factions, laws, and "
+        "landmarks for that place into the location description or travel_notes. "
+        "Use NpcUpsertedEvent for people the player can recognize or remember. "
+        "Use TravelModeChangedEvent when a horse, "
         "vehicle, group, injury, or other sustained circumstance meaningfully "
         "changes the player's travel speed.\n"
         "- When context_packet.travel_request.active is true, treat its distance "
@@ -1655,8 +1641,13 @@ def build_gemini_story_prompt(context_packet: dict[str, Any]) -> str:
         "as an integer of at least 1.\n"
         "- For weapons, set item_type='Weapon' and include weapon_hands "
         "('one-handed' or 'two-handed') plus damage as a dice expression such "
-        "as 1d6, 1d8, or 2d6. Ranged weapons may also include "
-        "attack_range_feet, ammunition_type_required, clip_size, and "
+        "as 1d6, 1d8, or 2d6. Any player weapon must have average damage "
+        "strictly higher than the player's unarmed base damage of 1d4; do "
+        "not create player weapons with damage of 1d4 or anything weaker. "
+        "Use at least 1d6 for ordinary one-handed weapons and at least 1d10 "
+        "for ordinary two-handed weapons unless a stronger fitting expression "
+        "is appropriate. Ranged weapons may also include attack_range_feet, "
+        "ammunition_type_required, clip_size, and "
         "bullets_per_attack. Ammunition inventory items use "
         "item_type='Ammunition' and matching ammunition_type metadata. "
         "For armor or shields, set item_type='Armor', "
@@ -1817,22 +1808,16 @@ def build_gemini_new_game_prompt(setup_packet: dict[str, Any]) -> str:
         "covering the basics of the world or city, prominent NPCs, locations of "
         "interest, religions, and economy. It may use light Markdown headings, "
         "bold names, italics, and bullet lists when that improves readability.\n"
-        "- world_lore must group player-known starting lore into keyed category "
-        "objects where each key is the durable entry name and each value is the "
-        "player-facing lore text. Include useful categories such as Religions, Economy, "
-        "Culture and Laws, Factions and Guilds, Prominent NPCs, and Current Rumors "
-        "when they fit the game. Do not include secrets, mystery solutions, hidden "
-        "villains, or GM-only facts in world_lore. Lore text may use light "
-        "Markdown such as italics, bold important names, and short lists.\n"
         "- locations must be a player-known array for the Travel tab. Include the "
         "starting location at x_miles=0 and y_miles=0 plus at least three other "
         "meaningful reachable places. Coordinates are relative map miles, not GPS "
         "coordinates. Give each location a concise description, terrain, a positive "
         "travel_multiplier (below 1 slows travel), and practical player-known route "
-        "notes. Do not include hidden routes, secrets, or GM-only facts.\n"
+        "notes. Put player-known local religion, culture, economy, factions, laws, "
+        "customs, landmarks, and practical context for a place in its description "
+        "or travel_notes. Do not include hidden routes, secrets, or GM-only facts.\n"
         "- introductory_message must be player-facing narration for the first "
-        "scene at start_location and must end with exactly "
-        "'What do you do now?'\n"
+        "scene at start_location and must end with setup_packet.turn_prompt.\n"
         "- suggested_actions must contain three or four short opening-scene "
         "actions the player can take next. Keep them concrete, immediate, and "
         "consistent with the introductory_message.\n"
@@ -1863,7 +1848,12 @@ def build_gemini_new_game_prompt(setup_packet: dict[str, Any]) -> str:
         "name only. Put scenic details such as floor, view, nearby landmarks, "
         "weather, and exact position in introductory_message instead. Example: "
         "use \"Y/N's Office\", not \"Y/N's Office, high up near the penthouse, "
-        "overlooking the Hudson River\".\n"
+        "overlooking the Hudson River\". If setup.start_location_mode is exact, "
+        "return setup.start_location unchanged as start_location and use that "
+        "same exact location name in introductory_message, locations, and events. "
+        "If setup.start_location_mode is suggestion, treat setup.start_location "
+        "as inspiration and you may replace it with a more specific fitting "
+        "location.\n"
         "- If setup.calendar.ai_generated is true, invent calendar_settings that "
         "fit the selected world, genre, culture, climate, and playstyle. Use "
         "clear day names, month names, season names, season weather hints, and "
@@ -1885,9 +1875,11 @@ def build_gemini_new_game_prompt(setup_packet: dict[str, Any]) -> str:
         "embellish, paraphrase, or reinterpret a player-provided character name, "
         "appearance, backstory, or notes field.\n"
         "- skills must contain every starting skill with name, description, and level. "
-        "For any skill whose name or description is blank/default/placeholder or "
-        "whose setup entry has requires_ai_invention=true, invent a distinct "
-        "setting-appropriate name and a concrete description matching that skill. "
+        "If setup.skills[N].name is nonblank, copy that exact skill name unchanged "
+        "in skills[N].name. Do not rename, embellish, specialize, hyphenate, or "
+        "reinterpret player-provided skill names. If only the description is blank, "
+        "fill the description for that exact named skill. Only invent a skill name "
+        "for a setup skill whose name is blank/default/placeholder. "
         "Skill names must be generalized gameplay capabilities useful across many "
         "checks, not one-off lore phrases, proper nouns, tiny item-maintenance "
         "tasks, or narrow setting trivia. Put local flavor, culture, equipment, "
@@ -1906,7 +1898,12 @@ def build_gemini_new_game_prompt(setup_packet: dict[str, Any]) -> str:
         "minimum. Return the finalized inventory in the starting_items field; "
         "do not use the alias starting_inventory. "
         "Weapon starter items should include weapon_hands, damage, attack_skill, "
-        "and attack_range_feet. Guns and other ammunition weapons should also "
+        "and attack_range_feet. A weapon must be mechanically worthwhile: its "
+        "average damage must be strictly higher than the player's unarmed base "
+        "damage of 1d4. Do not return starter weapons with damage of 1d4 or "
+        "anything weaker. Use at least 1d6 for ordinary one-handed weapons and "
+        "at least 1d10 for ordinary two-handed weapons unless the weapon has a "
+        "higher fitting damage expression. Guns and other ammunition weapons should also "
         "include ammunition_type_required, clip_size, and bullets_per_attack, "
         "plus a compatible Ammunition starter item with matching "
         "ammunition_type. Armor should include covers_body_parts and armor_rating. "
@@ -1958,6 +1955,14 @@ def build_gemini_new_game_prompt(setup_packet: dict[str, Any]) -> str:
         "Use the direct setup fields for all other initial state. Use type and payload for each event; "
         "do not use event_type as the top-level event type key.\n"
         "- Use only player-known information in player-facing event fields.\n"
+        "- setup.starting_task.mode controls whether the opening save starts with "
+        "an active quest. If it is none, do not create an initial "
+        "ActiveTaskUpsertedEvent unless another explicit setup field independently "
+        "requires one. If it is ai, create one fitting starting quest. If it is "
+        "custom, create exactly one ActiveTaskUpsertedEvent using the player's "
+        "provided task fields as anchors and filling any blank/default task fields "
+        "from the rest of the setup. Use category Quest unless the player provided "
+        "a different category.\n"
         "- Use NpcUpsertedEvent for prominent NPCs the player can know about at "
         "setup. Remember that if the Player requested more than one NPC, or that you think that the Player would know more than one NPC, then you can pass more than one NpcUpsertedEvent.\n"
         "Use ActiveTaskUpsertedEvent for initial active obligations, including "
@@ -2539,7 +2544,11 @@ def _player_command_is_routine_no_check(context_packet: dict[str, Any]) -> bool:
     return ROUTINE_NO_CHECK_ACTION_RE.search(command) is not None
 
 
-def parse_gemini_story_response(raw_text: str) -> AiNarrationResult:
+def parse_gemini_story_response(
+    raw_text: str,
+    *,
+    context_packet: dict[str, Any] | None = None,
+) -> AiNarrationResult:
     """
     Parses Gemini narration output.
 
@@ -2609,7 +2618,11 @@ def parse_gemini_story_response(raw_text: str) -> AiNarrationResult:
         event_types,
         json.dumps(suggested_events, ensure_ascii=False),
     )
-    narrative_text = _format_visible_response(response_text.strip(), suggested_actions)
+    narrative_text = _format_visible_response(
+        response_text.strip(),
+        suggested_actions,
+        turn_prompt=_turn_prompt_from_context_packet(context_packet),
+    )
 
     return AiNarrationResult(
         narrative_text=narrative_text,
@@ -2687,7 +2700,11 @@ def _ensure_in_game_suggested_actions(
     fallback_actions = list(FALLBACK_SUGGESTED_ACTIONS)
 
     return AiNarrationResult(
-        narrative_text=_format_visible_response(result.narrative_text, fallback_actions),
+        narrative_text=_format_visible_response(
+            result.narrative_text,
+            fallback_actions,
+            turn_prompt=_turn_prompt_from_context_packet(context_packet),
+        ),
         suggested_actions=fallback_actions,
         suggested_events=result.suggested_events,
         out_of_game=result.out_of_game,
@@ -3200,17 +3217,18 @@ def _remove_unsupported_inventory_sentences(text: str) -> str:
 def _split_visible_action_suffix(text: str) -> tuple[str, str]:
     """Splits formatted story text from the appended action prompt."""
 
-    marker = "\n\nWhat do you do now?\n"
+    match = re.search(
+        (
+            r"\n\nWhat\s+(?:do|does|did|will)\s+"
+            r"(?:you|I|[^\n?]{1,80}?)\s+"
+            r"(?:do\s+)?(?:now|next)\?\n"
+        ),
+        text,
+        flags=re.IGNORECASE,
+    )
 
-    if marker in text:
-        story_text, suffix = text.split(marker, 1)
-        return story_text, f"{marker}{suffix}"
-
-    marker = "\nWhat do you do now?\n"
-
-    if marker in text:
-        story_text, suffix = text.split(marker, 1)
-        return story_text, f"{marker}{suffix}"
+    if match:
+        return text[: match.start()], text[match.start() :]
 
     return text, ""
 
@@ -3278,7 +3296,11 @@ def _event_payload_text(event: dict[str, Any], *keys: str) -> str:
     return ""
 
 
-def parse_gemini_new_game_response(raw_text: str) -> AiWorldSetupResult:
+def parse_gemini_new_game_response(
+    raw_text: str,
+    *,
+    setup_packet: dict[str, Any] | None = None,
+) -> AiWorldSetupResult:
     """
     Parses Gemini new-game setup output.
 
@@ -3338,7 +3360,6 @@ def parse_gemini_new_game_response(raw_text: str) -> AiWorldSetupResult:
         data.get("starting_calendar", data.get("calendar"))
     )
     start_weather = str(data.get("weather", data.get("start_weather", ""))).strip()
-    world_lore = _parse_new_game_world_lore(data.get("world_lore", data.get("lore")))
     locations = _parse_new_game_locations(data.get("locations"), start_location)
     gm_secrets = _parse_new_game_gm_secrets(data.get("gm_secrets"))
     introductory_message = str(
@@ -3377,6 +3398,7 @@ def parse_gemini_new_game_response(raw_text: str) -> AiWorldSetupResult:
     introductory_message = _format_visible_response(
         introductory_message,
         suggested_actions,
+        turn_prompt=_turn_prompt_from_setup_packet(setup_packet),
     )
 
     if not isinstance(raw_events, list):
@@ -3400,7 +3422,6 @@ def parse_gemini_new_game_response(raw_text: str) -> AiWorldSetupResult:
         starting_calendar=starting_calendar,
         start_weather=start_weather,
         selected_genre=selected_genre,
-        world_lore=world_lore,
         locations=locations,
         gm_secrets=gm_secrets,
         finalized_character=finalized_character,
@@ -3432,46 +3453,6 @@ def _parse_new_game_character(raw_character: Any) -> dict[str, str]:
             character[key] = value
 
     return character
-
-
-def _parse_new_game_world_lore(raw_lore: Any) -> dict[str, dict[str, str]]:
-    """Parses grouped player-facing world lore from Gemini."""
-
-    if not isinstance(raw_lore, dict):
-        return {}
-
-    world_lore: dict[str, dict[str, str]] = {}
-
-    for raw_category, raw_entries in raw_lore.items():
-        category = str(raw_category).strip()
-
-        if not category:
-            continue
-
-        if isinstance(raw_entries, dict):
-            entries = {
-                str(key).strip(): str(value).strip()
-                for key, value in raw_entries.items()
-                if str(key).strip() and str(value).strip()
-            }
-        elif isinstance(raw_entries, str):
-            clean_entry = raw_entries.strip()
-            entries = {_derive_lore_key(clean_entry): clean_entry} if clean_entry else {}
-        elif isinstance(raw_entries, list):
-            entries = {}
-
-            for entry in raw_entries:
-                clean_entry = str(entry).strip()
-
-                if clean_entry:
-                    entries[_derive_lore_key(clean_entry)] = clean_entry
-        else:
-            entries = {}
-
-        if entries:
-            world_lore[category] = entries
-
-    return world_lore
 
 
 def _parse_new_game_gm_secrets(raw_secrets: Any) -> list[dict[str, Any]]:
@@ -3567,12 +3548,6 @@ def _parse_new_game_locations(
             )
 
     return [location.to_dict() for location in locations]
-
-
-def _derive_lore_key(text: str) -> str:
-    """Derives a lore key from list-shaped legacy AI lore."""
-
-    return str(text).split(":", 1)[0].strip()[:80]
 
 
 def _parse_new_game_calendar_settings(raw_calendar_settings: Any) -> dict[str, Any]:
@@ -4080,16 +4055,21 @@ def _coerce_int(value: Any, *, default: int = 0) -> int:
         return default
 
 
-def _format_visible_response(response_text: str, suggested_actions: list[str]) -> str:
+def _format_visible_response(
+    response_text: str,
+    suggested_actions: list[str],
+    *,
+    turn_prompt: str = "What do you do now?",
+) -> str:
     """Combines response text and suggested actions for current UI display."""
 
     formatted_response = format_story_message(_strip_terminal_turn_prompt(response_text))
+    question = turn_prompt.strip() or "What do you do now?"
 
     if not suggested_actions:
         return formatted_response
 
     action_lines = [f"- {action}" for action in suggested_actions]
-    question = "What do you do now?"
 
     if formatted_response.endswith(question):
         return f"{formatted_response}\n" + "\n".join(action_lines)
@@ -4098,6 +4078,93 @@ def _format_visible_response(response_text: str, suggested_actions: list[str]) -
         return f"{question}\n" + "\n".join(action_lines)
 
     return f"{formatted_response}\n\n{question}\n" + "\n".join(action_lines)
+
+
+def _turn_prompt_from_context_packet(
+    context_packet: dict[str, Any] | None,
+) -> str:
+    """Builds the visible turn prompt from story context narration preferences."""
+
+    if not isinstance(context_packet, dict):
+        return "What do you do now?"
+
+    state = context_packet.get("state", {})
+    if not isinstance(state, dict):
+        return "What do you do now?"
+
+    player = state.get("player", {})
+    ai_preferences = state.get("player_ai_preferences", {})
+    if not isinstance(player, dict):
+        player = {}
+    if not isinstance(ai_preferences, dict):
+        ai_preferences = {}
+
+    return _turn_prompt_for_preferences(
+        tense=str(ai_preferences.get("narration_tense", "present")),
+        style=str(ai_preferences.get("narration_style", "second_person_limited")),
+        character_name=str(player.get("name", "") or "the player character"),
+    )
+
+
+def _turn_prompt_from_setup_packet(setup_packet: dict[str, Any] | None) -> str:
+    """Builds the visible turn prompt from new-game setup preferences."""
+
+    if not isinstance(setup_packet, dict):
+        return "What do you do now?"
+
+    packet_prompt = str(setup_packet.get("turn_prompt", "") or "").strip()
+    if packet_prompt:
+        return packet_prompt
+
+    setup = setup_packet.get("setup", {})
+    if not isinstance(setup, dict):
+        return "What do you do now?"
+
+    narration = setup.get("narration", {})
+    character = setup.get("character", {})
+    if not isinstance(narration, dict):
+        narration = {}
+    if not isinstance(character, dict):
+        character = {}
+
+    return _turn_prompt_for_preferences(
+        tense=str(narration.get("tense", "present")),
+        style=str(narration.get("style", "second_person_limited")),
+        character_name=str(character.get("name", "") or "the player character"),
+    )
+
+
+def _turn_prompt_for_preferences(
+    *,
+    tense: str,
+    style: str,
+    character_name: str,
+) -> str:
+    """Returns the end-of-turn question for tense and narrative person."""
+
+    clean_tense = str(tense).casefold()
+    clean_style = str(style).casefold()
+    clean_name = str(character_name).strip() or "the player character"
+
+    if clean_tense == "past":
+        if clean_style.startswith("first_person"):
+            return "What did I do next?"
+        if clean_style.startswith("third_person"):
+            return f"What did {clean_name} do next?"
+        return "What did you do next?"
+
+    if clean_tense == "future":
+        if clean_style.startswith("first_person"):
+            return "What will I do next?"
+        if clean_style.startswith("third_person"):
+            return f"What will {clean_name} do next?"
+        return "What will you do next?"
+
+    if clean_style.startswith("first_person"):
+        return "What do I do now?"
+    if clean_style.startswith("third_person"):
+        return f"What does {clean_name} do now?"
+    return "What do you do now?"
 
 
 def _strip_terminal_turn_prompt(text: str) -> str:
@@ -4109,7 +4176,12 @@ def _strip_terminal_turn_prompt(text: str) -> str:
         return ""
 
     return re.sub(
-        r"(?:\s*\n*)what\s+do\s+you\s+do\s+now\?\s*$",
+        (
+            r"(?:\s*\n*)what\s+"
+            r"(?:do|does|did|will)\s+"
+            r"(?:you|i|[A-Za-z][^?\n]{0,80}?)\s+"
+            r"(?:do\s+)?(?:now|next)\?\s*$"
+        ),
         "",
         clean_text,
         flags=re.IGNORECASE,

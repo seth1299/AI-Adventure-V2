@@ -10,6 +10,7 @@ from typing import Any, Callable, Protocol
 from PySide6.QtCore import (
     QEvent,
     QObject,
+    QSize,
     QStringListModel,
     Qt,
     QThread,
@@ -19,6 +20,7 @@ from PySide6.QtCore import (
 )
 from PySide6.QtGui import QColor, QIcon, QPalette, QStandardItem, QStandardItemModel
 from PySide6.QtWidgets import (
+    QAbstractSpinBox,
     QApplication,
     QCheckBox,
     QComboBox,
@@ -38,6 +40,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QScrollArea,
+    QHeaderView,
     QSlider,
     QSpinBox,
     QStackedWidget,
@@ -225,6 +228,7 @@ from ai_adventure.locations import (
     format_distance,
     format_travel_time,
     normalize_known_location,
+    normalize_known_locations,
 )
 from ai_adventure.core.state_manager import StateManager
 from ai_adventure.events.event_applier import EventApplier
@@ -275,6 +279,8 @@ CONTINUE_STORY_INSTRUCTION = (
 TABLE_INLINE_EDITOR_HEIGHT = 30
 TABLE_INLINE_EDITOR_MIN_WIDTH = 132
 TABLE_INLINE_BUTTON_MIN_WIDTH = 96
+TABLE_CELL_HORIZONTAL_PADDING = 10
+TABLE_CELL_VERTICAL_PADDING = 4
 STARTER_ITEM_COLUMN_WIDTHS = (140, 132, 140, 220, 132, 100)
 CURRENCY_COLUMN_WIDTHS = (150, 160, 132, 100)
 ECONOMY_EXAMPLE_COLUMN_WIDTHS = (220, 132, 100)
@@ -314,12 +320,32 @@ def apply_application_theme(theme: str) -> None:
 
 
 class _NoCellFocusDelegate(QStyledItemDelegate):
-    """Draws selected table cells without Qt's per-cell focus marker."""
+    """Draws data table cells with clean selection and readable padding."""
 
     def paint(self, painter, option, index) -> None:
         clean_option = QStyleOptionViewItem(option)
         clean_option.state &= ~QStyle.StateFlag.State_HasFocus
+        clean_option.rect = clean_option.rect.adjusted(
+            TABLE_CELL_HORIZONTAL_PADDING,
+            TABLE_CELL_VERTICAL_PADDING,
+            -TABLE_CELL_HORIZONTAL_PADDING,
+            -TABLE_CELL_VERTICAL_PADDING,
+        )
         super().paint(painter, clean_option, index)
+
+    def sizeHint(self, option, index) -> QSize:
+        clean_option = QStyleOptionViewItem(option)
+        clean_option.rect = clean_option.rect.adjusted(
+            TABLE_CELL_HORIZONTAL_PADDING,
+            TABLE_CELL_VERTICAL_PADDING,
+            -TABLE_CELL_HORIZONTAL_PADDING,
+            -TABLE_CELL_VERTICAL_PADDING,
+        )
+        size = super().sizeHint(clean_option, index)
+        return QSize(
+            size.width() + (TABLE_CELL_HORIZONTAL_PADDING * 2),
+            size.height() + (TABLE_CELL_VERTICAL_PADDING * 2),
+        )
 
 
 def _use_soft_table_selection(table: QTableWidget) -> None:
@@ -331,8 +357,10 @@ def _use_soft_table_selection(table: QTableWidget) -> None:
 def _table_item(text: Any, sort_value: Any | None = None) -> QTableWidgetItem:
     """Builds a read-only table item with an optional hidden sort value."""
 
-    item = QTableWidgetItem(str(text))
+    display_text = str(text)
+    item = QTableWidgetItem(display_text)
     item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+    item.setToolTip(display_text)
 
     if sort_value is not None:
         item.setData(Qt.ItemDataRole.UserRole, sort_value)
@@ -349,6 +377,32 @@ def _enable_table_sorting(table: QTableWidget, on_section_clicked) -> None:
     header.setSectionsClickable(True)
     header.setSortIndicatorShown(True)
     header.sectionClicked.connect(on_section_clicked)
+
+
+def _configure_wrapping_table(
+    table: QTableWidget,
+    stretch_columns: set[int],
+) -> None:
+    """Configures a read-only table to wrap long text into taller rows."""
+
+    table.setWordWrap(True)
+    table.horizontalHeader().setStretchLastSection(False)
+    table.verticalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+    table.verticalHeader().setMinimumSectionSize(28)
+
+    for column_index in range(table.columnCount()):
+        resize_mode = (
+            QHeaderView.ResizeMode.Stretch
+            if column_index in stretch_columns
+            else QHeaderView.ResizeMode.ResizeToContents
+        )
+        table.horizontalHeader().setSectionResizeMode(column_index, resize_mode)
+
+
+def _resize_wrapping_table_rows(table: QTableWidget) -> None:
+    """Refreshes row heights after wrapped table content changes."""
+
+    table.resizeRowsToContents()
 
 
 def _update_sort_state(
@@ -797,20 +851,25 @@ class MainWindow(QMainWindow):
 
         for template in templates:
             if template.name == selected_name:
-                return True, self._template_setup_with_available_title(template.setup)
+                return True, self._template_setup_with_available_title(
+                    template.setup,
+                    template_name=template.name,
+                )
 
         return True, None
 
     def _template_setup_with_available_title(
         self,
         setup: dict[str, Any],
+        *,
+        template_name: str = "",
     ) -> dict[str, Any]:
         """Returns template setup with a title that does not collide with saves."""
 
         template_setup = dict(setup)
         template_setup["title"] = _next_available_save_title(
             self.app_paths.saves_dir,
-            str(template_setup.get("title", "")),
+            template_name or str(template_setup.get("title", "")),
         )
         return template_setup
 
@@ -961,17 +1020,10 @@ class MainWindow(QMainWindow):
                 result.finalized_character,
             )
         )
-        repository.set_world_lore(
-            _preserve_player_character_text(
-                result.world_lore,
-                setup,
-                result.finalized_character,
-            )
-        )
         repository.append_history(
             "story",
             _preserve_player_character_text(
-                result.introductory_message,
+                _introductory_message_for_save(setup, result),
                 setup,
                 result.finalized_character,
             ),
@@ -1021,11 +1073,15 @@ class MainWindow(QMainWindow):
     ) -> None:
         """Persists AI-finalized new-game character, skills, and start location."""
 
-        if result.start_location:
-            repository.set_state_value("location", result.start_location)
+        start_location = _final_start_location_for_save(setup, result)
+
+        if start_location:
+            repository.set_state_value("location", start_location)
 
         if getattr(result, "locations", None):
-            repository.set_travel_locations(result.locations)
+            repository.set_travel_locations(
+                _travel_locations_for_save(result.locations, setup, result)
+            )
 
         repository.ensure_travel_locations()
 
@@ -1113,8 +1169,13 @@ class MainWindow(QMainWindow):
             if character.get("notes"):
                 repository.set_setting("player.notes", character["notes"])
 
-        if _ai_skills_match_setup(result.finalized_skills, setup.get("skills", [])):
-            repository.replace_skills(_deduplicated_ai_skills(result.finalized_skills))
+        finalized_skills = _finalized_skills_for_save(
+            result.finalized_skills,
+            setup.get("skills", []),
+        )
+
+        if finalized_skills:
+            repository.replace_skills(finalized_skills)
         elif result.finalized_skills:
             LOGGER.warning(
                 "Skipped AI-finalized skills because they did not match the starting skill plan."
@@ -1389,9 +1450,9 @@ class CustomVoiceDialog(QDialog):
 
         self.sample_voice_button = QPushButton("Sample Voice")
         self.sample_voice_button.clicked.connect(self._sample_voice)
-        self.save_custom_voice_button = QPushButton("Save")
+        self.save_custom_voice_button = QPushButton("Update")
         self.save_custom_voice_button.clicked.connect(self._save_current_custom_voice)
-        self.save_custom_voice_as_button = QPushButton("Save As...")
+        self.save_custom_voice_as_button = QPushButton("Store As...")
         self.save_custom_voice_as_button.clicked.connect(self._save_current_custom_voice_as)
         self.rename_custom_voice_button = QPushButton("Rename")
         self.rename_custom_voice_button.clicked.connect(self._rename_current_custom_voice)
@@ -1595,7 +1656,7 @@ class CustomVoiceDialog(QDialog):
         """Prompts for a name and saves the current blend as that voice."""
 
         proposed_name = self.loaded_custom_voice_name or str(self.current_blend["name"])
-        voice_name = self._prompt_for_voice_name("Save Custom Voice As", proposed_name)
+        voice_name = self._prompt_for_voice_name("Store Custom Voice As", proposed_name)
 
         if voice_name is None:
             return
@@ -2313,7 +2374,7 @@ class AISettingsDialog(QDialog):
         scroll_area.setWidget(content)
 
         buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Save
+            QDialogButtonBox.StandardButton.Ok
             | QDialogButtonBox.StandardButton.Cancel
         )
         buttons.accepted.connect(self.accept)
@@ -2535,7 +2596,7 @@ class MainMenuSettingsDialog(QDialog):
             self.sample_voice_button = self.tts_settings_widget.sample_voice_button
             form.addRow("TTS:", self.tts_settings_widget)
 
-        save_button = QPushButton("Save")
+        save_button = QPushButton("Apply")
         save_button.clicked.connect(self.accept)
         cancel_button = QPushButton("Cancel")
         cancel_button.clicked.connect(self.reject)
@@ -2777,19 +2838,20 @@ class NewGameTemplateManagerDialog(QDialog):
 
         new_button = QPushButton("New")
         new_button.clicked.connect(self._new_template)
-        save_button = QPushButton("Save")
+        save_button = QPushButton("Update Template")
         save_button.clicked.connect(self._save_template)
         delete_button = QPushButton("Delete")
         delete_button.clicked.connect(self._delete_template)
 
         self.template_name_input = QLineEdit()
         self.template_name_input.setPlaceholderText("Template name")
-        self.save_title_input = QLineEdit()
-        self.save_title_input.setPlaceholderText("Suggested save name when loaded")
         self.genre_input = QLineEdit()
         self.genre_input.setPlaceholderText("Genre or adventure type")
         self.start_location_input = QLineEdit()
         self.start_location_input.setPlaceholderText("Starting place")
+        self.start_location_mode_combo = QComboBox()
+        self.start_location_mode_combo.addItem("Use as suggestion", "suggestion")
+        self.start_location_mode_combo.addItem("Use exactly this", "exact")
         self.narration_tense_combo = QComboBox()
         _add_combo_options(self.narration_tense_combo, NARRATION_TENSE_OPTIONS)
         _set_combo_to_data(self.narration_tense_combo, DEFAULT_NARRATION_TENSE)
@@ -2863,7 +2925,7 @@ class NewGameTemplateManagerDialog(QDialog):
         tabs.addTab(self._build_overview_tab(), "Overview")
         tabs.addTab(self._build_character_tab(), "Character")
         tabs.addTab(self._build_skills_tab(), "Skills")
-        tabs.addTab(self._build_world_tab(), "World")
+        tabs.addTab(self._build_world_tab(), "Details")
 
         close_button = QPushButton("Close")
         close_button.clicked.connect(self.accept)
@@ -2892,9 +2954,9 @@ class NewGameTemplateManagerDialog(QDialog):
 
         form = QFormLayout()
         form.addRow("Template Name:", self.template_name_input)
-        form.addRow("Suggested Save Name:", self.save_title_input)
         form.addRow("Genre:", self.genre_input)
         form.addRow("Starting Location:", self.start_location_input)
+        form.addRow("Location Handling:", self.start_location_mode_combo)
         form.addRow("Narration Tense:", self.narration_tense_combo)
         form.addRow("Narration Style:", self.narration_style_combo)
         form.addRow("Game Style:", self.game_style_input)
@@ -3007,9 +3069,12 @@ class NewGameTemplateManagerDialog(QDialog):
 
         character = setup.get("character", {}) if isinstance(setup.get("character"), dict) else {}
         self.template_name_input.setText(template_name)
-        self.save_title_input.setText(str(setup.get("title", "") or ""))
         self.genre_input.setText(str(setup.get("specified_genre", setup.get("genre", "")) or ""))
         self.start_location_input.setText(str(setup.get("start_location", "") or ""))
+        _set_combo_to_data(
+            self.start_location_mode_combo,
+            str(setup.get("start_location_mode", "suggestion") or "suggestion"),
+        )
         narration = normalize_narration_preferences(
             setup.get("narration", {}) if isinstance(setup.get("narration"), dict) else {}
         )
@@ -3118,10 +3183,13 @@ class NewGameTemplateManagerDialog(QDialog):
         """Builds a partial setup dictionary from the editor controls."""
 
         setup = dict(self.active_setup)
-        setup["title"] = self.save_title_input.text().strip()
+        setup["title"] = self.template_name_input.text().strip()
         setup["specified_genre"] = self.genre_input.text().strip()
         setup["game_style"] = self.game_style_input.toPlainText().strip()
         setup["start_location"] = self.start_location_input.text().strip()
+        setup["start_location_mode"] = (
+            self.start_location_mode_combo.currentData() or "suggestion"
+        )
         setup["world_context"] = self.world_context_input.toPlainText().strip()
         setup["narration"] = {
             "tense": self.narration_tense_combo.currentData() or DEFAULT_NARRATION_TENSE,
@@ -3247,6 +3315,9 @@ class NewGameTemplateManagerDialog(QDialog):
     def _remove_currency_row(self, button: QPushButton) -> None:
         """Removes the currency denomination row containing button."""
 
+        if _row_for_cell_widget(self.currency_table, button) == 0:
+            return
+
         if _remove_table_row_by_button(self.currency_table, button) >= 0:
             _sync_currency_base_value_row(self.currency_table)
 
@@ -3355,6 +3426,7 @@ class NewGameWizard(QWizard):
         self._apply_theme()
 
         self._build_adventure_page()
+        self._build_starting_task_page()
         self._build_character_page()
         self._build_skills_page()
         self._build_inventory_currency_page()
@@ -3692,6 +3764,7 @@ class NewGameWizard(QWizard):
             },
             "skills": skills,
             "starter_items": self._starter_items_from_table(),
+            "starting_task": self._starting_task_from_controls(),
             "calendar": calendar_settings,
             "audio": {
                 "music_enabled": self.music_enabled_checkbox.isChecked(),
@@ -3712,6 +3785,9 @@ class NewGameWizard(QWizard):
             "specified_genre": self.genre_input.text(),
             "game_style": self.game_style_input.toPlainText(),
             "start_location": self.start_location_input.text(),
+            "start_location_mode": (
+                self.start_location_mode_combo.currentData() or "suggestion"
+            ),
             "world_context": self.world_context_input.toPlainText(),
         }
 
@@ -3731,7 +3807,12 @@ class NewGameWizard(QWizard):
         self.genre_input.setText(clean_setup["specified_genre"])
         self.game_style_input.setPlainText(clean_setup["game_style"])
         self.start_location_input.setText(clean_setup["start_location"])
+        _set_combo_to_data(
+            self.start_location_mode_combo,
+            clean_setup["start_location_mode"],
+        )
         self.world_context_input.setPlainText(clean_setup["world_context"])
+        self._load_starting_task(clean_setup["starting_task"])
         self._apply_new_game_ai_settings(
             {
                 **ai_settings,
@@ -3882,6 +3963,9 @@ class NewGameWizard(QWizard):
         self.start_location_input.setPlaceholderText(
             "Optional: deserted island, frozen sea, crime scene, ruined store..."
         )
+        self.start_location_mode_combo = QComboBox()
+        self.start_location_mode_combo.addItem("Use as suggestion", "suggestion")
+        self.start_location_mode_combo.addItem("Use exactly this", "exact")
 
         self.narration_tense_combo = QComboBox(page)
         _add_combo_options(self.narration_tense_combo, NARRATION_TENSE_OPTIONS)
@@ -3912,12 +3996,116 @@ class NewGameWizard(QWizard):
         layout.addRow("Genre:", self.genre_input)
         layout.addRow("Game Style:", self.game_style_input)
         layout.addRow("Starting Location:", self.start_location_input)
+        layout.addRow("Location Handling:", self.start_location_mode_combo)
         layout.addRow("Artificial Intelligence:", self.ai_settings_button)
         layout.addRow("", self.ai_settings_summary_label)
         layout.addRow("World Details:", self.world_context_input)
         page.setLayout(layout)
 
         self.addPage(page)
+
+    def _build_starting_task_page(self) -> None:
+        """Builds the optional opening quest page."""
+
+        page = QWizardPage()
+        page.setTitle("Starting Quest")
+        page.setSubTitle("Choose whether the save starts with an active quest.")
+
+        self.starting_task_mode_combo = QComboBox()
+        self.starting_task_mode_combo.addItem("No starting quest", "none")
+        self.starting_task_mode_combo.addItem("Let the A.I. create one", "ai")
+        self.starting_task_mode_combo.addItem("Use a custom starting quest", "custom")
+        self.starting_task_mode_combo.currentIndexChanged.connect(
+            lambda _index: self._sync_starting_task_controls()
+        )
+
+        self.starting_task_name_input = QLineEdit()
+        self.starting_task_name_input.setPlaceholderText("Optional quest name")
+        self.starting_task_description_input = QTextEdit()
+        self.starting_task_description_input.setPlaceholderText(
+            "What the quest is about. Leave blanks for the A.I. to complete."
+        )
+        self.starting_task_requester_input = QLineEdit()
+        self.starting_task_requester_input.setPlaceholderText(
+            "NPC, faction, shop, Self, or blank"
+        )
+        self.starting_task_location_input = QLineEdit()
+        self.starting_task_location_input.setPlaceholderText(
+            "Where the quest is picked up, done, or turned in"
+        )
+        self.starting_task_reward_input = QLineEdit()
+        self.starting_task_reward_input.setPlaceholderText("Reward, N/A, or blank")
+        self.starting_task_due_date_input = QLineEdit()
+        self.starting_task_due_date_input.setPlaceholderText("Deadline, N/A, or blank")
+
+        self.starting_task_custom_group = QGroupBox("Custom Quest Draft")
+        custom_form = QFormLayout()
+        custom_form.addRow("Name:", self.starting_task_name_input)
+        custom_form.addRow("Description:", self.starting_task_description_input)
+        custom_form.addRow("Requester:", self.starting_task_requester_input)
+        custom_form.addRow("Location:", self.starting_task_location_input)
+        custom_form.addRow("Reward:", self.starting_task_reward_input)
+        custom_form.addRow("Due:", self.starting_task_due_date_input)
+        self.starting_task_custom_group.setLayout(custom_form)
+
+        layout = QVBoxLayout()
+        layout.addWidget(QLabel("Opening quest mode"))
+        layout.addWidget(self.starting_task_mode_combo)
+        layout.addWidget(self.starting_task_custom_group)
+        layout.addStretch()
+        page.setLayout(layout)
+
+        self.addPage(page)
+        self._sync_starting_task_controls()
+
+    def _sync_starting_task_controls(self) -> None:
+        """Shows custom quest fields only when custom mode is selected."""
+
+        if not hasattr(self, "starting_task_custom_group"):
+            return
+
+        is_custom = self.starting_task_mode_combo.currentData() == "custom"
+        self.starting_task_custom_group.setVisible(is_custom)
+
+    def _starting_task_from_controls(self) -> dict[str, Any]:
+        """Reads the optional starting quest page."""
+
+        mode = str(self.starting_task_mode_combo.currentData() or "none")
+        return {
+            "mode": mode,
+            "task": {
+                "name": self.starting_task_name_input.text(),
+                "category": "Quest",
+                "description": self.starting_task_description_input.toPlainText(),
+                "requester": self.starting_task_requester_input.text(),
+                "location": self.starting_task_location_input.text(),
+                "reward": self.starting_task_reward_input.text(),
+                "due_date": self.starting_task_due_date_input.text(),
+                "due_elapsed_minutes": -1,
+            },
+        }
+
+    def _load_starting_task(self, starting_task: dict[str, Any]) -> None:
+        """Loads optional starting quest controls from normalized setup."""
+
+        task_setup = starting_task if isinstance(starting_task, dict) else {}
+        task = task_setup.get("task", {})
+        if not isinstance(task, dict):
+            task = {}
+
+        _set_combo_to_data(
+            self.starting_task_mode_combo,
+            str(task_setup.get("mode", "none")),
+        )
+        self.starting_task_name_input.setText(str(task.get("name", "")))
+        self.starting_task_description_input.setPlainText(
+            str(task.get("description", ""))
+        )
+        self.starting_task_requester_input.setText(str(task.get("requester", "")))
+        self.starting_task_location_input.setText(str(task.get("location", "")))
+        self.starting_task_reward_input.setText(str(task.get("reward", "")))
+        self.starting_task_due_date_input.setText(str(task.get("due_date", "")))
+        self._sync_starting_task_controls()
 
     def _build_character_page(self) -> None:
         """Builds the character page."""
@@ -4206,6 +4394,9 @@ class NewGameWizard(QWizard):
     def _remove_currency_row(self, button: QPushButton) -> None:
         """Removes the currency row containing button."""
 
+        if _row_for_cell_widget(self.currency_table, button) == 0:
+            return
+
         if _remove_table_row_by_button(self.currency_table, button) >= 0:
             self._sync_currency_base_value_row()
 
@@ -4363,7 +4554,6 @@ class GameShell(QWidget):
         self.character_screen = CharacterScreen(
             playtesting_tools=self.playtesting_tools,
         )
-        self.world_screen = WorldScreen()
         self.travel_screen = TravelScreen(
             on_travel_requested=self._submit_travel_request,
         )
@@ -4395,7 +4585,6 @@ class GameShell(QWidget):
         self.screens: list[RepositoryBackedWidget] = [
             self.story_screen,
             self.character_screen,
-            self.world_screen,
             self.travel_screen,
             self.calendar_screen,
             self.inventory_screen,
@@ -4419,7 +4608,6 @@ class GameShell(QWidget):
         else:
             self.tabs.addTab(self.story_screen, "Story")
             self.tabs.addTab(self.character_screen, "Character")
-            self.tabs.addTab(self.world_screen, "World")
             self.tabs.addTab(self.travel_screen, "Travel")
             self.tabs.addTab(self.calendar_screen, "Calendar")
             self.tabs.addTab(self.inventory_screen, "Inventory")
@@ -5247,16 +5435,26 @@ class CharacterScreen(RepositoryBackedWidget):
 
         self.playtesting_tools = bool(playtesting_tools)
         self._loading_character = False
+        self._saving_character = False
+        self._last_saved_character_payload: dict[str, Any] | None = None
         self.name_input = QLineEdit()
+        self.name_input.editingFinished.connect(self._save_character)
         self.health_current_input = QSpinBox()
         self.health_current_input.setRange(0, 9999)
-        self.health_current_input.valueChanged.connect(lambda _value: self._sync_health_bounds())
+        self.health_current_input.valueChanged.connect(
+            lambda _value: self._handle_character_spin_changed()
+        )
         self.health_max_input = QSpinBox()
         self.health_max_input.setRange(1, 9999)
         self.health_max_input.setValue(DEFAULT_PLAYER_MAX_HEALTH)
-        self.health_max_input.valueChanged.connect(lambda _value: self._sync_health_bounds())
+        self.health_max_input.valueChanged.connect(
+            lambda _value: self._handle_character_spin_changed()
+        )
         self.initiative_bonus_input = QSpinBox()
         self.initiative_bonus_input.setRange(-99, 99)
+        self.initiative_bonus_input.valueChanged.connect(
+            lambda _value: self._save_character()
+        )
 
         if not self.playtesting_tools:
             health_tooltip = (
@@ -5279,29 +5477,16 @@ class CharacterScreen(RepositoryBackedWidget):
         self.appearance_input = QTextEdit()
         self.backstory_input = QTextEdit()
         self.notes_input = QTextEdit()
+        for text_edit in [
+            self.appearance_input,
+            self.backstory_input,
+            self.notes_input,
+        ]:
+            text_edit.installEventFilter(self)
 
         self.appearance_input.setPlaceholderText("Visible traits, clothing, manner, scars, voice...")
         self.backstory_input.setPlaceholderText("Origin, important history, relationships, goals...")
         self.notes_input.setPlaceholderText("Player notes about this character...")
-
-        self.body_map_label = QLabel(
-            "\n".join(
-                [
-                    "           [Head]",
-                    "             O",
-                    "      [Arms] /|\\ [Hands]",
-                    "           / | \\",
-                    "        [Torso]",
-                    "            |",
-                    "          /   \\",
-                    "       [Legs] [Feet]",
-                    "",
-                    "Main Hand / Off Hand",
-                ]
-            )
-        )
-        self.body_map_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        self.body_map_label.setStyleSheet("font-family: Consolas, 'Courier New', monospace;")
 
         for slot in EQUIPMENT_SLOTS:
             combo = QComboBox()
@@ -5318,9 +5503,6 @@ class CharacterScreen(RepositoryBackedWidget):
             )
             combo.currentIndexChanged.connect(lambda _index, slot=slot: self._equipment_changed(slot))
             self.equipment_combos[slot] = combo
-
-        save_button = QPushButton("Save Character Sheet")
-        save_button.clicked.connect(self._save_character)
 
         identity_group = QGroupBox("Identity")
         identity_layout = QFormLayout()
@@ -5346,13 +5528,11 @@ class CharacterScreen(RepositoryBackedWidget):
 
         left_layout = QVBoxLayout()
         left_layout.addWidget(stats_group)
-        left_layout.addWidget(self.body_map_label)
+        left_layout.addWidget(equipment_group)
         left_layout.addStretch()
 
         right_layout = QVBoxLayout()
         right_layout.addWidget(identity_group)
-        right_layout.addWidget(equipment_group)
-        right_layout.addWidget(save_button)
 
         sheet_layout = QHBoxLayout()
         sheet_layout.addLayout(left_layout)
@@ -5403,14 +5583,34 @@ class CharacterScreen(RepositoryBackedWidget):
             self._sync_equipment_summary()
         finally:
             self._loading_character = False
+            self._last_saved_character_payload = (
+                self._character_payload(repository) if repository is not None else None
+            )
 
-    def _save_character(self) -> None:
-        """Persists the editable character sheet."""
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:
+        """Autosaves multi-line character fields when focus leaves them."""
 
-        repository = self.repository()
+        if (
+            event.type() == QEvent.Type.FocusOut
+            and watched
+            in (
+                self.appearance_input,
+                self.backstory_input,
+                self.notes_input,
+            )
+        ):
+            QTimer.singleShot(0, self._save_character)
 
-        if repository is None:
-            return
+        return super().eventFilter(watched, event)
+
+    def _handle_character_spin_changed(self) -> None:
+        """Keeps health bounds valid and persists playtesting stat edits."""
+
+        self._sync_health_bounds()
+        self._save_character()
+
+    def _character_payload(self, repository: SaveRepository) -> dict[str, Any]:
+        """Builds the character payload currently represented by the widgets."""
 
         inventory_items = repository.list_inventory_items()
         equipment = normalize_equipment(
@@ -5424,6 +5624,7 @@ class CharacterScreen(RepositoryBackedWidget):
         if self.playtesting_tools:
             health_max = max(1, self.health_max_input.value())
             health_current = max(0, min(self.health_current_input.value(), health_max))
+            initiative_bonus = self.initiative_bonus_input.value()
         else:
             health_max = max(
                 1,
@@ -5445,27 +5646,63 @@ class CharacterScreen(RepositoryBackedWidget):
                     health_max,
                 ),
             )
-
-        repository.set_setting("player_name", self.name_input.text().strip())
-        repository.set_setting("player.appearance", self.appearance_input.toPlainText().strip())
-        repository.set_setting("player.backstory", self.backstory_input.toPlainText().strip())
-        repository.set_setting("player.notes", self.notes_input.toPlainText().strip())
-        repository.set_setting("player.health_current", health_current)
-        repository.set_setting("player.health_max", health_max)
-        repository.set_setting("player.armor_rating", armor_rating)
-
-        if self.playtesting_tools:
-            repository.set_setting(
-                "player.initiative_bonus",
-                self.initiative_bonus_input.value(),
+            initiative_bonus = _safe_int(
+                repository.get_setting("player.initiative_bonus", 0),
+                0,
             )
-        repository.set_player_equipment(equipment)
-        self._sync_player_combatant(repository, health_current, health_max, armor_rating)
-        repository.append_history("system", "Character sheet updated.")
-        self.refresh()
-        self.notify_repository_changed()
 
-        QMessageBox.information(self, "Character Saved", "Character sheet was saved.")
+        return {
+            "name": self.name_input.text().strip(),
+            "appearance": self.appearance_input.toPlainText().strip(),
+            "backstory": self.backstory_input.toPlainText().strip(),
+            "notes": self.notes_input.toPlainText().strip(),
+            "health_current": health_current,
+            "health_max": health_max,
+            "initiative_bonus": initiative_bonus,
+            "armor_rating": armor_rating,
+            "equipment": equipment,
+        }
+
+    def _save_character(self) -> None:
+        """Persists the editable character sheet."""
+
+        repository = self.repository()
+
+        if repository is None or self._loading_character or self._saving_character:
+            return
+
+        payload = self._character_payload(repository)
+        if payload == self._last_saved_character_payload:
+            return
+
+        self._saving_character = True
+        try:
+            repository.set_setting("player_name", payload["name"])
+            repository.set_setting("player.appearance", payload["appearance"])
+            repository.set_setting("player.backstory", payload["backstory"])
+            repository.set_setting("player.notes", payload["notes"])
+            repository.set_setting("player.health_current", payload["health_current"])
+            repository.set_setting("player.health_max", payload["health_max"])
+            repository.set_setting("player.armor_rating", payload["armor_rating"])
+
+            if self.playtesting_tools:
+                repository.set_setting(
+                    "player.initiative_bonus",
+                    payload["initiative_bonus"],
+                )
+            repository.set_player_equipment(payload["equipment"])
+            self._sync_player_combatant(
+                repository,
+                payload["health_current"],
+                payload["health_max"],
+                payload["armor_rating"],
+            )
+            self._last_saved_character_payload = payload
+        finally:
+            self._saving_character = False
+
+        self._sync_equipment_summary()
+        self.notify_repository_changed()
 
     def _populate_equipment_combos(
         self,
@@ -6926,62 +7163,6 @@ class CombatScreen(RepositoryBackedWidget):
         self.heal_button.setEnabled(bool(self.adjust_target_combo.count()))
 
 
-class WorldScreen(RepositoryBackedWidget):
-    """Read-only player-facing world information."""
-
-    def __init__(self) -> None:
-        super().__init__()
-
-        self.world_output = QTextEdit()
-        self.world_output.setReadOnly(True)
-
-        refresh_button = QPushButton("Refresh")
-        refresh_button.clicked.connect(self.refresh)
-
-        layout = QVBoxLayout()
-        layout.addWidget(refresh_button)
-        layout.addWidget(self.world_output)
-
-        self.setLayout(layout)
-
-    def refresh(self) -> None:
-        """Reloads player-known world lore."""
-
-        repository = self.repository()
-
-        if repository is None:
-            self.world_output.clear()
-            return
-
-        sections: list[str] = []
-        summary = repository.get_world_summary().strip()
-
-        if summary:
-            sections.append(f"# World Overview\n\n{summary}")
-
-        lore = repository.get_world_lore()
-
-        for category in sorted(lore):
-            if category.casefold() == "locations":
-                continue
-
-            entries = lore[category]
-
-            if not entries:
-                continue
-
-            body = "\n".join(
-                f"- **{key}:** {text}"
-                for key, text in sorted(entries.items())
-            )
-            sections.append(f"## {category}\n\n{body}")
-
-        if not sections:
-            sections.append("_No world information has been recorded yet._")
-
-        _set_markdown_text(self.world_output, "\n\n".join(sections))
-
-
 class TravelScreen(RepositoryBackedWidget):
     """Player-facing map knowledge, route estimates, and travel requests."""
 
@@ -7026,6 +7207,7 @@ class TravelScreen(RepositoryBackedWidget):
         """Reloads known locations while preserving the visible selection."""
 
         repository = self.repository()
+        current_location_name = ""
         selected_name = self._selected_location_name()
         self.location_list.blockSignals(True)
         self.location_list.clear()
@@ -7036,6 +7218,7 @@ class TravelScreen(RepositoryBackedWidget):
             self.travel_button.setEnabled(False)
             return
 
+        current_location_name = StateManager(repository).load_state().world.location
         locations = repository.ensure_travel_locations()
 
         for location in sorted(
@@ -7047,11 +7230,16 @@ class TravelScreen(RepositoryBackedWidget):
             if not name:
                 continue
 
-            item = QListWidgetItem(name)
+            display_name = name
+            if name.casefold() == current_location_name.casefold():
+                display_name = f"{name} (Currently here)"
+
+            item = QListWidgetItem(display_name)
             item.setData(
                 Qt.ItemDataRole.UserRole,
                 location,
             )
+            item.setData(Qt.ItemDataRole.UserRole + 1, name)
             self.location_list.addItem(item)
 
         self.location_list.blockSignals(False)
@@ -7061,12 +7249,19 @@ class TravelScreen(RepositoryBackedWidget):
             self.travel_button.setEnabled(False)
             return
 
+        target_name = current_location_name or selected_name
         target_row = 0
 
         for row in range(self.location_list.count()):
             item = self.location_list.item(row)
 
-            if item is not None and item.text().casefold() == selected_name.casefold():
+            item_name = (
+                str(item.data(Qt.ItemDataRole.UserRole + 1) or "")
+                if item is not None
+                else ""
+            )
+
+            if item_name.casefold() == target_name.casefold():
                 target_row = row
                 break
 
@@ -7077,7 +7272,13 @@ class TravelScreen(RepositoryBackedWidget):
         """Returns the currently selected location name, when any."""
 
         current_item = self.location_list.currentItem()
-        return current_item.text().strip() if current_item is not None else ""
+        if current_item is None:
+            return ""
+
+        return str(
+            current_item.data(Qt.ItemDataRole.UserRole + 1)
+            or current_item.text()
+        ).strip()
 
     def _selected_location_data(self) -> dict[str, Any] | None:
         """Returns the selected location's persisted data."""
@@ -7195,8 +7396,6 @@ class CalendarScreen(RepositoryBackedWidget):
         navigation_row = QHBoxLayout()
         navigation_row.addWidget(previous_button)
         navigation_row.addStretch()
-        navigation_row.addWidget(self.month_label)
-        navigation_row.addStretch()
         navigation_row.addWidget(self.settings_button)
         navigation_row.addWidget(today_button)
         navigation_row.addWidget(next_button)
@@ -7205,15 +7404,18 @@ class CalendarScreen(RepositoryBackedWidget):
         self.summary_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
         self.table = QTableWidget(0, 0)
+        self.table.setObjectName("calendarGrid")
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
         _use_soft_table_selection(self.table)
-        self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.table.verticalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
         self.table.verticalHeader().setVisible(False)
 
         layout = QVBoxLayout()
         layout.addLayout(navigation_row)
-        layout.addWidget(self.summary_label)
+        layout.addWidget(self.month_label, alignment=Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.summary_label, alignment=Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(self.table)
 
         self.setLayout(layout)
@@ -7255,6 +7457,7 @@ class CalendarScreen(RepositoryBackedWidget):
 
         for row_index, week in enumerate(grid["rows"]):
             for column_index, day in enumerate(week):
+                self.table.removeCellWidget(row_index, column_index)
                 label = str(day["day_of_month"])
 
                 if day["is_current_day"]:
@@ -7262,14 +7465,20 @@ class CalendarScreen(RepositoryBackedWidget):
 
                 item = QTableWidgetItem(label)
                 item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-
-                if day["is_current_day"]:
-                    item.setBackground(QColor("#d7ecff"))
-                    item.setToolTip("Current day")
-
                 self.table.setItem(row_index, column_index, item)
 
-        self.table.resizeColumnsToContents()
+                if day["is_current_day"]:
+                    item.setToolTip("Current day")
+                    current_day_label = QLabel(label)
+                    current_day_label.setObjectName("currentCalendarDay")
+                    current_day_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                    current_day_label.setToolTip("Current day")
+                    self.table.setCellWidget(
+                        row_index,
+                        column_index,
+                        current_day_label,
+                    )
+
         self.table.resizeRowsToContents()
 
     def return_to_current_month(self) -> None:
@@ -7385,7 +7594,7 @@ class CalendarSettingsDialog(QDialog):
         form.addRow("Time Display:", self.time_display_combo)
 
         buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Save
+            QDialogButtonBox.StandardButton.Ok
             | QDialogButtonBox.StandardButton.Cancel
         )
         buttons.accepted.connect(self.accept)
@@ -7430,9 +7639,9 @@ class InventoryScreen(RepositoryBackedWidget):
         self.table.setHorizontalHeaderLabels(
             ["Name", "Category", "Qty", "Value", "Description"]
         )
-        self.table.horizontalHeader().setStretchLastSection(True)
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        _configure_wrapping_table(self.table, {4})
         _enable_table_sorting(self.table, self._sort_by_column)
         self.table.horizontalHeader().setSortIndicator(self._sort_column, self._sort_order)
         self.currency_label = QLabel("Currency: 0")
@@ -7598,7 +7807,7 @@ class InventoryScreen(RepositoryBackedWidget):
             )
             self.table.setItem(row_index, 4, _table_item(str(item.get("description", ""))))
 
-        self.table.resizeColumnsToContents()
+        _resize_wrapping_table_rows(self.table)
 
         if self.playtesting_tools and self._selected_item_name:
             for row_index in range(self.table.rowCount()):
@@ -7869,8 +8078,8 @@ class NpcsScreen(RepositoryBackedWidget):
         self.table.setHorizontalHeaderLabels(
             ["Name", "Location", "Notes"]
         )
-        self.table.horizontalHeader().setStretchLastSection(True)
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        _configure_wrapping_table(self.table, {2})
         _enable_table_sorting(self.table, self._sort_by_column)
         self.table.horizontalHeader().setSortIndicator(self._sort_column, self._sort_order)
 
@@ -7908,7 +8117,7 @@ class NpcsScreen(RepositoryBackedWidget):
             self.table.setItem(row_index, 1, _table_item(str(npc.get("location", ""))))
             self.table.setItem(row_index, 2, _table_item(str(npc.get("notes", ""))))
 
-        self.table.resizeColumnsToContents()
+        _resize_wrapping_table_rows(self.table)
 
     def _sort_by_column(self, column_index: int) -> None:
         """Sorts NPCs by a clicked header column."""
@@ -7956,8 +8165,8 @@ class ActiveTasksScreen(RepositoryBackedWidget):
                 "Due",
             ]
         )
-        self.table.horizontalHeader().setStretchLastSection(True)
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        _configure_wrapping_table(self.table, {0, 3, 6})
         _enable_table_sorting(self.table, self._sort_by_column)
         self.table.horizontalHeader().setSortIndicator(self._sort_column, self._sort_order)
 
@@ -8002,7 +8211,7 @@ class ActiveTasksScreen(RepositoryBackedWidget):
             self.table.setItem(row_index, 6, _table_item(str(task.get("reward", ""))))
             self.table.setItem(row_index, 7, _table_item(str(task.get("due_date", ""))))
 
-        self.table.resizeColumnsToContents()
+        _resize_wrapping_table_rows(self.table)
 
     def _sort_by_column(self, column_index: int) -> None:
         """Sorts active tasks by a clicked header column."""
@@ -8063,8 +8272,8 @@ class SkillsScreen(RepositoryBackedWidget):
         self.skills_table.setHorizontalHeaderLabels(
             ["Skill", "Training", "Description"]
         )
-        self.skills_table.horizontalHeader().setStretchLastSection(True)
         self.skills_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        _configure_wrapping_table(self.skills_table, set())
         _enable_table_sorting(self.skills_table, self._sort_by_column)
         self.skills_table.horizontalHeader().setSortIndicator(
             self._sort_column,
@@ -8107,7 +8316,7 @@ class SkillsScreen(RepositoryBackedWidget):
                 _table_item(str(skill.get("description", ""))),
             )
 
-        self.skills_table.resizeColumnsToContents()
+        _resize_wrapping_table_rows(self.skills_table)
 
     def _sort_by_column(self, column_index: int) -> None:
         """Sorts skills by a clicked header column."""
@@ -8186,7 +8395,7 @@ class AlchemyNotebookScreen(RepositoryBackedWidget):
             self._reagent_sort_column,
             self._reagent_sort_order,
         )
-        self.reagent_table.horizontalHeader().setStretchLastSection(True)
+        _configure_wrapping_table(self.reagent_table, {1, 2, 3})
         self.reagent_table.itemSelectionChanged.connect(self._load_selected_reagent)
 
         self.reagent_name_input = QLineEdit()
@@ -8200,7 +8409,7 @@ class AlchemyNotebookScreen(RepositoryBackedWidget):
             "Comma-separated uses, such as repair, dye, medicine, fuel"
         )
 
-        save_button = QPushButton("Save Item")
+        save_button = QPushButton("Add / Update Item")
         save_button.clicked.connect(self._save_reagent)
         new_button = QPushButton("New Item")
         new_button.clicked.connect(self._clear_reagent_form)
@@ -8238,7 +8447,7 @@ class AlchemyNotebookScreen(RepositoryBackedWidget):
             self._recipe_sort_column,
             self._recipe_sort_order,
         )
-        self.recipe_table.horizontalHeader().setStretchLastSection(True)
+        _configure_wrapping_table(self.recipe_table, {1, 2, 3})
 
         self.recipe_name_input = QLineEdit()
         self.recipe_name_input.setPlaceholderText("Recipe name")
@@ -8311,7 +8520,7 @@ class AlchemyNotebookScreen(RepositoryBackedWidget):
         )
         _use_soft_table_selection(self.recipe_ingredient_table)
 
-        save_button = QPushButton("Save Recipe")
+        save_button = QPushButton("Add / Update Recipe")
         save_button.clicked.connect(self._add_recipe)
         new_button = QPushButton("New Recipe")
         new_button.clicked.connect(self._clear_recipe_form)
@@ -8373,7 +8582,7 @@ class AlchemyNotebookScreen(RepositoryBackedWidget):
             self.reagent_table.setItem(row_index, 2, _table_item(str(reagent.get("location", ""))))
             self.reagent_table.setItem(row_index, 3, _table_item(_join_list(reagent.get("uses", []))))
 
-        self.reagent_table.resizeColumnsToContents()
+        _resize_wrapping_table_rows(self.reagent_table)
         self._refreshing_reagents = False
 
         if selected_name:
@@ -8400,7 +8609,7 @@ class AlchemyNotebookScreen(RepositoryBackedWidget):
             self.recipe_table.setItem(row_index, 2, _table_item(str(recipe.get("result", ""))))
             self.recipe_table.setItem(row_index, 3, _table_item(str(recipe.get("notes", ""))))
 
-        self.recipe_table.resizeColumnsToContents()
+        _resize_wrapping_table_rows(self.recipe_table)
 
     def _save_reagent(self) -> None:
         """Adds or updates a known crafting item/material."""
@@ -8745,13 +8954,9 @@ class HistoryScreen(RepositoryBackedWidget):
             lambda _checked: self._schedule_journal_autosave()
         )
 
-        save_button = QPushButton("Save Journal")
-        save_button.clicked.connect(self._save_journal)
-
         layout = QVBoxLayout()
         layout.addWidget(self.share_with_ai_checkbox)
         layout.addWidget(self.journal_input)
-        layout.addWidget(save_button)
 
         self.setLayout(layout)
 
@@ -8785,15 +8990,9 @@ class HistoryScreen(RepositoryBackedWidget):
         """Persists journal changes without interrupting the player."""
 
         self._autosave_timer.stop()
-        self._persist_journal(show_confirmation=False)
+        self._persist_journal()
 
-    def _save_journal(self) -> None:
-        """Persists journal notes from the manual save button."""
-
-        self._autosave_timer.stop()
-        self._persist_journal(show_confirmation=True)
-
-    def _persist_journal(self, *, show_confirmation: bool) -> None:
+    def _persist_journal(self) -> None:
         """Persists journal notes and AI sharing preference."""
 
         repository = self.repository()
@@ -8807,9 +9006,6 @@ class HistoryScreen(RepositoryBackedWidget):
             repository.set_journal_notes(self.journal_input.toPlainText())
             repository.set_journal_share_with_ai(self.share_with_ai_checkbox.isChecked())
             self.notify_repository_changed()
-
-            if show_confirmation:
-                QMessageBox.information(self, "Journal Saved", "Journal notes were saved.")
         finally:
             self._saving_journal = False
 
@@ -9011,8 +9207,6 @@ class SettingsScreen(RepositoryBackedWidget):
         self._loading_settings = True
 
         try:
-            row_count = len(self.currency_row_widgets)
-
             for index, (row_widget, value_input, remove_button) in enumerate(
                 zip(
                     self.currency_row_widgets,
@@ -9028,10 +9222,14 @@ class SettingsScreen(RepositoryBackedWidget):
                 if index == 0:
                     value_input.setValue(1)
                     value_input.setEnabled(False)
+                    value_input.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
+                    remove_button.setVisible(False)
+                    remove_button.setEnabled(False)
                 else:
                     value_input.setEnabled(True)
-
-                remove_button.setVisible(row_count > 1)
+                    value_input.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.UpDownArrows)
+                    remove_button.setVisible(True)
+                    remove_button.setEnabled(True)
         finally:
             self._loading_settings = previous_loading
 
@@ -9870,6 +10068,11 @@ def _light_theme_stylesheet() -> str:
             border: 1px solid #cbd5e1;
             padding: 4px;
         }
+        QTableWidget#calendarGrid QLabel#currentCalendarDay {
+            background-color: transparent;
+            color: #111827;
+            border: 2px solid #1d4ed8;
+        }
     """
 
 
@@ -9979,6 +10182,11 @@ def _dark_theme_stylesheet() -> str:
             color: #f1f3f4;
             border: 1px solid #4b5258;
             padding: 4px;
+        }
+        QTableWidget#calendarGrid QLabel#currentCalendarDay {
+            background-color: transparent;
+            color: #f1f3f4;
+            border: 2px solid #6b7280;
         }
     """
 
@@ -10276,8 +10484,16 @@ def _sync_currency_base_value_row(table: QTableWidget) -> None:
         if row == 0:
             value_widget.setValue(1)
             value_widget.setEnabled(False)
+            value_widget.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
         else:
             value_widget.setEnabled(True)
+            value_widget.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.UpDownArrows)
+
+        remove_widget = table.cellWidget(row, 3)
+
+        if isinstance(remove_widget, QPushButton):
+            remove_widget.setVisible(row != 0)
+            remove_widget.setEnabled(row != 0)
 
 
 def _currency_denominations_from_table(table: QTableWidget) -> list[dict[str, Any]]:
@@ -10404,32 +10620,150 @@ def _clamped_int(value: Any, default: int, minimum: int, maximum: int) -> int:
     return max(minimum, min(maximum, parsed_value))
 
 
-def _ai_skills_match_setup(
+def _final_start_location_for_save(setup: dict[str, Any], result: Any) -> str:
+    """Returns the location that should be persisted as the current scene."""
+
+    requested_location = str(setup.get("start_location", "") or "").strip()
+
+    if (
+        str(setup.get("start_location_mode", "suggestion")).casefold() == "exact"
+        and requested_location
+    ):
+        return requested_location
+
+    return str(getattr(result, "start_location", "") or "").strip()
+
+
+def _introductory_message_for_save(setup: dict[str, Any], result: Any) -> str:
+    """Returns opening narration corrected for exact start-location requests."""
+
+    message = str(getattr(result, "introductory_message", "") or "")
+    requested_location = str(setup.get("start_location", "") or "").strip()
+    ai_location = str(getattr(result, "start_location", "") or "").strip()
+
+    if (
+        str(setup.get("start_location_mode", "suggestion")).casefold() == "exact"
+        and requested_location
+        and ai_location
+        and ai_location.casefold() != requested_location.casefold()
+    ):
+        return message.replace(ai_location, requested_location)
+
+    return message
+
+
+def _travel_locations_for_save(
+    raw_locations: Any,
+    setup: dict[str, Any],
+    result: Any,
+) -> list[dict[str, Any]]:
+    """Returns AI locations with exact requested start location preserved."""
+
+    locations = [
+        location.to_dict()
+        for location in normalize_known_locations(raw_locations)
+    ]
+    requested_location = str(setup.get("start_location", "") or "").strip()
+    ai_location = str(getattr(result, "start_location", "") or "").strip()
+
+    if (
+        str(setup.get("start_location_mode", "suggestion")).casefold() != "exact"
+        or not requested_location
+    ):
+        return locations
+
+    for location in locations:
+        name = str(location.get("name", "") or "").strip()
+        is_ai_start = bool(ai_location) and name.casefold() == ai_location.casefold()
+        is_origin = (
+            _coerce_float(location.get("x_miles")) == 0.0
+            and _coerce_float(location.get("y_miles")) == 0.0
+        )
+
+        if is_ai_start or is_origin:
+            location["name"] = requested_location
+            if not str(location.get("description", "") or "").strip():
+                location["description"] = "Starting location."
+            location["x_miles"] = 0.0
+            location["y_miles"] = 0.0
+            return locations
+
+    return [
+        {
+            "name": requested_location,
+            "description": "Starting location.",
+            "x_miles": 0.0,
+            "y_miles": 0.0,
+            "terrain": "",
+            "travel_multiplier": 1.0,
+            "travel_notes": "",
+        },
+        *locations,
+    ]
+
+
+def _finalized_skills_for_save(
     ai_skills: list[dict[str, Any]],
     setup_skills: Any,
-) -> bool:
-    """Returns True when AI-finalized skills preserve the setup level spread."""
+) -> list[dict[str, Any]]:
+    """Merges AI skill descriptions while preserving player-provided skill names."""
 
-    if not isinstance(setup_skills, list):
-        return False
+    if not isinstance(setup_skills, list) or not setup_skills:
+        return _deduplicated_ai_skills(ai_skills) if ai_skills else []
 
-    if len(ai_skills) != len(setup_skills):
-        return False
+    merged_skills: list[dict[str, Any]] = []
+    ai_by_name = {
+        str(skill.get("name", "")).strip().casefold(): skill
+        for skill in ai_skills
+        if isinstance(skill, dict)
+    }
+
+    for index, raw_setup_skill in enumerate(setup_skills):
+        if not isinstance(raw_setup_skill, dict):
+            raw_setup_skill = {"name": str(raw_setup_skill)}
+
+        setup_name = str(raw_setup_skill.get("name", "") or "").strip()
+        if not setup_name:
+            ai_skill = ai_skills[index] if index < len(ai_skills) else {}
+            merged_skills.append(dict(ai_skill) if isinstance(ai_skill, dict) else {})
+            continue
+
+        ai_skill = ai_by_name.get(setup_name.casefold())
+        if ai_skill is None and index < len(ai_skills) and isinstance(ai_skills[index], dict):
+            ai_skill = ai_skills[index]
+        if ai_skill is None:
+            ai_skill = {}
+
+        description = str(
+            ai_skill.get("description")
+            or raw_setup_skill.get("description")
+            or f"Player-selected {setup_name} skill."
+        ).strip()
+        merged_skills.append(
+            {
+                **dict(ai_skill),
+                "name": setup_name,
+                "description": description,
+                "level": _safe_int(raw_setup_skill.get("level"), _safe_int(ai_skill.get("level"), 1)),
+            }
+        )
+
+    return _deduplicated_ai_skills(
+        [
+            skill
+            for skill in merged_skills
+            if str(skill.get("name", "")).strip()
+        ]
+    )
+
+
+def _coerce_float(value: Any) -> float | None:
+    """Returns a float or None when the value is not numeric."""
 
     try:
-        ai_levels = sorted(int(skill.get("level", 0)) for skill in ai_skills)
-        setup_levels = sorted(int(skill.get("level", 0)) for skill in setup_skills)
-    except (AttributeError, TypeError, ValueError):
-        return False
-
-    if ai_levels != setup_levels:
-        return False
-
-    return all(
-        str(skill.get("name", "")).strip()
-        and str(skill.get("description", "")).strip()
-        for skill in ai_skills
-    )
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _deduplicated_ai_skills(ai_skills: list[dict[str, Any]]) -> list[dict[str, Any]]:

@@ -61,6 +61,7 @@ class NewGameSetupTests(unittest.TestCase):
         self.assertTrue(setup["skills"][0]["requires_ai_invention"])
         self.assertEqual(len(setup["starter_items"]), 1)
         self.assertEqual(setup["specified_genre"], "Realistic detective mystery")
+        self.assertEqual(setup["start_location_mode"], "suggestion")
         self.assertEqual(setup["calendar"]["month_names"][0], "January")
         self.assertEqual(setup["calendar"]["time_display"], "12_hour")
         self.assertEqual(setup["calendar"]["calendar_type"], "gregorian")
@@ -80,6 +81,26 @@ class NewGameSetupTests(unittest.TestCase):
             ["HARM_CATEGORY_DANGEROUS_CONTENT"],
         )
         self.assertIn("Keep the mystery grounded.", setup["ai_additional_context"])
+
+    def test_start_location_mode_and_turn_prompt_are_model_visible(self) -> None:
+        setup = normalize_new_game_setup(
+            {
+                "character": {"name": "Kit"},
+                "start_location": "Kit's Abandoned Loft",
+                "start_location_mode": "exactly this",
+                "narration": {
+                    "tense": "present",
+                    "style": "third_person_limited",
+                },
+            }
+        )
+        packet = build_new_game_setup_packet(setup)
+
+        self.assertEqual(setup["start_location_mode"], "exact")
+        self.assertEqual(packet["setup"]["start_location_mode"], "exact")
+        self.assertEqual(packet["turn_prompt"], "What does Kit do now?")
+        self.assertIn("start_location_mode", packet["requirements"]["start_location"])
+        self.assertIn("turn_prompt", packet["requirements"]["opening_scene"])
 
     def test_normalized_setup_preserves_explicit_sparse_skill_levels(self) -> None:
         setup = normalize_new_game_setup(
@@ -284,25 +305,6 @@ class NewGameSetupTests(unittest.TestCase):
                 "Keep clues internally consistent.",
                 state.settings.values["ai.additional_context"],
             )
-            repository.set_world_lore(
-                {
-                    "Locations": {
-                        "Rainmarket Station": "Rainmarket Station is the central rail terminal."
-                    },
-                    "Economy": {"Crowns": "Crowns dominate city trade."},
-                }
-            )
-            self.assertEqual(
-                repository.get_world_lore()["Locations"]["Rainmarket Station"],
-                "Rainmarket Station is the central rail terminal.",
-            )
-            repository.set_world_lore(
-                {"Locations": ["Old Entry: Converted from legacy list lore."]}
-            )
-            self.assertEqual(
-                repository.get_world_lore()["Locations"]["Old Entry"],
-                "Old Entry: Converted from legacy list lore.",
-            )
             self.assertEqual(state.currency.denominations[1]["name"], "Crown")
             self.assertEqual(state.currency.denominations[1]["value"], 12)
 
@@ -409,6 +411,46 @@ class NewGameSetupTests(unittest.TestCase):
         self.assertIn(
             "setup.economy_examples",
             packet["requirements"]["starting_currency_balance"],
+        )
+
+    def test_starting_task_setup_supports_ai_and_custom_opening_quests(self) -> None:
+        ai_setup = normalize_new_game_setup({"starting_task": {"mode": "ai"}})
+        ai_packet = build_new_game_setup_packet(ai_setup)
+
+        self.assertEqual(ai_setup["starting_task"]["mode"], "ai")
+        self.assertTrue(ai_setup["starting_task"]["task"]["requires_ai_invention"])
+        self.assertIn("opening quest/task", ai_packet["fields_requiring_ai_invention"])
+        self.assertEqual(ai_packet["starting_task_contract"]["mode"], "ai")
+        self.assertIn("ActiveTaskUpsertedEvent", ai_packet["requirements"]["starting_task"])
+
+        custom_setup = normalize_new_game_setup(
+            {
+                "starting_task": {
+                    "mode": "custom",
+                    "task": {
+                        "name": "Find the Canal Ledger",
+                        "description": "Recover the missing tax ledger.",
+                        "requester": "Archivist Pell",
+                    },
+                }
+            }
+        )
+        custom_packet = build_new_game_setup_packet(custom_setup)
+
+        self.assertEqual(custom_setup["starting_task"]["mode"], "custom")
+        self.assertEqual(
+            custom_setup["starting_task"]["task"]["name"],
+            "Find the Canal Ledger",
+        )
+        self.assertEqual(custom_setup["starting_task"]["task"]["category"], "Quest")
+        self.assertTrue(custom_setup["starting_task"]["task"]["requires_ai_invention"])
+        self.assertIn(
+            "blank starting quest/task fields",
+            custom_packet["fields_requiring_ai_invention"],
+        )
+        self.assertEqual(
+            custom_packet["starting_task_contract"]["task"]["requester"],
+            "Archivist Pell",
         )
 
     def test_blank_currency_setup_is_reserved_for_ai_generation(self) -> None:
@@ -641,7 +683,8 @@ class NewGameSetupTests(unittest.TestCase):
         self.assertIn("specific starting location", invention_fields)
         self.assertIn("specific genre or premise", invention_fields)
         self.assertIn("world context, factions, religions, and locations", invention_fields)
-        self.assertIn("distinct starting skill identities", invention_fields)
+        self.assertIn("blank starting skill names", invention_fields)
+        self.assertIn("blank starting skill descriptions", invention_fields)
         self.assertNotIn("starter inventory based on character and skills", invention_fields)
         self.assertIn("ai_invention_policy", packet["requirements"])
         self.assertIn("character_generation", packet["requirements"])
@@ -655,7 +698,7 @@ class NewGameSetupTests(unittest.TestCase):
         self.assertIn("does not need to start in a tavern", packet["requirements"]["starting_location"])
         self.assertIn("short, broad place name", packet["requirements"]["starting_location"])
         self.assertIn("skill_generation", packet["requirements"])
-        self.assertIn("requires_ai_invention=true", packet["requirements"]["skill_generation"])
+        self.assertIn("copy that exact name", packet["requirements"]["skill_generation"])
         self.assertIn("generalized gameplay capabilities", packet["requirements"]["skill_generation"])
         self.assertIn("Lore (Syndicate)", packet["requirements"]["skill_generation"])
         self.assertIn("rather than Syndicate Lore", packet["requirements"]["skill_generation"])

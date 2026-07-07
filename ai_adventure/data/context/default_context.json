@@ -20,7 +20,7 @@
           "Treat state.gm_secrets.active as authoritative AI-only hidden truth for continuity, clues, NPC behavior, and mystery logic. Do not expose active details in narration, suggested actions, or player-visible event fields.",
           "Use SecretUpsertedEvent with a stable secret_id when durable hidden truth is created or changes. Mark it revealed when the player learns it and retired when it is no longer true or useful.",
           "Resolve the player's submitted action instead of ending by restating the action, intent, or search target.",
-          "Do not include 'What do you do now?' or any end-of-turn prompt in the response field; the application displays that separately.",
+          "Do not include 'What do you do now?' or any tense/person-specific end-of-turn prompt in the response field; the application displays that separately based on the selected narration tense and style.",
           "Do not speak for the player character or invent player-character dialogue, questions, promises, purchases, attacks, or choices.",
           "Do not directly mutate inventory, flags, recipes, or player condition.",
           "Suggest mechanical changes in the events array."
@@ -83,7 +83,7 @@
           "Treat known crafting items/materials and recipes as discovered knowledge.",
           "Undiscovered recipes should be hinted at through observation and experimentation.",
           "When new practical crafting knowledge is discovered, suggest a recipe, useful item/material, or notebook event.",
-          "When the player learns an item's or material's description, source location, or crafting uses, use ReagentDiscoveredEvent with name, description, location, and uses. Do not store practical crafting-item properties only as WorldLoreUpsertedEvent.",
+          "When the player learns an item's or material's description, source location, or crafting uses, use ReagentDiscoveredEvent with name, description, location, and uses. If the source location itself should appear in Travel, also use LocationUpsertedEvent.",
           "Recipe ingredients must use item names from state.item_catalog.items in the reagent_name field, and only items categorized as Material, Ingredient, Reagent, or Crafting Item can be recipe ingredients.",
           "If the player physically collects, harvests, picks up, or stores a crafting item/material, also suggest InventoryItemAddedEvent for that same item/material."
         ]
@@ -100,9 +100,11 @@
           "Suggest SkillCheckRequestedEvent before narrating a final outcome only when the current command has meaningful uncertainty, opposition, hidden information, danger, scarcity, time pressure, or consequences.",
           "Do not request a check merely because an action could theoretically vary in quality or take extra time. Foraging, harvesting, searching, researching, identifying, crafting, alchemy experiments, persuasion, stealth, and combat need checks only when real stakes are present.",
           "When a scene becomes an actual fight, suggest CombatStartedEvent with enemy/allied combatants, health, armor_rating, to_hit_bonus, initiative_bonus, personality, complete ammunition/clip fields, damage dice, and loot. Then let Python roll initiative, calculate each team's Threat Levels from maximum health, armor rating, and average damage, use those percentages for non-intelligent NPC targeting, preserve tactical targeting for intelligent NPCs, and resolve attacks, reloading, damage, victory, defeat, and loot.",
+          "Any weapon given to the player must feel mechanically worthwhile: its average damage must be strictly higher than the player's unarmed base damage of 1d4. Do not create player weapons with damage of 1d4 or anything weaker; use at least 1d6 for ordinary one-handed weapons and at least 1d10 for ordinary two-handed weapons unless a stronger fitting expression is appropriate.",
           "Routine movement, paying a known price, receiving ordinary goods, eating, drinking, and casual conversation are not skill checks unless the player adds a contested, risky, hidden, time-sensitive, or deceptive goal.",
           "Use SkillXpAddedEvent only after meaningful use, training, study, or practice.",
           "Do not use SkillXpAddedEvent as a substitute for resolving an uncertain action.",
+          "Preserve player-provided starting skill names exactly; do not replace them with narrower, more local, hyphenated, or hyper-specific variants.",
           "Do not narrate final success or failure until the Python application has resolved the skill check.",
           "When state.skills.resolved_checks_this_turn contains results, treat them as authoritative for the current player command, narrate the outcome from those results, and do not request duplicate checks for those skills.",
           "Low failed rolls should create real setbacks or costs; very high successful rolls should produce cleaner, richer, faster, or more advantageous results without mentioning dice or roll numbers."

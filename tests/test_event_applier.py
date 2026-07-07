@@ -68,6 +68,44 @@ def _test_container_metadata(
 
 
 class EventApplierTests(unittest.TestCase):
+    def test_inventory_item_added_upgrades_player_weapon_damage_above_unarmed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = SaveRepository.create_new_save(Path(temp_dir), "Weapon Floor Test")
+
+            result = EventApplier(repository).apply_events(
+                [
+                    {
+                        "type": "InventoryItemAddedEvent",
+                        "payload": {
+                            "item_type": "Weapon",
+                            "item_name": "Rusty Dagger",
+                            "description": "A small blade that should still matter.",
+                            "amount": 1,
+                            "value_base_units": 5,
+                            "weapon_hands": "one-handed",
+                            "damage": "1d4",
+                            "attack_skill": "Melee",
+                            "attack_range_feet": 5,
+                        },
+                    }
+                ]
+            )[0]
+
+            item = _require(
+                next(
+                    (
+                        inventory_item
+                        for inventory_item in repository.list_inventory_items()
+                        if inventory_item["name"] == "Rusty Dagger"
+                    ),
+                    None,
+                )
+            )
+
+            self.assertEqual(result.status, "applied")
+            self.assertEqual(item["metadata"]["item_type"], "Weapon")
+            self.assertEqual(item["metadata"]["damage"], "1d6")
+
     def test_applies_inventory_add_remove_and_modify_events(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             repository = SaveRepository.create_new_save(Path(temp_dir), "Event Test")
@@ -873,7 +911,7 @@ class EventApplierTests(unittest.TestCase):
             self.assertEqual(repository.get_setting("audio.current_music"), "Boss_Fight.mp3")
             self.assertEqual(visible_npcs[0]["display_name"], "Bartender")
 
-    def test_world_lore_upsert_event_replaces_player_lore(self) -> None:
+    def test_world_lore_upsert_event_is_unsupported(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             repository = SaveRepository.create_new_save(Path(temp_dir), "Lore Test")
 
@@ -886,26 +924,12 @@ class EventApplierTests(unittest.TestCase):
                             "key": "The Gilded Compact",
                             "text": "The Gilded Compact controls the river tolls.",
                         },
-                    },
-                    {
-                        "type": "WorldLoreUpsertedEvent",
-                        "payload": {
-                            "section": "Factions",
-                            "key": "The Gilded Compact",
-                            "text": (
-                                "The Gilded Compact controls the river tolls and "
-                                "licenses trusted merchants."
-                            ),
-                        },
                     }
                 ]
             )
 
-            self.assertEqual([result.status for result in results], ["applied", "applied"])
-            self.assertEqual(
-                repository.get_world_lore()["Factions"]["The Gilded Compact"],
-                "The Gilded Compact controls the river tolls and licenses trusted merchants.",
-            )
+            self.assertEqual([result.status for result in results], ["skipped"])
+            self.assertIn("Unsupported event type", results[0].message)
 
     def test_event_payloads_sanitize_banned_creative_terms_before_storage(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -923,21 +947,28 @@ class EventApplierTests(unittest.TestCase):
                             },
                         },
                         {
-                            "type": "WorldLoreUpsertedEvent",
+                            "type": "LocationUpsertedEvent",
                             "payload": {
-                                "section": "Factions",
-                                "key": "New Aethelgard",
-                                "text": "New Aethelgard is a crowded city.",
+                                "name": "New Aethelgard",
+                                "description": "New Aethelgard is a crowded city.",
+                                "x_miles": 3,
+                                "y_miles": 4,
+                                "terrain": "City streets",
+                                "travel_multiplier": 1.0,
+                                "travel_notes": "Main roads are crowded.",
                             },
                         },
                     ]
                 )
 
-            stored_lore = json.dumps(repository.get_world_lore(), ensure_ascii=False)
+            stored_locations = json.dumps(
+                repository.get_travel_locations(),
+                ensure_ascii=False,
+            )
 
             self.assertEqual([result.status for result in results], ["applied", "applied"])
             self.assertNotIn("Aethelgard", repository.get_state_value("location"))
-            self.assertNotIn("Aethelgard", stored_lore)
+            self.assertNotIn("Aethelgard", stored_locations)
 
     def test_applies_alchemy_discovery_events(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

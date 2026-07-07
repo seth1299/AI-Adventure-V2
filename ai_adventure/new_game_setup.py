@@ -132,6 +132,7 @@ def normalize_new_game_setup(raw_setup: Any) -> dict[str, Any]:
     )
     game_style = _clean_text(raw_setup.get("game_style"))
     world_context = _clean_text(raw_setup.get("world_context"))
+    start_location_mode = _normalize_start_location_mode(raw_setup)
     currency_denominations = normalize_currency_denominations(
         raw_setup.get("currency_denominations", []),
         fallback_denominations=[],
@@ -163,6 +164,9 @@ def normalize_new_game_setup(raw_setup: Any) -> dict[str, Any]:
     custom_ai_context = _clean_text(raw_ai_settings.get("additional_context"))
     skills = _normalize_skills(raw_setup.get("skills", []))
     starter_items = _normalize_starter_items(raw_setup.get("starter_items", []))
+    starting_task = _normalize_starting_task(
+        raw_setup.get("starting_task", raw_setup.get("starting_quest", {}))
+    )
 
     return {
         "title": _clean_text(raw_setup.get("title")) or "New Adventure",
@@ -174,6 +178,7 @@ def normalize_new_game_setup(raw_setup: Any) -> dict[str, Any]:
         },
         "skills": skills,
         "starter_items": starter_items,
+        "starting_task": starting_task,
         "calendar": calendar_settings,
         "audio": audio_settings,
         "narration": narration_preferences,
@@ -193,6 +198,7 @@ def normalize_new_game_setup(raw_setup: Any) -> dict[str, Any]:
         "specified_genre": specified_genre,
         "game_style": game_style,
         "start_location": start_location,
+        "start_location_mode": start_location_mode,
         "world_context": world_context,
         "ai_additional_context": _build_ai_additional_context(
             specified_genre=specified_genre,
@@ -323,7 +329,15 @@ def build_new_game_setup_packet(
                 "starting location. Use setup.narration.tense_label and "
                 "setup.narration.style_label for the prose. Light Markdown is "
                 "allowed for italics, bold important names, and readable lists. "
-                "End with 'What do you do now?'"
+                "End with the prompt in setup.turn_prompt."
+            ),
+            "start_location": (
+                "setup.start_location_mode controls how to treat the requested "
+                "starting location. suggestion means use it as inspiration and "
+                "you may replace it with a more specific fitting location. exact "
+                "means return setup.start_location unchanged as start_location and "
+                "use that exact name consistently in introductory_message, "
+                "locations, and any opening events."
             ),
             "narration_preferences": (
                 "Use setup.narration.tense_label and setup.narration.style_label "
@@ -336,7 +350,8 @@ def build_new_game_setup_packet(
             "ai_modes": (
                 "Apply player_ai_preferences.model_tone_instruction, "
                 "response_length_instruction, and model_content_rules to "
-                "world_summary, introductory_message, world lore, and all other "
+                "world_summary, introductory_message, location descriptions, NPC "
+                "profile text, and all other "
                 "player-facing prose. These preferences do not relax schema "
                 "completeness or hidden-information rules."
             ),
@@ -360,11 +375,22 @@ def build_new_game_setup_packet(
                 "settings and return calendar_settings as an empty object."
             ),
             "events": (
-                "Use structured events for any initial NPCs, active tasks, "
-                "or starter-world facts that should be durable. Return AI-only "
+                "Use structured events for any initial NPCs, requested active "
+                "tasks, or starter-world facts that should be durable. Return AI-only "
                 "hidden identities, motives, mystery solutions, off-screen plans, "
                 "and other concealed truths in the dedicated gm_secrets setup "
                 "field; never place those truths in player-facing setup fields."
+            ),
+            "starting_task": (
+                "setup.starting_task.mode controls the initial active quest. If "
+                "mode is none, do not create an initial ActiveTaskUpsertedEvent "
+                "unless another explicit setup field independently asks for one. "
+                "If mode is ai, create one fitting starting quest with "
+                "ActiveTaskUpsertedEvent. If mode is custom, create exactly one "
+                "ActiveTaskUpsertedEvent using the player's provided fields as "
+                "authoritative anchors, filling any blank/default fields from the "
+                "rest of the setup. Use category Quest unless the player provided "
+                "a different category."
             ),
             "starting_music": (
                 "If valid background music tracks are available, suggest one "
@@ -421,7 +447,10 @@ def build_new_game_setup_packet(
                 "Return a short, broad place name only, such as a room, building, "
                 "street, district, ship, campsite, or landmark. Put scenic details "
                 "like floor, view, nearby landmarks, weather, and exact position in "
-                "the opening scene instead of start_location."
+                "the opening scene instead of start_location. If setup."
+                "start_location_mode is exact, return setup.start_location "
+                "unchanged as the final start_location. If it is suggestion, treat "
+                "setup.start_location as inspiration that may be replaced."
             ),
             "travel_locations": (
                 "Return a locations array for the Travel tab. Include the finalized "
@@ -432,9 +461,10 @@ def build_new_game_setup_packet(
                 "secrets, or GM-only information."
             ),
             "skill_generation": (
-                "If a setup.skills entry has blank name, blank description, or "
-                "requires_ai_invention=true, invent a distinct setting-appropriate "
-                "skill name and concrete description for that slot. Preserve the "
+                "If a setup.skills entry has a nonblank name, copy that exact name "
+                "unchanged and fill only missing description text for that slot. "
+                "Invent a distinct setting-appropriate skill name only when the "
+                "setup skill name is blank/default/placeholder. Preserve each "
                 "slot's level exactly. Skill names should be generalized gameplay "
                 "capabilities useful across many checks, not one-off lore phrases, "
                 "proper nouns, tiny item-maintenance tasks, or narrow setting trivia. "
@@ -531,6 +561,16 @@ def build_new_game_setup_packet(
                 "a setup starter-item entry and -1 only for extra invented items."
             ),
         },
+        "starting_task_contract": {
+            "mode": clean_setup["starting_task"]["mode"],
+            "task": clean_setup["starting_task"]["task"],
+            "rules": (
+                "none means no requested opening quest; ai means invent a fitting "
+                "opening quest; custom means use provided fields and have the AI "
+                "fill blanks from the rest of the setup."
+            ),
+        },
+        "turn_prompt": _turn_prompt_for_setup(clean_setup),
         "character_generation_guidance": _character_generation_guidance(clean_setup),
         "genre_generation_guidance": _genre_generation_guidance(clean_setup),
         "audio": {
@@ -586,7 +626,8 @@ def fallback_introductory_message(setup: dict[str, Any]) -> str:
         f"{character_name} begins in {location}, at the first quiet edge of a new "
         f"{style}. The immediate scene is ready, but the full AI-generated world "
         "introduction could not be created because Gemini is not configured yet.\n\n"
-        "What do you do now?"
+        +
+        _turn_prompt_for_setup(clean_setup)
     )
 
 
@@ -623,16 +664,76 @@ def _fields_requiring_ai_invention(clean_setup: dict[str, Any]) -> list[str]:
     if not clean_setup["world_context"]:
         invention_fields.append("world context, factions, religions, and locations")
 
-    if _has_ai_skill_placeholders(clean_setup["skills"]):
-        invention_fields.append("distinct starting skill identities")
+    if any(not str(skill.get("name", "")).strip() for skill in clean_setup["skills"]):
+        invention_fields.append("blank starting skill names")
+
+    if any(
+        not str(skill.get("description", "")).strip()
+        for skill in clean_setup["skills"]
+    ):
+        invention_fields.append("blank starting skill descriptions")
 
     if any(bool(item.get("requires_ai_invention")) for item in clean_setup["starter_items"]):
         invention_fields.append("starter inventory based on character and skills")
+
+    if clean_setup["starting_task"]["mode"] == "ai":
+        invention_fields.append("opening quest/task")
+    elif clean_setup["starting_task"]["mode"] == "custom" and clean_setup[
+        "starting_task"
+    ]["task"].get("requires_ai_invention"):
+        invention_fields.append("blank starting quest/task fields")
 
     if not clean_setup["currency_denominations"]:
         invention_fields.append("economy and currency denominations")
 
     return invention_fields
+
+
+def _normalize_start_location_mode(raw_setup: dict[str, Any]) -> str:
+    """Returns how strictly the AI should treat the requested start location."""
+
+    raw_mode = (
+        raw_setup.get("start_location_mode")
+        or raw_setup.get("starting_location_mode")
+        or raw_setup.get("start_location_kind")
+        or "suggestion"
+    )
+    mode = _clean_text(raw_mode).casefold().replace("-", "_").replace(" ", "_")
+
+    if mode in {"exact", "exactly_this", "fixed", "locked", "required"}:
+        return "exact"
+
+    return "suggestion"
+
+
+def _turn_prompt_for_setup(clean_setup: dict[str, Any]) -> str:
+    """Builds the visible end-of-turn prompt for the narration preferences."""
+
+    narration = clean_setup.get("narration", {})
+    character = clean_setup.get("character", {})
+    tense = str(narration.get("tense", "present"))
+    style = str(narration.get("style", "second_person_limited"))
+    character_name = _clean_text(character.get("name")) or "the player character"
+
+    if tense == "past":
+        if style.startswith("first_person"):
+            return "What did I do next?"
+        if style.startswith("third_person"):
+            return f"What did {character_name} do next?"
+        return "What did you do next?"
+
+    if tense == "future":
+        if style.startswith("first_person"):
+            return "What will I do next?"
+        if style.startswith("third_person"):
+            return f"What will {character_name} do next?"
+        return "What will you do next?"
+
+    if style.startswith("first_person"):
+        return "What do I do now?"
+    if style.startswith("third_person"):
+        return f"What does {character_name} do now?"
+    return "What do you do now?"
 
 
 def _character_generation_guidance(clean_setup: dict[str, Any]) -> dict[str, str]:
@@ -799,6 +900,63 @@ def _normalize_starter_items(raw_items: Any) -> list[dict[str, Any]]:
         )
 
     return items
+
+
+def _normalize_starting_task(raw_task_setup: Any) -> dict[str, Any]:
+    """Normalizes requested starting active-task setup."""
+
+    if not isinstance(raw_task_setup, dict):
+        raw_task_setup = {}
+
+    mode = _clean_text(
+        raw_task_setup.get("mode", raw_task_setup.get("task_mode", "none"))
+    ).casefold()
+    if mode not in {"none", "ai", "custom"}:
+        mode = "none"
+
+    raw_task = raw_task_setup.get("task", raw_task_setup)
+    if not isinstance(raw_task, dict):
+        raw_task = {}
+
+    task = {
+        "name": _clean_text(raw_task.get("name", raw_task.get("title"))),
+        "category": _clean_text(raw_task.get("category")) or "Quest",
+        "description": _clean_text(raw_task.get("description", raw_task.get("details"))),
+        "requester": _clean_text(raw_task.get("requester", raw_task.get("contact"))),
+        "location": _clean_text(raw_task.get("location")),
+        "reward": _clean_text(raw_task.get("reward")),
+        "due_date": _clean_text(raw_task.get("due_date")),
+        "due_elapsed_minutes": _safe_int(raw_task.get("due_elapsed_minutes"), -1),
+    }
+
+    if mode != "custom":
+        return {
+            "mode": mode,
+            "task": {
+                "name": "",
+                "category": "Quest",
+                "description": "",
+                "requester": "",
+                "location": "",
+                "reward": "",
+                "due_date": "",
+                "due_elapsed_minutes": -1,
+                "requires_ai_invention": mode == "ai",
+            },
+        }
+
+    task["requires_ai_invention"] = any(
+        not str(task[field]).strip()
+        for field in [
+            "name",
+            "description",
+            "requester",
+            "location",
+            "reward",
+            "due_date",
+        ]
+    )
+    return {"mode": mode, "task": task}
 
 
 def normalize_economy_examples(raw_examples: Any) -> list[dict[str, Any]]:

@@ -774,8 +774,9 @@ class AiContextBuilder:
             "response_contract": {
                 "response": (
                     "Required string. Player-facing narration only. Do not include "
-                    "'What do you do now?' or any end-of-turn prompt; the Python "
-                    "application displays that separately. Resolve the player's "
+                    "'What do you do now?' or any tense/person-specific "
+                    "end-of-turn prompt; the Python application displays that "
+                    "separately based on narration tense and style. Resolve the player's "
                     "submitted action instead of ending by restating the action, "
                     "intent, or search target. Do not invent player-character "
                     "dialogue or decisions. Light Markdown is allowed for readable "
@@ -919,7 +920,8 @@ class AiContextBuilder:
                     "details out of narration and every player-visible field. Set "
                     "status to revealed when the player learns the truth and also "
                     "write the newly player-known fact through the appropriate "
-                    "public NPC, World Lore, Location, task, flag, or other event. "
+                    "public NPC, Location, task, flag, item/material, or other "
+                    "supported event. "
                     "Set status to retired when the record is no longer true or useful."
                 ),
                 "currency_transactions": (
@@ -973,7 +975,6 @@ class AiContextBuilder:
                     "FlagSetEvent",
                     "LocationUpsertedEvent",
                     "TravelModeChangedEvent",
-                    "WorldLoreUpsertedEvent",
                     "ActiveTaskUpsertedEvent",
                     "ActiveTaskCompletedEvent",
                     "SpellLearnedEvent",

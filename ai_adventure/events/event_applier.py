@@ -248,9 +248,6 @@ class EventApplier:
             if event_type == "CurrencyDefinedEvent":
                 return self._apply_currency_defined(event_type, payload)
 
-            if event_type == "WorldLoreUpsertedEvent":
-                return self._apply_world_lore_event(event_type, payload)
-
             if event_type == "ActiveTaskUpsertedEvent":
                 return self._apply_active_task_upserted(event_type, payload)
 
@@ -1245,26 +1242,6 @@ class EventApplier:
             f"Defined currency denomination: {name}.",
             payload,
         )
-
-    def _apply_world_lore_event(
-        self,
-        event_type: str,
-        payload: dict[str, Any],
-    ) -> AppliedEventResult:
-        """Applies one keyed player-facing world-lore upsert."""
-
-        section = _first_text(payload, "section")
-        key = _first_text(payload, "key")
-        text = _first_text(payload, "text")
-
-        if not section or not key or not text:
-            return _invalid(event_type, payload, "World lore section, key, and text are required.")
-
-        self.repository.change_world_lore_entry(section, key, text)
-
-        label = f"{section}: {key}: {text}"
-        self.repository.append_history("world", label)
-        return AppliedEventResult(event_type, "applied", "Recorded world lore.", payload)
 
     def _apply_active_task_upserted(
         self,
