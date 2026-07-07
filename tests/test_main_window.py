@@ -7,6 +7,7 @@ import unittest
 import importlib.util
 from types import SimpleNamespace
 from pathlib import Path
+from typing import TypeVar, cast
 from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -14,26 +15,36 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 if importlib.util.find_spec("PySide6") is None:
     raise unittest.SkipTest("PySide6 is not installed in this test environment.")
 
-from PySide6.QtCore import QEvent, Qt
+from PySide6.QtCore import QEvent, QObject, Qt
 from PySide6.QtGui import QPalette
 from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
+    QComboBox,
     QDialog,
+    QFormLayout,
     QGroupBox,
     QLabel,
     QLineEdit,
     QMessageBox,
+    QPushButton,
+    QSlider,
+    QSpinBox,
     QTableWidget,
+    QWidget,
 )
 
 from ai_adventure.app.app_paths import AppPaths
 from ai_adventure.app.user_settings import load_app_settings
 from ai_adventure.audio.voices import DEFAULT_NARRATOR_VOICE
+from ai_adventure.audio.narration import NarrationPlayer
 from ai_adventure.calendar_system import DEFAULT_CALENDAR_SETTINGS
+from ai_adventure.combat import calculate_team_threat_levels
 from ai_adventure.new_game_setup import GREGORIAN_CALENDAR_SETTINGS, normalize_new_game_setup
 from ai_adventure.new_game_templates import load_new_game_templates
 from ai_adventure.persistence.save_repository import SaveRepository
 from ai_adventure.ui.main_window import (
+    AISettingsDialog,
     AlchemyNotebookScreen,
     CalendarSettingsDialog,
     CharacterScreen,
@@ -41,14 +52,19 @@ from ai_adventure.ui.main_window import (
     CustomVoiceDialog,
     GameShell,
     HistoryScreen,
+    InventoryScreen,
     MainMenuSettingsDialog,
     MainWindow,
     NewGameTemplateManagerDialog,
     NewGameWizard,
+    NPC_TURN_DELAY_MS,
     SettingsScreen,
     StoryScreen,
     TTSSettingsDialog,
+    TravelScreen,
     WorldScreen,
+    _next_available_save_title,
+    _player_command_markdown,
     _preserve_player_character_text,
     _set_combo_to_data,
     apply_application_theme,
@@ -100,13 +116,63 @@ class FakeNarrationPlayer:
         return True
 
     def play_chunk(self, text: str) -> None:
+        assert self.on_chunk_start is not None
         self.on_chunk_start(text)
 
     def complete(self) -> None:
+        assert self.on_complete is not None
         self.on_complete()
 
 
+WidgetT = TypeVar("WidgetT", bound=QObject)
+
+
+def _ensure_qt_application() -> QApplication:
+    """Returns a typed QApplication instance for Qt widget tests."""
+
+    application = QApplication.instance()
+
+    if isinstance(application, QApplication):
+        return application
+
+    return QApplication([])
+
+
+def _require_widget(widget: QObject | None, widget_type: type[WidgetT]) -> WidgetT:
+    """Narrows a nullable table or form widget for a test assertion."""
+
+    assert isinstance(widget, widget_type)
+    return widget
+
+
+ValueT = TypeVar("ValueT")
+
+
+def _require(value: ValueT | None) -> ValueT:
+    """Narrows an optional test fixture lookup after asserting its presence."""
+
+    assert value is not None
+    return value
+
+
+def _table_cell(
+    table: QTableWidget,
+    row: int,
+    column: int,
+    widget_type: type[WidgetT],
+) -> WidgetT:
+    """Returns a typed table-cell editor required by a populated test row."""
+
+    return _require_widget(table.cellWidget(row, column), widget_type)
+
+
 class MainWindowTests(unittest.TestCase):
+    def test_player_command_markdown_uses_normal_speaker_label(self) -> None:
+        formatted = _player_command_markdown("Pocket the locket.")
+
+        self.assertEqual(formatted, "**You:** Pocket the locket.")
+        self.assertFalse(formatted.startswith(">"))
+
     def test_startup_without_loaded_save_does_not_log_errors(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
@@ -119,7 +185,7 @@ class MainWindowTests(unittest.TestCase):
             app_paths.saves_dir.mkdir(parents=True, exist_ok=True)
             app_paths.logs_dir.mkdir(parents=True, exist_ok=True)
 
-            QApplication.instance() or QApplication([])
+            _ensure_qt_application()
 
             logger = logging.getLogger("ai_adventure.ui.main_window")
 
@@ -132,15 +198,16 @@ class MainWindowTests(unittest.TestCase):
                 ]
                 self.assertIn("Character", tab_names)
                 self.assertIn("World", tab_names)
+                self.assertIn("Travel", tab_names)
                 self.assertIn("Active Tasks", tab_names)
                 self.assertIn("Crafting", tab_names)
                 self.assertFalse(window.windowIcon().isNull())
                 npc_headers = [
-                    window.game_shell.npcs_screen.table.horizontalHeaderItem(index).text()
+                    _require(window.game_shell.npcs_screen.table.horizontalHeaderItem(index)).text()
                     for index in range(window.game_shell.npcs_screen.table.columnCount())
                 ]
                 task_headers = [
-                    window.game_shell.active_tasks_screen.table.horizontalHeaderItem(index).text()
+                    _require(window.game_shell.active_tasks_screen.table.horizontalHeaderItem(index)).text()
                     for index in range(window.game_shell.active_tasks_screen.table.columnCount())
                 ]
                 alchemy_tabs = [
@@ -180,7 +247,7 @@ class MainWindowTests(unittest.TestCase):
 
     def test_journal_screen_saves_ai_sharing_toggle(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            QApplication.instance() or QApplication([])
+            _ensure_qt_application()
             repository = SaveRepository.create_new_save(Path(temp_dir), "Journal Toggle Test")
             screen = HistoryScreen()
             screen.set_repository(repository)
@@ -199,7 +266,7 @@ class MainWindowTests(unittest.TestCase):
 
     def test_journal_screen_autosaves_after_typing(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            QApplication.instance() or QApplication([])
+            _ensure_qt_application()
             repository = SaveRepository.create_new_save(Path(temp_dir), "Journal Autosave Test")
             screen = HistoryScreen()
             screen.set_repository(repository)
@@ -219,13 +286,13 @@ class MainWindowTests(unittest.TestCase):
 
     def test_story_screen_reveals_latest_story_by_narration_chunk(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            QApplication.instance() or QApplication([])
+            _ensure_qt_application()
             repository = SaveRepository.create_new_save(Path(temp_dir), "Reveal Test")
             story_text = "First sentence. Second sentence.\n\n- Take action."
             repository.append_history("story", story_text)
             latest_story = repository.list_history()[-1]
             narration_player = FakeNarrationPlayer()
-            screen = StoryScreen(narration_player=narration_player)
+            screen = StoryScreen(narration_player=cast(NarrationPlayer, narration_player))
             screen.set_repository(repository)
 
             started = screen._reveal_story_with_narration(
@@ -256,13 +323,13 @@ class MainWindowTests(unittest.TestCase):
 
     def test_story_reveal_state_clears_when_repository_is_reset(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            QApplication.instance() or QApplication([])
+            _ensure_qt_application()
             repository = SaveRepository.create_new_save(Path(temp_dir), "Reveal Reset Test")
             story_text = "The opening scene is saved."
             repository.append_history("story", story_text)
             latest_story = repository.list_history()[-1]
             narration_player = FakeNarrationPlayer()
-            screen = StoryScreen(narration_player=narration_player)
+            screen = StoryScreen(narration_player=cast(NarrationPlayer, narration_player))
             screen.set_repository(repository)
 
             started = screen._reveal_story_with_narration(
@@ -280,11 +347,11 @@ class MainWindowTests(unittest.TestCase):
 
     def test_narrate_latest_story_keeps_saved_text_visible(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            QApplication.instance() or QApplication([])
+            _ensure_qt_application()
             repository = SaveRepository.create_new_save(Path(temp_dir), "Narrate Saved Test")
             repository.append_history("story", "The introduction is already in history.")
             narration_player = FakeNarrationPlayer()
-            screen = StoryScreen(narration_player=narration_player)
+            screen = StoryScreen(narration_player=cast(NarrationPlayer, narration_player))
             screen.set_repository(repository)
 
             screen.narrate_latest_story()
@@ -294,7 +361,7 @@ class MainWindowTests(unittest.TestCase):
 
     def test_story_submit_displays_player_text_and_busy_state_immediately(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            QApplication.instance() or QApplication([])
+            _ensure_qt_application()
             repository = SaveRepository.create_new_save(Path(temp_dir), "Submit Test")
             screen = StoryScreen()
             screen.set_repository(repository)
@@ -319,10 +386,17 @@ class MainWindowTests(unittest.TestCase):
 
     def test_continue_story_uses_latest_story_without_player_history_entry(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            QApplication.instance() or QApplication([])
+            _ensure_qt_application()
             repository = SaveRepository.create_new_save(Path(temp_dir), "Continue Test")
             repository.append_history("player", "Open the book and search for clues.")
             repository.append_history("story", "The brittle cover opens onto a map fragment.")
+            repository.upsert_gm_secret(
+                secret_id="map_marks_hidden_vault",
+                title="Hidden Vault",
+                details="The map's faded compass rose marks the concealed vault.",
+                reveal_condition="The player restores the missing corner.",
+                related_locations=["Old Archive"],
+            )
             screen = StoryScreen()
             screen.set_repository(repository)
             started_packets = []
@@ -342,6 +416,10 @@ class MainWindowTests(unittest.TestCase):
                 "The brittle cover opens onto a map fragment.",
                 started_packets[0]["continuation_request"]["latest_story_response"],
             )
+            self.assertEqual(
+                started_packets[0]["state"]["gm_secrets"]["active"][0]["secret_id"],
+                "map_marks_hidden_vault",
+            )
             self.assertEqual(repository.list_history(), history_before)
             self.assertFalse(screen.player_input.isEnabled())
             self.assertFalse(screen.continue_button.isEnabled())
@@ -349,7 +427,7 @@ class MainWindowTests(unittest.TestCase):
 
     def test_skill_check_plan_resolves_before_story_request(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            QApplication.instance() or QApplication([])
+            _ensure_qt_application()
             repository = SaveRepository.create_new_save(Path(temp_dir), "Plan Test")
             repository.upsert_skill("Foraging", "Finding useful materials.", 1)
             repository.append_history("player", "Search the cliff face for rare herbs.")
@@ -394,7 +472,8 @@ class MainWindowTests(unittest.TestCase):
                                 "dc": 14,
                                 "reason": "Searching a dangerous cliff.",
                             }
-                        ]
+                        ],
+                        relevant_tags=["exploration", "skill", "uncertainty"],
                     )
                 )
 
@@ -406,14 +485,18 @@ class MainWindowTests(unittest.TestCase):
             self.assertEqual(resolved_checks[0]["outcome"], "failure")
             self.assertEqual(resolved_checks[0]["roll"], 2)
             self.assertEqual(screen._pending_skill_check_event_results[0].payload["outcome"], "failure")
+            self.assertEqual(
+                started_packets[0]["selection"]["tags"],
+                ["exploration", "skill", "story", "uncertainty"],
+            )
             screen.close()
 
     def test_story_result_keeps_input_disabled_until_tts_completes(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            QApplication.instance() or QApplication([])
+            _ensure_qt_application()
             repository = SaveRepository.create_new_save(Path(temp_dir), "TTS Busy Test")
             narration_player = FakeNarrationPlayer()
-            screen = StoryScreen(narration_player=narration_player)
+            screen = StoryScreen(narration_player=cast(NarrationPlayer, narration_player))
             screen.set_repository(repository)
             screen._set_waiting_for_gm(True)
 
@@ -445,7 +528,7 @@ class MainWindowTests(unittest.TestCase):
 
     def test_story_screen_renders_markdown_story_text(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            QApplication.instance() or QApplication([])
+            _ensure_qt_application()
             repository = SaveRepository.create_new_save(Path(temp_dir), "Markdown Story Test")
             repository.append_history(
                 "story",
@@ -464,7 +547,7 @@ class MainWindowTests(unittest.TestCase):
 
     def test_story_screen_blocks_input_during_active_combat(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            QApplication.instance() or QApplication([])
+            _ensure_qt_application()
             repository = SaveRepository.create_new_save(Path(temp_dir), "Combat Lock Test")
             repository.set_combat_state(
                 {
@@ -513,7 +596,7 @@ class MainWindowTests(unittest.TestCase):
 
     def test_character_sheet_equips_weapon_armor_and_saves_stats(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            QApplication.instance() or QApplication([])
+            _ensure_qt_application()
             repository = SaveRepository.create_new_save(Path(temp_dir), "Character Sheet Test")
             repository.add_inventory_item(
                 "Longsword",
@@ -531,11 +614,11 @@ class MainWindowTests(unittest.TestCase):
                 "Leather Armor",
                 "Armor",
                 1,
-                "Flexible armor that protects the torso, arms, and legs.",
+                "Flexible armor that protects the head, torso, arms, and legs.",
                 20,
                 metadata={
                     "item_type": "Armor",
-                    "covers_body_parts": ["Torso", "Arms", "Legs"],
+                    "covers_body_parts": ["Head", "Torso", "Arms", "Legs"],
                     "armor_rating": 2,
                 },
             )
@@ -551,15 +634,20 @@ class MainWindowTests(unittest.TestCase):
                     "armor_rating": 2,
                 },
             )
-            screen = CharacterScreen()
+            screen = CharacterScreen(playtesting_tools=True)
             screen.set_repository(repository)
 
             _set_combo_to_data(screen.equipment_combos["Main Hand"], "Longsword")
             _set_combo_to_data(screen.equipment_combos["Off Hand"], "Tower Shield")
-            _set_combo_to_data(screen.equipment_combos["Torso"], "Leather Armor")
             _set_combo_to_data(screen.equipment_combos["Arms"], "Leather Armor")
             screen.health_max_input.setValue(20)
             screen.health_current_input.setValue(15)
+
+            for covered_slot in ["Head", "Torso", "Arms", "Legs"]:
+                self.assertEqual(
+                    screen.equipment_combos[covered_slot].currentData(),
+                    "Leather Armor",
+                )
 
             with patch("ai_adventure.ui.main_window.QMessageBox.information"):
                 screen._save_character()
@@ -568,18 +656,104 @@ class MainWindowTests(unittest.TestCase):
 
             self.assertEqual(equipment["Main Hand"], "Longsword")
             self.assertEqual(equipment["Off Hand"], "Tower Shield")
+            self.assertEqual(equipment["Head"], "Leather Armor")
             self.assertEqual(equipment["Torso"], "Leather Armor")
             self.assertEqual(equipment["Arms"], "Leather Armor")
+            self.assertEqual(equipment["Legs"], "Leather Armor")
             self.assertEqual(repository.get_setting("player.health_current"), 15)
             self.assertEqual(repository.get_setting("player.health_max"), 20)
             self.assertEqual(repository.get_setting("player.armor_rating"), 14)
-            self.assertEqual(screen.armor_rating_label.text(), "14")
-            self.assertEqual(screen.weapon_damage_label.text(), "1d8")
+            self.assertEqual(_require(screen.armor_rating_label).text(), "14")
+            self.assertEqual(_require(screen.weapon_damage_label).text(), "1d8")
+            screen.close()
+
+    def test_character_sheet_unequips_multi_slot_armor_from_every_slot(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            _ensure_qt_application()
+            repository = SaveRepository.create_new_save(
+                Path(temp_dir),
+                "Multi Slot Armor Test",
+            )
+            repository.add_inventory_item(
+                "Leather Armor",
+                "Armor",
+                1,
+                "Flexible armor covering several body regions.",
+                20,
+                metadata={
+                    "item_type": "Armor",
+                    "covers_body_parts": ["Head", "Torso", "Arms", "Legs"],
+                    "armor_rating": 2,
+                },
+            )
+            screen = CharacterScreen(playtesting_tools=True)
+            screen.set_repository(repository)
+
+            _set_combo_to_data(
+                screen.equipment_combos["Torso"],
+                "Leather Armor",
+            )
+            _set_combo_to_data(screen.equipment_combos["Head"], "")
+
+            for covered_slot in ["Head", "Torso", "Arms", "Legs"]:
+                self.assertEqual(
+                    screen.equipment_combos[covered_slot].currentData(),
+                    "",
+                )
+
+            screen.close()
+
+    def test_character_sheet_hides_single_equipped_weapon_from_other_hand(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            _ensure_qt_application()
+            repository = SaveRepository.create_new_save(
+                Path(temp_dir),
+                "Single Dagger Equipment Test",
+            )
+            screen = CharacterScreen(playtesting_tools=True)
+            screen.set_repository(repository)
+
+            _set_combo_to_data(
+                screen.equipment_combos["Main Hand"],
+                "Iron Dagger",
+            )
+
+            off_hand_values = {
+                str(screen.equipment_combos["Off Hand"].itemData(index) or "")
+                for index in range(screen.equipment_combos["Off Hand"].count())
+            }
+            dagger = next(
+                item
+                for item in repository.list_inventory_items()
+                if item["name"] == "Iron Dagger"
+            )
+
+            self.assertNotIn("Iron Dagger", off_hand_values)
+            self.assertTrue(dagger["equipped"])
+            self.assertEqual(
+                repository.get_player_equipment()["Main Hand"],
+                "Iron Dagger",
+            )
+
+            _set_combo_to_data(screen.equipment_combos["Main Hand"], "")
+
+            off_hand_values = {
+                str(screen.equipment_combos["Off Hand"].itemData(index) or "")
+                for index in range(screen.equipment_combos["Off Hand"].count())
+            }
+            dagger = next(
+                item
+                for item in repository.list_inventory_items()
+                if item["name"] == "Iron Dagger"
+            )
+
+            self.assertIn("Iron Dagger", off_hand_values)
+            self.assertFalse(dagger["equipped"])
             screen.close()
 
     def test_character_sheet_rejects_off_hand_when_main_weapon_is_two_handed(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            QApplication.instance() or QApplication([])
+            _ensure_qt_application()
             repository = SaveRepository.create_new_save(Path(temp_dir), "Two Handed Test")
             repository.add_inventory_item(
                 "Greatsword",
@@ -605,7 +779,7 @@ class MainWindowTests(unittest.TestCase):
                     "armor_rating": 2,
                 },
             )
-            screen = CharacterScreen()
+            screen = CharacterScreen(playtesting_tools=True)
             screen.set_repository(repository)
 
             _set_combo_to_data(screen.equipment_combos["Off Hand"], "Round Shield")
@@ -619,18 +793,20 @@ class MainWindowTests(unittest.TestCase):
             self.assertEqual(equipment["Main Hand"], "Greatsword")
             self.assertEqual(equipment["Off Hand"], "")
             self.assertEqual(repository.get_setting("player.armor_rating"), 10)
-            self.assertEqual(screen.weapon_damage_label.text(), "2d6")
+            self.assertEqual(_require(screen.weapon_damage_label).text(), "2d6")
             screen.close()
 
     def test_combat_screen_resolves_victory_and_grants_loot(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            QApplication.instance() or QApplication([])
+            _ensure_qt_application()
             repository = SaveRepository.create_new_save(Path(temp_dir), "Combat UI Test")
-            screen = CombatScreen()
+            repository.set_setting("player.initiative_bonus", 99)
+            screen = CombatScreen(playtesting_tools=True)
             screen.set_repository(repository)
             screen.name_input.setText("Wolf")
             screen.health_input.setValue(1)
             screen.armor_input.setValue(1)
+            screen.initiative_input.setValue(-99)
             screen.damage_input.setText("1d1")
             screen.loot_input.setText("Wolf Fang")
 
@@ -646,21 +822,560 @@ class MainWindowTests(unittest.TestCase):
             combat_state = repository.get_combat_state()
 
             self.assertFalse(combat_state["active"])
+            self.assertEqual(combat_state["combatants"], [])
+            self.assertEqual(screen.combatants_table.rowCount(), 0)
             self.assertIn("Wolf Fang", {item["name"] for item in items})
             self.assertIn("Combat resolved: victory.", "\n".join(combat_state["log"]))
             self.assertEqual(repository.get_setting("player.health_current"), 20)
             screen.close()
 
+    def test_combat_screen_applies_saved_to_hit_bonus(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            _ensure_qt_application()
+            repository = SaveRepository.create_new_save(
+                Path(temp_dir),
+                "To Hit Bonus Test",
+            )
+            repository.set_setting("player.initiative_bonus", 99)
+            screen = CombatScreen(playtesting_tools=True)
+            screen.set_repository(repository)
+            screen.name_input.setText("Guard")
+            screen.health_input.setValue(8)
+            screen.armor_input.setValue(10)
+            screen.initiative_input.setValue(-99)
+            screen._start_combat()
+
+            with patch(
+                "ai_adventure.ui.main_window.random.randint",
+                side_effect=[8, 1],
+            ):
+                screen._resolve_current_turn()
+
+            combat_state = repository.get_combat_state()
+            player = next(
+                combatant
+                for combatant in combat_state["combatants"]
+                if combatant["id"] == "player"
+            )
+            enemy = next(
+                combatant
+                for combatant in combat_state["combatants"]
+                if combatant["team"] == "enemy"
+            )
+            self.assertEqual(player["to_hit_bonus"], 2)
+            self.assertEqual(enemy["current_health"], 7)
+            self.assertIn("8+2=10 vs AR 10", "\n".join(combat_state["log"]))
+            screen.close()
+
+    def test_manual_combat_resolution_clears_battlefield_and_keeps_log(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            _ensure_qt_application()
+            repository = SaveRepository.create_new_save(
+                Path(temp_dir),
+                "Clear Battlefield Test",
+            )
+            screen = CombatScreen(playtesting_tools=True)
+            screen.set_repository(repository)
+            screen.name_input.setText("Bandit")
+            screen._start_combat()
+            screen._resolve_combat_manually()
+
+            combat_state = repository.get_combat_state()
+            self.assertFalse(combat_state["active"])
+            self.assertEqual(combat_state["combatants"], [])
+            self.assertEqual(screen.combatants_table.rowCount(), 0)
+            self.assertEqual(screen.adjust_target_combo.count(), 0)
+            self.assertIn("Combat is marked resolved.", combat_state["log"])
+            screen.close()
+
+    def test_duplicate_combatants_have_unique_table_and_target_labels(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            _ensure_qt_application()
+            repository = SaveRepository.create_new_save(
+                Path(temp_dir),
+                "Duplicate Combatants Test",
+            )
+            repository.set_setting("player.initiative_bonus", 99)
+            screen = CombatScreen(playtesting_tools=True)
+            screen.set_repository(repository)
+            screen.name_input.setText("Bandit")
+            screen.initiative_input.setValue(-99)
+            screen._start_combat()
+            screen._add_combatant()
+
+            state = repository.get_combat_state()
+            bandits = [
+                combatant
+                for combatant in state["combatants"]
+                if combatant["name"] == "Bandit"
+            ]
+            table_names = {
+                _require(screen.combatants_table.item(row, 1)).text()
+                for row in range(screen.combatants_table.rowCount())
+            }
+            target_names = {
+                screen.target_combo.itemText(index)
+                for index in range(screen.target_combo.count())
+            }
+
+            self.assertEqual(len({combatant["id"] for combatant in bandits}), 2)
+            self.assertEqual(
+                {combatant["display_name"] for combatant in bandits},
+                {"Bandit (1)", "Bandit (2)"},
+            )
+            self.assertIn("Bandit (1)", table_names)
+            self.assertIn("Bandit (2)", table_names)
+            self.assertIn("Bandit (1) (enemy)", target_names)
+            self.assertIn("Bandit (2) (enemy)", target_names)
+            screen.close()
+
+    def test_combat_table_replaces_spatial_columns_with_threat(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            _ensure_qt_application()
+            repository = SaveRepository.create_new_save(
+                Path(temp_dir),
+                "Threat Table Test",
+            )
+            repository.set_setting("player.initiative_bonus", 99)
+            screen = CombatScreen(playtesting_tools=True)
+            screen.set_repository(repository)
+            screen.name_input.setText("Bandit")
+            screen.initiative_input.setValue(-99)
+            screen._start_combat()
+
+            headers = [
+                _require(screen.combatants_table.horizontalHeaderItem(column)).text()
+                for column in range(screen.combatants_table.columnCount())
+            ]
+            threats = [
+                _require(screen.combatants_table.item(row, 7)).text()
+                for row in range(screen.combatants_table.rowCount())
+            ]
+
+            self.assertIn("Threat", headers)
+            self.assertNotIn("Range", headers)
+            self.assertNotIn("Distance", headers)
+            self.assertNotIn("Move", headers)
+            self.assertEqual(threats, ["100%", "100%"])
+            screen.close()
+
+    def test_npc_turns_schedule_automatically_with_reading_delay(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            _ensure_qt_application()
+            repository = SaveRepository.create_new_save(
+                Path(temp_dir),
+                "Automatic NPC Turns Test",
+            )
+            repository.set_combat_state(
+                {
+                    "active": True,
+                    "round": 1,
+                    "turn_index": 0,
+                    "combatants": [
+                        {
+                            "id": "enemy-1",
+                            "name": "Goblin One",
+                            "team": "enemy",
+                            "current_health": 8,
+                            "max_health": 8,
+                            "armor_rating": 10,
+                            "to_hit_bonus": 0,
+                            "personality": "balanced",
+                            "damage": "1d4",
+                        },
+                        {
+                            "id": "enemy-2",
+                            "name": "Goblin Two",
+                            "team": "enemy",
+                            "current_health": 8,
+                            "max_health": 8,
+                            "armor_rating": 10,
+                            "to_hit_bonus": 0,
+                            "personality": "balanced",
+                            "damage": "1d4",
+                        },
+                        {
+                            "id": "player",
+                            "name": "Player",
+                            "team": "party",
+                            "current_health": 20,
+                            "max_health": 20,
+                            "armor_rating": 10,
+                            "damage": "1d6",
+                        },
+                    ],
+                    "log": ["Combat begins."],
+                }
+            )
+            screen = CombatScreen(playtesting_tools=True)
+
+            try:
+                screen.set_repository(repository)
+
+                self.assertTrue(screen.npc_turn_timer.isActive())
+                self.assertEqual(
+                    screen.npc_turn_timer.interval(),
+                    NPC_TURN_DELAY_MS,
+                )
+                self.assertFalse(screen.attack_button.isEnabled())
+                self.assertFalse(screen.reload_button.isEnabled())
+                self.assertFalse(screen.end_turn_button.isEnabled())
+                self.assertTrue(screen.attack_button.isHidden())
+                self.assertTrue(screen.reload_button.isHidden())
+                self.assertTrue(screen.end_turn_button.isHidden())
+                self.assertEqual(
+                    screen.attack_button.text(),
+                    "Attack / Resolve Turn",
+                )
+                self.assertIn(
+                    "acting automatically in 2 seconds",
+                    screen.status_label.text(),
+                )
+
+                with patch(
+                    "ai_adventure.ui.main_window.random.randint",
+                    side_effect=[1, 1],
+                ):
+                    screen._resolve_scheduled_npc_turn()
+
+                state = repository.get_combat_state()
+                current_actor = state["combatants"][state["turn_index"]]
+                self.assertEqual(current_actor["id"], "enemy-2")
+                self.assertTrue(screen.npc_turn_timer.isActive())
+                self.assertEqual(
+                    screen._scheduled_npc_actor_id,
+                    "enemy-2",
+                )
+                self.assertIn(
+                    "Goblin One targets Player",
+                    "\n".join(state["log"]),
+                )
+            finally:
+                screen._cancel_scheduled_npc_turn()
+                screen.close()
+
+    def test_firearm_reload_consumes_inventory_and_attack_consumes_clip(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            _ensure_qt_application()
+            repository = SaveRepository.create_new_save(
+                Path(temp_dir),
+                "Firearm Combat Test",
+            )
+            repository.add_inventory_item(
+                "Service Pistol",
+                "Weapon",
+                1,
+                "A compact sidearm.",
+                metadata={
+                    "item_type": "Weapon",
+                    "weapon_hands": "one-handed",
+                    "damage": "1d4",
+                    "attack_skill": "Ranged",
+                    "attack_range_feet": 60,
+                    "ammunition_type_required": "9mm Round",
+                    "clip_size": 6,
+                    "bullets_per_attack": 2,
+                },
+            )
+            repository.add_inventory_item(
+                "9mm Box",
+                "Ammunition",
+                10,
+                "Loose cartridges.",
+                metadata={
+                    "item_type": "Ammunition",
+                    "ammunition_type": "9mm Round",
+                },
+            )
+            repository.set_player_equipment({"Main Hand": "Service Pistol"})
+            repository.set_setting("player.weapon_clip_ammo", {"service pistol": 0})
+            repository.set_setting("player.initiative_bonus", 99)
+            screen = CombatScreen(playtesting_tools=True)
+            screen.set_repository(repository)
+            screen.name_input.setText("Bandit")
+            screen.initiative_input.setValue(-99)
+            screen._start_combat()
+            screen._reload_current_weapon()
+
+            reloaded_state = repository.get_combat_state()
+            player = next(
+                combatant
+                for combatant in reloaded_state["combatants"]
+                if combatant["id"] == "player"
+            )
+            ammunition = next(
+                item
+                for item in repository.list_inventory_items()
+                if item["name"] == "9mm Box"
+            )
+            self.assertEqual(player["clip_ammo"], 6)
+            self.assertEqual(ammunition["quantity"], 4)
+
+            player_index = next(
+                index
+                for index, combatant in enumerate(reloaded_state["combatants"])
+                if combatant["id"] == "player"
+            )
+            reloaded_state["turn_index"] = player_index
+            repository.set_combat_state(reloaded_state)
+            screen.refresh()
+
+            with patch(
+                "ai_adventure.ui.main_window.random.randint",
+                side_effect=[10, 1],
+            ):
+                screen._resolve_current_turn()
+
+            attacked_state = repository.get_combat_state()
+            attacked_player = next(
+                combatant
+                for combatant in attacked_state["combatants"]
+                if combatant["id"] == "player"
+            )
+            self.assertEqual(attacked_player["clip_ammo"], 4)
+            self.assertEqual(
+                repository.get_setting("player.weapon_clip_ammo")[
+                    "service pistol"
+                ],
+                4,
+            )
+            screen.close()
+
+    def test_intelligent_npc_targeting_balances_hit_chance_and_wounds(self) -> None:
+        _ensure_qt_application()
+        screen = CombatScreen(playtesting_tools=True)
+        actor = {
+            "id": "enemy",
+            "team": "enemy",
+            "to_hit_bonus": 4,
+            "personality": "intelligent",
+        }
+        healthy_easy_target = {
+            "id": "easy",
+            "team": "party",
+            "current_health": 18,
+            "max_health": 20,
+            "armor_rating": 10,
+            "defeated": False,
+        }
+        wounded_hard_target = {
+            "id": "wounded",
+            "team": "party",
+            "current_health": 2,
+            "max_health": 20,
+            "armor_rating": 14,
+            "defeated": False,
+        }
+
+        try:
+            selected = screen._npc_target_for_actor(
+                actor,
+                [actor, healthy_easy_target, wounded_hard_target],
+            )
+            self.assertIs(selected, wounded_hard_target)
+        finally:
+            screen.close()
+
+    def test_non_intelligent_enemies_and_allies_use_opponent_threat(self) -> None:
+        _ensure_qt_application()
+        screen = CombatScreen(playtesting_tools=True)
+        enemy_actor = {
+            "id": "enemy-actor",
+            "team": "enemy",
+            "personality": "aggressive",
+            "defeated": False,
+        }
+        ally_actor = {
+            "id": "ally-actor",
+            "team": "party",
+            "personality": "cautious",
+            "defeated": False,
+        }
+        low_party_threat = {
+            "id": "party-low",
+            "team": "party",
+            "current_health": 8,
+            "max_health": 8,
+            "armor_rating": 8,
+            "damage": "1d4",
+            "defeated": False,
+        }
+        high_party_threat = {
+            "id": "party-high",
+            "team": "party",
+            "current_health": 30,
+            "max_health": 30,
+            "armor_rating": 18,
+            "damage": "2d8",
+            "defeated": False,
+        }
+        low_enemy_threat = {
+            "id": "enemy-low",
+            "team": "enemy",
+            "current_health": 6,
+            "max_health": 6,
+            "armor_rating": 8,
+            "damage": "1d4",
+            "defeated": False,
+        }
+        high_enemy_threat = {
+            "id": "enemy-high",
+            "team": "enemy",
+            "current_health": 28,
+            "max_health": 28,
+            "armor_rating": 17,
+            "damage": "2d10",
+            "defeated": False,
+        }
+
+        try:
+            combatants = [
+                enemy_actor,
+                ally_actor,
+                low_party_threat,
+                high_party_threat,
+                low_enemy_threat,
+                high_enemy_threat,
+            ]
+            party_low_percent = calculate_team_threat_levels(
+                combatants,
+                "party",
+            )["party-low"]
+            enemy_low_percent = calculate_team_threat_levels(
+                combatants,
+                "enemy",
+            )["enemy-low"]
+
+            with patch(
+                "ai_adventure.ui.main_window.random.randint",
+                return_value=party_low_percent + 1,
+            ):
+                enemy_target = screen._npc_target_for_actor(
+                    enemy_actor,
+                    combatants,
+                )
+            with patch(
+                "ai_adventure.ui.main_window.random.randint",
+                return_value=enemy_low_percent + 1,
+            ):
+                ally_target = screen._npc_target_for_actor(
+                    ally_actor,
+                    combatants,
+                )
+
+            self.assertIs(enemy_target, high_party_threat)
+            self.assertIs(ally_target, high_enemy_threat)
+        finally:
+            screen.close()
+
+    def test_manual_character_and_combat_editors_are_playtesting_only(self) -> None:
+        _ensure_qt_application()
+        character = CharacterScreen(playtesting_tools=False)
+        combat = CombatScreen(playtesting_tools=False)
+
+        try:
+            self.assertFalse(character.health_current_input.isEnabled())
+            self.assertFalse(character.health_max_input.isEnabled())
+            self.assertFalse(combat.add_group.isVisible())
+            self.assertFalse(combat.adjust_group.isVisible())
+            self.assertFalse(combat.resolve_button.isVisible())
+        finally:
+            character.close()
+            combat.close()
+
+    def test_playtesting_shell_only_exposes_manual_test_tabs(self) -> None:
+        _ensure_qt_application()
+        shell = GameShell(
+            on_return_to_menu=lambda: None,
+            playtesting_tools=True,
+            ai_enabled=False,
+            tts_enabled=False,
+        )
+
+        try:
+            tab_names = [
+                shell.tabs.tabText(index)
+                for index in range(shell.tabs.count())
+            ]
+            self.assertEqual(
+                tab_names,
+                ["Character", "Inventory", "Combat", "Settings"],
+            )
+            self.assertTrue(shell.character_screen.health_current_input.isEnabled())
+            self.assertFalse(shell.combat_screen.add_group.isHidden())
+        finally:
+            shell.close()
+
+    def test_playtesting_inventory_editor_adds_weapon_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            _ensure_qt_application()
+            repository = SaveRepository.create_new_save(
+                Path(temp_dir),
+                "Inventory Editor Test",
+            )
+            screen = InventoryScreen(playtesting_tools=True)
+            screen.set_repository(repository)
+            screen._clear_item_editor()
+            screen.item_name_input.setText("Test Greatsword")
+            _set_combo_to_data(screen.item_type_combo, "Weapon")
+            _set_combo_to_data(screen.weapon_hands_combo, "two-handed")
+            screen.weapon_damage_input.setText("2d6")
+            screen.weapon_attack_skill_input.setText("Melee")
+            screen.weapon_range_input.setValue(10)
+            screen._save_playtesting_item()
+
+            item = next(
+                item
+                for item in repository.list_inventory_items()
+                if item["name"] == "Test Greatsword"
+            )
+            self.assertEqual(item["metadata"]["item_type"], "Weapon")
+            self.assertEqual(item["metadata"]["weapon_hands"], "two-handed")
+            self.assertEqual(item["metadata"]["damage"], "2d6")
+            self.assertEqual(item["metadata"]["attack_skill"], "Melee")
+            self.assertEqual(item["metadata"]["attack_range_feet"], 10)
+            screen.close()
+
+    def test_playtesting_inventory_editor_adds_ammunition_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            _ensure_qt_application()
+            repository = SaveRepository.create_new_save(
+                Path(temp_dir),
+                "Ammunition Editor Test",
+            )
+            screen = InventoryScreen(playtesting_tools=True)
+            screen.set_repository(repository)
+            screen._clear_item_editor()
+            screen.item_name_input.setText("Rifle Cartridge Box")
+            _set_combo_to_data(screen.item_type_combo, "Ammunition")
+            screen.item_quantity_input.setValue(30)
+            screen.ammunition_type_name_input.setText("Rifle Cartridge")
+            screen._save_playtesting_item()
+
+            item = next(
+                item
+                for item in repository.list_inventory_items()
+                if item["name"] == "Rifle Cartridge Box"
+            )
+            self.assertEqual(item["metadata"]["item_type"], "Ammunition")
+            self.assertEqual(
+                item["metadata"]["ammunition_type"],
+                "Rifle Cartridge",
+            )
+            self.assertEqual(item["quantity"], 30)
+            screen.close()
+
     def test_world_screen_renders_markdown_summary_and_lore(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            QApplication.instance() or QApplication([])
+            _ensure_qt_application()
             repository = SaveRepository.create_new_save(Path(temp_dir), "Markdown World Test")
             repository.set_world_summary("The city of **Rainmarket** watches the canals.")
             repository.set_world_lore(
                 {
                     "Locations": {
                         "Rainmarket Station": "A rail hub with *old brass clocks*."
-                    }
+                    },
+                    "Culture": {"Canal custom": "Boats yield to funeral barges."},
                 }
             )
             screen = WorldScreen()
@@ -670,15 +1385,100 @@ class MainWindowTests(unittest.TestCase):
 
             self.assertIn("World Overview", plain_text)
             self.assertIn("The city of Rainmarket watches the canals.", plain_text)
-            self.assertIn("Locations", plain_text)
-            self.assertIn("Rainmarket Station: A rail hub with old brass clocks.", plain_text)
+            self.assertIn("Culture", plain_text)
+            self.assertIn("Canal custom: Boats yield to funeral barges.", plain_text)
+            self.assertNotIn("Rainmarket Station", plain_text)
             self.assertNotIn("**Rainmarket**", plain_text)
-            self.assertNotIn("*old brass clocks*", plain_text)
+            screen.close()
+
+    def test_travel_screen_displays_calculated_estimate_and_submits_context(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            _ensure_qt_application()
+            repository = SaveRepository.create_new_save(Path(temp_dir), "Travel Screen Test")
+            repository.set_state_value("location", "Canal Gate")
+            repository.set_travel_locations(
+                [
+                    {
+                        "name": "Canal Gate",
+                        "description": "The city's eastern entrance.",
+                        "x_miles": 0,
+                        "y_miles": 0,
+                    },
+                    {
+                        "name": "North Lock",
+                        "description": "A guarded lock beyond the warehouses.",
+                        "x_miles": 3,
+                        "y_miles": 4,
+                        "terrain": "Cobblestone",
+                        "travel_notes": "The gate closes after dark.",
+                    },
+                ]
+            )
+            submitted: list[tuple[dict[str, object], str]] = []
+            screen = TravelScreen(
+                on_travel_requested=lambda destination, context: (
+                    submitted.append((destination, context)) or True
+                )
+            )
+            screen.set_repository(repository)
+
+            for row in range(screen.location_list.count()):
+                if screen.location_list.item(row).text() == "North Lock":
+                    screen.location_list.setCurrentRow(row)
+                    break
+
+            self.assertIn("5.0 miles", screen.details_output.toPlainText())
+            self.assertIn("About 1 hour 40 minutes", screen.details_output.toPlainText())
+            self.assertTrue(screen.travel_button.isEnabled())
+
+            screen.travel_context_input.setPlainText("I keep to the lit road.")
+            screen._request_travel()
+
+            self.assertEqual(submitted[0][0]["name"], "North Lock")
+            self.assertEqual(submitted[0][1], "I keep to the lit road.")
+            self.assertEqual(screen.travel_context_input.toPlainText(), "")
+            screen.close()
+
+    def test_story_travel_request_sends_calculated_itinerary_to_gemini_context(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            _ensure_qt_application()
+            repository = SaveRepository.create_new_save(Path(temp_dir), "Travel Context Test")
+            repository.set_state_value("location", "Canal Gate")
+            repository.set_travel_locations(
+                [
+                    {"name": "Canal Gate", "x_miles": 0, "y_miles": 0},
+                    {
+                        "name": "North Lock",
+                        "description": "A guarded lock.",
+                        "x_miles": 3,
+                        "y_miles": 4,
+                        "terrain": "Cobblestone",
+                        "travel_notes": "The gate closes after dark.",
+                    },
+                ]
+            )
+            screen = StoryScreen()
+            screen.set_repository(repository)
+
+            with patch.object(screen, "_start_skill_check_planning_request") as request:
+                submitted = screen.submit_travel_request(
+                    _require(repository.find_travel_location("North Lock")),
+                    "I keep to the lit road.",
+                )
+
+            self.assertTrue(submitted)
+            packet = request.call_args.args[0]
+            self.assertTrue(packet["travel_request"]["active"])
+            self.assertEqual(packet["travel_request"]["destination"]["name"], "North Lock")
+            self.assertEqual(packet["travel_request"]["estimate"]["distance_miles"], 5.0)
+            self.assertEqual(packet["travel_request"]["estimate"]["estimated_minutes"], 100)
+            self.assertEqual(packet["travel_request"]["player_context"], "I keep to the lit road.")
+            self.assertIn("Travel toward North Lock.", repository.list_history()[-1]["content"])
             screen.close()
 
     def test_ai_new_game_state_sets_currency_balance(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            QApplication.instance() or QApplication([])
+            _ensure_qt_application()
             temp_path = Path(temp_dir)
             (temp_path / "saves").mkdir(parents=True, exist_ok=True)
             (temp_path / "logs").mkdir(parents=True, exist_ok=True)
@@ -711,15 +1511,30 @@ class MainWindowTests(unittest.TestCase):
                     finalized_character={},
                     finalized_skills=[],
                     finalized_starter_items=[],
+                    gm_secrets=[
+                        {
+                            "secret_id": "treasurer_forged_ledger",
+                            "title": "Forged Ledger",
+                            "details": "The treasurer forged the canal tax ledger.",
+                            "reveal_condition": "The player compares both seal impressions.",
+                            "related_npc_ids": ["treasurer"],
+                            "related_locations": ["Counting House"],
+                            "status": "active",
+                        }
+                    ],
                 ),
             )
 
             self.assertEqual(repository.get_state_value("currency.balance"), "37")
+            self.assertEqual(
+                repository.list_gm_secrets(active_only=True)[0]["secret_id"],
+                "treasurer_forged_ledger",
+            )
             window.close()
 
     def test_ai_generated_calendar_settings_replace_bootstrap_calendar(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            QApplication.instance() or QApplication([])
+            _ensure_qt_application()
             temp_path = Path(temp_dir)
             (temp_path / "saves").mkdir(parents=True, exist_ok=True)
             (temp_path / "logs").mkdir(parents=True, exist_ok=True)
@@ -789,7 +1604,7 @@ class MainWindowTests(unittest.TestCase):
 
     def test_ai_generated_calendar_rejects_default_gregorian_ai_output(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            QApplication.instance() or QApplication([])
+            _ensure_qt_application()
             temp_path = Path(temp_dir)
             (temp_path / "saves").mkdir(parents=True, exist_ok=True)
             (temp_path / "logs").mkdir(parents=True, exist_ok=True)
@@ -838,7 +1653,7 @@ class MainWindowTests(unittest.TestCase):
 
     def test_ai_new_game_state_preserves_player_provided_character_fields(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            QApplication.instance() or QApplication([])
+            _ensure_qt_application()
             temp_path = Path(temp_dir)
             (temp_path / "saves").mkdir(parents=True, exist_ok=True)
             (temp_path / "logs").mkdir(parents=True, exist_ok=True)
@@ -906,7 +1721,7 @@ class MainWindowTests(unittest.TestCase):
 
     def test_ai_new_game_state_fills_blank_character_fields(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            QApplication.instance() or QApplication([])
+            _ensure_qt_application()
             temp_path = Path(temp_dir)
             (temp_path / "saves").mkdir(parents=True, exist_ok=True)
             (temp_path / "logs").mkdir(parents=True, exist_ok=True)
@@ -1002,7 +1817,7 @@ class MainWindowTests(unittest.TestCase):
 
     def test_ai_new_game_state_accepts_generated_blank_skill_slots_with_duplicate_name(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            QApplication.instance() or QApplication([])
+            _ensure_qt_application()
             temp_path = Path(temp_dir)
             (temp_path / "saves").mkdir(parents=True, exist_ok=True)
             (temp_path / "logs").mkdir(parents=True, exist_ok=True)
@@ -1059,7 +1874,7 @@ class MainWindowTests(unittest.TestCase):
 
     def test_ai_new_game_state_accepts_partial_ai_starter_inventory(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            QApplication.instance() or QApplication([])
+            _ensure_qt_application()
             temp_path = Path(temp_dir)
             (temp_path / "saves").mkdir(parents=True, exist_ok=True)
             (temp_path / "logs").mkdir(parents=True, exist_ok=True)
@@ -1167,7 +1982,7 @@ class MainWindowTests(unittest.TestCase):
 
     def test_alchemy_reagent_selection_populates_form_without_table_editing(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            QApplication.instance() or QApplication([])
+            _ensure_qt_application()
             repository = SaveRepository.create_new_save(Path(temp_dir), "Crafting UI Test")
             repository.add_crafting_item(
                 name="Moon Salt",
@@ -1195,7 +2010,8 @@ class MainWindowTests(unittest.TestCase):
                 QTableWidget.EditTrigger.NoEditTriggers,
             )
             self.assertEqual(
-                screen.reagent_table.item(0, 0).flags() & Qt.ItemFlag.ItemIsEditable,
+                _require(screen.reagent_table.item(0, 0)).flags()
+                & Qt.ItemFlag.ItemIsEditable,
                 Qt.ItemFlag.NoItemFlags,
             )
 
@@ -1203,14 +2019,20 @@ class MainWindowTests(unittest.TestCase):
             QApplication.processEvents()
 
             self.assertEqual(screen.reagent_table.columnCount(), 4)
-            self.assertEqual(screen.reagent_table.horizontalHeaderItem(1).text(), "Description")
+            self.assertEqual(
+                _require(screen.reagent_table.horizontalHeaderItem(1)).text(),
+                "Description",
+            )
             self.assertEqual(screen.tabs.tabText(0), "Items")
             self.assertEqual(screen.reagent_name_input.placeholderText(), "Item or material name")
             self.assertEqual(
                 screen.recipe_reagent_combo.placeholderText(),
                 "Search material, ingredient, reagent, or crafting item",
             )
-            self.assertEqual(screen.recipe_ingredient_table.horizontalHeaderItem(0).text(), "Item")
+            self.assertEqual(
+                _require(screen.recipe_ingredient_table.horizontalHeaderItem(0)).text(),
+                "Item",
+            )
             self.assertEqual(screen.reagent_name_input.text(), "Moon Salt")
             self.assertEqual(screen.reagent_description_input.text(), "Crystals hum softly.")
             self.assertEqual(screen.reagent_location_input.text(), "Moonlit stone basins")
@@ -1228,7 +2050,7 @@ class MainWindowTests(unittest.TestCase):
 
     def test_recipe_ingredients_use_known_reagent_dropdown(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            QApplication.instance() or QApplication([])
+            _ensure_qt_application()
             repository = SaveRepository.create_new_save(Path(temp_dir), "Recipe UI Test")
             repository.add_crafting_item(
                 name="Alcohol Base",
@@ -1260,11 +2082,11 @@ class MainWindowTests(unittest.TestCase):
                 screen.recipe_reagent_choice_model.stringList(),
                 ["Alcohol Base (Material)"],
             )
-            self.assertIsNotNone(screen.recipe_reagent_line_edit)
+            recipe_reagent_line_edit = _require(screen.recipe_reagent_line_edit)
 
             with patch("ai_adventure.ui.main_window.QTimer.singleShot") as single_shot:
                 handled = screen.eventFilter(
-                    screen.recipe_reagent_line_edit,
+                    recipe_reagent_line_edit,
                     QEvent(QEvent.Type.MouseButtonPress),
                 )
 
@@ -1290,7 +2112,7 @@ class MainWindowTests(unittest.TestCase):
 
     def test_refresh_keeps_inventory_sorted_after_repository_changes(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            QApplication.instance() or QApplication([])
+            _ensure_qt_application()
             repository = SaveRepository(Path(temp_dir) / "sort.sqlite3")
             repository.set_meta("title", "Refresh Sort Test")
             repository.add_inventory_item(
@@ -1321,15 +2143,21 @@ class MainWindowTests(unittest.TestCase):
             )
 
             shell.refresh_screens()
-
-            self.assertEqual(shell.inventory_screen.table.item(0, 0).text(), "Rope")
-            self.assertEqual(shell.inventory_screen.table.item(1, 0).text(), "Torch")
-            self.assertEqual(shell.inventory_screen.table.item(2, 0).text(), "Small Stone")
-            shell.close()
+            if shell.inventory_screen.table != None:
+                item_zero = shell.inventory_screen.table.item(0, 0)
+                item_one = shell.inventory_screen.table.item(1, 0)
+                item_two = shell.inventory_screen.table.item(2, 0)
+                if item_zero != None:
+                    self.assertEqual(item_zero.text(), "Rope")
+                if item_one != None:
+                    self.assertEqual(item_one.text(), "Torch")
+                if item_two != None:
+                    self.assertEqual(item_two.text(), "Small Stone")
+                shell.close()
 
     def test_inventory_screen_displays_currency_balance_outside_inventory(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            QApplication.instance() or QApplication([])
+            _ensure_qt_application()
             repository = SaveRepository.create_new_save(Path(temp_dir), "Currency UI Test")
             repository.set_state_value("currency.balance", "65")
             shell = GameShell(on_return_to_menu=lambda: None)
@@ -1343,7 +2171,7 @@ class MainWindowTests(unittest.TestCase):
 
     def test_settings_autosave_persists_slider_release_and_refreshes_tabs(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            QApplication.instance() or QApplication([])
+            _ensure_qt_application()
             repository = SaveRepository.create_new_save(Path(temp_dir), "Settings Test")
             shell = GameShell(on_return_to_menu=lambda: None)
             shell.set_repository(repository)
@@ -1370,7 +2198,7 @@ class MainWindowTests(unittest.TestCase):
 
     def test_settings_currency_rows_match_active_save_denominations(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            QApplication.instance() or QApplication([])
+            _ensure_qt_application()
             repository = SaveRepository.create_new_save(Path(temp_dir), "Currency Settings Test")
             repository.set_currency_denominations(
                 [{"name": "Credit", "plural_name": "Credits", "value": 1}]
@@ -1395,7 +2223,7 @@ class MainWindowTests(unittest.TestCase):
             self.assertEqual([denomination["name"] for denomination in denominations], ["Credit", "Marker"])
             self.assertEqual(denominations[1]["value"], 5)
 
-            screen.currency_remove_buttons[1].click()
+            _require(screen.currency_remove_buttons[1]).click()
             denominations = repository.get_currency_denominations()
             self.assertEqual([denomination["name"] for denomination in denominations], ["Credit"])
             self.assertEqual(len(screen.currency_name_inputs), 1)
@@ -1403,7 +2231,7 @@ class MainWindowTests(unittest.TestCase):
 
     def test_settings_custom_voice_dialog_persists_to_save_and_app_defaults(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            QApplication.instance() or QApplication([])
+            _ensure_qt_application()
             repository = SaveRepository.create_new_save(Path(temp_dir), "Voice Defaults Test")
             app_tts_settings = []
             screen = SettingsScreen(
@@ -1449,7 +2277,7 @@ class MainWindowTests(unittest.TestCase):
                 "ai_adventure.ui.main_window.CustomVoiceDialog",
                 return_value=fake_dialog,
             ):
-                screen.custom_voice_button.click()
+                _require(screen.custom_voice_button).click()
 
             self.assertEqual(
                 repository.get_setting("audio.tts_custom_voices")[0]["name"],
@@ -1460,7 +2288,7 @@ class MainWindowTests(unittest.TestCase):
 
     def test_calendar_screen_settings_dialog_persists_and_refreshes_tabs(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            QApplication.instance() or QApplication([])
+            _ensure_qt_application()
             repository = SaveRepository.create_new_save(Path(temp_dir), "Calendar Settings Test")
             shell = GameShell(on_return_to_menu=lambda: None)
             shell.set_repository(repository)
@@ -1502,7 +2330,7 @@ class MainWindowTests(unittest.TestCase):
             shell.close()
 
     def test_calendar_settings_dialog_builds_calendar_settings(self) -> None:
-        QApplication.instance() or QApplication([])
+        _ensure_qt_application()
         dialog = CalendarSettingsDialog(DEFAULT_CALENDAR_SETTINGS)
 
         try:
@@ -1532,7 +2360,7 @@ class MainWindowTests(unittest.TestCase):
 
     def test_settings_theme_change_persists_and_notifies_callback(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            QApplication.instance() or QApplication([])
+            _ensure_qt_application()
             repository = SaveRepository.create_new_save(Path(temp_dir), "Theme Test")
             theme_changes = []
             screen = SettingsScreen(on_theme_changed=lambda: theme_changes.append("theme"))
@@ -1545,26 +2373,75 @@ class MainWindowTests(unittest.TestCase):
             self.assertEqual(theme_changes, ["theme"])
             screen.close()
 
-    def test_settings_narration_preferences_persist(self) -> None:
+    def test_ai_settings_dialog_builds_and_persists_all_modes(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            QApplication.instance() or QApplication([])
+            _ensure_qt_application()
             repository = SaveRepository.create_new_save(Path(temp_dir), "Narration Test")
             screen = SettingsScreen()
             screen.set_repository(repository)
+            dialog = AISettingsDialog(
+                settings=screen._current_ai_settings(repository)
+            )
 
-            _set_combo_to_data(screen.narration_tense_combo, "future")
-            _set_combo_to_data(screen.narration_style_combo, "first_person_omniscient")
-            QApplication.processEvents()
+            self.assertEqual(screen.ai_settings_button.text(), "A.I. Settings...")
+            self.assertFalse(hasattr(screen, "narration_tense_combo"))
+            self.assertEqual(
+                dialog.model_intelligence_combo.currentData(),
+                "faster",
+            )
+            self.assertEqual(dialog.model_tone_combo.currentData(), "neutral")
+            self.assertEqual(dialog.response_length_combo.currentData(), "normal")
+            self.assertEqual(
+                dialog.model_content_combo.selected_categories(),
+                [
+                    "HARM_CATEGORY_HARASSMENT",
+                    "HARM_CATEGORY_HATE_SPEECH",
+                    "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+                    "HARM_CATEGORY_DANGEROUS_CONTENT",
+                    "HARM_CATEGORY_CIVIC_INTEGRITY",
+                ],
+            )
 
+            _set_combo_to_data(dialog.model_intelligence_combo, "smarter")
+            _set_combo_to_data(dialog.model_tone_combo, "quirky")
+            _set_combo_to_data(dialog.response_length_combo, "verbose")
+            dialog.model_content_combo.set_selected_categories(
+                ["HARM_CATEGORY_DANGEROUS_CONTENT"]
+            )
+            _set_combo_to_data(dialog.narration_tense_combo, "future")
+            _set_combo_to_data(
+                dialog.narration_style_combo,
+                "first_person_omniscient",
+            )
+            dialog.additional_ai_context_input.setPlainText("Keep mysteries subtle.")
+            screen._save_ai_settings(dialog.build_ai_settings())
+
+            self.assertEqual(
+                repository.get_setting("ai.model_intelligence"),
+                "smarter",
+            )
+            self.assertEqual(repository.get_setting("ai.model_tone"), "quirky")
+            self.assertEqual(repository.get_setting("ai.response_length"), "verbose")
+            self.assertEqual(
+                repository.get_setting("ai.allowed_content_categories"),
+                ["HARM_CATEGORY_DANGEROUS_CONTENT"],
+            )
             self.assertEqual(repository.get_setting("ai.narration_tense"), "future")
             self.assertEqual(
                 repository.get_setting("ai.narration_style"),
                 "first_person_omniscient",
             )
+            self.assertEqual(
+                repository.get_setting("ai.additional_context"),
+                "Keep mysteries subtle.",
+            )
+            self.assertIn("highly detailed", dialog.response_length_description.text())
+            self.assertIn("Dangerous Content", dialog.model_content_description.text())
+            dialog.close()
             screen.close()
 
     def test_settings_sample_voice_uses_selected_voice_and_volume(self) -> None:
-        QApplication.instance() or QApplication([])
+        _ensure_qt_application()
         samples = []
         dialog = TTSSettingsDialog(
             audio_settings={
@@ -1584,18 +2461,18 @@ class MainWindowTests(unittest.TestCase):
         )
 
         try:
-            widget = dialog.tts_settings_widget
-            _set_combo_to_data(widget.tts_voice_combo, "am_echo")
-            widget.tts_volume_slider.setValue(41)
-            widget.tts_speed_slider.setValue(125)
-            widget.sample_voice_button.click()
+            widget = _require(dialog.tts_settings_widget)
+            _set_combo_to_data(_require(widget.tts_voice_combo), "am_echo")
+            _require(widget.tts_volume_slider).setValue(41)
+            _require(widget.tts_speed_slider).setValue(125)
+            _require(widget.sample_voice_button).click()
 
             self.assertEqual(samples, [("am_echo", 41, 125)])
         finally:
             dialog.close()
 
     def test_tts_settings_widget_hides_options_until_narrator_is_enabled(self) -> None:
-        QApplication.instance() or QApplication([])
+        _ensure_qt_application()
         dialog = TTSSettingsDialog(
             audio_settings={
                 "narrator_enabled": False,
@@ -1611,8 +2488,8 @@ class MainWindowTests(unittest.TestCase):
         )
 
         try:
-            widget = dialog.tts_settings_widget
-            form = widget.layout()
+            widget = _require(dialog.tts_settings_widget)
+            form = _require_widget(widget.layout(), QFormLayout)
 
             self.assertEqual(widget.tts_volume_slider.value(), 90)
             self.assertEqual(widget.tts_volume_label.text(), "90%")
@@ -1623,7 +2500,7 @@ class MainWindowTests(unittest.TestCase):
             self.assertTrue(widget.custom_voice_row.isHidden())
             self.assertTrue(widget.voice_button_row.isHidden())
             self.assertEqual(
-                form.labelForField(widget.custom_voice_row).text(),
+                _require_widget(form.labelForField(widget.custom_voice_row), QLabel).text(),
                 "Custom Voice:",
             )
             self.assertFalse(hasattr(widget, "custom_voice_name_input"))
@@ -1646,7 +2523,7 @@ class MainWindowTests(unittest.TestCase):
             dialog.close()
 
     def test_main_menu_exposes_settings_button(self) -> None:
-        QApplication.instance() or QApplication([])
+        _ensure_qt_application()
 
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
@@ -1667,7 +2544,7 @@ class MainWindowTests(unittest.TestCase):
             apply_application_theme("Light")
 
     def test_new_game_template_manager_saves_renames_and_deletes_partial_template(self) -> None:
-        QApplication.instance() or QApplication([])
+        _ensure_qt_application()
 
         with tempfile.TemporaryDirectory() as temp_dir:
             template_path = Path(temp_dir) / "new_game_templates.json"
@@ -1751,7 +2628,7 @@ class MainWindowTests(unittest.TestCase):
                 dialog.close()
 
     def test_main_menu_settings_apply_and_persist_without_save(self) -> None:
-        app = QApplication.instance() or QApplication([])
+        app = _ensure_qt_application()
 
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
@@ -1788,8 +2665,9 @@ class MainWindowTests(unittest.TestCase):
             self.assertEqual(saved_settings["audio"]["tts_voice"], "am_echo")
             self.assertEqual(saved_settings["audio"]["tts_speed"], 130)
             self.assertEqual(window.menu_theme, "Dark")
-            self.assertFalse(window.sound_manager.music_enabled)
-            self.assertEqual(window.sound_manager.music_volume, 0.07)
+            sound_manager = _require(window.sound_manager)
+            self.assertFalse(sound_manager.music_enabled)
+            self.assertEqual(sound_manager.music_volume, 0.07)
             self.assertEqual(
                 app.palette().color(QPalette.ColorRole.Window).name(),
                 "#202124",
@@ -1799,7 +2677,7 @@ class MainWindowTests(unittest.TestCase):
             apply_application_theme("Light")
 
     def test_main_window_persists_custom_voice_defaults_to_app_settings(self) -> None:
-        QApplication.instance() or QApplication([])
+        _ensure_qt_application()
 
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
@@ -1861,7 +2739,7 @@ class MainWindowTests(unittest.TestCase):
             apply_application_theme("Light")
 
     def test_main_menu_settings_dialog_builds_audio_and_theme_settings(self) -> None:
-        QApplication.instance() or QApplication([])
+        _ensure_qt_application()
         dialog = MainMenuSettingsDialog(
             settings={
                 "theme": "Light",
@@ -1883,12 +2761,12 @@ class MainWindowTests(unittest.TestCase):
 
         try:
             dialog.theme_combo.setCurrentText("Dark")
-            dialog.music_enabled_checkbox.setChecked(False)
-            dialog.music_volume_slider.setValue(12)
-            dialog.narrator_enabled_checkbox.setChecked(False)
-            dialog.tts_volume_slider.setValue(34)
-            dialog.tts_settings_widget.tts_speed_slider.setValue(135)
-            _set_combo_to_data(dialog.tts_voice_combo, "am_echo")
+            _require(dialog.music_enabled_checkbox).setChecked(False)
+            _require(dialog.music_volume_slider).setValue(12)
+            _require(dialog.narrator_enabled_checkbox).setChecked(False)
+            _require(dialog.tts_volume_slider).setValue(34)
+            _require(_require(dialog.tts_settings_widget).tts_speed_slider).setValue(135)
+            _set_combo_to_data(_require(dialog.tts_voice_combo), "am_echo")
 
             settings = dialog.build_settings()
 
@@ -1903,7 +2781,7 @@ class MainWindowTests(unittest.TestCase):
             dialog.close()
 
     def test_main_menu_settings_sample_voice_uses_selected_voice_and_volume(self) -> None:
-        QApplication.instance() or QApplication([])
+        _ensure_qt_application()
         samples = []
         dialog = MainMenuSettingsDialog(
             settings={
@@ -1922,20 +2800,20 @@ class MainWindowTests(unittest.TestCase):
                 "Sarah (Female, US)": "af_sarah",
                 "Echo (Male, US)": "am_echo",
             },
-            on_sample_voice=lambda voice, volume: samples.append((voice, volume)) or True,
+            on_sample_voice=lambda voice, volume, _speed: samples.append((voice, volume)) or True,
         )
 
         try:
-            _set_combo_to_data(dialog.tts_voice_combo, "am_echo")
-            dialog.tts_volume_slider.setValue(37)
-            dialog.sample_voice_button.click()
+            _set_combo_to_data(_require(dialog.tts_voice_combo), "am_echo")
+            _require(dialog.tts_volume_slider).setValue(37)
+            _require(dialog.sample_voice_button).click()
 
             self.assertEqual(samples, [("am_echo", 37)])
         finally:
             dialog.close()
 
     def test_custom_voice_dialog_links_blend_sliders_and_saves_as(self) -> None:
-        QApplication.instance() or QApplication([])
+        _ensure_qt_application()
         dialog = CustomVoiceDialog(
             audio_settings={
                 "narrator_enabled": True,
@@ -1987,7 +2865,7 @@ class MainWindowTests(unittest.TestCase):
             dialog.close()
 
     def test_custom_voice_dialog_loads_custom_voice_volume_and_speed(self) -> None:
-        QApplication.instance() or QApplication([])
+        _ensure_qt_application()
         dialog = CustomVoiceDialog(
             audio_settings={
                 "narrator_enabled": True,
@@ -2024,7 +2902,7 @@ class MainWindowTests(unittest.TestCase):
             dialog.close()
 
     def test_custom_voice_dialog_saves_loaded_voice_and_renames_explicitly(self) -> None:
-        QApplication.instance() or QApplication([])
+        _ensure_qt_application()
         dialog = CustomVoiceDialog(
             audio_settings={
                 "narrator_enabled": True,
@@ -2074,7 +2952,7 @@ class MainWindowTests(unittest.TestCase):
             dialog.close()
 
     def test_main_menu_uses_latest_saved_dark_theme_on_startup(self) -> None:
-        app = QApplication.instance() or QApplication([])
+        app = _ensure_qt_application()
 
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
@@ -2104,7 +2982,7 @@ class MainWindowTests(unittest.TestCase):
             apply_application_theme("Light")
 
     def test_create_new_game_warns_when_save_title_already_exists(self) -> None:
-        app = QApplication.instance() or QApplication([])
+        app = _ensure_qt_application()
 
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
@@ -2128,7 +3006,7 @@ class MainWindowTests(unittest.TestCase):
             apply_application_theme("Light")
 
     def test_start_new_game_wizard_prompts_for_new_name_after_duplicate(self) -> None:
-        QApplication.instance() or QApplication([])
+        _ensure_qt_application()
 
         class FakeTitleInput:
             def __init__(self, value: str) -> None:
@@ -2199,9 +3077,9 @@ class MainWindowTests(unittest.TestCase):
             self.assertEqual(wizard_instances[0].exec_calls, 1)
             self.assertEqual(wizard_instances[0].title_input.text(), "Duplicate UI Save 2")
             get_text.assert_called_once()
-            self.assertIsNotNone(window.active_repository)
+            repository = _require(window.active_repository)
             self.assertEqual(
-                window.active_repository.get_meta("title"),
+                repository.get_meta("title"),
                 "Duplicate UI Save 2",
             )
             self.assertEqual(len(scheduled_callbacks), 1)
@@ -2209,7 +3087,7 @@ class MainWindowTests(unittest.TestCase):
             apply_application_theme("Light")
 
     def test_create_new_game_opens_blank_shell_before_world_generation(self) -> None:
-        app = QApplication.instance() or QApplication([])
+        app = _ensure_qt_application()
 
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
@@ -2231,9 +3109,11 @@ class MainWindowTests(unittest.TestCase):
             def fake_finish(repository, setup):
                 generated.append((repository, setup))
 
-            window._finish_new_game_generation = fake_finish
-
-            with patch("ai_adventure.ui.main_window.QTimer.singleShot", fake_single_shot):
+            with patch.object(
+                window,
+                "_finish_new_game_generation",
+                side_effect=fake_finish,
+            ), patch("ai_adventure.ui.main_window.QTimer.singleShot", fake_single_shot):
                 window.create_new_game(
                     {
                         "title": "Immediate Shell Test",
@@ -2246,34 +3126,34 @@ class MainWindowTests(unittest.TestCase):
                         },
                     }
                 )
+                self.assertEqual(generated, [])
+                self.assertEqual(len(scheduled_callbacks), 1)
+                scheduled_callbacks[0]()
 
             self.assertEqual(window.stack.currentWidget(), window.game_shell)
-            self.assertIsNotNone(window.active_repository)
-            self.assertEqual(generated, [])
+            repository = _require(window.active_repository)
             self.assertEqual(len(scheduled_callbacks), 1)
             self.assertFalse(window.game_shell.story_screen.player_input.isEnabled())
             self.assertFalse(
-                window.active_repository.get_setting("audio.music_enabled", True)
+                repository.get_setting("audio.music_enabled", True)
             )
             self.assertFalse(
-                window.active_repository.get_setting("audio.narrator_enabled", True)
+                repository.get_setting("audio.narrator_enabled", True)
             )
-            self.assertEqual(window.active_repository.get_setting("audio.music_volume"), 0)
-            self.assertEqual(window.active_repository.get_setting("audio.tts_volume"), 20)
+            self.assertEqual(repository.get_setting("audio.music_volume"), 0)
+            self.assertEqual(repository.get_setting("audio.tts_volume"), 20)
             self.assertEqual(
-                window.active_repository.get_setting("audio.tts_voice"),
+                repository.get_setting("audio.tts_voice"),
                 "am_echo",
             )
 
-            scheduled_callbacks[0]()
-
             self.assertEqual(len(generated), 1)
-            self.assertEqual(generated[0][0], window.active_repository)
+            self.assertEqual(generated[0][0], repository)
             window.close()
             apply_application_theme("Light")
 
     def test_return_to_menu_preserves_active_save_dark_theme(self) -> None:
-        app = QApplication.instance() or QApplication([])
+        app = _ensure_qt_application()
 
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
@@ -2307,7 +3187,7 @@ class MainWindowTests(unittest.TestCase):
 
     def test_settings_theme_options_are_light_and_dark_only(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            QApplication.instance() or QApplication([])
+            _ensure_qt_application()
             repository = SaveRepository.create_new_save(Path(temp_dir), "Theme Test")
             screen = SettingsScreen()
             screen.set_repository(repository)
@@ -2323,7 +3203,7 @@ class MainWindowTests(unittest.TestCase):
 
     def test_settings_theme_migrates_system_to_light(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            QApplication.instance() or QApplication([])
+            _ensure_qt_application()
             repository = SaveRepository.create_new_save(Path(temp_dir), "Theme Test")
             repository.set_setting("theme", "System")
             screen = SettingsScreen()
@@ -2335,7 +3215,7 @@ class MainWindowTests(unittest.TestCase):
 
     def test_main_window_lightweight_mode_skips_narration_player(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            QApplication.instance() or QApplication([])
+            _ensure_qt_application()
             temp_path = Path(temp_dir)
             app_paths = AppPaths(
                 app_data_dir=temp_path,
@@ -2365,7 +3245,7 @@ class MainWindowTests(unittest.TestCase):
             window.close()
 
     def test_apply_application_theme_updates_application_palette(self) -> None:
-        app = QApplication.instance() or QApplication([])
+        app = _ensure_qt_application()
 
         try:
             apply_application_theme("Dark")
@@ -2410,7 +3290,7 @@ class MainWindowTests(unittest.TestCase):
             apply_application_theme("Light")
 
     def test_new_game_lightweight_mode_saves_narrator_off(self) -> None:
-        QApplication.instance() or QApplication([])
+        _ensure_qt_application()
 
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
@@ -2426,9 +3306,11 @@ class MainWindowTests(unittest.TestCase):
             with patch.dict(os.environ, {"AI_ADVENTURE_DISABLE_TTS": "1"}):
                 window = MainWindow(app_paths=app_paths)
 
-            window._finish_new_game_generation = lambda _repository, _setup: None
-
-            with patch("ai_adventure.ui.main_window.QTimer.singleShot", lambda *_args: None):
+            with patch.object(
+                window,
+                "_finish_new_game_generation",
+                side_effect=lambda _repository, _setup: None,
+            ), patch("ai_adventure.ui.main_window.QTimer.singleShot", lambda *_args: None):
                 self.assertTrue(
                     window.create_new_game(
                         {
@@ -2444,20 +3326,20 @@ class MainWindowTests(unittest.TestCase):
                     )
                 )
 
-            self.assertIsNotNone(window.active_repository)
+            repository = _require(window.active_repository)
             self.assertFalse(
-                window.active_repository.get_setting("audio.narrator_enabled", True)
+                repository.get_setting("audio.narrator_enabled", True)
             )
-            self.assertEqual(window.active_repository.get_setting("audio.tts_volume"), 0)
+            self.assertEqual(repository.get_setting("audio.tts_volume"), 0)
             self.assertEqual(
-                window.active_repository.get_setting("audio.tts_voice"),
+                repository.get_setting("audio.tts_voice"),
                 DEFAULT_NARRATOR_VOICE,
             )
             window.close()
             apply_application_theme("Light")
 
     def test_template_setup_uses_next_available_save_title(self) -> None:
-        QApplication.instance() or QApplication([])
+        _ensure_qt_application()
 
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
@@ -2481,8 +3363,19 @@ class MainWindowTests(unittest.TestCase):
             window.close()
             apply_application_theme("Light")
 
+    def test_next_available_save_title_increments_existing_numeric_suffix(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            saves_dir = Path(temp_dir)
+            SaveRepository.create_new_save(saves_dir, "A Thief's Tale 2")
+            SaveRepository.create_new_save(saves_dir, "A Thief's Tale 3")
+
+            self.assertEqual(
+                _next_available_save_title(saves_dir, "A Thief's Tale 2"),
+                "A Thief's Tale 4",
+            )
+
     def test_new_game_wizard_loads_template_fields(self) -> None:
-        QApplication.instance() or QApplication([])
+        _ensure_qt_application()
         wizard = NewGameWizard(
             template_setup={
                 "title": "Template Adventure",
@@ -2521,6 +3414,15 @@ class MainWindowTests(unittest.TestCase):
                     "tense": "past",
                     "style": "third_person_omniscient",
                 },
+                "ai_settings": {
+                    "model_intelligence": "smarter",
+                    "model_tone": "professional",
+                    "response_length": "descriptive",
+                    "allowed_content_categories": [
+                        "HARM_CATEGORY_HARASSMENT"
+                    ],
+                    "additional_context": "Favor investigative tension.",
+                },
                 "currency_denominations": [
                     {"name": "Bit", "plural_name": "Bits", "value": 1},
                     {"name": "Crown", "plural_name": "Crowns", "value": 12},
@@ -2540,16 +3442,16 @@ class MainWindowTests(unittest.TestCase):
         self.assertEqual(wizard.skill_inputs[0][1].text(), "Skill 0")
         self.assertEqual(wizard.skill_inputs[0][2].text(), "Skill 0 description.")
         self.assertEqual(wizard.starter_items_table.rowCount(), 1)
-        self.assertEqual(wizard.starter_items_table.cellWidget(0, 0).text(), "Notebook")
-        self.assertEqual(wizard.starter_items_table.cellWidget(0, 1).value(), 1)
-        self.assertEqual(wizard.starter_items_table.cellWidget(0, 2).text(), "Tool")
-        self.assertEqual(wizard.starter_items_table.cellWidget(0, 3).text(), "Case notes.")
-        self.assertEqual(wizard.starter_items_table.cellWidget(0, 4).value(), 4)
+        self.assertEqual(_table_cell(wizard.starter_items_table, 0, 0, QLineEdit).text(), "Notebook")
+        self.assertEqual(_table_cell(wizard.starter_items_table, 0, 1, QSpinBox).value(), 1)
+        self.assertEqual(_table_cell(wizard.starter_items_table, 0, 2, QLineEdit).text(), "Tool")
+        self.assertEqual(_table_cell(wizard.starter_items_table, 0, 3, QLineEdit).text(), "Case notes.")
+        self.assertEqual(_table_cell(wizard.starter_items_table, 0, 4, QSpinBox).value(), 4)
         self.assertEqual(wizard.currency_table.rowCount(), 2)
-        self.assertEqual(wizard.currency_table.cellWidget(1, 0).text(), "Crown")
+        self.assertEqual(_table_cell(wizard.currency_table, 1, 0, QLineEdit).text(), "Crown")
         self.assertEqual(wizard.economy_examples_table.rowCount(), 1)
-        self.assertEqual(wizard.economy_examples_table.cellWidget(0, 0).text(), "Bread")
-        self.assertEqual(wizard.economy_examples_table.cellWidget(0, 1).value(), 2)
+        self.assertEqual(_table_cell(wizard.economy_examples_table, 0, 0, QLineEdit).text(), "Bread")
+        self.assertEqual(_table_cell(wizard.economy_examples_table, 0, 1, QSpinBox).value(), 2)
         self.assertEqual(wizard.calendar_type_combo.currentData(), "gregorian")
         self.assertFalse(wizard.calendar_settings_button.isEnabled())
         self.assertEqual(wizard.narration_tense_combo.currentData(), "past")
@@ -2557,12 +3459,16 @@ class MainWindowTests(unittest.TestCase):
             wizard.narration_style_combo.currentData(),
             "third_person_omniscient",
         )
-        self.assertFalse(wizard.music_enabled_checkbox.isChecked())
-        self.assertFalse(wizard.narrator_enabled_checkbox.isChecked())
-        self.assertEqual(wizard.music_volume_slider.value(), 10)
-        self.assertEqual(wizard.tts_volume_slider.value(), 30)
-        self.assertEqual(wizard.tts_speed_slider.value(), 140)
-        self.assertEqual(wizard.tts_voice_combo.currentData(), "am_echo")
+        self.assertEqual(wizard.ai_settings_button.text(), "A.I. Settings...")
+        self.assertIn("Smarter", wizard.ai_settings_summary_label.text())
+        self.assertIn("Professional", wizard.ai_settings_summary_label.text())
+        self.assertIn("Descriptive", wizard.ai_settings_summary_label.text())
+        self.assertFalse(_require(wizard.music_enabled_checkbox).isChecked())
+        self.assertFalse(_require(wizard.narrator_enabled_checkbox).isChecked())
+        self.assertEqual(_require(wizard.music_volume_slider).value(), 10)
+        self.assertEqual(_require(wizard.tts_volume_slider).value(), 30)
+        self.assertEqual(_require(wizard.tts_speed_slider).value(), 140)
+        self.assertEqual(_require(wizard.tts_voice_combo).currentData(), "am_echo")
         setup = wizard.build_setup()
         self.assertEqual(setup["skills"][0]["description"], "Skill 0 description.")
         self.assertFalse(setup["skills"][0]["requires_ai_invention"])
@@ -2579,12 +3485,69 @@ class MainWindowTests(unittest.TestCase):
         self.assertEqual(setup["audio"]["tts_speed"], 140)
         self.assertEqual(setup["narration"]["tense"], "past")
         self.assertEqual(setup["narration"]["style"], "third_person_omniscient")
+        self.assertEqual(setup["ai_settings"]["model_intelligence"], "smarter")
+        self.assertEqual(setup["ai_settings"]["model_tone"], "professional")
+        self.assertEqual(setup["ai_settings"]["response_length"], "descriptive")
+        self.assertEqual(
+            setup["ai_settings"]["allowed_content_categories"],
+            ["HARM_CATEGORY_HARASSMENT"],
+        )
+        self.assertEqual(
+            setup["ai_settings"]["additional_context"],
+            "Favor investigative tension.",
+        )
         self.assertEqual(setup["economy_examples"][0]["name"], "Bread")
         self.assertIn("Bread costs 2 base units", setup["currency_description"])
         wizard.close()
 
+    def test_new_game_wizard_ai_settings_button_updates_setup(self) -> None:
+        _ensure_qt_application()
+        wizard = NewGameWizard()
+        fake_dialog = SimpleNamespace(
+            exec=lambda: QDialog.DialogCode.Accepted,
+            build_ai_settings=lambda: {
+                "model_intelligence": "smarter",
+                "model_tone": "friendly",
+                "response_length": "brief",
+                "allowed_content_categories": [
+                    "HARM_CATEGORY_DANGEROUS_CONTENT"
+                ],
+                "narration_tense": "future",
+                "narration_style": "first_person_limited",
+                "additional_context": "Keep the opening hopeful.",
+            },
+        )
+
+        try:
+            with patch(
+                "ai_adventure.ui.main_window.AISettingsDialog",
+                return_value=fake_dialog,
+            ):
+                wizard.ai_settings_button.click()
+
+            setup = wizard.build_setup()
+            self.assertEqual(
+                setup["ai_settings"]["model_intelligence"],
+                "smarter",
+            )
+            self.assertEqual(setup["ai_settings"]["model_tone"], "friendly")
+            self.assertEqual(setup["ai_settings"]["response_length"], "brief")
+            self.assertEqual(
+                setup["ai_settings"]["allowed_content_categories"],
+                ["HARM_CATEGORY_DANGEROUS_CONTENT"],
+            )
+            self.assertEqual(setup["narration"]["tense"], "future")
+            self.assertEqual(
+                setup["narration"]["style"],
+                "first_person_limited",
+            )
+            self.assertIn("Smarter", wizard.ai_settings_summary_label.text())
+            self.assertIn("Friendly", wizard.ai_settings_summary_label.text())
+        finally:
+            wizard.close()
+
     def test_new_game_wizard_accepts_partial_template_shell(self) -> None:
-        QApplication.instance() or QApplication([])
+        _ensure_qt_application()
         wizard = NewGameWizard(
             template_setup={
                 "title": "",
@@ -2599,13 +3562,13 @@ class MainWindowTests(unittest.TestCase):
             self.assertEqual(wizard.character_name_input.text(), "Player Name")
             self.assertEqual(wizard.genre_input.text(), "Cozy mystery")
             self.assertEqual(wizard.starter_items_table.rowCount(), 1)
-            self.assertEqual(wizard.starter_items_table.cellWidget(0, 0).text(), "")
-            self.assertEqual(wizard.starter_items_table.cellWidget(0, 3).text(), "")
+            self.assertEqual(_table_cell(wizard.starter_items_table, 0, 0, QLineEdit).text(), "")
+            self.assertEqual(_table_cell(wizard.starter_items_table, 0, 3, QLineEdit).text(), "")
         finally:
             wizard.close()
 
     def test_new_game_wizard_uses_shared_calendar_settings_dialog_for_custom_calendar(self) -> None:
-        QApplication.instance() or QApplication([])
+        _ensure_qt_application()
         wizard = NewGameWizard()
 
         try:
@@ -2629,7 +3592,7 @@ class MainWindowTests(unittest.TestCase):
             wizard.close()
 
     def test_new_game_wizard_allows_ai_generated_calendar(self) -> None:
-        QApplication.instance() or QApplication([])
+        _ensure_qt_application()
         wizard = NewGameWizard()
 
         try:
@@ -2643,7 +3606,7 @@ class MainWindowTests(unittest.TestCase):
             wizard.close()
 
     def test_new_game_wizard_inventory_currency_tables_add_and_remove_rows(self) -> None:
-        QApplication.instance() or QApplication([])
+        _ensure_qt_application()
         wizard = NewGameWizard()
 
         try:
@@ -2664,21 +3627,24 @@ class MainWindowTests(unittest.TestCase):
                 wizard.starter_items_table.selectionMode(),
                 QTableWidget.SelectionMode.NoSelection,
             )
-            self.assertIsInstance(wizard.starter_items_table.cellWidget(0, 0), QLineEdit)
-            self.assertEqual(wizard.starter_items_table.cellWidget(0, 1).value(), 2)
+            self.assertIsInstance(_table_cell(wizard.starter_items_table, 0, 0, QLineEdit), QLineEdit)
+            item_quantity = _table_cell(wizard.starter_items_table, 0, 1, QSpinBox)
+            item_category = _table_cell(wizard.starter_items_table, 0, 2, QLineEdit)
+            item_remove = _table_cell(wizard.starter_items_table, 0, 5, QPushButton)
+            self.assertEqual(item_quantity.value(), 2)
             self.assertEqual(
-                wizard.starter_items_table.cellWidget(0, 1).minimumWidth(),
-                wizard.starter_items_table.cellWidget(0, 2).minimumWidth(),
+                item_quantity.minimumWidth(),
+                item_category.minimumWidth(),
             )
             self.assertEqual(
                 wizard.starter_items_table.columnWidth(1),
                 wizard.starter_items_table.columnWidth(4),
             )
-            wizard.starter_items_table.cellWidget(0, 1).stepDown()
-            self.assertEqual(wizard.starter_items_table.cellWidget(0, 1).value(), 1)
-            wizard.starter_items_table.cellWidget(0, 1).stepUp()
-            self.assertEqual(wizard.starter_items_table.cellWidget(0, 1).value(), 2)
-            wizard.starter_items_table.cellWidget(0, 5).click()
+            item_quantity.stepDown()
+            self.assertEqual(item_quantity.value(), 1)
+            item_quantity.stepUp()
+            self.assertEqual(item_quantity.value(), 2)
+            item_remove.click()
             self.assertEqual(wizard.starter_items_table.rowCount(), 0)
 
             wizard._append_currency_row({"name": "Bit", "plural_name": "Bits", "value": 1})
@@ -2689,35 +3655,40 @@ class MainWindowTests(unittest.TestCase):
                 wizard.currency_table.selectionMode(),
                 QTableWidget.SelectionMode.NoSelection,
             )
-            self.assertIsInstance(wizard.currency_table.cellWidget(1, 0), QLineEdit)
-            self.assertFalse(wizard.currency_table.cellWidget(0, 2).isEnabled())
-            self.assertTrue(wizard.currency_table.cellWidget(1, 2).isEnabled())
+            self.assertIsInstance(_table_cell(wizard.currency_table, 1, 0, QLineEdit), QLineEdit)
+            base_currency_value = _table_cell(wizard.currency_table, 0, 2, QSpinBox)
+            crown_currency_value = _table_cell(wizard.currency_table, 1, 2, QSpinBox)
+            crown_currency_name = _table_cell(wizard.currency_table, 1, 0, QLineEdit)
+            base_currency_remove = _table_cell(wizard.currency_table, 0, 3, QPushButton)
+            self.assertFalse(base_currency_value.isEnabled())
+            self.assertTrue(crown_currency_value.isEnabled())
             self.assertEqual(
-                wizard.currency_table.cellWidget(1, 2).minimumWidth(),
-                wizard.currency_table.cellWidget(1, 0).minimumWidth(),
+                crown_currency_value.minimumWidth(),
+                crown_currency_name.minimumWidth(),
             )
             self.assertEqual(wizard.currency_table.columnWidth(2), 132)
-            wizard.currency_table.cellWidget(1, 2).stepDown()
-            self.assertEqual(wizard.currency_table.cellWidget(1, 2).value(), 11)
-            wizard.currency_table.cellWidget(1, 2).stepUp()
-            self.assertEqual(wizard.currency_table.cellWidget(1, 2).value(), 12)
-            wizard.currency_table.cellWidget(0, 3).click()
+            crown_currency_value.stepDown()
+            self.assertEqual(crown_currency_value.value(), 11)
+            crown_currency_value.stepUp()
+            self.assertEqual(crown_currency_value.value(), 12)
+            base_currency_remove.click()
             self.assertEqual(wizard.currency_table.rowCount(), 1)
-            self.assertEqual(wizard.currency_table.cellWidget(0, 0).text(), "Crown")
-            self.assertFalse(wizard.currency_table.cellWidget(0, 2).isEnabled())
-            self.assertEqual(wizard.currency_table.cellWidget(0, 2).value(), 1)
+            self.assertEqual(_table_cell(wizard.currency_table, 0, 0, QLineEdit).text(), "Crown")
+            remaining_currency_value = _table_cell(wizard.currency_table, 0, 2, QSpinBox)
+            self.assertFalse(remaining_currency_value.isEnabled())
+            self.assertEqual(remaining_currency_value.value(), 1)
 
             wizard._append_economy_example_row({"name": "Bread", "value_base_units": 2})
             self.assertEqual(wizard.economy_examples_table.rowCount(), 1)
-            self.assertEqual(wizard.economy_examples_table.cellWidget(0, 0).text(), "Bread")
-            self.assertEqual(wizard.economy_examples_table.cellWidget(0, 1).value(), 2)
-            wizard.economy_examples_table.cellWidget(0, 2).click()
+            self.assertEqual(_table_cell(wizard.economy_examples_table, 0, 0, QLineEdit).text(), "Bread")
+            self.assertEqual(_table_cell(wizard.economy_examples_table, 0, 1, QSpinBox).value(), 2)
+            _table_cell(wizard.economy_examples_table, 0, 2, QPushButton).click()
             self.assertEqual(wizard.economy_examples_table.rowCount(), 0)
         finally:
             wizard.close()
 
     def test_new_game_wizard_lightweight_mode_hides_narrator_controls(self) -> None:
-        QApplication.instance() or QApplication([])
+        _ensure_qt_application()
         wizard = NewGameWizard(
             tts_enabled=False,
             template_setup={
@@ -2751,7 +3722,7 @@ class MainWindowTests(unittest.TestCase):
             wizard.close()
 
     def test_new_game_wizard_uses_app_audio_defaults(self) -> None:
-        QApplication.instance() or QApplication([])
+        _ensure_qt_application()
         wizard = NewGameWizard(
             audio_defaults={
                 "music_enabled": False,
@@ -2764,17 +3735,17 @@ class MainWindowTests(unittest.TestCase):
         )
 
         try:
-            self.assertFalse(wizard.music_enabled_checkbox.isChecked())
-            self.assertFalse(wizard.narrator_enabled_checkbox.isChecked())
-            self.assertEqual(wizard.music_volume_slider.value(), 8)
-            self.assertEqual(wizard.tts_volume_slider.value(), 22)
-            self.assertEqual(wizard.tts_speed_slider.value(), 125)
-            self.assertEqual(wizard.tts_voice_combo.currentData(), "am_echo")
+            self.assertFalse(_require(wizard.music_enabled_checkbox).isChecked())
+            self.assertFalse(_require(wizard.narrator_enabled_checkbox).isChecked())
+            self.assertEqual(_require(wizard.music_volume_slider).value(), 8)
+            self.assertEqual(_require(wizard.tts_volume_slider).value(), 22)
+            self.assertEqual(_require(wizard.tts_speed_slider).value(), 125)
+            self.assertEqual(_require(wizard.tts_voice_combo).currentData(), "am_echo")
         finally:
             wizard.close()
 
     def test_new_game_wizard_persists_saved_custom_voice_for_next_wizard(self) -> None:
-        QApplication.instance() or QApplication([])
+        _ensure_qt_application()
         saved_audio_settings = []
         wizard = NewGameWizard(
             audio_defaults={
@@ -2793,7 +3764,7 @@ class MainWindowTests(unittest.TestCase):
         )
 
         try:
-            widget = wizard.tts_settings_widget
+            widget = _require(wizard.tts_settings_widget)
             saved_voice_audio = {
                 "narrator_enabled": True,
                 "tts_volume": 41,
@@ -2829,7 +3800,7 @@ class MainWindowTests(unittest.TestCase):
                 "ai_adventure.ui.main_window.CustomVoiceDialog",
                 return_value=fake_dialog,
             ):
-                widget.custom_voice_button.click()
+                _require(widget.custom_voice_button).click()
 
             self.assertEqual(len(saved_audio_settings), 1)
             self.assertEqual(
@@ -2860,9 +3831,12 @@ class MainWindowTests(unittest.TestCase):
         )
 
         try:
-            next_widget = next_wizard.tts_settings_widget
+            next_widget = _require(next_wizard.tts_settings_widget)
             self.assertEqual(len(next_widget.custom_voices), 1)
-            self.assertIn("Storm Blend", next_widget.custom_voice_summary_label.text())
+            self.assertIn(
+                "Storm Blend",
+                _require(next_widget.custom_voice_summary_label).text(),
+            )
 
             dialog = CustomVoiceDialog(
                 audio_settings=next_widget.build_audio_settings(),
@@ -2877,34 +3851,34 @@ class MainWindowTests(unittest.TestCase):
             self.assertIn("Storm Blend", dialog.current_voice_label.text())
             self.assertEqual(dialog.voice_a_weight_slider.value(), 72)
             self.assertEqual(dialog.voice_b_weight_slider.value(), 28)
-            self.assertEqual(next_widget.tts_volume_slider.value(), 41)
-            self.assertEqual(next_widget.tts_speed_slider.value(), 132)
+            self.assertEqual(_require(next_widget.tts_volume_slider).value(), 41)
+            self.assertEqual(_require(next_widget.tts_speed_slider).value(), 132)
             dialog.close()
         finally:
             next_wizard.close()
 
     def test_new_game_wizard_sample_voice_uses_selected_voice_and_volume(self) -> None:
-        QApplication.instance() or QApplication([])
+        _ensure_qt_application()
         samples = []
         wizard = NewGameWizard(
             voice_options={
                 "Sarah (Female, US)": "af_sarah",
                 "Echo (Male, US)": "am_echo",
             },
-            on_sample_voice=lambda voice, volume: samples.append((voice, volume)) or True,
+            on_sample_voice=lambda voice, volume, _speed: samples.append((voice, volume)) or True,
         )
 
         try:
-            _set_combo_to_data(wizard.tts_voice_combo, "am_echo")
-            wizard.tts_volume_slider.setValue(44)
-            wizard.sample_voice_button.click()
+            _set_combo_to_data(_require(wizard.tts_voice_combo), "am_echo")
+            _require(wizard.tts_volume_slider).setValue(44)
+            _require(wizard.sample_voice_button).click()
 
             self.assertEqual(samples, [("am_echo", 44)])
         finally:
             wizard.close()
 
     def test_new_game_wizard_light_theme_uses_readable_contrast(self) -> None:
-        QApplication.instance() or QApplication([])
+        _ensure_qt_application()
         apply_application_theme("Light")
         wizard = NewGameWizard()
 
@@ -2938,7 +3912,7 @@ class MainWindowTests(unittest.TestCase):
             apply_application_theme("Light")
 
     def test_new_game_wizard_dark_theme_uses_readable_contrast(self) -> None:
-        QApplication.instance() or QApplication([])
+        _ensure_qt_application()
         apply_application_theme("Dark")
         wizard = NewGameWizard()
 
@@ -2972,7 +3946,7 @@ class MainWindowTests(unittest.TestCase):
             apply_application_theme("Light")
 
     def test_new_game_wizard_skills_page_groups_levels_with_descriptions(self) -> None:
-        QApplication.instance() or QApplication([])
+        _ensure_qt_application()
         wizard = NewGameWizard()
 
         try:

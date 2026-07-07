@@ -5,13 +5,18 @@ import logging
 import os
 import re
 from dataclasses import dataclass, field
-from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
 
 from ai_adventure.alchemy.ingredients import (
     COMMON_MEASUREMENT_UNITS,
     CRAFTING_INGREDIENT_CATEGORY_NAMES,
+)
+from ai_adventure.ai.modes import (
+    ALL_CONTENT_HARM_CATEGORIES,
+    ai_mode_preferences_from_context_packet,
+    build_ai_mode_prompt_guidance,
+    normalize_ai_mode_preferences,
 )
 from ai_adventure.calendar_system import normalize_calendar_settings
 from ai_adventure.context.creative_guardrails import (
@@ -20,15 +25,13 @@ from ai_adventure.context.creative_guardrails import (
     sanitize_banned_creative_terms_in_data,
 )
 from ai_adventure.context.naming import GENERIC_PROPER_NOUN_PLACEHOLDER_RULE
-from ai_adventure.currency import normalize_currency_denominations
-from ai_adventure.locations import clean_player_location_name
+from ai_adventure.context.tags import CONTEXT_TAG_DESCRIPTIONS, PLANNABLE_CONTEXT_TAGS
+from ai_adventure.currency import (
+    normalize_currency_denominations,
+    normalize_visible_currency_text,
+)
+from ai_adventure.locations import clean_player_location_name, normalize_known_locations
 from ai_adventure.new_game_setup import STARTER_INVENTORY_MIN_ITEMS
-
-try:
-    from rapidfuzz import fuzz as _rapidfuzz_fuzz
-except ImportError:  # pragma: no cover - exercised only in lean dev environments.
-    _rapidfuzz_fuzz = None
-
 
 LOGGER = logging.getLogger(__name__)
 
@@ -40,6 +43,28 @@ FALLBACK_SUGGESTED_ACTIONS = [
     "Check your inventory, tasks, or surroundings.",
     "Choose the next thing to focus on.",
 ]
+ROUTINE_NO_CHECK_ACTION_RE = re.compile(
+    r"\b("
+    r"go|walk|head|move|travel|return|leave|enter|visit|approach|"
+    r"buy|purchase|pay|order|sell|eat|drink|rest|wait|"
+    r"talk|speak|chat|ask|greet"
+    r")\b",
+    re.IGNORECASE,
+)
+CHECK_WARRANTING_ACTION_RE = re.compile(
+    r"\b("
+    r"ability check|skill check|roll|dc|"
+    r"sneak|stealth|hide|unnoticed|silent|quietly|ambush|"
+    r"search|inspect|examine|investigate|identify|decipher|analyze|"
+    r"persuade|convince|deceive|lie|bluff|intimidate|threaten|haggle|"
+    r"steal|pickpocket|pocket|swipe|shoplift|lockpick|pick the lock|"
+    r"force|break|climb|jump|swim|chase|rush|quickly|before|"
+    r"trap|trapped|hidden|concealed|secret|disarm|"
+    r"craft|forge|brew|alchemy|harvest|forage|track|"
+    r"attack|fight|shoot|stab|cast"
+    r")\b",
+    re.IGNORECASE,
+)
 KNOWN_TEXT_MODELS = {
     "gemini-3.1-flash-lite",
     "gemini-3.1-flash-lite-preview",
@@ -56,6 +81,8 @@ KNOWN_EVENT_TYPE_NAMES = [
     "InventoryItemAddedEvent",
     "InventoryItemRemovedEvent",
     "InventoryItemModifiedEvent",
+    "ContainerOpenedEvent",
+    "ContainerContentsTakenEvent",
     "CombatStartedEvent",
     "RecipeDiscoveredEvent",
     "ReagentDiscoveredEvent",
@@ -63,27 +90,17 @@ KNOWN_EVENT_TYPE_NAMES = [
     "CurrencyDefinedEvent",
     "MusicChangedEvent",
     "FlagSetEvent",
-    "LocationChangedEvent",
-    "PlayerNoteAddedEvent",
-    "WorldLoreAddedEvent",
-    "WorldLoreChangedEvent",
-    "WorldLoreUpdatedEvent",
-    "QuestAddedEvent",
-    "QuestCompletedEvent",
+    "LocationUpsertedEvent",
+    "TravelModeChangedEvent",
+    "WorldLoreUpsertedEvent",
     "ActiveTaskUpsertedEvent",
-    "ActiveTaskUpdatedEvent",
     "ActiveTaskCompletedEvent",
     "SpellLearnedEvent",
     "NpcUpsertedEvent",
     "NpcKnowledgeAddedEvent",
+    "SecretUpsertedEvent",
 ]
-TEXT_SAFETY_HARM_CATEGORIES = [
-    "HARM_CATEGORY_HARASSMENT",
-    "HARM_CATEGORY_HATE_SPEECH",
-    "HARM_CATEGORY_SEXUALLY_EXPLICIT",
-    "HARM_CATEGORY_DANGEROUS_CONTENT",
-    "HARM_CATEGORY_CIVIC_INTEGRITY",
-]
+TEXT_SAFETY_HARM_CATEGORIES = list(ALL_CONTENT_HARM_CATEGORIES)
 STRING_LIST_SCHEMA: dict[str, Any] = {
     "type": "array",
     "items": {"type": "string"},
@@ -92,6 +109,55 @@ NONEMPTY_STRING_LIST_SCHEMA: dict[str, Any] = {
     "type": "array",
     "items": {"type": "string"},
     "minItems": 1,
+}
+GM_SECRET_RECORD_PROPERTIES: dict[str, Any] = {
+    "secret_id": {
+        "type": "string",
+        "description": "Stable lower_snake_case identifier for future updates.",
+    },
+    "title": {"type": "string"},
+    "details": {
+        "type": "string",
+        "description": "Canonical GM-only truth; never player-facing.",
+    },
+    "reveal_condition": {"type": "string"},
+    "related_npc_ids": STRING_LIST_SCHEMA,
+    "related_locations": STRING_LIST_SCHEMA,
+    "status": {
+        "type": "string",
+        "enum": ["active", "revealed", "retired"],
+    },
+}
+GM_SECRET_RECORD_REQUIRED_FIELDS = [
+    "secret_id",
+    "title",
+    "details",
+    "reveal_condition",
+    "related_npc_ids",
+    "related_locations",
+    "status",
+]
+GM_SECRET_RECORD_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": GM_SECRET_RECORD_PROPERTIES,
+    "required": GM_SECRET_RECORD_REQUIRED_FIELDS,
+    "additionalProperties": False,
+}
+NEW_GAME_GM_SECRET_RECORD_PROPERTIES: dict[str, Any] = {
+    key: value
+    for key, value in GM_SECRET_RECORD_PROPERTIES.items()
+    if key != "status"
+}
+NEW_GAME_GM_SECRET_RECORD_REQUIRED_FIELDS = [
+    key
+    for key in GM_SECRET_RECORD_REQUIRED_FIELDS
+    if key != "status"
+]
+NEW_GAME_GM_SECRET_RECORD_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": NEW_GAME_GM_SECRET_RECORD_PROPERTIES,
+    "required": NEW_GAME_GM_SECRET_RECORD_REQUIRED_FIELDS,
+    "additionalProperties": False,
 }
 RECIPE_INGREDIENT_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -137,6 +203,86 @@ JSON_PRIMITIVE_SCHEMA: dict[str, Any] = {
         {"type": "boolean"},
     ]
 }
+CONTAINER_CONTENT_ITEM_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "name": {"type": "string"},
+        "category": {"type": "string"},
+        "quantity": {"type": "integer", "minimum": 1},
+        "description": {"type": "string"},
+        "value_base_units": {"type": "integer", "minimum": 0},
+        "weapon_hands": {
+            "type": "string",
+            "enum": ["one-handed", "two-handed", ""],
+        },
+        "damage": {"type": "string"},
+        "damage_type": {"type": "string"},
+        "attack_skill": {"type": "string"},
+        "attack_range_feet": {"type": "integer", "minimum": 0},
+        "ammunition_type_required": {"type": "string"},
+        "clip_size": {"type": "integer", "minimum": 0},
+        "bullets_per_attack": {"type": "integer", "minimum": 0},
+        "ammunition_type": {"type": "string"},
+        "covers_body_parts": {
+            "type": "array",
+            "items": {"type": "string"},
+        },
+        "armor_rating": {"type": "integer", "minimum": 0},
+    },
+    "required": [
+        "name",
+        "category",
+        "quantity",
+        "description",
+        "value_base_units",
+    ],
+    "additionalProperties": False,
+}
+CONTAINER_METADATA_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "is_open": {"type": "boolean"},
+        "contents_taken": {"type": "boolean"},
+        "is_locked": {"type": "boolean"},
+        "lockpick_skill": {"type": "string"},
+        "lockpick_dc": {"type": "integer", "minimum": 0},
+        "lockpick_failure_consequence": {"type": "string"},
+        "is_trapped": {"type": "boolean"},
+        "trap_notice_skill": {"type": "string"},
+        "trap_notice_dc": {"type": "integer", "minimum": 0},
+        "trap_disarm_skill": {"type": "string"},
+        "trap_disarm_dc": {"type": "integer", "minimum": 0},
+        "trap_failure_consequence": {"type": "string"},
+        "contents": {
+            "type": "object",
+            "properties": {
+                "currency_base_units": {"type": "integer", "minimum": 0},
+                "items": {
+                    "type": "array",
+                    "items": CONTAINER_CONTENT_ITEM_SCHEMA,
+                },
+            },
+            "required": ["currency_base_units", "items"],
+            "additionalProperties": False,
+        },
+    },
+    "required": [
+        "is_open",
+        "contents_taken",
+        "is_locked",
+        "lockpick_skill",
+        "lockpick_dc",
+        "lockpick_failure_consequence",
+        "is_trapped",
+        "trap_notice_skill",
+        "trap_notice_dc",
+        "trap_disarm_skill",
+        "trap_disarm_dc",
+        "trap_failure_consequence",
+        "contents",
+    ],
+    "additionalProperties": False,
+}
 
 
 def _event_response_schema(
@@ -176,19 +322,16 @@ EVENT_RESPONSE_SCHEMA: dict[str, Any] = {
                 "location": {"type": "string"},
                 "minutes_passed": INT_OR_AUTO_SCHEMA,
                 "weather": {"type": "string"},
+                "discover_location": {
+                    "type": "boolean",
+                    "description": (
+                        "True only when the player has actually reached a newly "
+                        "discovered location that should appear in the Travel tab."
+                    ),
+                },
             },
             ["location", "minutes_passed", "weather"],
             description="Updates location, weather, and elapsed time.",
-        ),
-        _event_response_schema(
-            "LocationChangedEvent",
-            {
-                "location": {"type": "string"},
-                "minutes_passed": INT_OR_AUTO_SCHEMA,
-                "weather": {"type": "string"},
-            },
-            ["location"],
-            description="Legacy-compatible status update focused on location.",
         ),
         _event_response_schema(
             "SkillCheckRequestedEvent",
@@ -231,11 +374,18 @@ EVENT_RESPONSE_SCHEMA: dict[str, Any] = {
                 },
                 "damage": {"type": "string"},
                 "damage_type": {"type": "string"},
+                "attack_skill": {"type": "string"},
+                "attack_range_feet": INT_OR_SKIP_SCHEMA,
+                "ammunition_type_required": {"type": "string"},
+                "clip_size": INT_OR_SKIP_SCHEMA,
+                "bullets_per_attack": INT_OR_SKIP_SCHEMA,
+                "ammunition_type": {"type": "string"},
                 "covers_body_parts": {
                     "type": "array",
                     "items": {"type": "string"},
                 },
                 "armor_rating": INT_OR_SKIP_SCHEMA,
+                "container": CONTAINER_METADATA_SCHEMA,
             },
             ["item_type", "item_name", "description", "amount", "value_base_units"],
         ),
@@ -262,13 +412,36 @@ EVENT_RESPONSE_SCHEMA: dict[str, Any] = {
                 },
                 "damage": {"type": "string"},
                 "damage_type": {"type": "string"},
+                "attack_skill": {"type": "string"},
+                "attack_range_feet": INT_OR_SKIP_SCHEMA,
+                "ammunition_type_required": {"type": "string"},
+                "clip_size": INT_OR_SKIP_SCHEMA,
+                "bullets_per_attack": INT_OR_SKIP_SCHEMA,
+                "ammunition_type": {"type": "string"},
                 "covers_body_parts": {
                     "type": "array",
                     "items": {"type": "string"},
                 },
                 "armor_rating": INT_OR_SKIP_SCHEMA,
+                "container": CONTAINER_METADATA_SCHEMA,
             },
             ["target_name"],
+        ),
+        _event_response_schema(
+            "ContainerOpenedEvent",
+            {"container_name": {"type": "string"}},
+            ["container_name"],
+            description=(
+                "Marks a container as open after Python validates its lock and trap."
+            ),
+        ),
+        _event_response_schema(
+            "ContainerContentsTakenEvent",
+            {"container_name": {"type": "string"}},
+            ["container_name"],
+            description=(
+                "Transfers the exact stored contents of an already-open container."
+            ),
         ),
         _event_response_schema(
             "CombatStartedEvent",
@@ -283,6 +456,37 @@ EVENT_RESPONSE_SCHEMA: dict[str, Any] = {
                             "name": {"type": "string"},
                             "health": {"type": "integer", "minimum": 1},
                             "armor_rating": {"type": "integer", "minimum": 1},
+                            "to_hit_bonus": {
+                                "type": "integer",
+                                "minimum": -99,
+                                "maximum": 99,
+                            },
+                            "initiative_bonus": {
+                                "type": "integer",
+                                "minimum": -99,
+                                "maximum": 99,
+                            },
+                            "personality": {
+                                "type": "string",
+                                "enum": [
+                                    "balanced",
+                                    "aggressive",
+                                    "cautious",
+                                    "intelligent",
+                                ],
+                            },
+                            "weapon_name": {"type": "string"},
+                            "ammunition_type_required": {"type": "string"},
+                            "clip_size": {"type": "integer", "minimum": 0},
+                            "clip_ammo": {"type": "integer", "minimum": 0},
+                            "bullets_per_attack": {
+                                "type": "integer",
+                                "minimum": 0,
+                            },
+                            "reserve_ammo": {
+                                "type": "integer",
+                                "minimum": 0,
+                            },
                             "damage": {"type": "string"},
                             "loot": {
                                 "type": "array",
@@ -293,7 +497,22 @@ EVENT_RESPONSE_SCHEMA: dict[str, Any] = {
                                 "items": {"type": "string"},
                             },
                         },
-                        "required": ["name", "health", "armor_rating", "damage", "loot"],
+                        "required": [
+                            "name",
+                            "health",
+                            "armor_rating",
+                            "to_hit_bonus",
+                            "initiative_bonus",
+                            "personality",
+                            "weapon_name",
+                            "ammunition_type_required",
+                            "clip_size",
+                            "clip_ammo",
+                            "bullets_per_attack",
+                            "reserve_ammo",
+                            "damage",
+                            "loot",
+                        ],
                         "additionalProperties": False,
                     },
                 },
@@ -305,13 +524,58 @@ EVENT_RESPONSE_SCHEMA: dict[str, Any] = {
                             "name": {"type": "string"},
                             "health": {"type": "integer", "minimum": 1},
                             "armor_rating": {"type": "integer", "minimum": 1},
+                            "to_hit_bonus": {
+                                "type": "integer",
+                                "minimum": -99,
+                                "maximum": 99,
+                            },
+                            "initiative_bonus": {
+                                "type": "integer",
+                                "minimum": -99,
+                                "maximum": 99,
+                            },
+                            "personality": {
+                                "type": "string",
+                                "enum": [
+                                    "balanced",
+                                    "aggressive",
+                                    "cautious",
+                                    "intelligent",
+                                ],
+                            },
+                            "weapon_name": {"type": "string"},
+                            "ammunition_type_required": {"type": "string"},
+                            "clip_size": {"type": "integer", "minimum": 0},
+                            "clip_ammo": {"type": "integer", "minimum": 0},
+                            "bullets_per_attack": {
+                                "type": "integer",
+                                "minimum": 0,
+                            },
+                            "reserve_ammo": {
+                                "type": "integer",
+                                "minimum": 0,
+                            },
                             "damage": {"type": "string"},
                             "status_effects": {
                                 "type": "array",
                                 "items": {"type": "string"},
                             },
                         },
-                        "required": ["name", "health", "armor_rating", "damage"],
+                        "required": [
+                            "name",
+                            "health",
+                            "armor_rating",
+                            "to_hit_bonus",
+                            "initiative_bonus",
+                            "personality",
+                            "weapon_name",
+                            "ammunition_type_required",
+                            "clip_size",
+                            "clip_ammo",
+                            "bullets_per_attack",
+                            "reserve_ammo",
+                            "damage",
+                        ],
                         "additionalProperties": False,
                     },
                 },
@@ -378,58 +642,42 @@ EVENT_RESPONSE_SCHEMA: dict[str, Any] = {
             ["key", "value"],
         ),
         _event_response_schema(
-            "PlayerNoteAddedEvent",
-            {"content": {"type": "string"}},
-            ["content"],
+            "LocationUpsertedEvent",
+            {
+                "name": {"type": "string"},
+                "description": {"type": "string"},
+                "x_miles": {"type": "number"},
+                "y_miles": {"type": "number"},
+                "terrain": {"type": "string"},
+                "travel_multiplier": {"type": "number", "minimum": 0.1, "maximum": 3.0},
+                "travel_notes": {"type": "string"},
+            },
+            [
+                "name",
+                "description",
+                "x_miles",
+                "y_miles",
+                "terrain",
+                "travel_multiplier",
+                "travel_notes",
+            ],
         ),
         _event_response_schema(
-            "WorldLoreAddedEvent",
+            "TravelModeChangedEvent",
+            {
+                "mode": {"type": "string"},
+                "speed_multiplier": {"type": "number", "minimum": 0.1, "maximum": 20.0},
+            },
+            ["mode", "speed_multiplier"],
+        ),
+        _event_response_schema(
+            "WorldLoreUpsertedEvent",
             {
                 "section": {"type": "string"},
                 "key": {"type": "string"},
                 "text": {"type": "string"},
             },
             ["section", "key", "text"],
-        ),
-        _event_response_schema(
-            "WorldLoreChangedEvent",
-            {
-                "section": {"type": "string"},
-                "key": {"type": "string"},
-                "replacement_lore": {"type": "string"},
-            },
-            ["section", "key", "replacement_lore"],
-        ),
-        _event_response_schema(
-            "WorldLoreUpdatedEvent",
-            {
-                "section": {"type": "string"},
-                "key": {"type": "string"},
-                "replacement_lore": {"type": "string"},
-            },
-            ["section", "key", "replacement_lore"],
-        ),
-        _event_response_schema(
-            "QuestAddedEvent",
-            {
-                "name": {"type": "string"},
-                "giver": {"type": "string"},
-                "description": {"type": "string"},
-                "turn_in": {"type": "string"},
-                "reward": {"type": "string"},
-                "notes": {"type": "string"},
-            },
-            ["name", "description"],
-        ),
-        _event_response_schema(
-            "QuestCompletedEvent",
-            {
-                "name": {"type": "string"},
-                "notes": {"type": "string"},
-                "resolution": {"type": "string"},
-                "outcome": {"type": "string"},
-            },
-            ["name"],
         ),
         _event_response_schema(
             "ActiveTaskUpsertedEvent",
@@ -449,34 +697,6 @@ EVENT_RESPONSE_SCHEMA: dict[str, Any] = {
                         "Absolute in-world minute when the task is due, or -1 "
                         "when there is no known deadline."
                     ),
-                },
-            },
-            [
-                "name",
-                "category",
-                "status",
-                "description",
-                "requester",
-                "location",
-                "reward",
-                "due_date",
-                "due_elapsed_minutes",
-            ],
-        ),
-        _event_response_schema(
-            "ActiveTaskUpdatedEvent",
-            {
-                "name": {"type": "string"},
-                "category": {"type": "string"},
-                "status": {"type": "string"},
-                "description": {"type": "string"},
-                "requester": {"type": "string"},
-                "location": {"type": "string"},
-                "reward": {"type": "string"},
-                "due_date": {"type": "string"},
-                "due_elapsed_minutes": {
-                    "type": "integer",
-                    "minimum": -1,
                 },
             },
             ["name"],
@@ -533,6 +753,51 @@ EVENT_RESPONSE_SCHEMA: dict[str, Any] = {
             },
             ["facts"],
         ),
+        _event_response_schema(
+            "SecretUpsertedEvent",
+            GM_SECRET_RECORD_PROPERTIES,
+            GM_SECRET_RECORD_REQUIRED_FIELDS,
+            description="Creates or replaces private database-backed GM memory.",
+        ),
+    ]
+}
+NEW_GAME_EVENT_TYPE_NAMES = (
+    "NpcUpsertedEvent",
+    "ActiveTaskUpsertedEvent",
+    "MusicChangedEvent",
+)
+NEW_GAME_ACTIVE_TASK_EVENT_RESPONSE_SCHEMA: dict[str, Any] = _event_response_schema(
+    "ActiveTaskUpsertedEvent",
+    {
+        "name": {"type": "string"},
+        "category": {"type": "string"},
+        "description": {"type": "string"},
+        "requester": {"type": "string"},
+        "location": {"type": "string"},
+        "reward": {"type": "string"},
+        "due_date": {"type": "string"},
+        "due_elapsed_minutes": {
+            "type": "integer",
+            "minimum": -1,
+            "description": (
+                "Absolute in-world minute when the task is due, or -1 "
+                "when there is no known deadline."
+            ),
+        },
+    },
+    ["name"],
+)
+NEW_GAME_EVENT_RESPONSE_SCHEMA: dict[str, Any] = {
+    "anyOf": [
+        NEW_GAME_ACTIVE_TASK_EVENT_RESPONSE_SCHEMA
+        if event_type == "ActiveTaskUpsertedEvent"
+        else
+        next(
+            branch
+            for branch in EVENT_RESPONSE_SCHEMA["anyOf"]
+            if branch["properties"]["type"]["enum"] == [event_type]
+        )
+        for event_type in NEW_GAME_EVENT_TYPE_NAMES
     ]
 }
 STORY_RESPONSE_JSON_SCHEMA: dict[str, Any] = {
@@ -584,9 +849,18 @@ SKILL_CHECK_PLAN_RESPONSE_JSON_SCHEMA: dict[str, Any] = {
                 "required": ["skill_name"],
                 "additionalProperties": False,
             },
-        }
+        },
+        "relevant_tags": {
+            "type": "array",
+            "description": (
+                "Context-rule tags whose guidance materially applies to the latest "
+                "player command and should be included in the full narration request."
+            ),
+            "items": {"type": "string", "enum": sorted(PLANNABLE_CONTEXT_TAGS)},
+            "uniqueItems": True,
+        },
     },
-    "required": ["checks"],
+    "required": ["checks", "relevant_tags"],
     "additionalProperties": False,
 }
 NEW_GAME_RESPONSE_JSON_SCHEMA: dict[str, Any] = {
@@ -601,6 +875,40 @@ NEW_GAME_RESPONSE_JSON_SCHEMA: dict[str, Any] = {
                 "type": "object",
                 "additionalProperties": {"type": "string"},
             },
+        },
+        "locations": {
+            "type": "array",
+            "description": "Player-known map-aware locations for the Travel tab.",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "description": {"type": "string"},
+                    "x_miles": {"type": "number"},
+                    "y_miles": {"type": "number"},
+                    "terrain": {"type": "string"},
+                    "travel_multiplier": {"type": "number", "minimum": 0.1, "maximum": 3.0},
+                    "travel_notes": {"type": "string"},
+                },
+                "required": [
+                    "name",
+                    "description",
+                    "x_miles",
+                    "y_miles",
+                    "terrain",
+                    "travel_multiplier",
+                    "travel_notes",
+                ],
+                "additionalProperties": False,
+            },
+        },
+        "gm_secrets": {
+            "type": "array",
+            "description": (
+                "Private AI-only starting truths for continuity and mystery logic; "
+                "never player-facing."
+            ),
+            "items": NEW_GAME_GM_SECRET_RECORD_SCHEMA,
         },
         "start_location": {"type": "string"},
         "calendar_settings": {
@@ -640,7 +948,7 @@ NEW_GAME_RESPONSE_JSON_SCHEMA: dict[str, Any] = {
         "starting_calendar": {
             "type": "object",
             "properties": {
-                "elapsed_minutes": {"type": "integer"},
+                "current_minute": {"type": "integer"},
                 "year": {"type": "integer"},
                 "month_name": {"type": "string"},
                 "month_number": {"type": "integer"},
@@ -687,6 +995,23 @@ NEW_GAME_RESPONSE_JSON_SCHEMA: dict[str, Any] = {
                     "quantity": {"type": "integer", "minimum": 1},
                     "description": {"type": "string"},
                     "value_base_units": {"type": "integer", "minimum": 0},
+                    "weapon_hands": {
+                        "type": "string",
+                        "enum": ["one-handed", "two-handed", ""],
+                    },
+                    "damage": {"type": "string"},
+                    "damage_type": {"type": "string"},
+                    "attack_skill": {"type": "string"},
+                    "attack_range_feet": {"type": "integer", "minimum": 0},
+                    "ammunition_type_required": {"type": "string"},
+                    "clip_size": {"type": "integer", "minimum": 0},
+                    "bullets_per_attack": {"type": "integer", "minimum": 0},
+                    "ammunition_type": {"type": "string"},
+                    "covers_body_parts": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                    "armor_rating": {"type": "integer", "minimum": 0},
                     "source_index": {
                         "type": "integer",
                         "minimum": -1,
@@ -736,12 +1061,13 @@ NEW_GAME_RESPONSE_JSON_SCHEMA: dict[str, Any] = {
             "description": "Three or four short player-facing action options for the opening scene.",
             "items": {"type": "string"},
         },
-        "events": {"type": "array", "items": EVENT_RESPONSE_SCHEMA},
+        "events": {"type": "array", "items": NEW_GAME_EVENT_RESPONSE_SCHEMA},
     },
     "required": [
         "selected_genre",
         "world_summary",
         "world_lore",
+        "gm_secrets",
         "start_location",
         "starting_calendar",
         "weather",
@@ -756,146 +1082,6 @@ NEW_GAME_RESPONSE_JSON_SCHEMA: dict[str, Any] = {
     ],
     "additionalProperties": False,
 }
-
-UNCERTAIN_ACTION_KEYWORDS: dict[str, tuple[str, ...]] = {
-    "Crafting": (
-        "alchemy",
-        "brew",
-        "craft",
-        "crafting",
-        "distill",
-        "elixir",
-        "experiment",
-        "identify reagent",
-        "make",
-        "mix",
-        "potion",
-        "recipe",
-        "reagent",
-        "repair",
-        "tincture",
-    ),
-    "Foraging": (
-        "forage",
-        "foraging",
-        "geological find",
-        "harvest",
-        "herb",
-        "mushroom",
-        "plant",
-        "search for",
-        "specimen",
-        "camp",
-        "flora",
-        "forage",
-        "harvest",
-        "hunt",
-        "scout",
-        "track",
-        "trail",
-        "wild",
-    ),
-    "Mining": (
-        "dig",
-        "mine",
-        "mining",
-        "mineral",
-        "ore",
-        "pickaxe",
-        "quarry",
-        "vein",
-    ),
-    "Investigation": (
-        "clue",
-        "examine",
-        "inspect",
-        "investigate",
-        "research",
-        "search",
-        "study",
-    ),
-    "Perception": (
-        "listen",
-        "notice",
-        "observe",
-        "scan",
-        "spot",
-    ),
-    "Persuasion": (
-        "bargain",
-        "convince",
-        "haggle",
-        "negotiate",
-        "persuade",
-    ),
-    "Stealth": (
-        "hide",
-        "sneak",
-        "stealth",
-        "conceal",
-    ),
-    "Athletics": (
-        "balance",
-        "climb",
-        "jump",
-        "lift",
-        "run",
-        "swim",
-    ),
-    "Melee": (
-        "attack",
-        "block",
-        "duel",
-        "fight",
-        "parry",
-        "strike",
-    ),
-}
-TRIVIAL_ACTION_KEYWORDS = {
-    "close",
-    "go",
-    "head",
-    "leave",
-    "look around",
-    "move",
-    "open",
-    "return",
-    "talk",
-    "walk",
-}
-SKILL_NAME_MATCH_THRESHOLD = 82.0
-SKILL_DESCRIPTION_MATCH_THRESHOLD = 78.0
-SKILL_KEYWORD_ALIASES: dict[str, tuple[str, ...]] = {
-    "Foraging": ("Fieldcraft", "Survival"),
-    "Mining": ("Prospecting",),
-    "Perception": ("Awareness",),
-    "Prospecting": ("Mining",),
-}
-SKILL_MATCH_STOPWORDS = {
-    "a",
-    "an",
-    "and",
-    "are",
-    "as",
-    "at",
-    "by",
-    "for",
-    "from",
-    "in",
-    "into",
-    "is",
-    "it",
-    "of",
-    "on",
-    "or",
-    "that",
-    "the",
-    "their",
-    "to",
-    "with",
-    "your",
-}
-
 
 @dataclass(frozen=True)
 class GeminiSettings:
@@ -927,6 +1113,7 @@ class SkillCheckPlanResult:
     """Parsed result from a lightweight pre-narration skill-check request."""
 
     checks: list[dict[str, Any]] = field(default_factory=list)
+    relevant_tags: list[str] | None = None
     raw_text: str = ""
 
 
@@ -942,6 +1129,8 @@ class AiWorldSetupResult:
     start_weather: str = ""
     selected_genre: str = ""
     world_lore: dict[str, dict[str, str]] = field(default_factory=dict)
+    locations: list[dict[str, Any]] = field(default_factory=list)
+    gm_secrets: list[dict[str, Any]] = field(default_factory=list)
     finalized_character: dict[str, str] = field(default_factory=dict)
     finalized_skills: list[dict[str, Any]] = field(default_factory=list)
     finalized_starter_items: list[dict[str, Any]] = field(default_factory=list)
@@ -994,6 +1183,7 @@ class GeminiNarrationService:
                 "google-genai is not installed. Install project requirements first."
             ) from error
 
+        ai_preferences = ai_mode_preferences_from_context_packet(context_packet)
         prompt = build_gemini_story_prompt(context_packet)
         client = genai.Client(api_key=self.settings.api_key)
 
@@ -1008,7 +1198,12 @@ class GeminiNarrationService:
         response = client.models.generate_content(
             model=self.settings.model,
             contents=prompt,
-            config=_structured_output_config(STORY_RESPONSE_JSON_SCHEMA),  # type: ignore[arg-type]
+            config=_structured_output_config(
+                STORY_RESPONSE_JSON_SCHEMA,
+                model=self.settings.model,
+                ai_preferences=ai_preferences,
+                apply_response_length=True,
+            ),  # type: ignore[arg-type]
         )
         raw_text = _repair_gemini_creative_terms(
             client,
@@ -1016,6 +1211,8 @@ class GeminiNarrationService:
             str(getattr(response, "text", "") or "").strip(),
             "story response",
             STORY_RESPONSE_JSON_SCHEMA,
+            ai_preferences=ai_preferences,
+            apply_response_length=True,
         )
         LOGGER.info("Gemini raw story response:\n%s", raw_text)
 
@@ -1027,12 +1224,14 @@ class GeminiNarrationService:
             )
 
         result = parse_gemini_story_response(raw_text)
+        result = _drop_unwarranted_skill_check_events(result, context_packet)
         result = _drop_duplicate_resolved_skill_check_events(result, context_packet)
         result = _ensure_in_game_suggested_actions(result, context_packet)
         result = _ensure_status_event_for_in_game_response(result, context_packet)
-        result = _ensure_skill_check_for_uncertain_player_command(result, context_packet)
+        result = _enforce_container_reward_flow(result, context_packet)
         result = _ensure_inventory_for_collected_reagents(result, context_packet)
-        return _ensure_inventory_for_narrated_collection(result, context_packet)
+        result = _ensure_inventory_for_narrated_collection(result, context_packet)
+        return _normalize_visible_currency_phrasing(result, context_packet)
 
     def plan_story_skill_checks(
         self,
@@ -1060,6 +1259,7 @@ class GeminiNarrationService:
                 "google-genai is not installed. Install project requirements first."
             ) from error
 
+        ai_preferences = ai_mode_preferences_from_context_packet(context_packet)
         prompt = build_skill_check_plan_prompt(context_packet)
         client = genai.Client(api_key=self.settings.api_key)
 
@@ -1074,7 +1274,11 @@ class GeminiNarrationService:
         response = client.models.generate_content(
             model=self.settings.model,
             contents=prompt,
-            config=_structured_output_config(SKILL_CHECK_PLAN_RESPONSE_JSON_SCHEMA),  # type: ignore[arg-type]
+            config=_structured_output_config(
+                SKILL_CHECK_PLAN_RESPONSE_JSON_SCHEMA,
+                model=self.settings.model,
+                ai_preferences=ai_preferences,
+            ),  # type: ignore[arg-type]
         )
         raw_text = _repair_gemini_creative_terms(
             client,
@@ -1082,6 +1286,7 @@ class GeminiNarrationService:
             str(getattr(response, "text", "") or "").strip(),
             "skill-check plan response",
             SKILL_CHECK_PLAN_RESPONSE_JSON_SCHEMA,
+            ai_preferences=ai_preferences,
         )
         LOGGER.info("Gemini raw skill-check plan response:\n%s", raw_text)
 
@@ -1089,7 +1294,10 @@ class GeminiNarrationService:
             LOGGER.warning("Gemini returned an empty skill-check plan response.")
             return SkillCheckPlanResult(raw_text=raw_text)
 
-        return parse_skill_check_plan_response(raw_text)
+        return _filter_unwarranted_planned_skill_checks(
+            parse_skill_check_plan_response(raw_text),
+            context_packet,
+        )
 
     def generate_new_game_world(
         self,
@@ -1117,6 +1325,7 @@ class GeminiNarrationService:
                 "google-genai is not installed. Install project requirements first."
             ) from error
 
+        ai_preferences = ai_mode_preferences_from_context_packet(setup_packet)
         prompt = build_gemini_new_game_prompt(setup_packet)
         client = genai.Client(api_key=self.settings.api_key)
 
@@ -1124,7 +1333,13 @@ class GeminiNarrationService:
         response = client.models.generate_content(
             model=self.settings.model,
             contents=prompt,
-            config=_structured_output_config(NEW_GAME_RESPONSE_JSON_SCHEMA),  # type: ignore[arg-type]
+            config=_structured_output_config(
+                NEW_GAME_RESPONSE_JSON_SCHEMA,
+                model=self.settings.model,
+                ai_preferences=ai_preferences,
+                apply_response_length=True,
+                response_length_scope="new_game",
+            ),  # type: ignore[arg-type]
         )
         raw_text = _repair_gemini_creative_terms(
             client,
@@ -1132,6 +1347,9 @@ class GeminiNarrationService:
             str(getattr(response, "text", "") or "").strip(),
             "new-game response",
             NEW_GAME_RESPONSE_JSON_SCHEMA,
+            ai_preferences=ai_preferences,
+            apply_response_length=True,
+            response_length_scope="new_game",
         )
         LOGGER.info("Gemini raw new-game response:\n%s", raw_text)
 
@@ -1180,7 +1398,6 @@ def load_gemini_settings(env_path: Path | None = None) -> GeminiSettings:
         api_key=(
             os.getenv("GEMINI_API_KEY")
             or env_values.get("GEMINI_API_KEY")
-            
             or ""
         ).strip(),
         model=model,
@@ -1200,6 +1417,10 @@ def build_skill_check_plan_prompt(context_packet: dict[str, Any]) -> str:
 
     planning_packet = _skill_check_planning_packet(context_packet)
     packet_json = json.dumps(planning_packet, indent=2)
+    tag_rundown = "\n".join(
+        f"- {tag}: {description}."
+        for tag, description in CONTEXT_TAG_DESCRIPTIONS.items()
+    )
 
     return (
         "You are a game master deciding whether the player's latest action "
@@ -1208,21 +1429,46 @@ def build_skill_check_plan_prompt(context_packet: dict[str, Any]) -> str:
         "Rules:\n"
         "- Return checks as an array. Use [] when no check is needed.\n"
         "- Choose only checks needed to resolve meaningful uncertainty in the "
-        "latest player_command.\n"
-        "- Request checks for actions that could plausibly fail, go poorly, take "
-        "extra time, vary in quality, consume resources, reveal misleading "
-        "information, attract attention, cause harm, or miss something.\n"
-        "- Named skill use, foraging, harvesting, searching, researching, "
-        "identifying, crafting, alchemy experiments, persuasion, stealth, and "
-        "combat usually need checks unless trivial and risk-free.\n"
+        "latest player_command. Use [] for ordinary actions where no meaningful "
+        "stakes, opposition, hidden information, scarcity, danger, or time pressure "
+        "is present in this scene.\n"
+        "- Do not request a check merely because an action could theoretically "
+        "vary in quality or take extra time. Request a check only when failure or "
+        "partial success would create a meaningful consequence right now.\n"
+        "- Foraging, harvesting, searching, researching, identifying, crafting, "
+        "alchemy experiments, persuasion, stealth, and combat need checks only "
+        "when the current command has actual uncertainty, opposition, risk, hidden "
+        "information, resource pressure, or meaningful consequences.\n"
+        "- Named skill use is not automatically a check if the command is otherwise "
+        "routine or low-stakes.\n"
         "- Routine movement, paying a known price, receiving ordinary goods, "
         "eating, drinking, and casual conversation do not need checks unless the "
         "player adds a contested, risky, hidden, time-sensitive, or deceptive goal.\n"
+        "- Examples needing []: walk to the market; return to the tavern; buy a "
+        "listed meal at its known price; greet the bartender; wait by the fountain.\n"
+        "- Examples needing checks: sneak past guards; search for a hidden door; "
+        "haggle under pressure; pick a lock; identify a strange poison; rush to "
+        "arrive before a deadline.\n"
+        "- If the command tries to inspect or open a listed container, use its "
+        "container metadata exactly. Request its trap_notice_skill/trap_notice_dc "
+        "when noticing the trap is uncertain, trap_disarm_skill/trap_disarm_dc when "
+        "disarming it, and lockpick_skill/lockpick_dc when picking its lock. Do not "
+        "invent a generic check or substitute a different DC.\n"
         "- Prefer an existing known skill_name when one fits. If no existing skill "
         "fits, use a clear new skill_name.\n"
         "- Include difficulty or dc when the action's risk is clear. Use reason "
         "to briefly explain why the check is needed.\n"
+        "- Also return relevant_tags: the small list of rule categories that need "
+        "extra guidance for the full narration request. Include only categories "
+        "that materially apply; use [] when no special category applies.\n"
+        "- Choose relevant_tags only from the exact names below. For example, a "
+        "risky search for a recipe might return [\"exploration\", \"recipe\", "
+        "\"skill\", \"uncertainty\"].\n"
         "- Do not narrate the outcome. Do not roll. The Python application rolls.\n\n"
+        "Available context tags:\n"
+        f"{tag_rundown}\n\n"
+        "Response shape:\n"
+        "{\"checks\": [...], \"relevant_tags\": [\"tag_name\", ...]}\n\n"
         "Planning packet:\n"
         f"{packet_json}"
     )
@@ -1242,6 +1488,9 @@ def build_gemini_story_prompt(context_packet: dict[str, Any]) -> str:
     packet_json = json.dumps(context_packet, indent=2)
     banned_terms = _banned_terms_from_context(context_packet)
     banned_terms_text = ", ".join(banned_terms) if banned_terms else "(none provided)"
+    ai_preferences = ai_mode_preferences_from_context_packet(context_packet)
+    mode_guidance = build_ai_mode_prompt_guidance(context_packet)
+    content_rule = _story_content_rule(ai_preferences)
 
     return (
         "You are the AI narrator for AI Adventure.\n"
@@ -1249,6 +1498,7 @@ def build_gemini_story_prompt(context_packet: dict[str, Any]) -> str:
         "The Python application is the source of truth for state. You may suggest "
         "events, but do not claim that durable state changed unless an event is "
         "suggested for validation.\n\n"
+        f"{mode_guidance}\n\n"
         "NPC knowledge boundary:\n"
         "- The narrator can see the full context packet, but NPCs cannot.\n"
         "- NPCs must not reference private player state such as exact inventory, "
@@ -1281,8 +1531,23 @@ def build_gemini_story_prompt(context_packet: dict[str, Any]) -> str:
         "tab under Notes. Write it as player-known information about a person, not "
         "as a mechanical service role. Never put secret identities, hidden motives, "
         "mystery solutions, private plans, or GM-only facts in "
-        "player_facing_information. Do not put hidden NPC or mystery information "
-        "in suggested events unless the player has learned it.\n\n"
+        "player_facing_information. Store hidden NPC or mystery information with "
+        "SecretUpsertedEvent instead of a player-visible event field.\n\n"
+        "Private GM secret memory:\n"
+        "- state.gm_secrets.active contains authoritative hidden truths that the AI "
+        "must remember across turns. Use those truths for continuity, clues, NPC "
+        "behavior, off-screen plans, and mystery logic without stating them in "
+        "player-facing narration before the player earns or discovers them.\n"
+        "- Suggest SecretUpsertedEvent when a durable hidden fact is created or "
+        "materially changes. Reuse its stable secret_id and send the full current "
+        "record. Use status='active' while hidden, 'revealed' once the player learns "
+        "it, and 'retired' when it is no longer true or useful.\n"
+        "- When a secret becomes revealed, also suggest the appropriate player-known "
+        "NPC, World Lore, Location, task, flag, or other event so the learned fact "
+        "continues to exist outside private secret memory.\n"
+        "- Never copy active secret details into response, suggested_actions, "
+        "player_facing_information, public_description, world lore, travel fields, "
+        "tasks, or other player-visible fields unless the current turn reveals them.\n\n"
         "Creative naming boundary (hard requirement):\n"
         "- This is a highest-priority output rule, not optional style guidance.\n"
         "- If the context packet includes creative_ideas, treat those examples as "
@@ -1303,17 +1568,7 @@ def build_gemini_story_prompt(context_packet: dict[str, Any]) -> str:
         "schema defines the required top-level fields.\n\n"
         "Rules:\n"
         "- response must be a non-empty string.\n"
-        "- Mature fictional content is allowed when it fits the scene, genre, and "
-        "player choices. Assume the player character and player are adults of legal "
-        "drinking age unless the saved character profile explicitly says otherwise. "
-        "Do not sanitize taverns, inns, feasts, criminal districts, battlefields, "
-        "or political conflicts into harmless substitutes. Alcohol, drunken "
-        "patrons, gambling, threats, intimidation, violence, injury, blood, corpses, "
-        "crime, cruelty, corruption, and oppressive social attitudes may appear as "
-        "ordinary fictional world content. Keep descriptions story-focused rather "
-        "than instructional. For prejudice or slurs, use fictional in-world terms "
-        "for fictional cultures, species, factions, classes, or guilds; do not use "
-        "real-world slurs against protected classes.\n"
+        f"- {content_rule}\n"
         "- Spoken dialogue must use double quotation marks around the speaker's "
         "full spoken sentence or paragraph. Do not use single quotation marks as "
         "the outer boundary of dialogue. Use single quotation marks only when an "
@@ -1361,16 +1616,31 @@ def build_gemini_story_prompt(context_packet: dict[str, Any]) -> str:
         "- events may include multiple entries of the same event type when multiple "
         "distinct state changes happen in the same turn.\n"
         "- If suggesting events, use the event_shape, known_event_types, and selected event contracts from the packet.\n"
-        "- For uncertain actions, suggest SkillCheckRequestedEvent before any "
-        "final outcome event. This is required for foraging, harvesting, "
-        "searching, researching, identifying, crafting, alchemy experiments, "
-        "persuasion, stealth, combat, and named skill use unless the action is "
-        "trivial and risk-free. Do not use SkillXpAddedEvent as a substitute "
-        "for a check.\n"
+        "- For actions with meaningful uncertainty, opposition, hidden information, "
+        "danger, resource pressure, time pressure, or real consequences, suggest "
+        "SkillCheckRequestedEvent before any final outcome event. Do not request "
+        "a check merely because an action could theoretically vary in quality or "
+        "take extra time; use checks only when failure or partial success would "
+        "matter in the current scene. Do not use SkillXpAddedEvent as a substitute "
+        "for a warranted check.\n"
         "- Routine movement, paying a known price, receiving ordinary goods, "
         "eating, drinking, and casual conversation are not skill checks unless "
         "the player adds a contested, risky, hidden, time-sensitive, or "
         "deceptive goal.\n"
+        "- state.travel is the authoritative player-known travel map. Its x_miles "
+        "and y_miles coordinates use a shared map measured in miles; do not invent "
+        "a conflicting distance for known locations. When the player learns a new "
+        "meaningful location, suggest LocationUpsertedEvent with all player-known "
+        "description, map coordinates, terrain, travel_multiplier, and travel_notes "
+        "instead of WorldLoreUpsertedEvent. Use TravelModeChangedEvent when a horse, "
+        "vehicle, group, injury, or other sustained circumstance meaningfully "
+        "changes the player's travel speed.\n"
+        "- When context_packet.travel_request.active is true, treat its distance "
+        "and estimated_minutes as logistics for an attempted journey, not a "
+        "guaranteed teleport. Narrate the beginning, progress, interruption, delay, "
+        "detour, or arrival that follows from the scene. Suggest StatusUpdatedEvent "
+        "only when the player actually reaches a new location, set discover_location "
+        "true only when it is newly discovered, and report the time that truly passed.\n"
         "- If state.skills.resolved_checks_this_turn is non-empty, those are "
         "the authoritative skill-check results for this player_command. Do not "
         "request duplicate SkillCheckRequestedEvent entries for those skills. "
@@ -1385,16 +1655,40 @@ def build_gemini_story_prompt(context_packet: dict[str, Any]) -> str:
         "as an integer of at least 1.\n"
         "- For weapons, set item_type='Weapon' and include weapon_hands "
         "('one-handed' or 'two-handed') plus damage as a dice expression such "
-        "as 1d6, 1d8, or 2d6. For armor or shields, set item_type='Armor', "
+        "as 1d6, 1d8, or 2d6. Ranged weapons may also include "
+        "attack_range_feet, ammunition_type_required, clip_size, and "
+        "bullets_per_attack. Ammunition inventory items use "
+        "item_type='Ammunition' and matching ammunition_type metadata. "
+        "For armor or shields, set item_type='Armor', "
         "include covers_body_parts, and include armor_rating as the armor bonus "
         "that item contributes. Use category/item_type values of Weapon and "
         "Armor clearly so the Character sheet can equip them.\n"
         "- state.item_catalog.items is the master list of known item definitions. "
         "Use it to remember item descriptions after items leave inventory, but "
         "only state.inventory.items are current possessions.\n"
+        "- Containers are inventory items with item_type='Container' and a required "
+        "container metadata object. When the player acquires a closed pouch, purse, "
+        "chest, box, bag, or similar object, add only that container. Store its exact "
+        "hidden currency and item contents, open/taken flags, locked/trapped flags, "
+        "notice/disarm/lockpick skills and DCs, and both failure consequences in the "
+        "container metadata. Do not reveal, award, or independently emit the stored "
+        "currency/items while it is closed.\n"
+        "- Use ContainerOpenedEvent only when the player actually opens the named "
+        "container and all required resolved lock/trap checks succeeded. Opening does "
+        "not itself transfer contents. Use ContainerContentsTakenEvent only after the "
+        "container is open and the player explicitly takes its contents. Python then "
+        "transfers the exact stored contents once. Never accompany either container "
+        "event with CurrencyChangedEvent or InventoryItemAddedEvent for those contents.\n"
         "- If a situation becomes an actual fight, suggest CombatStartedEvent "
         "with concrete enemies, optional allied combatants, health, armor_rating, "
-        "damage dice, and loot. Do not narrate attack rolls, turn-by-turn combat, "
+        "to_hit_bonus, initiative_bonus, personality, weapon/ammunition/clip fields, damage "
+        "dice, and loot. Use empty ammunition_type_required and zero clip fields "
+        "for weapons that do not consume ammunition. The application rolls "
+        "initiative, adds to_hit_bonus to d20 attacks, tracks reloading, calculates "
+        "each team's Threat Levels from health, armor, and damage, and uses those "
+        "percentages for every non-intelligent NPC's target selection. Intelligent "
+        "NPCs instead choose targets tactically. "
+        "Do not narrate attack rolls, turn-by-turn combat, "
         "damage totals, deaths, victory, defeat, or loot recovery after combat "
         "starts. The Python application handles combat deterministically in the "
         "Combat tab and blocks Story input until combat is resolved.\n"
@@ -1420,7 +1714,12 @@ def build_gemini_story_prompt(context_packet: dict[str, Any]) -> str:
         "money movement, suggest CurrencyChangedEvent with payload.base_unit_amount "
         "as the one net money change. Never use net_base_unit_amount. If the "
         "player buys an item, also suggest the InventoryItemAddedEvent for that "
-        "item; do not create coin inventory items for payment or change.\n"
+        "item; do not create coin inventory items for payment or change. In "
+        "player-facing response text and suggested_actions, do not write awkward "
+        "phrases like '35 copper coins worth of silver' or mention base units. "
+        "Use the world's denomination names and break amounts into the largest "
+        "natural denominations, such as '3 Silver Coins and 5 Copper Coins' when "
+        "35 baseline units equals that breakdown.\n"
         "- ActiveTaskUpsertedEvent is shown directly in the Active Tasks tab. Fill "
         "only category, status, description, requester, location, reward, due_date, "
         "and due_elapsed_minutes with useful player-facing values. Do not add "
@@ -1433,10 +1732,9 @@ def build_gemini_story_prompt(context_packet: dict[str, Any]) -> str:
         "due_elapsed_minutes must be the absolute in-world elapsed minute for "
         "that deadline. Use 'Unknown' only when a value exists but is genuinely "
         "unclear.\n"
-        "Do not use a fixed sentence count. Scale response length to the "
-        "importance, risk, and consequences of the action; provide enough text "
-        "to make the outcome feel earned without being padded. "
-        "Concisely describe the scene, and make sure to properly address all parts of the user's query. \n"
+        "- Follow the selected Response Length mode. Within that mode, scale detail "
+        "to the importance, risk, and consequences of the action, and address every "
+        "part of the player's query without padding.\n"
         "When creating items, ensure that you give a quantifiable amount or size for the item, rather than using phrases such as \"a pile of [ore/apples/etc.]\".\n"
         "- Do not invent hidden state, inventory, recipes, or flags as confirmed facts.\n\n"
         "Context packet:\n"
@@ -1458,11 +1756,15 @@ def build_gemini_new_game_prompt(setup_packet: dict[str, Any]) -> str:
     packet_json = json.dumps(setup_packet, indent=2)
     banned_terms = _banned_terms_from_context(setup_packet)
     banned_terms_text = ", ".join(banned_terms) if banned_terms else "(none provided)"
+    ai_preferences = ai_mode_preferences_from_context_packet(setup_packet)
+    mode_guidance = build_ai_mode_prompt_guidance(setup_packet)
+    content_rule = _story_content_rule(ai_preferences)
 
     return (
         "You are creating the initial world setup for AI Adventure.\n"
         "Use only the structured setup packet below as confirmed setup input. "
         "Synthesize the player's choices into a coherent playable world.\n\n"
+        f"{mode_guidance}\n\n"
         "Creative naming boundary (hard requirement):\n"
         "- This is a highest-priority output rule, not optional style guidance.\n"
         "- Never use creative_ideas.banned_terms, close spelling variants, "
@@ -1489,16 +1791,7 @@ def build_gemini_new_game_prompt(setup_packet: dict[str, Any]) -> str:
         "- Never use creative_ideas.banned_terms, close spelling variants, "
         "hyphenation variants, or obvious reskins for newly invented proper nouns.\n"
         f"- {GENERIC_PROPER_NOUN_PLACEHOLDER_RULE}\n"
-        "- Mature fictional content is allowed when it fits the selected genre, "
-        "world, opening location, and player setup. Assume the player character "
-        "and player are adults of legal drinking age unless the character setup "
-        "explicitly says otherwise. Taverns may include alcohol, bartenders, "
-        "drunken patrons, gambling, brawls, shady deals, and adult social texture. "
-        "Violence, blood, corpses, criminality, cruelty, corruption, and oppressive "
-        "social attitudes may be part of the world when genre-appropriate. Use "
-        "fictional in-world slurs or insults only for fictional cultures, species, "
-        "factions, classes, or guilds; do not invent or use real-world slurs "
-        "against protected classes.\n"
+        f"- {content_rule}\n"
         "- If the setup packet includes character_generation_guidance, follow its "
         "gender_presentation_hint when inventing blank/default player character "
         "fields. A blank/default player character does not imply male. Vary gender "
@@ -1520,17 +1813,23 @@ def build_gemini_new_game_prompt(setup_packet: dict[str, Any]) -> str:
         "merchant character can live in a city whose religion is about storms, "
         "ancestry, law, harvests, stars, or anything else coherent; the economy "
         "can matter without every institution being coin-themed.\n"
-        "- world_summary must be a few paragraphs describing at least the basics "
-        "of the world or city, prominent NPCs, locations of interest, religions, "
-        "and economy. It may use light Markdown headings, bold names, italics, "
-        "and bullet lists when that improves readability.\n"
+        "- world_summary must follow the selected Response Length mode while still "
+        "covering the basics of the world or city, prominent NPCs, locations of "
+        "interest, religions, and economy. It may use light Markdown headings, "
+        "bold names, italics, and bullet lists when that improves readability.\n"
         "- world_lore must group player-known starting lore into keyed category "
         "objects where each key is the durable entry name and each value is the "
-        "player-facing lore text. Include useful categories such as Locations, Religions, Economy, "
+        "player-facing lore text. Include useful categories such as Religions, Economy, "
         "Culture and Laws, Factions and Guilds, Prominent NPCs, and Current Rumors "
         "when they fit the game. Do not include secrets, mystery solutions, hidden "
         "villains, or GM-only facts in world_lore. Lore text may use light "
         "Markdown such as italics, bold important names, and short lists.\n"
+        "- locations must be a player-known array for the Travel tab. Include the "
+        "starting location at x_miles=0 and y_miles=0 plus at least three other "
+        "meaningful reachable places. Coordinates are relative map miles, not GPS "
+        "coordinates. Give each location a concise description, terrain, a positive "
+        "travel_multiplier (below 1 slows travel), and practical player-known route "
+        "notes. Do not include hidden routes, secrets, or GM-only facts.\n"
         "- introductory_message must be player-facing narration for the first "
         "scene at start_location and must end with exactly "
         "'What do you do now?'\n"
@@ -1605,7 +1904,13 @@ def build_gemini_new_game_prompt(setup_packet: dict[str, Any]) -> str:
         "invent enough additional concrete items that naturally fit the finalized "
         "character, genre, starting location, weather, and economy to reach the "
         "minimum. Return the finalized inventory in the starting_items field; "
-        "do not use the alias starting_inventory. Preserve "
+        "do not use the alias starting_inventory. "
+        "Weapon starter items should include weapon_hands, damage, attack_skill, "
+        "and attack_range_feet. Guns and other ammunition weapons should also "
+        "include ammunition_type_required, clip_size, and bullets_per_attack, "
+        "plus a compatible Ammunition starter item with matching "
+        "ammunition_type. Armor should include covers_body_parts and armor_rating. "
+        "Preserve "
         "any player-provided setup.starter_items entries whose requires_ai_invention "
         "field is false. Set source_index to the zero-based setup.starter_items "
         "index for items based on a setup starter-item entry, and -1 for extra "
@@ -1623,6 +1928,11 @@ def build_gemini_new_game_prompt(setup_packet: dict[str, Any]) -> str:
         "of Starting Food Amount, and Water instead of Starting Water Quantity. Put "
         "quantities in quantity, not name. Each item must include "
         "name, category, quantity, description, value_base_units, and source_index.\n"
+        "- Do not create closed or hidden-content containers in starting_items. "
+        "The new-game schema intentionally keeps starter inventory flat for Gemini "
+        "compatibility. If the opening scene later awards a closed pouch, chest, "
+        "bag, case, or similar container, normal story turns can add it with "
+        "complete container metadata.\n"
         "- If setup.currency_denominations is empty, currency_denominations must "
         "contain at least one and at most four concrete denominations that fit "
         "the selected genre, world, and economy. One denomination must have "
@@ -1640,12 +1950,18 @@ def build_gemini_new_game_prompt(setup_packet: dict[str, Any]) -> str:
         "setup.economy_examples common-price rows when choosing it. Do not create "
         "coin or purse items in starting_items to represent spendable money.\n"
         "- The API response schema defines the required output fields and event "
-        "envelope. Use type and payload for each event; do not use event_type as "
-        "the top-level event type key.\n"
+        "envelope. New-game events may only be NpcUpsertedEvent, "
+        "ActiveTaskUpsertedEvent, or MusicChangedEvent. Put hidden identities, "
+        "motives, mystery solutions, off-screen plans, and other GM-only starting "
+        "truths in the top-level gm_secrets array, not in player-facing fields "
+        "or the events array. The app stores those starting secrets as active. "
+        "Use the direct setup fields for all other initial state. Use type and payload for each event; "
+        "do not use event_type as the top-level event type key.\n"
         "- Use only player-known information in player-facing event fields.\n"
         "- Use NpcUpsertedEvent for prominent NPCs the player can know about at "
         "setup. Remember that if the Player requested more than one NPC, or that you think that the Player would know more than one NPC, then you can pass more than one NpcUpsertedEvent.\n"
-        "Use ActiveTaskUpsertedEvent for initial active obligations. Use "
+        "Use ActiveTaskUpsertedEvent for initial active obligations, including "
+        "classic quests with category Quest. Use "
         "currency_denominations for initial generated money instead of "
         "CurrencyDefinedEvent. Use CurrencyDefinedEvent only when a story event "
         "establishes a new denomination after initial setup. If "
@@ -1658,23 +1974,71 @@ def build_gemini_new_game_prompt(setup_packet: dict[str, Any]) -> str:
     )
 
 
-def _structured_output_config(schema: dict[str, Any]) -> dict[str, Any]:
+def _story_content_rule(ai_preferences: dict[str, Any]) -> str:
+    """Returns story prose guidance that agrees with the selected safety filters."""
+
+    return str(ai_preferences["model_content_rules"])
+
+
+def _structured_output_config(
+    schema: dict[str, Any],
+    *,
+    model: str = DEFAULT_GEMINI_MODEL,
+    ai_preferences: dict[str, Any] | None = None,
+    apply_response_length: bool = False,
+    response_length_scope: str = "story",
+) -> dict[str, Any]:
     """Builds the Gemini structured-output config for a JSON response schema."""
 
-    return {
+    preferences = normalize_ai_mode_preferences(ai_preferences)
+    config: dict[str, Any] = {
         "response_mime_type": "application/json",
         "response_json_schema": schema,
-        "safety_settings": _permissive_text_safety_settings(),
+        "safety_settings": _content_safety_settings(
+            preferences["allowed_content_categories"]
+        ),
+        "thinking_config": _thinking_config(
+            model,
+            str(preferences["thinking_level"]),
+        ),
     }
 
+    max_output_tokens = (
+        preferences["new_game_max_output_tokens"]
+        if response_length_scope == "new_game"
+        else preferences["max_output_tokens"]
+    )
+    if apply_response_length and max_output_tokens is not None:
+        config["max_output_tokens"] = int(max_output_tokens)
 
-def _permissive_text_safety_settings() -> list[dict[str, str]]:
-    """Returns explicit Gemini safety settings for mature fictional storytelling."""
+    return config
 
+
+def _thinking_config(model: str, thinking_level: str) -> dict[str, Any]:
+    """Returns a model-compatible Gemini thinking configuration."""
+
+    if str(model).strip().casefold().startswith("gemini-2.5"):
+        return {
+            "thinking_budget": 24576 if thinking_level == "high" else 1024,
+        }
+
+    return {"thinking_level": "high" if thinking_level == "high" else "minimal"}
+
+
+def _content_safety_settings(
+    allowed_categories: list[str],
+) -> list[dict[str, str]]:
+    """Allows checked Gemini harm categories and blocks unchecked categories."""
+
+    allowed = set(allowed_categories)
     return [
         {
             "category": category,
-            "threshold": "OFF",
+            "threshold": (
+                "OFF"
+                if category in allowed
+                else "BLOCK_LOW_AND_ABOVE"
+            ),
         }
         for category in TEXT_SAFETY_HARM_CATEGORIES
     ]
@@ -1686,6 +2050,10 @@ def _repair_gemini_creative_terms(
     raw_text: str,
     response_label: str,
     schema: dict[str, Any],
+    *,
+    ai_preferences: dict[str, Any] | None = None,
+    apply_response_length: bool = False,
+    response_length_scope: str = "story",
 ) -> str:
     """Asks Gemini to rewrite a response when it uses banned generated names."""
 
@@ -1718,7 +2086,13 @@ def _repair_gemini_creative_terms(
             response = client.models.generate_content(
                 model=model,
                 contents=repair_prompt,
-                config=_structured_output_config(schema),  # type: ignore[arg-type]
+                config=_structured_output_config(
+                    schema,
+                    model=model,
+                    ai_preferences=ai_preferences,
+                    apply_response_length=apply_response_length,
+                    response_length_scope=response_length_scope,
+                ),  # type: ignore[arg-type]
             )
         except Exception:
             LOGGER.exception(
@@ -1886,6 +2260,16 @@ def _skill_check_planning_packet(context_packet: dict[str, Any]) -> dict[str, An
     if not isinstance(skills, dict):
         skills = {}
 
+    inventory = state.get("inventory", {})
+
+    if not isinstance(inventory, dict):
+        inventory = {}
+
+    inventory_items = inventory.get("items", [])
+
+    if not isinstance(inventory_items, list):
+        inventory_items = []
+
     recent_history = context_packet.get("recent_history", [])
 
     if not isinstance(recent_history, list):
@@ -1897,6 +2281,19 @@ def _skill_check_planning_packet(context_packet: dict[str, Any]) -> dict[str, An
         "scene": state.get("scene", {}) if isinstance(state.get("scene"), dict) else {},
         "player": state.get("player", {}) if isinstance(state.get("player"), dict) else {},
         "known_skills": skills.get("known_skills", []),
+        "containers": [
+            item
+            for item in inventory_items
+            if isinstance(item, dict)
+            and isinstance(item.get("metadata"), dict)
+            and str(item["metadata"].get("item_type", "")).casefold()
+            == "container"
+        ],
+        "gm_secrets": (
+            state.get("gm_secrets", {})
+            if isinstance(state.get("gm_secrets"), dict)
+            else {}
+        ),
         "recent_checks": skills.get("recent_checks", []),
         "recent_history": recent_history[-2:],
     }
@@ -1927,6 +2324,7 @@ def _context_packet_stats(
         "recent_checks": _list_len(_nested_value(state, "skills", "recent_checks")),
         "active_tasks": _list_len(_nested_value(state, "active_tasks", "tasks")),
         "relevant_npcs": _list_len(_nested_value(state, "npcs", "relevant")),
+        "active_gm_secrets": _list_len(_nested_value(state, "gm_secrets", "active")),
         "valid_music_tracks": _list_len(_nested_value(state, "audio", "valid_music_tracks")),
     }
 
@@ -2003,10 +2401,31 @@ def parse_skill_check_plan_response(raw_text: str) -> SkillCheckPlanResult:
     )
 
     raw_checks = data.get("checks", [])
+    raw_relevant_tags = data.get("relevant_tags")
 
     if not isinstance(raw_checks, list):
         LOGGER.warning("Gemini skill-check plan checks was not a list. Ignoring it.")
         raw_checks = []
+
+    relevant_tags: list[str] | None = None
+
+    if isinstance(raw_relevant_tags, list):
+        normalized_tags = [
+            tag.strip().casefold()
+            for tag in raw_relevant_tags
+            if isinstance(tag, str) and tag.strip().casefold() in PLANNABLE_CONTEXT_TAGS
+        ]
+        relevant_tags = list(dict.fromkeys(normalized_tags))
+
+        if raw_relevant_tags and not relevant_tags:
+            LOGGER.warning(
+                "Gemini skill-check plan returned no valid relevant_tags; using keyword fallback."
+            )
+            relevant_tags = None
+    elif raw_relevant_tags is not None:
+        LOGGER.warning(
+            "Gemini skill-check plan relevant_tags was not a list; using keyword fallback."
+        )
 
     checks: list[dict[str, Any]] = []
     seen_names: set[str] = set()
@@ -2041,7 +2460,83 @@ def parse_skill_check_plan_response(raw_text: str) -> SkillCheckPlanResult:
         checks.append(payload)
         seen_names.add(folded_name)
 
-    return SkillCheckPlanResult(checks=checks, raw_text=guarded_raw_text)
+    return SkillCheckPlanResult(
+        checks=checks,
+        relevant_tags=relevant_tags,
+        raw_text=guarded_raw_text,
+    )
+
+
+def _filter_unwarranted_planned_skill_checks(
+    result: SkillCheckPlanResult,
+    context_packet: dict[str, Any],
+) -> SkillCheckPlanResult:
+    """Drops planned checks for clearly routine low-stakes commands."""
+
+    if not result.checks or not _player_command_is_routine_no_check(context_packet):
+        return result
+
+    LOGGER.warning(
+        "Gemini planned skill check(s) for routine low-stakes action; dropping them."
+    )
+    relevant_tags = result.relevant_tags
+    if isinstance(relevant_tags, list):
+        relevant_tags = [
+            tag for tag in relevant_tags if tag not in {"skill", "uncertainty"}
+        ]
+
+    return SkillCheckPlanResult(
+        checks=[],
+        relevant_tags=relevant_tags,
+        raw_text=result.raw_text,
+    )
+
+
+def _drop_unwarranted_skill_check_events(
+    result: AiNarrationResult,
+    context_packet: dict[str, Any],
+) -> AiNarrationResult:
+    """Drops SkillCheckRequestedEvent entries for clearly routine commands."""
+
+    if not result.suggested_events or not _player_command_is_routine_no_check(
+        context_packet
+    ):
+        return result
+
+    filtered_events = [
+        event
+        for event in result.suggested_events
+        if _raw_event_type(event) != "SkillCheckRequestedEvent"
+    ]
+    if len(filtered_events) == len(result.suggested_events):
+        return result
+
+    LOGGER.warning(
+        "Gemini requested skill check(s) for routine low-stakes action; dropping them."
+    )
+    return AiNarrationResult(
+        narrative_text=result.narrative_text,
+        suggested_actions=result.suggested_actions,
+        suggested_events=filtered_events,
+        out_of_game=result.out_of_game,
+        raw_text=result.raw_text,
+    )
+
+
+def _player_command_is_routine_no_check(context_packet: dict[str, Any]) -> bool:
+    """Returns True when the latest command is ordinary and needs no check."""
+
+    if str(context_packet.get("packet_type", "")).strip() != "story_turn":
+        return False
+
+    command = str(context_packet.get("player_command", "")).strip()
+    if not command:
+        return False
+
+    if CHECK_WARRANTING_ACTION_RE.search(command):
+        return False
+
+    return ROUTINE_NO_CHECK_ACTION_RE.search(command) is not None
 
 
 def parse_gemini_story_response(raw_text: str) -> AiNarrationResult:
@@ -2139,6 +2634,40 @@ def _parse_suggested_actions(raw_actions: Any, *, response_label: str) -> list[s
     ]
 
 
+def _normalize_visible_currency_phrasing(
+    result: AiNarrationResult,
+    context_packet: dict[str, Any],
+) -> AiNarrationResult:
+    """Formats awkward visible money amounts using the save's denominations."""
+
+    currency_state = _state_subpacket(context_packet, "currency")
+    denominations = normalize_currency_denominations(
+        currency_state.get("denominations"),
+    )
+    narrative_text = normalize_visible_currency_text(
+        result.narrative_text,
+        denominations,
+    )
+    suggested_actions = [
+        normalize_visible_currency_text(action, denominations)
+        for action in result.suggested_actions
+    ]
+
+    if (
+        narrative_text == result.narrative_text
+        and suggested_actions == result.suggested_actions
+    ):
+        return result
+
+    return AiNarrationResult(
+        narrative_text=narrative_text,
+        suggested_actions=suggested_actions,
+        suggested_events=result.suggested_events,
+        out_of_game=result.out_of_game,
+        raw_text=result.raw_text,
+    )
+
+
 def _ensure_in_game_suggested_actions(
     result: AiNarrationResult,
     context_packet: dict[str, Any],
@@ -2179,7 +2708,7 @@ def _ensure_status_event_for_in_game_response(
         return result
 
     if any(
-        _raw_event_type(event) in {"StatusUpdatedEvent", "LocationChangedEvent"}
+        _raw_event_type(event) == "StatusUpdatedEvent"
         for event in result.suggested_events
     ):
         return result
@@ -2208,60 +2737,170 @@ def _ensure_status_event_for_in_game_response(
     )
 
 
-def _ensure_skill_check_for_uncertain_player_command(
+def _enforce_container_reward_flow(
     result: AiNarrationResult,
     context_packet: dict[str, Any],
 ) -> AiNarrationResult:
-    """Adds a fallback skill-check event for a clearly uncertain player command."""
+    """Drops direct rewards that would bypass a container's stored state."""
 
-    if result.out_of_game or _is_continuation_request(context_packet):
+    if result.out_of_game:
         return result
 
-    if _resolved_skill_names_from_context(context_packet):
-        return result
-
-    if any(_raw_event_type(event) == "SkillCheckRequestedEvent" for event in result.suggested_events):
-        return result
-
-    command = str(context_packet.get("player_command", "")).strip()
-    looks_uncertain = _looks_like_uncertain_action(command)
-    skill_name = _infer_skill_check_name(
-        command,
-        context_packet,
-        result.suggested_events,
+    combined_text = " ".join(
+        [
+            str(context_packet.get("player_command", "")),
+            result.narrative_text,
+            *result.suggested_actions,
+        ]
     )
-
-    if not skill_name:
-        return result
-
-    if not looks_uncertain and not _skill_text_matches_command(skill_name, command):
-        return result
-
-    skill_check_event = {
-        "type": "SkillCheckRequestedEvent",
-        "payload": {
-            "skill_name": skill_name,
-            "difficulty": "normal",
-        },
-    }
-    filtered_events = [
-        event
+    closed_container_names = _closed_container_names_from_context(context_packet)
+    references_closed_container = any(
+        name.casefold() in combined_text.casefold()
+        for name in closed_container_names
+    )
+    adds_closed_container = any(
+        _event_is_closed_container_addition(event)
         for event in result.suggested_events
-        if _raw_event_type(event) != "SkillXpAddedEvent"
-    ]
-    LOGGER.warning(
-        "Gemini omitted SkillCheckRequestedEvent for uncertain player command %r; "
-        "injecting %s check.",
-        command,
-        skill_name,
+    )
+    takes_contents = any(
+        _raw_event_type(event) == "ContainerContentsTakenEvent"
+        for event in result.suggested_events
+    )
+    protects_closed_contents = (
+        references_closed_container
+        or adds_closed_container
+        or _text_indicates_unopened_container(combined_text)
     )
 
+    if not protects_closed_contents and not takes_contents:
+        return result
+
+    filtered_events: list[dict[str, Any]] = []
+    removed_event_types: list[str] = []
+
+    for event in result.suggested_events:
+        event_type = _raw_event_type(event)
+        payload = event.get("payload", {})
+        clean_payload = payload if isinstance(payload, dict) else {}
+        remove_event = False
+
+        if event_type == "CurrencyChangedEvent":
+            amount = _coerce_int(
+                clean_payload.get(
+                    "base_unit_amount",
+                    clean_payload.get("amount", 0),
+                ),
+                default=0,
+            )
+            remove_event = amount > 0
+        elif (
+            event_type == "InventoryItemAddedEvent"
+            and str(clean_payload.get("item_type", "")).strip().casefold()
+            != "container"
+        ):
+            remove_event = True
+
+        if remove_event:
+            removed_event_types.append(event_type)
+        else:
+            filtered_events.append(event)
+
+    if not removed_event_types:
+        return result
+
+    LOGGER.warning(
+        "Dropped direct container reward event(s) %s; stored contents may only "
+        "transfer through ContainerContentsTakenEvent after the container opens.",
+        removed_event_types,
+    )
     return AiNarrationResult(
         narrative_text=result.narrative_text,
         suggested_actions=result.suggested_actions,
-        suggested_events=[skill_check_event, *filtered_events],
+        suggested_events=filtered_events,
         out_of_game=result.out_of_game,
         raw_text=result.raw_text,
+    )
+
+
+def _closed_container_names_from_context(
+    context_packet: dict[str, Any],
+) -> set[str]:
+    """Reads the names of unopened inventory containers from story state."""
+
+    state = context_packet.get("state", {})
+    inventory = state.get("inventory", {}) if isinstance(state, dict) else {}
+    items = inventory.get("items", []) if isinstance(inventory, dict) else []
+    names: set[str] = set()
+
+    if not isinstance(items, list):
+        return names
+
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+
+        metadata = item.get("metadata", {})
+        container = metadata.get("container", {}) if isinstance(metadata, dict) else {}
+
+        if (
+            isinstance(container, dict)
+            and str(metadata.get("item_type", "")).casefold() == "container"
+            and container.get("is_open") is not True
+        ):
+            name = str(item.get("name", "") or "").strip()
+
+            if name:
+                names.add(name)
+
+    return names
+
+
+def _event_is_closed_container_addition(event: dict[str, Any]) -> bool:
+    """Returns whether an event adds a container whose contents are still closed."""
+
+    if _raw_event_type(event) != "InventoryItemAddedEvent":
+        return False
+
+    payload = event.get("payload", {})
+
+    if not isinstance(payload, dict):
+        return False
+
+    container = payload.get("container", {})
+    return (
+        str(payload.get("item_type", "")).strip().casefold() == "container"
+        and isinstance(container, dict)
+        and container.get("is_open") is not True
+    )
+
+
+def _text_indicates_unopened_container(text: str) -> bool:
+    """Detects prose that explicitly defers inspecting or opening contents."""
+
+    folded = str(text or "").casefold()
+
+    if not re.search(
+        r"\b(?:bag|box|case|chest|container|crate|pouch|purse|sack|satchel)\b",
+        folded,
+    ):
+        return False
+
+    return bool(
+        re.search(
+            r"\b(?:closed|locked|sealed|shut|unopened)\b",
+            folded,
+        )
+        or re.search(
+            r"\b(?:open|inspect|search|check|examine|look(?:ing)?)\b"
+            r".{0,45}\b(?:contents|inside|pouch|purse|bag|box|case|chest|"
+            r"crate|sack|satchel)\b",
+            folded,
+        )
+        or re.search(
+            r"\b(?:contents|inside)\b.{0,45}"
+            r"\b(?:later|afterward|when safe|in private|quiet spot)\b",
+            folded,
+        )
     )
 
 
@@ -2360,8 +2999,12 @@ def _ensure_inventory_for_collected_reagents(
         [
             result.narrative_text,
             str(context_packet.get("player_command", "")),
+            *result.suggested_actions,
         ]
     )
+
+    if _text_indicates_unopened_container(collection_text):
+        return result
 
     if not _text_suggests_physical_collection(collection_text):
         return result
@@ -2428,7 +3071,7 @@ def _ensure_inventory_for_narrated_collection(
     result: AiNarrationResult,
     context_packet: dict[str, Any],
 ) -> AiNarrationResult:
-    """Adds a generic inventory item when Gemini narrates loot but emits none."""
+    """Removes unsupported inventory prose when Gemini narrates loot but emits none."""
 
     if result.out_of_game:
         return result
@@ -2440,8 +3083,12 @@ def _ensure_inventory_for_narrated_collection(
         [
             result.narrative_text,
             str(context_packet.get("player_command", "")),
+            *result.suggested_actions,
         ]
     )
+
+    if _text_indicates_unopened_container(collection_text):
+        return result
 
     if not _text_suggests_physical_collection(collection_text):
         return result
@@ -2449,25 +3096,20 @@ def _ensure_inventory_for_narrated_collection(
     if not _text_suggests_narrated_inventory_reward(collection_text):
         return result
 
-    inventory_event = {
-        "type": "InventoryItemAddedEvent",
-        "payload": {
-            "item_type": "Foraged Goods",
-            "item_name": "Assorted Foraged Specimens",
-            "description": _narrated_collection_description(collection_text),
-            "amount": 1,
-            "value_base_units": 1,
-        },
-    }
+    trimmed_narrative = _remove_unsupported_inventory_sentences(result.narrative_text)
+
+    if trimmed_narrative == result.narrative_text:
+        return result
+
     LOGGER.warning(
         "Gemini narrated collected inventory without InventoryItemAddedEvent; "
-        "adding Assorted Foraged Specimens."
+        "removing unsupported inventory sentence from visible narration."
     )
 
     return AiNarrationResult(
-        narrative_text=result.narrative_text,
+        narrative_text=trimmed_narrative,
         suggested_actions=result.suggested_actions,
-        suggested_events=[*result.suggested_events, inventory_event],
+        suggested_events=result.suggested_events,
         out_of_game=result.out_of_game,
         raw_text=result.raw_text,
     )
@@ -2529,24 +3171,58 @@ def _text_suggests_narrated_inventory_reward(text: str) -> bool:
     return any(phrase in clean_text for phrase in reward_phrases)
 
 
-def _narrated_collection_description(text: str) -> str:
-    """Builds a conservative description for fallback generic collection loot."""
+def _remove_unsupported_inventory_sentences(text: str) -> str:
+    """Removes sentence-level generic inventory claims from visible narration."""
 
-    clean_text = text.casefold()
+    story_text, action_suffix = _split_visible_action_suffix(text)
+    sentences = _split_sentences(story_text)
 
-    if "flora" in clean_text and "geological" in clean_text:
-        return (
-            "A mixed bounty of local flora and rare geological finds gathered "
-            "during foraging."
-        )
+    if not sentences:
+        return text
 
-    if "geological" in clean_text:
-        return "Assorted geological specimens gathered during exploration."
+    kept_sentences = [
+        sentence
+        for sentence in sentences
+        if not _text_suggests_narrated_inventory_reward(sentence)
+    ]
 
-    if "flora" in clean_text or "specimen" in clean_text:
-        return "Assorted local flora and field specimens gathered during foraging."
+    trimmed_story = " ".join(kept_sentences).strip()
 
-    return "Assorted useful specimens gathered during exploration."
+    if not trimmed_story and action_suffix:
+        return action_suffix.strip()
+
+    if not trimmed_story:
+        return text
+
+    return f"{trimmed_story}{action_suffix}"
+
+
+def _split_visible_action_suffix(text: str) -> tuple[str, str]:
+    """Splits formatted story text from the appended action prompt."""
+
+    marker = "\n\nWhat do you do now?\n"
+
+    if marker in text:
+        story_text, suffix = text.split(marker, 1)
+        return story_text, f"{marker}{suffix}"
+
+    marker = "\nWhat do you do now?\n"
+
+    if marker in text:
+        story_text, suffix = text.split(marker, 1)
+        return story_text, f"{marker}{suffix}"
+
+    return text, ""
+
+
+def _split_sentences(text: str) -> list[str]:
+    """Splits prose into simple sentence units while preserving punctuation."""
+
+    return [
+        sentence.strip()
+        for sentence in re.findall(r"[^.!?]+[.!?]+|[^.!?]+$", text.strip())
+        if sentence.strip()
+    ]
 
 
 def _reagent_inventory_description(payload: dict[str, Any]) -> str:
@@ -2577,382 +3253,6 @@ def _join_payload_list(value: Any) -> str:
         return ""
 
     return ", ".join(str(item).strip() for item in value if str(item).strip())
-
-
-def _looks_like_uncertain_action(command: str) -> bool:
-    """Returns true when a player command likely needs a Python-resolved check."""
-
-    clean_command = command.strip().casefold()
-
-    if not clean_command:
-        return False
-
-    if clean_command.startswith(("oog", "out-of-game", "out of game")):
-        return False
-
-    if "skill check" in clean_command or "roll " in clean_command:
-        return True
-
-    for keywords in UNCERTAIN_ACTION_KEYWORDS.values():
-        if any(keyword in clean_command for keyword in keywords):
-            return True
-
-    command_words = set(re.findall(r"[a-zA-Z]+", clean_command))
-
-    if command_words and command_words.issubset(TRIVIAL_ACTION_KEYWORDS):
-        return False
-
-    return False
-
-
-def _infer_skill_check_name(
-    command: str,
-    context_packet: dict[str, Any],
-    suggested_events: list[dict[str, Any]] | None = None,
-) -> str:
-    """Infers the most relevant skill for a fallback check."""
-
-    clean_command = command.casefold()
-    known_skill_records = _known_skill_records(context_packet)
-    known_skills = [record["name"] for record in known_skill_records]
-
-    known_match = _find_known_skill_for_text(command, known_skill_records)
-
-    if known_match:
-        return known_match
-
-    event_match = _find_event_skill_for_text(
-        command,
-        suggested_events or [],
-        known_skills,
-    )
-
-    if event_match:
-        return event_match
-
-    scored_candidates: list[tuple[int, str]] = []
-
-    for candidate, keywords in UNCERTAIN_ACTION_KEYWORDS.items():
-        score = sum(1 for keyword in keywords if keyword in clean_command)
-
-        if score > 0:
-            scored_candidates.append((score, candidate))
-
-    if scored_candidates:
-        scored_candidates.sort(key=lambda item: (-item[0], item[1]))
-        candidate = scored_candidates[0][1]
-        known_match = _find_known_skill(candidate, known_skills)
-        return known_match or candidate
-
-    if "skill check" in clean_command or "roll " in clean_command:
-        return _find_known_skill("Awareness", known_skills) or "Awareness"
-
-    return ""
-
-
-def _known_skill_names(context_packet: dict[str, Any]) -> list[str]:
-    """Reads known skill names from a story context packet."""
-
-    return [record["name"] for record in _known_skill_records(context_packet)]
-
-
-def _known_skill_records(context_packet: dict[str, Any]) -> list[dict[str, str]]:
-    """Reads known skill names and descriptions from a story context packet."""
-
-    raw_skills = (
-        context_packet.get("state", {})
-        .get("skills", {})
-        .get("known_skills", [])
-    )
-
-    if not isinstance(raw_skills, list):
-        return []
-
-    skill_records: list[dict[str, str]] = []
-
-    for raw_skill in raw_skills:
-        if not isinstance(raw_skill, dict):
-            continue
-
-        name = str(raw_skill.get("name", "")).strip()
-
-        if name:
-            skill_records.append(
-                {
-                    "name": name,
-                    "description": str(raw_skill.get("description", "")).strip(),
-                }
-            )
-
-    return skill_records
-
-
-def _find_known_skill(candidate: str, known_skills: list[str]) -> str:
-    """Returns a known skill matching a fallback candidate."""
-
-    candidate_folded = candidate.casefold()
-
-    for skill_name in known_skills:
-        if skill_name.casefold() == candidate_folded:
-            return skill_name
-
-    for skill_name in _skill_keyword_aliases(candidate):
-        for known_skill in known_skills:
-            if known_skill.casefold() == skill_name.casefold():
-                return known_skill
-
-    return _find_known_skill_for_text(
-        candidate,
-        [{"name": skill_name, "description": ""} for skill_name in known_skills],
-    )
-
-
-def _skill_keyword_aliases(candidate: str) -> tuple[str, ...]:
-    """Returns explicit broad-category aliases for legacy keyword buckets."""
-
-    candidate_folded = candidate.casefold()
-
-    for skill_name, aliases in SKILL_KEYWORD_ALIASES.items():
-        if skill_name.casefold() == candidate_folded:
-            return aliases
-
-    return ()
-
-
-def _find_known_skill_for_text(
-    text: str,
-    known_skill_records: list[dict[str, str]],
-) -> str:
-    """Returns the known skill whose name or description best matches text."""
-
-    scored_skills: list[tuple[float, int, str]] = []
-
-    for record in known_skill_records:
-        name = record["name"]
-        name_score = _skill_text_match_score(name, text)
-        description_score = _skill_description_match_score(
-            record.get("description", ""),
-            text,
-        )
-        score = max(name_score, description_score)
-
-        if (
-            name_score >= SKILL_NAME_MATCH_THRESHOLD
-            or description_score >= SKILL_DESCRIPTION_MATCH_THRESHOLD
-        ):
-            scored_skills.append((score, len(name), name))
-
-    if not scored_skills:
-        return ""
-
-    scored_skills.sort(key=lambda item: (-item[0], item[1], item[2].casefold()))
-    return scored_skills[0][2]
-
-
-def _find_event_skill_for_text(
-    command: str,
-    suggested_events: list[dict[str, Any]],
-    known_skills: list[str],
-) -> str:
-    """Returns a skill from Gemini's XP/upsert events when it matches the command."""
-
-    scored_skills: list[tuple[float, int, str]] = []
-
-    for skill_name in _skill_names_from_events(suggested_events):
-        score = _skill_text_match_score(skill_name, command)
-
-        if score < SKILL_NAME_MATCH_THRESHOLD:
-            continue
-
-        known_match = _find_known_skill(skill_name, known_skills)
-        matched_name = known_match or skill_name
-        scored_skills.append((score, len(matched_name), matched_name))
-
-    if not scored_skills:
-        return ""
-
-    scored_skills.sort(key=lambda item: (-item[0], item[1], item[2].casefold()))
-    return scored_skills[0][2]
-
-
-def _skill_names_from_events(events: list[dict[str, Any]]) -> list[str]:
-    """Reads skill names Gemini used in skill-related non-check events."""
-
-    skill_names: list[str] = []
-
-    for event in events:
-        event_type = _raw_event_type(event)
-
-        if event_type not in {"SkillXpAddedEvent", "SkillUpsertedEvent"}:
-            continue
-
-        payload = event.get("payload", {})
-
-        if not isinstance(payload, dict):
-            continue
-
-        skill_name = str(payload.get("skill_name", payload.get("name", ""))).strip()
-
-        if skill_name:
-            skill_names.append(skill_name)
-
-    return skill_names
-
-
-def _skill_text_matches_command(skill_name: str, command: str) -> bool:
-    """Returns True when the player command directly resembles a skill name."""
-
-    return _skill_text_match_score(skill_name, command) >= SKILL_NAME_MATCH_THRESHOLD
-
-
-def _skill_text_match_score(skill_text: str, command: str) -> float:
-    """Scores whether a command text is close enough to a skill name."""
-
-    clean_skill = _normalized_match_text(skill_text)
-    clean_command = _normalized_match_text(command)
-
-    if not clean_skill or not clean_command:
-        return 0.0
-
-    skill_tokens = _word_tokens(clean_skill)
-    coverage_score = _token_coverage_score(clean_skill, clean_command)
-    sequence_score = _sequence_window_score(clean_skill, clean_command)
-    rapidfuzz_score = 0.0
-
-    if _rapidfuzz_fuzz is not None:
-        rapidfuzz_score = max(
-            float(_rapidfuzz_fuzz.WRatio(clean_skill, clean_command)),
-            float(_rapidfuzz_fuzz.partial_ratio(clean_skill, clean_command)),
-        )
-
-        if len(skill_tokens) > 1 and coverage_score < 60.0:
-            rapidfuzz_score = min(rapidfuzz_score, coverage_score)
-
-    return max(coverage_score, sequence_score, rapidfuzz_score)
-
-
-def _skill_description_match_score(description: str, command: str) -> float:
-    """Scores a skill description against a command using significant word overlap."""
-
-    description_terms = _expanded_token_set(description, significant=True)
-    command_terms = _expanded_token_set(command, significant=True)
-
-    if not description_terms or not command_terms:
-        return 0.0
-
-    overlap_count = len(description_terms.intersection(command_terms))
-
-    if overlap_count >= 3:
-        return 86.0
-
-    if overlap_count == 2:
-        return SKILL_DESCRIPTION_MATCH_THRESHOLD
-
-    return 0.0
-
-
-def _token_coverage_score(skill_text: str, command: str) -> float:
-    """Scores how many skill-name tokens or simple variants appear in the command."""
-
-    skill_tokens = [
-        token
-        for token in _word_tokens(skill_text)
-        if token not in SKILL_MATCH_STOPWORDS
-    ]
-
-    if not skill_tokens:
-        return 0.0
-
-    command_terms = _expanded_token_set(command)
-    covered_tokens = 0
-
-    for token in skill_tokens:
-        if _token_variants(token).intersection(command_terms):
-            covered_tokens += 1
-
-    return (covered_tokens / len(skill_tokens)) * 100.0
-
-
-def _sequence_window_score(skill_text: str, command: str) -> float:
-    """Scores fuzzy similarity against command word windows."""
-
-    skill_tokens = _word_tokens(skill_text)
-    command_tokens = _word_tokens(command)
-
-    if not skill_tokens or not command_tokens:
-        return 0.0
-
-    best_score = 0.0
-    min_window = max(1, len(skill_tokens) - 1)
-    max_window = min(len(command_tokens), len(skill_tokens) + 1)
-
-    for window_size in range(min_window, max_window + 1):
-        for index in range(0, len(command_tokens) - window_size + 1):
-            phrase = " ".join(command_tokens[index : index + window_size])
-            best_score = max(
-                best_score,
-                SequenceMatcher(None, skill_text, phrase).ratio() * 100.0,
-            )
-
-    return best_score
-
-
-def _normalized_match_text(text: str) -> str:
-    """Normalizes free text before skill-name matching."""
-
-    return " ".join(_word_tokens(text))
-
-
-def _word_tokens(text: str) -> list[str]:
-    """Splits text into lower-case word tokens for matching."""
-
-    return re.findall(r"[a-zA-Z0-9]+", str(text).casefold())
-
-
-def _expanded_token_set(text: str, *, significant: bool = False) -> set[str]:
-    """Returns word tokens plus simple inflection variants."""
-
-    terms: set[str] = set()
-
-    for token in _word_tokens(text):
-        if significant and token in SKILL_MATCH_STOPWORDS:
-            continue
-
-        terms.update(_token_variants(token))
-
-    return terms
-
-
-def _token_variants(token: str) -> set[str]:
-    """Returns simple word-form variants for skill matching."""
-
-    clean_token = token.casefold().strip()
-
-    if not clean_token:
-        return set()
-
-    variants = {clean_token}
-
-    if clean_token.endswith("ies") and len(clean_token) > 4:
-        variants.add(f"{clean_token[:-3]}y")
-
-    if clean_token.endswith("s") and len(clean_token) > 3:
-        variants.add(clean_token[:-1])
-
-    if clean_token.endswith("ing") and len(clean_token) > 5:
-        stem = clean_token[:-3]
-        variants.add(stem)
-        variants.add(f"{stem}e")
-
-        if len(stem) > 2 and stem[-1] == stem[-2]:
-            variants.add(stem[:-1])
-
-    if clean_token.endswith("ed") and len(clean_token) > 4:
-        stem = clean_token[:-2]
-        variants.add(stem)
-        variants.add(f"{stem}e")
-
-    return variants
 
 
 def _raw_event_type(event: dict[str, Any]) -> str:
@@ -3039,6 +3339,8 @@ def parse_gemini_new_game_response(raw_text: str) -> AiWorldSetupResult:
     )
     start_weather = str(data.get("weather", data.get("start_weather", ""))).strip()
     world_lore = _parse_new_game_world_lore(data.get("world_lore", data.get("lore")))
+    locations = _parse_new_game_locations(data.get("locations"), start_location)
+    gm_secrets = _parse_new_game_gm_secrets(data.get("gm_secrets"))
     introductory_message = str(
         data.get("introductory_message", data.get("response", ""))
     ).strip()
@@ -3099,6 +3401,8 @@ def parse_gemini_new_game_response(raw_text: str) -> AiWorldSetupResult:
         start_weather=start_weather,
         selected_genre=selected_genre,
         world_lore=world_lore,
+        locations=locations,
+        gm_secrets=gm_secrets,
         finalized_character=finalized_character,
         finalized_skills=finalized_skills,
         finalized_starter_items=finalized_starter_items,
@@ -3170,6 +3474,101 @@ def _parse_new_game_world_lore(raw_lore: Any) -> dict[str, dict[str, str]]:
     return world_lore
 
 
+def _parse_new_game_gm_secrets(raw_secrets: Any) -> list[dict[str, Any]]:
+    """Parses private AI-only secret memory from new-game synthesis."""
+
+    if not isinstance(raw_secrets, list):
+        return []
+
+    secrets: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+
+    for raw_secret in raw_secrets:
+        if not isinstance(raw_secret, dict):
+            continue
+
+        secret_id = str(raw_secret.get("secret_id", "")).strip()
+        title = str(raw_secret.get("title", "")).strip()
+        details = str(raw_secret.get("details", "")).strip()
+        status = str(raw_secret.get("status", "active")).strip().casefold()
+
+        if (
+            not secret_id
+            or not title
+            or not details
+            or status not in {"active", "revealed", "retired"}
+            or secret_id.casefold() in seen_ids
+        ):
+            continue
+
+        seen_ids.add(secret_id.casefold())
+        secrets.append(
+            {
+                "secret_id": secret_id,
+                "title": title,
+                "details": details,
+                "reveal_condition": str(
+                    raw_secret.get("reveal_condition", "")
+                ).strip(),
+                "related_npc_ids": [
+                    str(value).strip()
+                    for value in raw_secret.get("related_npc_ids", [])
+                    if str(value).strip()
+                ]
+                if isinstance(raw_secret.get("related_npc_ids"), list)
+                else [],
+                "related_locations": [
+                    str(value).strip()
+                    for value in raw_secret.get("related_locations", [])
+                    if str(value).strip()
+                ]
+                if isinstance(raw_secret.get("related_locations"), list)
+                else [],
+                "status": status,
+            }
+        )
+
+    return secrets
+
+
+def _parse_new_game_locations(
+    raw_locations: Any,
+    start_location: str,
+) -> list[dict[str, Any]]:
+    """Parses player-known location metadata and anchors the starting map origin."""
+
+    locations = normalize_known_locations(raw_locations)
+    clean_start_location = clean_player_location_name(start_location)
+
+    if clean_start_location:
+        for index, location in enumerate(locations):
+            if location.name.casefold() != clean_start_location.casefold():
+                continue
+
+            location_data = location.to_dict()
+            location_data["x_miles"] = 0.0
+            location_data["y_miles"] = 0.0
+            locations[index] = normalize_known_locations([location_data])[0]
+            break
+        else:
+            locations = normalize_known_locations(
+                [
+                    *(location.to_dict() for location in locations),
+                    {
+                        "name": clean_start_location,
+                        "description": "Starting location.",
+                        "x_miles": 0.0,
+                        "y_miles": 0.0,
+                        "terrain": "",
+                        "travel_multiplier": 1.0,
+                        "travel_notes": "",
+                    },
+                ]
+            )
+
+    return [location.to_dict() for location in locations]
+
+
 def _derive_lore_key(text: str) -> str:
     """Derives a lore key from list-shaped legacy AI lore."""
 
@@ -3194,7 +3593,7 @@ def _parse_new_game_starting_calendar(raw_calendar: Any) -> dict[str, Any]:
     calendar: dict[str, Any] = {}
 
     for key in [
-        "elapsed_minutes",
+        "current_minute",
         "year",
         "month_name",
         "month_number",
@@ -3289,6 +3688,24 @@ def _parse_new_game_starter_items(raw_items: Any) -> list[dict[str, Any]]:
                 "description": str(raw_item.get("description", "")).strip(),
                 "value_base_units": max(0, value_base_units),
                 "source_index": _parse_optional_source_index(raw_item),
+                **{
+                    field_name: raw_item[field_name]
+                    for field_name in (
+                        "weapon_hands",
+                        "damage",
+                        "damage_type",
+                        "attack_skill",
+                        "attack_range_feet",
+                        "ammunition_type_required",
+                        "clip_size",
+                        "bullets_per_attack",
+                        "ammunition_type",
+                        "covers_body_parts",
+                        "armor_rating",
+                        "container",
+                    )
+                    if field_name in raw_item
+                },
             }
         )
         seen_names.add(name.casefold())
@@ -3652,6 +4069,15 @@ def _optional_positive_int(value: Any) -> int | None:
         return None
 
     return parsed
+
+
+def _coerce_int(value: Any, *, default: int = 0) -> int:
+    """Returns an integer value or a caller-provided fallback."""
+
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def _format_visible_response(response_text: str, suggested_actions: list[str]) -> str:

@@ -12,6 +12,7 @@ from ai_adventure.ai.gemini_service import (
     DEFAULT_GEMINI_MODEL,
     EVENT_RESPONSE_SCHEMA,
     KNOWN_EVENT_TYPE_NAMES,
+    NEW_GAME_EVENT_RESPONSE_SCHEMA,
     NEW_GAME_RESPONSE_JSON_SCHEMA,
     SKILL_CHECK_PLAN_RESPONSE_JSON_SCHEMA,
     STORY_RESPONSE_JSON_SCHEMA,
@@ -25,11 +26,69 @@ from ai_adventure.ai.gemini_service import (
     parse_gemini_new_game_response,
     parse_skill_check_plan_response,
     parse_gemini_story_response,
+    _drop_unwarranted_skill_check_events,
+    _filter_unwarranted_planned_skill_checks,
     _json_schema_shape_errors,
+    _normalize_visible_currency_phrasing,
+    _parse_new_game_starter_items,
 )
 
 
+def _container_metadata() -> dict[str, object]:
+    return {
+        "is_open": False,
+        "contents_taken": False,
+        "is_locked": False,
+        "lockpick_skill": "Lockpicking",
+        "lockpick_dc": 0,
+        "lockpick_failure_consequence": "",
+        "is_trapped": False,
+        "trap_notice_skill": "Perception",
+        "trap_notice_dc": 0,
+        "trap_disarm_skill": "Sleight of Hand",
+        "trap_disarm_dc": 0,
+        "trap_failure_consequence": "",
+        "contents": {
+            "currency_base_units": 20,
+            "items": [
+                {
+                    "name": "Tarnished Silver Locket",
+                    "category": "Valuable",
+                    "quantity": 1,
+                    "description": "A small worn locket.",
+                    "value_base_units": 12,
+                }
+            ],
+        },
+    }
+
+
 class GeminiServiceTests(unittest.TestCase):
+    def test_new_game_starter_item_parser_preserves_firearm_metadata(self) -> None:
+        items = _parse_new_game_starter_items(
+            [
+                {
+                    "name": "Service Pistol",
+                    "category": "Weapon",
+                    "quantity": 1,
+                    "description": "A compact sidearm.",
+                    "value_base_units": 50,
+                    "source_index": 0,
+                    "weapon_hands": "one-handed",
+                    "damage": "1d6",
+                    "attack_skill": "Ranged",
+                    "attack_range_feet": 60,
+                    "ammunition_type_required": "9mm Round",
+                    "clip_size": 12,
+                    "bullets_per_attack": 2,
+                }
+            ]
+        )
+
+        self.assertEqual(items[0]["ammunition_type_required"], "9mm Round")
+        self.assertEqual(items[0]["clip_size"], 12)
+        self.assertEqual(items[0]["bullets_per_attack"], 2)
+
     def test_load_gemini_settings_reads_env_file(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             env_path = Path(temp_dir) / ".env"
@@ -102,6 +161,68 @@ class GeminiServiceTests(unittest.TestCase):
             call["config"]["safety_settings"][0]["threshold"],
             "OFF",
         )
+        self.assertEqual(
+            call["config"]["thinking_config"]["thinking_budget"],
+            1024,
+        )
+        self.assertNotIn("max_output_tokens", call["config"])
+
+    def test_story_request_applies_selected_ai_modes_to_config(self) -> None:
+        fake_client_class = self._install_fake_genai_client(
+            json.dumps(
+                {
+                    "response": "A clipped answer.",
+                    "suggested_actions": [],
+                    "events": [],
+                    "out_of_game": False,
+                }
+            )
+        )
+
+        try:
+            service = GeminiNarrationService(
+                GeminiSettings(
+                    api_key="test-key",
+                    model="gemini-3.1-flash-lite",
+                )
+            )
+            service.generate_story_response(
+                {
+                    "packet_type": "story_turn",
+                    "state": {
+                        "player_ai_preferences": {
+                            "model_intelligence": "smarter",
+                            "model_tone": "serious",
+                            "response_length": "super_brief",
+                            "allowed_content_categories": [
+                                "HARM_CATEGORY_HARASSMENT"
+                            ],
+                        }
+                    },
+                }
+            )
+        finally:
+            self._remove_fake_genai_client()
+
+        call = fake_client_class.last_client.models.calls[0]
+        safety_by_category = {
+            setting["category"]: setting["threshold"]
+            for setting in call["config"]["safety_settings"]
+        }
+
+        self.assertEqual(
+            call["config"]["thinking_config"],
+            {"thinking_level": "high"},
+        )
+        self.assertEqual(call["config"]["max_output_tokens"], 1536)
+        self.assertEqual(safety_by_category["HARM_CATEGORY_HARASSMENT"], "OFF")
+        self.assertEqual(
+            safety_by_category["HARM_CATEGORY_DANGEROUS_CONTENT"],
+            "BLOCK_LOW_AND_ABOVE",
+        )
+        self.assertIn("cold, restrained, serious voice", call["contents"])
+        self.assertIn("as short as practical", call["contents"])
+        self.assertIn("unchecked categories", call["contents"])
 
     def test_skill_check_plan_request_uses_lightweight_schema(self) -> None:
         fake_client_class = self._install_fake_genai_client(
@@ -113,7 +234,8 @@ class GeminiServiceTests(unittest.TestCase):
                             "difficulty": "hard",
                             "reason": "Searching unstable cliffs for rare herbs.",
                         }
-                    ]
+                    ],
+                    "relevant_tags": ["exploration", "skill", "uncertainty"],
                 }
             )
         )
@@ -128,6 +250,15 @@ class GeminiServiceTests(unittest.TestCase):
                     "player_command": "Search the cliff face for rare herbs.",
                     "state": {
                         "scene": {"location": "Wind Cliff"},
+                        "gm_secrets": {
+                            "active": [
+                                {
+                                    "secret_id": "cliff_is_trapped",
+                                    "details": "A concealed wire triggers a rockfall.",
+                                    "status": "active",
+                                }
+                            ]
+                        },
                         "skills": {
                             "known_skills": [
                                 {"name": "Foraging", "level": 2, "bonus": 4}
@@ -147,13 +278,18 @@ class GeminiServiceTests(unittest.TestCase):
 
         self.assertEqual(result.checks[0]["skill_name"], "Foraging")
         self.assertEqual(result.checks[0]["difficulty"], "hard")
+        self.assertEqual(result.relevant_tags, ["exploration", "skill", "uncertainty"])
         self.assertEqual(call["config"]["response_mime_type"], "application/json")
         self.assertEqual(
             call["config"]["response_json_schema"],
             SKILL_CHECK_PLAN_RESPONSE_JSON_SCHEMA,
         )
         self.assertIn("skill_check_planning", call["contents"])
-        self.assertNotIn("inventory", call["contents"].casefold())
+        self.assertNotIn('"inventory":', call["contents"].casefold())
+        self.assertIn("cliff_is_trapped", call["contents"])
+        self.assertIn("concealed wire", call["contents"])
+        self.assertIn("Available context tags:", call["contents"])
+        self.assertIn('"relevant_tags"', call["contents"])
 
     def test_parse_skill_check_plan_response_normalizes_checks(self) -> None:
         result = parse_skill_check_plan_response(
@@ -171,7 +307,8 @@ class GeminiServiceTests(unittest.TestCase):
                             "difficulty": "easy",
                         },
                         {"difficulty": "normal"},
-                    ]
+                    ],
+                    "relevant_tags": ["alchemy", "skill", "not-a-real-tag", "alchemy"],
                 }
             )
         )
@@ -181,6 +318,103 @@ class GeminiServiceTests(unittest.TestCase):
         self.assertEqual(result.checks[0]["dc"], 18)
         self.assertNotIn("difficulty", result.checks[0])
         self.assertIn("unstable reagent", result.checks[0]["reason"])
+        self.assertEqual(result.relevant_tags, ["alchemy", "skill"])
+
+    def test_parse_skill_check_plan_missing_tags_uses_keyword_fallback(self) -> None:
+        result = parse_skill_check_plan_response(json.dumps({"checks": []}))
+
+        self.assertIsNone(result.relevant_tags)
+
+    def test_routine_action_drops_planned_skill_checks(self) -> None:
+        result = parse_skill_check_plan_response(
+            json.dumps(
+                {
+                    "checks": [
+                        {
+                            "skill_name": "Navigation",
+                            "difficulty": "easy",
+                            "reason": "Walking across town.",
+                        }
+                    ],
+                    "relevant_tags": ["skill", "uncertainty", "travel"],
+                }
+            )
+        )
+        filtered = _filter_unwarranted_planned_skill_checks(
+            result,
+            {
+                "packet_type": "story_turn",
+                "player_command": "Walk to the market.",
+            },
+        )
+
+        self.assertEqual(filtered.checks, [])
+        self.assertEqual(filtered.relevant_tags, ["travel"])
+
+    def test_risky_action_keeps_planned_skill_checks(self) -> None:
+        result = parse_skill_check_plan_response(
+            json.dumps(
+                {
+                    "checks": [
+                        {
+                            "skill_name": "Stealth",
+                            "difficulty": "normal",
+                            "reason": "Sneaking through a watched market.",
+                        }
+                    ],
+                    "relevant_tags": ["skill", "uncertainty"],
+                }
+            )
+        )
+        filtered = _filter_unwarranted_planned_skill_checks(
+            result,
+            {
+                "packet_type": "story_turn",
+                "player_command": "Sneak through the market without being noticed.",
+            },
+        )
+
+        self.assertEqual(filtered.checks, result.checks)
+
+    def test_routine_action_drops_story_skill_check_events(self) -> None:
+        result = parse_gemini_story_response(
+            json.dumps(
+                {
+                    "response": "You make your way to the market.",
+                    "suggested_actions": [],
+                    "events": [
+                        {
+                            "type": "SkillCheckRequestedEvent",
+                            "payload": {
+                                "skill_name": "Navigation",
+                                "difficulty": "easy",
+                            },
+                        },
+                        {
+                            "type": "StatusUpdatedEvent",
+                            "payload": {
+                                "location": "Market",
+                                "minutes_passed": 10,
+                                "weather": "Clear",
+                            },
+                        },
+                    ],
+                    "out_of_game": False,
+                }
+            )
+        )
+        filtered = _drop_unwarranted_skill_check_events(
+            result,
+            {
+                "packet_type": "story_turn",
+                "player_command": "Go to the market.",
+            },
+        )
+
+        self.assertEqual(
+            [event["type"] for event in filtered.suggested_events],
+            ["StatusUpdatedEvent"],
+        )
 
     def test_story_schema_requires_currency_changed_base_unit_amount(self) -> None:
         valid_response = {
@@ -280,7 +514,42 @@ class GeminiServiceTests(unittest.TestCase):
             _json_schema_shape_errors(zero_value_response, STORY_RESPONSE_JSON_SCHEMA),
         )
 
-    def test_story_request_injects_missing_skill_check_for_uncertain_action(self) -> None:
+    def test_story_schema_accepts_container_metadata_and_lifecycle_events(self) -> None:
+        response = {
+            "response": "You secure the still-closed pouch.",
+            "suggested_actions": ["Open the pouch."],
+            "events": [
+                {
+                    "type": "InventoryItemAddedEvent",
+                    "payload": {
+                        "item_type": "Container",
+                        "item_name": "Stolen Coin Pouch",
+                        "description": "A tied leather pouch.",
+                        "amount": 1,
+                        "value_base_units": 2,
+                        "container": _container_metadata(),
+                    },
+                },
+                {
+                    "type": "ContainerOpenedEvent",
+                    "payload": {"container_name": "Stolen Coin Pouch"},
+                },
+                {
+                    "type": "ContainerContentsTakenEvent",
+                    "payload": {"container_name": "Stolen Coin Pouch"},
+                },
+            ],
+            "out_of_game": False,
+        }
+
+        self.assertEqual(
+            _json_schema_shape_errors(response, STORY_RESPONSE_JSON_SCHEMA),
+            [],
+        )
+        self.assertIn("ContainerOpenedEvent", KNOWN_EVENT_TYPE_NAMES)
+        self.assertIn("ContainerContentsTakenEvent", KNOWN_EVENT_TYPE_NAMES)
+
+    def test_story_request_does_not_invent_check_when_planner_selected_none(self) -> None:
         fake_client_class = self._install_fake_genai_client(
             json.dumps(
                 {
@@ -328,14 +597,12 @@ class GeminiServiceTests(unittest.TestCase):
             self._remove_fake_genai_client()
 
         self.assertIsNotNone(fake_client_class.last_client)
-        self.assertEqual(result.suggested_events[0]["type"], "SkillCheckRequestedEvent")
-        self.assertEqual(result.suggested_events[0]["payload"]["skill_name"], "Fieldcraft")
-        self.assertNotIn(
-            "SkillXpAddedEvent",
-            [event["type"] for event in result.suggested_events],
-        )
+        event_types = [event["type"] for event in result.suggested_events]
 
-    def test_story_request_fuzzy_infers_mining_from_mine_action(self) -> None:
+        self.assertNotIn("SkillCheckRequestedEvent", event_types)
+        self.assertIn("SkillXpAddedEvent", event_types)
+
+    def test_story_request_does_not_fuzzy_infer_mining_check(self) -> None:
         self._install_fake_genai_client(
             json.dumps(
                 {
@@ -389,14 +656,12 @@ class GeminiServiceTests(unittest.TestCase):
         finally:
             self._remove_fake_genai_client()
 
-        self.assertEqual(result.suggested_events[0]["type"], "SkillCheckRequestedEvent")
-        self.assertEqual(result.suggested_events[0]["payload"]["skill_name"], "Mining")
-        self.assertNotIn(
-            "SkillXpAddedEvent",
-            [event["type"] for event in result.suggested_events],
-        )
+        event_types = [event["type"] for event in result.suggested_events]
 
-    def test_story_request_fuzzy_infers_custom_multi_word_skill(self) -> None:
+        self.assertNotIn("SkillCheckRequestedEvent", event_types)
+        self.assertIn("SkillXpAddedEvent", event_types)
+
+    def test_story_request_does_not_fuzzy_infer_custom_skill_check(self) -> None:
         self._install_fake_genai_client(
             json.dumps(
                 {
@@ -440,11 +705,128 @@ class GeminiServiceTests(unittest.TestCase):
         finally:
             self._remove_fake_genai_client()
 
-        self.assertEqual(result.suggested_events[0]["type"], "SkillCheckRequestedEvent")
-        self.assertEqual(
-            result.suggested_events[0]["payload"]["skill_name"],
-            "Shadow Rune Carving",
+        self.assertNotIn(
+            "SkillCheckRequestedEvent",
+            [event["type"] for event in result.suggested_events],
         )
+
+    def test_story_request_drops_direct_rewards_from_unopened_container(self) -> None:
+        self._install_fake_genai_client(
+            json.dumps(
+                {
+                    "response": (
+                        "You open the Stolen Coin Pouch and see coins beside a "
+                        "tarnished locket."
+                    ),
+                    "suggested_actions": ["Take the contents of the pouch."],
+                    "events": [
+                        {
+                            "type": "CurrencyChangedEvent",
+                            "payload": {"base_unit_amount": 35},
+                        },
+                        {
+                            "type": "InventoryItemAddedEvent",
+                            "payload": {
+                                "item_type": "Valuable",
+                                "item_name": "Tarnished Silver Locket",
+                                "description": "A small worn locket.",
+                                "amount": 1,
+                                "value_base_units": 12,
+                            },
+                        },
+                    ],
+                    "out_of_game": False,
+                }
+            )
+        )
+
+        try:
+            service = GeminiNarrationService(
+                GeminiSettings(api_key="test-key", model="gemini-2.5-flash")
+            )
+            result = service.generate_story_response(
+                {
+                    "packet_type": "story_turn",
+                    "player_command": "Open the Stolen Coin Pouch.",
+                    "state": {
+                        "inventory": {
+                            "items": [
+                                {
+                                    "name": "Stolen Coin Pouch",
+                                    "category": "Container",
+                                    "quantity": 1,
+                                    "metadata": {
+                                        "item_type": "Container",
+                                        "container": _container_metadata(),
+                                    },
+                                }
+                            ]
+                        }
+                    },
+                }
+            )
+        finally:
+            self._remove_fake_genai_client()
+
+        event_types = [event["type"] for event in result.suggested_events]
+
+        self.assertNotIn("CurrencyChangedEvent", event_types)
+        self.assertNotIn("InventoryItemAddedEvent", event_types)
+
+    def test_story_request_keeps_container_events_but_drops_duplicate_rewards(self) -> None:
+        self._install_fake_genai_client(
+            json.dumps(
+                {
+                    "response": "You open the pouch and pocket its contents.",
+                    "suggested_actions": [],
+                    "events": [
+                        {
+                            "type": "ContainerOpenedEvent",
+                            "payload": {"container_name": "Stolen Coin Pouch"},
+                        },
+                        {
+                            "type": "ContainerContentsTakenEvent",
+                            "payload": {"container_name": "Stolen Coin Pouch"},
+                        },
+                        {
+                            "type": "CurrencyChangedEvent",
+                            "payload": {"base_unit_amount": 35},
+                        },
+                        {
+                            "type": "InventoryItemAddedEvent",
+                            "payload": {
+                                "item_type": "Valuable",
+                                "item_name": "Tarnished Silver Locket",
+                                "description": "A duplicate direct reward.",
+                                "amount": 1,
+                                "value_base_units": 12,
+                            },
+                        },
+                    ],
+                    "out_of_game": False,
+                }
+            )
+        )
+
+        try:
+            result = GeminiNarrationService(
+                GeminiSettings(api_key="test-key", model="gemini-2.5-flash")
+            ).generate_story_response(
+                {
+                    "packet_type": "story_turn",
+                    "player_command": "Open the pouch and take everything inside.",
+                    "state": {"inventory": {"items": []}},
+                }
+            )
+        finally:
+            self._remove_fake_genai_client()
+
+        event_types = [event["type"] for event in result.suggested_events]
+
+        self.assertIn("ContainerOpenedEvent", event_types)
+        self.assertIn("ContainerContentsTakenEvent", event_types)
+        self.assertNotIn("CurrencyChangedEvent", event_types)
+        self.assertNotIn("InventoryItemAddedEvent", event_types)
 
     def test_story_request_does_not_inject_skill_check_from_narration_or_actions(self) -> None:
         self._install_fake_genai_client(
@@ -612,7 +994,7 @@ class GeminiServiceTests(unittest.TestCase):
         )
         self.assertEqual(inventory_events[0]["payload"]["value_base_units"], 1)
 
-    def test_story_request_adds_inventory_for_narrated_collection(self) -> None:
+    def test_story_request_trims_narrated_collection_without_inventory_event(self) -> None:
         self._install_fake_genai_client(
             json.dumps(
                 {
@@ -665,20 +1047,12 @@ class GeminiServiceTests(unittest.TestCase):
 
         self.assertNotIn("SkillCheckRequestedEvent", event_types)
         self.assertIn("SkillXpAddedEvent", event_types)
-        self.assertEqual(len(inventory_events), 1)
-        self.assertEqual(
-            inventory_events[0]["payload"],
-            {
-                "item_type": "Foraged Goods",
-                "item_name": "Assorted Foraged Specimens",
-                "description": (
-                    "A mixed bounty of local flora and rare geological finds gathered "
-                    "during foraging."
-                ),
-                "amount": 1,
-                "value_base_units": 1,
-            },
-        )
+        self.assertEqual(inventory_events, [])
+        self.assertNotIn("Assorted Foraged Specimens", result.narrative_text)
+        self.assertNotIn("bounty of fresh, high-quality specimens", result.narrative_text)
+        self.assertNotIn("Your basket is brimming", result.narrative_text)
+        self.assertNotIn("quite the collection", result.narrative_text)
+        self.assertIn("What do you do now?", result.narrative_text)
 
     def test_story_request_does_not_add_inventory_for_promising_search_site(self) -> None:
         self._install_fake_genai_client(
@@ -757,7 +1131,7 @@ class GeminiServiceTests(unittest.TestCase):
             [],
         )
 
-    def test_story_schema_requires_visible_active_task_fields(self) -> None:
+    def test_story_schema_allows_active_task_updates_with_only_changed_fields(self) -> None:
         valid_response = {
             "response": "You make a note to prepare more supplies.",
             "suggested_actions": [],
@@ -779,7 +1153,7 @@ class GeminiServiceTests(unittest.TestCase):
             ],
             "out_of_game": False,
         }
-        invalid_response = {
+        partial_update_response = {
             "response": "You make a note to prepare more supplies.",
             "suggested_actions": [],
             "events": [
@@ -798,9 +1172,9 @@ class GeminiServiceTests(unittest.TestCase):
             _json_schema_shape_errors(valid_response, STORY_RESPONSE_JSON_SCHEMA),
             [],
         )
-        self.assertIn(
-            "$.events[0] did not match any allowed schema",
-            _json_schema_shape_errors(invalid_response, STORY_RESPONSE_JSON_SCHEMA),
+        self.assertEqual(
+            _json_schema_shape_errors(partial_update_response, STORY_RESPONSE_JSON_SCHEMA),
+            [],
         )
 
         extra_notes_response = {
@@ -949,6 +1323,7 @@ class GeminiServiceTests(unittest.TestCase):
     def test_story_schema_only_advertises_supported_event_types(self) -> None:
         self.assertNotIn("StoryAdvancedEvent", KNOWN_EVENT_TYPE_NAMES)
         self.assertNotIn("SecretAddedEvent", KNOWN_EVENT_TYPE_NAMES)
+        self.assertIn("SecretUpsertedEvent", KNOWN_EVENT_TYPE_NAMES)
         self.assertNotIn("MerchantInterfaceRequestedEvent", KNOWN_EVENT_TYPE_NAMES)
 
     def test_event_schema_matches_advertised_event_types(self) -> None:
@@ -959,6 +1334,63 @@ class GeminiServiceTests(unittest.TestCase):
 
         self.assertEqual(sorted(schema_event_types), sorted(KNOWN_EVENT_TYPE_NAMES))
         self.assertEqual(len(schema_event_types), len(set(schema_event_types)))
+
+    def test_new_game_schema_allows_only_setup_event_types(self) -> None:
+        schema_event_types = {
+            branch["properties"]["type"]["enum"][0]
+            for branch in NEW_GAME_EVENT_RESPONSE_SCHEMA["anyOf"]
+        }
+
+        self.assertEqual(
+            schema_event_types,
+            {
+                "NpcUpsertedEvent",
+                "ActiveTaskUpsertedEvent",
+                "MusicChangedEvent",
+            },
+        )
+        self.assertIn("gm_secrets", NEW_GAME_RESPONSE_JSON_SCHEMA["properties"])
+        self.assertIn("gm_secrets", NEW_GAME_RESPONSE_JSON_SCHEMA["required"])
+        self.assertIs(
+            NEW_GAME_RESPONSE_JSON_SCHEMA["properties"]["events"]["items"],
+            NEW_GAME_EVENT_RESPONSE_SCHEMA,
+        )
+        secret_schema = NEW_GAME_RESPONSE_JSON_SCHEMA["properties"]["gm_secrets"]["items"]
+        self.assertNotIn("status", secret_schema["properties"])
+        self.assertIn(
+            "$.status is not allowed",
+            _json_schema_shape_errors(
+                {
+                    "secret_id": "station_master_is_villain",
+                    "title": "Station Master's Identity",
+                    "details": "The station master directs the canal murders.",
+                    "reveal_condition": "The player deciphers the ledger.",
+                    "related_npc_ids": ["station_master"],
+                    "related_locations": ["Rainmarket Station"],
+                    "status": "active",
+                },
+                secret_schema,
+            ),
+        )
+        task_branch = next(
+            branch
+            for branch in NEW_GAME_EVENT_RESPONSE_SCHEMA["anyOf"]
+            if branch["properties"]["type"]["enum"] == ["ActiveTaskUpsertedEvent"]
+        )
+        self.assertNotIn("status", task_branch["properties"]["payload"]["properties"])
+        self.assertIn(
+            "$.payload.status is not allowed",
+            _json_schema_shape_errors(
+                {
+                    "type": "ActiveTaskUpsertedEvent",
+                    "payload": {
+                        "name": "Opening Lead",
+                        "status": "Active",
+                    },
+                },
+                task_branch,
+            ),
+        )
 
     def test_story_schema_accepts_combat_started_event(self) -> None:
         valid_response = {
@@ -974,6 +1406,15 @@ class GeminiServiceTests(unittest.TestCase):
                                 "name": "Bandit",
                                 "health": 8,
                                 "armor_rating": 12,
+                                "to_hit_bonus": 3,
+                                "initiative_bonus": 2,
+                                "personality": "aggressive",
+                                "weapon_name": "Rusty Knife",
+                                "ammunition_type_required": "",
+                                "clip_size": 0,
+                                "clip_ammo": 0,
+                                "bullets_per_attack": 0,
+                                "reserve_ammo": 0,
                                 "damage": "1d6",
                                 "loot": ["Rusty Knife"],
                             }
@@ -983,6 +1424,15 @@ class GeminiServiceTests(unittest.TestCase):
                                 "name": "Mira",
                                 "health": 10,
                                 "armor_rating": 11,
+                                "to_hit_bonus": 2,
+                                "initiative_bonus": 1,
+                                "personality": "intelligent",
+                                "weapon_name": "Shortbow",
+                                "ammunition_type_required": "Arrow",
+                                "clip_size": 1,
+                                "clip_ammo": 1,
+                                "bullets_per_attack": 1,
+                                "reserve_ammo": 12,
                                 "damage": "1d4",
                             }
                         ],
@@ -1025,6 +1475,32 @@ class GeminiServiceTests(unittest.TestCase):
             ),
         )
 
+    def test_story_schema_accepts_private_secret_upsert_event(self) -> None:
+        valid_response = {
+            "response": "The station master closes the ledger before you can read it.",
+            "suggested_actions": ["Ask about the ledger."],
+            "events": [
+                {
+                    "type": "SecretUpsertedEvent",
+                    "payload": {
+                        "secret_id": "station_master_is_villain",
+                        "title": "Station Master's Identity",
+                        "details": "The station master directs the canal murders.",
+                        "reveal_condition": "The player deciphers the black ledger.",
+                        "related_npc_ids": ["station_master"],
+                        "related_locations": ["Rainmarket Station"],
+                        "status": "active",
+                    },
+                }
+            ],
+            "out_of_game": False,
+        }
+
+        self.assertEqual(
+            _json_schema_shape_errors(valid_response, STORY_RESPONSE_JSON_SCHEMA),
+            [],
+        )
+
     def test_default_rule_event_contracts_are_schema_supported(self) -> None:
         rules_path = (
             Path(__file__).resolve().parents[1]
@@ -1050,6 +1526,8 @@ class GeminiServiceTests(unittest.TestCase):
                     "selected_genre": "Solar noir",
                     "world_summary": "A city under glass.",
                     "world_lore": {},
+                    "gm_secrets": [],
+                    "locations": [],
                     "start_location": "Dawn Gate",
                     "starting_calendar": {},
                     "weather": "Bright and cold.",
@@ -1102,6 +1580,54 @@ class GeminiServiceTests(unittest.TestCase):
             call["config"]["safety_settings"][0]["threshold"],
             "OFF",
         )
+
+    def test_new_game_request_applies_wizard_ai_modes(self) -> None:
+        fake_client_class = self._install_fake_genai_client("{}")
+
+        try:
+            service = GeminiNarrationService(
+                GeminiSettings(
+                    api_key="test-key",
+                    model="gemini-3.1-flash-lite",
+                )
+            )
+            service.generate_new_game_world(
+                {
+                    "packet_type": "new_game_setup",
+                    "player_ai_preferences": {
+                        "model_intelligence": "smarter",
+                        "model_tone": "quirky",
+                        "response_length": "super_brief",
+                        "allowed_content_categories": [
+                            "HARM_CATEGORY_DANGEROUS_CONTENT"
+                        ],
+                    },
+                }
+            )
+        finally:
+            self._remove_fake_genai_client()
+
+        call = fake_client_class.last_client.models.calls[0]
+        safety_by_category = {
+            setting["category"]: setting["threshold"]
+            for setting in call["config"]["safety_settings"]
+        }
+
+        self.assertEqual(
+            call["config"]["thinking_config"],
+            {"thinking_level": "high"},
+        )
+        self.assertEqual(call["config"]["max_output_tokens"], 6144)
+        self.assertEqual(
+            safety_by_category["HARM_CATEGORY_DANGEROUS_CONTENT"],
+            "OFF",
+        )
+        self.assertEqual(
+            safety_by_category["HARM_CATEGORY_HARASSMENT"],
+            "BLOCK_LOW_AND_ABOVE",
+        )
+        self.assertIn("playful, occasionally zany voice", call["contents"])
+        self.assertIn("Response length — Super Brief", call["contents"])
 
     def test_new_game_repairs_banned_terms_until_response_is_clean(self) -> None:
         def response_for(
@@ -1271,6 +1797,10 @@ class GeminiServiceTests(unittest.TestCase):
         self.assertIn("must not reference private player state", prompt)
         self.assertIn("narration_tense_label", prompt)
         self.assertIn("narration_style_label", prompt)
+        self.assertIn("Player-selected AI modes", prompt)
+        self.assertIn("Model tone — Neutral", prompt)
+        self.assertIn("Response length — Normal", prompt)
+        self.assertIn("No Restrictions is selected", prompt)
         self.assertIn("Omniscient narration", prompt)
         self.assertIn("light Markdown", prompt)
         self.assertIn("italics for inner thoughts", prompt)
@@ -1278,6 +1808,10 @@ class GeminiServiceTests(unittest.TestCase):
         self.assertIn("display_name is the name", prompt)
         self.assertIn("multiple events with the same type", prompt)
         self.assertIn("one NpcUpsertedEvent for each", prompt)
+        self.assertIn("Private GM secret memory", prompt)
+        self.assertIn("state.gm_secrets.active", prompt)
+        self.assertIn("SecretUpsertedEvent", prompt)
+        self.assertIn("status='active'", prompt)
         self.assertIn("player_facing_information is shown directly", prompt)
         self.assertIn("knowledge_scope", prompt)
         self.assertIn("known_facts", prompt)
@@ -1310,12 +1844,23 @@ class GeminiServiceTests(unittest.TestCase):
         self.assertIn("Currency is stored as one integer", prompt)
         self.assertIn("payload.base_unit_amount", prompt)
         self.assertIn("Never use net_base_unit_amount", prompt)
+        self.assertIn("35 copper coins worth of silver", prompt)
+        self.assertIn("3 Silver Coins and 5 Copper Coins", prompt)
         self.assertIn("Every InventoryItemAddedEvent payload must include value_base_units", prompt)
+        self.assertIn("Containers are inventory items", prompt)
+        self.assertIn("ContainerContentsTakenEvent", prompt)
+        self.assertIn("Python then transfers the exact stored contents once", prompt)
         self.assertIn("weapon_hands", prompt)
         self.assertIn("covers_body_parts", prompt)
         self.assertIn("armor_rating", prompt)
         self.assertIn("state.item_catalog.items is the master list", prompt)
         self.assertIn("CombatStartedEvent", prompt)
+        self.assertIn("to_hit_bonus", prompt)
+        self.assertIn("initiative_bonus", prompt)
+        self.assertIn("ammunition_type_required", prompt)
+        self.assertIn("personality", prompt)
+        self.assertIn("Threat Levels", prompt)
+        self.assertIn("non-intelligent NPC", prompt)
         self.assertIn("damage dice", prompt)
         self.assertIn("Combat tab", prompt)
         self.assertIn("ReagentDiscoveredEvent records Crafting tab knowledge", prompt)
@@ -1323,11 +1868,12 @@ class GeminiServiceTests(unittest.TestCase):
         self.assertIn("RecipeDiscoveredEvent ingredients must be structured entries", prompt)
         self.assertIn("Only items with category Material, Ingredient, Reagent, Crafting Item", prompt)
         self.assertIn("Do not describe a successful bounty", prompt)
-        self.assertIn("For uncertain actions, suggest SkillCheckRequestedEvent", prompt)
+        self.assertIn("actions with meaningful uncertainty", prompt)
+        self.assertIn("Do not request a check merely because", prompt)
         self.assertIn("resolved_checks_this_turn", prompt)
         self.assertIn("Do not request duplicate SkillCheckRequestedEvent", prompt)
         self.assertIn("low failed rolls should", prompt)
-        self.assertIn("Do not use a fixed sentence count", prompt)
+        self.assertIn("Follow the selected Response Length mode", prompt)
         self.assertIn("Routine movement, paying a known price", prompt)
         self.assertIn("do not create coin inventory", prompt)
         self.assertIn("must not include 'What do you do now?'", prompt)
@@ -1593,6 +2139,46 @@ class GeminiServiceTests(unittest.TestCase):
         self.assertIn("*Stay calm,* you think.", formatted)
         self.assertIn("- Ask about rumors.", formatted)
 
+    def test_story_currency_phrasing_is_normalized_to_denominations(self) -> None:
+        result = parse_gemini_story_response(
+            json.dumps(
+                {
+                    "response": "You find 35 copper coins' worth of silver.",
+                    "suggested_actions": ["Spend 35 base units at the stall."],
+                    "events": [],
+                }
+            )
+        )
+        normalized = _normalize_visible_currency_phrasing(
+            result,
+            {
+                "state": {
+                    "currency": {
+                        "denominations": [
+                            {
+                                "name": "Copper Coin",
+                                "plural_name": "Copper Coins",
+                                "value": 1,
+                            },
+                            {
+                                "name": "Silver Coin",
+                                "plural_name": "Silver Coins",
+                                "value": 10,
+                            },
+                        ],
+                    },
+                },
+            },
+        )
+
+        self.assertIn("3 Silver Coins and 5 Copper Coins", normalized.narrative_text)
+        self.assertIn(
+            "Spend 3 Silver Coins and 5 Copper Coins at the stall.",
+            normalized.suggested_actions,
+        )
+        self.assertNotIn("copper coins' worth of silver", normalized.narrative_text)
+        self.assertNotIn("base units", normalized.narrative_text)
+
     def test_build_and_parse_new_game_response(self) -> None:
         prompt = build_gemini_new_game_prompt(
             {
@@ -1613,6 +2199,7 @@ class GeminiServiceTests(unittest.TestCase):
         self.assertIn("Limited styles", prompt)
         self.assertIn("light Markdown", prompt)
         self.assertIn("world_summary", prompt)
+        self.assertIn("locations must be a player-known array", prompt)
         self.assertIn("introductory_message may use", prompt)
         raw_text = json.dumps(
             {
@@ -1624,6 +2211,36 @@ class GeminiServiceTests(unittest.TestCase):
                     },
                     "Economy": {"Crowns": "Crowns dominate official trade."},
                 },
+                "gm_secrets": [
+                    {
+                        "secret_id": "station_master_is_villain",
+                        "title": "Station Master's Identity",
+                        "details": "The station master directs the canal murders.",
+                        "reveal_condition": "The player deciphers the black ledger.",
+                        "related_npc_ids": ["station_master"],
+                        "related_locations": ["Rainmarket Station"],
+                    }
+                ],
+                "locations": [
+                    {
+                        "name": "Rainmarket Station",
+                        "description": "A crowded canal-side transit hub.",
+                        "x_miles": 12,
+                        "y_miles": -4,
+                        "terrain": "Canal streets",
+                        "travel_multiplier": 0.9,
+                        "travel_notes": "Crowded at morning and dusk.",
+                    },
+                    {
+                        "name": "North Lock",
+                        "description": "A guarded lock beyond the warehouse district.",
+                        "x_miles": 7,
+                        "y_miles": 3,
+                        "terrain": "Cobblestone",
+                        "travel_multiplier": 1.0,
+                        "travel_notes": "The gate closes after dark.",
+                    },
+                ],
                 "start_location": "Rainmarket Station, beneath the old canal clock",
                 "calendar_settings": {
                     "days_per_week": 8,
@@ -1721,7 +2338,20 @@ class GeminiServiceTests(unittest.TestCase):
                     "Question the station porter.",
                     "Review the case notebook.",
                 ],
-                "events": [{"type": "NpcUpsertedEvent", "payload": {}}],
+                "events": [
+                    {
+                        "type": "NpcUpsertedEvent",
+                        "payload": {
+                            "display_name": "Station Porter",
+                            "role": "Porter",
+                            "location": "Rainmarket Station",
+                            "public_description": "A porter in a weathered blue coat.",
+                            "player_facing_information": "The porter knows the platform schedule.",
+                            "knowledge_scope": ["Station routines"],
+                            "known_facts": ["The porter can identify the next train."],
+                        },
+                    }
+                ],
             }
         )
 
@@ -1738,6 +2368,8 @@ class GeminiServiceTests(unittest.TestCase):
         self.assertIn("Exact banned proper nouns", prompt)
         self.assertIn("bare category labels as final proper nouns", prompt)
         self.assertIn("the Police Department", prompt)
+        self.assertEqual(result.locations[0]["name"], "Rainmarket Station")
+        self.assertEqual((result.locations[0]["x_miles"], result.locations[0]["y_miles"]), (0.0, 0.0))
         self.assertIn("The Blue Wall", prompt)
         self.assertIn("gender_presentation_hint", prompt)
         self.assertIn("does not imply male", prompt)
@@ -1753,6 +2385,9 @@ class GeminiServiceTests(unittest.TestCase):
         )
         self.assertIn("every institution being coin-themed", prompt)
         self.assertIn("MusicChangedEvent", prompt)
+        self.assertIn("top-level gm_secrets array", prompt)
+        self.assertIn("GM-only starting truths", prompt)
+        self.assertNotIn("gm_secrets array with status", prompt)
         self.assertIn("start_location", prompt)
         self.assertIn("short and broad", prompt)
         self.assertIn("Y/N's Office", prompt)
@@ -1764,6 +2399,14 @@ class GeminiServiceTests(unittest.TestCase):
         self.assertEqual(
             NEW_GAME_RESPONSE_JSON_SCHEMA["properties"]["starting_items"]["minItems"],
             5,
+        )
+        starter_item_properties = NEW_GAME_RESPONSE_JSON_SCHEMA["properties"][
+            "starting_items"
+        ]["items"]["properties"]
+        self.assertNotIn("container", starter_item_properties)
+        self.assertIn(
+            "new-game schema intentionally keeps starter inventory flat",
+            prompt,
         )
         calendar_schema = NEW_GAME_RESPONSE_JSON_SCHEMA["properties"]["calendar_settings"]
         for list_field in ("day_names", "month_names", "seasons"):
@@ -1812,6 +2455,11 @@ class GeminiServiceTests(unittest.TestCase):
             result.world_lore["Locations"]["Rainmarket Station"],
             "Rainmarket Station anchors the canal district.",
         )
+        self.assertEqual(
+            result.gm_secrets[0]["secret_id"],
+            "station_master_is_villain",
+        )
+        self.assertEqual(result.gm_secrets[0]["status"], "active")
         self.assertEqual(result.start_location, "Rainmarket Station")
         self.assertEqual(result.selected_genre, "Realistic detective mystery")
         self.assertEqual(result.calendar_settings["days_per_week"], 8)
@@ -1841,6 +2489,7 @@ class GeminiServiceTests(unittest.TestCase):
                 "selected_genre": "Frontier survival",
                 "world_summary": "A route across dry country.",
                 "world_lore": {},
+                "gm_secrets": [],
                 "start_location": "Fuel Depot",
                 "starting_calendar": {},
                 "weather": "Hot",
@@ -1987,11 +2636,9 @@ class GeminiServiceTests(unittest.TestCase):
                 "introductory_message": "The sun rises over New Aethelgard.",
                 "events": [
                     {
-                        "type": "WorldLoreAddedEvent",
+                        "type": "ActiveTaskUpsertedEvent",
                         "payload": {
-                            "section": "Locations",
-                            "key": "New Aethelgard",
-                            "text": "New Aethelgard is crowded at dawn.",
+                            "name": "New Aethelgard Opening Task",
                         },
                     }
                 ],
@@ -2113,8 +2760,8 @@ class GeminiServiceTests(unittest.TestCase):
 
         google_module = types.ModuleType("google")
         genai_module = types.ModuleType("google.genai")
-        genai_module.Client = FakeClient
-        google_module.genai = genai_module
+        setattr(genai_module, "Client", FakeClient)
+        setattr(google_module, "genai", genai_module)
         self._old_google_module = sys.modules.get("google")
         self._old_genai_module = sys.modules.get("google.genai")
         sys.modules["google"] = google_module

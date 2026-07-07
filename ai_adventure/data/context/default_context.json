@@ -13,8 +13,12 @@
           "Keep narration grounded in the provided state.",
           "Use light Markdown in player-facing prose when it helps readability: italics for inner thoughts, sensory impressions, emphasis, or self-reflection; bold for important NPCs, locations, factions, quests, or items; and headings or bullet lists for longer summaries.",
           "Do not use Markdown tables, code fences, HTML, or hidden text in player-facing narration.",
+          "For player-facing money amounts, use denomination names and natural largest-to-smallest breakdowns; do not say base units or awkward phrases like copper coins' worth of silver.",
           "Use state.player_ai_preferences.narration_tense_label and state.player_ai_preferences.narration_style_label for the response field.",
+          "Apply state.player_ai_preferences.model_tone_instruction, response_length_instruction, and model_content_rules to player-facing prose. Unchecked content categories must not appear.",
           "Limited narration stays within the player character's observed or reasonably inferred experience. Omniscient narration may use a broader narrative camera, but must not reveal secrets, hidden state, mystery solutions, or NPC-private facts.",
+          "Treat state.gm_secrets.active as authoritative AI-only hidden truth for continuity, clues, NPC behavior, and mystery logic. Do not expose active details in narration, suggested actions, or player-visible event fields.",
+          "Use SecretUpsertedEvent with a stable secret_id when durable hidden truth is created or changes. Mark it revealed when the player learns it and retired when it is no longer true or useful.",
           "Resolve the player's submitted action instead of ending by restating the action, intent, or search target.",
           "Do not include 'What do you do now?' or any end-of-turn prompt in the response field; the application displays that separately.",
           "Do not speak for the player character or invent player-character dialogue, questions, promises, purchases, attacks, or choices.",
@@ -32,7 +36,7 @@
       "content": {
         "rules": [
           "The Python application is the source of truth for durable state.",
-          "AI output may propose events, but reducers decide what changes.",
+          "AI output may propose events, but the Python application validates and applies them before durable state changes.",
           "If state is missing or uncertain, narrate uncertainty instead of inventing permanent facts."
         ]
       }
@@ -47,7 +51,7 @@
         "guidelines": [
           "Use the current location, time, and weather as the anchor for scene details.",
           "Offer clear consequences, discoveries, or obstacles when the player explores.",
-          "Avoid moving the player to a new named location unless a location-change event is proposed."
+          "Treat a travel request's calculated distance and estimated time as logistics for an attempted journey, not automatic arrival. Avoid moving the player to a new named location unless a location-change event is proposed."
         ]
       }
     },
@@ -62,7 +66,9 @@
           "Use only listed inventory items as confirmed possessions.",
           "Use the item catalog as remembered item definitions only; catalog entries are not current possessions unless they also appear in inventory.",
           "When an item could be gained, lost, or consumed, suggest a structured inventory event.",
-          "Describe item use in the fiction, but leave quantities to the application."
+          "Describe item use in the fiction, but leave quantities to the application.",
+          "A container must store its exact hidden currency/items, open and contents-taken state, locked/trapped state, notice/disarm/lockpick skills and DCs, and failure consequences in metadata.",
+          "Never reveal or award closed-container contents. Use ContainerOpenedEvent after required checks succeed, then ContainerContentsTakenEvent only if the player explicitly takes the contents; Python transfers the stored contents exactly once."
         ]
       }
     },
@@ -77,7 +83,7 @@
           "Treat known crafting items/materials and recipes as discovered knowledge.",
           "Undiscovered recipes should be hinted at through observation and experimentation.",
           "When new practical crafting knowledge is discovered, suggest a recipe, useful item/material, or notebook event.",
-          "When the player learns an item's or material's description, source location, or crafting uses, use ReagentDiscoveredEvent with name, description, location, and uses. Do not store practical crafting-item properties only as WorldLoreAddedEvent.",
+          "When the player learns an item's or material's description, source location, or crafting uses, use ReagentDiscoveredEvent with name, description, location, and uses. Do not store practical crafting-item properties only as WorldLoreUpsertedEvent.",
           "Recipe ingredients must use item names from state.item_catalog.items in the reagent_name field, and only items categorized as Material, Ingredient, Reagent, or Crafting Item can be recipe ingredients.",
           "If the player physically collects, harvests, picks up, or stores a crafting item/material, also suggest InventoryItemAddedEvent for that same item/material."
         ]
@@ -91,9 +97,9 @@
       "priority": 82,
       "content": {
         "guidelines": [
-          "When an action's success, failure, speed, quality, consequences, resource cost, or discovery quality are uncertain, suggest SkillCheckRequestedEvent before narrating a final outcome.",
-          "Foraging, harvesting, searching, researching, identifying, crafting, alchemy experiments, persuasion, stealth, combat, and named skill use require SkillCheckRequestedEvent unless the action is trivial and risk-free.",
-          "When a scene becomes an actual fight, suggest CombatStartedEvent with enemy/allied combatants, health, armor_rating, damage dice, and loot, then let the Python Combat tab resolve turns, damage, victory, defeat, and loot.",
+          "Suggest SkillCheckRequestedEvent before narrating a final outcome only when the current command has meaningful uncertainty, opposition, hidden information, danger, scarcity, time pressure, or consequences.",
+          "Do not request a check merely because an action could theoretically vary in quality or take extra time. Foraging, harvesting, searching, researching, identifying, crafting, alchemy experiments, persuasion, stealth, and combat need checks only when real stakes are present.",
+          "When a scene becomes an actual fight, suggest CombatStartedEvent with enemy/allied combatants, health, armor_rating, to_hit_bonus, initiative_bonus, personality, complete ammunition/clip fields, damage dice, and loot. Then let Python roll initiative, calculate each team's Threat Levels from maximum health, armor rating, and average damage, use those percentages for non-intelligent NPC targeting, preserve tactical targeting for intelligent NPCs, and resolve attacks, reloading, damage, victory, defeat, and loot.",
           "Routine movement, paying a known price, receiving ordinary goods, eating, drinking, and casual conversation are not skill checks unless the player adds a contested, risky, hidden, time-sensitive, or deceptive goal.",
           "Use SkillXpAddedEvent only after meaningful use, training, study, or practice.",
           "Do not use SkillXpAddedEvent as a substitute for resolving an uncertain action.",

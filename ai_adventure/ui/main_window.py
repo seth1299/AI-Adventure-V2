@@ -17,7 +17,7 @@ from PySide6.QtCore import (
     Signal,
     Slot,
 )
-from PySide6.QtGui import QColor, QIcon, QPalette
+from PySide6.QtGui import QColor, QIcon, QPalette, QStandardItem, QStandardItemModel
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -33,6 +33,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QListWidget,
+    QListWidgetItem,
     QMainWindow,
     QMessageBox,
     QPushButton,
@@ -61,19 +62,106 @@ from ai_adventure.alchemy.ingredients import (
     normalize_recipe_ingredient,
 )
 from ai_adventure.app.app_paths import AppPaths
-from ai_adventure.app.features import is_tts_enabled
+from ai_adventure.app.features import (
+    is_ai_enabled,
+    is_playtesting_build,
+    is_tts_enabled,
+)
 from ai_adventure.app.user_settings import (
     load_app_settings,
     normalize_app_settings,
     save_app_settings,
 )
-from ai_adventure.ai.gemini_service import (
-    GeminiConfigurationError,
-    GeminiNarrationService,
-    format_story_message,
+from ai_adventure.ai.modes import (
+    ALL_CONTENT_HARM_CATEGORIES,
+    CONTENT_HARM_CATEGORY_OPTIONS,
+    DEFAULT_ALLOWED_CONTENT_HARM_CATEGORIES,
+    DEFAULT_MODEL_INTELLIGENCE,
+    DEFAULT_MODEL_TONE,
+    DEFAULT_RESPONSE_LENGTH,
+    MODEL_INTELLIGENCE_OPTIONS,
+    MODEL_TONE_OPTIONS,
+    RESPONSE_LENGTH_OPTIONS,
+    normalize_ai_mode_preferences,
 )
-from ai_adventure.audio.narration import NarrationPlayer
-from ai_adventure.audio.sound_manager import SoundManager, prepare_sound_directory
+class SoundManagerProtocol(Protocol):
+    """Runtime surface used from the background music manager."""
+
+    def get_valid_track_names(self) -> list[str]: ...
+
+    def set_music_enabled(self, enabled: bool) -> None: ...
+
+    def set_music_volume(self, volume: float | int | None) -> None: ...
+
+    def play_music(self, track_name_or_path: str | Path | None) -> None: ...
+
+    def stop_music(self, *, clear_current: bool = True) -> None: ...
+
+
+class NarrationPlayerProtocol(Protocol):
+    """Runtime surface used from the narrator player."""
+
+    def set_enabled(self, enabled: bool) -> None: ...
+
+    def set_volume(self, volume: float | int | None) -> None: ...
+
+    def set_voice(self, voice: str | None) -> None: ...
+
+    def set_speed(self, speed: float | int | None) -> None: ...
+
+    def play_sample(
+        self,
+        *,
+        voice: str | None = None,
+        volume: float | int | None = None,
+        speed: float | int | None = None,
+        text: str = ...,
+    ) -> bool: ...
+
+    def narrate(
+        self,
+        text: str,
+        *,
+        voice: str | None = None,
+        on_chunk_start: Callable[[str], None] | None = None,
+        on_complete: Callable[[], None] | None = None,
+    ) -> bool: ...
+
+    def stop(self) -> None: ...
+
+    def get_available_voices(self) -> dict[str, str]: ...
+
+
+if is_ai_enabled():
+    from ai_adventure.ai.gemini_service import (
+        GeminiConfigurationError,
+        GeminiNarrationService,
+        format_story_message,
+    )
+else:
+    GeminiNarrationService = None
+    GeminiConfigurationError = RuntimeError
+
+    def format_story_message(text: str) -> str:
+        """Returns plain story text when the AI presentation layer is excluded."""
+
+        return text
+
+
+if not is_playtesting_build():
+    from ai_adventure.audio.narration import NarrationPlayer as _NarrationPlayerClass
+    from ai_adventure.audio.sound_manager import (
+        SoundManager as _SoundManagerClass,
+        prepare_sound_directory,
+    )
+else:
+    _NarrationPlayerClass = None
+    _SoundManagerClass = None
+
+    def prepare_sound_directory(app_paths: Any) -> Path:
+        """Returns a harmless placeholder path in the audio-free build."""
+
+        return Path(app_paths.sounds_dir)
 from ai_adventure.audio.tts_settings import (
     DEFAULT_TTS_SPEED_PERCENT,
     active_voice_spec_from_audio,
@@ -96,17 +184,26 @@ from ai_adventure.calendar_system import (
     DEFAULT_START_ELAPSED_MINUTES,
     build_calendar_snapshot,
     build_month_grid,
-    resolve_starting_elapsed_minutes,
+    resolve_starting_calendar_minute,
 )
 from ai_adventure.combat import (
     BODY_PARTS,
+    COMBAT_PERSONALITIES,
+    DEFAULT_ATTACK_RANGE_FEET,
     DEFAULT_BASE_ARMOR_RATING,
     DEFAULT_PLAYER_MAX_HEALTH,
     DEFAULT_UNARMED_DAMAGE,
     EQUIPMENT_SLOTS,
+    attack_hit_probability,
+    attack_bonus_from_skills,
     armor_rating_from_equipment,
+    calculate_team_threat_levels,
+    combatant_display_name,
     combat_team_defeated,
     empty_equipment,
+    equipment_item_counts,
+    equipped_weapon_attack_skill,
+    equipped_weapon_combat_profile,
     equipped_weapon_damage,
     item_is_valid_for_slot,
     item_metadata,
@@ -114,6 +211,7 @@ from ai_adventure.combat import (
     normalize_combat_state,
     normalize_damage_expression,
     normalize_equipment,
+    roll_combat_initiative,
     roll_damage_expression,
 )
 from ai_adventure.context.context_builder import AiContextBuilder
@@ -121,6 +219,12 @@ from ai_adventure.currency import (
     FALLBACK_CURRENCY_DENOMINATIONS,
     describe_currency_denominations,
     format_currency_amount,
+)
+from ai_adventure.locations import (
+    calculate_travel_estimate,
+    format_distance,
+    format_travel_time,
+    normalize_known_location,
 )
 from ai_adventure.core.state_manager import StateManager
 from ai_adventure.events.event_applier import EventApplier
@@ -160,6 +264,7 @@ from ai_adventure.persistence.save_repository import (
 LOGGER = logging.getLogger(__name__)
 GM_THINKING_TEXT = "GM is thinking..."
 STORY_REVEAL_STALL_TIMEOUT_MS = 8000
+NPC_TURN_DELAY_MS = 2000
 CONTINUE_STORY_INSTRUCTION = (
     "Continue the previous story response as though it had been longer originally. "
     "Do not treat this as a new player action. Do not invent new player-character "
@@ -174,6 +279,7 @@ STARTER_ITEM_COLUMN_WIDTHS = (140, 132, 140, 220, 132, 100)
 CURRENCY_COLUMN_WIDTHS = (150, 160, 132, 100)
 ECONOMY_EXAMPLE_COLUMN_WIDTHS = (220, 132, 100)
 THEME_NAMES = {"Light", "Dark"}
+SampleVoiceCallback = Callable[[str, int, int], bool]
 SKILL_LEVEL_DESCRIPTIONS = {
     5: "Signature expertise - the character's strongest, defining capability.",
     4: "Expert - a major specialty the character can rely on often.",
@@ -340,6 +446,9 @@ class _GeminiStoryWorker(QObject):
         """Generates one story response and emits the result on completion."""
 
         try:
+            if GeminiNarrationService is None:
+                raise GeminiConfigurationError("AI generation is disabled in this build.")
+
             result = GeminiNarrationService().generate_story_response(
                 self._context_packet
             )
@@ -372,6 +481,9 @@ class _GeminiSkillCheckPlanWorker(QObject):
         """Generates one pre-narration skill-check plan."""
 
         try:
+            if GeminiNarrationService is None:
+                raise GeminiConfigurationError("AI generation is disabled in this build.")
+
             result = GeminiNarrationService().plan_story_skill_checks(
                 self._context_packet
             )
@@ -387,7 +499,7 @@ class _GeminiSkillCheckPlanWorker(QObject):
             self.finished.emit()
 
 
-def _create_narration_player(app_paths: AppPaths) -> NarrationPlayer | None:
+def _create_narration_player(app_paths: AppPaths) -> NarrationPlayerProtocol | None:
     """Creates the narration player only when TTS support is enabled."""
 
     if not is_tts_enabled():
@@ -401,7 +513,10 @@ def _create_narration_player(app_paths: AppPaths) -> NarrationPlayer | None:
         LOGGER.warning("Narrator is unavailable because TTS could not be loaded: %s", error)
         return None
 
-    return NarrationPlayer(
+    if _NarrationPlayerClass is None:
+        return None
+
+    return _NarrationPlayerClass(
         create_tts_manager(
             model_path=app_paths.kokoro_model_path,
             voices_path=app_paths.kokoro_voices_path,
@@ -427,6 +542,8 @@ class MainWindow(QMainWindow):
 
         self.app_paths = app_paths
         self.active_repository: SaveRepository | None = None
+        self.playtesting_build = is_playtesting_build()
+        self.ai_enabled = is_ai_enabled()
         self.tts_enabled = is_tts_enabled()
         self.app_settings = load_app_settings(
             self.app_paths.app_settings_path,
@@ -434,10 +551,19 @@ class MainWindow(QMainWindow):
             tts_enabled=self.tts_enabled,
         )
         self.menu_theme = _normalize_theme_name(self.app_settings["theme"])
-        self.sound_manager = SoundManager(prepare_sound_directory(self.app_paths))
+        self.sound_manager = (
+            None
+            if self.playtesting_build or _SoundManagerClass is None
+            else _SoundManagerClass(prepare_sound_directory(self.app_paths))
+        )
         self.narration_player = _create_narration_player(self.app_paths)
 
-        self.setWindowTitle("AI Adventure")
+        self.application_name = (
+            "AI Adventure Playtesting"
+            if self.playtesting_build
+            else "AI Adventure"
+        )
+        self.setWindowTitle(self.application_name)
         self._set_app_icon()
         self.resize(1100, 750)
 
@@ -450,6 +576,9 @@ class MainWindow(QMainWindow):
             on_load_game=self.load_game_from_path,
             on_settings=self.open_main_menu_settings,
             on_templates=self.open_new_game_templates,
+            application_name=self.application_name,
+            new_game_label="New Playtest" if self.playtesting_build else "New Game",
+            show_templates=not self.playtesting_build,
         )
 
         self.game_shell = GameShell(
@@ -461,6 +590,8 @@ class MainWindow(QMainWindow):
             on_app_tts_settings_saved=self._persist_app_tts_settings,
             global_tts_settings_provider=lambda: self.app_settings["audio"],
             custom_voice_storage_path=self.app_paths.app_settings_path,
+            playtesting_tools=self.playtesting_build,
+            ai_enabled=self.ai_enabled,
         )
 
         self.stack.addWidget(self.main_menu)
@@ -487,6 +618,10 @@ class MainWindow(QMainWindow):
 
     def start_new_game_wizard(self) -> None:
         """Opens the New Game Wizard."""
+
+        if self.playtesting_build:
+            self._start_new_playtest()
+            return
 
         should_continue, template_setup = self._choose_new_game_template_setup()
 
@@ -533,6 +668,54 @@ class MainWindow(QMainWindow):
                     )
                     return
 
+    def _start_new_playtest(self) -> None:
+        """Creates an isolated save without invoking setup generation or Gemini."""
+
+        suggested_title = _next_available_save_title(
+            self.app_paths.saves_dir,
+            "Combat Playtest",
+        )
+        title, accepted = QInputDialog.getText(
+            self,
+            "New Playtest",
+            "Playtest save name:",
+            QLineEdit.EchoMode.Normal,
+            suggested_title,
+        )
+
+        if not accepted:
+            return
+
+        clean_title = title.strip()
+
+        if not clean_title:
+            QMessageBox.warning(
+                self,
+                "Missing Playtest Name",
+                "Enter a name for the playtest save.",
+            )
+            return
+
+        try:
+            repository = SaveRepository.create_new_save(
+                self.app_paths.saves_dir,
+                clean_title,
+            )
+        except DuplicateSaveTitleError as error:
+            QMessageBox.warning(self, "Playtest Name Already Exists", str(error))
+            return
+        except Exception:
+            LOGGER.exception("Failed to create playtest save.")
+            QMessageBox.critical(
+                self,
+                "New Playtest Failed",
+                "Could not create the playtest save.",
+            )
+            return
+
+        repository.set_setting("theme", self.menu_theme)
+        self.open_repository(repository)
+
     def open_main_menu_settings(self) -> None:
         """Opens app-level settings from the Main Menu."""
 
@@ -540,6 +723,7 @@ class MainWindow(QMainWindow):
             self,
             settings=self.app_settings,
             tts_enabled=self.tts_enabled,
+            music_enabled=not self.playtesting_build,
             voice_options=_narrator_voice_options(self.narration_player),
             on_sample_voice=self._play_narrator_sample,
             custom_voice_storage_path=self.app_paths.app_settings_path,
@@ -704,6 +888,10 @@ class MainWindow(QMainWindow):
 
         save_new_game_template(self.app_paths.new_game_templates_path, clean_setup)
         self.open_repository(repository)
+
+        if not self.ai_enabled:
+            return
+
         self.game_shell.story_screen.set_initial_generation_pending(True)
         QApplication.processEvents()
         QTimer.singleShot(
@@ -735,11 +923,21 @@ class MainWindow(QMainWindow):
     ) -> None:
         """Uses Gemini to synthesize the initial world and opening scene."""
 
+        if GeminiNarrationService is None:
+            self._apply_fallback_currency_if_needed(repository, setup)
+            repository.set_world_summary(fallback_world_summary(setup))
+            repository.append_history("story", fallback_introductory_message(setup))
+            return
+
         try:
             result = GeminiNarrationService().generate_new_game_world(
                 build_new_game_setup_packet(
                     setup,
-                    valid_music_tracks=self.sound_manager.get_valid_track_names(),
+                    valid_music_tracks=(
+                        self.sound_manager.get_valid_track_names()
+                        if self.sound_manager is not None
+                        else []
+                    ),
                 )
             )
         except GeminiConfigurationError as error:
@@ -826,6 +1024,22 @@ class MainWindow(QMainWindow):
         if result.start_location:
             repository.set_state_value("location", result.start_location)
 
+        if getattr(result, "locations", None):
+            repository.set_travel_locations(result.locations)
+
+        repository.ensure_travel_locations()
+
+        for secret in getattr(result, "gm_secrets", []):
+            repository.upsert_gm_secret(
+                secret_id=str(secret.get("secret_id", "")),
+                title=str(secret.get("title", "")),
+                details=str(secret.get("details", "")),
+                reveal_condition=str(secret.get("reveal_condition", "")),
+                related_npc_ids=list(secret.get("related_npc_ids", [])),
+                related_locations=list(secret.get("related_locations", [])),
+                status=str(secret.get("status", "active")),
+            )
+
         setup_calendar = setup.get("calendar", {})
         if (
             isinstance(setup_calendar, dict)
@@ -838,16 +1052,16 @@ class MainWindow(QMainWindow):
             )
 
         if result.starting_calendar:
-            elapsed_minutes = resolve_starting_elapsed_minutes(
+            current_minute = resolve_starting_calendar_minute(
                 result.starting_calendar,
                 repository.get_calendar_settings(),
-                default_elapsed_minutes=DEFAULT_START_ELAPSED_MINUTES,
+                default_current_minute=DEFAULT_START_ELAPSED_MINUTES,
             )
             calendar_snapshot = build_calendar_snapshot(
-                elapsed_minutes,
+                current_minute,
                 repository.get_calendar_settings(),
             )
-            repository.set_state_value("elapsed_minutes", str(elapsed_minutes))
+            repository.set_current_calendar_minute(current_minute)
             repository.set_state_value("time", calendar_snapshot["display_label"])
 
         if result.start_weather:
@@ -970,7 +1184,7 @@ class MainWindow(QMainWindow):
         self.stack.setCurrentWidget(self.game_shell)
 
         title = repository.get_meta("title", default="AI Adventure")
-        self.setWindowTitle(f"AI Adventure - {title}")
+        self.setWindowTitle(f"{self.application_name} - {title}")
 
         LOGGER.info("Opened save: %s", repository.db_path)
 
@@ -982,7 +1196,7 @@ class MainWindow(QMainWindow):
         self._apply_app_settings(self.app_settings, persist=False)
         self.main_menu.refresh_saves()
         self.stack.setCurrentWidget(self.main_menu)
-        self.setWindowTitle("AI Adventure")
+        self.setWindowTitle(self.application_name)
 
     def _apply_active_theme(self) -> None:
         """Applies the theme saved for the currently loaded adventure."""
@@ -1098,7 +1312,7 @@ class CustomVoiceDialog(QDialog):
         *,
         audio_settings: dict[str, Any] | None = None,
         voice_options: dict[str, str] | None = None,
-        on_sample_voice: Callable[[str, int, int], bool] | None = None,
+        on_sample_voice: SampleVoiceCallback | None = None,
         storage_path: Path | str | None = None,
     ) -> None:
         super().__init__(parent)
@@ -1518,7 +1732,7 @@ class TTSSettingsWidget(QWidget):
         *,
         audio_settings: dict[str, Any] | None = None,
         voice_options: dict[str, str] | None = None,
-        on_sample_voice: Callable[[str, int, int], bool] | None = None,
+        on_sample_voice: SampleVoiceCallback | None = None,
         on_custom_voice_saved: Callable[[dict[str, Any]], None] | None = None,
         custom_voice_storage_path: Path | str | None = None,
         parent: QWidget | None = None,
@@ -1771,7 +1985,7 @@ class TTSSettingsDialog(QDialog):
         *,
         audio_settings: dict[str, Any] | None = None,
         voice_options: dict[str, str] | None = None,
-        on_sample_voice: Callable[[str, int, int], bool] | None = None,
+        on_sample_voice: SampleVoiceCallback | None = None,
         on_custom_voice_saved: Callable[[dict[str, Any]], None] | None = None,
         custom_voice_storage_path: Path | str | None = None,
     ) -> None:
@@ -1810,6 +2024,437 @@ class TTSSettingsDialog(QDialog):
         return self.tts_settings_widget.custom_voice_library_changed
 
 
+class ContentCategoryComboBox(QComboBox):
+    """Checkable multi-select dropdown for Gemini harm categories."""
+
+    selection_changed = Signal()
+    _ALL_VALUE = "__no_restrictions__"
+
+    def __init__(
+        self,
+        selected_categories: list[str] | tuple[str, ...] | None = None,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+
+        self._keep_popup_open = False
+        self._model = QStandardItemModel(self)
+        self.setModel(self._model)
+        self.setEditable(True)
+
+        line_edit = self.lineEdit()
+        if line_edit is not None:
+            line_edit.setReadOnly(True)
+            line_edit.setPlaceholderText("Select allowed content...")
+
+        self._append_checkable_item("No Restrictions", self._ALL_VALUE)
+        for option in CONTENT_HARM_CATEGORY_OPTIONS:
+            self._append_checkable_item(option["label"], option["value"])
+
+        self.view().pressed.connect(self._toggle_item)
+        self.set_selected_categories(
+            selected_categories
+            if selected_categories is not None
+            else list(DEFAULT_ALLOWED_CONTENT_HARM_CATEGORIES)
+        )
+
+    def selected_categories(self) -> list[str]:
+        """Returns checked Gemini harm category identifiers in API order."""
+
+        selected: list[str] = []
+        for row in range(1, self._model.rowCount()):
+            item = self._model.item(row)
+            if item is not None and item.checkState() == Qt.CheckState.Checked:
+                selected.append(str(item.data(Qt.ItemDataRole.UserRole)))
+        return selected
+
+    def set_selected_categories(self, categories: list[str] | tuple[str, ...]) -> None:
+        """Checks only the provided Gemini harm category identifiers."""
+
+        selected = {
+            str(category)
+            for category in categories
+            if str(category) in ALL_CONTENT_HARM_CATEGORIES
+        }
+        for row in range(1, self._model.rowCount()):
+            item = self._model.item(row)
+            if item is None:
+                continue
+            category = str(item.data(Qt.ItemDataRole.UserRole))
+            item.setCheckState(
+                Qt.CheckState.Checked
+                if category in selected
+                else Qt.CheckState.Unchecked
+            )
+
+        self._sync_no_restrictions_item()
+        self._refresh_summary()
+
+    def hidePopup(self) -> None:  # noqa: N802 - Qt method name
+        """Keeps the popup open while checkboxes are being toggled."""
+
+        if self._keep_popup_open:
+            self._keep_popup_open = False
+            return
+        super().hidePopup()
+
+    def _append_checkable_item(self, label: str, value: str) -> None:
+        item = QStandardItem(label)
+        item.setFlags(
+            Qt.ItemFlag.ItemIsEnabled
+            | Qt.ItemFlag.ItemIsSelectable
+            | Qt.ItemFlag.ItemIsUserCheckable
+        )
+        item.setData(value, Qt.ItemDataRole.UserRole)
+        item.setCheckState(Qt.CheckState.Unchecked)
+        self._model.appendRow(item)
+
+    def _toggle_item(self, index) -> None:
+        self._keep_popup_open = True
+        item = self._model.itemFromIndex(index)
+        if item is None:
+            return
+
+        value = str(item.data(Qt.ItemDataRole.UserRole))
+        if value == self._ALL_VALUE:
+            should_check_all = len(self.selected_categories()) != len(
+                ALL_CONTENT_HARM_CATEGORIES
+            )
+            self.set_selected_categories(
+                list(ALL_CONTENT_HARM_CATEGORIES) if should_check_all else []
+            )
+        else:
+            item.setCheckState(
+                Qt.CheckState.Unchecked
+                if item.checkState() == Qt.CheckState.Checked
+                else Qt.CheckState.Checked
+            )
+            self._sync_no_restrictions_item()
+            self._refresh_summary()
+
+        self.selection_changed.emit()
+        QTimer.singleShot(0, self._refresh_summary)
+
+    def _sync_no_restrictions_item(self) -> None:
+        all_item = self._model.item(0)
+        if all_item is None:
+            return
+        all_item.setCheckState(
+            Qt.CheckState.Checked
+            if len(self.selected_categories()) == len(ALL_CONTENT_HARM_CATEGORIES)
+            else Qt.CheckState.Unchecked
+        )
+
+    def _refresh_summary(self) -> None:
+        categories = self.selected_categories()
+        labels_by_category = {
+            option["value"]: option["label"]
+            for option in CONTENT_HARM_CATEGORY_OPTIONS
+        }
+
+        if len(categories) == len(ALL_CONTENT_HARM_CATEGORIES):
+            summary = "No Restrictions"
+        elif not categories:
+            summary = "None"
+        else:
+            summary = ", ".join(labels_by_category[category] for category in categories)
+
+        line_edit = self.lineEdit()
+        if line_edit is not None:
+            line_edit.setText(summary)
+        self.setToolTip(summary)
+
+
+class AISettingsDialog(QDialog):
+    """Save-specific AI behavior, prose, and content controls."""
+
+    def __init__(
+        self,
+        parent: QWidget | None = None,
+        *,
+        settings: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(parent)
+
+        raw_settings = settings or {}
+        modes = normalize_ai_mode_preferences(raw_settings)
+        narration = normalize_narration_preferences(
+            {
+                "tense": raw_settings.get(
+                    "narration_tense",
+                    DEFAULT_NARRATION_TENSE,
+                ),
+                "style": raw_settings.get(
+                    "narration_style",
+                    DEFAULT_NARRATION_STYLE,
+                ),
+            }
+        )
+
+        self.setWindowTitle("A.I. Settings")
+        self.resize(640, 720)
+
+        self.model_intelligence_combo = QComboBox()
+        self._add_mode_options(
+            self.model_intelligence_combo,
+            MODEL_INTELLIGENCE_OPTIONS,
+        )
+        _set_combo_to_data(
+            self.model_intelligence_combo,
+            modes["model_intelligence"],
+        )
+        self.model_intelligence_description = self._description_label()
+
+        self.model_tone_combo = QComboBox()
+        self._add_mode_options(self.model_tone_combo, MODEL_TONE_OPTIONS)
+        _set_combo_to_data(self.model_tone_combo, modes["model_tone"])
+        self.model_tone_description = self._description_label()
+
+        self.response_length_combo = QComboBox()
+        self._add_mode_options(self.response_length_combo, RESPONSE_LENGTH_OPTIONS)
+        _set_combo_to_data(self.response_length_combo, modes["response_length"])
+        self.response_length_description = self._description_label()
+
+        self.model_content_combo = ContentCategoryComboBox(
+            list(modes["allowed_content_categories"])
+        )
+        self.model_content_description = self._description_label()
+
+        self.narration_tense_combo = QComboBox()
+        _add_combo_options(self.narration_tense_combo, NARRATION_TENSE_OPTIONS)
+        _set_combo_to_data(self.narration_tense_combo, narration["tense"])
+        self.narration_tense_description = self._description_label(
+            "Controls the grammatical tense used for player-facing narration."
+        )
+
+        self.narration_style_combo = QComboBox()
+        _add_combo_options(self.narration_style_combo, NARRATION_STYLE_OPTIONS)
+        _set_combo_to_data(self.narration_style_combo, narration["style"])
+        self.narration_style_description = self._description_label(
+            "Controls narrative person and camera. Limited styles preserve the "
+            "player character's perspective; omniscient styles may use a wider camera "
+            "without revealing hidden information."
+        )
+
+        self.additional_ai_context_input = QTextEdit()
+        self.additional_ai_context_input.setPlaceholderText(
+            "Optional AI-facing guidance, style preferences, boundaries, or reminders..."
+        )
+        self.additional_ai_context_input.setPlainText(
+            str(raw_settings.get("additional_context", ""))
+        )
+
+        behavior_group = QGroupBox("Model Modes")
+        behavior_layout = QVBoxLayout()
+        behavior_layout.addWidget(
+            self._choice_field(
+                "Model Intelligence",
+                self.model_intelligence_combo,
+                self.model_intelligence_description,
+            )
+        )
+        behavior_layout.addWidget(
+            self._choice_field(
+                "Model Tone",
+                self.model_tone_combo,
+                self.model_tone_description,
+            )
+        )
+        behavior_layout.addWidget(
+            self._choice_field(
+                "Response Length",
+                self.response_length_combo,
+                self.response_length_description,
+            )
+        )
+        behavior_layout.addWidget(
+            self._choice_field(
+                "Model Content (select every category that may appear)",
+                self.model_content_combo,
+                self.model_content_description,
+            )
+        )
+        behavior_group.setLayout(behavior_layout)
+
+        narration_group = QGroupBox("Narration")
+        narration_layout = QVBoxLayout()
+        narration_layout.addWidget(
+            self._choice_field(
+                "Narration Tense",
+                self.narration_tense_combo,
+                self.narration_tense_description,
+            )
+        )
+        narration_layout.addWidget(
+            self._choice_field(
+                "Narration Style",
+                self.narration_style_combo,
+                self.narration_style_description,
+            )
+        )
+        additional_label = QLabel("Additional A.I. Context")
+        narration_layout.addWidget(additional_label)
+        narration_layout.addWidget(self.additional_ai_context_input)
+        additional_description = self._description_label(
+            "Persistent free-form guidance sent to the A.I. with every story turn."
+        )
+        narration_layout.addWidget(additional_description)
+        narration_group.setLayout(narration_layout)
+
+        content = QWidget()
+        content_layout = QVBoxLayout()
+        content_layout.addWidget(behavior_group)
+        content_layout.addWidget(narration_group)
+        content_layout.addStretch()
+        content.setLayout(content_layout)
+
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setWidget(content)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+
+        layout = QVBoxLayout()
+        layout.addWidget(scroll_area)
+        layout.addWidget(buttons)
+        self.setLayout(layout)
+
+        self.model_intelligence_combo.currentIndexChanged.connect(
+            lambda _index: self._refresh_mode_descriptions()
+        )
+        self.model_tone_combo.currentIndexChanged.connect(
+            lambda _index: self._refresh_mode_descriptions()
+        )
+        self.response_length_combo.currentIndexChanged.connect(
+            lambda _index: self._refresh_mode_descriptions()
+        )
+        self.model_content_combo.selection_changed.connect(
+            self._refresh_mode_descriptions
+        )
+        self._refresh_mode_descriptions()
+
+    def build_ai_settings(self) -> dict[str, Any]:
+        """Builds normalized save-specific AI settings from the dialog."""
+
+        modes = normalize_ai_mode_preferences(
+            {
+                "model_intelligence": (
+                    self.model_intelligence_combo.currentData()
+                    or DEFAULT_MODEL_INTELLIGENCE
+                ),
+                "model_tone": self.model_tone_combo.currentData()
+                or DEFAULT_MODEL_TONE,
+                "response_length": self.response_length_combo.currentData()
+                or DEFAULT_RESPONSE_LENGTH,
+                "allowed_content_categories": (
+                    self.model_content_combo.selected_categories()
+                ),
+            }
+        )
+        narration = normalize_narration_preferences(
+            {
+                "tense": (
+                    self.narration_tense_combo.currentData()
+                    or DEFAULT_NARRATION_TENSE
+                ),
+                "style": (
+                    self.narration_style_combo.currentData()
+                    or DEFAULT_NARRATION_STYLE
+                ),
+            }
+        )
+        return {
+            "model_intelligence": modes["model_intelligence"],
+            "model_tone": modes["model_tone"],
+            "response_length": modes["response_length"],
+            "allowed_content_categories": modes["allowed_content_categories"],
+            "narration_tense": narration["tense"],
+            "narration_style": narration["style"],
+            "additional_context": (
+                self.additional_ai_context_input.toPlainText().strip()
+            ),
+        }
+
+    @staticmethod
+    def _description_label(text: str = "") -> QLabel:
+        label = QLabel(text)
+        label.setWordWrap(True)
+        label.setStyleSheet("font-size: 11px;")
+        return label
+
+    @staticmethod
+    def _choice_field(title: str, combo: QComboBox, description: QLabel) -> QWidget:
+        field = QWidget()
+        layout = QVBoxLayout()
+        layout.setContentsMargins(0, 4, 0, 8)
+        layout.addWidget(QLabel(title))
+        layout.addWidget(combo)
+        layout.addWidget(description)
+        field.setLayout(layout)
+        return field
+
+    @staticmethod
+    def _add_mode_options(
+        combo: QComboBox,
+        options: tuple[dict[str, Any], ...],
+    ) -> None:
+        for option in options:
+            combo.addItem(str(option["label"]), str(option["value"]))
+
+    def _refresh_mode_descriptions(self) -> None:
+        modes = normalize_ai_mode_preferences(
+            {
+                "model_intelligence": self.model_intelligence_combo.currentData(),
+                "model_tone": self.model_tone_combo.currentData(),
+                "response_length": self.response_length_combo.currentData(),
+                "allowed_content_categories": (
+                    self.model_content_combo.selected_categories()
+                ),
+            }
+        )
+        self.model_intelligence_description.setText(
+            str(modes["model_intelligence_description"])
+        )
+        self.model_tone_description.setText(str(modes["model_tone_description"]))
+        self.response_length_description.setText(
+            str(modes["response_length_description"])
+        )
+
+        if not modes["blocked_content_labels"]:
+            content_text = (
+                "No Restrictions: all five configurable Gemini harm categories may "
+                "appear when appropriate."
+            )
+        elif modes["allowed_content_labels"]:
+            content_text = (
+                "Checked categories may appear; unchecked categories are blocked at "
+                "Gemini's strict threshold. Allowed: "
+                + ", ".join(modes["allowed_content_labels"])
+                + "."
+            )
+        else:
+            content_text = (
+                "No categories are allowed. All five configurable Gemini harm "
+                "categories are blocked at the strict threshold."
+            )
+
+        selected = set(modes["allowed_content_categories"])
+        selected_descriptions = [
+            f"• {option['label']}: {option['description']}"
+            for option in CONTENT_HARM_CATEGORY_OPTIONS
+            if option["value"] in selected
+        ]
+        if selected_descriptions:
+            content_text += "\n" + "\n".join(selected_descriptions)
+
+        self.model_content_description.setText(content_text)
+
+
 class MainMenuSettingsDialog(QDialog):
     """App-level settings available before a save is loaded."""
 
@@ -1819,13 +2464,15 @@ class MainMenuSettingsDialog(QDialog):
         *,
         settings: dict[str, Any],
         tts_enabled: bool = True,
+        music_enabled: bool = True,
         voice_options: dict[str, str] | None = None,
-        on_sample_voice: Callable[[str, int], bool] | None = None,
+        on_sample_voice: SampleVoiceCallback | None = None,
         custom_voice_storage_path: Path | str | None = None,
     ) -> None:
         super().__init__(parent)
 
         self.tts_enabled = bool(tts_enabled)
+        self.music_enabled = bool(music_enabled)
         self.voice_options = voice_options or available_narrator_voices()
         self.on_sample_voice = on_sample_voice
         clean_settings = normalize_app_settings(
@@ -1863,11 +2510,13 @@ class MainMenuSettingsDialog(QDialog):
 
         form = QFormLayout()
         form.addRow("Theme Preference:", self.theme_combo)
-        form.addRow("Background Music:", self.music_enabled_checkbox)
-        form.addRow(
-            "Music Volume:",
-            _slider_row(self.music_volume_slider, self.music_volume_label),
-        )
+
+        if self.music_enabled:
+            form.addRow("Background Music:", self.music_enabled_checkbox)
+            form.addRow(
+                "Music Volume:",
+                _slider_row(self.music_volume_slider, self.music_volume_label),
+            )
 
         if self.tts_enabled:
             self.tts_settings_widget = TTSSettingsWidget(
@@ -1955,11 +2604,11 @@ class MainMenuSettingsDialog(QDialog):
         voice: str | None = None,
         volume: int | None = None,
         speed: int | None = None,
-    ) -> bool | None:
+    ) -> bool:
         """Plays the selected voice sample."""
 
         if self.on_sample_voice is None:
-            return None
+            return False
 
         return _invoke_sample_voice_callback(
             self.on_sample_voice,
@@ -1992,6 +2641,10 @@ class MainMenuScreen(QWidget):
         on_load_game,
         on_settings,
         on_templates,
+        *,
+        application_name: str = "AI Adventure",
+        new_game_label: str = "New Game",
+        show_templates: bool = True,
     ) -> None:
         """
         Args:
@@ -2010,11 +2663,11 @@ class MainMenuScreen(QWidget):
         self.on_settings = on_settings
         self.on_templates = on_templates
 
-        title_label = QLabel("AI Adventure")
+        title_label = QLabel(application_name)
         title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         title_label.setStyleSheet("font-size: 32px; font-weight: bold;")
 
-        new_game_button = QPushButton("New Game")
+        new_game_button = QPushButton(new_game_label)
         new_game_button.clicked.connect(self._handle_new_game)
 
         self.save_combo = QComboBox()
@@ -2027,6 +2680,7 @@ class MainMenuScreen(QWidget):
 
         self.templates_button = QPushButton("New Game Templates")
         self.templates_button.clicked.connect(self.on_templates)
+        self.templates_button.setVisible(show_templates)
 
         layout = QVBoxLayout()
         layout.addStretch()
@@ -2662,7 +3316,7 @@ class NewGameWizard(QWizard):
         tts_enabled: bool = True,
         audio_defaults: dict[str, Any] | None = None,
         voice_options: dict[str, str] | None = None,
-        on_sample_voice: Callable[[str, int], bool] | None = None,
+        on_sample_voice: SampleVoiceCallback | None = None,
         on_tts_settings_saved: Callable[[dict[str, Any]], None] | None = None,
         custom_voice_storage_path: Path | str | None = None,
     ) -> None:
@@ -2685,6 +3339,16 @@ class NewGameWizard(QWizard):
         self.tts_speed_slider: QSlider | None = None
         self.tts_settings_widget: TTSSettingsWidget | None = None
         self._legacy_currency_description = ""
+        default_modes = normalize_ai_mode_preferences({})
+        self._new_game_ai_settings: dict[str, Any] = {
+            "model_intelligence": default_modes["model_intelligence"],
+            "model_tone": default_modes["model_tone"],
+            "response_length": default_modes["response_length"],
+            "allowed_content_categories": default_modes[
+                "allowed_content_categories"
+            ],
+            "additional_context": "",
+        }
 
         self.setWindowTitle("New Game Wizard")
         self.resize(780, 620)
@@ -3034,6 +3698,7 @@ class NewGameWizard(QWizard):
                 "music_volume": self.music_volume_slider.value(),
                 **self._tts_settings_value(),
             },
+            "ai_settings": dict(self._new_game_ai_settings),
             "narration": {
                 "tense": self.narration_tense_combo.currentData(),
                 "style": self.narration_style_combo.currentData(),
@@ -3060,14 +3725,20 @@ class NewGameWizard(QWizard):
         calendar = clean_setup["calendar"]
         audio = clean_setup["audio"]
         narration = clean_setup["narration"]
+        ai_settings = clean_setup["ai_settings"]
 
         self.title_input.setText(clean_setup["title"])
         self.genre_input.setText(clean_setup["specified_genre"])
         self.game_style_input.setPlainText(clean_setup["game_style"])
         self.start_location_input.setText(clean_setup["start_location"])
         self.world_context_input.setPlainText(clean_setup["world_context"])
-        _set_combo_to_data(self.narration_tense_combo, narration["tense"])
-        _set_combo_to_data(self.narration_style_combo, narration["style"])
+        self._apply_new_game_ai_settings(
+            {
+                **ai_settings,
+                "narration_tense": narration["tense"],
+                "narration_style": narration["style"],
+            }
+        )
 
         self.character_name_input.setText(character["name"])
         self.appearance_input.setPlainText(character["appearance"])
@@ -3110,6 +3781,83 @@ class NewGameWizard(QWizard):
         if self.tts_settings_widget is not None:
             self.tts_settings_widget.load_audio_settings(audio)
 
+    def _open_new_game_ai_settings_dialog(self) -> None:
+        """Opens the shared A.I. settings modal during new-game creation."""
+
+        dialog = AISettingsDialog(
+            self,
+            settings={
+                **self._new_game_ai_settings,
+                "narration_tense": (
+                    self.narration_tense_combo.currentData()
+                    or DEFAULT_NARRATION_TENSE
+                ),
+                "narration_style": (
+                    self.narration_style_combo.currentData()
+                    or DEFAULT_NARRATION_STYLE
+                ),
+            },
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        self._apply_new_game_ai_settings(dialog.build_ai_settings())
+
+    def _apply_new_game_ai_settings(self, raw_settings: dict[str, Any]) -> None:
+        """Applies modal values to wizard state and its visible summary."""
+
+        modes = normalize_ai_mode_preferences(raw_settings)
+        narration = normalize_narration_preferences(
+            {
+                "tense": raw_settings.get("narration_tense"),
+                "style": raw_settings.get("narration_style"),
+            }
+        )
+        self._new_game_ai_settings = {
+            "model_intelligence": modes["model_intelligence"],
+            "model_tone": modes["model_tone"],
+            "response_length": modes["response_length"],
+            "allowed_content_categories": modes[
+                "allowed_content_categories"
+            ],
+            "additional_context": str(
+                raw_settings.get("additional_context", "")
+            ).strip(),
+        }
+        _set_combo_to_data(self.narration_tense_combo, narration["tense"])
+        _set_combo_to_data(self.narration_style_combo, narration["style"])
+        self._refresh_new_game_ai_settings_summary()
+
+    def _refresh_new_game_ai_settings_summary(self) -> None:
+        """Shows the active wizard A.I. modes without expanding every control."""
+
+        if not hasattr(self, "ai_settings_summary_label"):
+            return
+
+        modes = normalize_ai_mode_preferences(self._new_game_ai_settings)
+        narration = normalize_narration_preferences(
+            {
+                "tense": self.narration_tense_combo.currentData(),
+                "style": self.narration_style_combo.currentData(),
+            }
+        )
+        content_label = (
+            "No Restrictions"
+            if not modes["blocked_content_labels"]
+            else (
+                ", ".join(modes["allowed_content_labels"])
+                if modes["allowed_content_labels"]
+                else "No Harm Categories"
+            )
+        )
+        self.ai_settings_summary_label.setText(
+            f"{modes['model_intelligence_label']} · "
+            f"{modes['model_tone_label']} · "
+            f"{modes['response_length_label']} · "
+            f"{content_label}\n"
+            f"{narration['tense_label']} · {narration['style_label']}"
+        )
+
     def _build_adventure_page(self) -> None:
         """Builds the adventure/world setup page."""
 
@@ -3135,13 +3883,24 @@ class NewGameWizard(QWizard):
             "Optional: deserted island, frozen sea, crime scene, ruined store..."
         )
 
-        self.narration_tense_combo = QComboBox()
+        self.narration_tense_combo = QComboBox(page)
         _add_combo_options(self.narration_tense_combo, NARRATION_TENSE_OPTIONS)
         _set_combo_to_data(self.narration_tense_combo, DEFAULT_NARRATION_TENSE)
+        self.narration_tense_combo.setVisible(False)
 
-        self.narration_style_combo = QComboBox()
+        self.narration_style_combo = QComboBox(page)
         _add_combo_options(self.narration_style_combo, NARRATION_STYLE_OPTIONS)
         _set_combo_to_data(self.narration_style_combo, DEFAULT_NARRATION_STYLE)
+        self.narration_style_combo.setVisible(False)
+
+        self.ai_settings_button = QPushButton("A.I. Settings...")
+        self.ai_settings_button.clicked.connect(
+            self._open_new_game_ai_settings_dialog
+        )
+        self.ai_settings_summary_label = QLabel()
+        self.ai_settings_summary_label.setWordWrap(True)
+        self.ai_settings_summary_label.setStyleSheet("font-size: 11px;")
+        self._refresh_new_game_ai_settings_summary()
 
         self.world_context_input = QTextEdit()
         self.world_context_input.setPlaceholderText(
@@ -3153,8 +3912,8 @@ class NewGameWizard(QWizard):
         layout.addRow("Genre:", self.genre_input)
         layout.addRow("Game Style:", self.game_style_input)
         layout.addRow("Starting Location:", self.start_location_input)
-        layout.addRow("Narration Tense:", self.narration_tense_combo)
-        layout.addRow("Narration Style:", self.narration_style_combo)
+        layout.addRow("Artificial Intelligence:", self.ai_settings_button)
+        layout.addRow("", self.ai_settings_summary_label)
         layout.addRow("World Details:", self.world_context_input)
         page.setLayout(layout)
 
@@ -3390,11 +4149,11 @@ class NewGameWizard(QWizard):
         voice: str | None = None,
         volume: int | None = None,
         speed: int | None = None,
-    ) -> bool | None:
+    ) -> bool:
         """Plays the selected narrator voice sample."""
 
         if self.on_sample_voice is None:
-            return None
+            return False
 
         return _invoke_sample_voice_callback(
             self.on_sample_voice,
@@ -3556,12 +4315,14 @@ class GameShell(QWidget):
         on_return_to_menu,
         *,
         on_theme_changed=None,
-        sound_manager: SoundManager | None = None,
-        narration_player: NarrationPlayer | None = None,
+        sound_manager: SoundManagerProtocol | None = None,
+        narration_player: NarrationPlayerProtocol | None = None,
         tts_enabled: bool = True,
         on_app_tts_settings_saved: Callable[[dict[str, Any]], None] | None = None,
         global_tts_settings_provider: Callable[[], dict[str, Any]] | None = None,
         custom_voice_storage_path: Path | str | None = None,
+        playtesting_tools: bool = False,
+        ai_enabled: bool = True,
     ) -> None:
         """
         Args:
@@ -3578,6 +4339,8 @@ class GameShell(QWidget):
         self.on_app_tts_settings_saved = on_app_tts_settings_saved
         self.global_tts_settings_provider = global_tts_settings_provider
         self.custom_voice_storage_path = custom_voice_storage_path
+        self.playtesting_tools = bool(playtesting_tools)
+        self.ai_enabled = bool(ai_enabled)
         self.repository: SaveRepository | None = None
 
         self.title_label = QLabel("No Save Loaded")
@@ -3597,11 +4360,20 @@ class GameShell(QWidget):
             sound_manager=self.sound_manager,
             narration_player=self.narration_player,
         )
-        self.character_screen = CharacterScreen()
+        self.character_screen = CharacterScreen(
+            playtesting_tools=self.playtesting_tools,
+        )
         self.world_screen = WorldScreen()
+        self.travel_screen = TravelScreen(
+            on_travel_requested=self._submit_travel_request,
+        )
         self.calendar_screen = CalendarScreen()
-        self.inventory_screen = InventoryScreen()
-        self.combat_screen = CombatScreen()
+        self.inventory_screen = InventoryScreen(
+            playtesting_tools=self.playtesting_tools,
+        )
+        self.combat_screen = CombatScreen(
+            playtesting_tools=self.playtesting_tools,
+        )
         self.npcs_screen = NpcsScreen()
         self.active_tasks_screen = ActiveTasksScreen()
         self.skills_screen = SkillsScreen()
@@ -3616,12 +4388,15 @@ class GameShell(QWidget):
             on_app_tts_settings_saved=self.on_app_tts_settings_saved,
             global_tts_settings_provider=self.global_tts_settings_provider,
             custom_voice_storage_path=self.custom_voice_storage_path,
+            ai_enabled=self.ai_enabled,
+            music_enabled=not self.playtesting_tools,
         )
 
         self.screens: list[RepositoryBackedWidget] = [
             self.story_screen,
             self.character_screen,
             self.world_screen,
+            self.travel_screen,
             self.calendar_screen,
             self.inventory_screen,
             self.combat_screen,
@@ -3636,18 +4411,25 @@ class GameShell(QWidget):
         for screen in self.screens:
             screen.on_repository_changed = self._handle_screen_repository_changed
 
-        self.tabs.addTab(self.story_screen, "Story")
-        self.tabs.addTab(self.character_screen, "Character")
-        self.tabs.addTab(self.world_screen, "World")
-        self.tabs.addTab(self.calendar_screen, "Calendar")
-        self.tabs.addTab(self.inventory_screen, "Inventory")
-        self.tabs.addTab(self.combat_screen, "Combat")
-        self.tabs.addTab(self.npcs_screen, "NPCs")
-        self.tabs.addTab(self.active_tasks_screen, "Active Tasks")
-        self.tabs.addTab(self.skills_screen, "Skills")
-        self.tabs.addTab(self.alchemy_screen, "Crafting")
-        self.tabs.addTab(self.history_screen, "Journal")
-        self.tabs.addTab(self.settings_screen, "Settings")
+        if self.playtesting_tools:
+            self.tabs.addTab(self.character_screen, "Character")
+            self.tabs.addTab(self.inventory_screen, "Inventory")
+            self.tabs.addTab(self.combat_screen, "Combat")
+            self.tabs.addTab(self.settings_screen, "Settings")
+        else:
+            self.tabs.addTab(self.story_screen, "Story")
+            self.tabs.addTab(self.character_screen, "Character")
+            self.tabs.addTab(self.world_screen, "World")
+            self.tabs.addTab(self.travel_screen, "Travel")
+            self.tabs.addTab(self.calendar_screen, "Calendar")
+            self.tabs.addTab(self.inventory_screen, "Inventory")
+            self.tabs.addTab(self.combat_screen, "Combat")
+            self.tabs.addTab(self.npcs_screen, "NPCs")
+            self.tabs.addTab(self.active_tasks_screen, "Active Tasks")
+            self.tabs.addTab(self.skills_screen, "Skills")
+            self.tabs.addTab(self.alchemy_screen, "Crafting")
+            self.tabs.addTab(self.history_screen, "Journal")
+            self.tabs.addTab(self.settings_screen, "Settings")
         self.tabs.currentChanged.connect(self._handle_tab_changed)
 
         layout = QVBoxLayout()
@@ -3704,6 +4486,18 @@ class GameShell(QWidget):
         if self.tabs.widget(index) == self.calendar_screen:
             self.calendar_screen.return_to_current_month()
 
+        if self.tabs.widget(index) == self.travel_screen:
+            self.travel_screen.refresh()
+
+    def _submit_travel_request(
+        self,
+        destination: dict[str, Any],
+        player_context: str,
+    ) -> bool:
+        """Routes a Travel tab action through the ordinary story-turn pipeline."""
+
+        return self.story_screen.submit_travel_request(destination, player_context)
+
     def _apply_audio_settings(self) -> None:
         """Applies saved audio settings to the active audio managers."""
 
@@ -3755,8 +4549,8 @@ class StoryScreen(RepositoryBackedWidget):
     def __init__(
         self,
         *,
-        sound_manager: SoundManager | None = None,
-        narration_player: NarrationPlayer | None = None,
+        sound_manager: SoundManagerProtocol | None = None,
+        narration_player: NarrationPlayerProtocol | None = None,
     ) -> None:
         super().__init__()
 
@@ -3768,6 +4562,7 @@ class StoryScreen(RepositoryBackedWidget):
         self._gemini_thread: QThread | None = None
         self._gemini_worker: QObject | None = None
         self._pending_skill_check_event_results: list[Any] = []
+        self._pending_travel_request: dict[str, Any] | None = None
         self._waiting_for_gm = False
         self._combat_active = False
         self._default_input_placeholder = "Enter a player action..."
@@ -3816,6 +4611,7 @@ class StoryScreen(RepositoryBackedWidget):
         """Sets the active save and clears any stale narration reveal state."""
 
         self._clear_story_reveal_state()
+        self._pending_travel_request = None
         super().set_repository(repository)
 
     def refresh(self) -> None:
@@ -3868,29 +4664,96 @@ class StoryScreen(RepositoryBackedWidget):
     def _submit_player_action(self) -> None:
         """Records a player action and requests AI narration when configured."""
 
+        self._submit_player_command(self.player_input.text().strip())
+
+    def submit_travel_request(
+        self,
+        raw_destination: dict[str, Any],
+        player_context: str,
+    ) -> bool:
+        """Submits a Travel-tab journey with calculated logistics for Gemini."""
+
         if self._waiting_for_gm or self._combat_active:
-            return
+            return False
+
+        repository = self.repository()
+        destination = normalize_known_location(raw_destination)
+
+        if repository is None or destination is None:
+            return False
+
+        state = StateManager(repository).load_state()
+        origin = normalize_known_location(
+            repository.find_travel_location(state.world.location)
+        )
+        estimate = calculate_travel_estimate(
+            origin,
+            destination,
+            move_speed_mph=state.travel.move_speed_mph,
+            travel_mode=state.travel.travel_mode,
+            speed_multiplier=state.travel.speed_multiplier,
+        )
+
+        if not estimate.is_available:
+            return False
+
+        clean_context = player_context.strip()
+        player_text = f"Travel toward {destination.name}."
+
+        if clean_context:
+            player_text = f"{player_text} {clean_context}"
+
+        return self._submit_player_command(
+            player_text,
+            travel_request={
+                "active": True,
+                "origin": origin.to_dict() if origin is not None else {},
+                "destination": destination.to_dict(),
+                "estimate": estimate.to_dict(),
+                "player_context": clean_context,
+                "rules": (
+                    "This is an attempted journey. The estimate is mathematical "
+                    "logistics, not an automatic arrival."
+                ),
+            },
+        )
+
+    def _submit_player_command(
+        self,
+        player_text: str,
+        *,
+        travel_request: dict[str, Any] | None = None,
+    ) -> bool:
+        """Records one submitted command and starts its normal Gemini turn."""
+
+        if self._waiting_for_gm or self._combat_active:
+            return False
 
         repository = self.repository()
 
         if repository is None:
-            return
+            return False
 
-        player_text = self.player_input.text().strip()
+        player_text = player_text.strip()
 
         if not player_text:
             LOGGER.warning("Skipped blank player action.")
-            return
+            return False
 
         repository.append_history("player", player_text)
         self.player_input.clear()
         self._pending_skill_check_event_results = []
+        self._pending_travel_request = travel_request
         self._set_waiting_for_gm(True)
         self.refresh()
 
         context_packet = self._build_story_context_packet(repository, player_text)
 
+        if travel_request is not None:
+            context_packet["travel_request"] = travel_request
+
         self._start_skill_check_planning_request(context_packet)
+        return True
 
     def _continue_story_response(self) -> None:
         """Requests a fuller continuation of the latest story response."""
@@ -3911,6 +4774,7 @@ class StoryScreen(RepositoryBackedWidget):
 
         player_text = self._latest_player_command() or "Continue the previous narration."
         self._pending_skill_check_event_results = []
+        self._pending_travel_request = None
         self._set_waiting_for_gm(True)
         self.refresh()
 
@@ -3929,6 +4793,7 @@ class StoryScreen(RepositoryBackedWidget):
         player_text: str,
         *,
         resolved_skill_checks: list[dict[str, Any]] | None = None,
+        planner_context_tags: list[str] | None = None,
     ) -> dict[str, Any]:
         """Builds the Gemini story context packet for the current save."""
 
@@ -3937,6 +4802,7 @@ class StoryScreen(RepositoryBackedWidget):
             location=state.world.location,
             query_text=player_text,
         )
+        gm_secrets = repository.list_gm_secrets(active_only=True)
         valid_music_tracks = (
             self.sound_manager.get_valid_track_names()
             if self.sound_manager is not None
@@ -3946,9 +4812,11 @@ class StoryScreen(RepositoryBackedWidget):
             state,
             player_command=player_text,
             relevant_npcs=relevant_npcs,
+            gm_secrets=gm_secrets,
             valid_music_tracks=valid_music_tracks,
             current_music=str(repository.get_setting("audio.current_music", "")),
             resolved_skill_checks=resolved_skill_checks,
+            planner_context_tags=planner_context_tags,
         )
 
     def _start_skill_check_planning_request(self, context_packet: dict[str, Any]) -> None:
@@ -4023,7 +4891,11 @@ class StoryScreen(RepositoryBackedWidget):
             repository,
             player_text,
             resolved_skill_checks=resolved_skill_checks,
+            planner_context_tags=getattr(plan_result, "relevant_tags", None),
         )
+
+        if self._pending_travel_request is not None:
+            context_packet["travel_request"] = self._pending_travel_request
 
         self._start_gemini_story_request(context_packet)
 
@@ -4057,6 +4929,7 @@ class StoryScreen(RepositoryBackedWidget):
 
         if repository is None:
             self._set_waiting_for_gm(False)
+            self._pending_travel_request = None
             return
 
         repository.append_history("story", result.narrative_text)
@@ -4083,6 +4956,7 @@ class StoryScreen(RepositoryBackedWidget):
             self.notify_repository_changed()
 
         self._pending_skill_check_event_results = []
+        self._pending_travel_request = None
         latest_story = self._latest_story_entry()
 
         if latest_story is not None and self._reveal_story_with_narration(
@@ -4100,6 +4974,7 @@ class StoryScreen(RepositoryBackedWidget):
 
         repository = self.repository()
         self._pending_skill_check_event_results = []
+        self._pending_travel_request = None
 
         if repository is not None:
             repository.append_history(
@@ -4119,6 +4994,7 @@ class StoryScreen(RepositoryBackedWidget):
 
         repository = self.repository()
         self._pending_skill_check_event_results = []
+        self._pending_travel_request = None
 
         if repository is not None:
             repository.append_history(
@@ -4366,9 +5242,10 @@ class StoryScreen(RepositoryBackedWidget):
 class CharacterScreen(RepositoryBackedWidget):
     """Dungeons-and-Dragons-style character sheet."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, playtesting_tools: bool = False) -> None:
         super().__init__()
 
+        self.playtesting_tools = bool(playtesting_tools)
         self._loading_character = False
         self.name_input = QLineEdit()
         self.health_current_input = QSpinBox()
@@ -4378,9 +5255,26 @@ class CharacterScreen(RepositoryBackedWidget):
         self.health_max_input.setRange(1, 9999)
         self.health_max_input.setValue(DEFAULT_PLAYER_MAX_HEALTH)
         self.health_max_input.valueChanged.connect(lambda _value: self._sync_health_bounds())
+        self.initiative_bonus_input = QSpinBox()
+        self.initiative_bonus_input.setRange(-99, 99)
+
+        if not self.playtesting_tools:
+            health_tooltip = (
+                "Health is managed by gameplay. Direct health editing is available "
+                "only in the Playtesting build."
+            )
+            self.health_current_input.setEnabled(False)
+            self.health_max_input.setEnabled(False)
+            self.health_current_input.setToolTip(health_tooltip)
+            self.health_max_input.setToolTip(health_tooltip)
+            self.initiative_bonus_input.setEnabled(False)
         self.armor_rating_label = QLabel(str(DEFAULT_BASE_ARMOR_RATING))
         self.weapon_damage_label = QLabel(DEFAULT_UNARMED_DAMAGE)
         self.equipment_combos: dict[str, QComboBox] = {}
+        self._equipment_selection = {
+            slot: ""
+            for slot in EQUIPMENT_SLOTS
+        }
 
         self.appearance_input = QTextEdit()
         self.backstory_input = QTextEdit()
@@ -4411,6 +5305,17 @@ class CharacterScreen(RepositoryBackedWidget):
 
         for slot in EQUIPMENT_SLOTS:
             combo = QComboBox()
+            combo.setToolTip(
+                (
+                    "Optional hand slot. One-handed weapons may be placed in "
+                    "either hand; an owned copy can occupy only one slot."
+                )
+                if slot in {"Main Hand", "Off Hand"}
+                else (
+                    "Forced armor slot. Equipping armor fills every body slot "
+                    "listed in that item's coverage metadata."
+                )
+            )
             combo.currentIndexChanged.connect(lambda _index, slot=slot: self._equipment_changed(slot))
             self.equipment_combos[slot] = combo
 
@@ -4428,6 +5333,7 @@ class CharacterScreen(RepositoryBackedWidget):
         stats_group = QGroupBox("Vitals")
         stats_layout = QFormLayout()
         stats_layout.addRow("Health:", _spin_pair_row(self.health_current_input, self.health_max_input))
+        stats_layout.addRow("Initiative Bonus:", self.initiative_bonus_input)
         stats_layout.addRow("Armor Rating:", self.armor_rating_label)
         stats_layout.addRow("Weapon Damage:", self.weapon_damage_label)
         stats_group.setLayout(stats_layout)
@@ -4468,6 +5374,7 @@ class CharacterScreen(RepositoryBackedWidget):
                 self.notes_input.clear()
                 self.health_current_input.setValue(DEFAULT_PLAYER_MAX_HEALTH)
                 self.health_max_input.setValue(DEFAULT_PLAYER_MAX_HEALTH)
+                self.initiative_bonus_input.setValue(0)
                 self._populate_equipment_combos([], empty_equipment())
                 self._sync_equipment_summary()
                 return
@@ -4485,6 +5392,12 @@ class CharacterScreen(RepositoryBackedWidget):
             self.health_max_input.setValue(max(1, int(state.player.health_max)))
             self.health_current_input.setValue(
                 max(0, min(int(state.player.health_current), self.health_max_input.value()))
+            )
+            self.initiative_bonus_input.setValue(
+                _safe_int(
+                    repository.get_setting("player.initiative_bonus", 0),
+                    0,
+                )
             )
             self._populate_equipment_combos(inventory_items, equipment)
             self._sync_equipment_summary()
@@ -4508,8 +5421,30 @@ class CharacterScreen(RepositoryBackedWidget):
             inventory_items,
         )
         armor_rating = armor_rating_from_equipment(equipment, inventory_items)
-        health_max = max(1, self.health_max_input.value())
-        health_current = max(0, min(self.health_current_input.value(), health_max))
+        if self.playtesting_tools:
+            health_max = max(1, self.health_max_input.value())
+            health_current = max(0, min(self.health_current_input.value(), health_max))
+        else:
+            health_max = max(
+                1,
+                _safe_int(
+                    repository.get_setting(
+                        "player.health_max",
+                        DEFAULT_PLAYER_MAX_HEALTH,
+                    ),
+                    DEFAULT_PLAYER_MAX_HEALTH,
+                ),
+            )
+            health_current = max(
+                0,
+                min(
+                    _safe_int(
+                        repository.get_setting("player.health_current", health_max),
+                        health_max,
+                    ),
+                    health_max,
+                ),
+            )
 
         repository.set_setting("player_name", self.name_input.text().strip())
         repository.set_setting("player.appearance", self.appearance_input.toPlainText().strip())
@@ -4518,6 +5453,12 @@ class CharacterScreen(RepositoryBackedWidget):
         repository.set_setting("player.health_current", health_current)
         repository.set_setting("player.health_max", health_max)
         repository.set_setting("player.armor_rating", armor_rating)
+
+        if self.playtesting_tools:
+            repository.set_setting(
+                "player.initiative_bonus",
+                self.initiative_bonus_input.value(),
+            )
         repository.set_player_equipment(equipment)
         self._sync_player_combatant(repository, health_current, health_max, armor_rating)
         repository.append_history("system", "Character sheet updated.")
@@ -4533,17 +5474,34 @@ class CharacterScreen(RepositoryBackedWidget):
     ) -> None:
         """Reloads all equipment dropdown choices."""
 
+        used_counts = equipment_item_counts(equipment, inventory_items)
+
         for slot, combo in self.equipment_combos.items():
             combo.blockSignals(True)
             combo.clear()
             combo.addItem("None", "")
+            selected_name = str(equipment.get(slot, "") or "")
 
             for item in inventory_items:
-                if item_is_valid_for_slot(item, slot):
-                    combo.addItem(str(item.get("name", "")), str(item.get("name", "")))
+                item_name = str(item.get("name", "") or "").strip()
 
-            _set_combo_to_data(combo, equipment.get(slot, ""))
+                if not item_name or not item_is_valid_for_slot(item, slot):
+                    continue
+
+                is_selected_here = item_name.casefold() == selected_name.casefold()
+                available_quantity = max(
+                    0,
+                    _safe_int(item.get("quantity", 0), 0)
+                    - used_counts.get(item_name.casefold(), 0),
+                )
+
+                if is_selected_here or available_quantity > 0:
+                    combo.addItem(item_name, item_name)
+
+            _set_combo_to_data(combo, selected_name)
             combo.blockSignals(False)
+
+        self._remember_equipment_selection()
 
     def _equipment_changed(self, slot: str) -> None:
         """Enforces equipment constraints when a dropdown changes."""
@@ -4551,21 +5509,132 @@ class CharacterScreen(RepositoryBackedWidget):
         if self._loading_character:
             return
 
-        if slot == "Main Hand":
-            main_name = str(self.equipment_combos["Main Hand"].currentData() or "")
+        selected_name = str(self.equipment_combos[slot].currentData() or "")
+        previous_name = self._equipment_selection.get(slot, "")
+        self._loading_character = True
+
+        try:
+            if previous_name and previous_name.casefold() != selected_name.casefold():
+                self._unequip_previous_item(previous_name)
+
+            selected_item = self._inventory_item_by_name(selected_name)
+
+            if selected_item is not None:
+                metadata = item_metadata(selected_item)
+
+                if str(metadata.get("item_type", "")).casefold() == "armor":
+                    self._equip_armor_in_covered_slots(
+                        selected_name,
+                        list(metadata.get("covers_body_parts", [])),
+                    )
+
+            main_name = str(
+                self.equipment_combos["Main Hand"].currentData() or ""
+            )
             main_item = self._inventory_item_by_name(main_name)
+            main_is_two_handed = (
+                main_item is not None
+                and item_metadata(main_item).get("weapon_hands") == "two-handed"
+            )
 
-            if main_item is not None and item_metadata(main_item).get("weapon_hands") == "two-handed":
-                _set_combo_to_data(self.equipment_combos["Off Hand"], "")
+            if main_is_two_handed:
+                off_hand_name = str(
+                    self.equipment_combos["Off Hand"].currentData() or ""
+                )
 
-        if slot == "Off Hand":
-            off_name = str(self.equipment_combos["Off Hand"].currentData() or "")
-            off_item = self._inventory_item_by_name(off_name)
+                if off_hand_name:
+                    self._clear_item_from_equipment(off_hand_name)
 
-            if off_item is not None and item_metadata(off_item).get("weapon_hands") == "two-handed":
-                _set_combo_to_data(self.equipment_combos["Off Hand"], "")
+            repository = self.repository()
+
+            if repository is not None:
+                inventory_items = repository.list_inventory_items()
+                equipment = repository.set_player_equipment(
+                    {
+                        equipment_slot: combo.currentData() or ""
+                        for equipment_slot, combo in self.equipment_combos.items()
+                    }
+                )
+                armor_rating = armor_rating_from_equipment(
+                    equipment,
+                    inventory_items,
+                )
+                repository.set_setting("player.armor_rating", armor_rating)
+                self._populate_equipment_combos(inventory_items, equipment)
+                self._sync_player_combatant(
+                    repository,
+                    self.health_current_input.value(),
+                    self.health_max_input.value(),
+                    armor_rating,
+                )
+        finally:
+            self._loading_character = False
+            self._remember_equipment_selection()
 
         self._sync_equipment_summary()
+        self.notify_repository_changed()
+
+    def _unequip_previous_item(self, item_name: str) -> None:
+        """Clears every forced slot when the previous item was linked armor."""
+
+        item = self._inventory_item_by_name(item_name)
+
+        if (
+            item is not None
+            and str(item_metadata(item).get("item_type", "")).casefold() == "armor"
+        ):
+            self._clear_item_from_equipment(item_name)
+
+    def _equip_armor_in_covered_slots(
+        self,
+        item_name: str,
+        covered_slots: list[Any],
+    ) -> None:
+        """Equips one armor item into every slot its metadata covers."""
+
+        clean_slots = [
+            str(covered_slot)
+            for covered_slot in covered_slots
+            if str(covered_slot) in self.equipment_combos
+        ]
+        conflicting_items = {
+            str(self.equipment_combos[covered_slot].currentData() or "")
+            for covered_slot in clean_slots
+        }
+        conflicting_items.discard("")
+        conflicting_items = {
+            equipped_name
+            for equipped_name in conflicting_items
+            if equipped_name.casefold() != item_name.casefold()
+        }
+
+        for conflicting_item in conflicting_items:
+            self._clear_item_from_equipment(conflicting_item)
+
+        for covered_slot in clean_slots:
+            _set_combo_to_data(
+                self.equipment_combos[covered_slot],
+                item_name,
+            )
+
+    def _clear_item_from_equipment(self, item_name: str) -> None:
+        """Clears every slot currently occupied by the named item."""
+
+        folded_name = item_name.casefold()
+
+        for combo in self.equipment_combos.values():
+            equipped_name = str(combo.currentData() or "")
+
+            if equipped_name.casefold() == folded_name:
+                _set_combo_to_data(combo, "")
+
+    def _remember_equipment_selection(self) -> None:
+        """Stores the current dropdown state for the next user change."""
+
+        self._equipment_selection = {
+            slot: str(combo.currentData() or "")
+            for slot, combo in self.equipment_combos.items()
+        }
 
     def _inventory_item_by_name(self, name: str) -> dict[str, Any] | None:
         """Finds one current inventory item by name."""
@@ -4620,13 +5689,39 @@ class CharacterScreen(RepositoryBackedWidget):
             if combatant.get("id") != "player":
                 continue
 
+            inventory_items = repository.list_inventory_items()
+            equipment = repository.get_player_equipment()
+            weapon_profile = equipped_weapon_combat_profile(
+                equipment,
+                inventory_items,
+            )
             combatant["name"] = self.name_input.text().strip() or combatant.get("name", "Player")
             combatant["current_health"] = health_current
             combatant["max_health"] = health_max
             combatant["armor_rating"] = armor_rating
+            attack_skill = equipped_weapon_attack_skill(
+                equipment,
+                inventory_items,
+            )
+            combatant["to_hit_bonus"] = attack_bonus_from_skills(
+                attack_skill,
+                repository.list_skills(),
+            )
             combatant["damage"] = equipped_weapon_damage(
-                repository.get_player_equipment(),
-                repository.list_inventory_items(),
+                equipment,
+                inventory_items,
+            )
+            previous_weapon_name = str(combatant.get("weapon_name", ""))
+            combatant.update(weapon_profile)
+
+            if previous_weapon_name.casefold() != str(
+                weapon_profile["weapon_name"]
+            ).casefold():
+                combatant["clip_ammo"] = int(weapon_profile["clip_size"])
+
+            combatant["initiative_bonus"] = _safe_int(
+                repository.get_setting("player.initiative_bonus", 0),
+                0,
             )
             combatant["defeated"] = health_current <= 0
             break
@@ -4637,13 +5732,32 @@ class CharacterScreen(RepositoryBackedWidget):
 class CombatScreen(RepositoryBackedWidget):
     """Deterministic saved combat manager."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, playtesting_tools: bool = False) -> None:
         super().__init__()
 
+        self.playtesting_tools = bool(playtesting_tools)
+        self._scheduled_npc_actor_id = ""
+        self._scheduled_npc_repository: SaveRepository | None = None
+        self.npc_turn_timer = QTimer(self)
+        self.npc_turn_timer.setSingleShot(True)
+        self.npc_turn_timer.setInterval(NPC_TURN_DELAY_MS)
+        self.npc_turn_timer.timeout.connect(self._resolve_scheduled_npc_turn)
         self.status_label = QLabel("No active combat.")
-        self.combatants_table = QTableWidget(0, 7)
+        self.combatants_table = QTableWidget(0, 11)
         self.combatants_table.setHorizontalHeaderLabels(
-            ["Turn", "Name", "Team", "Health", "Armor", "Damage", "Loot/Status"]
+            [
+                "Turn",
+                "Name",
+                "Team",
+                "Initiative",
+                "Health",
+                "Armor",
+                "To Hit",
+                "Threat",
+                "Ammo",
+                "Damage",
+                "Loot/Status",
+            ]
         )
         self.combatants_table.horizontalHeader().setStretchLastSection(True)
         self.combatants_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
@@ -4654,9 +5768,10 @@ class CombatScreen(RepositoryBackedWidget):
         self.attack_button.clicked.connect(self._resolve_current_turn)
         self.end_turn_button = QPushButton("End Turn")
         self.end_turn_button.clicked.connect(self._end_turn_without_attack)
+        self.reload_button = QPushButton("Reload / End Turn")
+        self.reload_button.clicked.connect(self._reload_current_weapon)
         self.resolve_button = QPushButton("Mark Combat Resolved")
         self.resolve_button.clicked.connect(self._resolve_combat_manually)
-
         self.team_combo = QComboBox()
         self.team_combo.addItem("Enemy", "enemy")
         self.team_combo.addItem("Player Party", "party")
@@ -4668,6 +5783,29 @@ class CombatScreen(RepositoryBackedWidget):
         self.armor_input = QSpinBox()
         self.armor_input.setRange(1, 99)
         self.armor_input.setValue(10)
+        self.to_hit_input = QSpinBox()
+        self.to_hit_input.setRange(-99, 99)
+        self.to_hit_input.setValue(0)
+        self.initiative_input = QSpinBox()
+        self.initiative_input.setRange(-99, 99)
+        self.personality_combo = QComboBox()
+
+        for personality in COMBAT_PERSONALITIES:
+            self.personality_combo.addItem(personality.title(), personality)
+
+        self.ammunition_type_input = QLineEdit()
+        self.ammunition_type_input.setPlaceholderText(
+            "Optional, e.g. 9mm Round"
+        )
+        self.clip_size_input = QSpinBox()
+        self.clip_size_input.setRange(0, 9999)
+        self.clip_ammo_input = QSpinBox()
+        self.clip_ammo_input.setRange(0, 9999)
+        self.clip_size_input.valueChanged.connect(self._sync_clip_inputs)
+        self.bullets_per_attack_input = QSpinBox()
+        self.bullets_per_attack_input.setRange(1, 9999)
+        self.reserve_ammo_input = QSpinBox()
+        self.reserve_ammo_input.setRange(0, 999999)
         self.damage_input = QLineEdit("1d6")
         self.loot_input = QLineEdit()
         self.loot_input.setPlaceholderText("Optional loot names separated by commas")
@@ -4691,36 +5829,60 @@ class CombatScreen(RepositoryBackedWidget):
         action_group = QGroupBox("Current Turn")
         action_layout = QFormLayout()
         action_layout.addRow("Target:", self.target_combo)
-        action_layout.addRow(_button_row(self.attack_button, self.end_turn_button, self.resolve_button))
+        action_layout.addRow(
+            _button_row(
+                self.attack_button,
+                self.reload_button,
+                self.end_turn_button,
+                self.resolve_button,
+            )
+        )
         action_group.setLayout(action_layout)
 
-        add_group = QGroupBox("Combatants")
+        self.add_group = QGroupBox("Combatants")
         add_layout = QFormLayout()
         add_layout.addRow("Team:", self.team_combo)
         add_layout.addRow("Name:", self.name_input)
         add_layout.addRow("Health:", self.health_input)
         add_layout.addRow("Armor Rating:", self.armor_input)
+        add_layout.addRow("To-Hit Bonus:", self.to_hit_input)
+        add_layout.addRow("Initiative Bonus:", self.initiative_input)
+        add_layout.addRow("Personality:", self.personality_combo)
+        add_layout.addRow("Ammunition Type:", self.ammunition_type_input)
+        add_layout.addRow("Clip Size:", self.clip_size_input)
+        add_layout.addRow("Loaded Ammo:", self.clip_ammo_input)
+        add_layout.addRow("Bullets / Attack:", self.bullets_per_attack_input)
+        add_layout.addRow("Reserve Ammo:", self.reserve_ammo_input)
         add_layout.addRow("Damage:", self.damage_input)
         add_layout.addRow("Loot:", self.loot_input)
         add_layout.addRow(_button_row(self.start_button, self.add_combatant_button))
-        add_group.setLayout(add_layout)
+        self.add_group.setLayout(add_layout)
 
-        adjust_group = QGroupBox("Damage and Recovery")
+        self.adjust_group = QGroupBox("Damage and Recovery")
         adjust_layout = QFormLayout()
         adjust_layout.addRow("Combatant:", self.adjust_target_combo)
         adjust_layout.addRow("Amount:", self.adjust_amount_input)
         adjust_layout.addRow(_button_row(self.damage_button, self.heal_button))
-        adjust_group.setLayout(adjust_layout)
+        self.adjust_group.setLayout(adjust_layout)
+
+        self.resolve_button.setVisible(self.playtesting_tools)
+        self.add_group.setVisible(self.playtesting_tools)
+        self.adjust_group.setVisible(self.playtesting_tools)
 
         controls = QVBoxLayout()
         controls.addWidget(action_group)
-        controls.addWidget(add_group)
-        controls.addWidget(adjust_group)
+        controls.addWidget(self.add_group)
+        controls.addWidget(self.adjust_group)
         controls.addStretch()
+        controls_widget = QWidget()
+        controls_widget.setLayout(controls)
+        controls_scroll = QScrollArea()
+        controls_scroll.setWidgetResizable(True)
+        controls_scroll.setWidget(controls_widget)
 
         main_row = QHBoxLayout()
         main_row.addWidget(self.combatants_table, stretch=2)
-        main_row.addLayout(controls, stretch=1)
+        main_row.addWidget(controls_scroll, stretch=1)
 
         layout = QVBoxLayout()
         layout.addWidget(self.status_label)
@@ -4729,12 +5891,19 @@ class CombatScreen(RepositoryBackedWidget):
         layout.addWidget(self.log_output)
         self.setLayout(layout)
 
+    def set_repository(self, repository: SaveRepository | None) -> None:
+        """Cancels delayed actions before changing the active save."""
+
+        self._cancel_scheduled_npc_turn()
+        super().set_repository(repository)
+
     def refresh(self) -> None:
         """Reloads saved combat state."""
 
         repository = self.repository()
 
         if repository is None:
+            self._cancel_scheduled_npc_turn()
             self.status_label.setText("No active combat.")
             self.combatants_table.setRowCount(0)
             self.target_combo.clear()
@@ -4745,6 +5914,78 @@ class CombatScreen(RepositoryBackedWidget):
 
         combat_state = repository.get_combat_state()
         self._render_combat_state(combat_state)
+
+    def _schedule_npc_turn(self, combat_state: dict[str, Any]) -> None:
+        """Schedules the current NPC to act after the reading delay."""
+
+        repository = self.repository()
+        combatants = combat_state.get("combatants", [])
+
+        if (
+            repository is None
+            or not combat_state.get("active")
+            or not combatants
+        ):
+            self._cancel_scheduled_npc_turn()
+            return
+
+        actor = combatants[int(combat_state.get("turn_index", 0))]
+        actor_id = str(actor.get("id", ""))
+
+        if actor_id == "player" or actor.get("defeated"):
+            self._cancel_scheduled_npc_turn()
+            return
+
+        if (
+            self.npc_turn_timer.isActive()
+            and self._scheduled_npc_actor_id == actor_id
+            and self._scheduled_npc_repository is repository
+        ):
+            return
+
+        self.npc_turn_timer.stop()
+        self._scheduled_npc_actor_id = actor_id
+        self._scheduled_npc_repository = repository
+        self.npc_turn_timer.start(NPC_TURN_DELAY_MS)
+
+    def _cancel_scheduled_npc_turn(self) -> None:
+        """Cancels any NPC action waiting on the reading delay."""
+
+        if hasattr(self, "npc_turn_timer"):
+            self.npc_turn_timer.stop()
+        self._scheduled_npc_actor_id = ""
+        self._scheduled_npc_repository = None
+
+    def _resolve_scheduled_npc_turn(self) -> None:
+        """Resolves the still-current NPC after its delay expires."""
+
+        self.npc_turn_timer.stop()
+        repository = self.repository()
+        expected_repository = self._scheduled_npc_repository
+        expected_actor_id = self._scheduled_npc_actor_id
+        self._scheduled_npc_actor_id = ""
+        self._scheduled_npc_repository = None
+
+        if repository is None or repository is not expected_repository:
+            return
+
+        combat_state = repository.get_combat_state()
+        combatants = combat_state.get("combatants", [])
+
+        if not combat_state.get("active") or not combatants:
+            return
+
+        actor = combatants[int(combat_state.get("turn_index", 0))]
+
+        if (
+            str(actor.get("id", "")) != expected_actor_id
+            or expected_actor_id == "player"
+            or actor.get("defeated")
+        ):
+            self.refresh()
+            return
+
+        self._resolve_current_turn()
 
     def _start_combat(self) -> None:
         """Starts deterministic combat with the player and first opponent."""
@@ -4757,6 +5998,11 @@ class CombatScreen(RepositoryBackedWidget):
         state = StateManager(repository).load_state()
         inventory_items = repository.list_inventory_items()
         equipment = repository.get_player_equipment()
+        attack_skill = equipped_weapon_attack_skill(equipment, inventory_items)
+        weapon_profile = equipped_weapon_combat_profile(
+            equipment,
+            inventory_items,
+        )
         armor_rating = armor_rating_from_equipment(equipment, inventory_items)
         player = {
             "id": "player",
@@ -4765,6 +6011,21 @@ class CombatScreen(RepositoryBackedWidget):
             "current_health": max(0, int(state.player.health_current)),
             "max_health": max(1, int(state.player.health_max)),
             "armor_rating": armor_rating,
+            "to_hit_bonus": attack_bonus_from_skills(
+                attack_skill,
+                repository.list_skills(),
+            ),
+            "initiative_bonus": _safe_int(
+                repository.get_setting("player.initiative_bonus", 0),
+                0,
+            ),
+            "personality": "balanced",
+            **weapon_profile,
+            "clip_ammo": self._stored_player_clip_ammo(
+                repository,
+                weapon_profile,
+            ),
+            "reserve_ammo": 0,
             "damage": equipped_weapon_damage(equipment, inventory_items),
             "status_effects": [],
             "loot": [],
@@ -4775,12 +6036,26 @@ class CombatScreen(RepositoryBackedWidget):
             fallback_name="Enemy",
             use_selected_team=False,
         )
+        combatants = roll_combat_initiative(
+            [player, enemy],
+            rng=random,
+        )
+        initiative_order = ", ".join(
+            (
+                f"{combatant_display_name(combatant)} "
+                f"({combatant['initiative_total']})"
+            )
+            for combatant in combatants
+        )
         combat_state = {
             "active": True,
             "round": 1,
             "turn_index": 0,
-            "combatants": [player, enemy],
-            "log": [f"Combat begins: {player['name']} faces {enemy['name']}."],
+            "combatants": combatants,
+            "log": [
+                f"Combat begins: {player['name']} faces {enemy['name']}.",
+                f"Initiative order: {initiative_order}.",
+            ],
         }
         repository.set_combat_state(combat_state)
         repository.append_history("system", "Combat started.")
@@ -4801,13 +6076,47 @@ class CombatScreen(RepositoryBackedWidget):
             self._start_combat()
             return
 
+        current_actor_id = str(
+            combat_state["combatants"][int(combat_state["turn_index"])].get(
+                "id",
+                "",
+            )
+        )
         combatant = self._combatant_from_inputs(
             default_team=str(self.team_combo.currentData() or "enemy"),
             fallback_name="Combatant",
             index=len(combat_state["combatants"]) + 1,
         )
+        roll_combat_initiative([combatant], rng=random)
         combat_state["combatants"].append(combatant)
-        combat_state["log"].append(f"{combatant['name']} joins the fight.")
+        combat_state["combatants"].sort(
+            key=lambda entry: (
+                -int(entry.get("initiative_total", 0)),
+                -int(entry.get("initiative_bonus", 0)),
+                str(entry.get("id", "")),
+            )
+        )
+        combat_state = normalize_combat_state(combat_state)
+        combat_state["turn_index"] = next(
+            (
+                index
+                for index, entry in enumerate(combat_state["combatants"])
+                if str(entry.get("id", "")) == current_actor_id
+            ),
+            0,
+        )
+        added_combatant = next(
+            (
+                entry
+                for entry in combat_state["combatants"]
+                if str(entry.get("id", "")) == str(combatant["id"])
+            ),
+            combatant,
+        )
+        combat_state["log"].append(
+            f"{combatant_display_name(added_combatant)} joins the fight "
+            f"with initiative {added_combatant.get('initiative_total', 0)}."
+        )
         repository.set_combat_state(combat_state)
         self.refresh()
         self.notify_repository_changed()
@@ -4825,6 +6134,7 @@ class CombatScreen(RepositoryBackedWidget):
         if not combat_state.get("active"):
             return
 
+        self._cancel_scheduled_npc_turn()
         combatants = combat_state["combatants"]
         turn_index = int(combat_state["turn_index"])
         actor = combatants[turn_index]
@@ -4836,32 +6146,79 @@ class CombatScreen(RepositoryBackedWidget):
             self.notify_repository_changed()
             return
 
+        if str(actor.get("id", "")) != "player":
+            self._resolve_npc_turn(repository, combat_state, actor)
+            return
+
         target = self._target_for_actor(actor, combatants)
 
         if target is None:
             self._resolve_combat(repository, combat_state)
             return
 
+        if not self._consume_attack_ammunition(repository, actor):
+            combat_state["log"].append(
+                f"{combatant_display_name(actor)} cannot attack: reload "
+                f"{actor.get('ammunition_type_required', 'ammunition')} first."
+            )
+            repository.set_combat_state(combat_state)
+            self.refresh()
+            return
+
+        self._perform_attack(combat_state, actor, target)
+        self._finish_combat_action(repository, combat_state)
+
+    def _perform_attack(
+        self,
+        combat_state: dict[str, Any],
+        actor: dict[str, Any],
+        target: dict[str, Any],
+    ) -> None:
+        """Rolls and applies one attack."""
+
         attack_roll = random.randint(1, 20)
+        to_hit_bonus = int(actor.get("to_hit_bonus", 0))
+        attack_total = attack_roll + to_hit_bonus
         target_armor = int(target.get("armor_rating", 10))
-        hit = attack_roll == 20 or (attack_roll != 1 and attack_roll >= target_armor)
+        hit = attack_roll == 20 or (
+            attack_roll != 1
+            and attack_total >= target_armor
+        )
+        roll_detail = (
+            f"{attack_roll}{to_hit_bonus:+d}={attack_total}"
+            if to_hit_bonus
+            else str(attack_roll)
+        )
 
         if hit:
             damage, damage_detail = roll_damage_expression(actor.get("damage", DEFAULT_UNARMED_DAMAGE))
             target["current_health"] = max(0, int(target["current_health"]) - damage)
             target["defeated"] = target["current_health"] <= 0
             combat_state["log"].append(
-                f"{actor['name']} hits {target['name']} with {attack_roll} vs AR {target_armor}, "
+                f"{combatant_display_name(actor)} hits "
+                f"{combatant_display_name(target)} with {roll_detail} vs AR {target_armor}, "
                 f"dealing {damage} damage [{damage_detail}]."
             )
 
             if target["defeated"]:
-                combat_state["log"].append(f"{target['name']} is defeated.")
+                combat_state["log"].append(
+                    f"{combatant_display_name(target)} is defeated."
+                )
         else:
             combat_state["log"].append(
-                f"{actor['name']} misses {target['name']} with {attack_roll} vs AR {target_armor}."
+                f"{combatant_display_name(actor)} misses "
+                f"{combatant_display_name(target)} with {roll_detail} "
+                f"vs AR {target_armor}."
             )
 
+    def _finish_combat_action(
+        self,
+        repository: SaveRepository,
+        combat_state: dict[str, Any],
+    ) -> None:
+        """Persists an action and advances unless combat ended."""
+
+        combatants = combat_state["combatants"]
         self._sync_player_health_from_combat(repository, combat_state)
 
         if combat_team_defeated(combatants, "enemy") or combat_team_defeated(combatants, "party"):
@@ -4872,6 +6229,286 @@ class CombatScreen(RepositoryBackedWidget):
         repository.set_combat_state(combat_state)
         self.refresh()
         self.notify_repository_changed()
+
+    def _resolve_npc_turn(
+        self,
+        repository: SaveRepository,
+        combat_state: dict[str, Any],
+        actor: dict[str, Any],
+    ) -> None:
+        """Resolves one NPC turn with deterministic personality rules."""
+
+        target = self._npc_target_for_actor(
+            actor,
+            combat_state["combatants"],
+        )
+
+        if target is None:
+            self._resolve_combat(repository, combat_state)
+            return
+
+        if actor.get("personality") == "intelligent":
+            hit_chance = attack_hit_probability(
+                int(actor.get("to_hit_bonus", 0)),
+                int(target.get("armor_rating", 10)),
+            )
+            max_health = max(1, int(target.get("max_health", 1)))
+            wounded_percent = round(
+                (1.0 - (int(target.get("current_health", 0)) / max_health))
+                * 100
+            )
+            combat_state["log"].append(
+                f"{combatant_display_name(actor)} selects "
+                f"{combatant_display_name(target)}: "
+                f"{round(hit_chance * 100)}% hit chance, "
+                f"{wounded_percent}% wounded."
+            )
+        else:
+            combat_state["log"].append(
+                f"{combatant_display_name(actor)} targets "
+                f"{combatant_display_name(target)} based on its "
+                f"{target.get('threat_level', 0)}% Threat Level."
+            )
+
+        if not self._consume_attack_ammunition(repository, actor):
+            loaded = self._reload_actor_ammunition(repository, actor)
+
+            if loaded > 0:
+                combat_state["log"].append(
+                    f"{combatant_display_name(actor)} reloads {loaded} "
+                    f"{actor.get('ammunition_type_required', 'rounds')}."
+                )
+            else:
+                combat_state["log"].append(
+                    f"{combatant_display_name(actor)} is out of "
+                    f"{actor.get('ammunition_type_required', 'ammunition')}."
+                )
+
+            self._finish_combat_action(repository, combat_state)
+            return
+
+        self._perform_attack(combat_state, actor, target)
+        self._finish_combat_action(repository, combat_state)
+
+    def _npc_target_for_actor(
+        self,
+        actor: dict[str, Any],
+        combatants: list[dict[str, Any]],
+    ) -> dict[str, Any] | None:
+        """Selects by threat unless the NPC uses intelligent tactical targeting."""
+
+        enemy_team = "party" if actor.get("team") == "enemy" else "enemy"
+        candidates = [
+            combatant
+            for combatant in combatants
+            if combatant.get("team") == enemy_team
+            and not combatant.get("defeated")
+        ]
+
+        if not candidates:
+            return None
+
+        if actor.get("personality") != "intelligent":
+            threat_levels = calculate_team_threat_levels(
+                combatants,
+                enemy_team,
+            )
+            roll = random.randint(1, 100)
+            cumulative = 0
+
+            for candidate in candidates:
+                threat = threat_levels.get(
+                    str(candidate.get("id", "")),
+                    0,
+                )
+                candidate["threat_level"] = threat
+                cumulative += threat
+
+                if roll <= cumulative:
+                    return candidate
+
+            return candidates[-1]
+
+        def target_score(target: dict[str, Any]) -> tuple[float, float, int]:
+            hit_probability = attack_hit_probability(
+                int(actor.get("to_hit_bonus", 0)),
+                int(target.get("armor_rating", 10)),
+            )
+            max_health = max(1, int(target.get("max_health", 1)))
+            current_health = max(0, int(target.get("current_health", 0)))
+            wounded_ratio = 1.0 - (current_health / max_health)
+            combined_score = (hit_probability * 0.65) + (wounded_ratio * 0.35)
+            return combined_score, wounded_ratio, -current_health
+
+        return max(candidates, key=target_score)
+
+    def _consume_attack_ammunition(
+        self,
+        repository: SaveRepository,
+        actor: dict[str, Any],
+    ) -> bool:
+        """Consumes loaded rounds for an attack when the weapon requires them."""
+
+        ammunition_type = str(
+            actor.get("ammunition_type_required", "")
+        ).strip()
+
+        if not ammunition_type:
+            return True
+
+        bullets_per_attack = max(1, int(actor.get("bullets_per_attack", 1)))
+        clip_ammo = max(0, int(actor.get("clip_ammo", 0)))
+
+        if clip_ammo < bullets_per_attack:
+            return False
+
+        actor["clip_ammo"] = clip_ammo - bullets_per_attack
+
+        if str(actor.get("id", "")) == "player":
+            self._persist_player_clip_ammo(repository, actor)
+
+        return True
+
+    def _reload_current_weapon(self) -> None:
+        """Reloads the current actor and consumes the turn."""
+
+        repository = self.repository()
+
+        if repository is None:
+            return
+
+        combat_state = repository.get_combat_state()
+
+        if not combat_state.get("active"):
+            return
+
+        actor = combat_state["combatants"][int(combat_state["turn_index"])]
+        loaded = self._reload_actor_ammunition(repository, actor)
+
+        if loaded <= 0:
+            combat_state["log"].append(
+                f"{combatant_display_name(actor)} cannot reload."
+            )
+            repository.set_combat_state(combat_state)
+            self.refresh()
+            return
+
+        combat_state["log"].append(
+            f"{combatant_display_name(actor)} reloads {loaded} "
+            f"{actor.get('ammunition_type_required', 'rounds')}."
+        )
+        self._finish_combat_action(repository, combat_state)
+
+    def _reload_actor_ammunition(
+        self,
+        repository: SaveRepository,
+        actor: dict[str, Any],
+    ) -> int:
+        """Moves reserve ammunition into an actor's clip."""
+
+        ammunition_type = str(
+            actor.get("ammunition_type_required", "")
+        ).strip()
+        clip_size = max(0, int(actor.get("clip_size", 0)))
+        clip_ammo = max(0, int(actor.get("clip_ammo", 0)))
+        needed = max(0, clip_size - clip_ammo)
+
+        if not ammunition_type or needed <= 0:
+            return 0
+
+        if str(actor.get("id", "")) == "player":
+            loaded = self._consume_inventory_ammunition(
+                repository,
+                ammunition_type,
+                needed,
+            )
+        else:
+            reserve_ammo = max(0, int(actor.get("reserve_ammo", 0)))
+            loaded = min(needed, reserve_ammo)
+            actor["reserve_ammo"] = reserve_ammo - loaded
+
+        actor["clip_ammo"] = clip_ammo + loaded
+
+        if str(actor.get("id", "")) == "player":
+            self._persist_player_clip_ammo(repository, actor)
+
+        return loaded
+
+    @staticmethod
+    def _consume_inventory_ammunition(
+        repository: SaveRepository,
+        ammunition_type: str,
+        amount: int,
+    ) -> int:
+        """Consumes matching ammunition stacks from inventory."""
+
+        remaining = max(0, amount)
+        consumed = 0
+
+        for item in repository.list_inventory_items():
+            metadata = item_metadata(item)
+
+            if str(metadata.get("item_type", "")).casefold() != "ammunition":
+                continue
+            if (
+                str(metadata.get("ammunition_type", "")).casefold()
+                != ammunition_type.casefold()
+            ):
+                continue
+
+            available = max(0, int(item.get("quantity", 0)))
+            used = min(remaining, available)
+
+            if used <= 0:
+                continue
+
+            repository.remove_inventory_item(str(item.get("name", "")), used)
+            consumed += used
+            remaining -= used
+
+            if remaining <= 0:
+                break
+
+        return consumed
+
+    @staticmethod
+    def _stored_player_clip_ammo(
+        repository: SaveRepository,
+        weapon_profile: dict[str, Any],
+    ) -> int:
+        """Loads the durable clip count for the equipped player weapon."""
+
+        clip_size = max(0, int(weapon_profile.get("clip_size", 0)))
+        weapon_name = str(weapon_profile.get("weapon_name", "")).casefold()
+        stored_clips = repository.get_setting("player.weapon_clip_ammo", {})
+
+        if not isinstance(stored_clips, dict) or not weapon_name:
+            return clip_size
+
+        return max(
+            0,
+            min(
+                clip_size,
+                _safe_int(stored_clips.get(weapon_name, clip_size), clip_size),
+            ),
+        )
+
+    @staticmethod
+    def _persist_player_clip_ammo(
+        repository: SaveRepository,
+        actor: dict[str, Any],
+    ) -> None:
+        """Stores the player's loaded rounds by weapon name."""
+
+        weapon_name = str(actor.get("weapon_name", "")).casefold()
+
+        if not weapon_name:
+            return
+
+        stored_clips = repository.get_setting("player.weapon_clip_ammo", {})
+        clean_clips = dict(stored_clips) if isinstance(stored_clips, dict) else {}
+        clean_clips[weapon_name] = max(0, int(actor.get("clip_ammo", 0)))
+        repository.set_setting("player.weapon_clip_ammo", clean_clips)
 
     def _end_turn_without_attack(self) -> None:
         """Skips the active combatant's turn."""
@@ -4887,7 +6524,9 @@ class CombatScreen(RepositoryBackedWidget):
             return
 
         actor = combat_state["combatants"][int(combat_state["turn_index"])]
-        combat_state["log"].append(f"{actor['name']} holds position.")
+        combat_state["log"].append(
+            f"{combatant_display_name(actor)} holds position."
+        )
         self._advance_turn(combat_state)
         repository.set_combat_state(combat_state)
         self.refresh()
@@ -4907,8 +6546,8 @@ class CombatScreen(RepositoryBackedWidget):
             return
 
         combat_state["log"].append("Combat is marked resolved.")
-        combat_state["active"] = False
         self._sync_player_health_from_combat(repository, combat_state)
+        self._clear_resolved_battlefield(combat_state)
         repository.set_combat_state(combat_state)
         repository.append_history("system", "Combat resolved.")
         self.refresh()
@@ -4939,7 +6578,8 @@ class CombatScreen(RepositoryBackedWidget):
             combatant["defeated"] = new_health <= 0
             verb = "heals" if delta > 0 else "takes"
             combat_state["log"].append(
-                f"{combatant['name']} {verb} {abs(delta)}; health is now "
+                f"{combatant_display_name(combatant)} {verb} {abs(delta)}; "
+                f"health is now "
                 f"{new_health}/{combatant['max_health']}."
             )
             break
@@ -4974,6 +6614,8 @@ class CombatScreen(RepositoryBackedWidget):
         if team not in {"party", "enemy"}:
             team = default_team
 
+        ammunition_type = self.ammunition_type_input.text().strip()
+        clip_size = self.clip_size_input.value() if ammunition_type else 0
         return {
             "id": f"{team}-{index}-{_slug_for_id(name)}",
             "name": name,
@@ -4981,11 +6623,33 @@ class CombatScreen(RepositoryBackedWidget):
             "current_health": self.health_input.value(),
             "max_health": self.health_input.value(),
             "armor_rating": self.armor_input.value(),
+            "to_hit_bonus": self.to_hit_input.value(),
+            "initiative_bonus": self.initiative_input.value(),
+            "personality": self.personality_combo.currentData() or "balanced",
+            "weapon_name": "",
+            "ammunition_type_required": ammunition_type,
+            "clip_size": clip_size,
+            "clip_ammo": min(self.clip_ammo_input.value(), clip_size),
+            "bullets_per_attack": (
+                min(self.bullets_per_attack_input.value(), clip_size)
+                if ammunition_type and clip_size > 0
+                else 0
+            ),
+            "reserve_ammo": self.reserve_ammo_input.value(),
             "damage": damage,
             "status_effects": [],
             "loot": _split_loot_items(self.loot_input.text()) if team == "enemy" else [],
             "defeated": False,
         }
+
+    def _sync_clip_inputs(self, clip_size: int) -> None:
+        """Keeps playtesting clip controls inside the selected capacity."""
+
+        self.clip_ammo_input.setMaximum(max(0, clip_size))
+        self.bullets_per_attack_input.setMaximum(max(1, clip_size))
+
+        if clip_size > 0 and self.clip_ammo_input.value() == 0:
+            self.clip_ammo_input.setValue(clip_size)
 
     def _target_for_actor(
         self,
@@ -5042,7 +6706,10 @@ class CombatScreen(RepositoryBackedWidget):
                         loot_name,
                         "Loot",
                         1,
-                        f"Loot recovered from {combatant['name']}.",
+                        (
+                            "Loot recovered from "
+                            f"{combatant_display_name(combatant)}."
+                        ),
                         0,
                     )
                     granted_loot.append(loot_name)
@@ -5059,8 +6726,8 @@ class CombatScreen(RepositoryBackedWidget):
             combat_state["log"].append("Combat resolved.")
             repository.append_history("system", "Combat resolved.")
 
-        combat_state["active"] = False
         self._sync_player_health_from_combat(repository, combat_state)
+        self._clear_resolved_battlefield(combat_state)
         repository.set_combat_state(combat_state)
         self.refresh()
         self.notify_repository_changed()
@@ -5083,22 +6750,38 @@ class CombatScreen(RepositoryBackedWidget):
                 "condition",
                 "Incapacitated" if int(combatant["current_health"]) <= 0 else "Healthy",
             )
+            self._persist_player_clip_ammo(repository, combatant)
             break
+
+    @staticmethod
+    def _clear_resolved_battlefield(combat_state: dict[str, Any]) -> None:
+        """Clears active participants while preserving the completed combat log."""
+
+        combat_state["active"] = False
+        combat_state["round"] = 1
+        combat_state["turn_index"] = 0
+        combat_state["combatants"] = []
 
     def _render_combat_state(self, combat_state: dict[str, Any]) -> None:
         """Renders saved combat state."""
 
         active = bool(combat_state.get("active", False))
-        combatants = combat_state.get("combatants", [])
+        combatants = combat_state.get("combatants", []) if active else []
         current_id = ""
 
         if active and combatants:
             turn_index = int(combat_state.get("turn_index", 0))
             actor = combatants[turn_index]
             current_id = str(actor.get("id", ""))
-            self.status_label.setText(
-                f"Round {combat_state.get('round', 1)} - {actor['name']}'s turn"
+            status = (
+                f"Round {combat_state.get('round', 1)} - "
+                f"{combatant_display_name(actor)}'s turn"
             )
+
+            if current_id != "player":
+                status += " (acting automatically in 2 seconds...)"
+
+            self.status_label.setText(status)
         else:
             self.status_label.setText("No active combat.")
 
@@ -5120,29 +6803,72 @@ class CombatScreen(RepositoryBackedWidget):
                 status_bits.append(f"Loot: {loot_text}")
 
             self.combatants_table.setItem(row_index, 0, _table_item(current_marker))
-            self.combatants_table.setItem(row_index, 1, _table_item(str(combatant["name"])))
+            self.combatants_table.setItem(
+                row_index,
+                1,
+                _table_item(combatant_display_name(combatant)),
+            )
             self.combatants_table.setItem(row_index, 2, _table_item(str(combatant["team"])))
             self.combatants_table.setItem(
                 row_index,
                 3,
+                _table_item(
+                    f"{combatant.get('initiative_total', 0)} "
+                    f"({combatant.get('initiative_roll', 0)}"
+                    f"{int(combatant.get('initiative_bonus', 0)):+d})"
+                ),
+            )
+            self.combatants_table.setItem(
+                row_index,
+                4,
                 _table_item(f"{combatant['current_health']}/{combatant['max_health']}"),
             )
-            self.combatants_table.setItem(row_index, 4, _table_item(str(combatant["armor_rating"])))
-            self.combatants_table.setItem(row_index, 5, _table_item(str(combatant["damage"])))
-            self.combatants_table.setItem(row_index, 6, _table_item("; ".join(status_bits)))
+            self.combatants_table.setItem(row_index, 5, _table_item(str(combatant["armor_rating"])))
+            to_hit_bonus = int(combatant.get("to_hit_bonus", 0))
+            self.combatants_table.setItem(
+                row_index,
+                6,
+                _table_item(f"{to_hit_bonus:+d}"),
+            )
+            self.combatants_table.setItem(
+                row_index,
+                7,
+                _table_item(f"{combatant.get('threat_level', 0)}%"),
+            )
+            ammunition_type = str(
+                combatant.get("ammunition_type_required", "")
+            )
+            ammo_text = (
+                f"{combatant.get('clip_ammo', 0)}/"
+                f"{combatant.get('clip_size', 0)} {ammunition_type}"
+                if ammunition_type
+                else "-"
+            )
+            self.combatants_table.setItem(
+                row_index,
+                8,
+                _table_item(ammo_text),
+            )
+            self.combatants_table.setItem(row_index, 9, _table_item(str(combatant["damage"])))
+            self.combatants_table.setItem(row_index, 10, _table_item("; ".join(status_bits)))
 
         self.combatants_table.resizeColumnsToContents()
         self._populate_target_combos(combat_state)
         self.log_output.setPlainText("\n".join(str(entry) for entry in combat_state.get("log", [])))
         self.log_output.moveCursor(self.log_output.textCursor().MoveOperation.End)
         self._sync_buttons(active)
+        self._schedule_npc_turn(combat_state)
 
     def _populate_target_combos(self, combat_state: dict[str, Any]) -> None:
         """Reloads target dropdowns from combatants."""
 
         self.target_combo.clear()
         self.adjust_target_combo.clear()
-        combatants = combat_state.get("combatants", [])
+        combatants = (
+            combat_state.get("combatants", [])
+            if combat_state.get("active")
+            else []
+        )
         actor = None
 
         if combat_state.get("active") and combatants:
@@ -5152,7 +6878,10 @@ class CombatScreen(RepositoryBackedWidget):
             if combatant.get("defeated"):
                 continue
 
-            label = f"{combatant['name']} ({combatant['team']})"
+            label = (
+                f"{combatant_display_name(combatant)} "
+                f"({combatant['team']})"
+            )
             self.adjust_target_combo.addItem(label, combatant["id"])
 
             if actor is None:
@@ -5164,8 +6893,32 @@ class CombatScreen(RepositoryBackedWidget):
     def _sync_buttons(self, combat_active: bool) -> None:
         """Enables combat controls for the active state."""
 
-        self.attack_button.setEnabled(combat_active)
-        self.end_turn_button.setEnabled(combat_active)
+        repository = self.repository()
+        combat_state = (
+            repository.get_combat_state()
+            if repository is not None and combat_active
+            else {}
+        )
+        combatants = combat_state.get("combatants", [])
+        actor = (
+            combatants[int(combat_state.get("turn_index", 0))]
+            if combatants
+            else None
+        )
+        player_turn = bool(
+            combat_active
+            and actor is not None
+            and actor.get("id") == "player"
+        )
+        self.attack_button.setText("Attack / Resolve Turn")
+        self.attack_button.setEnabled(player_turn)
+        self.end_turn_button.setEnabled(player_turn)
+        self.reload_button.setEnabled(player_turn)
+        self.target_combo.setEnabled(player_turn)
+        manual_action_visible = not combat_active or player_turn
+        self.attack_button.setVisible(manual_action_visible)
+        self.end_turn_button.setVisible(manual_action_visible)
+        self.reload_button.setVisible(manual_action_visible)
         self.resolve_button.setEnabled(combat_active)
         self.add_combatant_button.setEnabled(self.repository() is not None)
         self.start_button.setEnabled(self.repository() is not None and not combat_active)
@@ -5209,6 +6962,9 @@ class WorldScreen(RepositoryBackedWidget):
         lore = repository.get_world_lore()
 
         for category in sorted(lore):
+            if category.casefold() == "locations":
+                continue
+
             entries = lore[category]
 
             if not entries:
@@ -5224,6 +6980,192 @@ class WorldScreen(RepositoryBackedWidget):
             sections.append("_No world information has been recorded yet._")
 
         _set_markdown_text(self.world_output, "\n\n".join(sections))
+
+
+class TravelScreen(RepositoryBackedWidget):
+    """Player-facing map knowledge, route estimates, and travel requests."""
+
+    def __init__(
+        self,
+        *,
+        on_travel_requested: Callable[[dict[str, Any], str], bool] | None = None,
+    ) -> None:
+        super().__init__()
+
+        self.on_travel_requested = on_travel_requested
+        self.location_list = QListWidget()
+        self.location_list.currentItemChanged.connect(self._display_selected_location)
+
+        self.details_output = QTextEdit()
+        self.details_output.setReadOnly(True)
+
+        self.travel_context_input = QTextEdit()
+        self.travel_context_input.setPlaceholderText("Optional details for the GM")
+        self.travel_context_input.setMaximumHeight(92)
+
+        self.travel_button = QPushButton("Travel")
+        self.travel_button.clicked.connect(self._request_travel)
+        self.travel_button.setEnabled(False)
+
+        list_layout = QVBoxLayout()
+        list_layout.addWidget(QLabel("Known Locations"))
+        list_layout.addWidget(self.location_list)
+
+        details_layout = QVBoxLayout()
+        details_layout.addWidget(self.details_output)
+        details_layout.addWidget(QLabel("Travel Context"))
+        details_layout.addWidget(self.travel_context_input)
+        details_layout.addWidget(self.travel_button)
+
+        layout = QHBoxLayout()
+        layout.addLayout(list_layout, 1)
+        layout.addLayout(details_layout, 2)
+        self.setLayout(layout)
+
+    def refresh(self) -> None:
+        """Reloads known locations while preserving the visible selection."""
+
+        repository = self.repository()
+        selected_name = self._selected_location_name()
+        self.location_list.blockSignals(True)
+        self.location_list.clear()
+
+        if repository is None:
+            self.location_list.blockSignals(False)
+            self.details_output.clear()
+            self.travel_button.setEnabled(False)
+            return
+
+        locations = repository.ensure_travel_locations()
+
+        for location in sorted(
+            locations,
+            key=lambda value: str(value.get("name", "")).casefold(),
+        ):
+            name = str(location.get("name", "")).strip()
+
+            if not name:
+                continue
+
+            item = QListWidgetItem(name)
+            item.setData(
+                Qt.ItemDataRole.UserRole,
+                location,
+            )
+            self.location_list.addItem(item)
+
+        self.location_list.blockSignals(False)
+
+        if self.location_list.count() == 0:
+            self.details_output.setPlainText("No locations are known yet.")
+            self.travel_button.setEnabled(False)
+            return
+
+        target_row = 0
+
+        for row in range(self.location_list.count()):
+            item = self.location_list.item(row)
+
+            if item is not None and item.text().casefold() == selected_name.casefold():
+                target_row = row
+                break
+
+        self.location_list.setCurrentRow(target_row)
+        self._display_selected_location()
+
+    def _selected_location_name(self) -> str:
+        """Returns the currently selected location name, when any."""
+
+        current_item = self.location_list.currentItem()
+        return current_item.text().strip() if current_item is not None else ""
+
+    def _selected_location_data(self) -> dict[str, Any] | None:
+        """Returns the selected location's persisted data."""
+
+        current_item = self.location_list.currentItem()
+
+        if current_item is None:
+            return None
+
+        raw_location = current_item.data(Qt.ItemDataRole.UserRole)
+        return dict(raw_location) if isinstance(raw_location, dict) else None
+
+    def _display_selected_location(self, *_args: Any) -> None:
+        """Shows selected details and a mathematically calculated route estimate."""
+
+        repository = self.repository()
+        raw_destination = self._selected_location_data()
+        destination = normalize_known_location(raw_destination)
+
+        if repository is None or destination is None:
+            self.details_output.clear()
+            self.travel_button.setEnabled(False)
+            return
+
+        state = StateManager(repository).load_state()
+        origin = normalize_known_location(
+            repository.find_travel_location(state.world.location)
+        )
+        estimate = calculate_travel_estimate(
+            origin,
+            destination,
+            move_speed_mph=state.travel.move_speed_mph,
+            travel_mode=state.travel.travel_mode,
+            speed_multiplier=state.travel.speed_multiplier,
+        )
+
+        sections = [f"# {destination.name}"]
+
+        if destination.description:
+            sections.append(destination.description)
+
+        travel_lines = [
+            "## Travel",
+            f"**From:** {state.world.location or 'Current location'}",
+            f"**Distance:** {format_distance(estimate.distance_miles)}",
+            f"**Estimated time:** {format_travel_time(estimate.estimated_minutes)}",
+            (
+                f"**Travel mode:** {estimate.travel_mode} "
+                f"({estimate.effective_speed_mph:g} mph)"
+            ),
+        ]
+
+        if not estimate.is_available:
+            travel_lines.append(
+                "A route estimate will be available once both locations have map positions."
+            )
+
+        sections.append("\n\n".join(travel_lines))
+
+        conditions = []
+        if destination.terrain:
+            conditions.append(f"**Terrain:** {destination.terrain}")
+        if destination.travel_notes:
+            conditions.append(f"**Route notes:** {destination.travel_notes}")
+        if conditions:
+            sections.append("## Conditions\n\n" + "\n\n".join(conditions))
+
+        _set_markdown_text(self.details_output, "\n\n".join(sections))
+        can_travel = (
+            estimate.is_available
+            and destination.name.casefold() != state.world.location.casefold()
+            and self.on_travel_requested is not None
+        )
+        self.travel_button.setEnabled(can_travel)
+
+    def _request_travel(self) -> None:
+        """Sends the selected planned route through the normal story input flow."""
+
+        destination = self._selected_location_data()
+
+        if destination is None or self.on_travel_requested is None:
+            return
+
+        if self.on_travel_requested(
+            destination,
+            self.travel_context_input.toPlainText().strip(),
+        ):
+            self.travel_context_input.clear()
 
 
 class CalendarScreen(RepositoryBackedWidget):
@@ -5476,9 +7418,12 @@ class CalendarSettingsDialog(QDialog):
 class InventoryScreen(RepositoryBackedWidget):
     """Read-only inventory journal."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, playtesting_tools: bool = False) -> None:
         super().__init__()
 
+        self.playtesting_tools = bool(playtesting_tools)
+        self._selected_item_name = ""
+        self._loading_item_editor = False
         self._sort_column = 0
         self._sort_order = Qt.SortOrder.AscendingOrder
         self.table = QTableWidget(0, 5)
@@ -5487,6 +7432,7 @@ class InventoryScreen(RepositoryBackedWidget):
         )
         self.table.horizontalHeader().setStretchLastSection(True)
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         _enable_table_sorting(self.table, self._sort_by_column)
         self.table.horizontalHeader().setSortIndicator(self._sort_column, self._sort_order)
         self.currency_label = QLabel("Currency: 0")
@@ -5496,7 +7442,117 @@ class InventoryScreen(RepositoryBackedWidget):
         layout.addWidget(self.currency_label)
         layout.addWidget(self.table)
 
+        if self.playtesting_tools:
+            self.table.itemSelectionChanged.connect(self._load_selected_item)
+            layout.addWidget(self._build_playtesting_item_editor())
+
         self.setLayout(layout)
+
+    def _build_playtesting_item_editor(self) -> QGroupBox:
+        """Builds manual item controls used only by the Playtesting build."""
+
+        self.item_name_input = QLineEdit()
+        self.item_type_combo = QComboBox()
+        self.item_type_combo.addItem("General Item", "Item")
+        self.item_type_combo.addItem("Weapon", "Weapon")
+        self.item_type_combo.addItem("Armor / Shield", "Armor")
+        self.item_type_combo.addItem("Ammunition", "Ammunition")
+        self.item_type_combo.currentIndexChanged.connect(
+            lambda _index: self._sync_item_editor_type()
+        )
+        self.item_quantity_input = QSpinBox()
+        self.item_quantity_input.setRange(1, 9999)
+        self.item_quantity_input.setValue(1)
+        self.item_value_input = QSpinBox()
+        self.item_value_input.setRange(0, 999999999)
+        self.item_description_input = QLineEdit()
+
+        self.weapon_hands_combo = QComboBox()
+        self.weapon_hands_combo.addItem("One-handed", "one-handed")
+        self.weapon_hands_combo.addItem("Two-handed", "two-handed")
+        self.weapon_damage_input = QLineEdit("1d6")
+        self.weapon_attack_skill_input = QLineEdit("Melee")
+        self.weapon_range_input = QSpinBox()
+        self.weapon_range_input.setRange(0, 999999)
+        self.weapon_range_input.setValue(DEFAULT_ATTACK_RANGE_FEET)
+        self.weapon_ammunition_type_input = QLineEdit()
+        self.weapon_ammunition_type_input.setPlaceholderText(
+            "Optional, e.g. 9mm Round"
+        )
+        self.weapon_clip_size_input = QSpinBox()
+        self.weapon_clip_size_input.setRange(0, 9999)
+        self.weapon_bullets_per_attack_input = QSpinBox()
+        self.weapon_bullets_per_attack_input.setRange(1, 9999)
+        self.ammunition_type_name_input = QLineEdit()
+        self.ammunition_type_name_input.setPlaceholderText(
+            "Type matched by a weapon, e.g. 9mm Round"
+        )
+
+        self.armor_body_parts_input = QLineEdit("Torso")
+        self.armor_body_parts_input.setPlaceholderText(
+            "Head, Torso, Arms, Hands, Legs, Feet, Off Hand"
+        )
+        self.armor_rating_input = QSpinBox()
+        self.armor_rating_input.setRange(0, 99)
+        self.armor_rating_input.setValue(1)
+
+        save_button = QPushButton("Add Item")
+        save_button.clicked.connect(self._save_playtesting_item)
+        self.save_item_button = save_button
+        remove_button = QPushButton("Remove Selected Item")
+        remove_button.clicked.connect(self._remove_selected_item)
+        clear_button = QPushButton("Clear Editor")
+        clear_button.clicked.connect(self._clear_item_editor)
+
+        general_form = QFormLayout()
+        general_form.addRow("Name:", self.item_name_input)
+        general_form.addRow("Type:", self.item_type_combo)
+        general_form.addRow("Quantity:", self.item_quantity_input)
+        general_form.addRow("Value (base units):", self.item_value_input)
+        general_form.addRow("Description:", self.item_description_input)
+
+        self.weapon_group = QGroupBox("Weapon Metadata")
+        weapon_form = QFormLayout()
+        weapon_form.addRow("Hands:", self.weapon_hands_combo)
+        weapon_form.addRow("Damage:", self.weapon_damage_input)
+        weapon_form.addRow("Attack Skill:", self.weapon_attack_skill_input)
+        weapon_form.addRow("Attack Range (feet):", self.weapon_range_input)
+        weapon_form.addRow(
+            "Ammunition Required:",
+            self.weapon_ammunition_type_input,
+        )
+        weapon_form.addRow("Clip Size:", self.weapon_clip_size_input)
+        weapon_form.addRow(
+            "Bullets per Attack:",
+            self.weapon_bullets_per_attack_input,
+        )
+        self.weapon_group.setLayout(weapon_form)
+
+        self.armor_group = QGroupBox("Armor Metadata")
+        armor_form = QFormLayout()
+        armor_form.addRow("Covers:", self.armor_body_parts_input)
+        armor_form.addRow("Armor Bonus:", self.armor_rating_input)
+        self.armor_group.setLayout(armor_form)
+
+        self.ammunition_group = QGroupBox("Ammunition Metadata")
+        ammunition_form = QFormLayout()
+        ammunition_form.addRow(
+            "Ammunition Type:",
+            self.ammunition_type_name_input,
+        )
+        self.ammunition_group.setLayout(ammunition_form)
+
+        editor_layout = QVBoxLayout()
+        editor_layout.addLayout(general_form)
+        editor_layout.addWidget(self.weapon_group)
+        editor_layout.addWidget(self.armor_group)
+        editor_layout.addWidget(self.ammunition_group)
+        editor_layout.addWidget(_button_row(save_button, remove_button, clear_button))
+
+        editor = QGroupBox("Playtesting Item Editor")
+        editor.setLayout(editor_layout)
+        self._sync_item_editor_type()
+        return editor
 
     def refresh(self) -> None:
         """Reloads inventory table."""
@@ -5543,6 +7599,232 @@ class InventoryScreen(RepositoryBackedWidget):
             self.table.setItem(row_index, 4, _table_item(str(item.get("description", ""))))
 
         self.table.resizeColumnsToContents()
+
+        if self.playtesting_tools and self._selected_item_name:
+            for row_index in range(self.table.rowCount()):
+                item = self.table.item(row_index, 0)
+
+                if (
+                    item is not None
+                    and item.text().casefold() == self._selected_item_name.casefold()
+                ):
+                    self.table.selectRow(row_index)
+                    break
+
+    def _sync_item_editor_type(self) -> None:
+        """Shows metadata fields for the selected playtesting item type."""
+
+        item_type = str(self.item_type_combo.currentData() or "Item")
+        self.weapon_group.setVisible(item_type == "Weapon")
+        self.armor_group.setVisible(item_type == "Armor")
+        self.ammunition_group.setVisible(item_type == "Ammunition")
+
+    def _load_selected_item(self) -> None:
+        """Loads the selected inventory row into the playtesting editor."""
+
+        if not self.playtesting_tools or self._loading_item_editor:
+            return
+
+        row_index = self.table.currentRow()
+        name_item = self.table.item(row_index, 0) if row_index >= 0 else None
+        repository = self.repository()
+
+        if name_item is None or repository is None:
+            return
+
+        selected_name = name_item.text()
+        selected_item = next(
+            (
+                item
+                for item in repository.list_inventory_items()
+                if str(item.get("name", "")).casefold() == selected_name.casefold()
+            ),
+            None,
+        )
+
+        if selected_item is None:
+            return
+
+        metadata = item_metadata(selected_item)
+        item_type = str(metadata.get("item_type", "Item"))
+        self._selected_item_name = selected_name
+        self.item_name_input.setText(selected_name)
+        _set_combo_to_data(self.item_type_combo, item_type)
+        self.item_quantity_input.setValue(max(1, int(selected_item.get("quantity", 1))))
+        self.item_value_input.setValue(max(0, int(selected_item.get("value_base_units", 0))))
+        self.item_description_input.setText(str(selected_item.get("description", "")))
+        _set_combo_to_data(
+            self.weapon_hands_combo,
+            str(metadata.get("weapon_hands", "one-handed")),
+        )
+        self.weapon_damage_input.setText(str(metadata.get("damage", "1d6")))
+        self.weapon_attack_skill_input.setText(
+            str(metadata.get("attack_skill", "Melee"))
+        )
+        self.weapon_range_input.setValue(
+            max(
+                0,
+                int(
+                    metadata.get(
+                        "attack_range_feet",
+                        DEFAULT_ATTACK_RANGE_FEET,
+                    )
+                ),
+            )
+        )
+        self.weapon_ammunition_type_input.setText(
+            str(metadata.get("ammunition_type_required", ""))
+        )
+        self.weapon_clip_size_input.setValue(
+            max(0, int(metadata.get("clip_size", 0)))
+        )
+        self.weapon_bullets_per_attack_input.setValue(
+            max(1, int(metadata.get("bullets_per_attack", 1)))
+        )
+        self.ammunition_type_name_input.setText(
+            str(metadata.get("ammunition_type", selected_name))
+        )
+        self.armor_body_parts_input.setText(
+            ", ".join(str(part) for part in metadata.get("covers_body_parts", []))
+        )
+        self.armor_rating_input.setValue(
+            max(0, int(metadata.get("armor_rating", 0)))
+        )
+        self.save_item_button.setText("Update Item")
+        self._sync_item_editor_type()
+
+    def _save_playtesting_item(self) -> None:
+        """Adds or updates one manually defined inventory item."""
+
+        repository = self.repository()
+
+        if repository is None:
+            return
+
+        name = self.item_name_input.text().strip()
+
+        if not name:
+            QMessageBox.warning(self, "Missing Item Name", "Enter an item name.")
+            return
+
+        item_type = str(self.item_type_combo.currentData() or "Item")
+        metadata: dict[str, Any] = {"item_type": item_type}
+
+        if item_type == "Weapon":
+            metadata.update(
+                {
+                    "weapon_hands": (
+                        self.weapon_hands_combo.currentData() or "one-handed"
+                    ),
+                    "damage": self.weapon_damage_input.text(),
+                    "attack_skill": (
+                        self.weapon_attack_skill_input.text().strip() or "Melee"
+                    ),
+                    "attack_range_feet": self.weapon_range_input.value(),
+                    "ammunition_type_required": (
+                        self.weapon_ammunition_type_input.text().strip()
+                    ),
+                    "clip_size": self.weapon_clip_size_input.value(),
+                    "bullets_per_attack": (
+                        self.weapon_bullets_per_attack_input.value()
+                    ),
+                }
+            )
+        elif item_type == "Armor":
+            metadata.update(
+                {
+                    "covers_body_parts": _split_list(
+                        self.armor_body_parts_input.text()
+                    ),
+                    "armor_rating": self.armor_rating_input.value(),
+                }
+            )
+        elif item_type == "Ammunition":
+            metadata["ammunition_type"] = (
+                self.ammunition_type_name_input.text().strip() or name
+            )
+
+        if self._selected_item_name:
+            repository.modify_inventory_item(
+                target_name=self._selected_item_name,
+                new_name=name,
+                category=item_type,
+                description=self.item_description_input.text().strip(),
+                quantity=self.item_quantity_input.value(),
+                value_base_units=self.item_value_input.value(),
+                metadata=metadata,
+            )
+        else:
+            repository.add_inventory_item(
+                name,
+                item_type,
+                self.item_quantity_input.value(),
+                self.item_description_input.text().strip(),
+                self.item_value_input.value(),
+                metadata=metadata,
+            )
+
+        self._selected_item_name = name
+        self.refresh()
+        self.notify_repository_changed()
+
+    def _remove_selected_item(self) -> None:
+        """Removes the selected inventory stack."""
+
+        repository = self.repository()
+
+        if repository is None or not self._selected_item_name:
+            return
+
+        selected_item = next(
+            (
+                item
+                for item in repository.list_inventory_items()
+                if str(item.get("name", "")).casefold()
+                == self._selected_item_name.casefold()
+            ),
+            None,
+        )
+
+        if selected_item is None:
+            return
+
+        repository.remove_inventory_item(
+            self._selected_item_name,
+            max(1, int(selected_item.get("quantity", 1))),
+        )
+        self._clear_item_editor()
+        self.refresh()
+        self.notify_repository_changed()
+
+    def _clear_item_editor(self) -> None:
+        """Resets the manual item editor to a blank new item."""
+
+        self._selected_item_name = ""
+        self._loading_item_editor = True
+
+        try:
+            self.table.clearSelection()
+            self.table.setCurrentCell(-1, -1)
+            self.item_name_input.clear()
+            _set_combo_to_data(self.item_type_combo, "Item")
+            self.item_quantity_input.setValue(1)
+            self.item_value_input.setValue(0)
+            self.item_description_input.clear()
+            _set_combo_to_data(self.weapon_hands_combo, "one-handed")
+            self.weapon_damage_input.setText("1d6")
+            self.weapon_attack_skill_input.setText("Melee")
+            self.weapon_range_input.setValue(DEFAULT_ATTACK_RANGE_FEET)
+            self.weapon_ammunition_type_input.clear()
+            self.weapon_clip_size_input.setValue(0)
+            self.weapon_bullets_per_attack_input.setValue(1)
+            self.ammunition_type_name_input.clear()
+            self.armor_body_parts_input.setText("Torso")
+            self.armor_rating_input.setValue(1)
+            self.save_item_button.setText("Add Item")
+            self._sync_item_editor_type()
+        finally:
+            self._loading_item_editor = False
 
     def _sort_by_column(self, column_index: int) -> None:
         """Sorts inventory by a clicked header column."""
@@ -5980,7 +8262,7 @@ class AlchemyNotebookScreen(RepositoryBackedWidget):
         self.recipe_reagent_completer.setCompletionMode(
             QCompleter.CompletionMode.PopupCompletion
         )
-        self.recipe_reagent_completer.activated[str].connect(
+        self.recipe_reagent_completer.activated.connect(
             self._select_recipe_reagent_label
         )
         self.recipe_reagent_combo.setCompleter(self.recipe_reagent_completer)
@@ -6541,10 +8823,12 @@ class SettingsScreen(RepositoryBackedWidget):
         on_theme_changed=None,
         tts_enabled: bool = True,
         voice_options: dict[str, str] | None = None,
-        on_sample_voice: Callable[[str, int], bool] | None = None,
+        on_sample_voice: SampleVoiceCallback | None = None,
         on_app_tts_settings_saved: Callable[[dict[str, Any]], None] | None = None,
         global_tts_settings_provider: Callable[[], dict[str, Any]] | None = None,
         custom_voice_storage_path: Path | str | None = None,
+        ai_enabled: bool = True,
+        music_enabled: bool = True,
     ) -> None:
         super().__init__()
 
@@ -6556,6 +8840,8 @@ class SettingsScreen(RepositoryBackedWidget):
         self.on_app_tts_settings_saved = on_app_tts_settings_saved
         self.global_tts_settings_provider = global_tts_settings_provider
         self.custom_voice_storage_path = custom_voice_storage_path
+        self.ai_enabled = bool(ai_enabled)
+        self.music_feature_enabled = bool(music_enabled)
         self.narrator_enabled_checkbox: QCheckBox | None = None
         self.tts_volume_slider: QSlider | None = None
         self.tts_volume_label: QLabel | None = None
@@ -6575,19 +8861,9 @@ class SettingsScreen(RepositoryBackedWidget):
         self.theme_combo.addItems(["Light", "Dark"])
         self.theme_combo.currentIndexChanged.connect(lambda _index: self._save_settings())
 
-        self.narration_tense_combo = QComboBox()
-        _add_combo_options(self.narration_tense_combo, NARRATION_TENSE_OPTIONS)
-        _set_combo_to_data(self.narration_tense_combo, DEFAULT_NARRATION_TENSE)
-        self.narration_tense_combo.currentIndexChanged.connect(
-            lambda _index: self._save_settings()
-        )
-
-        self.narration_style_combo = QComboBox()
-        _add_combo_options(self.narration_style_combo, NARRATION_STYLE_OPTIONS)
-        _set_combo_to_data(self.narration_style_combo, DEFAULT_NARRATION_STYLE)
-        self.narration_style_combo.currentIndexChanged.connect(
-            lambda _index: self._save_settings()
-        )
+        self.ai_settings_button = QPushButton("A.I. Settings...")
+        self.ai_settings_button.setEnabled(False)
+        self.ai_settings_button.clicked.connect(self._open_ai_settings_dialog)
 
         self.music_enabled_checkbox = QCheckBox("Music enabled")
         self.music_enabled_checkbox.setChecked(True)
@@ -6608,12 +8884,6 @@ class SettingsScreen(RepositoryBackedWidget):
             self.custom_voice_button = QPushButton("Custom Voices...")
             self.custom_voice_button.clicked.connect(self._open_custom_voice_dialog)
 
-        self.additional_ai_context_input = QTextEdit()
-        self.additional_ai_context_input.setPlaceholderText(
-            "Optional AI-facing guidance, style preferences, boundaries, or reminders..."
-        )
-        self.additional_ai_context_input.textChanged.connect(self._schedule_settings_save)
-
         self.currency_name_inputs: list[QLineEdit] = []
         self.currency_plural_inputs: list[QLineEdit] = []
         self.currency_value_inputs: list[QSpinBox] = []
@@ -6627,10 +8897,14 @@ class SettingsScreen(RepositoryBackedWidget):
 
         layout = QFormLayout()
         layout.addRow("Theme Preference:", self.theme_combo)
-        layout.addRow("Narration Tense:", self.narration_tense_combo)
-        layout.addRow("Narration Style:", self.narration_style_combo)
-        layout.addRow("Background Music:", self.music_enabled_checkbox)
-        layout.addRow("Music Volume:", _slider_row(self.music_volume_slider, self.music_volume_label))
+        if self.ai_enabled:
+            layout.addRow("Artificial Intelligence:", self.ai_settings_button)
+        if self.music_feature_enabled:
+            layout.addRow("Background Music:", self.music_enabled_checkbox)
+            layout.addRow(
+                "Music Volume:",
+                _slider_row(self.music_volume_slider, self.music_volume_label),
+            )
 
         if self.tts_settings_button is not None:
             layout.addRow("Narration Audio:", self.tts_settings_button)
@@ -6638,7 +8912,6 @@ class SettingsScreen(RepositoryBackedWidget):
         if self.custom_voice_button is not None:
             layout.addRow("Custom Voices:", self.custom_voice_button)
 
-        layout.addRow("Additional AI Context:", self.additional_ai_context_input)
         layout.addRow("Currencies:", self.currency_rows_widget)
         layout.addRow("", self.add_settings_currency_button)
 
@@ -6749,7 +9022,7 @@ class SettingsScreen(RepositoryBackedWidget):
             ):
                 label = self.currency_rows_layout.labelForField(row_widget)
 
-                if label is not None:
+                if isinstance(label, QLabel):
                     label.setText(f"Currency {index + 1}:")
 
                 if index == 0:
@@ -6800,9 +9073,7 @@ class SettingsScreen(RepositoryBackedWidget):
         try:
             if repository is None:
                 self.theme_combo.setCurrentText("Light")
-                _set_combo_to_data(self.narration_tense_combo, DEFAULT_NARRATION_TENSE)
-                _set_combo_to_data(self.narration_style_combo, DEFAULT_NARRATION_STYLE)
-                self.additional_ai_context_input.clear()
+                self.ai_settings_button.setEnabled(False)
                 self.music_enabled_checkbox.setChecked(True)
                 self.music_volume_slider.setValue(25)
                 self._load_settings_currency_rows([])
@@ -6831,19 +9102,6 @@ class SettingsScreen(RepositoryBackedWidget):
                 return
 
             theme = repository.get_setting("theme", "Light")
-            additional_ai_context = repository.get_setting("ai.additional_context", "")
-            narration_preferences = normalize_narration_preferences(
-                {
-                    "tense": repository.get_setting(
-                        "ai.narration_tense",
-                        DEFAULT_NARRATION_TENSE,
-                    ),
-                    "style": repository.get_setting(
-                        "ai.narration_style",
-                        DEFAULT_NARRATION_STYLE,
-                    ),
-                }
-            )
             denominations = repository.get_currency_denominations()
 
             if theme in ["Light", "Dark"]:
@@ -6855,16 +9113,7 @@ class SettingsScreen(RepositoryBackedWidget):
 
             self._load_settings_currency_rows(denominations)
             self.add_settings_currency_button.setEnabled(True)
-
-            _set_combo_to_data(
-                self.narration_tense_combo,
-                narration_preferences["tense"],
-            )
-            _set_combo_to_data(
-                self.narration_style_combo,
-                narration_preferences["style"],
-            )
-            self.additional_ai_context_input.setPlainText(str(additional_ai_context))
+            self.ai_settings_button.setEnabled(True)
             self.music_enabled_checkbox.setChecked(
                 _bool_setting(repository.get_setting("audio.music_enabled", True), True)
             )
@@ -6928,18 +9177,6 @@ class SettingsScreen(RepositoryBackedWidget):
 
         try:
             repository.set_setting("theme", self.theme_combo.currentText())
-            repository.set_setting(
-                "ai.additional_context",
-                self.additional_ai_context_input.toPlainText().strip(),
-            )
-            repository.set_setting(
-                "ai.narration_tense",
-                self.narration_tense_combo.currentData() or DEFAULT_NARRATION_TENSE,
-            )
-            repository.set_setting(
-                "ai.narration_style",
-                self.narration_style_combo.currentData() or DEFAULT_NARRATION_STYLE,
-            )
             repository.set_setting("audio.music_enabled", self.music_enabled_checkbox.isChecked())
             repository.set_setting("audio.music_volume", self.music_volume_slider.value())
 
@@ -6960,6 +9197,103 @@ class SettingsScreen(RepositoryBackedWidget):
                 self.on_audio_settings_changed()
             if self.on_theme_changed is not None:
                 self.on_theme_changed()
+        finally:
+            self._saving_settings = False
+
+        self.notify_repository_changed()
+
+    def _open_ai_settings_dialog(self) -> None:
+        """Opens and persists the save-specific A.I. settings modal."""
+
+        repository = self.repository()
+        if repository is None:
+            return
+
+        dialog = AISettingsDialog(
+            self,
+            settings=self._current_ai_settings(repository),
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        self._save_ai_settings(dialog.build_ai_settings())
+
+    @staticmethod
+    def _current_ai_settings(repository: SaveRepository) -> dict[str, Any]:
+        """Reads current save A.I. settings for the modal."""
+
+        return {
+            "model_intelligence": repository.get_setting(
+                "ai.model_intelligence",
+                DEFAULT_MODEL_INTELLIGENCE,
+            ),
+            "model_tone": repository.get_setting(
+                "ai.model_tone",
+                DEFAULT_MODEL_TONE,
+            ),
+            "response_length": repository.get_setting(
+                "ai.response_length",
+                DEFAULT_RESPONSE_LENGTH,
+            ),
+            "allowed_content_categories": repository.get_setting(
+                "ai.allowed_content_categories",
+                list(DEFAULT_ALLOWED_CONTENT_HARM_CATEGORIES),
+            ),
+            "narration_tense": repository.get_setting(
+                "ai.narration_tense",
+                DEFAULT_NARRATION_TENSE,
+            ),
+            "narration_style": repository.get_setting(
+                "ai.narration_style",
+                DEFAULT_NARRATION_STYLE,
+            ),
+            "additional_context": repository.get_setting(
+                "ai.additional_context",
+                "",
+            ),
+        }
+
+    def _save_ai_settings(self, raw_settings: dict[str, Any]) -> None:
+        """Persists normalized A.I. settings and refreshes model-facing state."""
+
+        repository = self.repository()
+        if repository is None or self._saving_settings:
+            return
+
+        modes = normalize_ai_mode_preferences(raw_settings)
+        narration = normalize_narration_preferences(
+            {
+                "tense": raw_settings.get("narration_tense"),
+                "style": raw_settings.get("narration_style"),
+            }
+        )
+        self._saving_settings = True
+        try:
+            repository.set_setting(
+                "ai.model_intelligence",
+                modes["model_intelligence"],
+            )
+            repository.set_setting("ai.model_tone", modes["model_tone"])
+            repository.set_setting(
+                "ai.response_length",
+                modes["response_length"],
+            )
+            repository.set_setting(
+                "ai.allowed_content_categories",
+                modes["allowed_content_categories"],
+            )
+            repository.set_setting(
+                "ai.narration_tense",
+                narration["tense"],
+            )
+            repository.set_setting(
+                "ai.narration_style",
+                narration["style"],
+            )
+            repository.set_setting(
+                "ai.additional_context",
+                str(raw_settings.get("additional_context", "")).strip(),
+            )
         finally:
             self._saving_settings = False
 
@@ -7112,11 +9446,11 @@ class SettingsScreen(RepositoryBackedWidget):
         voice: str | None = None,
         volume: int | None = None,
         speed: int | None = None,
-    ) -> bool | None:
+    ) -> bool:
         """Plays the selected voice sample."""
 
         if self.on_sample_voice is None:
-            return None
+            return False
 
         return _invoke_sample_voice_callback(
             self.on_sample_voice,
@@ -7137,15 +9471,9 @@ class SettingsScreen(RepositoryBackedWidget):
 def _refresh_repository_calendar_time(repository: SaveRepository) -> None:
     """Recomputes the saved display time from current calendar settings."""
 
-    elapsed_minutes = _safe_int(
-        repository.get_state_value(
-            "elapsed_minutes",
-            str(DEFAULT_START_ELAPSED_MINUTES),
-        ),
-        DEFAULT_START_ELAPSED_MINUTES,
-    )
+    current_minute = repository.get_current_calendar_minute()
     calendar_snapshot = build_calendar_snapshot(
-        elapsed_minutes,
+        current_minute,
         repository.get_calendar_settings(),
     )
     repository.set_state_value("time", calendar_snapshot["display_label"])
@@ -7154,8 +9482,8 @@ def _refresh_repository_calendar_time(repository: SaveRepository) -> None:
 def _apply_audio_settings_to_managers(
     repository: SaveRepository,
     *,
-    sound_manager: SoundManager | None,
-    narration_player: NarrationPlayer | None,
+    sound_manager: SoundManagerProtocol | None,
+    narration_player: NarrationPlayerProtocol | None,
 ) -> None:
     """Applies saved music and narrator settings to runtime audio managers."""
 
@@ -7346,7 +9674,8 @@ def _next_available_save_title(saves_dir: Path, requested_title: str) -> str:
     if not SaveRepository.save_title_exists(saves_dir, base_title):
         return base_title
 
-    suffix = 2
+    base_title, existing_suffix = _split_save_title_suffix(base_title)
+    suffix = max(2, existing_suffix + 1)
 
     while True:
         candidate = f"{base_title} {suffix}"
@@ -7355,6 +9684,23 @@ def _next_available_save_title(saves_dir: Path, requested_title: str) -> str:
             return candidate
 
         suffix += 1
+
+
+def _split_save_title_suffix(title: str) -> tuple[str, int]:
+    """Splits a trailing numeric save suffix from a title."""
+
+    match = re.match(r"^(?P<base>.*?)(?:\s+(?P<suffix>\d+))?$", title.strip())
+
+    if match is None:
+        return title.strip() or "New Adventure", 1
+
+    base_title = str(match.group("base") or "").strip() or "New Adventure"
+    suffix_text = match.group("suffix")
+
+    if suffix_text is None:
+        return base_title, 1
+
+    return base_title, int(suffix_text)
 
 
 def _light_theme_palette() -> QPalette:
@@ -7679,20 +10025,17 @@ def _button_row(*widgets: QWidget) -> QWidget:
 
 
 def _invoke_sample_voice_callback(
-    callback: Callable[..., bool] | None,
+    callback: SampleVoiceCallback | None,
     voice: str,
     volume: int,
     speed: int,
 ) -> bool:
-    """Calls old and new sample-voice callbacks."""
+    """Calls a sample-voice callback with its complete voice settings."""
 
     if callback is None:
         return False
 
-    try:
-        return bool(callback(voice, volume, speed))
-    except TypeError:
-        return bool(callback(voice, volume))
+    return bool(callback(voice, volume, speed))
 
 
 def _narrator_voice_options(narration_player: Any | None = None) -> dict[str, str]:
@@ -8481,17 +10824,17 @@ def _set_markdown_text(text_edit: QTextEdit, markdown_text: str) -> None:
 
 
 def _player_command_markdown(command: str) -> str:
-    """Formats a player command as a Markdown blockquote."""
+    """Formats a player command with a normal Markdown speaker label."""
 
     lines = [line.strip() for line in str(command or "").splitlines() if line.strip()]
 
     if not lines:
-        return "> **You:**"
+        return "**You:**"
 
     first_line, *remaining_lines = lines
-    quoted_lines = [f"> **You:** {first_line}"]
-    quoted_lines.extend(f"> {line}" for line in remaining_lines)
-    return "\n".join(quoted_lines)
+    formatted_lines = [f"**You:** {first_line}"]
+    formatted_lines.extend(remaining_lines)
+    return "\n".join(formatted_lines)
 
 
 def _safe_int(value, default: int) -> int:

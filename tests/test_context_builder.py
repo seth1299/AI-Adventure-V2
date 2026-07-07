@@ -39,6 +39,25 @@ class ContextBuilderTests(unittest.TestCase):
         self.assertIn("exploration", tags)
         self.assertIn("alchemy", tags)
 
+    def test_planner_tags_take_precedence_over_keyword_inference(self) -> None:
+        library = ContextReferenceLoader().load_default_library()
+        packet = AiContextBuilder(library).build_story_context(
+            AdventureState(),
+            player_command="I make a quiet purchase.",
+            planner_context_tags=["merchant", "currency"],
+        )
+
+        self.assertEqual(packet["selection"]["tags"], ["currency", "merchant", "story"])
+
+    def test_missing_planner_tags_fall_back_to_keyword_inference(self) -> None:
+        library = ContextReferenceLoader().load_default_library()
+        packet = AiContextBuilder(library).build_story_context(
+            AdventureState(),
+            player_command="I make a quiet purchase.",
+        )
+
+        self.assertIn("crafting", packet["selection"]["tags"])
+
     def test_build_story_context_selects_relevant_sections(self) -> None:
         library = ContextReferenceLoader().load_default_library()
         builder = AiContextBuilder(
@@ -67,6 +86,7 @@ class ContextBuilderTests(unittest.TestCase):
                         name="Lantern",
                         category="tool",
                         quantity=1,
+                        equipped=True,
                         description="A brass lantern.",
                         metadata={"item_type": "Tool"},
                     )
@@ -108,6 +128,13 @@ class ContextBuilderTests(unittest.TestCase):
         )
         state.settings.values["ai.narration_tense"] = "past"
         state.settings.values["ai.narration_style"] = "third_person_limited"
+        state.settings.values["ai.model_intelligence"] = "smarter"
+        state.settings.values["ai.model_tone"] = "friendly"
+        state.settings.values["ai.response_length"] = "descriptive"
+        state.settings.values["ai.allowed_content_categories"] = [
+            "HARM_CATEGORY_HARASSMENT",
+            "HARM_CATEGORY_DANGEROUS_CONTENT",
+        ]
         state.settings.values["world.summary"] = "Rainmarket is a canal city."
         state.settings.values["world.genre"] = "Realistic detective mystery"
         state.settings.values["world.game_style"] = "Realistic detective mystery"
@@ -154,6 +181,19 @@ class ContextBuilderTests(unittest.TestCase):
                     "disposition": "Friendly",
                 }
             ],
+            gm_secrets=[
+                {
+                    "secret_id": "station_master_is_villain",
+                    "title": "Station Master's Identity",
+                    "details": "The station master directs the canal murders.",
+                    "reveal_condition": "The player deciphers the black ledger.",
+                    "related_npc_ids": ["station_master"],
+                    "related_locations": ["Rainmarket Station"],
+                    "status": "active",
+                    "created_at": "2026-07-01T08:00:00",
+                    "updated_at": "2026-07-01T08:00:00",
+                }
+            ],
             valid_music_tracks=["Town Village City.mp3", "Boss_Fight.mp3"],
             current_music="Town Village City.mp3",
             resolved_skill_checks=[
@@ -195,7 +235,31 @@ class ContextBuilderTests(unittest.TestCase):
             "preserve fog of war",
             packet["state"]["player_ai_preferences"]["narration_style_rules"],
         )
+        self.assertEqual(
+            packet["state"]["player_ai_preferences"]["model_intelligence"],
+            "smarter",
+        )
+        self.assertEqual(
+            packet["state"]["player_ai_preferences"]["model_tone_label"],
+            "Friendly",
+        )
+        self.assertEqual(
+            packet["state"]["player_ai_preferences"]["response_length_label"],
+            "Descriptive",
+        )
+        self.assertEqual(
+            packet["state"]["player_ai_preferences"]["allowed_content_labels"],
+            ["Harassment", "Dangerous Content"],
+        )
+        self.assertIn(
+            "unchecked categories",
+            packet["state"]["player_ai_preferences"]["model_content_rules"],
+        )
         self.assertEqual(packet["state"]["scene"]["location"], "Old Road")
+        self.assertIn("travel", packet["state"])
+        self.assertEqual(packet["state"]["travel"]["movement"]["base_move_speed_mph"], 3.0)
+        self.assertIn("LocationUpsertedEvent", packet["response_contract"]["known_event_types"])
+        self.assertIn("TravelModeChangedEvent", packet["response_contract"]["known_event_types"])
         self.assertEqual(packet["state"]["world_profile"]["summary"], "Rainmarket is a canal city.")
         self.assertEqual(packet["state"]["world_profile"]["genre"], "Realistic detective mystery")
         self.assertEqual(packet["state"]["currency"]["world_description"], "Crowns and half-crowns.")
@@ -215,6 +279,8 @@ class ContextBuilderTests(unittest.TestCase):
             packet["response_contract"]["currency_transactions"],
         )
         self.assertIn("Currency is not an inventory item", packet["state"]["currency"]["transaction_rule"])
+        self.assertIn("natural breakdowns", packet["state"]["currency"]["transaction_rule"])
+        self.assertIn("copper coins' worth", packet["response_contract"]["currency_transactions"])
         self.assertEqual(
             packet["state"]["scene"]["time"],
             "Monday, Month 1 1, Year 1, Morning",
@@ -235,16 +301,22 @@ class ContextBuilderTests(unittest.TestCase):
         self.assertIn("active_tasks", packet["response_contract"])
         self.assertIn("mature_content", packet["response_contract"])
         self.assertIn(
-            "adults of legal drinking age",
+            "unchecked categories",
             packet["response_contract"]["mature_content"],
         )
         self.assertIn(
-            "fictional in-world slurs",
+            "Harassment, Dangerous Content",
             packet["response_contract"]["mature_content"],
         )
         self.assertIn("background_music", packet["response_contract"])
         self.assertIn("MusicChangedEvent", packet["response_contract"]["known_event_types"])
-        self.assertIn("WorldLoreChangedEvent", packet["response_contract"]["known_event_types"])
+        self.assertIn("WorldLoreUpsertedEvent", packet["response_contract"]["known_event_types"])
+        self.assertIn("SecretUpsertedEvent", packet["response_contract"]["known_event_types"])
+        self.assertIn("ContainerOpenedEvent", packet["response_contract"]["known_event_types"])
+        self.assertIn(
+            "ContainerContentsTakenEvent",
+            packet["response_contract"]["known_event_types"],
+        )
         self.assertNotIn("StoryAdvancedEvent", packet["response_contract"]["known_event_types"])
         self.assertNotIn("SecretAddedEvent", packet["response_contract"]["known_event_types"])
         self.assertNotIn(
@@ -257,10 +329,15 @@ class ContextBuilderTests(unittest.TestCase):
         )
         self.assertEqual(packet["state"]["audio"]["current_music"], "Town Village City.mp3")
         self.assertEqual(packet["state"]["inventory"]["items"][0]["name"], "Lantern")
+        self.assertTrue(packet["state"]["inventory"]["items"][0]["equipped"])
         self.assertEqual(packet["state"]["inventory"]["items"][0]["value_base_units"], 0)
         self.assertEqual(
             packet["state"]["inventory"]["items"][0]["metadata"]["item_type"],
             "Tool",
+        )
+        self.assertIn(
+            "exact stored currency/items once",
+            packet["state"]["inventory"]["container_rule"],
         )
         self.assertEqual(packet["state"]["item_catalog"]["items"][0]["name"], "Lantern")
         self.assertNotIn("quantity", packet["state"]["item_catalog"]["items"][0])
@@ -291,6 +368,7 @@ class ContextBuilderTests(unittest.TestCase):
         self.assertIn("alchemy.default_guidance", section_ids)
         self.assertIn("skills.default_guidance", section_ids)
         self.assertIn("event.add", section_ids)
+        self.assertIn("event.secret_memory", section_ids)
         self.assertIn("skill_checks", packet["response_contract"])
         self.assertEqual(
             packet["state"]["skills"]["resolved_checks_this_turn"][0]["roll"],
@@ -299,6 +377,14 @@ class ContextBuilderTests(unittest.TestCase):
         self.assertIn(
             "do not request duplicate checks",
             packet["response_contract"]["skill_checks"],
+        )
+        self.assertIn(
+            "meaningful uncertainty",
+            packet["response_contract"]["skill_checks"],
+        )
+        self.assertIn(
+            "Do not request checks merely",
+            packet["state"]["skills"]["rules"]["uncertain_action_rule"],
         )
         self.assertIn(
             "very high successful rolls",
@@ -350,10 +436,28 @@ class ContextBuilderTests(unittest.TestCase):
             {category["id"] for category in packet["creative_ideas"]["categories"]},
         )
         self.assertIn("npc_memory", packet["response_contract"])
+        self.assertIn("secret_memory", packet["response_contract"])
+        self.assertEqual(
+            packet["state"]["gm_secrets"]["active"][0]["secret_id"],
+            "station_master_is_villain",
+        )
+        self.assertIn(
+            "canal murders",
+            packet["state"]["gm_secrets"]["active"][0]["details"],
+        )
+        self.assertIn("AI-only", packet["state"]["gm_secrets"]["visibility"])
+        self.assertIn(
+            "player-visible field",
+            packet["response_contract"]["secret_memory"],
+        )
         self.assertIn("currency_transactions", packet["response_contract"])
         self.assertIn(
             "not inventory coin items",
             packet["response_contract"]["currency_transactions"],
+        )
+        self.assertIn(
+            "ContainerContentsTakenEvent",
+            packet["state"]["currency"]["transaction_rule"],
         )
         self.assertIn(
             "Do not include 'What do you do now?'",
@@ -385,9 +489,35 @@ class ContextBuilderTests(unittest.TestCase):
         self.assertTrue(packet["state"]["combat"]["active"])
         self.assertEqual(packet["state"]["combat"]["round"], 2)
         self.assertEqual(packet["state"]["combat"]["combatants"][1]["name"], "Bandit")
+        self.assertEqual(
+            packet["state"]["combat"]["combatants"][0]["threat_level"],
+            100,
+        )
+        self.assertEqual(
+            packet["state"]["combat"]["combatants"][1]["threat_level"],
+            100,
+        )
         self.assertIn("CombatStartedEvent", packet["response_contract"]["combat_handoff"])
+        self.assertIn("to_hit_bonus", packet["state"]["combat"]["rules"])
+        self.assertIn("to_hit_bonus", packet["response_contract"]["combat_handoff"])
         self.assertIn(
-            "Do not leave visible task fields blank",
+            "initiative_bonus",
+            packet["response_contract"]["combat_handoff"],
+        )
+        self.assertIn(
+            "personality",
+            packet["response_contract"]["combat_handoff"],
+        )
+        self.assertIn(
+            "Threat Levels",
+            packet["response_contract"]["combat_handoff"],
+        )
+        self.assertIn(
+            "ammunition",
+            packet["response_contract"]["combat_handoff"],
+        )
+        self.assertIn(
+            "For a new task, do not leave visible fields blank",
             packet["state"]["active_tasks"]["rules"]["field_completion_rule"],
         )
         self.assertIn(
@@ -543,7 +673,8 @@ class ContextBuilderTests(unittest.TestCase):
         self.assertIn("response.structured_story_turn", section_ids)
         self.assertIn("event.status", section_ids)
         self.assertIn("event.add", section_ids)
-        self.assertIn("event.quest", section_ids)
+        self.assertIn("event.active_task", section_ids)
+        self.assertIn("event.upsert_world", section_ids)
 
 
 if __name__ == "__main__":

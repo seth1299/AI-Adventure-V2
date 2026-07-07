@@ -158,7 +158,11 @@ class SkillSystemTests(unittest.TestCase):
                 packet["state"]["skills"]["rules"]["uncertain_action_rule"],
             )
             self.assertIn(
-                "foraging",
+                "Foraging",
+                packet["state"]["skills"]["rules"]["uncertain_action_rule"],
+            )
+            self.assertIn(
+                "real stakes are present",
                 packet["state"]["skills"]["rules"]["uncertain_action_rule"],
             )
 

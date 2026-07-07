@@ -41,6 +41,15 @@ class NewGameSetupTests(unittest.TestCase):
                     "tense": "past",
                     "style": "third_person_omniscient",
                 },
+                "ai_settings": {
+                    "model_intelligence": "smarter",
+                    "model_tone": "serious",
+                    "response_length": "brief",
+                    "allowed_content_categories": [
+                        "HARM_CATEGORY_DANGEROUS_CONTENT"
+                    ],
+                    "additional_context": "Keep the mystery grounded.",
+                },
                 "specified_genre": "Realistic detective mystery",
                 "start_location": "Rainmarket Station",
             }
@@ -63,6 +72,14 @@ class NewGameSetupTests(unittest.TestCase):
             setup["narration"]["style_label"],
             "Third-Person Omniscient",
         )
+        self.assertEqual(setup["ai_settings"]["model_intelligence"], "smarter")
+        self.assertEqual(setup["ai_settings"]["model_tone"], "serious")
+        self.assertEqual(setup["ai_settings"]["response_length"], "brief")
+        self.assertEqual(
+            setup["ai_settings"]["allowed_content_categories"],
+            ["HARM_CATEGORY_DANGEROUS_CONTENT"],
+        )
+        self.assertIn("Keep the mystery grounded.", setup["ai_additional_context"])
 
     def test_normalized_setup_preserves_explicit_sparse_skill_levels(self) -> None:
         setup = normalize_new_game_setup(
@@ -202,6 +219,15 @@ class NewGameSetupTests(unittest.TestCase):
                         "tense": "future",
                         "style": "first_person_limited",
                     },
+                    "ai_settings": {
+                        "model_intelligence": "smarter",
+                        "model_tone": "friendly",
+                        "response_length": "descriptive",
+                        "allowed_content_categories": [
+                            "HARM_CATEGORY_HARASSMENT"
+                        ],
+                        "additional_context": "Keep clues internally consistent.",
+                    },
                 }
             )
             repository = SaveRepository.create_new_save(
@@ -240,6 +266,23 @@ class NewGameSetupTests(unittest.TestCase):
             self.assertEqual(
                 state.settings.values["ai.narration_style"],
                 "first_person_limited",
+            )
+            self.assertEqual(
+                state.settings.values["ai.model_intelligence"],
+                "smarter",
+            )
+            self.assertEqual(state.settings.values["ai.model_tone"], "friendly")
+            self.assertEqual(
+                state.settings.values["ai.response_length"],
+                "descriptive",
+            )
+            self.assertEqual(
+                state.settings.values["ai.allowed_content_categories"],
+                ["HARM_CATEGORY_HARASSMENT"],
+            )
+            self.assertIn(
+                "Keep clues internally consistent.",
+                state.settings.values["ai.additional_context"],
             )
             repository.set_world_lore(
                 {
@@ -389,6 +432,16 @@ class NewGameSetupTests(unittest.TestCase):
             "setup.narration.tense_label",
             packet["requirements"]["narration_preferences"],
         )
+        self.assertEqual(
+            packet["player_ai_preferences"]["model_intelligence"],
+            "faster",
+        )
+        self.assertEqual(packet["player_ai_preferences"]["model_tone"], "neutral")
+        self.assertEqual(
+            packet["player_ai_preferences"]["response_length"],
+            "normal",
+        )
+        self.assertIn("ai_modes", packet["requirements"])
         self.assertIn("currency_generation", packet["requirements"])
         self.assertIn("at least one and at most four", packet["requirements"]["currency_generation"])
         self.assertIn("value=1", packet["requirements"]["currency_generation"])
@@ -451,8 +504,9 @@ class NewGameSetupTests(unittest.TestCase):
             templates = load_new_game_templates(template_path)
             loaded = load_new_game_template(template_path)
 
+            assert loaded is not None
+
             self.assertEqual([template.name for template in templates], ["Space Test", "Template Test"])
-            self.assertIsNotNone(loaded)
             self.assertEqual(templates[1].setup["title"], "Template Test")
             self.assertEqual(templates[1].setup["character"]["name"], "Iris Vale")
             self.assertEqual(templates[1].setup["starter_items"][0]["name"], "Notebook")

@@ -9,6 +9,7 @@ from ai_adventure.currency import (
     describe_currency_denominations,
     format_currency_amount,
     normalize_currency_denominations,
+    normalize_visible_currency_text,
 )
 from ai_adventure.events.event_applier import EventApplier
 from ai_adventure.persistence.save_repository import SaveRepository
@@ -50,6 +51,28 @@ class CurrencyTests(unittest.TestCase):
         self.assertNotIn(
             "Copper Piece",
             {denomination["name"] for denomination in denominations},
+        )
+
+    def test_visible_currency_text_uses_denomination_breakdowns(self) -> None:
+        denominations = [
+            {"name": "Copper Coin", "plural_name": "Copper Coins", "value": 1},
+            {"name": "Silver Coin", "plural_name": "Silver Coins", "value": 10},
+            {"name": "Gold Coin", "plural_name": "Gold Coins", "value": 100},
+        ]
+
+        self.assertEqual(
+            normalize_visible_currency_text(
+                "You find 35 copper coins' worth of silver.",
+                denominations,
+            ),
+            "You find 3 Silver Coins and 5 Copper Coins.",
+        )
+        self.assertEqual(
+            normalize_visible_currency_text(
+                "The fee is 35 base units.",
+                denominations,
+            ),
+            "The fee is 3 Silver Coins and 5 Copper Coins.",
         )
 
     def test_inventory_items_store_baseline_value(self) -> None:

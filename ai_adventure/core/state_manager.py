@@ -4,7 +4,6 @@ import logging
 from typing import Any
 
 from ai_adventure.calendar_system import (
-    DEFAULT_START_ELAPSED_MINUTES,
     build_calendar_snapshot,
 )
 from ai_adventure.combat import (
@@ -34,8 +33,10 @@ from ai_adventure.core.models import (
     Skill,
     SkillCheck,
     SkillsState,
+    TravelState,
     WorldState,
 )
+from ai_adventure.locations import normalize_known_locations
 from ai_adventure.persistence.save_repository import SaveRepository
 
 
@@ -47,7 +48,7 @@ class StateManager:
     Loads and commits the composed adventure state for one save.
 
     This is the bridge between the SQLite repository and the typed state models.
-    Event reducers can target these models in Phase 3 without needing to know
+    Event application and UI code can use these models without needing to know
     the database layout.
     """
 
@@ -70,8 +71,10 @@ class StateManager:
         state_snapshot = self.repository.get_state_snapshot()
         settings = self._load_settings()
         inventory = self._load_inventory()
+        travel_locations = self.repository.ensure_travel_locations()
+        travel_profile = self.repository.get_travel_profile()
         calendar_snapshot = build_calendar_snapshot(
-            _read_int(state_snapshot, "elapsed_minutes", DEFAULT_START_ELAPSED_MINUTES),
+            self.repository.get_current_calendar_minute(),
             self.repository.get_calendar_settings(),
         )
         equipment = normalize_equipment(
@@ -114,6 +117,12 @@ class StateManager:
                 time=_read_string(state_snapshot, "time", calendar_snapshot["display_label"]),
                 weather=_read_string(state_snapshot, "weather", "Clear"),
                 flags=self._load_flags(state_snapshot),
+            ),
+            travel=TravelState(
+                locations=normalize_known_locations(travel_locations),
+                move_speed_mph=float(travel_profile["move_speed_mph"]),
+                travel_mode=str(travel_profile["travel_mode"]),
+                speed_multiplier=float(travel_profile["speed_multiplier"]),
             ),
             inventory=inventory,
             item_catalog=self._load_item_catalog(),
@@ -172,6 +181,7 @@ class StateManager:
                     name=_read_string(row, "name", ""),
                     category=_read_string(row, "category", ""),
                     quantity=_read_int(row, "quantity", 1),
+                    equipped=bool(row.get("equipped", False)),
                     description=_read_string(row, "description", ""),
                     value_base_units=_read_int(row, "value_base_units", 0),
                     metadata=dict(row.get("metadata", {}))

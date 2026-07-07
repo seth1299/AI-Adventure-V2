@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import logging
+import os
 import tempfile
 import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+import importlib
 from pathlib import Path
 from collections.abc import Callable
 from typing import Any, ClassVar
@@ -74,7 +76,7 @@ class PyKokoroTTSEngine(TTSEngine):
         from pykokoro.tokenizer import TokenizerConfig
         from pykokoro.voice_manager import VoiceBlend
 
-        _load_pykokoro_spacy_model()
+        self.spacy_model = _resolve_pykokoro_spacy_model()
         self.output_directory = Path(output_directory or tempfile.gettempdir())
         self.output_directory.mkdir(parents=True, exist_ok=True)
         self._KokoroPipeline = KokoroPipeline
@@ -135,7 +137,7 @@ class PyKokoroTTSEngine(TTSEngine):
             model_quality=self.model_quality,
             generation=generation,
             tokenizer_config=self._TokenizerConfig(
-                spacy_model=PYKOKORO_SPACY_MODEL,
+                spacy_model=self.spacy_model,
                 spacy_model_size="sm",
             ),
         )
@@ -346,20 +348,43 @@ def _create_preferred_tts_engine(
     voices_path: str | Path,
     output_directory: str | Path,
 ) -> TTSEngine:
-    """Creates PyKokoro when available, otherwise falls back to kokoro-onnx."""
+    """Creates the configured Kokoro engine, defaulting to kokoro-onnx."""
+
+    if _preferred_tts_engine_name() == "pykokoro":
+        try:
+            return PyKokoroTTSEngine(output_directory=output_directory)
+        except ImportError as error:
+            LOGGER.info("PyKokoro is unavailable; using kokoro-onnx fallback: %s", error)
+        except Exception as error:
+            LOGGER.warning(
+                "PyKokoro initialization failed; using kokoro-onnx fallback: %s",
+                error,
+            )
 
     try:
-        return PyKokoroTTSEngine(output_directory=output_directory)
-    except ImportError as error:
-        LOGGER.info("PyKokoro is unavailable; using kokoro-onnx fallback: %s", error)
-    except Exception as error:
-        LOGGER.warning("PyKokoro initialization failed; using kokoro-onnx fallback: %s", error)
+        return KokoroOnnxTTSEngine(
+            model_path=model_path,
+            voices_path=voices_path,
+            output_directory=output_directory,
+        )
+    except Exception as onnx_error:
+        LOGGER.warning(
+            "Kokoro-ONNX initialization failed; trying PyKokoro fallback: %s",
+            onnx_error,
+        )
 
-    return KokoroOnnxTTSEngine(
-        model_path=model_path,
-        voices_path=voices_path,
-        output_directory=output_directory,
-    )
+    return PyKokoroTTSEngine(output_directory=output_directory)
+
+
+def _preferred_tts_engine_name() -> str:
+    """Returns the configured TTS engine preference."""
+
+    value = str(os.getenv("AI_ADVENTURE_TTS_ENGINE", "")).strip().casefold()
+
+    if value in {"pykokoro", "py-kokoro", "py_kokoro"}:
+        return "pykokoro"
+
+    return "kokoro_onnx"
 
 
 def _normalize_pykokoro_model_quality(value: str) -> str:
@@ -373,9 +398,26 @@ def _normalize_pykokoro_model_quality(value: str) -> str:
     return PYKOKORO_MODEL_QUALITY
 
 
-def _load_pykokoro_spacy_model() -> None:
-    """Preloads the spaCy model PyKokoro needs for English tokenization."""
+def _resolve_pykokoro_spacy_model() -> str:
+    """Returns a spaCy model name or path PyKokoro can load for tokenization."""
 
     import spacy
 
-    spacy.load(PYKOKORO_SPACY_MODEL)
+    configured_path = str(os.getenv("AI_ADVENTURE_SPACY_MODEL_PATH", "")).strip()
+
+    if configured_path:
+        spacy_path = Path(configured_path)
+        if spacy_path.exists():
+            spacy.load(spacy_path)
+            return str(spacy_path)
+
+        LOGGER.warning("Configured spaCy model path does not exist: %s", spacy_path)
+
+    try:
+        spacy.load(PYKOKORO_SPACY_MODEL)
+        return PYKOKORO_SPACY_MODEL
+    except OSError:
+        model_package = importlib.import_module(PYKOKORO_SPACY_MODEL)
+        package_path = Path(str(model_package.__file__)).resolve().parent
+        spacy.load(package_path)
+        return str(package_path)

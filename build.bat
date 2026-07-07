@@ -18,6 +18,11 @@ if not exist "%ENTRYPOINT%" (
     exit /b 1
 )
 
+if not exist ".env" (
+    echo ERROR: Missing required .env file.
+    exit /b 1
+)
+
 if not exist "%TTS_MODEL%" (
     echo ERROR: Missing Kokoro ONNX model: "%TTS_MODEL%"
     exit /b 1
@@ -37,6 +42,12 @@ if defined PYTHON_USER_SITE if exist "%PYTHON_USER_SITE%" (
     )
 )
 
+"%PYTHON%" -m pip install --user --disable-pip-version-check --no-input --quiet -r requirements.txt
+if errorlevel 1 (
+    echo ERROR: Failed to install requirements.txt.
+    exit /b 1
+)
+
 "%PYTHON%" -m PyInstaller ^
     --log-level ERROR ^
     --noconfirm ^
@@ -54,6 +65,8 @@ if defined PYTHON_USER_SITE if exist "%PYTHON_USER_SITE%" (
     --icon "%APP_ICON%" ^
     --collect-all "kokoro_onnx" ^
     --collect-all "pykokoro" ^
+    --collect-all "kokorog2p" ^
+    --collect-all "en_core_web_sm" ^
     --collect-all "language_tags" ^
     --collect-all "espeakng_loader" ^
     --collect-all "onnxruntime" ^
@@ -68,6 +81,12 @@ if defined PYTHON_USER_SITE if exist "%PYTHON_USER_SITE%" (
 if errorlevel 1 (
     echo.
     echo Build failed.
+    exit /b 1
+)
+
+"%PYTHON%" -m ai_adventure.app.build_support
+if errorlevel 1 (
+    echo ERROR: Failed to copy .env to dist.
     exit /b 1
 )
 

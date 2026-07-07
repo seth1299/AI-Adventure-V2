@@ -86,15 +86,15 @@ def normalize_calendar_settings(raw_settings: Any) -> dict[str, Any]:
 
 
 def build_calendar_snapshot(
-    elapsed_minutes: int,
+    current_minute: int,
     settings: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Builds derived calendar fields for one elapsed-minute value."""
+    """Builds derived calendar fields for one absolute in-world minute."""
 
     clean_settings = normalize_calendar_settings(settings)
-    clean_elapsed = max(0, _safe_int(elapsed_minutes, DEFAULT_START_ELAPSED_MINUTES))
-    day_index = clean_elapsed // MINUTES_PER_DAY
-    time_of_day_minutes = clean_elapsed % MINUTES_PER_DAY
+    clean_minute = max(0, _safe_int(current_minute, DEFAULT_START_ELAPSED_MINUTES))
+    day_index = clean_minute // MINUTES_PER_DAY
+    time_of_day_minutes = clean_minute % MINUTES_PER_DAY
     days_per_week = int(clean_settings["days_per_week"])
     weeks_per_month = int(clean_settings["weeks_per_month"])
     months_per_year = int(clean_settings["months_per_year"])
@@ -120,7 +120,7 @@ def build_calendar_snapshot(
     date_label = f"{day_name}, {month_name} {day_of_month_index + 1}, Year {year_index + 1}"
 
     return {
-        "elapsed_minutes": clean_elapsed,
+        "current_minute": clean_minute,
         "absolute_day": day_index + 1,
         "year": year_index + 1,
         "month_index": month_index,
@@ -148,28 +148,28 @@ def build_calendar_snapshot(
     }
 
 
-def resolve_starting_elapsed_minutes(
+def resolve_starting_calendar_minute(
     raw_starting_calendar: Any,
     settings: dict[str, Any] | None = None,
     *,
-    default_elapsed_minutes: int = DEFAULT_START_ELAPSED_MINUTES,
+    default_current_minute: int = DEFAULT_START_ELAPSED_MINUTES,
 ) -> int:
     """
-    Resolves AI-provided starting calendar hints to elapsed minutes.
+    Resolves AI-provided starting calendar hints to an absolute in-world minute.
 
-    The AI may provide an exact elapsed_minutes value, or softer fields such as
+    The AI may provide an exact current_minute value, or softer fields such as
     season_name, season_hint, month_name, month_number, day_of_month, and
     time_of_day_minutes. This keeps opening prose and the displayed calendar in
     sync without requiring the model to perform calendar math perfectly.
     """
 
     if not isinstance(raw_starting_calendar, dict):
-        return default_elapsed_minutes
+        return default_current_minute
 
-    explicit_elapsed = raw_starting_calendar.get("elapsed_minutes")
+    explicit_current_minute = raw_starting_calendar.get("current_minute")
 
-    if explicit_elapsed is not None:
-        return max(0, _safe_int(explicit_elapsed, default_elapsed_minutes))
+    if explicit_current_minute is not None:
+        return max(0, _safe_int(explicit_current_minute, default_current_minute))
 
     clean_settings = normalize_calendar_settings(settings)
     days_per_month = int(clean_settings["days_per_week"]) * int(clean_settings["weeks_per_month"])
@@ -180,7 +180,7 @@ def resolve_starting_elapsed_minutes(
         month_index = _resolve_month_index_for_season(raw_starting_calendar, clean_settings)
 
     if month_index is None:
-        return default_elapsed_minutes
+        return default_current_minute
 
     day_of_month = _bounded_int(
         raw_starting_calendar.get("day_of_month"),

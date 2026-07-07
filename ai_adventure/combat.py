@@ -13,6 +13,11 @@ DEFAULT_BASE_ARMOR_RATING = 10
 DEFAULT_UNARMED_DAMAGE = "1d4"
 DEFAULT_WEAPON_DAMAGE = "1d6"
 DEFAULT_TWO_HANDED_DAMAGE = "1d10"
+DEFAULT_ATTACK_SKILL = "Melee"
+DEFAULT_TO_HIT_BONUS = 0
+DEFAULT_ATTACK_RANGE_FEET = 5
+DEFAULT_RANGED_ATTACK_RANGE_FEET = 100
+COMBAT_PERSONALITIES = ("balanced", "aggressive", "cautious", "intelligent")
 
 
 def empty_equipment() -> dict[str, str]:
@@ -28,7 +33,7 @@ def normalize_item_metadata(
     category: str = "",
     description: str = "",
 ) -> dict[str, Any]:
-    """Returns clean item metadata for equipment and combat."""
+    """Returns clean item metadata for equipment, containers, and combat."""
 
     metadata = dict(raw_metadata) if isinstance(raw_metadata, dict) else {}
     clean_category = str(category or "").strip()
@@ -48,12 +53,63 @@ def normalize_item_metadata(
 
     if item_type == "Weapon":
         hands = _normalize_weapon_hands(metadata.get("weapon_hands"), folded)
+        attack_skill = (
+            str(_metadata_value(metadata, "attack_skill") or "").strip()
+            or _default_attack_skill(folded)
+        )
+        ammunition_type = str(
+            _metadata_value(
+                metadata,
+                "ammunition_type_required",
+                "ammunition_required",
+                "ammo_type_required",
+            )
+            or ""
+        ).strip()
         clean_metadata["weapon_hands"] = hands
         clean_metadata["damage"] = normalize_damage_expression(
             metadata.get("damage", metadata.get("damage_expression")),
             default=DEFAULT_TWO_HANDED_DAMAGE if hands == "two-handed" else DEFAULT_WEAPON_DAMAGE,
         )
         clean_metadata["damage_type"] = str(metadata.get("damage_type", "") or "").strip()
+        clean_metadata["attack_skill"] = attack_skill
+        clean_metadata["attack_range_feet"] = max(
+            0,
+            _safe_int(
+                _metadata_value(metadata, "attack_range_feet", "range_feet"),
+                (
+                    DEFAULT_RANGED_ATTACK_RANGE_FEET
+                    if attack_skill.casefold() == "ranged"
+                    else DEFAULT_ATTACK_RANGE_FEET
+                ),
+            ),
+        )
+        clean_metadata["ammunition_type_required"] = ammunition_type
+
+        if ammunition_type:
+            clip_size = max(
+                1,
+                _safe_int(_metadata_value(metadata, "clip_size"), 1),
+            )
+            clean_metadata["clip_size"] = clip_size
+            clean_metadata["bullets_per_attack"] = max(
+                1,
+                min(
+                    clip_size,
+                    _safe_int(
+                        _metadata_value(
+                            metadata,
+                            "bullets_per_attack",
+                            "amount_of_bullets_fired_per_attack",
+                        ),
+                        1,
+                    ),
+                ),
+            )
+        else:
+            clean_metadata["clip_size"] = 0
+            clean_metadata["bullets_per_attack"] = 0
+
         return clean_metadata
 
     if item_type == "Armor":
@@ -73,7 +129,159 @@ def normalize_item_metadata(
         )
         return clean_metadata
 
+    if item_type in {"Ammunition", "Ammo"}:
+        clean_metadata["item_type"] = "Ammunition"
+        clean_metadata["ammunition_type"] = (
+            str(
+                _metadata_value(
+                    metadata,
+                    "ammunition_type",
+                    "ammo_type",
+                )
+                or ""
+            ).strip()
+            or clean_name
+        )
+        return clean_metadata
+
+    if item_type == "Container":
+        clean_metadata["container"] = _normalize_container_metadata(
+            metadata.get("container", metadata)
+        )
+        return clean_metadata
+
     return clean_metadata
+
+
+def _normalize_container_metadata(raw_container: Any) -> dict[str, Any]:
+    """Returns the durable state and exact hidden contents of one container."""
+
+    container = dict(raw_container) if isinstance(raw_container, dict) else {}
+    is_open = bool(
+        container.get("is_open", container.get("container_is_open", False))
+    )
+    contents_taken = bool(
+        container.get(
+            "contents_taken",
+            container.get("container_contents_taken", False),
+        )
+    )
+    is_locked = bool(
+        container.get("is_locked", container.get("container_is_locked", False))
+    )
+    is_trapped = bool(
+        container.get("is_trapped", container.get("container_is_trapped", False))
+    )
+    raw_contents = container.get("contents", {})
+
+    if not isinstance(raw_contents, dict):
+        raw_contents = {}
+
+    currency_base_units = max(
+        0,
+        _safe_int(
+            raw_contents.get(
+                "currency_base_units",
+                container.get("currency_base_units", 0),
+            ),
+            0,
+        ),
+    )
+    raw_items = raw_contents.get("items", container.get("items", []))
+
+    return {
+        "is_open": is_open,
+        "contents_taken": bool(is_open and contents_taken),
+        "is_locked": is_locked,
+        "lockpick_skill": (
+            str(container.get("lockpick_skill", "") or "").strip()
+            or "Lockpicking"
+        ),
+        "lockpick_dc": (
+            max(1, _safe_int(container.get("lockpick_dc"), 10))
+            if is_locked
+            else 0
+        ),
+        "lockpick_failure_consequence": str(
+            container.get("lockpick_failure_consequence", "") or ""
+        ).strip(),
+        "is_trapped": is_trapped,
+        "trap_notice_skill": (
+            str(container.get("trap_notice_skill", "") or "").strip()
+            or "Perception"
+        ),
+        "trap_notice_dc": (
+            max(1, _safe_int(container.get("trap_notice_dc"), 10))
+            if is_trapped
+            else 0
+        ),
+        "trap_disarm_skill": (
+            str(container.get("trap_disarm_skill", "") or "").strip()
+            or "Sleight of Hand"
+        ),
+        "trap_disarm_dc": (
+            max(1, _safe_int(container.get("trap_disarm_dc"), 10))
+            if is_trapped
+            else 0
+        ),
+        "trap_failure_consequence": str(
+            container.get("trap_failure_consequence", "") or ""
+        ).strip(),
+        "contents": {
+            "currency_base_units": currency_base_units,
+            "items": _normalize_container_contents_items(raw_items),
+        },
+    }
+
+
+def _normalize_container_contents_items(raw_items: Any) -> list[dict[str, Any]]:
+    """Returns canonical inventory records stored inside a container."""
+
+    if not isinstance(raw_items, list):
+        return []
+
+    items: list[dict[str, Any]] = []
+
+    for raw_item in raw_items:
+        if not isinstance(raw_item, dict):
+            continue
+
+        name = str(raw_item.get("name", raw_item.get("item_name", "")) or "").strip()
+
+        if not name:
+            continue
+
+        category = str(
+            raw_item.get("category", raw_item.get("item_type", "Item")) or "Item"
+        ).strip() or "Item"
+        description = str(raw_item.get("description", "") or "").strip()
+        raw_metadata = raw_item.get("metadata", raw_item)
+        items.append(
+            {
+                "name": name,
+                "category": category,
+                "quantity": max(
+                    1,
+                    _safe_int(
+                        raw_item.get("quantity", raw_item.get("amount", 1)),
+                        1,
+                    ),
+                ),
+                "description": description,
+                "value_base_units": max(
+                    0,
+                    _safe_int(raw_item.get("value_base_units"), 0),
+                ),
+                "metadata": normalize_item_metadata(
+                    raw_metadata,
+                    name=name,
+                    category=category,
+                    description=description,
+                ),
+            }
+        )
+
+    return items
 
 
 def normalize_body_parts(
@@ -195,6 +403,8 @@ def normalize_equipment(raw_equipment: Any, inventory_items: list[dict[str, Any]
         for item in inventory_items
         if str(item.get("name", "")).strip()
     }
+    used_counts: dict[str, int] = {}
+    equipped_armor: set[str] = set()
 
     for slot in EQUIPMENT_SLOTS:
         item_name = str(raw_equipment.get(slot, "") or "").strip()
@@ -207,19 +417,87 @@ def normalize_equipment(raw_equipment: Any, inventory_items: list[dict[str, Any]
         if item is None or not item_is_valid_for_slot(item, slot):
             continue
 
-        equipment[slot] = str(item.get("name", item_name))
+        canonical_name = str(item.get("name", item_name))
+        folded_name = canonical_name.casefold()
+        metadata = item_metadata(item)
+        item_type = str(metadata.get("item_type", "")).casefold()
 
-    main_item = inventory_by_name.get(equipment["Main Hand"].casefold())
+        if item_type == "armor":
+            if folded_name in equipped_armor:
+                continue
 
-    if main_item is not None and item_weapon_hands(main_item) == "two-handed":
-        equipment["Off Hand"] = ""
+            covered_slots = [
+                str(covered_slot)
+                for covered_slot in metadata.get("covers_body_parts", [])
+                if str(covered_slot) in EQUIPMENT_SLOTS
+            ]
 
-    off_item = inventory_by_name.get(equipment["Off Hand"].casefold())
+            if (
+                not covered_slots
+                or used_counts.get(folded_name, 0) >= _inventory_quantity(item)
+                or any(equipment[covered_slot] for covered_slot in covered_slots)
+            ):
+                continue
 
-    if off_item is not None and item_weapon_hands(off_item) == "two-handed":
-        equipment["Off Hand"] = ""
+            for covered_slot in covered_slots:
+                equipment[covered_slot] = canonical_name
+
+            used_counts[folded_name] = used_counts.get(folded_name, 0) + 1
+            equipped_armor.add(folded_name)
+            continue
+
+        if (
+            slot == "Off Hand"
+            and equipment["Main Hand"]
+            and item_weapon_hands(
+                inventory_by_name[equipment["Main Hand"].casefold()]
+            )
+            == "two-handed"
+        ):
+            continue
+
+        if used_counts.get(folded_name, 0) >= _inventory_quantity(item):
+            continue
+
+        equipment[slot] = canonical_name
+        used_counts[folded_name] = used_counts.get(folded_name, 0) + 1
 
     return equipment
+
+
+def equipment_item_counts(
+    equipment: dict[str, str],
+    inventory_items: list[dict[str, Any]],
+) -> dict[str, int]:
+    """Returns how many owned instances are allocated by an equipment map."""
+
+    inventory_by_name = {
+        str(item.get("name", "")).casefold(): item
+        for item in inventory_items
+        if str(item.get("name", "")).strip()
+    }
+    counts: dict[str, int] = {}
+    counted_armor: set[str] = set()
+
+    for slot in EQUIPMENT_SLOTS:
+        folded_name = str(equipment.get(slot, "") or "").strip().casefold()
+
+        if not folded_name:
+            continue
+
+        item = inventory_by_name.get(folded_name)
+
+        if item is None:
+            continue
+
+        if str(item_metadata(item).get("item_type", "")).casefold() == "armor":
+            if folded_name in counted_armor:
+                continue
+            counted_armor.add(folded_name)
+
+        counts[folded_name] = counts.get(folded_name, 0) + 1
+
+    return counts
 
 
 def item_is_valid_for_slot(item: dict[str, Any], slot: str) -> bool:
@@ -242,6 +520,12 @@ def item_is_valid_for_slot(item: dict[str, Any], slot: str) -> bool:
         return False
 
     return slot in list(metadata.get("covers_body_parts", []))
+
+
+def _inventory_quantity(item: dict[str, Any]) -> int:
+    """Returns an inventory stack's usable quantity."""
+
+    return max(0, _safe_int(item.get("quantity"), 1))
 
 
 def armor_rating_from_equipment(
@@ -304,6 +588,90 @@ def equipped_weapon_damage(
     return normalize_damage_expression(metadata.get("damage"), default=DEFAULT_WEAPON_DAMAGE)
 
 
+def equipped_weapon_attack_skill(
+    equipment: dict[str, str],
+    inventory_items: list[dict[str, Any]],
+) -> str:
+    """Returns the skill used to calculate the player's to-hit bonus."""
+
+    inventory_by_name = {
+        str(item.get("name", "")).casefold(): item
+        for item in inventory_items
+        if str(item.get("name", "")).strip()
+    }
+    main_item = inventory_by_name.get(str(equipment.get("Main Hand", "")).casefold())
+
+    if main_item is None:
+        return DEFAULT_ATTACK_SKILL
+
+    metadata = item_metadata(main_item)
+
+    if str(metadata.get("item_type", "")).casefold() != "weapon":
+        return DEFAULT_ATTACK_SKILL
+
+    return str(metadata.get("attack_skill", DEFAULT_ATTACK_SKILL)).strip() or DEFAULT_ATTACK_SKILL
+
+
+def equipped_weapon_combat_profile(
+    equipment: dict[str, str],
+    inventory_items: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Returns range and ammunition metadata for the active weapon."""
+
+    inventory_by_name = {
+        str(item.get("name", "")).casefold(): item
+        for item in inventory_items
+        if str(item.get("name", "")).strip()
+    }
+    weapon_name = str(equipment.get("Main Hand", "") or "").strip()
+    main_item = inventory_by_name.get(weapon_name.casefold())
+
+    if main_item is None:
+        return {
+            "weapon_name": "",
+            "ammunition_type_required": "",
+            "clip_size": 0,
+            "bullets_per_attack": 0,
+        }
+
+    metadata = item_metadata(main_item)
+
+    if str(metadata.get("item_type", "")).casefold() != "weapon":
+        return {
+            "weapon_name": "",
+            "ammunition_type_required": "",
+            "clip_size": 0,
+            "bullets_per_attack": 0,
+        }
+
+    return {
+        "weapon_name": str(main_item.get("name", weapon_name)),
+        "ammunition_type_required": str(
+            metadata.get("ammunition_type_required", "")
+        ).strip(),
+        "clip_size": max(0, _safe_int(metadata.get("clip_size"), 0)),
+        "bullets_per_attack": max(
+            0,
+            _safe_int(metadata.get("bullets_per_attack"), 0),
+        ),
+    }
+
+
+def attack_bonus_from_skills(
+    skill_name: str,
+    skills: list[dict[str, Any]],
+) -> int:
+    """Returns the saved bonus for the named combat skill."""
+
+    for skill in skills:
+        if str(skill.get("name", "")).casefold() != skill_name.casefold():
+            continue
+
+        return max(-99, min(99, _safe_int(skill.get("bonus"), DEFAULT_TO_HIT_BONUS)))
+
+    return DEFAULT_TO_HIT_BONUS
+
+
 def item_metadata(item: dict[str, Any]) -> dict[str, Any]:
     """Returns normalized metadata for an inventory row."""
 
@@ -342,6 +710,9 @@ def normalize_combat_state(raw_state: Any) -> dict[str, Any]:
     else:
         turn_index = 0
 
+    _assign_display_names(combatants)
+    assign_combat_threat_levels(combatants)
+
     return {
         "active": bool(state.get("active", False)) and bool(combatants),
         "round": max(1, _safe_int(state.get("round"), 1)),
@@ -377,6 +748,153 @@ def combat_team_defeated(combatants: list[dict[str, Any]], team: str) -> bool:
     return bool(members) and all(bool(member.get("defeated", False)) for member in members)
 
 
+def roll_combat_initiative(
+    combatants: list[dict[str, Any]],
+    *,
+    rng: Any = None,
+) -> list[dict[str, Any]]:
+    """Rolls initiative and returns combatants in descending turn order."""
+
+    roller = rng or random
+
+    for combatant in combatants:
+        initiative_roll = roller.randint(1, 20)
+        initiative_bonus = _bounded_int(
+            combatant.get("initiative_bonus"),
+            -99,
+            99,
+            0,
+        )
+        combatant["initiative_roll"] = initiative_roll
+        combatant["initiative_total"] = initiative_roll + initiative_bonus
+
+    combatants.sort(
+        key=lambda combatant: (
+            -_safe_int(combatant.get("initiative_total"), 0),
+            -_safe_int(combatant.get("initiative_bonus"), 0),
+            str(combatant.get("id", "")),
+        )
+    )
+    _assign_display_names(combatants)
+    return combatants
+
+
+def combatant_display_name(combatant: dict[str, Any]) -> str:
+    """Returns the unique player-facing name for a combatant."""
+
+    return str(
+        combatant.get("display_name")
+        or combatant.get("name")
+        or "Combatant"
+    )
+
+
+def attack_hit_probability(to_hit_bonus: int, armor_rating: int) -> float:
+    """Returns the exact d20 hit probability with natural-one/twenty rules."""
+
+    successful_rolls = sum(
+        1
+        for roll in range(1, 21)
+        if roll == 20
+        or (roll != 1 and roll + int(to_hit_bonus) >= int(armor_rating))
+    )
+    return successful_rolls / 20.0
+
+
+def average_damage(damage_expression: Any) -> float:
+    """Returns the mathematical average of a normalized damage expression."""
+
+    expression = normalize_damage_expression(
+        damage_expression,
+        default=DEFAULT_UNARMED_DAMAGE,
+    )
+    match = re.fullmatch(r"(\d+)d(\d+)([+-]\d+)?", expression)
+
+    if match is None:
+        return 1.0
+
+    count = int(match.group(1))
+    sides = int(match.group(2))
+    bonus = int(match.group(3) or "0")
+    return max(1.0, (count * (sides + 1) / 2.0) + bonus)
+
+
+def calculate_team_threat_levels(
+    combatants: list[dict[str, Any]],
+    team: str,
+) -> dict[str, int]:
+    """
+    Returns whole-percent threat for one living team, totaling exactly 100.
+
+    Maximum health, armor rating, and average weapon damage contribute equally:
+    each combatant receives the average of its share of those three party totals.
+    """
+
+    living_members = [
+        combatant
+        for combatant in combatants
+        if combatant.get("team") == team
+        and not combatant.get("defeated")
+        and int(combatant.get("current_health", 0)) > 0
+    ]
+
+    if not living_members:
+        return {}
+    if len(living_members) == 1:
+        return {str(living_members[0].get("id", "")): 100}
+
+    health_values = [
+        max(1, int(combatant.get("max_health", 1)))
+        for combatant in living_members
+    ]
+    armor_values = [
+        max(1, int(combatant.get("armor_rating", 1)))
+        for combatant in living_members
+    ]
+    damage_values = [
+        average_damage(combatant.get("damage", DEFAULT_UNARMED_DAMAGE))
+        for combatant in living_members
+    ]
+    total_health = sum(health_values)
+    total_armor = sum(armor_values)
+    total_damage = sum(damage_values)
+    scores = [
+        (health / total_health)
+        + (armor / total_armor)
+        + (damage / total_damage)
+        for health, armor, damage in zip(
+            health_values,
+            armor_values,
+            damage_values,
+            strict=True,
+        )
+    ]
+    percentages = _whole_percentages(scores)
+    return {
+        str(combatant.get("id", "")): percentage
+        for combatant, percentage in zip(
+            living_members,
+            percentages,
+            strict=True,
+        )
+    }
+
+
+def assign_combat_threat_levels(combatants: list[dict[str, Any]]) -> None:
+    """Writes recalculated threat percentages onto both combat teams."""
+
+    levels = {
+        **calculate_team_threat_levels(combatants, "party"),
+        **calculate_team_threat_levels(combatants, "enemy"),
+    }
+
+    for combatant in combatants:
+        combatant["threat_level"] = levels.get(
+            str(combatant.get("id", "")),
+            0,
+        )
+
+
 def _normalize_combatant(raw_combatant: dict[str, Any], index: int) -> dict[str, Any]:
     """Returns one clean combatant record."""
 
@@ -390,14 +908,79 @@ def _normalize_combatant(raw_combatant: dict[str, Any], index: int) -> dict[str,
     if team not in {"party", "enemy"}:
         team = "enemy"
 
+    clip_size = max(0, _safe_int(raw_combatant.get("clip_size"), 0))
+    ammunition_type = str(
+        raw_combatant.get("ammunition_type_required", "") or ""
+    ).strip()
+    bullets_per_attack = (
+        max(
+            1,
+            min(
+                clip_size,
+                _safe_int(raw_combatant.get("bullets_per_attack"), 1),
+            ),
+        )
+        if ammunition_type and clip_size > 0
+        else 0
+    )
+    personality = str(
+        raw_combatant.get("personality", "balanced") or "balanced"
+    ).strip().casefold()
+
+    if personality not in COMBAT_PERSONALITIES:
+        personality = "balanced"
+
     return {
         "id": str(raw_combatant.get("id", f"combatant-{index + 1}")),
         "name": str(raw_combatant.get("name", f"Combatant {index + 1}")).strip()
         or f"Combatant {index + 1}",
+        "display_name": str(raw_combatant.get("display_name", "")).strip(),
         "team": team,
         "current_health": current_health,
         "max_health": max_health,
         "armor_rating": max(1, _safe_int(raw_combatant.get("armor_rating"), 10)),
+        "to_hit_bonus": max(
+            -99,
+            min(
+                99,
+                _safe_int(
+                    raw_combatant.get("to_hit_bonus"),
+                    DEFAULT_TO_HIT_BONUS,
+                ),
+            ),
+        ),
+        "initiative_bonus": _bounded_int(
+            raw_combatant.get("initiative_bonus"),
+            -99,
+            99,
+            0,
+        ),
+        "initiative_roll": _bounded_int(
+            raw_combatant.get("initiative_roll"),
+            0,
+            20,
+            0,
+        ),
+        "initiative_total": _safe_int(
+            raw_combatant.get("initiative_total"),
+            0,
+        ),
+        "threat_level": 0,
+        "personality": personality,
+        "weapon_name": str(raw_combatant.get("weapon_name", "") or "").strip(),
+        "ammunition_type_required": ammunition_type,
+        "clip_size": clip_size,
+        "clip_ammo": _bounded_int(
+            raw_combatant.get("clip_ammo"),
+            0,
+            clip_size,
+            clip_size,
+        ),
+        "bullets_per_attack": bullets_per_attack,
+        "reserve_ammo": max(
+            0,
+            _safe_int(raw_combatant.get("reserve_ammo"), 0),
+        ),
         "damage": normalize_damage_expression(
             raw_combatant.get("damage"),
             default=DEFAULT_WEAPON_DAMAGE,
@@ -414,6 +997,84 @@ def _normalize_combatant(raw_combatant: dict[str, Any], index: int) -> dict[str,
         ],
         "defeated": current_health <= 0 or bool(raw_combatant.get("defeated", False)),
     }
+
+
+def _assign_display_names(combatants: list[dict[str, Any]]) -> None:
+    """Assigns stable numbered labels when base names repeat."""
+
+    totals: dict[str, int] = {}
+
+    for combatant in combatants:
+        folded_name = str(combatant.get("name", "")).casefold()
+        totals[folded_name] = totals.get(folded_name, 0) + 1
+
+    occurrences: dict[str, int] = {}
+
+    for combatant in combatants:
+        name = str(combatant.get("name", "") or "Combatant")
+        folded_name = name.casefold()
+        occurrences[folded_name] = occurrences.get(folded_name, 0) + 1
+        combatant["display_name"] = (
+            f"{name} ({occurrences[folded_name]})"
+            if totals.get(folded_name, 0) > 1
+            else name
+        )
+
+
+def _whole_percentages(scores: list[float]) -> list[int]:
+    """Normalizes positive scores to whole percentages totaling exactly 100."""
+
+    if not scores:
+        return []
+
+    total = sum(max(0.0, score) for score in scores)
+
+    if total <= 0:
+        scores = [1.0 for _score in scores]
+        total = float(len(scores))
+
+    raw_percentages = [
+        max(0.0, score) * 100.0 / total
+        for score in scores
+    ]
+    percentages = [int(percentage) for percentage in raw_percentages]
+
+    if len(percentages) <= 100:
+        for index, percentage in enumerate(percentages):
+            if percentage == 0:
+                percentages[index] = 1
+
+    remainder = 100 - sum(percentages)
+
+    if remainder > 0:
+        order = sorted(
+            range(len(scores)),
+            key=lambda index: (
+                raw_percentages[index] - int(raw_percentages[index]),
+                scores[index],
+                -index,
+            ),
+            reverse=True,
+        )
+        for offset in range(remainder):
+            percentages[order[offset % len(order)]] += 1
+    elif remainder < 0:
+        order = sorted(
+            range(len(scores)),
+            key=lambda index: (
+                percentages[index] > 1,
+                percentages[index],
+                index,
+            ),
+            reverse=True,
+        )
+        for _offset in range(-remainder):
+            for index in order:
+                if percentages[index] > 1:
+                    percentages[index] -= 1
+                    break
+
+    return percentages
 
 
 def _normalize_weapon_hands(raw_hands: Any, folded_text: str) -> str:
@@ -476,6 +1137,42 @@ def _default_armor_rating(name: str, folded_text: str, body_parts: list[str]) ->
     return 2
 
 
+def _default_attack_skill(folded_text: str) -> str:
+    """Infers the ordinary attack skill for a weapon."""
+
+    if any(word in folded_text for word in _RANGED_WEAPON_HINTS):
+        return "Ranged"
+
+    return DEFAULT_ATTACK_SKILL
+
+
+def _metadata_value(metadata: dict[str, Any], *names: str) -> Any:
+    """Reads a metadata field while tolerating common key casing styles."""
+
+    normalized_metadata = {
+        re.sub(r"[^a-z0-9]+", "_", str(key).casefold()).strip("_"): value
+        for key, value in metadata.items()
+    }
+
+    for name in names:
+        normalized_name = re.sub(
+            r"[^a-z0-9]+",
+            "_",
+            name.casefold(),
+        ).strip("_")
+
+        if normalized_name in normalized_metadata:
+            return normalized_metadata[normalized_name]
+
+    return None
+
+
+def _bounded_int(value: Any, minimum: int, maximum: int, default: int) -> int:
+    """Safely converts and clamps an integer."""
+
+    return max(minimum, min(maximum, _safe_int(value, default)))
+
+
 def _safe_int(value: Any, default: int) -> int:
     """Safely converts value to int."""
 
@@ -508,4 +1205,12 @@ _TWO_HANDED_HINTS = {
     "rifle",
     "halberd",
     "pike",
+}
+_RANGED_WEAPON_HINTS = {
+    "bow",
+    "crossbow",
+    "pistol",
+    "rifle",
+    "firearm",
+    "sling",
 }

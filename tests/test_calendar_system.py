@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+import sqlite3
 from pathlib import Path
 
 from ai_adventure.calendar_system import (
@@ -10,7 +11,7 @@ from ai_adventure.calendar_system import (
     build_month_grid,
     format_time_of_day,
     normalize_calendar_settings,
-    resolve_starting_elapsed_minutes,
+    resolve_starting_calendar_minute,
 )
 from ai_adventure.core.state_manager import StateManager
 from ai_adventure.persistence.save_repository import SaveRepository
@@ -30,14 +31,14 @@ class CalendarSystemTests(unittest.TestCase):
         self.assertEqual(format_time_of_day(7 * 60, "12_hour"), "7:00 A.M.")
 
     def test_resolves_ai_selected_starting_season(self) -> None:
-        elapsed_minutes = resolve_starting_elapsed_minutes(
+        current_minute = resolve_starting_calendar_minute(
             {
                 "season_hint": "autumn",
                 "day_of_month": 1,
                 "time_of_day_minutes": 20 * 60,
             }
         )
-        snapshot = build_calendar_snapshot(elapsed_minutes)
+        snapshot = build_calendar_snapshot(current_minute)
 
         self.assertEqual(snapshot["season_hint"], "autumn")
         self.assertEqual(snapshot["month_name"], "Month 7")
@@ -105,6 +106,25 @@ class CalendarSystemTests(unittest.TestCase):
             self.assertEqual(state.calendar.days_per_week, 5)
             self.assertEqual(state.calendar.month_name, "Bloom")
             self.assertEqual(state.calendar.time_label, "8:00 A.M.")
+
+    def test_legacy_game_state_elapsed_minutes_migrates_to_calendar_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = SaveRepository.create_new_save(Path(temp_dir), "Calendar Migration")
+            repository.set_state_value("elapsed_minutes", "1234")
+            connection = sqlite3.connect(repository.db_path)
+            try:
+                connection.execute(
+                    "DELETE FROM settings WHERE key = ?",
+                    ("calendar.current_minute",),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+            migrated_repository = SaveRepository(repository.db_path)
+
+            self.assertEqual(migrated_repository.get_current_calendar_minute(), 1234)
+            self.assertNotIn("elapsed_minutes", migrated_repository.get_state_snapshot())
 
 
 if __name__ == "__main__":

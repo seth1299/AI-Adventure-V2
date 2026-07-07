@@ -12,6 +12,10 @@ from pathlib import Path
 from typing import Any
 
 from ai_adventure.alchemy.ingredients import normalize_recipe_ingredients
+from ai_adventure.ai.modes import (
+    default_ai_mode_settings,
+    normalize_ai_mode_preferences,
+)
 from ai_adventure.calendar_system import (
     DEFAULT_CALENDAR_SETTINGS,
     DEFAULT_START_ELAPSED_MINUTES,
@@ -30,10 +34,20 @@ from ai_adventure.narration_preferences import (
     DEFAULT_NARRATION_STYLE,
     DEFAULT_NARRATION_TENSE,
 )
+from ai_adventure.locations import (
+    DEFAULT_MOVE_SPEED_MPH,
+    DEFAULT_TRAVEL_MODE,
+    DEFAULT_TRAVEL_SPEED_MULTIPLIER,
+    KnownLocation,
+    clean_player_location_name,
+    normalize_known_location,
+    normalize_known_locations,
+)
 from ai_adventure.skills.rules import bonus_for_level, clamp_skill_level, level_for_xp
 
 
 LOGGER = logging.getLogger(__name__)
+GM_SECRET_STATUSES = frozenset({"active", "revealed", "retired"})
 
 
 @dataclass(frozen=True)
@@ -75,6 +89,7 @@ class SaveRepository:
         self.db_path = db_path
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._initialize_schema()
+        self.set_player_equipment(self.get_setting("player.equipment", {}))
 
     @classmethod
     def create_new_save(
@@ -117,6 +132,7 @@ class SaveRepository:
         repository.set_setting("ai.additional_context", "")
         repository.set_setting("ai.narration_tense", DEFAULT_NARRATION_TENSE)
         repository.set_setting("ai.narration_style", DEFAULT_NARRATION_STYLE)
+        repository._set_default_ai_mode_settings()
         repository.set_setting("audio.music_enabled", True)
         repository.set_setting("audio.narrator_enabled", True)
         repository.set_setting("audio.music_volume", 25)
@@ -134,7 +150,7 @@ class SaveRepository:
         repository.set_journal_share_with_ai(False)
         repository.set_currency_denominations(DEFAULT_CURRENCY_DENOMINATIONS)
         repository.set_calendar_settings(DEFAULT_CALENDAR_SETTINGS)
-        repository.set_state_value("elapsed_minutes", str(DEFAULT_START_ELAPSED_MINUTES))
+        repository.set_current_calendar_minute(DEFAULT_START_ELAPSED_MINUTES)
         calendar_snapshot = build_calendar_snapshot(
             DEFAULT_START_ELAPSED_MINUTES,
             DEFAULT_CALENDAR_SETTINGS,
@@ -232,6 +248,7 @@ class SaveRepository:
         self.set_setting("ai.additional_context", clean_setup["ai_additional_context"])
         self.set_setting("ai.narration_tense", narration_preferences["tense"])
         self.set_setting("ai.narration_style", narration_preferences["style"])
+        self._set_ai_mode_settings(clean_setup["ai_settings"])
         self.set_setting("audio.music_enabled", bool(audio_settings["music_enabled"]))
         self.set_setting("audio.narrator_enabled", bool(audio_settings["narrator_enabled"]))
         self.set_setting("audio.music_volume", int(audio_settings["music_volume"]))
@@ -251,7 +268,7 @@ class SaveRepository:
         self.set_journal_share_with_ai(False)
         self.set_currency_denominations(clean_setup["currency_denominations"])
         self.set_calendar_settings(calendar_settings)
-        self.set_state_value("elapsed_minutes", str(DEFAULT_START_ELAPSED_MINUTES))
+        self.set_current_calendar_minute(DEFAULT_START_ELAPSED_MINUTES)
         self.set_state_value("location", start_location)
         self.set_state_value("time", calendar_snapshot["display_label"])
         self.set_state_value("weather", "Clear")
@@ -600,6 +617,7 @@ class SaveRepository:
                     name,
                     category,
                     quantity,
+                    equipped,
                     description,
                     value_base_units,
                     metadata_json
@@ -702,6 +720,7 @@ class SaveRepository:
                     metadata=item["metadata"],
                 )
 
+        self.set_player_equipment(self.get_setting("player.equipment", {}))
         self.append_history("inventory", "Starting inventory finalized.")
 
     def upsert_item_catalog_entry(
@@ -804,6 +823,7 @@ class SaveRepository:
                     (row["id"],),
                 )
 
+        self.set_player_equipment(self.get_setting("player.equipment", {}))
         self.append_history("inventory", f"Removed {quantity} x {clean_name}.")
 
     def modify_inventory_item(
@@ -926,6 +946,7 @@ class SaveRepository:
                 metadata=updated_metadata,
             )
 
+        self.set_player_equipment(self.get_setting("player.equipment", {}))
         self.append_history("inventory", f"Modified inventory item: {clean_target}.")
 
     def add_crafting_item(
@@ -1939,6 +1960,190 @@ class SaveRepository:
         )
         return [npc for _, npc in scored_npcs[: max(1, limit)]]
 
+    def upsert_gm_secret(
+        self,
+        *,
+        title: str,
+        details: str,
+        secret_id: str = "",
+        reveal_condition: str = "",
+        related_npc_ids: list[str] | None = None,
+        related_locations: list[str] | None = None,
+        status: str = "active",
+    ) -> dict[str, Any] | None:
+        """
+        Creates or updates one AI-only secret-memory record.
+
+        Args:
+            title: Concise internal label for the hidden fact.
+            details: Canonical GM-only truth the AI must remember.
+            secret_id: Stable identifier used for later updates.
+            reveal_condition: Circumstances under which the player could learn it.
+            related_npc_ids: Stable NPC ids connected to the secret.
+            related_locations: Locations connected to the secret.
+            status: active, revealed, or retired.
+
+        Returns:
+            Stored secret dictionary, or None when required content is blank.
+        """
+
+        clean_title = title.strip()
+        clean_details = details.strip()
+
+        if not clean_title or not clean_details:
+            LOGGER.warning("Skipped GM secret upsert without title and details.")
+            return None
+
+        clean_secret_id = _gm_secret_id(secret_id or clean_title)
+        clean_status = status.strip().casefold() or "active"
+
+        if clean_status not in GM_SECRET_STATUSES:
+            LOGGER.warning(
+                "Invalid GM secret status %r; defaulting to active.",
+                status,
+            )
+            clean_status = "active"
+
+        timestamp = datetime.now().isoformat(timespec="seconds")
+
+        with self._connect() as connection:
+            existing = connection.execute(
+                """
+                SELECT
+                    title,
+                    details,
+                    reveal_condition,
+                    related_npc_ids_json,
+                    related_locations_json,
+                    created_at
+                FROM gm_secrets
+                WHERE secret_id = ?
+                """,
+                (clean_secret_id,),
+            ).fetchone()
+            created_at = timestamp if existing is None else str(existing["created_at"])
+            merged_npc_ids = _merge_string_lists(
+                (
+                    []
+                    if existing is None
+                    else _decode_string_list(
+                        existing["related_npc_ids_json"],
+                        "GM secret related NPC ids",
+                    )
+                ),
+                related_npc_ids or [],
+            )
+            merged_locations = _merge_string_lists(
+                (
+                    []
+                    if existing is None
+                    else _decode_string_list(
+                        existing["related_locations_json"],
+                        "GM secret related locations",
+                    )
+                ),
+                related_locations or [],
+            )
+
+            connection.execute(
+                """
+                INSERT INTO gm_secrets (
+                    secret_id,
+                    title,
+                    details,
+                    reveal_condition,
+                    related_npc_ids_json,
+                    related_locations_json,
+                    status,
+                    created_at,
+                    updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(secret_id) DO UPDATE SET
+                    title = excluded.title,
+                    details = excluded.details,
+                    reveal_condition = excluded.reveal_condition,
+                    related_npc_ids_json = excluded.related_npc_ids_json,
+                    related_locations_json = excluded.related_locations_json,
+                    status = excluded.status,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    clean_secret_id,
+                    clean_title,
+                    clean_details,
+                    reveal_condition.strip(),
+                    _encode_string_list(merged_npc_ids),
+                    _encode_string_list(merged_locations),
+                    clean_status,
+                    created_at,
+                    timestamp,
+                ),
+            )
+
+        return self.get_gm_secret(clean_secret_id)
+
+    def get_gm_secret(self, secret_id: str) -> dict[str, Any] | None:
+        """Reads one AI-only secret-memory record by stable id."""
+
+        clean_secret_id = _gm_secret_id(secret_id)
+
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT
+                    secret_id,
+                    title,
+                    details,
+                    reveal_condition,
+                    related_npc_ids_json,
+                    related_locations_json,
+                    status,
+                    created_at,
+                    updated_at
+                FROM gm_secrets
+                WHERE secret_id = ?
+                """,
+                (clean_secret_id,),
+            ).fetchone()
+
+        return None if row is None else _gm_secret_row_to_dict(row)
+
+    def list_gm_secrets(
+        self,
+        *,
+        active_only: bool = False,
+    ) -> list[dict[str, Any]]:
+        """
+        Lists AI-only secret-memory records.
+
+        Args:
+            active_only: Excludes revealed and retired records when true.
+        """
+
+        where_clause = "WHERE status = 'active'" if active_only else ""
+
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT
+                    secret_id,
+                    title,
+                    details,
+                    reveal_condition,
+                    related_npc_ids_json,
+                    related_locations_json,
+                    status,
+                    created_at,
+                    updated_at
+                FROM gm_secrets
+                {where_clause}
+                ORDER BY created_at ASC, secret_id COLLATE NOCASE
+                """
+            ).fetchall()
+
+        return [_gm_secret_row_to_dict(row) for row in rows]
+
     def append_history(self, kind: str, content: str) -> None:
         """
         Appends an entry to the adventure history.
@@ -2453,6 +2658,194 @@ class SaveRepository:
 
         self.set_world_lore(lore)
 
+    def get_travel_locations(self) -> list[dict[str, Any]]:
+        """Reads structured player-known locations used by the Travel screen."""
+
+        return [
+            location.to_dict()
+            for location in normalize_known_locations(
+                self.get_setting("travel.locations", [])
+            )
+        ]
+
+    def set_travel_locations(self, locations: Any) -> None:
+        """Stores normalized structured player-known travel locations."""
+
+        self.set_setting(
+            "travel.locations",
+            [location.to_dict() for location in normalize_known_locations(locations)],
+        )
+
+    def ensure_travel_locations(self) -> list[dict[str, Any]]:
+        """Bootstraps travel data from the current scene and legacy Locations lore."""
+
+        locations = normalize_known_locations(self.get_setting("travel.locations", []))
+        indexes_by_name = {
+            location.name.casefold(): index for index, location in enumerate(locations)
+        }
+        changed = False
+        current_location = clean_player_location_name(
+            self.get_state_value("location", "")
+        )
+
+        if current_location and current_location.casefold() not in indexes_by_name:
+            indexes_by_name[current_location.casefold()] = len(locations)
+            locations.append(
+                KnownLocation(
+                    name=current_location,
+                    description="Current player location.",
+                    x_miles=0.0 if not locations else None,
+                    y_miles=0.0 if not locations else None,
+                )
+            )
+            changed = True
+
+        for category, entries in self.get_world_lore().items():
+            if str(category).casefold() != "locations" or not isinstance(entries, dict):
+                continue
+
+            for raw_name, raw_description in entries.items():
+                name = clean_player_location_name(raw_name)
+
+                if not name or name.casefold() in indexes_by_name:
+                    continue
+
+                indexes_by_name[name.casefold()] = len(locations)
+                locations.append(
+                    KnownLocation(
+                        name=name,
+                        description=str(raw_description).strip(),
+                    )
+                )
+                changed = True
+
+        if changed:
+            self.set_travel_locations([location.to_dict() for location in locations])
+
+        return [location.to_dict() for location in locations]
+
+    def find_travel_location(self, name: str) -> dict[str, Any] | None:
+        """Finds one structured location by its player-visible name."""
+
+        clean_name = clean_player_location_name(name)
+
+        if not clean_name:
+            return None
+
+        for location in self.ensure_travel_locations():
+            if str(location.get("name", "")).casefold() == clean_name.casefold():
+                return location
+
+        return None
+
+    def upsert_travel_location(self, raw_location: Any) -> bool:
+        """Adds or updates player-known location metadata without duplicating names."""
+
+        incoming = normalize_known_location(raw_location)
+
+        if incoming is None:
+            return False
+
+        locations = normalize_known_locations(self.get_setting("travel.locations", []))
+        incoming_data = incoming.to_dict()
+        raw_data = raw_location if isinstance(raw_location, dict) else {}
+
+        for index, existing in enumerate(locations):
+            if existing.name.casefold() != incoming.name.casefold():
+                continue
+
+            merged_data = existing.to_dict()
+            merged_data["name"] = incoming.name
+
+            for key in (
+                "description",
+                "x_miles",
+                "y_miles",
+                "terrain",
+                "travel_multiplier",
+                "travel_notes",
+            ):
+                aliases = {
+                    "x_miles": ("x_miles", "x"),
+                    "y_miles": ("y_miles", "y"),
+                }.get(key, (key,))
+
+                if any(alias in raw_data for alias in aliases):
+                    merged_data[key] = incoming_data[key]
+
+            locations[index] = normalize_known_location(merged_data) or existing
+            self.set_travel_locations([location.to_dict() for location in locations])
+            return True
+
+        locations.append(incoming)
+        self.set_travel_locations([location.to_dict() for location in locations])
+        return True
+
+    def get_travel_profile(self) -> dict[str, Any]:
+        """Reads hidden movement values used for mathematically calculated travel."""
+
+        return {
+            "move_speed_mph": _bounded_float(
+                self.get_setting("travel.move_speed_mph", DEFAULT_MOVE_SPEED_MPH),
+                default=DEFAULT_MOVE_SPEED_MPH,
+                minimum=0.1,
+                maximum=100.0,
+            ),
+            "travel_mode": str(
+                self.get_setting("travel.mode", DEFAULT_TRAVEL_MODE)
+            ).strip()
+            or DEFAULT_TRAVEL_MODE,
+            "speed_multiplier": _bounded_float(
+                self.get_setting(
+                    "travel.speed_multiplier",
+                    DEFAULT_TRAVEL_SPEED_MULTIPLIER,
+                ),
+                default=DEFAULT_TRAVEL_SPEED_MULTIPLIER,
+                minimum=0.1,
+                maximum=20.0,
+            ),
+        }
+
+    def set_travel_mode(self, mode: str, speed_multiplier: Any) -> bool:
+        """Updates the hidden current travel mode after a validated story event."""
+
+        clean_mode = str(mode or "").strip()
+
+        if not clean_mode:
+            return False
+
+        self.set_setting("travel.mode", clean_mode)
+        self.set_setting(
+            "travel.speed_multiplier",
+            _bounded_float(
+                speed_multiplier,
+                default=DEFAULT_TRAVEL_SPEED_MULTIPLIER,
+                minimum=0.1,
+                maximum=20.0,
+            ),
+        )
+        return True
+
+    def _set_default_ai_mode_settings(self) -> None:
+        """Stores the default save-specific AI behavior modes."""
+
+        self._set_ai_mode_settings(default_ai_mode_settings())
+
+    def _set_ai_mode_settings(self, raw_settings: dict[str, Any]) -> None:
+        """Stores normalized save-specific AI behavior modes."""
+
+        settings = normalize_ai_mode_preferences(raw_settings)
+        self.set_setting(
+            "ai.model_intelligence",
+            settings["model_intelligence"],
+        )
+        self.set_setting("ai.model_tone", settings["model_tone"])
+        self.set_setting("ai.response_length", settings["response_length"])
+        self.set_setting(
+            "ai.allowed_content_categories",
+            settings["allowed_content_categories"],
+        )
+
     def set_setting(self, key: str, value: Any) -> None:
         """
         Stores a user setting as JSON.
@@ -2600,6 +2993,23 @@ class SaveRepository:
             )
         )
 
+    def set_current_calendar_minute(self, current_minute: int) -> None:
+        """Stores the current absolute in-world minute with calendar state."""
+
+        self.set_setting(
+            "calendar.current_minute",
+            max(0, _safe_int(current_minute, default=DEFAULT_START_ELAPSED_MINUTES)),
+        )
+
+    def get_current_calendar_minute(self) -> int:
+        """Reads the current absolute in-world minute for this save."""
+
+        stored_minute = self.get_setting(
+            "calendar.current_minute",
+            DEFAULT_START_ELAPSED_MINUTES,
+        )
+        return max(0, _safe_int(stored_minute, default=DEFAULT_START_ELAPSED_MINUTES))
+
     def get_player_equipment(self) -> dict[str, str]:
         """Reads current player equipment."""
 
@@ -2613,7 +3023,30 @@ class SaveRepository:
 
         clean_equipment = normalize_equipment(equipment, self.list_inventory_items())
         self.set_setting("player.equipment", clean_equipment)
+        self._sync_inventory_equipped_flags(clean_equipment)
         return clean_equipment
+
+    def _sync_inventory_equipped_flags(self, equipment: dict[str, str]) -> None:
+        """Keeps inventory flags aligned with the canonical equipment map."""
+
+        equipped_names = {
+            str(item_name).strip().casefold()
+            for item_name in equipment.values()
+            if str(item_name).strip()
+        }
+
+        with self._connect() as connection:
+            connection.execute("UPDATE inventory_items SET equipped = 0")
+
+            for item_name in equipped_names:
+                connection.execute(
+                    """
+                    UPDATE inventory_items
+                    SET equipped = 1
+                    WHERE name = ? COLLATE NOCASE
+                    """,
+                    (item_name,),
+                )
 
     def get_combat_state(self) -> dict[str, Any]:
         """Reads the saved deterministic combat state."""
@@ -2674,6 +3107,7 @@ class SaveRepository:
                     name TEXT NOT NULL,
                     category TEXT NOT NULL DEFAULT '',
                     quantity INTEGER NOT NULL DEFAULT 1,
+                    equipped INTEGER NOT NULL DEFAULT 0,
                     description TEXT NOT NULL DEFAULT '',
                     value_base_units INTEGER NOT NULL DEFAULT 0,
                     metadata_json TEXT NOT NULL DEFAULT '{}'
@@ -2762,6 +3196,18 @@ class SaveRepository:
                     updated_at TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS gm_secrets (
+                    secret_id TEXT PRIMARY KEY,
+                    title TEXT NOT NULL,
+                    details TEXT NOT NULL,
+                    reveal_condition TEXT NOT NULL DEFAULT '',
+                    related_npc_ids_json TEXT NOT NULL DEFAULT '[]',
+                    related_locations_json TEXT NOT NULL DEFAULT '[]',
+                    status TEXT NOT NULL DEFAULT 'active',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
                 CREATE TABLE IF NOT EXISTS history_entries (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     kind TEXT NOT NULL,
@@ -2802,6 +3248,12 @@ class SaveRepository:
             )
             _ensure_column(
                 connection,
+                "inventory_items",
+                "equipped",
+                "INTEGER NOT NULL DEFAULT 0",
+            )
+            _ensure_column(
+                connection,
                 "item_catalog",
                 "metadata_json",
                 "TEXT NOT NULL DEFAULT '{}'",
@@ -2824,8 +3276,47 @@ class SaveRepository:
                 "due_elapsed_minutes",
                 "INTEGER NOT NULL DEFAULT -1",
             )
+            self._migrate_calendar_minute_from_game_state(connection)
             self._coalesce_inventory_stacks(connection)
             self._seed_item_catalog_from_inventory(connection)
+
+    def _migrate_calendar_minute_from_game_state(
+        self,
+        connection: sqlite3.Connection,
+    ) -> None:
+        """Moves legacy current-time storage out of game_state."""
+
+        legacy_row = connection.execute(
+            "SELECT value FROM game_state WHERE key = ?",
+            ("elapsed_minutes",),
+        ).fetchone()
+
+        if legacy_row is not None:
+            existing_row = connection.execute(
+                "SELECT value_json FROM settings WHERE key = ?",
+                ("calendar.current_minute",),
+            ).fetchone()
+            if existing_row is None:
+                current_minute = max(
+                    0,
+                    _safe_int(
+                        legacy_row["value"],
+                        default=DEFAULT_START_ELAPSED_MINUTES,
+                    ),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO settings (key, value_json)
+                    VALUES (?, ?)
+                    ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json
+                    """,
+                    ("calendar.current_minute", json.dumps(current_minute)),
+                )
+
+        connection.execute(
+            "DELETE FROM game_state WHERE key = ?",
+            ("elapsed_minutes",),
+        )
 
     def _coalesce_inventory_stacks(self, connection: sqlite3.Connection) -> None:
         """Merges duplicate inventory rows by case-insensitive item name."""
@@ -2986,6 +3477,13 @@ def _npc_id_from_parts(name: str, role: str, location: str) -> str:
         return "unknown_npc"
 
     return cleaned[:80]
+
+
+def _gm_secret_id(value: str) -> str:
+    """Builds a stable internal id for AI-only secret memory."""
+
+    cleaned = re.sub(r"[^a-zA-Z0-9]+", "_", value.strip().casefold()).strip("_")
+    return (cleaned or "unnamed_secret")[:100]
 
 
 def _fallback_npc_display_name(name: str, role: str) -> str:
@@ -3200,7 +3698,7 @@ def _merge_string_lists(existing: list[str], additions: list[str]) -> list[str]:
     return _clean_string_list([*existing, *additions])
 
 
-def _safe_int(value: Any, *, default: int | None) -> int | None:
+def _safe_int(value: Any, *, default: int = -1) -> int:
     """Safely converts a value to int."""
 
     try:
@@ -3344,6 +3842,7 @@ def _inventory_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
         "name": row["name"],
         "category": row["category"],
         "quantity": row["quantity"],
+        "equipped": bool(row["equipped"]),
         "description": row["description"],
         "value_base_units": row["value_base_units"],
         "metadata": normalize_item_metadata(
@@ -3394,6 +3893,28 @@ def _npc_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
         ),
         "known_facts": _decode_string_list(row["known_facts_json"], "npc known facts"),
         "disposition": row["disposition"],
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
+def _gm_secret_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    """Converts an AI-only secret-memory row to a plain dictionary."""
+
+    return {
+        "secret_id": row["secret_id"],
+        "title": row["title"],
+        "details": row["details"],
+        "reveal_condition": row["reveal_condition"],
+        "related_npc_ids": _decode_string_list(
+            row["related_npc_ids_json"],
+            "GM secret related NPC ids",
+        ),
+        "related_locations": _decode_string_list(
+            row["related_locations_json"],
+            "GM secret related locations",
+        ),
+        "status": row["status"],
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
     }
@@ -3527,3 +4048,17 @@ def _derive_world_lore_key(text: Any) -> str:
         return key[:80]
 
     return clean_text[:80]
+
+
+def _bounded_float(value: Any, *, default: float, minimum: float, maximum: float) -> float:
+    """Parses a finite bounded float for persisted hidden travel settings."""
+
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        parsed = default
+
+    if parsed != parsed or parsed in {float("inf"), float("-inf")}:
+        parsed = default
+
+    return round(max(minimum, min(maximum, parsed)), 2)

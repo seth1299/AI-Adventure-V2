@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
+from ai_adventure.locations import KnownLocation
+
 
 @dataclass
 class AdventureMetadata:
@@ -52,6 +54,26 @@ class WorldState:
 
 
 @dataclass
+class TravelState:
+    """Player-known map data and the hidden movement values used for estimates."""
+
+    locations: list[KnownLocation] = field(default_factory=list)
+    move_speed_mph: float = 3.0
+    travel_mode: str = "On Foot"
+    speed_multiplier: float = 1.0
+
+    def to_dict(self) -> dict[str, Any]:
+        """Returns a JSON-serializable travel-state dictionary."""
+
+        return {
+            "locations": [location.to_dict() for location in self.locations],
+            "move_speed_mph": self.move_speed_mph,
+            "travel_mode": self.travel_mode,
+            "speed_multiplier": self.speed_multiplier,
+        }
+
+
+@dataclass
 class InventoryItem:
     """An item owned by the player."""
 
@@ -59,6 +81,7 @@ class InventoryItem:
     name: str = ""
     category: str = ""
     quantity: int = 1
+    equipped: bool = False
     description: str = ""
     value_base_units: int = 0
     metadata: dict[str, Any] = field(default_factory=dict)
@@ -129,7 +152,7 @@ class CurrencyState:
 class CalendarState:
     """The current custom calendar and derived date/time fields."""
 
-    elapsed_minutes: int = 480
+    current_minute: int = 480
     absolute_day: int = 1
     year: int = 1
     month_index: int = 0
@@ -363,6 +386,7 @@ class AdventureState:
     metadata: AdventureMetadata = field(default_factory=AdventureMetadata)
     player: PlayerState = field(default_factory=PlayerState)
     world: WorldState = field(default_factory=WorldState)
+    travel: TravelState = field(default_factory=TravelState)
     inventory: InventoryState = field(default_factory=InventoryState)
     item_catalog: ItemCatalogState = field(default_factory=ItemCatalogState)
     currency: CurrencyState = field(default_factory=CurrencyState)

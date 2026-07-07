@@ -3,6 +3,7 @@ from __future__ import annotations
 import random
 from typing import Any
 
+from ai_adventure.ai.modes import normalize_ai_mode_preferences
 from ai_adventure.calendar_system import (
     DEFAULT_START_ELAPSED_MINUTES,
     build_calendar_snapshot,
@@ -152,6 +153,14 @@ def normalize_new_game_setup(raw_setup: Any) -> dict[str, Any]:
     narration_preferences = normalize_narration_preferences(
         raw_setup.get("narration", {})
     )
+    raw_ai_settings = raw_setup.get(
+        "ai_settings",
+        raw_setup.get("ai_modes", {}),
+    )
+    if not isinstance(raw_ai_settings, dict):
+        raw_ai_settings = {}
+    ai_mode_preferences = normalize_ai_mode_preferences(raw_ai_settings)
+    custom_ai_context = _clean_text(raw_ai_settings.get("additional_context"))
     skills = _normalize_skills(raw_setup.get("skills", []))
     starter_items = _normalize_starter_items(raw_setup.get("starter_items", []))
 
@@ -168,6 +177,15 @@ def normalize_new_game_setup(raw_setup: Any) -> dict[str, Any]:
         "calendar": calendar_settings,
         "audio": audio_settings,
         "narration": narration_preferences,
+        "ai_settings": {
+            "model_intelligence": ai_mode_preferences["model_intelligence"],
+            "model_tone": ai_mode_preferences["model_tone"],
+            "response_length": ai_mode_preferences["response_length"],
+            "allowed_content_categories": ai_mode_preferences[
+                "allowed_content_categories"
+            ],
+            "additional_context": custom_ai_context,
+        },
         "time_display": calendar_settings["time_display"],
         "currency_denominations": currency_denominations,
         "currency_description": currency_description,
@@ -180,6 +198,7 @@ def normalize_new_game_setup(raw_setup: Any) -> dict[str, Any]:
             specified_genre=specified_genre,
             game_style=game_style,
             world_context=world_context,
+            additional_context=custom_ai_context,
         ),
     }
 
@@ -280,21 +299,24 @@ def build_new_game_setup_packet(
     ]
     creative_ideas = CreativeIdeasLibrary.load_default().select_for_new_game()
     starter_item_count = len(clean_setup["starter_items"])
+    ai_mode_preferences = normalize_ai_mode_preferences(clean_setup["ai_settings"])
 
     return {
         "schema_version": 1,
         "packet_type": "new_game_setup",
         "setup": clean_setup,
+        "player_ai_preferences": ai_mode_preferences,
         "current_calendar": current_calendar,
         "current_weather": "Clear",
         "requirements": {
             "world_summary": (
-                "Write a few paragraphs describing at least the basics of the "
-                "world or city, prominent NPCs, locations of interest, religions, "
-                "and economy. Incorporate player-provided names, factions, "
-                "guilds, locations, style, calendar, and currency when present. "
-                "Use light Markdown headings, bold important names, italics, and "
-                "bullet lists when they improve readability."
+                "Follow player_ai_preferences.response_length_instruction while "
+                "describing the basics of the world or city, prominent NPCs, "
+                "locations of interest, religions, and economy. Incorporate "
+                "player-provided names, factions, guilds, locations, style, "
+                "calendar, and currency when present. Use light Markdown headings, "
+                "bold important names, italics, and bullet lists when they improve "
+                "readability."
             ),
             "opening_scene": (
                 "Write an introductory player-facing scene at the requested "
@@ -310,6 +332,13 @@ def build_new_game_setup_packet(
                 "reasonably inferred experience. Omniscient styles may use a "
                 "broader narrative camera, but must not reveal secrets, hidden "
                 "state, mystery solutions, or NPC-private facts."
+            ),
+            "ai_modes": (
+                "Apply player_ai_preferences.model_tone_instruction, "
+                "response_length_instruction, and model_content_rules to "
+                "world_summary, introductory_message, world lore, and all other "
+                "player-facing prose. These preferences do not relax schema "
+                "completeness or hidden-information rules."
             ),
             "calendar_weather_consistency": (
                 "Opening prose must match current_calendar and current_weather unless "
@@ -332,8 +361,10 @@ def build_new_game_setup_packet(
             ),
             "events": (
                 "Use structured events for any initial NPCs, active tasks, "
-                "or starter-world facts "
-                "that should be durable."
+                "or starter-world facts that should be durable. Return AI-only "
+                "hidden identities, motives, mystery solutions, off-screen plans, "
+                "and other concealed truths in the dedicated gm_secrets setup "
+                "field; never place those truths in player-facing setup fields."
             ),
             "starting_music": (
                 "If valid background music tracks are available, suggest one "
@@ -380,18 +411,7 @@ def build_new_game_setup_packet(
                 "coherent; a detective can investigate a world not wholly built "
                 "around detective work."
             ),
-            "mature_content": (
-                "Assume the player and player character are adults of legal drinking "
-                "age unless the character setup explicitly says otherwise. Alcohol, "
-                "tavern drinking, drunken patrons, gambling, violence, injury, blood, "
-                "corpses, criminality, cruelty, corruption, and oppressive fictional "
-                "social attitudes are allowed when they fit the selected genre, "
-                "world, opening location, and player choices. Do not sanitize adult "
-                "fictional locations into harmless substitutes. Use fictional "
-                "in-world slurs only for fictional cultures, species, factions, "
-                "classes, guilds, or regions; do not use real-world slurs against "
-                "protected classes."
-            ),
+            "mature_content": ai_mode_preferences["model_content_rules"],
             "starting_location": (
                 "If setup.start_location is blank/default, choose any fitting "
                 "starting location for the selected genre and character. The player "
@@ -402,6 +422,14 @@ def build_new_game_setup_packet(
                 "street, district, ship, campsite, or landmark. Put scenic details "
                 "like floor, view, nearby landmarks, weather, and exact position in "
                 "the opening scene instead of start_location."
+            ),
+            "travel_locations": (
+                "Return a locations array for the Travel tab. Include the finalized "
+                "starting location at x_miles=0 and y_miles=0 plus at least three "
+                "other player-known reachable places. Coordinates are relative map "
+                "miles. Each location needs player-facing description, terrain, "
+                "travel_multiplier, and route notes. Do not include hidden routes, "
+                "secrets, or GM-only information."
             ),
             "skill_generation": (
                 "If a setup.skills entry has blank name, blank description, or "
@@ -968,6 +996,7 @@ def _build_ai_additional_context(
     specified_genre: str,
     game_style: str,
     world_context: str,
+    additional_context: str = "",
 ) -> str:
     """Builds AI-facing setup instructions from wizard inputs."""
 
@@ -981,6 +1010,9 @@ def _build_ai_additional_context(
 
     if world_context:
         lines.append(f"World creation context: {world_context}")
+
+    if additional_context:
+        lines.append(additional_context)
 
     return "\n\n".join(lines)
 

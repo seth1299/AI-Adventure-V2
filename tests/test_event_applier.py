@@ -6,17 +6,65 @@ import unittest
 import sqlite3
 import random
 from pathlib import Path
+from typing import TypeVar
 
+from ai_adventure.calendar_system import build_calendar_snapshot
 from ai_adventure.events.event_applier import EventApplier
 from ai_adventure.persistence.save_repository import SaveRepository
+
+
+ValueT = TypeVar("ValueT")
+
+
+def _require(value: ValueT | None) -> ValueT:
+    """Narrows an optional repository lookup for a test assertion."""
+
+    assert value is not None
+    return value
 
 
 class _FixedRollRng:
     def __init__(self, roll: int) -> None:
         self.roll = roll
 
-    def randint(self, lower: int, upper: int) -> int:
+    def randint(self, minimum: int, maximum: int, /) -> int:
         return self.roll
+
+
+def _test_container_metadata(
+    *,
+    locked: bool = False,
+    trapped: bool = False,
+) -> dict[str, object]:
+    return {
+        "item_type": "Container",
+        "container": {
+            "is_open": False,
+            "contents_taken": False,
+            "is_locked": locked,
+            "lockpick_skill": "Lockpicking",
+            "lockpick_dc": 16 if locked else 0,
+            "lockpick_failure_consequence": "The pick snaps.",
+            "is_trapped": trapped,
+            "trap_notice_skill": "Perception",
+            "trap_notice_dc": 12 if trapped else 0,
+            "trap_disarm_skill": "Sleight of Hand",
+            "trap_disarm_dc": 15 if trapped else 0,
+            "trap_failure_consequence": "A poisoned needle strikes.",
+            "contents": {
+                "currency_base_units": 35,
+                "items": [
+                    {
+                        "name": "Tarnished Silver Locket",
+                        "category": "Valuable",
+                        "quantity": 1,
+                        "description": "A locket with a worn clasp.",
+                        "value_base_units": 12,
+                    }
+                ],
+            },
+        },
+    }
 
 
 class EventApplierTests(unittest.TestCase):
@@ -69,6 +117,179 @@ class EventApplierTests(unittest.TestCase):
                 {item["name"] for item in repository.list_inventory_items()},
             )
 
+    def test_container_contents_require_opening_and_transfer_exactly_once(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = SaveRepository.create_new_save(Path(temp_dir), "Container Test")
+            repository.set_state_value("currency.balance", "5")
+            repository.add_inventory_item(
+                "Stolen Coin Pouch",
+                "Container",
+                1,
+                "A tied leather pouch.",
+                2,
+                metadata=_test_container_metadata(),
+            )
+            applier = EventApplier(repository)
+
+            generic_modify = applier.apply_event(
+                {
+                    "type": "InventoryItemModifiedEvent",
+                    "payload": {
+                        "target_name": "Stolen Coin Pouch",
+                        "new_description": "An opened, empty pouch.",
+                    },
+                }
+            )
+            closed_take = applier.apply_event(
+                {
+                    "type": "ContainerContentsTakenEvent",
+                    "payload": {"container_name": "Stolen Coin Pouch"},
+                }
+            )
+            opened_and_taken = applier.apply_events(
+                [
+                    {
+                        "type": "ContainerOpenedEvent",
+                        "payload": {"container_name": "Stolen Coin Pouch"},
+                    },
+                    {
+                        "type": "ContainerContentsTakenEvent",
+                        "payload": {"container_name": "Stolen Coin Pouch"},
+                    },
+                ]
+            )
+            repeated_take = applier.apply_event(
+                {
+                    "type": "ContainerContentsTakenEvent",
+                    "payload": {"container_name": "Stolen Coin Pouch"},
+                }
+            )
+            items = {
+                item["name"]: item
+                for item in repository.list_inventory_items()
+            }
+            container = items["Stolen Coin Pouch"]["metadata"]["container"]
+
+            self.assertEqual(generic_modify.status, "skipped")
+            self.assertEqual(closed_take.status, "skipped")
+            self.assertEqual(
+                [result.status for result in opened_and_taken],
+                ["applied", "applied"],
+            )
+            self.assertEqual(repeated_take.status, "skipped")
+            self.assertEqual(repository.get_state_value("currency.balance"), "40")
+            self.assertEqual(items["Tarnished Silver Locket"]["quantity"], 1)
+            self.assertTrue(container["is_open"])
+            self.assertTrue(container["contents_taken"])
+
+    def test_locked_trapped_container_uses_stored_check_skills_and_dcs(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = SaveRepository.create_new_save(Path(temp_dir), "Secured Container")
+            repository.add_inventory_item(
+                "Cipher Chest",
+                "Container",
+                1,
+                "A small chest with a complex lock.",
+                20,
+                metadata=_test_container_metadata(locked=True, trapped=True),
+            )
+            repository.upsert_skill("Lockpicking", "Opening locks.", 1)
+            repository.upsert_skill("Sleight of Hand", "Fine manual work.", 1)
+            applier = EventApplier(repository, rng=_FixedRollRng(20))
+
+            missing_checks = applier.apply_event(
+                {
+                    "type": "ContainerOpenedEvent",
+                    "payload": {"container_name": "Cipher Chest"},
+                }
+            )
+            check_results = applier.apply_events(
+                [
+                    {
+                        "type": "SkillCheckRequestedEvent",
+                        "payload": {"skill_name": "Lockpicking", "dc": 16},
+                    },
+                    {
+                        "type": "SkillCheckRequestedEvent",
+                        "payload": {"skill_name": "Sleight of Hand", "dc": 15},
+                    },
+                ]
+            )
+            opened = applier.apply_events(
+                [
+                    {
+                        "type": "ContainerOpenedEvent",
+                        "payload": {"container_name": "Cipher Chest"},
+                    }
+                ],
+                prior_results=check_results,
+            )
+            container = repository.list_inventory_items()[0]["metadata"]["container"]
+
+            self.assertEqual(missing_checks.status, "skipped")
+            self.assertIn("Lockpicking", missing_checks.message)
+            self.assertEqual(opened[0].status, "applied")
+            self.assertTrue(container["is_open"])
+            self.assertFalse(container["is_locked"])
+            self.assertFalse(container["is_trapped"])
+
+    def test_container_batch_rejects_duplicate_direct_rewards(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = SaveRepository.create_new_save(Path(temp_dir), "Duplicate Guard")
+            repository.set_state_value("currency.balance", "0")
+            repository.add_inventory_item(
+                "Coin Pouch",
+                "Container",
+                1,
+                "An open pouch.",
+                2,
+                metadata={
+                    **_test_container_metadata(),
+                    "container": {
+                        **_test_container_metadata()["container"],
+                        "is_open": True,
+                    },
+                },
+            )
+
+            results = EventApplier(repository).apply_events(
+                [
+                    {
+                        "type": "ContainerContentsTakenEvent",
+                        "payload": {"container_name": "Coin Pouch"},
+                    },
+                    {
+                        "type": "CurrencyChangedEvent",
+                        "payload": {"base_unit_amount": 35},
+                    },
+                    {
+                        "type": "InventoryItemAddedEvent",
+                        "payload": {
+                            "item_type": "Valuable",
+                            "item_name": "Tarnished Silver Locket",
+                            "description": "An accidental duplicate.",
+                            "amount": 1,
+                            "value_base_units": 12,
+                        },
+                    },
+                ]
+            )
+            items = repository.list_inventory_items()
+
+            self.assertEqual(
+                [result.status for result in results],
+                ["applied", "skipped", "skipped"],
+            )
+            self.assertEqual(repository.get_state_value("currency.balance"), "35")
+            self.assertEqual(
+                sum(
+                    item["quantity"]
+                    for item in items
+                    if item["name"] == "Tarnished Silver Locket"
+                ),
+                1,
+            )
+
     def test_combat_started_event_persists_combat_state(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             repository = SaveRepository.create_new_save(Path(temp_dir), "Combat Event Test")
@@ -99,6 +320,15 @@ class EventApplierTests(unittest.TestCase):
                                     "name": "Bandit",
                                     "health": 7,
                                     "armor_rating": 12,
+                                    "to_hit_bonus": 3,
+                                    "initiative_bonus": 4,
+                                    "personality": "aggressive",
+                                    "weapon_name": "Rusty Knife",
+                                    "ammunition_type_required": "",
+                                    "clip_size": 0,
+                                    "clip_ammo": 0,
+                                    "bullets_per_attack": 0,
+                                    "reserve_ammo": 0,
                                     "damage": "1d6+1",
                                     "loot": ["Rusty Knife", "Copper Ring"],
                                 }
@@ -108,6 +338,15 @@ class EventApplierTests(unittest.TestCase):
                                     "name": "Mira",
                                     "health": 10,
                                     "armor_rating": 11,
+                                    "to_hit_bonus": 2,
+                                    "initiative_bonus": 1,
+                                    "personality": "cautious",
+                                    "weapon_name": "Shortbow",
+                                    "ammunition_type_required": "Arrow",
+                                    "clip_size": 1,
+                                    "clip_ammo": 1,
+                                    "bullets_per_attack": 1,
+                                    "reserve_ammo": 12,
                                     "damage": "1d4",
                                 }
                             ],
@@ -116,9 +355,21 @@ class EventApplierTests(unittest.TestCase):
                 ]
             )
             combat_state = repository.get_combat_state()
-            player = combat_state["combatants"][0]
-            ally = combat_state["combatants"][1]
-            enemy = combat_state["combatants"][2]
+            player = next(
+                combatant
+                for combatant in combat_state["combatants"]
+                if combatant["id"] == "player"
+            )
+            ally = next(
+                combatant
+                for combatant in combat_state["combatants"]
+                if combatant["name"] == "Mira"
+            )
+            enemy = next(
+                combatant
+                for combatant in combat_state["combatants"]
+                if combatant["name"] == "Bandit"
+            )
 
             self.assertEqual(results[0].status, "applied")
             self.assertTrue(combat_state["active"])
@@ -128,21 +379,59 @@ class EventApplierTests(unittest.TestCase):
             self.assertEqual(player["current_health"], 18)
             self.assertEqual(player["max_health"], 24)
             self.assertEqual(player["damage"], "1d8")
+            self.assertEqual(player["to_hit_bonus"], 2)
             self.assertEqual(ally["name"], "Mira")
             self.assertEqual(ally["team"], "party")
+            self.assertEqual(ally["to_hit_bonus"], 2)
             self.assertEqual(enemy["name"], "Bandit")
             self.assertEqual(enemy["team"], "enemy")
             self.assertEqual(enemy["current_health"], 7)
             self.assertEqual(enemy["armor_rating"], 12)
+            self.assertEqual(enemy["to_hit_bonus"], 3)
+            self.assertEqual(enemy["initiative_bonus"], 4)
+            self.assertEqual(enemy["personality"], "aggressive")
+            self.assertGreater(enemy["threat_level"], 0)
             self.assertEqual(enemy["damage"], "1d6+1")
             self.assertEqual(enemy["loot"], ["Rusty Knife", "Copper Ring"])
-            self.assertEqual(combat_state["log"], ["Two bandits draw blades."])
+            self.assertEqual(combat_state["log"][0], "Two bandits draw blades.")
+            self.assertIn("Initiative order:", combat_state["log"][1])
+            self.assertTrue(
+                all(
+                    1 <= combatant["initiative_roll"] <= 20
+                    for combatant in combat_state["combatants"]
+                )
+            )
 
             skipped = EventApplier(repository).apply_event(
                 {"type": "CombatStartedEvent", "payload": {"enemy_name": "Second Bandit"}}
             )
 
             self.assertEqual(skipped.status, "skipped")
+
+    def test_player_equipment_updates_inventory_equipped_flag(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = SaveRepository.create_new_save(
+                Path(temp_dir),
+                "Inventory Equipment Flag Test",
+            )
+
+            repository.set_player_equipment({"Main Hand": "Iron Dagger"})
+            dagger = next(
+                item
+                for item in repository.list_inventory_items()
+                if item["name"] == "Iron Dagger"
+            )
+
+            self.assertTrue(dagger["equipped"])
+
+            repository.set_player_equipment({})
+            dagger = next(
+                item
+                for item in repository.list_inventory_items()
+                if item["name"] == "Iron Dagger"
+            )
+
+            self.assertFalse(dagger["equipped"])
 
     def test_applies_status_flag_and_currency_events(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -173,7 +462,15 @@ class EventApplierTests(unittest.TestCase):
 
             self.assertEqual(snapshot["location"], "Old Road")
             self.assertEqual(snapshot["weather"], "Rain")
-            self.assertEqual(snapshot["elapsed_minutes"], "495")
+            self.assertNotIn("elapsed_minutes", snapshot)
+            self.assertEqual(repository.get_current_calendar_minute(), 495)
+            self.assertEqual(
+                snapshot["time"],
+                build_calendar_snapshot(
+                    495,
+                    repository.get_calendar_settings(),
+                )["display_label"],
+            )
             self.assertEqual(snapshot["flag.met_gate_guard"], "True")
             self.assertEqual(snapshot["currency.balance"], "25")
 
@@ -252,13 +549,13 @@ class EventApplierTests(unittest.TestCase):
             fern_items = [item for item in items if item["name"] == "Silver-Spire Fern"]
             self.assertEqual(len(fern_items), 1)
             self.assertEqual(fern_items[0]["quantity"], 4)
+            self.assertFalse(fern_items[0]["equipped"])
             self.assertEqual(fern_items[0]["value_base_units"], 8)
 
     def test_failed_skill_check_blocks_following_reward_events(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             repository = SaveRepository.create_new_save(Path(temp_dir), "Gate Test")
             repository.upsert_skill("Foraging", "Finding useful materials.", 1)
-
             results = EventApplier(repository, rng=random.Random(2)).apply_events(
                 [
                     {
@@ -465,18 +762,21 @@ class EventApplierTests(unittest.TestCase):
             self.assertEqual(len(fern_items), 1)
             self.assertEqual(fern_items[0]["quantity"], 4)
 
-    def test_location_changed_event_stores_short_broad_location_name(self) -> None:
+    def test_status_updated_event_stores_short_broad_location_name(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             repository = SaveRepository.create_new_save(Path(temp_dir), "Location Test")
 
             EventApplier(repository).apply_event(
                 {
-                    "type": "LocationChangedEvent",
+                    "type": "StatusUpdatedEvent",
                     "payload": {
                         "location": (
                             "Y/N's Office, high up near the penthouse, overlooking "
                             "the Hudson River"
-                        )
+                        ),
+                        "minutes_passed": "AUTO",
+                        "weather": "AUTO",
+                        "discover_location": True,
                     },
                 }
             )
@@ -485,6 +785,50 @@ class EventApplierTests(unittest.TestCase):
                 repository.get_state_snapshot()["location"],
                 "Y/N's Office",
             )
+
+    def test_location_upserted_and_travel_mode_events_store_travel_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = SaveRepository.create_new_save(Path(temp_dir), "Travel Event Test")
+            results = EventApplier(repository).apply_events(
+                [
+                    {
+                        "type": "LocationUpsertedEvent",
+                        "payload": {
+                            "name": "Old Road",
+                            "description": "A well-marked road beyond the city gate.",
+                            "x_miles": 3,
+                            "y_miles": 4,
+                            "terrain": "Packed dirt",
+                            "travel_multiplier": 0.8,
+                            "travel_notes": "Patrolled at dusk.",
+                        },
+                    },
+                    {
+                        "type": "TravelModeChangedEvent",
+                        "payload": {"mode": "Horse and Buggy", "speed_multiplier": 1.8},
+                    },
+                ]
+            )
+
+            self.assertEqual([result.status for result in results], ["applied", "applied"])
+            location = _require(repository.find_travel_location("Old Road"))
+            self.assertEqual(location["terrain"], "Packed dirt")
+            self.assertEqual((location["x_miles"], location["y_miles"]), (3.0, 4.0))
+            self.assertEqual(repository.get_travel_profile()["travel_mode"], "Horse and Buggy")
+            self.assertEqual(repository.get_travel_profile()["speed_multiplier"], 1.8)
+
+    def test_travel_mode_event_requires_speed_multiplier(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = SaveRepository.create_new_save(Path(temp_dir), "Travel Mode Test")
+            result = EventApplier(repository).apply_event(
+                {
+                    "type": "TravelModeChangedEvent",
+                    "payload": {"mode": "Horse and Buggy"},
+                }
+            )
+
+            self.assertEqual(result.status, "skipped")
+            self.assertIn("speed multiplier", result.message.casefold())
 
     def test_applies_music_changed_event(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -529,28 +873,28 @@ class EventApplierTests(unittest.TestCase):
             self.assertEqual(repository.get_setting("audio.current_music"), "Boss_Fight.mp3")
             self.assertEqual(visible_npcs[0]["display_name"], "Bartender")
 
-    def test_world_lore_events_update_player_lore_store(self) -> None:
+    def test_world_lore_upsert_event_replaces_player_lore(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             repository = SaveRepository.create_new_save(Path(temp_dir), "Lore Test")
 
             results = EventApplier(repository).apply_events(
                 [
                     {
-                        "type": "WorldLoreAddedEvent",
+                        "type": "WorldLoreUpsertedEvent",
                         "payload": {
-                            "section": "Locations",
-                            "key": "The Gilded Tankard",
-                            "text": "The Gilded Tankard is a smoky tavern in Amberfell.",
+                            "section": "Factions",
+                            "key": "The Gilded Compact",
+                            "text": "The Gilded Compact controls the river tolls.",
                         },
                     },
                     {
-                        "type": "WorldLoreChangedEvent",
+                        "type": "WorldLoreUpsertedEvent",
                         "payload": {
-                            "section": "Locations",
-                            "key": "The Gilded Tankard",
-                            "replacement_lore": (
-                                "The Gilded Tankard is a smoky tavern in Amberfell "
-                                "known for discreet contract work."
+                            "section": "Factions",
+                            "key": "The Gilded Compact",
+                            "text": (
+                                "The Gilded Compact controls the river tolls and "
+                                "licenses trusted merchants."
                             ),
                         },
                     }
@@ -559,8 +903,8 @@ class EventApplierTests(unittest.TestCase):
 
             self.assertEqual([result.status for result in results], ["applied", "applied"])
             self.assertEqual(
-                repository.get_world_lore()["Locations"]["The Gilded Tankard"],
-                "The Gilded Tankard is a smoky tavern in Amberfell known for discreet contract work.",
+                repository.get_world_lore()["Factions"]["The Gilded Compact"],
+                "The Gilded Compact controls the river tolls and licenses trusted merchants.",
             )
 
     def test_event_payloads_sanitize_banned_creative_terms_before_storage(self) -> None:
@@ -579,9 +923,9 @@ class EventApplierTests(unittest.TestCase):
                             },
                         },
                         {
-                            "type": "WorldLoreAddedEvent",
+                            "type": "WorldLoreUpsertedEvent",
                             "payload": {
-                                "section": "Locations",
+                                "section": "Factions",
                                 "key": "New Aethelgard",
                                 "text": "New Aethelgard is a crowded city.",
                             },
@@ -759,7 +1103,55 @@ class EventApplierTests(unittest.TestCase):
             self.assertNotIn("knowledge_scope", visible_npcs[0])
             self.assertNotIn("updated_at", visible_npcs[0])
 
-    def test_applies_active_task_and_quest_events(self) -> None:
+    def test_upserts_private_gm_secrets_and_hides_inactive_records(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = SaveRepository.create_new_save(Path(temp_dir), "Secret Test")
+            applier = EventApplier(repository)
+
+            created = applier.apply_event(
+                {
+                    "type": "SecretUpsertedEvent",
+                    "payload": {
+                        "secret_id": "station_master_is_villain",
+                        "title": "Station Master's Identity",
+                        "details": "The station master directs the canal murders.",
+                        "reveal_condition": "The player deciphers the black ledger.",
+                        "related_npc_ids": ["station_master"],
+                        "related_locations": ["Rainmarket Station"],
+                        "status": "active",
+                    },
+                }
+            )
+            active_secrets = repository.list_gm_secrets(active_only=True)
+
+            self.assertEqual(created.status, "applied")
+            self.assertEqual(len(active_secrets), 1)
+            self.assertEqual(
+                active_secrets[0]["details"],
+                "The station master directs the canal murders.",
+            )
+            self.assertEqual(active_secrets[0]["related_npc_ids"], ["station_master"])
+
+            revealed = applier.apply_event(
+                {
+                    "type": "SecretUpsertedEvent",
+                    "payload": {
+                        "secret_id": "station_master_is_villain",
+                        "title": "Station Master's Identity",
+                        "details": "The station master directs the canal murders.",
+                        "reveal_condition": "The player deciphers the black ledger.",
+                        "related_npc_ids": ["station_master"],
+                        "related_locations": ["Rainmarket Station"],
+                        "status": "revealed",
+                    },
+                }
+            )
+
+            self.assertEqual(revealed.status, "applied")
+            self.assertEqual(repository.list_gm_secrets(active_only=True), [])
+            self.assertEqual(repository.list_gm_secrets()[0]["status"], "revealed")
+
+    def test_applies_active_task_events_including_quests(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             repository = SaveRepository.create_new_save(Path(temp_dir), "Task Test")
             repository.set_calendar_settings({"time_display": "12_hour"})
@@ -767,12 +1159,14 @@ class EventApplierTests(unittest.TestCase):
             results = EventApplier(repository).apply_events(
                 [
                     {
-                        "type": "QuestAddedEvent",
+                        "type": "ActiveTaskUpsertedEvent",
                         "payload": {
                             "name": "Find the Missing Ledger",
-                            "giver": "Mira Coppercup",
+                            "category": "Quest",
+                            "status": "Active",
+                            "requester": "Mira Coppercup",
                             "description": "Recover the missing tavern ledger.",
-                            "turn_in": "Tavern",
+                            "location": "Tavern",
                             "reward": "Free room and board.",
                         },
                     },
@@ -799,7 +1193,9 @@ class EventApplierTests(unittest.TestCase):
             self.assertIn("Find the Missing Ledger", task_names)
             self.assertIn("Silver Ring Commission", task_names)
 
-            ledger_task = repository.get_active_task("Find the Missing Ledger")
+            ledger_task = _require(
+                repository.get_active_task("Find the Missing Ledger")
+            )
             self.assertIsNotNone(ledger_task)
             self.assertEqual(ledger_task["category"], "Quest")
             self.assertEqual(ledger_task["requester"], "Mira Coppercup")
@@ -807,8 +1203,14 @@ class EventApplierTests(unittest.TestCase):
             self.assertEqual(ledger_task["reward"], "Free room and board.")
             self.assertEqual(ledger_task["due_date"], "N/A")
             self.assertEqual(ledger_task["due_elapsed_minutes"], -1)
+            self.assertEqual(
+                repository.get_state_value("quest.Find the Missing Ledger.status"),
+                "active",
+            )
 
-            commission_task = repository.get_active_task("Silver Ring Commission")
+            commission_task = _require(
+                repository.get_active_task("Silver Ring Commission")
+            )
             self.assertIsNotNone(commission_task)
             self.assertEqual(
                 commission_task["due_date"],
@@ -832,16 +1234,30 @@ class EventApplierTests(unittest.TestCase):
                 {task["name"] for task in repository.list_active_tasks()},
             )
 
-            completed_task = repository.get_active_task("Silver Ring Commission")
+            completed_task = _require(
+                repository.get_active_task("Silver Ring Commission")
+            )
             self.assertIsNotNone(completed_task)
             self.assertEqual(completed_task["status"], "Completed")
             self.assertEqual(completed_task["notes"], "The ring was collected.")
+
+            quest_complete_result = EventApplier(repository).apply_event(
+                {
+                    "type": "ActiveTaskCompletedEvent",
+                    "payload": {"name": "Find the Missing Ledger"},
+                }
+            )
+            self.assertEqual(quest_complete_result.status, "applied")
+            self.assertEqual(
+                repository.get_state_value("quest.Find the Missing Ledger.status"),
+                "completed",
+            )
 
     def test_active_task_vague_due_date_is_stored_as_exact_elapsed_minute(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             repository = SaveRepository.create_new_save(Path(temp_dir), "Task Due Date")
             repository.set_calendar_settings({"time_display": "12_hour"})
-            repository.set_state_value("elapsed_minutes", str(8 * 60))
+            repository.set_current_calendar_minute(8 * 60)
 
             result = EventApplier(repository).apply_event(
                 {
@@ -859,7 +1275,7 @@ class EventApplierTests(unittest.TestCase):
                 }
             )
 
-            task = repository.get_active_task("Deliver the Samples")
+            task = _require(repository.get_active_task("Deliver the Samples"))
 
             self.assertEqual(result.status, "applied")
             self.assertIsNotNone(task)
@@ -876,7 +1292,9 @@ class EventApplierTests(unittest.TestCase):
                     "time_display": "24_hour",
                 }
             )
-            refreshed_task = repository.get_active_task("Deliver the Samples")
+            refreshed_task = _require(
+                repository.get_active_task("Deliver the Samples")
+            )
 
             self.assertEqual(
                 refreshed_task["due_elapsed_minutes"],
@@ -900,10 +1318,16 @@ class EventApplierTests(unittest.TestCase):
                 }
             )
 
-            task = repository.get_active_task("Craft spare lockpicks")
+            task = _require(repository.get_active_task("Craft spare lockpicks"))
 
             self.assertEqual(result.status, "applied")
             self.assertIsNotNone(task)
+            self.assertEqual(task["category"], "Personal Goal")
+            self.assertEqual(task["status"], "Active")
+            self.assertEqual(
+                task["description"],
+                "Create more lockpicks for future work.",
+            )
             self.assertEqual(task["requester"], "Self")
             self.assertEqual(task["location"], "Player's Workshop")
             self.assertEqual(task["reward"], "N/A")
@@ -925,7 +1349,7 @@ class EventApplierTests(unittest.TestCase):
 
             result = EventApplier(repository).apply_event(
                 {
-                    "type": "ActiveTaskUpdatedEvent",
+                    "type": "ActiveTaskUpsertedEvent",
                     "payload": {
                         "name": "Collect the Samples",
                         "description": "Collect river mud samples and label each jar.",
@@ -933,10 +1357,16 @@ class EventApplierTests(unittest.TestCase):
                 }
             )
 
-            task = repository.get_active_task("Collect the Samples")
+            task = _require(repository.get_active_task("Collect the Samples"))
 
             self.assertEqual(result.status, "applied")
             self.assertIsNotNone(task)
+            self.assertEqual(task["category"], "Research")
+            self.assertEqual(task["status"], "Active")
+            self.assertEqual(
+                task["description"],
+                "Collect river mud samples and label each jar.",
+            )
             self.assertEqual(task["requester"], "Self")
             self.assertEqual(task["location"], "Riverbank")
             self.assertEqual(task["reward"], "N/A")

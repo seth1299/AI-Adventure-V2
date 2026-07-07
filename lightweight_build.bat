@@ -18,6 +18,11 @@ if not exist "%ENTRYPOINT%" (
     exit /b 1
 )
 
+if not exist ".env" (
+    echo ERROR: Missing required .env file.
+    exit /b 1
+)
+
 if not exist "%APP_ICON%" (
     echo ERROR: Missing application icon: "%APP_ICON%"
     exit /b 1
@@ -37,11 +42,23 @@ if defined PYTHON_USER_SITE if exist "%PYTHON_USER_SITE%" (
     )
 )
 
+"%PYTHON%" -m pip install --user --disable-pip-version-check --no-input --quiet -r requirements.txt
+if errorlevel 1 (
+    echo ERROR: Failed to install requirements.txt.
+    exit /b 1
+)
+
 "%PYTHON%" -m PyInstaller --log-level ERROR --noconfirm --noconsole --onefile --clean --windowed --name "%APP_NAME%" --add-data "ai_adventure\data\context;ai_adventure\data\context" --add-data "ai_adventure\data\alchemy;ai_adventure\data\alchemy" --add-data "%APP_ICON%;ai_adventure\data" --add-data "ai_adventure\audio\music_tracks;ai_adventure\audio\music_tracks" --icon "%APP_ICON%" --runtime-hook "%LIGHTWEIGHT_RUNTIME_HOOK%" --exclude-module "ai_adventure.audio.tts" --exclude-module "ai_adventure.audio.tts.tts_manager" --exclude-module "kokoro_onnx" --exclude-module "pykokoro" --exclude-module "onnxruntime" --exclude-module "soundfile" --exclude-module "edge_tts" --exclude-module "piper" --exclude-module "piper_tts" --exclude-module "pyttsx3" --exclude-module "espeakng_loader" --exclude-module "phonemizer" --exclude-module "language_tags" --hidden-import "google.genai" --hidden-import "PySide6.QtCore" --hidden-import "PySide6.QtGui" --hidden-import "PySide6.QtWidgets" "%ENTRYPOINT%"
 
 if errorlevel 1 (
     echo.
     echo Lightweight build failed.
+    exit /b 1
+)
+
+"%PYTHON%" -m ai_adventure.app.build_support
+if errorlevel 1 (
+    echo ERROR: Failed to copy .env to dist.
     exit /b 1
 )
 

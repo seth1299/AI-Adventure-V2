@@ -4,7 +4,7 @@ import logging
 import random
 import re
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Protocol
 
 from ai_adventure.calendar_system import (
     DEFAULT_START_ELAPSED_MINUTES,
@@ -26,13 +26,18 @@ from ai_adventure.context.creative_guardrails import (
 from ai_adventure.combat import (
     DEFAULT_BASE_ARMOR_RATING,
     DEFAULT_PLAYER_MAX_HEALTH,
+    attack_bonus_from_skills,
     armor_rating_from_equipment,
+    equipped_weapon_attack_skill,
+    equipped_weapon_combat_profile,
     equipped_weapon_damage,
     normalize_damage_expression,
+    normalize_item_metadata,
+    roll_combat_initiative,
 )
 from ai_adventure.currency import format_currency_amount
 from ai_adventure.locations import clean_player_location_name
-from ai_adventure.persistence.save_repository import SaveRepository
+from ai_adventure.persistence.save_repository import GM_SECRET_STATUSES, SaveRepository
 from ai_adventure.skills.rules import bonus_for_level, dc_for_difficulty
 
 
@@ -40,10 +45,11 @@ LOGGER = logging.getLogger(__name__)
 _SKILL_CHECK_GATED_EVENT_TYPES = {
     "ActiveTaskCompletedEvent",
     "CurrencyChangedEvent",
+    "ContainerContentsTakenEvent",
+    "ContainerOpenedEvent",
     "InventoryItemAddedEvent",
     "InventoryItemModifiedEvent",
     "ItemAddedEvent",
-    "QuestCompletedEvent",
     "ReagentDiscoveredEvent",
     "RecipeDiscoveredEvent",
     "SkillXpAddedEvent",
@@ -54,6 +60,14 @@ _BAD_LUCK_MIN_HISTORY = 5
 _BAD_LUCK_LOW_ROLL_MAX = 10
 _BAD_LUCK_LOW_ROLL_RATIO = 0.70
 _BAD_LUCK_MAX_NUDGE = 3
+
+
+class RandomNumberGenerator(Protocol):
+    """Minimal random interface needed to resolve a skill check."""
+
+    def randint(self, minimum: int, maximum: int, /) -> int:
+        """Returns an integer within the inclusive range."""
+        return random.randint(minimum, maximum)
 
 
 @dataclass(frozen=True)
@@ -69,7 +83,11 @@ class AppliedEventResult:
 class EventApplier:
     """Applies validated AI-suggested events to the save repository."""
 
-    def __init__(self, repository: SaveRepository, rng: random.Random | None = None) -> None:
+    def __init__(
+        self,
+        repository: SaveRepository,
+        rng: RandomNumberGenerator | None = None,
+    ) -> None:
         """
         Args:
             repository: Active save repository.
@@ -99,11 +117,28 @@ class EventApplier:
 
         results: list[AppliedEventResult] = []
         blocking_failure = _blocking_skill_check_failure(prior_results or [])
+        protects_container_contents = any(
+            _raw_event_protects_container_contents(raw_event)
+            for raw_event in raw_events
+        )
 
         for raw_event in raw_events:
             event_type, payload = normalize_event(raw_event)
 
-            if (
+            if protects_container_contents and _is_direct_container_reward(
+                event_type,
+                payload,
+            ):
+                result = AppliedEventResult(
+                    event_type,
+                    "skipped",
+                    (
+                        "Skipped direct reward because container contents must "
+                        "transfer only through ContainerContentsTakenEvent."
+                    ),
+                    payload,
+                )
+            elif (
                 blocking_failure is not None
                 and event_type in _SKILL_CHECK_GATED_EVENT_TYPES
             ):
@@ -117,7 +152,10 @@ class EventApplier:
                     payload,
                 )
             else:
-                result = self.apply_event({"type": event_type, "payload": payload})
+                result = self.apply_event(
+                    {"type": event_type, "payload": payload},
+                    skill_check_results=[*(prior_results or []), *results],
+                )
 
             if (
                 result.event_type == "SkillCheckRequestedEvent"
@@ -136,7 +174,12 @@ class EventApplier:
 
         return results
 
-    def apply_event(self, raw_event: dict[str, Any]) -> AppliedEventResult:
+    def apply_event(
+        self,
+        raw_event: dict[str, Any],
+        *,
+        skill_check_results: list[AppliedEventResult] | None = None,
+    ) -> AppliedEventResult:
         """
         Applies one raw event dictionary.
 
@@ -159,6 +202,16 @@ class EventApplier:
             if event_type == "InventoryItemModifiedEvent":
                 return self._apply_inventory_item_modified(event_type, payload)
 
+            if event_type == "ContainerOpenedEvent":
+                return self._apply_container_opened(
+                    event_type,
+                    payload,
+                    skill_check_results or [],
+                )
+
+            if event_type == "ContainerContentsTakenEvent":
+                return self._apply_container_contents_taken(event_type, payload)
+
             if event_type == "CombatStartedEvent":
                 return self._apply_combat_started(event_type, payload)
 
@@ -171,8 +224,14 @@ class EventApplier:
             if event_type == "SkillCheckRequestedEvent":
                 return self._apply_skill_check_requested(event_type, payload)
 
-            if event_type in {"StatusUpdatedEvent", "LocationChangedEvent"}:
+            if event_type == "StatusUpdatedEvent":
                 return self._apply_status_updated(event_type, payload)
+
+            if event_type == "LocationUpsertedEvent":
+                return self._apply_location_upserted(event_type, payload)
+
+            if event_type == "TravelModeChangedEvent":
+                return self._apply_travel_mode_changed(event_type, payload)
 
             if event_type == "FlagSetEvent":
                 return self._apply_flag_set(event_type, payload)
@@ -183,26 +242,16 @@ class EventApplier:
             if event_type == "ReagentDiscoveredEvent":
                 return self._apply_reagent_discovered(event_type, payload)
 
-            if event_type == "PlayerNoteAddedEvent":
-                return self._apply_player_note_added(event_type, payload)
-
             if event_type == "CurrencyChangedEvent":
                 return self._apply_currency_changed(event_type, payload)
 
             if event_type == "CurrencyDefinedEvent":
                 return self._apply_currency_defined(event_type, payload)
 
-            if event_type in {
-                "WorldLoreAddedEvent",
-                "WorldLoreChangedEvent",
-                "WorldLoreUpdatedEvent",
-            }:
+            if event_type == "WorldLoreUpsertedEvent":
                 return self._apply_world_lore_event(event_type, payload)
 
-            if event_type in {"QuestAddedEvent", "QuestCompletedEvent"}:
-                return self._apply_quest_event(event_type, payload)
-
-            if event_type in {"ActiveTaskUpsertedEvent", "ActiveTaskUpdatedEvent"}:
+            if event_type == "ActiveTaskUpsertedEvent":
                 return self._apply_active_task_upserted(event_type, payload)
 
             if event_type == "ActiveTaskCompletedEvent":
@@ -216,6 +265,9 @@ class EventApplier:
 
             if event_type == "NpcKnowledgeAddedEvent":
                 return self._apply_npc_knowledge_added(event_type, payload)
+
+            if event_type == "SecretUpsertedEvent":
+                return self._apply_secret_upserted(event_type, payload)
 
             if event_type == "MusicChangedEvent":
                 return self._apply_music_changed(event_type, payload)
@@ -303,6 +355,17 @@ class EventApplier:
         if not target_name:
             return _invalid(event_type, payload, "Inventory target name is required.")
 
+        if _find_inventory_container(self.repository, target_name) is not None:
+            return _invalid(
+                event_type,
+                payload,
+                (
+                    "Container state cannot be changed with "
+                    "InventoryItemModifiedEvent; use ContainerOpenedEvent or "
+                    "ContainerContentsTakenEvent."
+                ),
+            )
+
         quantity = _optional_int(payload, "new_amount", "quantity", "new_quantity")
         value_base_units = _optional_int(
             payload,
@@ -327,6 +390,227 @@ class EventApplier:
             "applied",
             f"Modified inventory item: {target_name}.",
             payload,
+        )
+
+    def _apply_container_opened(
+        self,
+        event_type: str,
+        payload: dict[str, Any],
+        skill_check_results: list[AppliedEventResult],
+    ) -> AppliedEventResult:
+        """Opens a container only after its stored requirements are satisfied."""
+
+        container_name = _first_text(payload, "container_name", "item_name", "name")
+
+        if not container_name:
+            return _invalid(event_type, payload, "Container name is required.")
+
+        item = _find_inventory_container(self.repository, container_name)
+
+        if item is None:
+            return _invalid(
+                event_type,
+                payload,
+                f"Container is not in inventory: {container_name}.",
+            )
+
+        metadata = dict(item.get("metadata", {}))
+        container = dict(metadata.get("container", {}))
+
+        if container.get("is_open") is True:
+            return AppliedEventResult(
+                event_type,
+                "skipped",
+                f"{item['name']} is already open.",
+                payload,
+            )
+
+        if container.get("is_locked") is True:
+            required_skill = str(container.get("lockpick_skill", "Lockpicking"))
+            required_dc = max(1, _safe_int(container.get("lockpick_dc"), default=10) or 10)
+
+            if not _has_successful_skill_check(
+                skill_check_results,
+                skill_name=required_skill,
+                minimum_total=required_dc,
+            ):
+                consequence = str(
+                    container.get("lockpick_failure_consequence", "") or ""
+                ).strip()
+                return _invalid(
+                    event_type,
+                    payload,
+                    (
+                        f"{item['name']} remains locked; opening it requires a "
+                        f"successful {required_skill} check against DC {required_dc}."
+                        + (f" Failure consequence: {consequence}" if consequence else "")
+                    ),
+                )
+
+            container["is_locked"] = False
+
+        if container.get("is_trapped") is True:
+            required_skill = str(
+                container.get("trap_disarm_skill", "Sleight of Hand")
+            )
+            required_dc = max(
+                1,
+                _safe_int(container.get("trap_disarm_dc"), default=10) or 10,
+            )
+
+            if not _has_successful_skill_check(
+                skill_check_results,
+                skill_name=required_skill,
+                minimum_total=required_dc,
+            ):
+                consequence = str(
+                    container.get("trap_failure_consequence", "") or ""
+                ).strip()
+                return _invalid(
+                    event_type,
+                    payload,
+                    (
+                        f"{item['name']} remains trapped; opening it requires a "
+                        f"successful {required_skill} check against DC {required_dc}."
+                        + (f" Failure consequence: {consequence}" if consequence else "")
+                    ),
+                )
+
+            container["is_trapped"] = False
+
+        container["is_open"] = True
+        metadata["container"] = container
+        self.repository.modify_inventory_item(
+            target_name=str(item["name"]),
+            metadata=metadata,
+        )
+        return AppliedEventResult(
+            event_type,
+            "applied",
+            f"Opened container: {item['name']}.",
+            {**payload, "container_name": item["name"]},
+        )
+
+    def _apply_container_contents_taken(
+        self,
+        event_type: str,
+        payload: dict[str, Any],
+    ) -> AppliedEventResult:
+        """Transfers an open container's stored contents exactly once."""
+
+        container_name = _first_text(payload, "container_name", "item_name", "name")
+
+        if not container_name:
+            return _invalid(event_type, payload, "Container name is required.")
+
+        item = _find_inventory_container(self.repository, container_name)
+
+        if item is None:
+            return _invalid(
+                event_type,
+                payload,
+                f"Container is not in inventory: {container_name}.",
+            )
+
+        metadata = dict(item.get("metadata", {}))
+        container = dict(metadata.get("container", {}))
+
+        if container.get("is_open") is not True:
+            return _invalid(
+                event_type,
+                payload,
+                f"{item['name']} must be opened before its contents can be taken.",
+            )
+
+        if container.get("contents_taken") is True:
+            return AppliedEventResult(
+                event_type,
+                "skipped",
+                f"The contents of {item['name']} were already taken.",
+                payload,
+            )
+
+        contents = dict(container.get("contents", {}))
+        currency_amount = max(
+            0,
+            _safe_int(contents.get("currency_base_units"), default=0) or 0,
+        )
+        transferred_items: list[dict[str, Any]] = []
+
+        if currency_amount:
+            current_balance = _safe_int(
+                self.repository.get_state_value("currency.balance", "0"),
+                default=0,
+            ) or 0
+            self.repository.set_state_value(
+                "currency.balance",
+                str(current_balance + currency_amount),
+            )
+
+        for raw_item in contents.get("items", []):
+            if not isinstance(raw_item, dict):
+                continue
+
+            name = str(raw_item.get("name", "") or "").strip()
+
+            if not name:
+                continue
+
+            category = str(raw_item.get("category", "Item") or "Item").strip()
+            description = str(raw_item.get("description", "") or "").strip()
+            quantity = max(
+                1,
+                _safe_int(raw_item.get("quantity"), default=1) or 1,
+            )
+            value_base_units = max(
+                0,
+                _safe_int(raw_item.get("value_base_units"), default=0) or 0,
+            )
+            item_metadata = normalize_item_metadata(
+                raw_item.get("metadata", raw_item),
+                name=name,
+                category=category,
+                description=description,
+            )
+            self.repository.add_inventory_item(
+                name=name,
+                category=category,
+                quantity=quantity,
+                description=description,
+                value_base_units=value_base_units,
+                metadata=item_metadata,
+            )
+            transferred_items.append(
+                {
+                    "name": name,
+                    "category": category,
+                    "quantity": quantity,
+                    "description": description,
+                    "value_base_units": value_base_units,
+                    "metadata": item_metadata,
+                }
+            )
+
+        container["contents_taken"] = True
+        metadata["container"] = container
+        self.repository.modify_inventory_item(
+            target_name=str(item["name"]),
+            metadata=metadata,
+        )
+        return AppliedEventResult(
+            event_type,
+            "applied",
+            (
+                f"Transferred the stored contents of {item['name']}: "
+                f"{currency_amount} base currency unit(s) and "
+                f"{len(transferred_items)} item record(s)."
+            ),
+            {
+                **payload,
+                "container_name": item["name"],
+                "currency_base_units": currency_amount,
+                "items": transferred_items,
+            },
         )
 
     def _apply_combat_started(
@@ -359,6 +643,24 @@ class EventApplier:
                             "enemy_armor_rating",
                             "armor_rating",
                         ),
+                        "to_hit_bonus": _first_int(
+                            payload,
+                            0,
+                            "enemy_to_hit_bonus",
+                            "to_hit_bonus",
+                        ),
+                        "initiative_bonus": _first_int(
+                            payload,
+                            0,
+                            "enemy_initiative_bonus",
+                            "initiative_bonus",
+                        ),
+                        "personality": _first_text(
+                            payload,
+                            "enemy_personality",
+                            "personality",
+                        )
+                        or "balanced",
                         "damage": _first_text(payload, "enemy_damage", "damage") or "1d6",
                         "loot": payload.get("loot", []),
                     },
@@ -370,6 +672,24 @@ class EventApplier:
         allies = _combatants_from_payload(payload.get("allies", []), team="party", start_index=2)
         inventory_items = self.repository.list_inventory_items()
         equipment = self.repository.get_player_equipment()
+        attack_skill = equipped_weapon_attack_skill(equipment, inventory_items)
+        weapon_profile = equipped_weapon_combat_profile(
+            equipment,
+            inventory_items,
+        )
+        stored_clips = self.repository.get_setting(
+            "player.weapon_clip_ammo",
+            {},
+        )
+        weapon_name_key = str(
+            weapon_profile.get("weapon_name", "")
+        ).casefold()
+        clip_size = int(weapon_profile.get("clip_size", 0))
+        stored_clip_ammo = (
+            _safe_int(stored_clips.get(weapon_name_key), default=clip_size)
+            if isinstance(stored_clips, dict) and weapon_name_key
+            else clip_size
+        )
         player_health_max = _safe_positive_int(
             self.repository.get_setting("player.health_max", DEFAULT_PLAYER_MAX_HEALTH),
             DEFAULT_PLAYER_MAX_HEALTH,
@@ -395,18 +715,47 @@ class EventApplier:
                 inventory_items,
                 base_armor_rating=DEFAULT_BASE_ARMOR_RATING,
             ),
+            "to_hit_bonus": attack_bonus_from_skills(
+                attack_skill,
+                self.repository.list_skills(),
+            ),
+            "initiative_bonus": _safe_int(
+                self.repository.get_setting("player.initiative_bonus", 0),
+                default=0,
+            )
+            or 0,
+            "personality": "balanced",
+            **weapon_profile,
+            "clip_ammo": max(
+                0,
+                min(clip_size, stored_clip_ammo or 0),
+            ),
+            "reserve_ammo": 0,
             "damage": equipped_weapon_damage(equipment, inventory_items),
             "status_effects": [],
             "loot": [],
             "defeated": player_health_current <= 0,
         }
+        combatants = roll_combat_initiative(
+            [player, *allies, *enemies],
+            rng=self.rng,
+        )
         combat_state = {
             "active": True,
             "round": 1,
             "turn_index": 0,
-            "combatants": [player, *allies, *enemies],
+            "combatants": combatants,
             "log": [
                 str(payload.get("description", "") or "Combat begins.").strip(),
+                "Initiative order: "
+                + ", ".join(
+                    (
+                        f"{combatant.get('display_name', combatant['name'])} "
+                        f"({combatant['initiative_total']})"
+                    )
+                    for combatant in combatants
+                )
+                + ".",
             ],
         }
         self.repository.set_combat_state(combat_state)
@@ -561,35 +910,119 @@ class EventApplier:
         event_type: str,
         payload: dict[str, Any],
     ) -> AppliedEventResult:
-        """Applies StatusUpdatedEvent or LocationChangedEvent."""
+        """Applies StatusUpdatedEvent."""
 
         location = _first_text(payload, "location", "new_location")
         weather = _first_text(payload, "weather")
         minutes_passed = _optional_int(payload, "minutes_passed", "minutes", "time")
 
         if location and location.upper() not in {"AUTO", "SAME", "SKIP"}:
-            self.repository.set_state_value("location", clean_player_location_name(location))
+            clean_location = clean_player_location_name(location)
+            self.repository.set_state_value("location", clean_location)
+
+            if payload.get("discover_location") is True:
+                self.repository.upsert_travel_location({"name": clean_location})
 
         if weather and weather.upper() not in {"AUTO", "SAME", "SKIP"}:
             self.repository.set_state_value("weather", weather)
 
         if minutes_passed is not None and minutes_passed >= 0:
-            current_total = _safe_int(
-                self.repository.get_state_value(
-                    "elapsed_minutes",
-                    str(DEFAULT_START_ELAPSED_MINUTES),
-                ),
-                default=DEFAULT_START_ELAPSED_MINUTES,
-            ) or DEFAULT_START_ELAPSED_MINUTES
+            current_total = self.repository.get_current_calendar_minute()
+            new_total = current_total + minutes_passed
+            self.repository.set_current_calendar_minute(new_total)
+            calendar_snapshot = build_calendar_snapshot(
+                new_total,
+                self.repository.get_calendar_settings(),
+            )
             self.repository.set_state_value(
-                "elapsed_minutes",
-                str(current_total + minutes_passed),
+                "time",
+                str(calendar_snapshot["display_label"]),
             )
 
         return AppliedEventResult(
             event_type,
             "applied",
             "Updated status fields.",
+            payload,
+        )
+
+    def _apply_location_upserted(
+        self,
+        event_type: str,
+        payload: dict[str, Any],
+    ) -> AppliedEventResult:
+        """Stores one player-known, map-aware location for the Travel screen."""
+
+        name = _first_text(payload, "name", "location", "location_name")
+        has_x = "x_miles" in payload or "x" in payload
+        has_y = "y_miles" in payload or "y" in payload
+
+        if not name:
+            return _invalid(event_type, payload, "Location name is required.")
+
+        if not has_x or not has_y:
+            return _invalid(
+                event_type,
+                payload,
+                "Location map coordinates x_miles and y_miles are required.",
+            )
+
+        location = {
+            "name": name,
+            "description": _first_text(payload, "description", "text", "lore"),
+            "x_miles": payload.get("x_miles", payload.get("x")),
+            "y_miles": payload.get("y_miles", payload.get("y")),
+            "terrain": _first_text(payload, "terrain"),
+            "travel_multiplier": payload.get("travel_multiplier", 1.0),
+            "travel_notes": _first_text(payload, "travel_notes", "route_notes"),
+        }
+
+        if not self.repository.upsert_travel_location(location):
+            return _invalid(event_type, payload, "Location metadata was invalid.")
+
+        self.repository.append_history(
+            "world",
+            f"Recorded travel location: {clean_player_location_name(name)}.",
+        )
+        return AppliedEventResult(
+            event_type,
+            "applied",
+            "Recorded travel location.",
+            payload,
+        )
+
+    def _apply_travel_mode_changed(
+        self,
+        event_type: str,
+        payload: dict[str, Any],
+    ) -> AppliedEventResult:
+        """Updates the hidden speed multiplier for a changed travel arrangement."""
+
+        mode = _first_text(payload, "mode", "travel_mode")
+        raw_speed_multiplier = payload.get("speed_multiplier")
+
+        if raw_speed_multiplier is None:
+            return _invalid(event_type, payload, "Travel speed multiplier is required.")
+
+        try:
+            speed_multiplier = float(raw_speed_multiplier)
+        except (TypeError, ValueError):
+            return _invalid(event_type, payload, "Travel speed multiplier is required.")
+
+        if not 0.1 <= speed_multiplier <= 20.0:
+            return _invalid(
+                event_type,
+                payload,
+                "Travel speed multiplier must be between 0.1 and 20.",
+            )
+
+        if not self.repository.set_travel_mode(mode, speed_multiplier):
+            return _invalid(event_type, payload, "Travel mode is required.")
+
+        return AppliedEventResult(
+            event_type,
+            "applied",
+            f"Updated travel mode to {mode}.",
             payload,
         )
 
@@ -734,21 +1167,6 @@ class EventApplier:
             payload,
         )
 
-    def _apply_player_note_added(
-        self,
-        event_type: str,
-        payload: dict[str, Any],
-    ) -> AppliedEventResult:
-        """Applies PlayerNoteAddedEvent as a history note for now."""
-
-        content = _first_text(payload, "content", "note", "text")
-
-        if not content:
-            return _invalid(event_type, payload, "Player note content is required.")
-
-        self.repository.append_history("note", content)
-        return AppliedEventResult(event_type, "applied", "Added player note.", payload)
-
     def _apply_currency_changed(
         self,
         event_type: str,
@@ -833,102 +1251,27 @@ class EventApplier:
         event_type: str,
         payload: dict[str, Any],
     ) -> AppliedEventResult:
-        """Applies keyed world-lore events."""
+        """Applies one keyed player-facing world-lore upsert."""
 
         section = _first_text(payload, "section")
-        key = _first_text(payload, "key", "anchor", "name", "title")
-        text = _first_text(payload, "text", "replacement_lore", "lore")
+        key = _first_text(payload, "key")
+        text = _first_text(payload, "text")
 
-        if not text:
-            return _invalid(event_type, payload, "World lore text is required.")
+        if not section or not key or not text:
+            return _invalid(event_type, payload, "World lore section, key, and text are required.")
 
-        if event_type in {"WorldLoreChangedEvent", "WorldLoreUpdatedEvent"}:
-            if not key:
-                return _invalid(event_type, payload, "World lore key is required.")
+        self.repository.change_world_lore_entry(section, key, text)
 
-            self.repository.change_world_lore_entry(section or "World", key, text)
-        else:
-            self.repository.add_world_lore_entry(section or "World", key, text)
-
-        label = f"{section}: {key}: {text}" if section and key else f"{section}: {text}" if section else text
+        label = f"{section}: {key}: {text}"
         self.repository.append_history("world", label)
         return AppliedEventResult(event_type, "applied", "Recorded world lore.", payload)
-
-    def _apply_quest_event(
-        self,
-        event_type: str,
-        payload: dict[str, Any],
-    ) -> AppliedEventResult:
-        """Applies quest events as durable active tasks."""
-
-        name = _first_text(payload, "name")
-
-        if not name:
-            return _invalid(event_type, payload, "Quest name is required.")
-
-        if event_type == "QuestCompletedEvent":
-            self.repository.set_state_value(f"quest.{name}.status", "completed")
-            task = self.repository.complete_active_task(
-                name,
-                _first_text(payload, "notes", "resolution", "outcome"),
-            )
-            self.repository.append_history("quest", f"Completed quest: {name}.")
-            if task is None:
-                return AppliedEventResult(
-                    event_type,
-                    "applied",
-                    f"Completed quest flag: {name}.",
-                    payload,
-                )
-            return AppliedEventResult(event_type, "applied", f"Completed quest: {name}.", payload)
-
-        self.repository.set_state_value(f"quest.{name}.status", "active")
-        description = _first_text(payload, "description")
-        existing_task = self.repository.get_active_task(name)
-        due_fields = _active_task_due_fields(
-            self.repository,
-            payload,
-            due_date=_first_text(payload, "due_date", "deadline"),
-        )
-        default_fields = _active_task_defaults(
-            self.repository,
-            name=name,
-            category="Quest",
-            description=description,
-            requester=_first_text(payload, "giver", "quest_giver", "requester"),
-            location=_first_text(payload, "turn_in", "location"),
-            reward=_first_text(payload, "reward"),
-            due_date=due_fields["due_date"],
-            existing_task=existing_task,
-        )
-        self.repository.upsert_active_task(
-            name=name,
-            category="Quest",
-            status="Active",
-            description=description,
-            requester=default_fields["requester"],
-            location=default_fields["location"],
-            reward=default_fields["reward"],
-            due_date=default_fields["due_date"],
-            due_elapsed_minutes=due_fields["due_elapsed_minutes"],
-        )
-        self.repository.append_history(
-            "quest",
-            f"Added quest: {name}. {description}",
-        )
-        return AppliedEventResult(
-            event_type,
-            "applied",
-            f"Added quest: {name}.",
-            {**payload, "name": name, **default_fields},
-        )
 
     def _apply_active_task_upserted(
         self,
         event_type: str,
         payload: dict[str, Any],
     ) -> AppliedEventResult:
-        """Applies ActiveTaskUpsertedEvent or ActiveTaskUpdatedEvent."""
+        """Applies ActiveTaskUpsertedEvent for creates and updates."""
 
         name = _first_text(payload, "name", "title", "task_name")
 
@@ -936,8 +1279,20 @@ class EventApplier:
             return _invalid(event_type, payload, "Active task name is required.")
 
         existing_task = self.repository.get_active_task(name)
-        category = _first_text(payload, "category", "type") or "Task"
-        description = _first_text(payload, "description", "objective", "summary")
+        category = (
+            _first_text(payload, "category", "type")
+            or str((existing_task or {}).get("category", "")).strip()
+            or "Task"
+        )
+        description = (
+            _first_text(payload, "description", "objective", "summary")
+            or str((existing_task or {}).get("description", "")).strip()
+        )
+        status = (
+            _first_text(payload, "status")
+            or str((existing_task or {}).get("status", "")).strip()
+            or "Active"
+        )
         default_fields = _active_task_defaults(
             self.repository,
             name=name,
@@ -963,7 +1318,7 @@ class EventApplier:
         task = self.repository.upsert_active_task(
             name=name,
             category=category,
-            status=_first_text(payload, "status") or "Active",
+            status=status,
             description=description,
             requester=default_fields["requester"],
             location=default_fields["location"],
@@ -974,6 +1329,9 @@ class EventApplier:
 
         if task is None:
             return _invalid(event_type, payload, "Active task could not be stored.")
+
+        if category.casefold() == "quest":
+            self.repository.set_state_value(f"quest.{name}.status", task["status"].casefold())
 
         return AppliedEventResult(
             event_type,
@@ -1001,6 +1359,9 @@ class EventApplier:
 
         if task is None:
             return _invalid(event_type, payload, f"Active task does not exist: {name}.")
+
+        if str(task.get("category", "")).casefold() == "quest":
+            self.repository.set_state_value(f"quest.{name}.status", "completed")
 
         return AppliedEventResult(
             event_type,
@@ -1041,7 +1402,7 @@ class EventApplier:
             _first_text(payload, "name", "npc_name")
             or internal_name
             or display_name
-            or role
+            or raw_role
             or npc_id
         )
 
@@ -1131,6 +1492,50 @@ class EventApplier:
             {**payload, "npc_id": npc["npc_id"], "facts": facts},
         )
 
+    def _apply_secret_upserted(
+        self,
+        event_type: str,
+        payload: dict[str, Any],
+    ) -> AppliedEventResult:
+        """Applies SecretUpsertedEvent to private database-backed GM memory."""
+
+        title = _first_text(payload, "title", "name")
+        details = _first_text(payload, "details", "hidden_information")
+        status = (_first_text(payload, "status") or "active").casefold()
+
+        if not title:
+            return _invalid(event_type, payload, "Secret title is required.")
+
+        if not details:
+            return _invalid(event_type, payload, "Secret details are required.")
+
+        if status not in GM_SECRET_STATUSES:
+            return _invalid(
+                event_type,
+                payload,
+                "Secret status must be active, revealed, or retired.",
+            )
+
+        secret = self.repository.upsert_gm_secret(
+            secret_id=_first_text(payload, "secret_id", "id"),
+            title=title,
+            details=details,
+            reveal_condition=_first_text(payload, "reveal_condition"),
+            related_npc_ids=_as_string_list(payload.get("related_npc_ids", [])),
+            related_locations=_as_string_list(payload.get("related_locations", [])),
+            status=status,
+        )
+
+        if secret is None:
+            return _invalid(event_type, payload, "Secret could not be stored.")
+
+        return AppliedEventResult(
+            event_type,
+            "applied",
+            f"Stored private GM secret: {secret['title']}.",
+            {**payload, "secret_id": secret["secret_id"], "status": secret["status"]},
+        )
+
 
 def normalize_event(raw_event: dict[str, Any]) -> tuple[str, dict[str, Any]]:
     """
@@ -1201,6 +1606,50 @@ def _event_type_from_raw_event(raw_event: dict[str, Any]) -> str:
             return event_type
 
     return ""
+
+
+def _raw_event_protects_container_contents(raw_event: dict[str, Any]) -> bool:
+    """Returns whether an event batch invokes the authoritative container flow."""
+
+    event_type, payload = normalize_event(raw_event)
+
+    if event_type == "ContainerContentsTakenEvent":
+        return True
+
+    if event_type != "InventoryItemAddedEvent":
+        return False
+
+    container = payload.get("container", {})
+    return (
+        str(payload.get("item_type", "")).strip().casefold() == "container"
+        and isinstance(container, dict)
+        and container.get("is_open") is not True
+    )
+
+
+def _is_direct_container_reward(
+    event_type: str,
+    payload: dict[str, Any],
+) -> bool:
+    """Detects reward events that would duplicate or bypass stored contents."""
+
+    if event_type == "CurrencyChangedEvent":
+        amount = _optional_int(
+            payload,
+            "base_unit_amount",
+            "base_units",
+            "delta_base_units",
+            "amount",
+        )
+        return amount is not None and amount > 0
+
+    return (
+        event_type in {"InventoryItemAddedEvent", "ItemAddedEvent"}
+        and str(payload.get("item_type", payload.get("category", "")))
+        .strip()
+        .casefold()
+        != "container"
+    )
 
 
 def _invalid(
@@ -1284,6 +1733,42 @@ def _combatant_from_payload(
         "current_health": max(0, min(current_health, max_health)),
         "max_health": max_health,
         "armor_rating": _safe_positive_int(raw_combatant.get("armor_rating"), 10),
+        "to_hit_bonus": max(
+            -99,
+            min(99, _safe_int(raw_combatant.get("to_hit_bonus"), default=0) or 0),
+        ),
+        "initiative_bonus": max(
+            -99,
+            min(
+                99,
+                _safe_int(raw_combatant.get("initiative_bonus"), default=0)
+                or 0,
+            ),
+        ),
+        "personality": str(
+            raw_combatant.get("personality", "balanced") or "balanced"
+        ),
+        "weapon_name": str(raw_combatant.get("weapon_name", "") or ""),
+        "ammunition_type_required": str(
+            raw_combatant.get("ammunition_type_required", "") or ""
+        ),
+        "clip_size": max(
+            0,
+            _safe_int(raw_combatant.get("clip_size"), default=0) or 0,
+        ),
+        "clip_ammo": max(
+            0,
+            _safe_int(raw_combatant.get("clip_ammo"), default=0) or 0,
+        ),
+        "bullets_per_attack": max(
+            0,
+            _safe_int(raw_combatant.get("bullets_per_attack"), default=0)
+            or 0,
+        ),
+        "reserve_ammo": max(
+            0,
+            _safe_int(raw_combatant.get("reserve_ammo"), default=0) or 0,
+        ),
         "damage": normalize_damage_expression(raw_combatant.get("damage"), default="1d6"),
         "status_effects": _text_list(raw_combatant.get("status_effects", [])),
         "loot": _text_list(raw_combatant.get("loot", [])),
@@ -1336,6 +1821,48 @@ def _blocking_skill_check_failure(
             return result
 
     return None
+
+
+def _find_inventory_container(
+    repository: SaveRepository,
+    container_name: str,
+) -> dict[str, Any] | None:
+    """Finds a named inventory item carrying canonical container metadata."""
+
+    folded_name = str(container_name or "").strip().casefold()
+
+    for item in repository.list_inventory_items():
+        metadata = item.get("metadata", {})
+
+        if (
+            str(item.get("name", "")).strip().casefold() == folded_name
+            and isinstance(metadata, dict)
+            and str(metadata.get("item_type", "")).casefold() == "container"
+            and isinstance(metadata.get("container"), dict)
+        ):
+            return item
+
+    return None
+
+
+def _has_successful_skill_check(
+    results: list[AppliedEventResult],
+    *,
+    skill_name: str,
+    minimum_total: int,
+) -> bool:
+    """Returns whether this command resolved the required check successfully."""
+
+    folded_skill = str(skill_name or "").strip().casefold()
+
+    return any(
+        result.event_type == "SkillCheckRequestedEvent"
+        and result.status == "applied"
+        and str(result.payload.get("outcome", "")).casefold() == "success"
+        and str(result.payload.get("skill_name", "")).strip().casefold() == folded_skill
+        and (_safe_int(result.payload.get("total"), default=0) or 0) >= minimum_total
+        for result in results
+    )
 
 
 def _bad_luck_roll_nudge(recent_checks: list[dict[str, Any]]) -> int:
@@ -1594,21 +2121,15 @@ def _resolve_due_text_to_elapsed_minutes(
 
     clean_text = due_text.strip()
     folded_text = clean_text.casefold()
-    parsed_current_elapsed = _safe_int(
-        repository.get_state_value(
-            "elapsed_minutes",
-            str(DEFAULT_START_ELAPSED_MINUTES),
-        ),
-        default=DEFAULT_START_ELAPSED_MINUTES,
-    )
-    current_elapsed = max(
+    stored_current_minute = repository.get_current_calendar_minute()
+    current_minute = max(
         0,
-        parsed_current_elapsed
-        if parsed_current_elapsed is not None
+        stored_current_minute
+        if stored_current_minute is not None
         else DEFAULT_START_ELAPSED_MINUTES,
     )
     settings = normalize_calendar_settings(repository.get_calendar_settings())
-    current_day_index = current_elapsed // MINUTES_PER_DAY
+    current_day_index = current_minute // MINUTES_PER_DAY
     days_per_week = int(settings["days_per_week"])
     due_time = _resolve_due_time_of_day_minutes(payload, clean_text)
 

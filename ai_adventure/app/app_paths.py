@@ -4,6 +4,8 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
+from ai_adventure.app.features import is_playtesting_build
+
 
 @dataclass(frozen=True)
 class AppPaths:
@@ -137,10 +139,21 @@ class AppPaths:
 
         app_data_env = os.getenv("APPDATA")
 
+        app_directory_name = (
+            "AI Adventure Playtesting"
+            if is_playtesting_build()
+            else "AI Adventure"
+        )
+
         if app_data_env is not None and app_data_env.strip():
-            app_data_dir = Path(app_data_env) / "AI Adventure"
+            app_data_dir = Path(app_data_env) / app_directory_name
         else:
-            app_data_dir = Path.home() / ".ai_adventure"
+            fallback_directory_name = (
+                ".ai_adventure_playtesting"
+                if is_playtesting_build()
+                else ".ai_adventure"
+            )
+            app_data_dir = Path.home() / fallback_directory_name
 
         saves_dir = app_data_dir / "saves"
         logs_dir = app_data_dir / "logs"

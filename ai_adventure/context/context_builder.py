@@ -7,10 +7,12 @@ from ai_adventure.alchemy.ingredients import (
     CRAFTING_INGREDIENT_CATEGORY_NAMES,
 )
 from ai_adventure.alchemy.rulebook import AlchemyRulebook, AlchemyRulebookLoader
+from ai_adventure.ai.modes import ai_mode_preferences_from_settings
 from ai_adventure.context.creative_ideas import CreativeIdeasLibrary
 from ai_adventure.context.models import ContextLibrary
 from ai_adventure.context.naming import GENERIC_PROPER_NOUN_PLACEHOLDER_RULE
 from ai_adventure.context.reference_loader import ContextReferenceLoader
+from ai_adventure.context.tags import PLANNABLE_CONTEXT_TAGS
 from ai_adventure.combat import normalize_combat_state
 from ai_adventure.currency import format_currency_amount
 from ai_adventure.core.models import AdventureState
@@ -66,6 +68,18 @@ KEYWORD_TAGS: dict[str, set[str]] = {
         "south",
         "travel",
         "west",
+    },
+    "travel": {
+        "buggy",
+        "carriage",
+        "horse",
+        "journey",
+        "march",
+        "ride",
+        "sail",
+        "ship",
+        "travel",
+        "wagon",
     },
     "combat": {
         "attack",
@@ -216,9 +230,11 @@ class AiContextBuilder:
         *,
         player_command: str,
         relevant_npcs: list[dict[str, Any]] | None = None,
+        gm_secrets: list[dict[str, Any]] | None = None,
         valid_music_tracks: list[str] | None = None,
         current_music: str | None = None,
         resolved_skill_checks: list[dict[str, Any]] | None = None,
+        planner_context_tags: list[str] | None = None,
     ) -> dict[str, Any]:
         """
         Builds the context packet for one story turn.
@@ -227,16 +243,24 @@ class AiContextBuilder:
             state: Current composed adventure state.
             player_command: The player's pending command.
             relevant_npcs: NPC memory profiles likely relevant this turn.
+            gm_secrets: Active private GM-memory records for every turn.
             valid_music_tracks: Playable background music filenames.
             current_music: Currently selected background music filename.
             resolved_skill_checks: Skill checks already resolved for this command.
+            planner_context_tags: Validated tags selected by the pre-narration
+                planner. ``None`` falls back to keyword inference.
 
         Returns:
             JSON-serializable context packet.
         """
 
         clean_command = player_command.strip()
-        selected_tags = infer_context_tags(clean_command)
+        selected_tags = (
+            infer_context_tags(clean_command)
+            if planner_context_tags is None
+            else _normalize_planner_context_tags(planner_context_tags)
+        )
+        selected_tags.add("story")
         clean_music_tracks = [
             str(track).strip()
             for track in (valid_music_tracks or [])
@@ -254,6 +278,11 @@ class AiContextBuilder:
             _npc_context_profile(npc)
             for npc in (relevant_npcs or [])
         ]
+        clean_gm_secrets = [
+            _gm_secret_context_record(secret)
+            for secret in (gm_secrets or [])
+            if str(secret.get("status", "active")).strip().casefold() == "active"
+        ]
         journal_share_with_ai = _coerce_bool(
             state.settings.values.get("journal.share_with_ai", False),
             default=False,
@@ -270,6 +299,7 @@ class AiContextBuilder:
                 "style": state.settings.values.get("ai.narration_style", ""),
             }
         )
+        ai_mode_preferences = ai_mode_preferences_from_settings(state.settings.values)
         combat_state = normalize_combat_state(state.settings.values.get("combat.state", {}))
 
         return {
@@ -313,6 +343,34 @@ class AiContextBuilder:
                         "narrative camera, but must still preserve fog of war, "
                         "NPC knowledge boundaries, and hidden state."
                     ),
+                    "model_intelligence": ai_mode_preferences["model_intelligence"],
+                    "model_intelligence_label": ai_mode_preferences[
+                        "model_intelligence_label"
+                    ],
+                    "model_tone": ai_mode_preferences["model_tone"],
+                    "model_tone_label": ai_mode_preferences["model_tone_label"],
+                    "model_tone_instruction": ai_mode_preferences[
+                        "model_tone_instruction"
+                    ],
+                    "response_length": ai_mode_preferences["response_length"],
+                    "response_length_label": ai_mode_preferences[
+                        "response_length_label"
+                    ],
+                    "response_length_instruction": ai_mode_preferences[
+                        "response_length_instruction"
+                    ],
+                    "allowed_content_categories": ai_mode_preferences[
+                        "allowed_content_categories"
+                    ],
+                    "allowed_content_labels": ai_mode_preferences[
+                        "allowed_content_labels"
+                    ],
+                    "blocked_content_labels": ai_mode_preferences[
+                        "blocked_content_labels"
+                    ],
+                    "model_content_rules": ai_mode_preferences[
+                        "model_content_rules"
+                    ],
                     "rules": (
                         "These are player-provided instructions and preferences "
                         "for the AI to remember across turns. Follow them unless "
@@ -335,6 +393,31 @@ class AiContextBuilder:
                     "time": state.calendar.display_label,
                     "weather": state.world.weather,
                     "flags": _compact_mapping(state.world.flags),
+                },
+                "travel": {
+                    "locations": [
+                        {
+                            "name": location.name,
+                            "description": _compact_text(location.description),
+                            "x_miles": location.x_miles,
+                            "y_miles": location.y_miles,
+                            "terrain": _compact_text(location.terrain),
+                            "travel_multiplier": location.travel_multiplier,
+                            "travel_notes": _compact_text(location.travel_notes),
+                        }
+                        for location in state.travel.locations
+                    ],
+                    "movement": {
+                        "base_move_speed_mph": state.travel.move_speed_mph,
+                        "travel_mode": state.travel.travel_mode,
+                        "speed_multiplier": state.travel.speed_multiplier,
+                    },
+                    "rules": (
+                        "This is player-known map information. x_miles and y_miles "
+                        "share a relative map measured in miles. Use "
+                        "LocationUpsertedEvent for newly learned or corrected travel "
+                        "locations, and do not reveal undiscovered routes or secrets."
+                    ),
                 },
                 "world_profile": {
                     "summary": _compact_text(state.settings.values.get("world.summary", "")),
@@ -369,12 +452,21 @@ class AiContextBuilder:
                             "name": item.name,
                             "category": item.category,
                             "quantity": item.quantity,
+                            "equipped": item.equipped,
                             "description": _compact_text(item.description),
                             "value_base_units": item.value_base_units,
                             "metadata": _compact_context_value(item.metadata),
                         }
                         for item in state.inventory.items[:MAX_INVENTORY_CONTEXT_ITEMS]
                     ],
+                    "container_rule": (
+                        "Container metadata is authoritative hidden state. Never "
+                        "reveal or award a closed container's contents. Use "
+                        "ContainerOpenedEvent only after required lock/trap checks "
+                        "succeed, then ContainerContentsTakenEvent only when the "
+                        "player explicitly takes the contents. Python transfers "
+                        "the exact stored currency/items once."
+                    ),
                 },
                 "item_catalog": {
                     "items": [
@@ -430,10 +522,17 @@ class AiContextBuilder:
                         "refunds, change, or other money movement, suggest "
                         "CurrencyChangedEvent with payload.base_unit_amount as "
                         "the one net money change. Never use net_base_unit_amount. "
-                        "For example, buying a 35-base-unit item while paying with "
-                        "one 100-base-unit coin is still base_unit_amount -35; the "
-                        "application displays the remaining 65 base units as the "
-                        "appropriate denominations."
+                        "Currency listed in container metadata is hidden, unowned "
+                        "container contents until the container is open and the "
+                        "player explicitly takes it. Use ContainerContentsTakenEvent "
+                        "instead of CurrencyChangedEvent for that transfer. "
+                        "In player-facing prose, use denomination names and natural "
+                        "breakdowns such as 3 Silver Coins and 5 Copper Coins; do "
+                        "not describe money as base units or as copper coins' worth "
+                        "of a different metal. For example, buying an item whose "
+                        "internal price is 35 while paying with a larger coin is "
+                        "still base_unit_amount -35; the application displays the "
+                        "remaining balance as the appropriate denominations."
                     ),
                 },
                 "combat": {
@@ -446,8 +545,13 @@ class AiContextBuilder:
                     ],
                     "rules": (
                         "When a fight starts, suggest CombatStartedEvent with "
-                        "enemy/allied combatants, health, armor_rating, damage "
-                        "dice, and loot. Do not resolve attacks, turns, damage, "
+                        "enemy/allied combatants, health, armor_rating, "
+                        "to_hit_bonus, initiative_bonus, personality, ammunition/clip "
+                        "fields, damage dice, and loot. The Python combat system "
+                        "rolls initiative, calculates each team's Threat Levels "
+                        "from health, armor, and average damage, and uses those "
+                        "percentages for non-intelligent NPC targeting. Intelligent "
+                        "NPCs target tactically. Do not resolve attacks, turns, damage, "
                         "victory, defeat, or loot in story prose after combat "
                         "starts; the Python Combat tab handles those mechanics."
                     ),
@@ -489,13 +593,15 @@ class AiContextBuilder:
                         "bonus_formula": "level * 2",
                         "levels": "1-5",
                         "uncertain_action_rule": (
-                            "When success, failure, speed, quality, consequences, "
-                            "resource cost, or discovery quality are uncertain, "
-                            "suggest SkillCheckRequestedEvent before narrating a "
-                            "final outcome. This is required for foraging, harvesting, "
-                            "searching, researching, identifying, crafting, alchemy "
-                            "experiments, persuasion, stealth, combat, and any named "
-                            "skill use unless the action is trivial and risk-free. "
+                            "Suggest SkillCheckRequestedEvent before narrating a "
+                            "final outcome only when the current command has "
+                            "meaningful uncertainty, opposition, hidden information, "
+                            "danger, scarcity, time pressure, or consequences. Do "
+                            "not request checks merely because an action could "
+                            "theoretically vary in quality or take extra time. "
+                            "Foraging, harvesting, searching, researching, identifying, "
+                            "crafting, alchemy experiments, persuasion, stealth, and "
+                            "combat need checks only when those real stakes are present. "
                             "Routine movement, paying a known price, receiving "
                             "ordinary goods, eating, drinking, and casual conversation "
                             "are not checks unless the player adds a contested, risky, "
@@ -543,7 +649,8 @@ class AiContextBuilder:
                             "requester, location, due date, or exact due elapsed minute."
                         ),
                         "field_completion_rule": (
-                            "Do not leave visible task fields blank. Use Self for "
+                            "For a new task, do not leave visible fields blank. An "
+                            "update may omit fields that did not change. Use Self for "
                             "personal goals, N/A for no reward or no deadline, and "
                             "a logical player-known location for where the task is "
                             "done, picked up, completed, or turned in. Use Unknown "
@@ -554,9 +661,8 @@ class AiContextBuilder:
                             "time settings."
                         ),
                         "completion_rule": (
-                            "Suggest ActiveTaskCompletedEvent or QuestCompletedEvent "
-                            "when a task is fulfilled, cancelled, resolved, delivered, "
-                            "or otherwise no longer active."
+                            "Suggest ActiveTaskCompletedEvent when a task is fulfilled, "
+                            "cancelled, resolved, delivered, or otherwise no longer active."
                         ),
                     },
                     "tasks": [
@@ -631,6 +737,27 @@ class AiContextBuilder:
                     },
                     "relevant": clean_relevant_npcs,
                 },
+                "gm_secrets": {
+                    "visibility": "AI-only; never display this section to the player.",
+                    "rules": {
+                        "continuity": (
+                            "Treat active records as authoritative hidden truth for "
+                            "mystery logic, clues, NPC behavior, and off-screen plans."
+                        ),
+                        "non_disclosure": (
+                            "Do not quote, summarize, or reveal an active secret in "
+                            "response, suggested_actions, or player-visible event "
+                            "fields until the player discovers it in the fiction."
+                        ),
+                        "updates": (
+                            "Use SecretUpsertedEvent with the same secret_id and a "
+                            "full current record when hidden truth changes. Mark it "
+                            "revealed when the player learns it or retired when it is "
+                            "no longer true or useful."
+                        ),
+                    },
+                    "active": clean_gm_secrets,
+                },
             },
             "rulebooks": self._build_rulebook_context(
                 selected_tags,
@@ -669,8 +796,10 @@ class AiContextBuilder:
                     "when multiple distinct state changes happen in one turn."
                 ),
                 "skill_checks": (
-                    "For uncertain actions, suggest SkillCheckRequestedEvent with "
-                    "skill_name and either dc or difficulty before any outcome event. "
+                    "Suggest SkillCheckRequestedEvent with skill_name and either dc "
+                    "or difficulty only for actions with meaningful uncertainty, "
+                    "opposition, hidden information, danger, resource pressure, time "
+                    "pressure, or consequences in the current scene. "
                     "When state.skills.resolved_checks_this_turn is non-empty, those "
                     "checks are already resolved for the current player command; "
                     "narrate the outcome from those results and do not request "
@@ -708,7 +837,9 @@ class AiContextBuilder:
                 "player_ai_preferences": (
                     "Use state.player_ai_preferences.narration_tense_label and "
                     "state.player_ai_preferences.narration_style_label for the "
-                    "response field. Also use "
+                    "response field. Apply model_tone_instruction, "
+                    "response_length_instruction, and model_content_rules to "
+                    "player-facing prose. Also use "
                     "state.player_ai_preferences.additional_context as persistent "
                     "player-provided guidance for boundaries and miscellaneous "
                     "preferences. This is always AI-facing; Journal notes are only "
@@ -721,15 +852,7 @@ class AiContextBuilder:
                     "not automatically true world facts. When share_with_ai is false, "
                     "ignore Journal notes because they are private."
                 ),
-                "mature_content": (
-                    "Assume the player and player character are adults of legal "
-                    "drinking age unless the character profile explicitly says "
-                    "otherwise. Alcohol, drunken patrons, gambling, violence, blood, "
-                    "corpses, criminality, cruelty, corruption, and fictional "
-                    "oppressive social attitudes are allowed when genre-appropriate. "
-                    "Use fictional in-world slurs only for fictional groups; do not "
-                    "use real-world slurs against protected classes."
-                ),
+                "mature_content": ai_mode_preferences["model_content_rules"],
                 "active_tasks": (
                     "Use state.active_tasks.tasks to remember current quests, "
                     "commissions, custom orders, pending purchases, and other "
@@ -742,8 +865,14 @@ class AiContextBuilder:
                     "Use state.item_catalog.items as the master list of remembered "
                     "item definitions. It preserves descriptions, categories, values, "
                     "and equipment metadata for items even after they leave inventory. "
-                    "Use Weapon metadata for weapon_hands and damage dice. Use Armor "
-                    "metadata for covers_body_parts and armor_rating. Do not treat "
+                    "Use Weapon metadata for weapon_hands, damage dice, attack range, "
+                    "and optional ammunition_type_required, clip_size, and "
+                    "bullets_per_attack. Ammunition items use matching "
+                    "ammunition_type metadata. Use Armor "
+                    "metadata for covers_body_parts and armor_rating. Container "
+                    "metadata preserves exact hidden contents, open/taken state, "
+                    "locks, traps, check skills/DCs, and failure consequences. "
+                    "Do not treat "
                     "catalog entries as possessions unless they also appear in "
                     "state.inventory.items. Recipe ingredients may only use "
                     "catalog items whose category is one of "
@@ -783,6 +912,16 @@ class AiContextBuilder:
                     "internal name for the same role/person at the same location. Use "
                     "one NpcUpsertedEvent per distinct meaningful NPC introduced."
                 ),
+                "secret_memory": (
+                    "Use state.gm_secrets.active as authoritative AI-only hidden "
+                    "truth. Suggest SecretUpsertedEvent to create or replace a "
+                    "durable secret, reusing its stable secret_id. Keep active "
+                    "details out of narration and every player-visible field. Set "
+                    "status to revealed when the player learns the truth and also "
+                    "write the newly player-known fact through the appropriate "
+                    "public NPC, World Lore, Location, task, flag, or other event. "
+                    "Set status to retired when the record is no longer true or useful."
+                ),
                 "currency_transactions": (
                     "The player's money is state.currency.balance, also shown as "
                     "state.currency.balance_base_units, and is stored in "
@@ -791,12 +930,23 @@ class AiContextBuilder:
                     "the item and a CurrencyChangedEvent with payload.base_unit_amount "
                     "as the negative net price. Never use net_base_unit_amount. Do "
                     "not model making change as separate coin items; the application "
-                    "formats the resulting integer balance into coin denominations."
+                    "formats the resulting integer balance into coin denominations. "
+                    "In player-facing prose, use denomination names and natural "
+                    "breakdowns; do not say base units or awkward phrases like "
+                    "copper coins' worth of silver. "
+                    "Currency stored inside a container is not spendable money and "
+                    "must not use CurrencyChangedEvent; Python adds it only when an "
+                    "open container receives ContainerContentsTakenEvent."
                 ),
                 "combat_handoff": (
                     "When a fight begins, suggest CombatStartedEvent with concrete "
-                    "enemy/allied combatants, health, armor_rating, damage dice, and "
-                    "loot. After that, do not resolve attacks, turns, damage, victory, "
+                    "enemy/allied combatants, health, armor_rating, to_hit_bonus, "
+                    "initiative_bonus, personality, complete ammunition/clip fields, "
+                    "damage dice, and loot. Python rolls initiative, calculates "
+                    "team Threat Levels from maximum health, armor rating, and average "
+                    "damage, uses them for non-intelligent NPC targets, and preserves "
+                    "tactical targeting for intelligent NPCs. After that, do not resolve "
+                    "attacks, turns, reloading, damage, victory, "
                     "defeat, or loot in story prose; the Combat tab owns those mechanics."
                 ),
                 "out_of_game": "Boolean. True only for fully out-of-game answers.",
@@ -812,6 +962,8 @@ class AiContextBuilder:
                     "InventoryItemAddedEvent",
                     "InventoryItemRemovedEvent",
                     "InventoryItemModifiedEvent",
+                    "ContainerOpenedEvent",
+                    "ContainerContentsTakenEvent",
                     "CombatStartedEvent",
                     "RecipeDiscoveredEvent",
                     "ReagentDiscoveredEvent",
@@ -819,19 +971,15 @@ class AiContextBuilder:
                     "CurrencyDefinedEvent",
                     "MusicChangedEvent",
                     "FlagSetEvent",
-                    "LocationChangedEvent",
-                    "PlayerNoteAddedEvent",
-                    "WorldLoreAddedEvent",
-                    "WorldLoreChangedEvent",
-                    "WorldLoreUpdatedEvent",
-                    "QuestAddedEvent",
-                    "QuestCompletedEvent",
+                    "LocationUpsertedEvent",
+                    "TravelModeChangedEvent",
+                    "WorldLoreUpsertedEvent",
                     "ActiveTaskUpsertedEvent",
-                    "ActiveTaskUpdatedEvent",
                     "ActiveTaskCompletedEvent",
                     "SpellLearnedEvent",
                     "NpcUpsertedEvent",
                     "NpcKnowledgeAddedEvent",
+                    "SecretUpsertedEvent",
                 ],
             },
         }
@@ -908,6 +1056,16 @@ def infer_context_tags(player_command: str) -> set[str]:
     return tags
 
 
+def _normalize_planner_context_tags(tags: list[str]) -> set[str]:
+    """Keeps only known planner-selected tags before selecting rule sections."""
+
+    return {
+        tag.strip().casefold()
+        for tag in tags
+        if isinstance(tag, str) and tag.strip().casefold() in PLANNABLE_CONTEXT_TAGS
+    }
+
+
 def _npc_context_profile(npc: dict[str, Any]) -> dict[str, Any]:
     """Returns NPC fields that belong in AI memory context."""
 
@@ -927,6 +1085,27 @@ def _npc_context_profile(npc: dict[str, Any]) -> dict[str, Any]:
     return {
         key: _compact_context_value(value)
         for key, value in npc.items()
+        if key in allowed_fields
+    }
+
+
+def _gm_secret_context_record(secret: dict[str, Any]) -> dict[str, Any]:
+    """Returns private secret fields that belong in AI context."""
+
+    allowed_fields = {
+        "secret_id",
+        "title",
+        "details",
+        "reveal_condition",
+        "related_npc_ids",
+        "related_locations",
+        "status",
+        "created_at",
+        "updated_at",
+    }
+    return {
+        key: _compact_context_value(value)
+        for key, value in secret.items()
         if key in allowed_fields
     }
 

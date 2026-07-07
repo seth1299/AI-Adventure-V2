@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from typing import Any
 
 
@@ -13,6 +14,19 @@ DEFAULT_CURRENCY_DENOMINATIONS: list[dict[str, Any]] = [
 FALLBACK_CURRENCY_DENOMINATIONS: list[dict[str, Any]] = [
     {"name": "Coin", "plural_name": "Coins", "value": 1},
 ]
+
+_BASE_UNIT_PHRASE_RE = re.compile(
+    r"\b(?P<amount>\d+)\s*(?:-| )?(?:base|baseline)(?:\s+currency)?\s+units?\b",
+    re.IGNORECASE,
+)
+_MONEY_WORTH_PHRASE_RE = re.compile(
+    r"\b(?P<amount>\d+)\s+"
+    r"(?:(?:copper|silver|gold|platinum)\s+(?:coins?|pieces?)|"
+    r"(?:base|baseline)(?:\s+currency)?\s+units?)"
+    r"(?:'s|’s|'|’)?\s+worth\s+of\s+"
+    r"(?:copper|silver|gold|platinum)\b",
+    re.IGNORECASE,
+)
 
 
 def normalize_currency_denominations(
@@ -117,6 +131,73 @@ def format_currency_amount(
     return sign + _join_currency_parts(parts)
 
 
+def normalize_visible_currency_text(
+    text: str,
+    denominations: list[dict[str, Any]] | None = None,
+) -> str:
+    """Rewrites player-visible base-unit money phrases into denominations."""
+
+    clean_denominations = normalize_currency_denominations(denominations)
+    normalized = str(text or "")
+
+    def replace_amount(match: re.Match[str]) -> str:
+        amount = _safe_int(match.group("amount"), 0)
+        return format_currency_amount(amount, clean_denominations)
+
+    normalized = _MONEY_WORTH_PHRASE_RE.sub(replace_amount, normalized)
+    normalized = _BASE_UNIT_PHRASE_RE.sub(replace_amount, normalized)
+
+    base_denomination = next(
+        (
+            denomination
+            for denomination in clean_denominations
+            if int(denomination.get("value", 0)) == 1
+        ),
+        None,
+    )
+    if base_denomination is None:
+        return normalized
+
+    larger_values = [
+        int(denomination["value"])
+        for denomination in clean_denominations
+        if int(denomination["value"]) > 1
+    ]
+    smallest_larger_value = min(larger_values, default=0)
+    if smallest_larger_value <= 1:
+        return normalized
+
+    base_names = {
+        str(base_denomination.get("name", "")).strip(),
+        str(base_denomination.get("plural_name", "")).strip(),
+    }
+    folded_base_name = str(base_denomination.get("name", "")).casefold()
+    folded_base_plural = str(base_denomination.get("plural_name", "")).casefold()
+    if "copper" in folded_base_name or "copper" in folded_base_plural:
+        base_names.update({"Copper Coin", "Copper Coins", "Copper Piece", "Copper Pieces"})
+
+    escaped_names = sorted(
+        (re.escape(name) for name in base_names if name),
+        key=len,
+        reverse=True,
+    )
+    if not escaped_names:
+        return normalized
+
+    base_coin_re = re.compile(
+        r"\b(?P<amount>\d+)\s+(?P<name>" + "|".join(escaped_names) + r")\b",
+        re.IGNORECASE,
+    )
+
+    def replace_base_coin_amount(match: re.Match[str]) -> str:
+        amount = _safe_int(match.group("amount"), 0)
+        if amount < smallest_larger_value:
+            return match.group(0)
+        return format_currency_amount(amount, clean_denominations)
+
+    return base_coin_re.sub(replace_base_coin_amount, normalized)
+
+
 def _safe_positive_int(value: Any) -> int | None:
     """Converts a value to a positive integer."""
 
@@ -129,6 +210,15 @@ def _safe_positive_int(value: Any) -> int | None:
         return None
 
     return clean_value
+
+
+def _safe_int(value: Any, default: int) -> int:
+    """Converts a value to an integer, returning default on failure."""
+
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def _join_currency_parts(parts: list[str]) -> str:
