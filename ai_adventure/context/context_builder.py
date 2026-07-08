@@ -6,7 +6,6 @@ from ai_adventure.alchemy.ingredients import (
     COMMON_MEASUREMENT_UNITS,
     CRAFTING_INGREDIENT_CATEGORY_NAMES,
 )
-from ai_adventure.alchemy.rulebook import AlchemyRulebook, AlchemyRulebookLoader
 from ai_adventure.ai.modes import ai_mode_preferences_from_settings
 from ai_adventure.context.creative_ideas import CreativeIdeasLibrary
 from ai_adventure.context.models import ContextLibrary
@@ -191,28 +190,22 @@ class AiContextBuilder:
         self,
         library: ContextLibrary,
         *,
-        alchemy_rulebook: AlchemyRulebook | None = None,
         creative_ideas: CreativeIdeasLibrary | None = None,
         max_history_entries: int = 8,
         max_reference_sections: int = 14,
-        max_rulebook_reagents: int = 8,
     ) -> None:
         """
         Args:
             library: Validated reference context library.
-            alchemy_rulebook: Optional structured alchemy rules.
             creative_ideas: Optional creative seed library.
             max_history_entries: Recent history entries to include.
             max_reference_sections: Maximum reference sections to include.
-            max_rulebook_reagents: Maximum example rulebook reagents to include.
         """
 
         self.library = library
-        self.alchemy_rulebook = alchemy_rulebook
         self.creative_ideas = creative_ideas
         self.max_history_entries = max_history_entries
         self.max_reference_sections = max_reference_sections
-        self.max_rulebook_reagents = max_rulebook_reagents
 
     @classmethod
     def from_default_library(cls) -> "AiContextBuilder":
@@ -220,7 +213,6 @@ class AiContextBuilder:
 
         return cls(
             ContextReferenceLoader().load_default_library(),
-            alchemy_rulebook=AlchemyRulebookLoader().load_default_rulebook(),
             creative_ideas=CreativeIdeasLibrary.load_default(),
         )
 
@@ -600,7 +592,7 @@ class AiContextBuilder:
                             "not request checks merely because an action could "
                             "theoretically vary in quality or take extra time. "
                             "Foraging, harvesting, searching, researching, identifying, "
-                            "crafting, alchemy experiments, persuasion, stealth, and "
+                            "crafting experiments, persuasion, stealth, and "
                             "combat need checks only when those real stakes are present. "
                             "Routine movement, paying a known price, receiving "
                             "ordinary goods, eating, drinking, and casual conversation "
@@ -708,7 +700,9 @@ class AiContextBuilder:
                             "NpcUpsertedEvent with internal name, player-visible "
                             "display_name, internal role, location, public "
                             "description, player-facing information, knowledge_scope, "
-                            "and known_facts. role is for AI memory and should not "
+                            "and known_facts. public description should include identifying "
+                            "information about the NPC that the Player would know, such as "
+                            "the NPC's gender or age. role is for AI memory and should not "
                             "replace player_facing_information. location should be "
                             "a meaningful player-known place, usually the current "
                             "scene location, and should not be blank. Do not add "
@@ -759,10 +753,7 @@ class AiContextBuilder:
                     "active": clean_gm_secrets,
                 },
             },
-            "rulebooks": self._build_rulebook_context(
-                selected_tags,
-                player_command=clean_command,
-            ),
+            "rulebooks": {},
             "creative_ideas": self._build_creative_ideas_context(selected_tags),
             "recent_history": [
                 _history_entry_context(entry)
@@ -886,7 +877,7 @@ class AiContextBuilder:
                 "creative_ideas": (
                     "Treat creative_ideas as the preferred source of style seeds "
                     "when the current turn calls for names, locations, cultures, "
-                    "food, drinks, magic, alchemy ingredients, species, or similar "
+                    "food, drinks, magic, crafting ingredients, species, or similar "
                     "invented details. Prefer the provided examples or close "
                     "stylistic relatives over generic training-data fantasy "
                     "defaults. The banned_terms list is a hard exclusion list, "
@@ -984,24 +975,6 @@ class AiContextBuilder:
                 ],
             },
         }
-
-    def _build_rulebook_context(
-        self,
-        selected_tags: set[str],
-        *,
-        player_command: str,
-    ) -> dict[str, Any]:
-        """Builds relevant rulebook context sections."""
-
-        rulebooks: dict[str, Any] = {}
-
-        if "alchemy" in selected_tags and self.alchemy_rulebook is not None:
-            rulebooks["alchemy"] = self.alchemy_rulebook.to_context_summary(
-                player_command=player_command,
-                max_reagents=self.max_rulebook_reagents,
-            )
-
-        return rulebooks
 
     def _build_creative_ideas_context(self, selected_tags: set[str]) -> dict[str, Any]:
         """Builds creative idea context for relevant story turns."""

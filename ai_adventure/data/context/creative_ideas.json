@@ -668,10 +668,11 @@
       ]
     },
     {
-      "id": "alchemy_ingredients",
-      "title": "Alchemy Ingredients",
+      "id": "crafting_ingredients",
+      "title": "Crafting Ingredients",
       "tags": [
         "alchemy",
+        "crafting",
         "reagent",
         "inventory"
       ],

@@ -1,2 +1,2 @@
-"""Alchemy rulebook and discovery helpers."""
+"""Crafting discovery and recipe helpers."""
 

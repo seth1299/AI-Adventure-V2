@@ -73,9 +73,9 @@
       }
     },
     {
-      "id": "alchemy.default_guidance",
+      "id": "crafting.default_guidance",
       "title": "Crafting Guidance",
-      "category": "alchemy",
+      "category": "crafting",
       "tags": ["alchemy", "crafting"],
       "priority": 75,
       "content": {
@@ -98,7 +98,7 @@
       "content": {
         "guidelines": [
           "Suggest SkillCheckRequestedEvent before narrating a final outcome only when the current command has meaningful uncertainty, opposition, hidden information, danger, scarcity, time pressure, or consequences.",
-          "Do not request a check merely because an action could theoretically vary in quality or take extra time. Foraging, harvesting, searching, researching, identifying, crafting, alchemy experiments, persuasion, stealth, and combat need checks only when real stakes are present.",
+          "Do not request a check merely because an action could theoretically vary in quality or take extra time. Foraging, harvesting, searching, researching, identifying, crafting experiments, persuasion, stealth, and combat need checks only when real stakes are present.",
           "When a scene becomes an actual fight, suggest CombatStartedEvent with enemy/allied combatants, health, armor_rating, to_hit_bonus, initiative_bonus, personality, complete ammunition/clip fields, damage dice, and loot. Then let Python roll initiative, calculate each team's Threat Levels from maximum health, armor rating, and average damage, use those percentages for non-intelligent NPC targeting, preserve tactical targeting for intelligent NPCs, and resolve attacks, reloading, damage, victory, defeat, and loot.",
           "Any weapon given to the player must feel mechanically worthwhile: its average damage must be strictly higher than the player's unarmed base damage of 1d4. Do not create player weapons with damage of 1d4 or anything weaker; use at least 1d6 for ordinary one-handed weapons and at least 1d10 for ordinary two-handed weapons unless a stronger fitting expression is appropriate.",
           "Routine movement, paying a known price, receiving ordinary goods, eating, drinking, and casual conversation are not skill checks unless the player adds a contested, risky, hidden, time-sensitive, or deceptive goal.",

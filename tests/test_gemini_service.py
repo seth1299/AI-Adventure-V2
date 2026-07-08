@@ -1351,6 +1351,18 @@ class GeminiServiceTests(unittest.TestCase):
         )
         self.assertIn("gm_secrets", NEW_GAME_RESPONSE_JSON_SCHEMA["properties"])
         self.assertIn("gm_secrets", NEW_GAME_RESPONSE_JSON_SCHEMA["required"])
+        self.assertIn("known_crafting_items", NEW_GAME_RESPONSE_JSON_SCHEMA["properties"])
+        self.assertIn("known_crafting_recipes", NEW_GAME_RESPONSE_JSON_SCHEMA["properties"])
+        self.assertIn("known_crafting_items", NEW_GAME_RESPONSE_JSON_SCHEMA["required"])
+        self.assertIn("known_crafting_recipes", NEW_GAME_RESPONSE_JSON_SCHEMA["required"])
+        self.assertNotIn(
+            "maxItems",
+            NEW_GAME_RESPONSE_JSON_SCHEMA["properties"]["known_crafting_items"],
+        )
+        self.assertNotIn(
+            "maxItems",
+            NEW_GAME_RESPONSE_JSON_SCHEMA["properties"]["known_crafting_recipes"],
+        )
         self.assertIs(
             NEW_GAME_RESPONSE_JSON_SCHEMA["properties"]["events"]["items"],
             NEW_GAME_EVENT_RESPONSE_SCHEMA,
@@ -1548,6 +1560,8 @@ class GeminiServiceTests(unittest.TestCase):
                         }
                         for index in range(5)
                     ],
+                    "known_crafting_items": [],
+                    "known_crafting_recipes": [],
                     "currency_denominations": [
                         {"name": "Credit", "plural_name": "Credits", "value": 1}
                     ],
@@ -1680,6 +1694,8 @@ class GeminiServiceTests(unittest.TestCase):
                         }
                         for index in range(5)
                     ],
+                    "known_crafting_items": [],
+                    "known_crafting_recipes": [],
                     "currency_denominations": [
                         {"name": "Credit", "plural_name": "Credits", "value": 1}
                     ],
@@ -2235,9 +2251,13 @@ class GeminiServiceTests(unittest.TestCase):
         self.assertIn("setup.narration.tense_label", prompt)
         self.assertIn("setup.narration.style_label", prompt)
         self.assertIn("Limited styles", prompt)
+        self.assertIn("Do not fall back to second-person wording", prompt)
+        self.assertIn("third-person styles should use the player character's name", prompt)
         self.assertIn("light Markdown", prompt)
         self.assertIn("world_summary", prompt)
         self.assertIn("locations must be a player-known array", prompt)
+        self.assertIn("starting location may be the only known location", prompt)
+        self.assertIn("even six or more", prompt)
         self.assertIn("introductory_message may use", prompt)
         self.assertIn("setup.starting_task.mode", prompt)
         self.assertIn("ActiveTaskUpsertedEvent", prompt)
@@ -2365,6 +2385,43 @@ class GeminiServiceTests(unittest.TestCase):
                         "source_index": 4,
                     },
                 ],
+                "known_crafting_items": [
+                    {
+                        "name": "Moonwater",
+                        "category": "Material",
+                        "description": "Water exposed to moonlight for dream work.",
+                        "location": "Prepared under moonlight.",
+                        "uses": ["sleep draughts", "gentle washes"],
+                    },
+                    {
+                        "name": "Canal Salt",
+                        "category": "Reagent",
+                        "description": "Mineral salt from old lock gates.",
+                        "location": "Rainmarket lockhouses.",
+                        "uses": ["clarifying tinctures"],
+                    },
+                ],
+                "known_crafting_recipes": [
+                    {
+                        "name": "Mistglass Tincture",
+                        "ingredients": [
+                            {
+                                "reagent_name": "Moonwater",
+                                "quantity": 1,
+                                "measure_amount": 100,
+                                "measure_unit": "mL",
+                            },
+                            {
+                                "reagent_name": "Canal Salt",
+                                "quantity": 1,
+                                "measure_amount": 1,
+                                "measure_unit": "pinch",
+                            },
+                        ],
+                        "result": "Reveals faint hidden script.",
+                        "notes": "Useful for ledger work.",
+                    }
+                ],
                 "currency_denominations": [
                     {"name": "Bit", "plural_name": "Bits", "value": 1},
                     {"name": "Crown", "plural_name": "Crowns", "value": 12},
@@ -2426,6 +2483,11 @@ class GeminiServiceTests(unittest.TestCase):
         )
         self.assertIn("every institution being coin-themed", prompt)
         self.assertIn("MusicChangedEvent", prompt)
+        self.assertIn("setup.starting_npcs", prompt)
+        self.assertIn("start with no known NPCs", prompt)
+        self.assertIn("Do not parse NPCs out of ordinary setup prose", prompt)
+        self.assertIn("payload.public_description", prompt)
+        self.assertNotIn("the captain, the engineer, and the weapons expert", prompt)
         self.assertIn("top-level gm_secrets array", prompt)
         self.assertIn("GM-only starting truths", prompt)
         self.assertNotIn("gm_secrets array with status", prompt)
@@ -2438,7 +2500,11 @@ class GeminiServiceTests(unittest.TestCase):
         self.assertIn("invent enough additional concrete items", prompt)
         self.assertIn("Do not return starter weapons with damage of 1d4", prompt)
         self.assertIn("at least 1d6 for ordinary one-handed weapons", prompt)
+        self.assertIn("keep its mechanical fields instead of downgrading", prompt)
         self.assertNotIn("starter_inventory_contract is present it defines", prompt)
+        self.assertIn("known_crafting_items and known_crafting_recipes", prompt)
+        self.assertIn("not physical inventory", prompt)
+        self.assertIn("alchemist, cook, engineer", prompt)
         self.assertEqual(
             NEW_GAME_RESPONSE_JSON_SCHEMA["properties"]["starting_items"]["minItems"],
             5,
@@ -2488,6 +2554,8 @@ class GeminiServiceTests(unittest.TestCase):
         self.assertIn("setup.calendar.ai_generated", prompt)
         self.assertIn("invent calendar_settings", prompt)
         self.assertIn("Do not copy the default Gregorian calendar", prompt)
+        self.assertIn("generic fantasy/artisan defaults", prompt)
+        self.assertIn("not hearth, market, lantern", prompt)
         self.assertIn("January-through-December", prompt)
         self.assertIn("Month 1/Month 2 placeholder", prompt)
         self.assertIn("do not use event_type", prompt)
@@ -2513,6 +2581,13 @@ class GeminiServiceTests(unittest.TestCase):
         self.assertEqual(result.finalized_starter_items[0]["name"], "Case Notebook")
         self.assertEqual(result.finalized_starter_items[0]["value_base_units"], 4)
         self.assertEqual(result.finalized_starter_items[0]["source_index"], 0)
+        self.assertEqual(result.known_crafting_items[0]["name"], "Moonwater")
+        self.assertEqual(result.known_crafting_items[1]["category"], "Reagent")
+        self.assertEqual(result.known_crafting_recipes[0]["name"], "Mistglass Tincture")
+        self.assertEqual(
+            result.known_crafting_recipes[0]["ingredients"][0]["measure_unit"],
+            "mL",
+        )
         self.assertEqual(result.finalized_currency_denominations[1]["name"], "Crown")
         self.assertEqual(result.finalized_currency_denominations[2]["value"], 37)
         self.assertEqual(
@@ -2541,6 +2616,8 @@ class GeminiServiceTests(unittest.TestCase):
                 },
                 "skills": [],
                 "starting_items": [],
+                "known_crafting_items": [],
+                "known_crafting_recipes": [],
                 "currency_denominations": [{"name": "Copper", "plural_name": "Coppers", "value": 1}],
                 "currency_description": "Copper coins.",
                 "starting_currency_balance_base_units": 4,
@@ -2617,6 +2694,8 @@ class GeminiServiceTests(unittest.TestCase):
                         "source_index": 4,
                     },
                 ],
+                "known_crafting_items": [],
+                "known_crafting_recipes": [],
                 "currency_denominations": [
                     {"name": "Credit", "plural_name": "Credits", "value": 1}
                 ],
@@ -2709,6 +2788,8 @@ class GeminiServiceTests(unittest.TestCase):
                         "source_index": -1,
                     },
                 ],
+                "known_crafting_items": [],
+                "known_crafting_recipes": [],
                 "currency_denominations": [
                     {"name": "Credit", "plural_name": "Credits", "value": 1}
                 ],
@@ -2776,6 +2857,8 @@ class GeminiServiceTests(unittest.TestCase):
                     }
                     for index in range(12)
                 ],
+                "known_crafting_items": [],
+                "known_crafting_recipes": [],
                 "currency_denominations": [
                     {"name": "Credit", "plural_name": "Credits", "value": 1}
                 ],

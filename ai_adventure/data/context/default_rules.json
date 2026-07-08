@@ -293,7 +293,7 @@
         "rules": [
           "Suggest SkillCheckRequestedEvent only when the current command has meaningful stakes: uncertainty, opposition, hidden information, danger, resource pressure, time pressure, or consequences.",
           "Do not request a check merely because an action could theoretically vary in quality or take extra time.",
-          "Foraging, harvesting, searching, researching, identifying, crafting, alchemy experiments, persuasion, stealth, and combat need checks only when real stakes are present.",
+          "Foraging, harvesting, searching, researching, identifying, crafting experiments, persuasion, stealth, and combat need checks only when real stakes are present.",
           "Do not request checks for routine movement, paying a known price, receiving ordinary goods, eating, drinking, or casual conversation unless the player adds a contested, risky, hidden, time-sensitive, or deceptive goal.",
           "Prefer SkillCheckRequestedEvent over SkillXpAddedEvent when the player is attempting a risky or uncertain action.",
           "Do not narrate found items, harvested resources, crafted products, persuaded NPC outcomes, stealth results, combat results, or research conclusions as final success until after the Python application resolves the check.",
@@ -670,7 +670,7 @@
         ],
         "purpose": "Saves a discovered useful item/material for the Crafting tab.",
         "rules": [
-          "Suggest ReagentDiscoveredEvent when the player learns that a plant, mineral, fluid, creature part, tool part, salvage, foodstuff, or other material is useful for crafting, repair, cooking, medicine, alchemy, or other practical preparation.",
+          "Suggest ReagentDiscoveredEvent when the player learns that a plant, mineral, fluid, creature part, tool part, salvage, foodstuff, or other material is useful for crafting, repair, cooking, medicine, or other practical preparation.",
           "Do not use name-only item/material payloads. Include description, location, and uses.",
           "`Description` should briefly explain what the item or material is.",
           "`Location` should describe where the item or material is found.",

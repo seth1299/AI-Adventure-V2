@@ -366,7 +366,7 @@ class ContextBuilderTests(unittest.TestCase):
         self.assertIn("gm.safety_and_crime_narration", section_ids)
         self.assertIn("response.structured_story_turn", section_ids)
         self.assertIn("inventory.default_guidance", section_ids)
-        self.assertIn("alchemy.default_guidance", section_ids)
+        self.assertIn("crafting.default_guidance", section_ids)
         self.assertIn("skills.default_guidance", section_ids)
         self.assertIn("event.add", section_ids)
         self.assertIn("event.secret_memory", section_ids)
@@ -433,7 +433,7 @@ class ContextBuilderTests(unittest.TestCase):
         self.assertNotIn("legacy_tag", packet_json)
         self.assertNotIn("do_not_emit_legacy_tag", packet_json)
         self.assertIn(
-            "alchemy_ingredients",
+            "crafting_ingredients",
             {category["id"] for category in packet["creative_ideas"]["categories"]},
         )
         self.assertIn("npc_memory", packet["response_contract"])

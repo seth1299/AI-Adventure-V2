@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import shutil
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -68,6 +69,10 @@ class SaveSummary:
 
 class DuplicateSaveTitleError(ValueError):
     """Raised when a new save title already exists."""
+
+
+class SaveFileOperationError(ValueError):
+    """Raised when a save file operation cannot be performed safely."""
 
 
 class SaveRepository:
@@ -284,6 +289,7 @@ class SaveRepository:
                 quantity=int(item["quantity"]),
                 description=item["description"],
                 value_base_units=int(item["value_base_units"]),
+                metadata=item,
             )
 
         for skill in clean_setup["skills"]:
@@ -336,15 +342,80 @@ class SaveRepository:
     def save_title_exists(cls, saves_dir: Path, title: str) -> bool:
         """Returns True when a save already uses this player-facing title."""
 
+        return cls._save_title_exists(saves_dir, title)
+
+    @classmethod
+    def rename_save(cls, saves_dir: Path, db_path: Path, new_title: str) -> None:
+        """Renames an existing save's player-facing title."""
+
+        save_dir = cls._save_dir_for_db_path(saves_dir, db_path)
+        clean_title = new_title.strip() or "New Adventure"
+        resolved_db_path = save_dir / cls.DATABASE_NAME
+
+        if cls._save_title_exists(
+            saves_dir,
+            clean_title,
+            exclude_db_path=resolved_db_path,
+        ):
+            raise DuplicateSaveTitleError(
+                f"A save named '{clean_title}' already exists."
+            )
+
+        repository = cls(resolved_db_path)
+        repository.set_meta("title", clean_title)
+
+    @classmethod
+    def delete_save(cls, saves_dir: Path, db_path: Path) -> None:
+        """Deletes one save directory after validating it belongs to saves_dir."""
+
+        save_dir = cls._save_dir_for_db_path(saves_dir, db_path)
+        shutil.rmtree(save_dir)
+
+    @classmethod
+    def _save_title_exists(
+        cls,
+        saves_dir: Path,
+        title: str,
+        *,
+        exclude_db_path: Path | None = None,
+    ) -> bool:
+        """Returns True when another save already uses this title."""
+
         clean_title = _normalize_save_title(title)
 
         if not clean_title:
             clean_title = _normalize_save_title("New Adventure")
 
+        resolved_excluded = exclude_db_path.resolve() if exclude_db_path is not None else None
+
         return any(
             _normalize_save_title(summary.title) == clean_title
+            and (
+                resolved_excluded is None
+                or summary.db_path.resolve() != resolved_excluded
+            )
             for summary in cls.list_saves(saves_dir)
         )
+
+    @classmethod
+    def _save_dir_for_db_path(cls, saves_dir: Path, db_path: Path) -> Path:
+        """Returns the validated save directory for db_path."""
+
+        resolved_saves_dir = saves_dir.resolve()
+        resolved_db_path = db_path.resolve()
+
+        if resolved_db_path.name != cls.DATABASE_NAME:
+            raise SaveFileOperationError("Selected path is not an adventure save database.")
+
+        save_dir = resolved_db_path.parent
+
+        if save_dir.parent != resolved_saves_dir:
+            raise SaveFileOperationError("Selected save is not inside the configured saves directory.")
+
+        if not resolved_db_path.exists():
+            raise SaveFileOperationError("Selected save no longer exists.")
+
+        return save_dir
 
     @classmethod
     def _raise_for_duplicate_save_title(cls, saves_dir: Path, title: str) -> None:

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 
 CONTEXT_TAG_DESCRIPTIONS: dict[str, str] = {
-    "alchemy": "potions, mixtures, reagents, and alchemical experiments",
+    "alchemy": "potions, mixtures, reagents, recipes, and crafting experiments",
     "character": "character-specific background, class, profession, and identity boundaries",
     "combat": "fights, combatants, damage, and combat-state rules",
     "crafting": "making, repairing, or building items",

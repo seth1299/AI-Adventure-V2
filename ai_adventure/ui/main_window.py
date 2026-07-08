@@ -63,6 +63,7 @@ from ai_adventure.alchemy.ingredients import (
     format_recipe_ingredients,
     is_crafting_ingredient_category,
     normalize_recipe_ingredient,
+    normalize_recipe_ingredients,
 )
 from ai_adventure.app.app_paths import AppPaths
 from ai_adventure.app.features import (
@@ -260,6 +261,7 @@ from ai_adventure.new_game_templates import (
 )
 from ai_adventure.persistence.save_repository import (
     DuplicateSaveTitleError,
+    SaveFileOperationError,
     SaveRepository,
     SaveSummary,
 )
@@ -282,6 +284,9 @@ TABLE_INLINE_BUTTON_MIN_WIDTH = 96
 TABLE_CELL_HORIZONTAL_PADDING = 10
 TABLE_CELL_VERTICAL_PADDING = 4
 STARTER_ITEM_COLUMN_WIDTHS = (140, 132, 140, 220, 132, 100)
+STARTER_WEAPON_COLUMN_WIDTHS = (150, 132, 100, 96, 120, 120, 132, 132, 100)
+STARTER_ARMOR_COLUMN_WIDTHS = (150, 132, 220, 132, 132, 100)
+STARTING_NPC_COLUMN_WIDTHS = (150, 160, 260, 132, 100)
 CURRENCY_COLUMN_WIDTHS = (150, 160, 132, 100)
 ECONOMY_EXAMPLE_COLUMN_WIDTHS = (220, 132, 100)
 THEME_NAMES = {"Light", "Dark"}
@@ -1011,7 +1016,7 @@ class MainWindow(QMainWindow):
             repository.set_world_summary(fallback_world_summary(setup))
             repository.append_history("story", fallback_introductory_message(setup))
             return
-
+        LOGGER.debug(f"INITIAL NEW GAME GEMINI PROMPT: \n\n{result}")
         self._apply_new_game_ai_state(repository, setup, result)
         repository.set_world_summary(
             _preserve_player_character_text(
@@ -1103,7 +1108,8 @@ class MainWindow(QMainWindow):
         ):
             repository.set_calendar_settings(
                 ai_generated_calendar_settings_or_fallback(
-                    getattr(result, "calendar_settings", {})
+                    getattr(result, "calendar_settings", {}),
+                    genre_hint=_new_game_calendar_genre_hint(setup, result),
                 )
             )
 
@@ -1188,6 +1194,8 @@ class MainWindow(QMainWindow):
 
         if finalized_starter_items:
             repository.replace_inventory_items(finalized_starter_items)
+
+        _apply_new_game_crafting_knowledge(repository, result)
 
     def _apply_fallback_currency_if_needed(
         self,
@@ -2732,9 +2740,18 @@ class MainMenuScreen(QWidget):
         new_game_button.clicked.connect(self._handle_new_game)
 
         self.save_combo = QComboBox()
+        self.save_combo.currentIndexChanged.connect(
+            lambda _index: self._sync_save_action_buttons()
+        )
 
-        load_button = QPushButton("Load Game")
-        load_button.clicked.connect(self._handle_load_game)
+        self.load_button = QPushButton("Load Game")
+        self.load_button.clicked.connect(self._handle_load_game)
+
+        self.rename_save_button = QPushButton("Rename Save")
+        self.rename_save_button.clicked.connect(self._handle_rename_save)
+
+        self.delete_save_button = QPushButton("Delete Save")
+        self.delete_save_button.clicked.connect(self._handle_delete_save)
 
         self.settings_button = QPushButton("Settings")
         self.settings_button.clicked.connect(self.on_settings)
@@ -2755,7 +2772,9 @@ class MainMenuScreen(QWidget):
         layout.addSpacing(30)
         layout.addWidget(QLabel("Existing Saves:"))
         layout.addWidget(self.save_combo)
-        layout.addWidget(load_button)
+        layout.addWidget(self.load_button)
+        layout.addWidget(self.rename_save_button)
+        layout.addWidget(self.delete_save_button)
         layout.addStretch()
 
         wrapper = QHBoxLayout()
@@ -2775,11 +2794,14 @@ class MainMenuScreen(QWidget):
 
         if not saves:
             self.save_combo.addItem("No saves found", None)
+            self._sync_save_action_buttons()
             return
 
         for summary in saves:
             label = self._format_save_summary(summary)
             self.save_combo.addItem(label, summary.db_path)
+
+        self._sync_save_action_buttons()
 
     def _handle_new_game(self) -> None:
         """Handles the New Game button."""
@@ -2796,6 +2818,106 @@ class MainMenuScreen(QWidget):
             return
 
         self.on_load_game(Path(db_path))
+
+    def _handle_rename_save(self) -> None:
+        """Prompts for a new title for the selected save."""
+
+        db_path = self.save_combo.currentData()
+
+        if db_path is None:
+            QMessageBox.information(self, "No Save Selected", "There is no save to rename.")
+            return
+
+        summary = self._selected_save_summary()
+        current_title = summary.title if summary is not None else ""
+        new_title, accepted = QInputDialog.getText(
+            self,
+            "Rename Save",
+            "Save name:",
+            text=current_title,
+        )
+
+        if not accepted:
+            return
+
+        clean_title = new_title.strip()
+
+        if not clean_title:
+            QMessageBox.warning(self, "Missing Save Name", "Enter a save name.")
+            return
+
+        try:
+            SaveRepository.rename_save(self.saves_dir, Path(db_path), clean_title)
+        except DuplicateSaveTitleError as error:
+            QMessageBox.warning(self, "Save Name Already Exists", str(error))
+            return
+        except SaveFileOperationError as error:
+            QMessageBox.warning(self, "Save Not Renamed", str(error))
+            self.refresh_saves()
+            return
+        except OSError as error:
+            QMessageBox.warning(self, "Save Not Renamed", f"Could not rename the save: {error}")
+            self.refresh_saves()
+            return
+
+        self.refresh_saves()
+
+    def _handle_delete_save(self) -> None:
+        """Confirms and deletes the selected save."""
+
+        db_path = self.save_combo.currentData()
+
+        if db_path is None:
+            QMessageBox.information(self, "No Save Selected", "There is no save to delete.")
+            return
+
+        summary = self._selected_save_summary()
+        title = summary.title if summary is not None else "this save"
+        result = QMessageBox.question(
+            self,
+            "Delete Save",
+            f"Delete '{title}' permanently?",
+        )
+
+        if result != QMessageBox.StandardButton.Yes:
+            return
+
+        try:
+            SaveRepository.delete_save(self.saves_dir, Path(db_path))
+        except SaveFileOperationError as error:
+            QMessageBox.warning(self, "Save Not Deleted", str(error))
+            self.refresh_saves()
+            return
+        except OSError as error:
+            QMessageBox.warning(self, "Save Not Deleted", f"Could not delete the save: {error}")
+            self.refresh_saves()
+            return
+
+        self.refresh_saves()
+
+    def _selected_save_summary(self) -> SaveSummary | None:
+        """Returns the selected save summary, if it still exists."""
+
+        db_path = self.save_combo.currentData()
+
+        if db_path is None:
+            return None
+
+        selected_path = Path(db_path).resolve()
+
+        for summary in SaveRepository.list_saves(self.saves_dir):
+            if summary.db_path.resolve() == selected_path:
+                return summary
+
+        return None
+
+    def _sync_save_action_buttons(self) -> None:
+        """Enables save actions only when a real save is selected."""
+
+        has_save = self.save_combo.currentData() is not None
+        self.load_button.setEnabled(has_save)
+        self.rename_save_button.setEnabled(has_save)
+        self.delete_save_button.setEnabled(has_save)
 
     def _format_save_summary(self, summary: SaveSummary) -> str:
         """
@@ -2885,6 +3007,42 @@ class NewGameTemplateManagerDialog(QDialog):
         self.add_starter_item_button = QPushButton("Add Item")
         self.add_starter_item_button.clicked.connect(
             lambda: self._append_starter_item_row({})
+        )
+        self.starter_weapons_table = QTableWidget(0, 9)
+        self.starter_weapons_table.setHorizontalHeaderLabels(
+            [
+                "Name",
+                "Amount",
+                "Hands",
+                "Damage",
+                "Skill",
+                "Range",
+                "Ammo Type",
+                "Clip Size",
+                "",
+            ]
+        )
+        _configure_inline_table(
+            self.starter_weapons_table,
+            STARTER_WEAPON_COLUMN_WIDTHS,
+            minimum_height=150,
+        )
+        self.add_starter_weapon_button = QPushButton("Add Weapon")
+        self.add_starter_weapon_button.clicked.connect(
+            lambda: self._append_starter_weapon_row({})
+        )
+        self.starter_armor_table = QTableWidget(0, 6)
+        self.starter_armor_table.setHorizontalHeaderLabels(
+            ["Name", "Amount", "Covers", "Armor Bonus", "Value", ""]
+        )
+        _configure_inline_table(
+            self.starter_armor_table,
+            STARTER_ARMOR_COLUMN_WIDTHS,
+            minimum_height=130,
+        )
+        self.add_starter_armor_button = QPushButton("Add Armor")
+        self.add_starter_armor_button.clicked.connect(
+            lambda: self._append_starter_armor_row({})
         )
         self.currency_table = QTableWidget(0, 4)
         self.currency_table.setHorizontalHeaderLabels(["Name", "Plural Name", "Base Value", ""])
@@ -3010,6 +3168,10 @@ class NewGameTemplateManagerDialog(QDialog):
         form.addRow("World Details:", self.world_context_input)
         form.addRow("Starter Items:", self.starter_items_table)
         form.addRow("", self.add_starter_item_button)
+        form.addRow("Starter Weapons:", self.starter_weapons_table)
+        form.addRow("", self.add_starter_weapon_button)
+        form.addRow("Starter Armor:", self.starter_armor_table)
+        form.addRow("", self.add_starter_armor_button)
         form.addRow("Currencies:", self.currency_table)
         form.addRow("", self.add_currency_button)
         form.addRow("Economy Notes:", self.economy_examples_table)
@@ -3095,9 +3257,18 @@ class NewGameTemplateManagerDialog(QDialog):
             description_input.setText(str(skill.get("description", "") or ""))
 
         self.starter_items_table.setRowCount(0)
+        self.starter_weapons_table.setRowCount(0)
+        self.starter_armor_table.setRowCount(0)
 
         for item in self._starter_items_for_editor(setup.get("starter_items", [])):
-            self._append_starter_item_row(item)
+            kind = _starter_item_kind(item)
+
+            if kind == "Weapon":
+                self._append_starter_weapon_row(item)
+            elif kind == "Armor":
+                self._append_starter_armor_row(item)
+            else:
+                self._append_starter_item_row(item)
 
         self.currency_table.setRowCount(0)
 
@@ -3283,7 +3454,39 @@ class NewGameTemplateManagerDialog(QDialog):
     def _starter_items_from_table(self) -> list[dict[str, Any]]:
         """Reads starter item rows from the template editor."""
 
-        return _starter_items_from_table(self.starter_items_table)
+        return [
+            *_starter_items_from_table(self.starter_items_table),
+            *_starter_weapons_from_table(self.starter_weapons_table),
+            *_starter_armor_from_table(self.starter_armor_table),
+        ]
+
+    def _append_starter_weapon_row(self, item: dict[str, Any]) -> None:
+        """Adds a starter weapon row to the template editor."""
+
+        _append_starter_weapon_table_row(
+            self.starter_weapons_table,
+            item,
+            self._remove_starter_weapon_row,
+        )
+
+    def _remove_starter_weapon_row(self, button: QPushButton) -> None:
+        """Removes the starter weapon row containing button."""
+
+        _remove_table_row_by_button(self.starter_weapons_table, button)
+
+    def _append_starter_armor_row(self, item: dict[str, Any]) -> None:
+        """Adds a starter armor row to the template editor."""
+
+        _append_starter_armor_table_row(
+            self.starter_armor_table,
+            item,
+            self._remove_starter_armor_row,
+        )
+
+    def _remove_starter_armor_row(self, button: QPushButton) -> None:
+        """Removes the starter armor row containing button."""
+
+        _remove_table_row_by_button(self.starter_armor_table, button)
 
     @staticmethod
     def _starter_items_for_editor(raw_items: Any) -> list[dict[str, Any]]:
@@ -3427,6 +3630,7 @@ class NewGameWizard(QWizard):
 
         self._build_adventure_page()
         self._build_starting_task_page()
+        self._build_starting_npcs_page()
         self._build_character_page()
         self._build_skills_page()
         self._build_inventory_currency_page()
@@ -3764,6 +3968,7 @@ class NewGameWizard(QWizard):
             },
             "skills": skills,
             "starter_items": self._starter_items_from_table(),
+            "starting_npcs": self._starting_npcs_from_table(),
             "starting_task": self._starting_task_from_controls(),
             "calendar": calendar_settings,
             "audio": {
@@ -3813,6 +4018,11 @@ class NewGameWizard(QWizard):
         )
         self.world_context_input.setPlainText(clean_setup["world_context"])
         self._load_starting_task(clean_setup["starting_task"])
+        self.starting_npcs_table.setRowCount(0)
+
+        for npc in clean_setup["starting_npcs"]:
+            self._append_starting_npc_row(npc)
+
         self._apply_new_game_ai_settings(
             {
                 **ai_settings,
@@ -3832,9 +4042,18 @@ class NewGameWizard(QWizard):
             description_input.setText(str(skill.get("description", "")))
 
         self.starter_items_table.setRowCount(0)
+        self.starter_weapons_table.setRowCount(0)
+        self.starter_armor_table.setRowCount(0)
 
         for item in clean_setup["starter_items"]:
-            self._append_starter_item_row(item)
+            kind = _starter_item_kind(item)
+
+            if kind == "Weapon":
+                self._append_starter_weapon_row(item)
+            elif kind == "Armor":
+                self._append_starter_armor_row(item)
+            else:
+                self._append_starter_item_row(item)
 
         self.currency_table.setRowCount(0)
 
@@ -4107,6 +4326,53 @@ class NewGameWizard(QWizard):
         self.starting_task_due_date_input.setText(str(task.get("due_date", "")))
         self._sync_starting_task_controls()
 
+    def _build_starting_npcs_page(self) -> None:
+        """Builds the requested starting NPCs page."""
+
+        page = QWizardPage()
+        page.setTitle("NPCs")
+        page.setSubTitle("Add starting NPCs the player character may know.")
+
+        self.starting_npcs_table = QTableWidget(0, 5)
+        self.starting_npcs_table.setHorizontalHeaderLabels(
+            ["Name", "Location", "Description", "Description Mode", ""]
+        )
+        _configure_inline_table(
+            self.starting_npcs_table,
+            STARTING_NPC_COLUMN_WIDTHS,
+            minimum_height=240,
+        )
+
+        add_npc_button = QPushButton("Add NPC")
+        add_npc_button.clicked.connect(lambda: self._append_starting_npc_row({}))
+
+        layout = QVBoxLayout()
+        layout.addWidget(self.starting_npcs_table)
+        layout.addWidget(_button_row(add_npc_button))
+        layout.addStretch()
+        page.setLayout(layout)
+
+        self.addPage(page)
+
+    def _append_starting_npc_row(self, npc: dict[str, Any]) -> None:
+        """Adds one requested starting NPC row to the wizard table."""
+
+        _append_starting_npc_table_row(
+            self.starting_npcs_table,
+            npc,
+            self._remove_starting_npc_row,
+        )
+
+    def _remove_starting_npc_row(self, button: QPushButton) -> None:
+        """Removes the starting NPC row containing button."""
+
+        _remove_table_row_by_button(self.starting_npcs_table, button)
+
+    def _starting_npcs_from_table(self) -> list[dict[str, Any]]:
+        """Reads requested starting NPC rows from the wizard table."""
+
+        return _starting_npcs_from_table(self.starting_npcs_table)
+
     def _build_character_page(self) -> None:
         """Builds the character page."""
 
@@ -4208,6 +4474,42 @@ class NewGameWizard(QWizard):
         add_item_button = QPushButton("Add Item")
         add_item_button.clicked.connect(lambda: self._append_starter_item_row({}))
 
+        self.starter_weapons_table = QTableWidget(0, 9)
+        self.starter_weapons_table.setHorizontalHeaderLabels(
+            [
+                "Name",
+                "Amount",
+                "Hands",
+                "Damage",
+                "Skill",
+                "Range",
+                "Ammo Type",
+                "Clip Size",
+                "",
+            ]
+        )
+        _configure_inline_table(
+            self.starter_weapons_table,
+            STARTER_WEAPON_COLUMN_WIDTHS,
+            minimum_height=150,
+        )
+
+        add_weapon_button = QPushButton("Add Weapon")
+        add_weapon_button.clicked.connect(lambda: self._append_starter_weapon_row({}))
+
+        self.starter_armor_table = QTableWidget(0, 6)
+        self.starter_armor_table.setHorizontalHeaderLabels(
+            ["Name", "Amount", "Covers", "Armor Bonus", "Value", ""]
+        )
+        _configure_inline_table(
+            self.starter_armor_table,
+            STARTER_ARMOR_COLUMN_WIDTHS,
+            minimum_height=130,
+        )
+
+        add_armor_button = QPushButton("Add Armor")
+        add_armor_button.clicked.connect(lambda: self._append_starter_armor_row({}))
+
         self.currency_table = QTableWidget(0, 4)
         self.currency_table.setHorizontalHeaderLabels(["Name", "Plural Name", "Base Value", ""])
         self.currency_table.setMinimumHeight(180)
@@ -4238,6 +4540,10 @@ class NewGameWizard(QWizard):
         layout = QFormLayout()
         layout.addRow("Starter Items:", self.starter_items_table)
         layout.addRow("", add_item_button)
+        layout.addRow("Starter Weapons:", self.starter_weapons_table)
+        layout.addRow("", add_weapon_button)
+        layout.addRow("Starter Armor:", self.starter_armor_table)
+        layout.addRow("", add_armor_button)
         layout.addRow("Currencies:", self.currency_table)
         layout.addRow("", add_currency_button)
         layout.addRow("Economy Notes:", self.economy_examples_table)
@@ -4380,7 +4686,39 @@ class NewGameWizard(QWizard):
     def _starter_items_from_table(self) -> list[dict[str, Any]]:
         """Reads starter item rows from the wizard table."""
 
-        return _starter_items_from_table(self.starter_items_table)
+        return [
+            *_starter_items_from_table(self.starter_items_table),
+            *_starter_weapons_from_table(self.starter_weapons_table),
+            *_starter_armor_from_table(self.starter_armor_table),
+        ]
+
+    def _append_starter_weapon_row(self, item: dict[str, Any]) -> None:
+        """Adds a starter weapon row to the wizard table."""
+
+        _append_starter_weapon_table_row(
+            self.starter_weapons_table,
+            item,
+            self._remove_starter_weapon_row,
+        )
+
+    def _remove_starter_weapon_row(self, button: QPushButton) -> None:
+        """Removes the starter weapon row containing button."""
+
+        _remove_table_row_by_button(self.starter_weapons_table, button)
+
+    def _append_starter_armor_row(self, item: dict[str, Any]) -> None:
+        """Adds a starter armor row to the wizard table."""
+
+        _append_starter_armor_table_row(
+            self.starter_armor_table,
+            item,
+            self._remove_starter_armor_row,
+        )
+
+    def _remove_starter_armor_row(self, button: QPushButton) -> None:
+        """Removes the starter armor row containing button."""
+
+        _remove_table_row_by_button(self.starter_armor_table, button)
 
     def _append_currency_row(self, denomination: dict[str, Any]) -> None:
         """Adds a currency denomination row to the wizard table."""
@@ -10338,12 +10676,101 @@ def _table_spin_box(minimum: int, maximum: int) -> QSpinBox:
     return spin_box
 
 
+def _table_combo_box(options: dict[str, str], current_value: str) -> QComboBox:
+    """Builds an inline table combo box."""
+
+    combo = QComboBox()
+    _add_combo_options(combo, options)
+    _set_combo_to_data(combo, current_value)
+    combo.setMinimumWidth(TABLE_INLINE_EDITOR_MIN_WIDTH)
+    combo.setMinimumHeight(TABLE_INLINE_EDITOR_HEIGHT)
+    return combo
+
+
 def _set_table_column_widths(table: QTableWidget, widths: tuple[int, ...]) -> None:
     """Applies stable table column widths so inline editors do not autoshrink."""
 
     for column, width in enumerate(widths):
         if column < table.columnCount():
             table.setColumnWidth(column, width)
+
+
+def _append_starting_npc_table_row(
+    table: QTableWidget,
+    npc: dict[str, Any],
+    remove_callback: Callable[[QPushButton], None],
+) -> None:
+    """Adds one editable starting NPC row to table."""
+
+    row = table.rowCount()
+    table.insertRow(row)
+    table.setRowHeight(row, 36)
+
+    name_input = _table_line_edit(str(npc.get("name", npc.get("display_name", ""))))
+    location_input = _table_line_edit(str(npc.get("location", "")))
+    description_input = _table_line_edit(
+        str(npc.get("description", npc.get("public_description", "")))
+    )
+    mode_input = _table_combo_box(
+        {"suggestion": "Suggestion", "exact": "Exact"},
+        str(npc.get("description_mode", "suggestion") or "suggestion"),
+    )
+    remove_button = QPushButton("Remove NPC")
+    remove_button.setMinimumWidth(TABLE_INLINE_BUTTON_MIN_WIDTH)
+    remove_button.setMinimumHeight(TABLE_INLINE_EDITOR_HEIGHT)
+    remove_button.clicked.connect(
+        lambda _checked=False, button=remove_button: remove_callback(button)
+    )
+
+    table.setCellWidget(row, 0, name_input)
+    table.setCellWidget(row, 1, location_input)
+    table.setCellWidget(row, 2, description_input)
+    table.setCellWidget(row, 3, mode_input)
+    table.setCellWidget(row, 4, remove_button)
+    _set_table_column_widths(table, STARTING_NPC_COLUMN_WIDTHS)
+
+
+def _starting_npcs_from_table(table: QTableWidget) -> list[dict[str, Any]]:
+    """Reads requested starting NPC rows from table."""
+
+    npcs: list[dict[str, Any]] = []
+
+    for row in range(table.rowCount()):
+        name_widget = table.cellWidget(row, 0)
+        location_widget = table.cellWidget(row, 1)
+        description_widget = table.cellWidget(row, 2)
+        mode_widget = table.cellWidget(row, 3)
+        name = name_widget.text().strip() if isinstance(name_widget, QLineEdit) else ""
+        location = (
+            location_widget.text().strip()
+            if isinstance(location_widget, QLineEdit)
+            else ""
+        )
+        description = (
+            description_widget.text().strip()
+            if isinstance(description_widget, QLineEdit)
+            else ""
+        )
+
+        description_mode = (
+            str(mode_widget.currentData())
+            if isinstance(mode_widget, QComboBox)
+            else "suggestion"
+        )
+        if description_mode not in {"suggestion", "exact"}:
+            description_mode = "suggestion"
+
+        npcs.append(
+            {
+                "name": name,
+                "location": location,
+                "description": description,
+                "description_mode": description_mode,
+                "requires_ai_invention": not name or not location or not description,
+            }
+        )
+
+    return npcs
 
 
 def _configure_inline_table(
@@ -10432,6 +10859,242 @@ def _starter_items_from_table(table: QTableWidget) -> list[dict[str, Any]]:
                     else ""
                 ),
                 "value_base_units": value_widget.value() if isinstance(value_widget, QSpinBox) else 0,
+                "item_request": "",
+                "requires_ai_invention": False,
+            }
+        )
+
+    return items
+
+
+def _starter_item_kind(item: dict[str, Any]) -> str:
+    """Returns the starter item table kind for a normalized item."""
+
+    category = str(item.get("category", "") or "").strip().casefold()
+    item_type = str(item.get("item_type", "") or "").strip().casefold()
+
+    if not item_type and isinstance(item.get("metadata"), dict):
+        item_type = str(item["metadata"].get("item_type", "") or "").strip().casefold()
+
+    if category == "weapon" or item_type == "weapon":
+        return "Weapon"
+    if category in {"armor", "armour", "shield"} or item_type == "armor":
+        return "Armor"
+    return "Item"
+
+
+def _metadata_text(item: dict[str, Any], key: str, default: str = "") -> str:
+    """Reads a top-level or metadata-backed text value."""
+
+    value = item.get(key, None)
+
+    if (value is None or value == "") and isinstance(item.get("metadata"), dict):
+        value = item["metadata"].get(key, default)
+
+    return str(default if value is None else value).strip()
+
+
+def _metadata_int(item: dict[str, Any], key: str, default: int = 0) -> int:
+    """Reads a top-level or metadata-backed integer value."""
+
+    value = item.get(key, None)
+
+    if value is None and isinstance(item.get("metadata"), dict):
+        value = item["metadata"].get(key, default)
+
+    return _safe_int(value, default)
+
+
+def _append_starter_weapon_table_row(
+    table: QTableWidget,
+    item: dict[str, Any],
+    remove_callback: Callable[[QPushButton], None],
+) -> None:
+    """Adds one editable starter-weapon row to table."""
+
+    row = table.rowCount()
+    table.insertRow(row)
+    table.setRowHeight(row, 36)
+
+    name_input = _table_line_edit(str(item.get("name", "")))
+    quantity_input = _table_spin_box(1, 999_999)
+    quantity_input.setValue(_safe_int(item.get("quantity", 1), 1))
+    hands_input = _table_combo_box(
+        {"One-handed": "one-handed", "Two-handed": "two-handed"},
+        _metadata_text(item, "weapon_hands", "one-handed") or "one-handed",
+    )
+    damage_input = _table_line_edit(_metadata_text(item, "damage", "1d6") or "1d6")
+    attack_skill_input = _table_line_edit(
+        _metadata_text(item, "attack_skill", "Melee") or "Melee"
+    )
+    range_input = _table_spin_box(0, 10_000)
+    range_input.setValue(max(0, _metadata_int(item, "attack_range_feet", 5)))
+    ammo_input = _table_line_edit(_metadata_text(item, "ammunition_type_required"))
+    clip_size_input = _table_spin_box(0, 999)
+    clip_size_input.setValue(max(0, _metadata_int(item, "clip_size", 0)))
+    remove_button = QPushButton("Remove")
+    remove_button.setMinimumWidth(TABLE_INLINE_BUTTON_MIN_WIDTH)
+    remove_button.setMinimumHeight(TABLE_INLINE_EDITOR_HEIGHT)
+    remove_button.clicked.connect(
+        lambda _checked=False, button=remove_button: remove_callback(button)
+    )
+
+    table.setCellWidget(row, 0, name_input)
+    table.setCellWidget(row, 1, quantity_input)
+    table.setCellWidget(row, 2, hands_input)
+    table.setCellWidget(row, 3, damage_input)
+    table.setCellWidget(row, 4, attack_skill_input)
+    table.setCellWidget(row, 5, range_input)
+    table.setCellWidget(row, 6, ammo_input)
+    table.setCellWidget(row, 7, clip_size_input)
+    table.setCellWidget(row, 8, remove_button)
+    _set_table_column_widths(table, STARTER_WEAPON_COLUMN_WIDTHS)
+
+
+def _starter_weapons_from_table(table: QTableWidget) -> list[dict[str, Any]]:
+    """Reads starter-weapon rows from table."""
+
+    items: list[dict[str, Any]] = []
+
+    for row in range(table.rowCount()):
+        name_widget = table.cellWidget(row, 0)
+        quantity_widget = table.cellWidget(row, 1)
+        hands_widget = table.cellWidget(row, 2)
+        damage_widget = table.cellWidget(row, 3)
+        attack_skill_widget = table.cellWidget(row, 4)
+        range_widget = table.cellWidget(row, 5)
+        ammo_widget = table.cellWidget(row, 6)
+        clip_size_widget = table.cellWidget(row, 7)
+        name = name_widget.text().strip() if isinstance(name_widget, QLineEdit) else ""
+
+        if not name:
+            continue
+
+        ammunition_type_required = (
+            ammo_widget.text().strip() if isinstance(ammo_widget, QLineEdit) else ""
+        )
+        clip_size = clip_size_widget.value() if isinstance(clip_size_widget, QSpinBox) else 0
+
+        items.append(
+            {
+                "name": name,
+                "category": "Weapon",
+                "quantity": quantity_widget.value() if isinstance(quantity_widget, QSpinBox) else 1,
+                "description": "",
+                "value_base_units": 0,
+                "item_type": "Weapon",
+                "weapon_hands": (
+                    str(hands_widget.currentData())
+                    if isinstance(hands_widget, QComboBox)
+                    else "one-handed"
+                ),
+                "damage": (
+                    damage_widget.text().strip()
+                    if isinstance(damage_widget, QLineEdit)
+                    and damage_widget.text().strip()
+                    else "1d6"
+                ),
+                "attack_skill": (
+                    attack_skill_widget.text().strip()
+                    if isinstance(attack_skill_widget, QLineEdit)
+                    and attack_skill_widget.text().strip()
+                    else "Melee"
+                ),
+                "attack_range_feet": (
+                    range_widget.value() if isinstance(range_widget, QSpinBox) else 5
+                ),
+                "ammunition_type_required": ammunition_type_required,
+                "clip_size": clip_size if ammunition_type_required else 0,
+                "bullets_per_attack": 1 if ammunition_type_required and clip_size > 0 else 0,
+                "item_request": "",
+                "requires_ai_invention": False,
+            }
+        )
+
+    return items
+
+
+def _append_starter_armor_table_row(
+    table: QTableWidget,
+    item: dict[str, Any],
+    remove_callback: Callable[[QPushButton], None],
+) -> None:
+    """Adds one editable starter-armor row to table."""
+
+    row = table.rowCount()
+    table.insertRow(row)
+    table.setRowHeight(row, 36)
+
+    name_input = _table_line_edit(str(item.get("name", "")))
+    quantity_input = _table_spin_box(1, 999_999)
+    quantity_input.setValue(_safe_int(item.get("quantity", 1), 1))
+    raw_covers_body_parts = item.get("covers_body_parts")
+
+    if not isinstance(raw_covers_body_parts, list) and isinstance(
+        item.get("metadata"), dict
+    ):
+        raw_covers_body_parts = item["metadata"].get("covers_body_parts")
+
+    covers_body_parts = (
+        raw_covers_body_parts if isinstance(raw_covers_body_parts, list) else []
+    )
+    covers_input = _table_line_edit(
+        ", ".join(str(part) for part in covers_body_parts if part is not None)
+    )
+    armor_rating_input = _table_spin_box(0, 99)
+    armor_rating_input.setValue(max(0, _metadata_int(item, "armor_rating", 1)))
+    value_input = _table_spin_box(0, 1_000_000_000)
+    value_input.setValue(_safe_int(item.get("value_base_units", 0), 0))
+    remove_button = QPushButton("Remove")
+    remove_button.setMinimumWidth(TABLE_INLINE_BUTTON_MIN_WIDTH)
+    remove_button.setMinimumHeight(TABLE_INLINE_EDITOR_HEIGHT)
+    remove_button.clicked.connect(
+        lambda _checked=False, button=remove_button: remove_callback(button)
+    )
+
+    table.setCellWidget(row, 0, name_input)
+    table.setCellWidget(row, 1, quantity_input)
+    table.setCellWidget(row, 2, covers_input)
+    table.setCellWidget(row, 3, armor_rating_input)
+    table.setCellWidget(row, 4, value_input)
+    table.setCellWidget(row, 5, remove_button)
+    _set_table_column_widths(table, STARTER_ARMOR_COLUMN_WIDTHS)
+
+
+def _starter_armor_from_table(table: QTableWidget) -> list[dict[str, Any]]:
+    """Reads starter-armor rows from table."""
+
+    items: list[dict[str, Any]] = []
+
+    for row in range(table.rowCount()):
+        name_widget = table.cellWidget(row, 0)
+        quantity_widget = table.cellWidget(row, 1)
+        covers_widget = table.cellWidget(row, 2)
+        armor_rating_widget = table.cellWidget(row, 3)
+        value_widget = table.cellWidget(row, 4)
+        name = name_widget.text().strip() if isinstance(name_widget, QLineEdit) else ""
+
+        if not name:
+            continue
+
+        items.append(
+            {
+                "name": name,
+                "category": "Armor",
+                "quantity": quantity_widget.value() if isinstance(quantity_widget, QSpinBox) else 1,
+                "description": "",
+                "value_base_units": value_widget.value() if isinstance(value_widget, QSpinBox) else 0,
+                "item_type": "Armor",
+                "covers_body_parts": (
+                    _split_list(covers_widget.text())
+                    if isinstance(covers_widget, QLineEdit)
+                    else []
+                ),
+                "armor_rating": (
+                    armor_rating_widget.value()
+                    if isinstance(armor_rating_widget, QSpinBox)
+                    else 1
+                ),
                 "item_request": "",
                 "requires_ai_invention": False,
             }
@@ -10702,6 +11365,98 @@ def _travel_locations_for_save(
     ]
 
 
+def _apply_new_game_crafting_knowledge(
+    repository: SaveRepository,
+    result: Any,
+) -> None:
+    """Persists AI-finalized starting Crafting tab knowledge."""
+
+    for raw_item in getattr(result, "known_crafting_items", []):
+        if not isinstance(raw_item, dict):
+            continue
+
+        name = str(raw_item.get("name", "") or "").strip()
+
+        if not name:
+            continue
+
+        description = str(raw_item.get("description", "") or "").strip()
+        category = str(raw_item.get("category", "Material") or "Material").strip()
+
+        if not is_crafting_ingredient_category(category):
+            category = "Material"
+
+        uses = [
+            str(value).strip()
+            for value in raw_item.get("uses", [])
+            if str(value).strip()
+        ] if isinstance(raw_item.get("uses"), list) else []
+
+        repository.add_crafting_item(
+            name=name,
+            description=description,
+            location=str(raw_item.get("location", "") or "").strip(),
+            uses=uses,
+        )
+        repository.upsert_item_catalog_entry(
+            name=name,
+            category=category,
+            description=description,
+        )
+
+    allowed_ingredient_names = {
+        str(item.get("name", "") or "").casefold()
+        for item in repository.list_item_catalog()
+        if str(item.get("name", "") or "").strip()
+        and is_crafting_ingredient_category(item.get("category", ""))
+    }
+
+    for raw_recipe in getattr(result, "known_crafting_recipes", []):
+        if not isinstance(raw_recipe, dict):
+            continue
+
+        name = str(raw_recipe.get("name", "") or "").strip()
+        ingredients = normalize_recipe_ingredients(raw_recipe.get("ingredients", []))
+        result_text = str(raw_recipe.get("result", "") or "").strip()
+
+        if not name or not ingredients or not result_text:
+            continue
+
+        unknown_ingredients = [
+            ingredient["reagent_name"]
+            for ingredient in ingredients
+            if ingredient["reagent_name"].casefold() not in allowed_ingredient_names
+        ]
+
+        if unknown_ingredients:
+            LOGGER.warning(
+                "Skipped new-game crafting recipe %s because ingredient knowledge is missing: %s",
+                name,
+                ", ".join(unknown_ingredients),
+            )
+            continue
+
+        repository.add_crafting_recipe(
+            name=name,
+            ingredients=ingredients,
+            result=result_text,
+            notes=str(raw_recipe.get("notes", "") or "").strip(),
+        )
+
+
+def _new_game_calendar_genre_hint(setup: dict[str, Any], result: Any) -> str:
+    """Combines setup and AI-selected genre text for calendar fallback checks."""
+
+    parts = [
+        str(setup.get("specified_genre", "") or ""),
+        str(setup.get("game_style", "") or ""),
+        str(setup.get("world_context", "") or ""),
+        str(setup.get("ai_additional_context", "") or ""),
+        str(getattr(result, "selected_genre", "") or ""),
+    ]
+    return "\n".join(part for part in parts if part.strip())
+
+
 def _finalized_skills_for_save(
     ai_skills: list[dict[str, Any]],
     setup_skills: Any,
@@ -10940,6 +11695,24 @@ def _fallback_starter_item_from_setup(
         or "Player-requested starter item awaiting AI detail.",
         "value_base_units": max(0, _safe_int(raw_item.get("value_base_units"), 0)),
         "source_index": source_index,
+        **{
+            field_name: raw_item[field_name]
+            for field_name in (
+                "item_type",
+                "weapon_hands",
+                "damage",
+                "damage_type",
+                "attack_skill",
+                "attack_range_feet",
+                "ammunition_type_required",
+                "clip_size",
+                "bullets_per_attack",
+                "ammunition_type",
+                "covers_body_parts",
+                "armor_rating",
+            )
+            if field_name in raw_item
+        },
     }
 
 

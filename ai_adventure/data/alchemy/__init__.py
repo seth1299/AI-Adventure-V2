@@ -1,2 +1,0 @@
-"""Packaged alchemy rulebook data."""
-

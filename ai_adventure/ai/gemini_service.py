@@ -11,6 +11,9 @@ from typing import Any
 from ai_adventure.alchemy.ingredients import (
     COMMON_MEASUREMENT_UNITS,
     CRAFTING_INGREDIENT_CATEGORY_NAMES,
+    CRAFTING_INGREDIENT_CATEGORIES,
+    is_crafting_ingredient_category,
+    normalize_recipe_ingredients,
 )
 from ai_adventure.ai.modes import (
     ALL_CONTENT_HARM_CATEGORIES,
@@ -181,6 +184,32 @@ NONEMPTY_RECIPE_INGREDIENT_LIST_SCHEMA: dict[str, Any] = {
     "type": "array",
     "items": RECIPE_INGREDIENT_SCHEMA,
     "minItems": 1,
+}
+NEW_GAME_CRAFTING_ITEM_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "name": {"type": "string"},
+        "category": {
+            "type": "string",
+            "enum": list(CRAFTING_INGREDIENT_CATEGORIES),
+        },
+        "description": {"type": "string"},
+        "location": {"type": "string"},
+        "uses": STRING_LIST_SCHEMA,
+    },
+    "required": ["name", "category", "description", "location", "uses"],
+    "additionalProperties": False,
+}
+NEW_GAME_CRAFTING_RECIPE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "name": {"type": "string"},
+        "ingredients": NONEMPTY_RECIPE_INGREDIENT_LIST_SCHEMA,
+        "result": {"type": "string"},
+        "notes": {"type": "string"},
+    },
+    "required": ["name", "ingredients", "result", "notes"],
+    "additionalProperties": False,
 }
 INT_OR_AUTO_SCHEMA: dict[str, Any] = {
     "anyOf": [
@@ -1015,6 +1044,22 @@ NEW_GAME_RESPONSE_JSON_SCHEMA: dict[str, Any] = {
                 "additionalProperties": False,
             },
         },
+        "known_crafting_items": {
+            "type": "array",
+            "description": (
+                "Player-known crafting items/materials. Use an empty array when "
+                "the player character would not know any at setup."
+            ),
+            "items": NEW_GAME_CRAFTING_ITEM_SCHEMA,
+        },
+        "known_crafting_recipes": {
+            "type": "array",
+            "description": (
+                "Player-known crafting recipes. Use an empty array when the "
+                "player character would not know any at setup."
+            ),
+            "items": NEW_GAME_CRAFTING_RECIPE_SCHEMA,
+        },
         "currency_denominations": {
             "type": "array",
             "maxItems": 4,
@@ -1056,6 +1101,8 @@ NEW_GAME_RESPONSE_JSON_SCHEMA: dict[str, Any] = {
         "character",
         "skills",
         "starting_items",
+        "known_crafting_items",
+        "known_crafting_recipes",
         "currency_denominations",
         "currency_description",
         "starting_currency_balance_base_units",
@@ -1115,6 +1162,8 @@ class AiWorldSetupResult:
     finalized_character: dict[str, str] = field(default_factory=dict)
     finalized_skills: list[dict[str, Any]] = field(default_factory=list)
     finalized_starter_items: list[dict[str, Any]] = field(default_factory=list)
+    known_crafting_items: list[dict[str, Any]] = field(default_factory=list)
+    known_crafting_recipes: list[dict[str, Any]] = field(default_factory=list)
     finalized_currency_denominations: list[dict[str, Any]] = field(default_factory=list)
     finalized_currency_description: str = ""
     finalized_starting_currency_balance_base_units: int | None = None
@@ -1311,6 +1360,7 @@ class GeminiNarrationService:
         client = genai.Client(api_key=self.settings.api_key)
 
         LOGGER.info("Sending new-game setup packet to Gemini model %s.", self.settings.model)
+        LOGGER.info(f"NEW GAME PROMPT: \n\n{prompt}")
         response = client.models.generate_content(
             model=self.settings.model,
             contents=prompt,
@@ -1416,8 +1466,8 @@ def build_skill_check_plan_prompt(context_packet: dict[str, Any]) -> str:
         "- Do not request a check merely because an action could theoretically "
         "vary in quality or take extra time. Request a check only when failure or "
         "partial success would create a meaningful consequence right now.\n"
-        "- Foraging, harvesting, searching, researching, identifying, crafting, "
-        "alchemy experiments, persuasion, stealth, and combat need checks only "
+        "- Foraging, harvesting, searching, researching, identifying, crafting "
+        "experiments, persuasion, stealth, and combat need checks only "
         "when the current command has actual uncertainty, opposition, risk, hidden "
         "information, resource pressure, or meaningful consequences.\n"
         "- Named skill use is not automatically a check if the command is otherwise "
@@ -1809,13 +1859,21 @@ def build_gemini_new_game_prompt(setup_packet: dict[str, Any]) -> str:
         "interest, religions, and economy. It may use light Markdown headings, "
         "bold names, italics, and bullet lists when that improves readability.\n"
         "- locations must be a player-known array for the Travel tab. Include the "
-        "starting location at x_miles=0 and y_miles=0 plus at least three other "
-        "meaningful reachable places. Coordinates are relative map miles, not GPS "
-        "coordinates. Give each location a concise description, terrain, a positive "
-        "travel_multiplier (below 1 slows travel), and practical player-known route "
-        "notes. Put player-known local religion, culture, economy, factions, laws, "
-        "customs, landmarks, and practical context for a place in its description "
-        "or travel_notes. Do not include hidden routes, secrets, or GM-only facts.\n"
+        "finalized starting location at x_miles=0 and y_miles=0, then add only "
+        "the other places the player character would plausibly know at setup. "
+        "There is no minimum or maximum number of other locations. For an unknown "
+        "crash-landing, isolated survival, amnesia, or new-arrival premise, the "
+        "starting location may be the only known location. For a ranger, courier, "
+        "trader, local resident, or well-traveled character, include every "
+        "important place they would reasonably know, even six or more. Coordinates "
+        "are relative map miles, not GPS coordinates. Give each returned location "
+        "a concise player-known description, terrain, a positive travel_multiplier "
+        "(below 1 slows travel), and practical route notes. Put player-known local "
+        "religion, culture, economy, factions, laws, customs, landmarks, and "
+        "practical context for a place in its description or travel_notes. Do not "
+        "include hidden routes, secrets, GM-only facts, or names of unknown worlds, "
+        "planets, regions, or settlements unless the player character would know "
+        "those names.\n"
         "- introductory_message must be player-facing narration for the first "
         "scene at start_location and must end with setup_packet.turn_prompt.\n"
         "- suggested_actions must contain three or four short opening-scene "
@@ -1826,11 +1884,14 @@ def build_gemini_new_game_prompt(setup_packet: dict[str, Any]) -> str:
         "mention of important NPCs, locations, factions, or items. Do not use "
         "Markdown tables, code fences, or HTML.\n"
         "- introductory_message and other player-facing setup prose must use "
-        "setup.narration.tense_label and setup.narration.style_label. Limited "
-        "styles stay within the player character's observed or reasonably "
-        "inferred experience. Omniscient styles may use a broader narrative "
-        "camera, but must not reveal secrets, hidden state, mystery solutions, "
-        "or NPC-private facts.\n"
+        "setup.narration.tense_label and setup.narration.style_label. Do not "
+        "fall back to second-person wording unless the selected style is "
+        "Second-Person. First-person styles should use I/me/my; third-person "
+        "styles should use the player character's name or pronouns instead of "
+        "you/your. Limited styles stay within the player character's observed "
+        "or reasonably inferred experience. Omniscient styles may use a broader "
+        "narrative camera, but must not reveal secrets, hidden state, mystery "
+        "solutions, or NPC-private facts.\n"
         "- introductory_message must match setup_packet.current_calendar and "
         "setup_packet.current_weather unless you intentionally return "
         "starting_calendar and/or weather fields to change the starting date, "
@@ -1861,8 +1922,12 @@ def build_gemini_new_game_prompt(setup_packet: dict[str, Any]) -> str:
         "weeks_per_month 1-12, months_per_year 1-24, and seasons_per_year 1-12. "
         "Do not copy the default Gregorian calendar, weekday names, January-"
         "through-December month names, Spring/Summer/Autumn/Winter as the full "
-        "season list, or generic Month 1/Month 2 placeholder names when AI "
-        "generation is requested. "
+        "season list, generic Month 1/Month 2 placeholder names, or generic "
+        "fantasy/artisan defaults when AI generation is requested. For futuristic, "
+        "space, cyberpunk, or science-fiction settings, use calendar names that "
+        "fit that premise, such as orbital, colonial, corporate, astronomical, "
+        "technical, station, mission, or local alien-cultural terms, not hearth, "
+        "market, lantern, harvest, or village-craft naming. "
         "If setup.calendar.ai_generated is false, return calendar_settings as an "
         "empty object and use the provided calendar.\n"
         "- character must finalize the player character profile. If character name, "
@@ -1909,7 +1974,9 @@ def build_gemini_new_game_prompt(setup_packet: dict[str, Any]) -> str:
         "ammunition_type. Armor should include covers_body_parts and armor_rating. "
         "Preserve "
         "any player-provided setup.starter_items entries whose requires_ai_invention "
-        "field is false. Set source_index to the zero-based setup.starter_items "
+        "field is false. If a player-provided setup starter item is already a "
+        "Weapon or Armor, keep its mechanical fields instead of downgrading it "
+        "to a generic item. Set source_index to the zero-based setup.starter_items "
         "index for items based on a setup starter-item entry, and -1 for extra "
         "invented items. "
         "If a setup.starter_items entry has requires_ai_invention=true or "
@@ -1930,6 +1997,16 @@ def build_gemini_new_game_prompt(setup_packet: dict[str, Any]) -> str:
         "compatibility. If the opening scene later awards a closed pouch, chest, "
         "bag, case, or similar container, normal story turns can add it with "
         "complete container metadata.\n"
+        "- known_crafting_items and known_crafting_recipes are player-known Crafting "
+        "tab knowledge, not physical inventory. Return empty arrays for a character "
+        "with no relevant training or discoveries. For an alchemist, cook, engineer, "
+        "herbalist, survivalist, medic, scientist, crafter, or other profession "
+        "that logically starts with practical making knowledge, return as many "
+        "useful known items/materials and recipes as fit the backstory. Recipe "
+        "ingredients must use item names from known_crafting_items or other known "
+        "item catalog entries. Ingredient objects must use reagent_name, quantity, "
+        "measure_amount, and measure_unit. Do not add those ingredients to "
+        "starting_items unless the player physically possesses them.\n"
         "- If setup.currency_denominations is empty, currency_denominations must "
         "contain at least one and at most four concrete denominations that fit "
         "the selected genre, world, and economy. One denomination must have "
@@ -1952,7 +2029,9 @@ def build_gemini_new_game_prompt(setup_packet: dict[str, Any]) -> str:
         "motives, mystery solutions, off-screen plans, and other GM-only starting "
         "truths in the top-level gm_secrets array, not in player-facing fields "
         "or the events array. The app stores those starting secrets as active. "
-        "Use the direct setup fields for all other initial state. Use type and payload for each event; "
+        "Use the direct setup fields for locations, crafting knowledge, inventory, "
+        "currency, character, skills, calendar, and all other initial state that "
+        "has a direct field. Use type and payload for each event; "
         "do not use event_type as the top-level event type key.\n"
         "- Use only player-known information in player-facing event fields.\n"
         "- setup.starting_task.mode controls whether the opening save starts with "
@@ -1964,7 +2043,16 @@ def build_gemini_new_game_prompt(setup_packet: dict[str, Any]) -> str:
         "from the rest of the setup. Use category Quest unless the player provided "
         "a different category.\n"
         "- Use NpcUpsertedEvent for prominent NPCs the player can know about at "
-        "setup. Remember that if the Player requested more than one NPC, or that you think that the Player would know more than one NPC, then you can pass more than one NpcUpsertedEvent.\n"
+        "setup. Use zero, one, or many NPC events according to setup.starting_npcs "
+        "and what the player character would actually know. A loner or stranger "
+        "in a new city can start with no known NPCs; a local, commander, teacher, "
+        "noble, merchant, or socially connected character can start with several. "
+        "Do not parse NPCs out of ordinary setup prose or plaintext fields. For "
+        "each setup.starting_npcs row, create one NpcUpsertedEvent. Fill blank "
+        "name, location, or description fields with fitting specifics. If "
+        "description_mode is exact, copy description into payload.public_description "
+        "unchanged; if description_mode is suggestion, use description as a guide "
+        "and put the finalized description in payload.public_description.\n"
         "Use ActiveTaskUpsertedEvent for initial active obligations, including "
         "classic quests with category Quest. Use "
         "currency_denominations for initial generated money instead of "
@@ -3370,6 +3458,12 @@ def parse_gemini_new_game_response(
     finalized_starter_items = _parse_new_game_starter_items(
         _new_game_starter_items_payload(data)
     )
+    known_crafting_items = _parse_new_game_crafting_items(
+        data.get("known_crafting_items", data.get("crafting_items", []))
+    )
+    known_crafting_recipes = _parse_new_game_crafting_recipes(
+        data.get("known_crafting_recipes", data.get("crafting_recipes", []))
+    )
     finalized_currency_denominations = _parse_new_game_currency_denominations(data)
     finalized_currency_description = _parse_new_game_currency_description(data)
     finalized_starting_currency_balance_base_units = (
@@ -3427,6 +3521,8 @@ def parse_gemini_new_game_response(
         finalized_character=finalized_character,
         finalized_skills=finalized_skills,
         finalized_starter_items=finalized_starter_items,
+        known_crafting_items=known_crafting_items,
+        known_crafting_recipes=known_crafting_recipes,
         finalized_currency_denominations=finalized_currency_denominations,
         finalized_currency_description=finalized_currency_description,
         finalized_starting_currency_balance_base_units=(
@@ -3686,6 +3782,82 @@ def _parse_new_game_starter_items(raw_items: Any) -> list[dict[str, Any]]:
         seen_names.add(name.casefold())
 
     return items
+
+
+def _parse_new_game_crafting_items(raw_items: Any) -> list[dict[str, Any]]:
+    """Parses player-known crafting item/material knowledge from setup."""
+
+    if not isinstance(raw_items, list):
+        return []
+
+    items: list[dict[str, Any]] = []
+    seen_names: set[str] = set()
+
+    for raw_item in raw_items:
+        if not isinstance(raw_item, dict):
+            continue
+
+        name = str(raw_item.get("name", raw_item.get("item_name", ""))).strip()
+
+        if not name or name.casefold() in seen_names:
+            continue
+
+        category = str(raw_item.get("category", "Material")).strip() or "Material"
+
+        if not is_crafting_ingredient_category(category):
+            category = "Material"
+
+        uses = [
+            str(value).strip()
+            for value in raw_item.get("uses", [])
+            if str(value).strip()
+        ] if isinstance(raw_item.get("uses"), list) else []
+
+        items.append(
+            {
+                "name": name,
+                "category": category,
+                "description": str(raw_item.get("description", "")).strip(),
+                "location": str(raw_item.get("location", "")).strip(),
+                "uses": uses,
+            }
+        )
+        seen_names.add(name.casefold())
+
+    return items
+
+
+def _parse_new_game_crafting_recipes(raw_recipes: Any) -> list[dict[str, Any]]:
+    """Parses player-known crafting recipe knowledge from setup."""
+
+    if not isinstance(raw_recipes, list):
+        return []
+
+    recipes: list[dict[str, Any]] = []
+    seen_names: set[str] = set()
+
+    for raw_recipe in raw_recipes:
+        if not isinstance(raw_recipe, dict):
+            continue
+
+        name = str(raw_recipe.get("name", raw_recipe.get("recipe_name", ""))).strip()
+        ingredients = normalize_recipe_ingredients(raw_recipe.get("ingredients", []))
+        result = str(raw_recipe.get("result", raw_recipe.get("description", ""))).strip()
+
+        if not name or not ingredients or not result or name.casefold() in seen_names:
+            continue
+
+        recipes.append(
+            {
+                "name": name,
+                "ingredients": ingredients,
+                "result": result,
+                "notes": str(raw_recipe.get("notes", "")).strip(),
+            }
+        )
+        seen_names.add(name.casefold())
+
+    return recipes
 
 
 def _generalized_starter_item_name(raw_name: Any) -> str:

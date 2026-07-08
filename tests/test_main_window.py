@@ -56,6 +56,7 @@ from ai_adventure.ui.main_window import (
     GameShell,
     HistoryScreen,
     InventoryScreen,
+    MainMenuScreen,
     MainMenuSettingsDialog,
     MainWindow,
     NewGameTemplateManagerDialog,
@@ -1566,6 +1567,92 @@ class MainWindowTests(unittest.TestCase):
             )
             window.close()
 
+    def test_ai_new_game_state_persists_starting_crafting_knowledge(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            _ensure_qt_application()
+            temp_path = Path(temp_dir)
+            (temp_path / "saves").mkdir(parents=True, exist_ok=True)
+            (temp_path / "logs").mkdir(parents=True, exist_ok=True)
+            setup = normalize_new_game_setup(
+                {
+                    "title": "Crafting Knowledge",
+                    "currency_denominations": [
+                        {"name": "Credit", "plural_name": "Credits", "value": 1}
+                    ],
+                }
+            )
+            repository = SaveRepository.create_new_save(
+                temp_path,
+                "Crafting Knowledge",
+                setup=setup,
+            )
+            window = MainWindow(
+                app_paths=AppPaths(
+                    app_data_dir=temp_path,
+                    saves_dir=temp_path / "saves",
+                    logs_dir=temp_path / "logs",
+                    log_file=temp_path / "logs" / "ai_adventure.log",
+                )
+            )
+
+            window._apply_new_game_ai_state(
+                repository,
+                setup,
+                SimpleNamespace(
+                    start_location="",
+                    locations=[],
+                    starting_calendar={},
+                    start_weather="",
+                    finalized_starting_currency_balance_base_units=None,
+                    finalized_currency_denominations=[],
+                    finalized_currency_description="",
+                    selected_genre="",
+                    finalized_character={},
+                    finalized_skills=[],
+                    finalized_starter_items=[],
+                    known_crafting_items=[
+                        {
+                            "name": "Sterile Culture Gel",
+                            "category": "Crafting Item",
+                            "description": "A clear gel used to stabilize samples.",
+                            "location": "Expedition lab stores.",
+                            "uses": ["sample preservation", "field cultures"],
+                        }
+                    ],
+                    known_crafting_recipes=[
+                        {
+                            "name": "Emergency Culture Patch",
+                            "ingredients": [
+                                {
+                                    "reagent_name": "Sterile Culture Gel",
+                                    "quantity": 1,
+                                    "measure_amount": 30,
+                                    "measure_unit": "mL",
+                                }
+                            ],
+                            "result": "A sterile patch for sealing a sample breach.",
+                            "notes": "Standard expedition field method.",
+                        }
+                    ],
+                ),
+            )
+
+            crafting_items = repository.list_crafting_items()
+            recipes = repository.list_crafting_recipes()
+            catalog = repository.list_item_catalog()
+
+            self.assertEqual(crafting_items[0]["name"], "Sterile Culture Gel")
+            self.assertEqual(crafting_items[0]["uses"], ["sample preservation", "field cultures"])
+            self.assertEqual(recipes[0]["name"], "Emergency Culture Patch")
+            self.assertEqual(recipes[0]["ingredients"][0]["measure_unit"], "mL")
+            self.assertEqual(
+                next(item for item in catalog if item["name"] == "Sterile Culture Gel")[
+                    "category"
+                ],
+                "Crafting Item",
+            )
+            window.close()
+
     def test_ai_generated_calendar_settings_replace_bootstrap_calendar(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             _ensure_qt_application()
@@ -1683,6 +1770,95 @@ class MainWindowTests(unittest.TestCase):
             self.assertEqual(calendar_settings["day_names"][0], "Dawn")
             self.assertNotEqual(calendar_settings["month_names"][0], "January")
             self.assertIn("Dawn", repository.get_state_value("time"))
+            window.close()
+
+    def test_ai_generated_sci_fi_calendar_rejects_artisan_fallback_names(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            _ensure_qt_application()
+            temp_path = Path(temp_dir)
+            (temp_path / "saves").mkdir(parents=True, exist_ok=True)
+            (temp_path / "logs").mkdir(parents=True, exist_ok=True)
+            setup = normalize_new_game_setup(
+                {
+                    "title": "Alien Crash",
+                    "specified_genre": "Futuristic sci-fi survival",
+                    "world_context": "Crash-landed on an unknown alien planet.",
+                    "calendar": {"calendar_type": "ai_generated"},
+                }
+            )
+            repository = SaveRepository.create_new_save(
+                temp_path,
+                "Alien Crash",
+                setup=setup,
+            )
+            window = MainWindow(
+                app_paths=AppPaths(
+                    app_data_dir=temp_path,
+                    saves_dir=temp_path / "saves",
+                    logs_dir=temp_path / "logs",
+                    log_file=temp_path / "logs" / "ai_adventure.log",
+                )
+            )
+
+            window._apply_new_game_ai_state(
+                repository,
+                setup,
+                SimpleNamespace(
+                    start_location="",
+                    calendar_settings={
+                        "days_per_week": 8,
+                        "weeks_per_month": 5,
+                        "months_per_year": 10,
+                        "seasons_per_year": 5,
+                        "day_names": [
+                            "Dawn",
+                            "Bell",
+                            "Hearth",
+                            "Market",
+                            "Lantern",
+                            "Tide",
+                            "Star",
+                            "Rest",
+                        ],
+                        "month_names": [
+                            "First Rise",
+                            "Greenwake",
+                            "Highsun",
+                            "Goldleaf",
+                            "Longshade",
+                            "Deepfrost",
+                            "Raincall",
+                            "Bloomturn",
+                            "Redharvest",
+                            "Yearsend",
+                        ],
+                        "seasons": [
+                            {"name": "Waking", "weather_hint": "spring"},
+                            {"name": "Highlight", "weather_hint": "summer"},
+                            {"name": "Harvest", "weather_hint": "autumn"},
+                            {"name": "Frost", "weather_hint": "winter"},
+                            {"name": "Rainmoot", "weather_hint": "rainy"},
+                        ],
+                        "time_display": "12_hour",
+                    },
+                    starting_calendar={"day_of_month": 1, "time_of_day_minutes": 480},
+                    start_weather="",
+                    finalized_starting_currency_balance_base_units=None,
+                    finalized_currency_denominations=[],
+                    finalized_currency_description="",
+                    selected_genre="Science-fiction crash survival",
+                    finalized_character={},
+                    finalized_skills=[],
+                    finalized_starter_items=[],
+                ),
+            )
+
+            calendar_settings = repository.get_calendar_settings()
+
+            self.assertEqual(calendar_settings["day_names"][0], "Launch")
+            self.assertEqual(calendar_settings["month_names"][0], "Perihelion")
+            self.assertNotIn("Hearth", calendar_settings["day_names"])
+            self.assertNotIn("Market", calendar_settings["day_names"])
             window.close()
 
     def test_ai_new_game_state_preserves_player_provided_character_fields(self) -> None:
@@ -3172,6 +3348,48 @@ class MainWindowTests(unittest.TestCase):
             window.close()
             apply_application_theme("Light")
 
+    def test_main_menu_renames_and_deletes_selected_save(self) -> None:
+        _ensure_qt_application()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            saves_dir = Path(temp_dir)
+            repository = SaveRepository.create_new_save(saves_dir, "Old Save")
+            loaded_paths: list[Path] = []
+            menu = MainMenuScreen(
+                saves_dir,
+                on_new_game=lambda: None,
+                on_load_game=loaded_paths.append,
+                on_settings=lambda: None,
+                on_templates=lambda: None,
+            )
+
+            try:
+                self.assertTrue(menu.rename_save_button.isEnabled())
+                self.assertTrue(menu.delete_save_button.isEnabled())
+
+                with patch(
+                    "ai_adventure.ui.main_window.QInputDialog.getText",
+                    return_value=("Renamed Save", True),
+                ):
+                    menu.rename_save_button.click()
+
+                self.assertEqual(SaveRepository(repository.db_path).get_meta("title"), "Renamed Save")
+                self.assertIn("Renamed Save", menu.save_combo.itemText(0))
+
+                with patch(
+                    "ai_adventure.ui.main_window.QMessageBox.question",
+                    return_value=QMessageBox.StandardButton.Yes,
+                ):
+                    menu.delete_save_button.click()
+
+                self.assertFalse(repository.db_path.exists())
+                self.assertEqual(menu.save_combo.currentData(), None)
+                self.assertFalse(menu.load_button.isEnabled())
+                self.assertFalse(menu.rename_save_button.isEnabled())
+                self.assertFalse(menu.delete_save_button.isEnabled())
+            finally:
+                menu.close()
+
     def test_start_new_game_wizard_prompts_for_new_name_after_duplicate(self) -> None:
         _ensure_qt_application()
 
@@ -3568,6 +3786,14 @@ class MainWindowTests(unittest.TestCase):
                         "value_base_units": 4,
                     }
                 ],
+                "starting_npcs": [
+                    {
+                        "name": "Quartermaster Vale",
+                        "location": "Rainmarket Station",
+                        "description": "Sells travel supplies with exact wording.",
+                        "description_mode": "exact",
+                    }
+                ],
                 "starting_task": {
                     "mode": "custom",
                     "task": {
@@ -3626,8 +3852,25 @@ class MainWindowTests(unittest.TestCase):
         self.assertEqual(_table_cell(wizard.starter_items_table, 0, 2, QLineEdit).text(), "Tool")
         self.assertEqual(_table_cell(wizard.starter_items_table, 0, 3, QLineEdit).text(), "Case notes.")
         self.assertEqual(_table_cell(wizard.starter_items_table, 0, 4, QSpinBox).value(), 4)
+        self.assertEqual(wizard.starting_npcs_table.rowCount(), 1)
+        self.assertEqual(
+            _table_cell(wizard.starting_npcs_table, 0, 0, QLineEdit).text(),
+            "Quartermaster Vale",
+        )
+        self.assertEqual(
+            _table_cell(wizard.starting_npcs_table, 0, 1, QLineEdit).text(),
+            "Rainmarket Station",
+        )
+        self.assertEqual(
+            _table_cell(wizard.starting_npcs_table, 0, 2, QLineEdit).text(),
+            "Sells travel supplies with exact wording.",
+        )
+        self.assertEqual(
+            _table_cell(wizard.starting_npcs_table, 0, 3, QComboBox).currentData(),
+            "exact",
+        )
         self.assertEqual(wizard.starting_task_mode_combo.currentData(), "custom")
-        self.assertTrue(wizard.starting_task_custom_group.isVisible())
+        self.assertFalse(wizard.starting_task_custom_group.isHidden())
         self.assertEqual(wizard.starting_task_name_input.text(), "Find the Canal Ledger")
         self.assertEqual(
             wizard.starting_task_description_input.toPlainText(),
@@ -3666,6 +3909,14 @@ class MainWindowTests(unittest.TestCase):
         self.assertEqual(setup["starter_items"][0]["quantity"], 1)
         self.assertEqual(setup["starter_items"][0]["description"], "Case notes.")
         self.assertEqual(setup["starter_items"][0]["value_base_units"], 4)
+        self.assertEqual(setup["starting_npcs"][0]["name"], "Quartermaster Vale")
+        self.assertEqual(setup["starting_npcs"][0]["location"], "Rainmarket Station")
+        self.assertEqual(
+            setup["starting_npcs"][0]["description"],
+            "Sells travel supplies with exact wording.",
+        )
+        self.assertEqual(setup["starting_npcs"][0]["description_mode"], "exact")
+        self.assertFalse(setup["starting_npcs"][0]["requires_ai_invention"])
         self.assertEqual(setup["starting_task"]["mode"], "custom")
         self.assertEqual(
             setup["starting_task"]["task"]["name"],
@@ -3844,6 +4095,55 @@ class MainWindowTests(unittest.TestCase):
             self.assertEqual(item_quantity.value(), 2)
             item_remove.click()
             self.assertEqual(wizard.starter_items_table.rowCount(), 0)
+
+            wizard._append_starter_weapon_row(
+                {
+                    "name": "Rail Pistol",
+                    "quantity": 1,
+                    "weapon_hands": "one-handed",
+                    "damage": "1d8",
+                    "attack_skill": "Ranged",
+                    "attack_range_feet": 80,
+                    "ammunition_type_required": "Rail Cells",
+                    "clip_size": 6,
+                }
+            )
+            wizard._append_starter_armor_row(
+                {
+                    "name": "Vac Suit",
+                    "quantity": 1,
+                    "covers_body_parts": ["Torso", "Arms", "Legs"],
+                    "armor_rating": 2,
+                    "value_base_units": 30,
+                }
+            )
+
+            self.assertEqual(wizard.starter_weapons_table.rowCount(), 1)
+            self.assertEqual(wizard.starter_armor_table.rowCount(), 1)
+            self.assertEqual(
+                _table_cell(wizard.starter_weapons_table, 0, 3, QLineEdit).text(),
+                "1d8",
+            )
+            self.assertEqual(
+                _table_cell(wizard.starter_armor_table, 0, 2, QLineEdit).text(),
+                "Torso, Arms, Legs",
+            )
+
+            setup = wizard.build_setup()
+            weapon = next(item for item in setup["starter_items"] if item["name"] == "Rail Pistol")
+            armor = next(item for item in setup["starter_items"] if item["name"] == "Vac Suit")
+            self.assertEqual(weapon["category"], "Weapon")
+            self.assertEqual(weapon["item_type"], "Weapon")
+            self.assertEqual(weapon["damage"], "1d8")
+            self.assertEqual(weapon["attack_skill"], "Ranged")
+            self.assertEqual(weapon["attack_range_feet"], 80)
+            self.assertEqual(weapon["ammunition_type_required"], "Rail Cells")
+            self.assertEqual(weapon["clip_size"], 6)
+            self.assertEqual(weapon["bullets_per_attack"], 1)
+            self.assertEqual(armor["category"], "Armor")
+            self.assertEqual(armor["item_type"], "Armor")
+            self.assertEqual(armor["covers_body_parts"], ["Torso", "Arms", "Legs"])
+            self.assertEqual(armor["armor_rating"], 2)
 
             wizard._append_currency_row({"name": "Bit", "plural_name": "Bits", "value": 1})
             wizard._append_currency_row({"name": "Crown", "plural_name": "Crowns", "value": 12})

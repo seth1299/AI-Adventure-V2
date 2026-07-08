@@ -85,33 +85,105 @@ AI_GENERATED_CALENDAR_FALLBACK_SETTINGS: dict[str, Any] = {
     "day_names": [
         "Dawn",
         "Bell",
-        "Hearth",
-        "Market",
-        "Lantern",
+        "Pulse",
+        "Aster",
+        "Crossing",
         "Tide",
-        "Star",
+        "Signal",
         "Rest",
     ],
     "month_names": [
-        "First Rise",
-        "Greenwake",
-        "Highsun",
-        "Goldleaf",
-        "Longshade",
-        "Deepfrost",
-        "Raincall",
-        "Bloomturn",
-        "Redharvest",
+        "First Light",
+        "Bluewake",
+        "High Zenith",
+        "Goldline",
+        "Long Drift",
+        "Deep Frost",
+        "Rain Signal",
+        "Bloomrise",
+        "Red Reach",
         "Yearsend",
     ],
     "seasons": [
-        {"name": "Waking", "weather_hint": "spring"},
-        {"name": "Highlight", "weather_hint": "summer"},
-        {"name": "Harvest", "weather_hint": "autumn"},
+        {"name": "Thaw", "weather_hint": "spring"},
+        {"name": "Zenith", "weather_hint": "summer"},
+        {"name": "Drift", "weather_hint": "autumn"},
         {"name": "Frost", "weather_hint": "winter"},
-        {"name": "Rainmoot", "weather_hint": "rainy"},
+        {"name": "Storm", "weather_hint": "rainy"},
     ],
     "time_display": "narrative",
+}
+AI_GENERATED_SCI_FI_CALENDAR_FALLBACK_SETTINGS: dict[str, Any] = {
+    "days_per_week": 8,
+    "weeks_per_month": 5,
+    "months_per_year": 10,
+    "seasons_per_year": 5,
+    "day_names": [
+        "Launch",
+        "Vector",
+        "Relay",
+        "Apex",
+        "Drift",
+        "Orbit",
+        "Signal",
+        "Rest",
+    ],
+    "month_names": [
+        "Perihelion",
+        "Blue Shift",
+        "Aphelion",
+        "Gold Transit",
+        "Long Drift",
+        "Deep Night",
+        "Signal Rain",
+        "Bloom Cycle",
+        "Red Return",
+        "Year Lock",
+    ],
+    "seasons": [
+        {"name": "Thaw", "weather_hint": "spring"},
+        {"name": "Zenith", "weather_hint": "summer"},
+        {"name": "Drift", "weather_hint": "autumn"},
+        {"name": "Shadow", "weather_hint": "winter"},
+        {"name": "Storm", "weather_hint": "rainy"},
+    ],
+    "time_display": "24_hour",
+}
+GENERIC_FANTASY_ARTISAN_CALENDAR_NAMES = {
+    "hearth",
+    "market",
+    "lantern",
+    "greenwake",
+    "goldleaf",
+    "longshade",
+    "deepfrost",
+    "raincall",
+    "bloomturn",
+    "redharvest",
+    "rainmoot",
+}
+SCI_FI_CONTEXT_MARKERS = {
+    "sci-fi",
+    "science fiction",
+    "futuristic",
+    "future",
+    "far-off year",
+    "space",
+    "starship",
+    "spaceship",
+    "planet",
+    "alien",
+    "orbital",
+    "interstellar",
+    "colony",
+    "colonial",
+    "station",
+    "cyberpunk",
+    "android",
+    "research expedition",
+    "crash-land",
+    "crash landing",
+    "crash-landed",
 }
 
 
@@ -164,6 +236,7 @@ def normalize_new_game_setup(raw_setup: Any) -> dict[str, Any]:
     custom_ai_context = _clean_text(raw_ai_settings.get("additional_context"))
     skills = _normalize_skills(raw_setup.get("skills", []))
     starter_items = _normalize_starter_items(raw_setup.get("starter_items", []))
+    starting_npcs = _normalize_starting_npcs(raw_setup.get("starting_npcs", []))
     starting_task = _normalize_starting_task(
         raw_setup.get("starting_task", raw_setup.get("starting_quest", {}))
     )
@@ -178,6 +251,7 @@ def normalize_new_game_setup(raw_setup: Any) -> dict[str, Any]:
         },
         "skills": skills,
         "starter_items": starter_items,
+        "starting_npcs": starting_npcs,
         "starting_task": starting_task,
         "calendar": calendar_settings,
         "audio": audio_settings,
@@ -341,11 +415,15 @@ def build_new_game_setup_packet(
             ),
             "narration_preferences": (
                 "Use setup.narration.tense_label and setup.narration.style_label "
-                "for introductory_message and other player-facing prose. Limited "
-                "styles should stay within the player character's observed or "
-                "reasonably inferred experience. Omniscient styles may use a "
-                "broader narrative camera, but must not reveal secrets, hidden "
-                "state, mystery solutions, or NPC-private facts."
+                "for introductory_message and other player-facing prose. Do not "
+                "fall back to second-person wording unless the selected style is "
+                "Second-Person. First-person styles should use I/me/my; "
+                "third-person styles should use the player character's name or "
+                "pronouns instead of you/your. Limited styles should stay within "
+                "the player character's observed or reasonably inferred experience. "
+                "Omniscient styles may use a broader narrative camera, but must "
+                "not reveal secrets, hidden state, mystery solutions, or "
+                "NPC-private facts."
             ),
             "ai_modes": (
                 "Apply player_ai_preferences.model_tone_instruction, "
@@ -369,14 +447,29 @@ def build_new_game_setup_packet(
                 "season weather hints, and time_display. The calendar should fit "
                 "the selected genre, world culture, climate, and playstyle. Do "
                 "not copy the default Gregorian calendar, weekday names, January-"
-                "through-December month names, or generic Month 1/Month 2 style "
-                "placeholder names when AI generation is requested. If setup."
-                "calendar.ai_generated is false, use the provided calendar "
+                "through-December month names, generic Month 1/Month 2 style "
+                "placeholder names, or generic fantasy/artisan defaults when AI "
+                "generation is requested. For futuristic, space, cyberpunk, or "
+                "science-fiction settings, use calendar names that fit that "
+                "premise, such as orbital, colonial, corporate, astronomical, "
+                "technical, station, mission, or local alien-cultural terms, not "
+                "hearth, market, lantern, harvest, or village-craft naming. If "
+                "setup.calendar.ai_generated is false, use the provided calendar "
                 "settings and return calendar_settings as an empty object."
             ),
             "events": (
-                "Use structured events for any initial NPCs, requested active "
-                "tasks, or starter-world facts that should be durable. Return AI-only "
+                "Use structured events for any setup.starting_npcs rows or "
+                "requested active tasks that should be durable. The number of "
+                "NpcUpsertedEvent entries can be zero, one, or many; choose the "
+                "count from setup.starting_npcs and what the player character "
+                "would actually know at setup. Do not parse NPCs out of "
+                "ordinary setup prose or plaintext fields. For each "
+                "setup.starting_npcs row, create one NpcUpsertedEvent. Fill blank "
+                "name, location, or description fields with fitting specifics. "
+                "If description_mode is exact, copy description into "
+                "payload.public_description unchanged; if description_mode is "
+                "suggestion, treat description as inspiration and put the final "
+                "description you choose into payload.public_description. Return AI-only "
                 "hidden identities, motives, mystery solutions, off-screen plans, "
                 "and other concealed truths in the dedicated gm_secrets setup "
                 "field; never place those truths in player-facing setup fields."
@@ -453,12 +546,40 @@ def build_new_game_setup_packet(
                 "setup.start_location as inspiration that may be replaced."
             ),
             "travel_locations": (
-                "Return a locations array for the Travel tab. Include the finalized "
-                "starting location at x_miles=0 and y_miles=0 plus at least three "
-                "other player-known reachable places. Coordinates are relative map "
-                "miles. Each location needs player-facing description, terrain, "
+                "Return a locations array for the Travel tab containing exactly "
+                "the places the player character plausibly knows at setup. There "
+                "is no minimum or maximum count beyond the current starting place. "
+                "For an unknown crash-landing, isolated survival, amnesia, or "
+                "new-arrival premise, it is valid for the only known location to "
+                "be the finalized starting location at x_miles=0 and y_miles=0. "
+                "For a ranger, courier, trader, local resident, or well-traveled "
+                "character, include every important place they would reasonably "
+                "know, even six or more. Coordinates are relative map miles. Each "
+                "returned location needs player-facing description, terrain, "
                 "travel_multiplier, and route notes. Do not include hidden routes, "
-                "secrets, or GM-only information."
+                "secrets, or GM-only information, and do not include the name of "
+                "an unknown world, planet, region, or settlement unless the player "
+                "character would know that name."
+            ),
+            "setup_scope_counts": (
+                "Use zero, one, or many setup entries according to the actual "
+                "premise instead of forcing a default count. Known locations, "
+                "known NPCs, known crafting items/materials, known crafting "
+                "recipes, active tasks, secrets, and starter possessions should "
+                "all scale with the character's backstory, profession, current "
+                "situation, and player-provided context."
+            ),
+            "crafting_knowledge": (
+                "known_crafting_items and known_crafting_recipes are player-known "
+                "Crafting tab knowledge, not physical inventory. Return empty "
+                "arrays for a character with no relevant training or discoveries. "
+                "For an alchemist, cook, engineer, herbalist, survivalist, medic, "
+                "scientist, crafter, or other profession that logically starts "
+                "with practical making knowledge, return as many useful known "
+                "items/materials and recipes as fit the backstory. Recipe "
+                "ingredients must use item names from known_crafting_items or "
+                "other known item catalog entries and use quantity, measure_amount, "
+                "and measure_unit."
             ),
             "skill_generation": (
                 "If a setup.skills entry has a nonblank name, copy that exact name "
@@ -497,7 +618,12 @@ def build_new_game_setup_packet(
                 "index for any item based on that setup entry; for extra items not "
                 "based on a specific setup.starter_items entry, set source_index to "
                 "-1. Do not "
-                "include setup bookkeeping words such as Starting, Starter, Initial, "
+                "downgrade setup weapons or armor into generic items: preserve "
+                "Weapon fields such as weapon_hands, damage, attack_skill, "
+                "attack_range_feet, ammunition_type_required, clip_size, and "
+                "bullets_per_attack, and preserve Armor fields such as "
+                "covers_body_parts and armor_rating. "
+                "Do not include setup bookkeeping words such as Starting, Starter, Initial, "
                 "Amount, Quantity, Count, or Total in item names. Generalize resource "
                 "names to the actual inventory item, such as Fuel instead of Starting "
                 "Fuel Amount, Food instead of Starting Food Amount, and Water instead "
@@ -532,7 +658,7 @@ def build_new_game_setup_packet(
             "creative_ideas": (
                 "Treat creative_ideas as high-priority style seeds when inventing "
                 "names, locations, cultures, religions, foods, drinks, species, "
-                "alchemy ingredients, magic styles, and other world details. "
+                "crafting ingredients, magic styles, and other world details. "
                 "Strongly prefer the examples or close stylistic relatives over "
                 "generic training-data fantasy defaults. The banned_terms list is "
                 "a hard exclusion list, not optional style guidance: never use any "
@@ -888,18 +1014,168 @@ def _normalize_starter_items(raw_items: Any) -> list[dict[str, Any]]:
             continue
 
         items.append(
-            {
-                "name": name,
-                "category": _clean_text(raw_item.get("category")) or "Item",
-                "quantity": max(1, _safe_int(raw_item.get("quantity"), 1)),
-                "description": _clean_text(raw_item.get("description")),
-                "value_base_units": max(0, _safe_int(raw_item.get("value_base_units"), 0)),
-                "item_request": item_request,
-                "requires_ai_invention": requires_ai_invention,
-            }
+            _starter_item_with_metadata(
+                raw_item,
+                name=name,
+                category=_clean_text(raw_item.get("category")) or "Item",
+                quantity=max(1, _safe_int(raw_item.get("quantity"), 1)),
+                description=_clean_text(raw_item.get("description")),
+                value_base_units=max(0, _safe_int(raw_item.get("value_base_units"), 0)),
+                item_request=item_request,
+                requires_ai_invention=requires_ai_invention,
+            )
         )
 
     return items
+
+
+def _normalize_starting_npcs(raw_npcs: Any) -> list[dict[str, Any]]:
+    """Normalizes structured requested starting NPC rows."""
+
+    if not isinstance(raw_npcs, list):
+        return []
+
+    npcs: list[dict[str, Any]] = []
+
+    for raw_npc in raw_npcs:
+        if not isinstance(raw_npc, dict):
+            continue
+
+        name = _clean_text(raw_npc.get("name", raw_npc.get("display_name")))
+        location = _clean_text(raw_npc.get("location"))
+        description = _clean_text(
+            raw_npc.get("description", raw_npc.get("public_description"))
+        )
+        description_mode = _clean_text(
+            raw_npc.get("description_mode", raw_npc.get("mode"))
+        ).casefold()
+
+        if description_mode not in {"suggestion", "exact"}:
+            description_mode = "suggestion"
+
+        npcs.append(
+            {
+                "name": name,
+                "location": location,
+                "description": description,
+                "description_mode": description_mode,
+                "requires_ai_invention": not name or not location or not description,
+            }
+        )
+
+    return npcs
+
+
+def _starter_item_with_metadata(
+    raw_item: dict[str, Any],
+    **base_item: Any,
+) -> dict[str, Any]:
+    """Preserves starter equipment fields that matter after AI finalization."""
+
+    category = _clean_text(base_item.get("category")).title()
+    metadata = raw_item.get("metadata", {})
+    metadata = metadata if isinstance(metadata, dict) else {}
+    item_type = (
+        _clean_text(raw_item.get("item_type"))
+        or _clean_text(metadata.get("item_type"))
+        or category
+    ).title()
+
+    if item_type == "Weapon" or category == "Weapon":
+        base_item["category"] = "Weapon"
+        base_item["item_type"] = "Weapon"
+        base_item["weapon_hands"] = (
+            _clean_text(raw_item.get("weapon_hands"))
+            or _clean_text(metadata.get("weapon_hands"))
+            or "one-handed"
+        )
+        base_item["damage"] = (
+            _clean_text(raw_item.get("damage"))
+            or _clean_text(metadata.get("damage"))
+            or "1d6"
+        )
+        base_item["damage_type"] = (
+            _clean_text(raw_item.get("damage_type"))
+            or _clean_text(metadata.get("damage_type"))
+        )
+        base_item["attack_skill"] = (
+            _clean_text(raw_item.get("attack_skill"))
+            or _clean_text(metadata.get("attack_skill"))
+            or "Melee"
+        )
+        base_item["attack_range_feet"] = max(
+            0,
+            _safe_int(
+                raw_item.get(
+                    "attack_range_feet",
+                    metadata.get("attack_range_feet", 5),
+                ),
+                5,
+            ),
+        )
+        ammunition_type_required = (
+            _clean_text(raw_item.get("ammunition_type_required"))
+            or _clean_text(metadata.get("ammunition_type_required"))
+        )
+        base_item["ammunition_type_required"] = ammunition_type_required
+        base_item["clip_size"] = max(
+            0,
+            _safe_int(raw_item.get("clip_size", metadata.get("clip_size", 0)), 0),
+        )
+        base_item["bullets_per_attack"] = max(
+            0,
+            _safe_int(
+                raw_item.get(
+                    "bullets_per_attack",
+                    metadata.get("bullets_per_attack", 0),
+                ),
+                0,
+            ),
+        )
+        return base_item
+
+    if item_type == "Armor" or category in {"Armor", "Armour", "Shield"}:
+        base_item["category"] = "Armor"
+        base_item["item_type"] = "Armor"
+        base_item["covers_body_parts"] = _normalize_text_list(
+            raw_item.get("covers_body_parts", metadata.get("covers_body_parts", []))
+        )
+        base_item["armor_rating"] = max(
+            0,
+            _safe_int(
+                raw_item.get("armor_rating", metadata.get("armor_rating", 0)),
+                0,
+            ),
+        )
+        return base_item
+
+    if item_type in {"Ammunition", "Ammo"}:
+        base_item["category"] = "Ammunition"
+        base_item["item_type"] = "Ammunition"
+        base_item["ammunition_type"] = (
+            _clean_text(raw_item.get("ammunition_type"))
+            or _clean_text(metadata.get("ammunition_type"))
+            or str(base_item.get("name", ""))
+        )
+
+    return base_item
+
+
+def _normalize_text_list(raw_values: Any) -> list[str]:
+    """Returns a clean list of strings from a list or comma-separated text."""
+
+    if isinstance(raw_values, list):
+        return [
+            _clean_text(value)
+            for value in raw_values
+            if _clean_text(value)
+        ]
+
+    return [
+        part.strip()
+        for part in str(raw_values or "").split(",")
+        if part.strip()
+    ]
 
 
 def _normalize_starting_task(raw_task_setup: Any) -> dict[str, Any]:
@@ -1111,18 +1387,61 @@ def calendar_looks_like_default_gregorian(raw_calendar: Any) -> bool:
     )
 
 
-def ai_generated_calendar_settings_or_fallback(raw_calendar: Any) -> dict[str, Any]:
-    """Returns AI calendar settings, replacing default Gregorian output."""
+def ai_generated_calendar_settings_or_fallback(
+    raw_calendar: Any,
+    *,
+    genre_hint: str = "",
+) -> dict[str, Any]:
+    """Returns AI calendar settings, replacing incompatible placeholder output."""
+
+    fallback = _ai_generated_calendar_fallback_for_genre(genre_hint)
 
     if calendar_looks_like_default_gregorian(raw_calendar):
-        return _copy_calendar_settings(AI_GENERATED_CALENDAR_FALLBACK_SETTINGS)
+        return _copy_calendar_settings(fallback)
 
     clean_calendar = normalize_calendar_settings(raw_calendar)
 
     if calendar_looks_like_default_gregorian(clean_calendar):
-        return _copy_calendar_settings(AI_GENERATED_CALENDAR_FALLBACK_SETTINGS)
+        return _copy_calendar_settings(fallback)
+
+    if (
+        _looks_like_sci_fi_context(genre_hint)
+        and calendar_looks_like_generic_fantasy_artisan(clean_calendar)
+    ):
+        return _copy_calendar_settings(AI_GENERATED_SCI_FI_CALENDAR_FALLBACK_SETTINGS)
 
     return clean_calendar
+
+
+def calendar_looks_like_generic_fantasy_artisan(raw_calendar: Any) -> bool:
+    """Returns True for the old Hearth/Market-style AI calendar fallback."""
+
+    if not isinstance(raw_calendar, dict) or not raw_calendar:
+        return False
+
+    calendar = normalize_calendar_settings(raw_calendar)
+    names = set(_folded_names(calendar["day_names"]))
+    names.update(_folded_names(calendar["month_names"]))
+    names.update(_folded_names([season["name"] for season in calendar["seasons"]]))
+
+    return bool(names.intersection(GENERIC_FANTASY_ARTISAN_CALENDAR_NAMES))
+
+
+def _ai_generated_calendar_fallback_for_genre(genre_hint: str) -> dict[str, Any]:
+    """Returns a fallback calendar suited to broad setup genre hints."""
+
+    if _looks_like_sci_fi_context(genre_hint):
+        return AI_GENERATED_SCI_FI_CALENDAR_FALLBACK_SETTINGS
+
+    return AI_GENERATED_CALENDAR_FALLBACK_SETTINGS
+
+
+def _looks_like_sci_fi_context(value: str) -> bool:
+    """Returns True when setup prose clearly asks for a futuristic premise."""
+
+    clean_value = str(value or "").casefold()
+
+    return any(marker in clean_value for marker in SCI_FI_CONTEXT_MARKERS)
 
 
 def _copy_calendar_settings(settings: dict[str, Any]) -> dict[str, Any]:

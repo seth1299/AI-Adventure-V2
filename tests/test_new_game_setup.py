@@ -9,6 +9,7 @@ from ai_adventure.new_game_setup import (
     SKILL_LEVEL_PLAN,
     ai_generated_calendar_settings_or_fallback,
     build_new_game_setup_packet,
+    calendar_looks_like_generic_fantasy_artisan,
     calendar_looks_like_default_gregorian,
     fallback_introductory_message,
     fallback_world_summary,
@@ -36,6 +37,14 @@ class NewGameSetupTests(unittest.TestCase):
                 "character": {"name": "Iris Vale"},
                 "skills": [{"name": f"Skill {index}"} for index in range(15)],
                 "starter_items": [{"name": "Notebook"}],
+                "starting_npcs": [
+                    {
+                        "name": "Quartermaster Vale",
+                        "location": "Rainmarket Station",
+                        "description": "Sells practical travel supplies.",
+                        "description_mode": "exact",
+                    }
+                ],
                 "calendar": {"calendar_type": "gregorian"},
                 "narration": {
                     "tense": "past",
@@ -60,6 +69,10 @@ class NewGameSetupTests(unittest.TestCase):
         self.assertEqual(setup["skills"][0]["description"], "")
         self.assertTrue(setup["skills"][0]["requires_ai_invention"])
         self.assertEqual(len(setup["starter_items"]), 1)
+        self.assertEqual(len(setup["starting_npcs"]), 1)
+        self.assertEqual(setup["starting_npcs"][0]["name"], "Quartermaster Vale")
+        self.assertEqual(setup["starting_npcs"][0]["description_mode"], "exact")
+        self.assertFalse(setup["starting_npcs"][0]["requires_ai_invention"])
         self.assertEqual(setup["specified_genre"], "Realistic detective mystery")
         self.assertEqual(setup["start_location_mode"], "suggestion")
         self.assertEqual(setup["calendar"]["month_names"][0], "January")
@@ -187,7 +200,56 @@ class NewGameSetupTests(unittest.TestCase):
 
         self.assertEqual(fallback["days_per_week"], 8)
         self.assertEqual(fallback["day_names"][0], "Dawn")
-        self.assertEqual(fallback["month_names"][0], "First Rise")
+        self.assertEqual(fallback["month_names"][0], "First Light")
+
+    def test_ai_generated_calendar_fallback_rejects_artisan_names_for_sci_fi(self) -> None:
+        raw_calendar = {
+            "days_per_week": 8,
+            "weeks_per_month": 5,
+            "months_per_year": 10,
+            "seasons_per_year": 5,
+            "day_names": [
+                "Dawn",
+                "Bell",
+                "Hearth",
+                "Market",
+                "Lantern",
+                "Tide",
+                "Star",
+                "Rest",
+            ],
+            "month_names": [
+                "First Rise",
+                "Greenwake",
+                "Highsun",
+                "Goldleaf",
+                "Longshade",
+                "Deepfrost",
+                "Raincall",
+                "Bloomturn",
+                "Redharvest",
+                "Yearsend",
+            ],
+            "seasons": [
+                {"name": "Waking", "weather_hint": "spring"},
+                {"name": "Highlight", "weather_hint": "summer"},
+                {"name": "Harvest", "weather_hint": "autumn"},
+                {"name": "Frost", "weather_hint": "winter"},
+                {"name": "Rainmoot", "weather_hint": "rainy"},
+            ],
+            "time_display": "12_hour",
+        }
+
+        fallback = ai_generated_calendar_settings_or_fallback(
+            raw_calendar,
+            genre_hint="Futuristic sci-fi crash landing on an unknown alien planet.",
+        )
+
+        self.assertTrue(calendar_looks_like_generic_fantasy_artisan(raw_calendar))
+        self.assertEqual(fallback["day_names"][0], "Launch")
+        self.assertEqual(fallback["month_names"][0], "Perihelion")
+        self.assertNotIn("Hearth", fallback["day_names"])
+        self.assertNotIn("Market", fallback["day_names"])
 
     def test_parse_starter_items_text_supports_plain_and_structured_lines(self) -> None:
         items = parse_starter_items_text(
@@ -336,6 +398,36 @@ class NewGameSetupTests(unittest.TestCase):
             self.assertNotEqual(first_repository.db_path, second_repository.db_path)
             self.assertTrue(first_repository.db_path.exists())
             self.assertTrue(second_repository.db_path.exists())
+
+    def test_save_repository_renames_and_deletes_existing_save(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            saves_dir = Path(temp_dir)
+            repository = SaveRepository.create_new_save(saves_dir, "Old Save")
+            db_path = repository.db_path
+
+            SaveRepository.rename_save(saves_dir, db_path, "New Save")
+
+            renamed_repository = SaveRepository(db_path)
+            self.assertEqual(renamed_repository.get_meta("title"), "New Save")
+            self.assertTrue(SaveRepository.save_title_exists(saves_dir, "new save"))
+
+            SaveRepository.delete_save(saves_dir, db_path)
+
+            self.assertFalse(db_path.exists())
+            self.assertEqual(SaveRepository.list_saves(saves_dir), [])
+
+    def test_save_repository_rename_rejects_duplicate_title(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            saves_dir = Path(temp_dir)
+            first_repository = SaveRepository.create_new_save(saves_dir, "First Save")
+            SaveRepository.create_new_save(saves_dir, "Second Save")
+
+            with self.assertRaises(DuplicateSaveTitleError):
+                SaveRepository.rename_save(
+                    saves_dir,
+                    first_repository.db_path,
+                    " second   save ",
+                )
 
     def test_create_new_save_skips_ai_item_requests_until_finalized(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -697,6 +789,14 @@ class NewGameSetupTests(unittest.TestCase):
         self.assertIn("starting_location", packet["requirements"])
         self.assertIn("does not need to start in a tavern", packet["requirements"]["starting_location"])
         self.assertIn("short, broad place name", packet["requirements"]["starting_location"])
+        self.assertIn("travel_locations", packet["requirements"])
+        self.assertIn("only known location", packet["requirements"]["travel_locations"])
+        self.assertIn("six or more", packet["requirements"]["travel_locations"])
+        self.assertIn("setup_scope_counts", packet["requirements"])
+        self.assertIn("zero, one, or many", packet["requirements"]["setup_scope_counts"])
+        self.assertIn("crafting_knowledge", packet["requirements"])
+        self.assertIn("known_crafting_items", packet["requirements"]["crafting_knowledge"])
+        self.assertIn("not physical inventory", packet["requirements"]["crafting_knowledge"])
         self.assertIn("skill_generation", packet["requirements"])
         self.assertIn("copy that exact name", packet["requirements"]["skill_generation"])
         self.assertIn("generalized gameplay capabilities", packet["requirements"]["skill_generation"])
@@ -813,6 +913,97 @@ class NewGameSetupTests(unittest.TestCase):
             packet["requirements"]["starter_inventory"],
         )
         self.assertEqual(len(packet["setup"]["starter_items"]), 12)
+
+    def test_setup_packet_uses_structured_starting_npcs_instead_of_plaintext_parsing(self) -> None:
+        setup = normalize_new_game_setup(
+            {
+                "world_context": (
+                    "Her team included the captain, the engineer, and the weapons expert."
+                ),
+                "starting_npcs": [
+                    {},
+                    {
+                        "name": "Captain Ives",
+                        "location": "",
+                        "description": "A tense expedition captain.",
+                        "description_mode": "suggestion",
+                    },
+                    {
+                        "name": "",
+                        "location": "Supply Deck",
+                        "description": "Do not change this exact description.",
+                        "description_mode": "exact",
+                    },
+                ],
+            }
+        )
+
+        packet = build_new_game_setup_packet(setup)
+
+        self.assertEqual(len(packet["setup"]["starting_npcs"]), 3)
+        self.assertTrue(packet["setup"]["starting_npcs"][0]["requires_ai_invention"])
+        self.assertEqual(packet["setup"]["starting_npcs"][0]["name"], "")
+        self.assertTrue(packet["setup"]["starting_npcs"][1]["requires_ai_invention"])
+        self.assertEqual(
+            packet["setup"]["starting_npcs"][2]["description_mode"],
+            "exact",
+        )
+        self.assertIn("setup.starting_npcs", packet["requirements"]["events"])
+        self.assertIn("payload.public_description", packet["requirements"]["events"])
+        self.assertIn("Do not parse NPCs out of ordinary setup prose", packet["requirements"]["events"])
+        self.assertNotIn(
+            "the captain, the engineer, and the weapons expert",
+            packet["requirements"]["events"],
+        )
+
+    def test_setup_packet_preserves_weapon_armor_metadata_for_gemini(self) -> None:
+        setup = normalize_new_game_setup(
+            {
+                "world_context": (
+                    "Her team included the captain, the engineer, and the weapons expert."
+                ),
+                "starter_items": [
+                    {
+                        "name": "Rail Pistol",
+                        "category": "Weapon",
+                        "quantity": 1,
+                        "weapon_hands": "one-handed",
+                        "damage": "1d8",
+                        "attack_skill": "Ranged",
+                        "attack_range_feet": 80,
+                        "ammunition_type_required": "Rail Cells",
+                        "clip_size": 6,
+                        "bullets_per_attack": 1,
+                    },
+                    {
+                        "name": "Vac Suit",
+                        "category": "Armor",
+                        "covers_body_parts": ["Torso", "Arms", "Legs"],
+                        "armor_rating": 2,
+                    },
+                ],
+            }
+        )
+
+        packet = build_new_game_setup_packet(setup)
+        weapon = packet["setup"]["starter_items"][0]
+        armor = packet["setup"]["starter_items"][1]
+
+        self.assertEqual(weapon["item_type"], "Weapon")
+        self.assertEqual(weapon["damage"], "1d8")
+        self.assertEqual(weapon["ammunition_type_required"], "Rail Cells")
+        self.assertEqual(weapon["clip_size"], 6)
+        self.assertEqual(armor["item_type"], "Armor")
+        self.assertEqual(armor["covers_body_parts"], ["Torso", "Arms", "Legs"])
+        self.assertEqual(armor["armor_rating"], 2)
+        self.assertIn(
+            "Do not downgrade setup weapons or armor into generic items",
+            packet["requirements"]["starter_inventory"],
+        )
+        self.assertIn(
+            "setup.starting_npcs",
+            packet["requirements"]["events"],
+        )
 
 
 if __name__ == "__main__":
