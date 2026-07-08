@@ -37,6 +37,19 @@ class NewGameSetupTests(unittest.TestCase):
                 "character": {"name": "Iris Vale"},
                 "skills": [{"name": f"Skill {index}"} for index in range(15)],
                 "starter_items": [{"name": "Notebook"}],
+                "starting_locations": [
+                    {
+                        "name": "Rainmarket Station",
+                        "description": "A canal station under an old clock.",
+                        "location_mode": "exact",
+                    },
+                    {
+                        "name": "Blacksmith Shop",
+                        "description": "A forge inside the station concourse.",
+                        "is_sublocation": True,
+                        "parent_location": "Rainmarket Station",
+                    }
+                ],
                 "starting_npcs": [
                     {
                         "name": "Quartermaster Vale",
@@ -69,6 +82,15 @@ class NewGameSetupTests(unittest.TestCase):
         self.assertEqual(setup["skills"][0]["description"], "")
         self.assertTrue(setup["skills"][0]["requires_ai_invention"])
         self.assertEqual(len(setup["starter_items"]), 1)
+        self.assertEqual(len(setup["starting_locations"]), 2)
+        self.assertEqual(setup["starting_locations"][0]["name"], "Rainmarket Station")
+        self.assertEqual(setup["starting_locations"][0]["location_mode"], "exact")
+        self.assertFalse(setup["starting_locations"][0]["requires_ai_invention"])
+        self.assertTrue(setup["starting_locations"][1]["is_sublocation"])
+        self.assertEqual(
+            setup["starting_locations"][1]["parent_location"],
+            "Rainmarket Station",
+        )
         self.assertEqual(len(setup["starting_npcs"]), 1)
         self.assertEqual(setup["starting_npcs"][0]["name"], "Quartermaster Vale")
         self.assertEqual(setup["starting_npcs"][0]["description_mode"], "exact")
@@ -790,6 +812,11 @@ class NewGameSetupTests(unittest.TestCase):
         self.assertIn("does not need to start in a tavern", packet["requirements"]["starting_location"])
         self.assertIn("short, broad place name", packet["requirements"]["starting_location"])
         self.assertIn("travel_locations", packet["requirements"])
+        self.assertIn("setup.starting_locations", packet["requirements"]["travel_locations"])
+        self.assertIn("location_mode is exact", packet["requirements"]["travel_locations"])
+        self.assertIn("do not parse starting locations", packet["requirements"]["travel_locations"])
+        self.assertIn("is_sublocation is true", packet["requirements"]["travel_locations"])
+        self.assertIn("parent_location is set", packet["requirements"]["travel_locations"])
         self.assertIn("only known location", packet["requirements"]["travel_locations"])
         self.assertIn("six or more", packet["requirements"]["travel_locations"])
         self.assertIn("setup_scope_counts", packet["requirements"])
@@ -954,6 +981,57 @@ class NewGameSetupTests(unittest.TestCase):
         self.assertNotIn(
             "the captain, the engineer, and the weapons expert",
             packet["requirements"]["events"],
+        )
+
+    def test_setup_packet_uses_structured_starting_locations_instead_of_plaintext_parsing(self) -> None:
+        setup = normalize_new_game_setup(
+            {
+                "world_context": (
+                    "The city mentions a canal station, a market, and a north road in passing."
+                ),
+                "starting_locations": [
+                    {},
+                    {
+                        "name": "Rainmarket Station",
+                        "description": "A canal station under an old clock.",
+                        "location_mode": "exact",
+                    },
+                    {
+                        "name": "North Road",
+                        "description": "",
+                        "location_mode": "suggestion",
+                        "is_sublocation": True,
+                        "parent_location": "Rainmarket Station",
+                    },
+                ],
+            }
+        )
+
+        packet = build_new_game_setup_packet(setup)
+
+        self.assertEqual(len(packet["setup"]["starting_locations"]), 3)
+        self.assertTrue(packet["setup"]["starting_locations"][0]["requires_ai_invention"])
+        self.assertEqual(packet["setup"]["starting_locations"][0]["name"], "")
+        self.assertEqual(
+            packet["setup"]["starting_locations"][1]["location_mode"],
+            "exact",
+        )
+        self.assertTrue(packet["setup"]["starting_locations"][2]["requires_ai_invention"])
+        self.assertTrue(packet["setup"]["starting_locations"][2]["is_sublocation"])
+        self.assertEqual(
+            packet["setup"]["starting_locations"][2]["parent_location"],
+            "Rainmarket Station",
+        )
+        self.assertIn("setup.starting_locations", packet["requirements"]["travel_locations"])
+        self.assertIn("locations entry unchanged", packet["requirements"]["travel_locations"])
+        self.assertIn("parent_location is set", packet["requirements"]["travel_locations"])
+        self.assertIn(
+            "do not parse starting locations out of ordinary setup prose",
+            packet["requirements"]["travel_locations"],
+        )
+        self.assertNotIn(
+            "a canal station, a market, and a north road",
+            packet["requirements"]["travel_locations"],
         )
 
     def test_setup_packet_preserves_weapon_armor_metadata_for_gemini(self) -> None:

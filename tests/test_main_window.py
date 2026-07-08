@@ -3786,6 +3786,20 @@ class MainWindowTests(unittest.TestCase):
                         "value_base_units": 4,
                     }
                 ],
+                "starting_locations": [
+                    {
+                        "name": "Rainmarket Station",
+                        "description": "A canal station under an old clock.",
+                        "location_mode": "exact",
+                    },
+                    {
+                        "name": "Blacksmith Shop",
+                        "description": "A forge inside the station concourse.",
+                        "location_mode": "suggestion",
+                        "is_sublocation": True,
+                        "parent_location": "Rainmarket Station",
+                    }
+                ],
                 "starting_npcs": [
                     {
                         "name": "Quartermaster Vale",
@@ -3852,6 +3866,31 @@ class MainWindowTests(unittest.TestCase):
         self.assertEqual(_table_cell(wizard.starter_items_table, 0, 2, QLineEdit).text(), "Tool")
         self.assertEqual(_table_cell(wizard.starter_items_table, 0, 3, QLineEdit).text(), "Case notes.")
         self.assertEqual(_table_cell(wizard.starter_items_table, 0, 4, QSpinBox).value(), 4)
+        self.assertEqual(wizard.starting_locations_table.rowCount(), 2)
+        self.assertEqual(wizard.start_location_combo.currentText(), "Rainmarket Station")
+        self.assertEqual(
+            _table_cell(wizard.starting_locations_table, 0, 0, QLineEdit).text(),
+            "Rainmarket Station",
+        )
+        self.assertEqual(
+            _table_cell(wizard.starting_locations_table, 0, 1, QLineEdit).text(),
+            "A canal station under an old clock.",
+        )
+        self.assertEqual(
+            _table_cell(wizard.starting_locations_table, 0, 2, QComboBox).currentData(),
+            "exact",
+        )
+        self.assertEqual(
+            _table_cell(wizard.starting_locations_table, 1, 0, QLineEdit).text(),
+            "Blacksmith Shop",
+        )
+        self.assertTrue(
+            _table_cell(wizard.starting_locations_table, 1, 3, QCheckBox).isChecked()
+        )
+        self.assertEqual(
+            _table_cell(wizard.starting_locations_table, 1, 4, QComboBox).currentText(),
+            "Rainmarket Station",
+        )
         self.assertEqual(wizard.starting_npcs_table.rowCount(), 1)
         self.assertEqual(
             _table_cell(wizard.starting_npcs_table, 0, 0, QLineEdit).text(),
@@ -3909,6 +3948,21 @@ class MainWindowTests(unittest.TestCase):
         self.assertEqual(setup["starter_items"][0]["quantity"], 1)
         self.assertEqual(setup["starter_items"][0]["description"], "Case notes.")
         self.assertEqual(setup["starter_items"][0]["value_base_units"], 4)
+        self.assertEqual(setup["starting_locations"][0]["name"], "Rainmarket Station")
+        self.assertEqual(
+            setup["starting_locations"][0]["description"],
+            "A canal station under an old clock.",
+        )
+        self.assertEqual(setup["starting_locations"][0]["location_mode"], "exact")
+        self.assertFalse(setup["starting_locations"][0]["requires_ai_invention"])
+        self.assertEqual(setup["starting_locations"][1]["name"], "Blacksmith Shop")
+        self.assertTrue(setup["starting_locations"][1]["is_sublocation"])
+        self.assertEqual(
+            setup["starting_locations"][1]["parent_location"],
+            "Rainmarket Station",
+        )
+        self.assertEqual(setup["start_location"], "Rainmarket Station")
+        self.assertEqual(setup["start_location_mode"], "exact")
         self.assertEqual(setup["starting_npcs"][0]["name"], "Quartermaster Vale")
         self.assertEqual(setup["starting_npcs"][0]["location"], "Rainmarket Station")
         self.assertEqual(
@@ -3948,6 +4002,56 @@ class MainWindowTests(unittest.TestCase):
         self.assertEqual(setup["start_location_mode"], "exact")
         self.assertIn("Bread costs 2 base units", setup["currency_description"])
         wizard.close()
+
+    def test_new_game_wizard_location_dropdowns_update_live(self) -> None:
+        _ensure_qt_application()
+        wizard = NewGameWizard()
+
+        try:
+            wizard._append_starting_location_row({})
+            _table_cell(wizard.starting_locations_table, 0, 0, QLineEdit).setText(
+                "Broad City"
+            )
+            _table_cell(wizard.starting_locations_table, 0, 1, QLineEdit).setText(
+                "A compact city around a canal."
+            )
+            wizard._append_starting_location_row({})
+            _table_cell(wizard.starting_locations_table, 1, 0, QLineEdit).setText(
+                "Blacksmith Shop"
+            )
+            _table_cell(wizard.starting_locations_table, 1, 1, QLineEdit).setText(
+                "A forge tucked into a city arcade."
+            )
+            _table_cell(wizard.starting_locations_table, 1, 3, QCheckBox).setChecked(
+                True
+            )
+            parent_combo = _table_cell(
+                wizard.starting_locations_table,
+                1,
+                4,
+                QComboBox,
+            )
+
+            self.assertNotEqual(parent_combo.findText("Broad City"), -1)
+            self.assertEqual(parent_combo.findText("Blacksmith Shop"), -1)
+            parent_combo.setCurrentIndex(parent_combo.findText("Broad City"))
+
+            start_index = wizard.start_location_combo.findText("Blacksmith Shop")
+            self.assertNotEqual(start_index, -1)
+            wizard.start_location_combo.setCurrentIndex(start_index)
+
+            setup = wizard.build_setup()
+
+            self.assertEqual(setup["start_location"], "Blacksmith Shop")
+            self.assertEqual(setup["starting_locations"][1]["parent_location"], "Broad City")
+
+            _table_cell(wizard.starting_locations_table, 0, 5, QPushButton).click()
+
+            self.assertEqual(parent_combo.findText("Broad City"), -1)
+            self.assertNotEqual(wizard.start_location_combo.findText("Blacksmith Shop"), -1)
+            self.assertEqual(wizard.start_location_combo.currentText(), "Blacksmith Shop")
+        finally:
+            wizard.close()
 
     def test_new_game_wizard_ai_settings_button_updates_setup(self) -> None:
         _ensure_qt_application()

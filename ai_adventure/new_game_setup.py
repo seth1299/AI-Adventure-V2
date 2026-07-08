@@ -237,6 +237,9 @@ def normalize_new_game_setup(raw_setup: Any) -> dict[str, Any]:
     skills = _normalize_skills(raw_setup.get("skills", []))
     starter_items = _normalize_starter_items(raw_setup.get("starter_items", []))
     starting_npcs = _normalize_starting_npcs(raw_setup.get("starting_npcs", []))
+    starting_locations = _normalize_starting_locations(
+        raw_setup.get("starting_locations", [])
+    )
     starting_task = _normalize_starting_task(
         raw_setup.get("starting_task", raw_setup.get("starting_quest", {}))
     )
@@ -252,6 +255,7 @@ def normalize_new_game_setup(raw_setup: Any) -> dict[str, Any]:
         "skills": skills,
         "starter_items": starter_items,
         "starting_npcs": starting_npcs,
+        "starting_locations": starting_locations,
         "starting_task": starting_task,
         "calendar": calendar_settings,
         "audio": audio_settings,
@@ -549,6 +553,20 @@ def build_new_game_setup_packet(
                 "Return a locations array for the Travel tab containing exactly "
                 "the places the player character plausibly knows at setup. There "
                 "is no minimum or maximum count beyond the current starting place. "
+                "Use setup.starting_locations as structured player-requested "
+                "starting Travel-tab locations; do not parse starting locations "
+                "out of ordinary setup prose or plaintext fields. For each "
+                "setup.starting_locations row, include one corresponding entry in "
+                "locations. Fill blank name or description fields with fitting "
+                "specifics. If location_mode is exact, copy name and description "
+                "into the locations entry unchanged, while still filling terrain, "
+                "coordinates, travel_multiplier, and route notes. If location_mode "
+                "is suggestion, treat name and description as inspiration and put "
+                "the finalized player-facing values in the locations entry. "
+                "If is_sublocation is true and parent_location is set, treat the "
+                "location as existing inside that parent location; reflect that "
+                "relationship in the returned location description and travel_notes "
+                "without creating a separate hidden route. "
                 "For an unknown crash-landing, isolated survival, amnesia, or "
                 "new-arrival premise, it is valid for the only known location to "
                 "be the finalized starting location at x_miles=0 and y_miles=0. "
@@ -1064,6 +1082,51 @@ def _normalize_starting_npcs(raw_npcs: Any) -> list[dict[str, Any]]:
         )
 
     return npcs
+
+
+def _normalize_starting_locations(raw_locations: Any) -> list[dict[str, Any]]:
+    """Normalizes structured requested starting Travel-tab location rows."""
+
+    if not isinstance(raw_locations, list):
+        return []
+
+    locations: list[dict[str, Any]] = []
+
+    for raw_location in raw_locations:
+        if not isinstance(raw_location, dict):
+            continue
+
+        name = _clean_text(raw_location.get("name"))
+        description = _clean_text(raw_location.get("description"))
+        location_mode = _clean_text(
+            raw_location.get("location_mode", raw_location.get("mode"))
+        ).casefold()
+
+        if location_mode not in {"suggestion", "exact"}:
+            location_mode = "suggestion"
+        is_sublocation = _safe_bool(
+            raw_location.get("is_sublocation", raw_location.get("sublocation")),
+            False,
+        )
+        parent_location = _clean_text(
+            raw_location.get(
+                "parent_location",
+                raw_location.get("containing_location"),
+            )
+        )
+
+        locations.append(
+            {
+                "name": name,
+                "description": description,
+                "location_mode": location_mode,
+                "is_sublocation": is_sublocation,
+                "parent_location": parent_location if is_sublocation else "",
+                "requires_ai_invention": not name or not description,
+            }
+        )
+
+    return locations
 
 
 def _starter_item_with_metadata(

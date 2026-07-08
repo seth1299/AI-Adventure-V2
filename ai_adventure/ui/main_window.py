@@ -287,6 +287,7 @@ STARTER_ITEM_COLUMN_WIDTHS = (140, 132, 140, 220, 132, 100)
 STARTER_WEAPON_COLUMN_WIDTHS = (150, 132, 100, 96, 120, 120, 132, 132, 100)
 STARTER_ARMOR_COLUMN_WIDTHS = (150, 132, 220, 132, 132, 100)
 STARTING_NPC_COLUMN_WIDTHS = (150, 160, 260, 132, 100)
+STARTING_LOCATION_COLUMN_WIDTHS = (180, 320, 132, 110, 180, 120)
 CURRENCY_COLUMN_WIDTHS = (150, 160, 132, 100)
 ECONOMY_EXAMPLE_COLUMN_WIDTHS = (220, 132, 100)
 THEME_NAMES = {"Light", "Dark"}
@@ -3613,6 +3614,7 @@ class NewGameWizard(QWizard):
         self.tts_speed_slider: QSlider | None = None
         self.tts_settings_widget: TTSSettingsWidget | None = None
         self._legacy_currency_description = ""
+        self._starting_location_row_id_counter = 0
         default_modes = normalize_ai_mode_preferences({})
         self._new_game_ai_settings: dict[str, Any] = {
             "model_intelligence": default_modes["model_intelligence"],
@@ -3629,6 +3631,7 @@ class NewGameWizard(QWizard):
         self._apply_theme()
 
         self._build_adventure_page()
+        self._build_starting_locations_page()
         self._build_starting_task_page()
         self._build_starting_npcs_page()
         self._build_character_page()
@@ -3958,6 +3961,7 @@ class NewGameWizard(QWizard):
             }
             for level, skill_input, description_input in self.skill_inputs
         ]
+        selected_start_location = self._selected_starting_location_for_setup()
         setup = {
             "title": self.title_input.text(),
             "character": {
@@ -3969,6 +3973,7 @@ class NewGameWizard(QWizard):
             "skills": skills,
             "starter_items": self._starter_items_from_table(),
             "starting_npcs": self._starting_npcs_from_table(),
+            "starting_locations": self._starting_locations_from_table(),
             "starting_task": self._starting_task_from_controls(),
             "calendar": calendar_settings,
             "audio": {
@@ -3989,9 +3994,13 @@ class NewGameWizard(QWizard):
             "economy_examples": economy_examples,
             "specified_genre": self.genre_input.text(),
             "game_style": self.game_style_input.toPlainText(),
-            "start_location": self.start_location_input.text(),
+            "start_location": (
+                selected_start_location.get("name") or self.start_location_input.text()
+            ),
             "start_location_mode": (
-                self.start_location_mode_combo.currentData() or "suggestion"
+                selected_start_location.get("location_mode")
+                or self.start_location_mode_combo.currentData()
+                or "suggestion"
             ),
             "world_context": self.world_context_input.toPlainText(),
         }
@@ -4017,6 +4026,12 @@ class NewGameWizard(QWizard):
             clean_setup["start_location_mode"],
         )
         self.world_context_input.setPlainText(clean_setup["world_context"])
+        self.starting_locations_table.setRowCount(0)
+
+        for location in clean_setup["starting_locations"]:
+            self._append_starting_location_row(location)
+
+        self._select_starting_location_combo_by_name(clean_setup["start_location"])
         self._load_starting_task(clean_setup["starting_task"])
         self.starting_npcs_table.setRowCount(0)
 
@@ -4222,6 +4237,242 @@ class NewGameWizard(QWizard):
         page.setLayout(layout)
 
         self.addPage(page)
+
+    def _build_starting_locations_page(self) -> None:
+        """Builds the requested starting Travel locations page."""
+
+        page = QWizardPage()
+        page.setTitle("Locations")
+        page.setSubTitle("Add starting locations the player character may know.")
+
+        self.start_location_combo = QComboBox()
+        self.start_location_combo.addItem("Select from starting locations", "")
+        self.start_location_combo.currentIndexChanged.connect(
+            lambda _index: self._sync_start_location_from_locations_combo()
+        )
+
+        self.starting_locations_table = QTableWidget(0, 6)
+        self.starting_locations_table.setHorizontalHeaderLabels(
+            ["Name", "Description", "Location Mode", "Sublocation?", "Within", ""]
+        )
+        _configure_inline_table(
+            self.starting_locations_table,
+            STARTING_LOCATION_COLUMN_WIDTHS,
+            minimum_height=240,
+        )
+
+        add_location_button = QPushButton("Add Location")
+        add_location_button.clicked.connect(
+            lambda: self._append_starting_location_row({})
+        )
+
+        layout = QVBoxLayout()
+        form = QFormLayout()
+        form.addRow("Start Location:", self.start_location_combo)
+        layout.addLayout(form)
+        layout.addWidget(self.starting_locations_table)
+        layout.addWidget(_button_row(add_location_button))
+        layout.addStretch()
+        page.setLayout(layout)
+
+        self.addPage(page)
+
+    def _append_starting_location_row(self, location: dict[str, Any]) -> None:
+        """Adds one requested starting location row to the wizard table."""
+
+        self._starting_location_row_id_counter += 1
+        _append_starting_location_table_row(
+            self.starting_locations_table,
+            location,
+            self._starting_location_row_id_counter,
+            self._remove_starting_location_row,
+        )
+        row = self.starting_locations_table.rowCount() - 1
+        name_widget = self.starting_locations_table.cellWidget(row, 0)
+        sublocation_widget = self.starting_locations_table.cellWidget(row, 3)
+        parent_widget = self.starting_locations_table.cellWidget(row, 4)
+
+        if isinstance(name_widget, QLineEdit):
+            name_widget.textChanged.connect(
+                lambda _text: self._refresh_starting_location_dropdowns()
+            )
+
+        if isinstance(sublocation_widget, QCheckBox):
+            sublocation_widget.toggled.connect(
+                lambda _checked: self._refresh_starting_location_dropdowns()
+            )
+
+        if isinstance(parent_widget, QComboBox):
+            parent_widget.currentIndexChanged.connect(
+                lambda _index: self._refresh_starting_location_dropdowns()
+            )
+
+        self._refresh_starting_location_dropdowns()
+
+    def _remove_starting_location_row(self, button: QPushButton) -> None:
+        """Removes the starting location row containing button."""
+
+        _remove_table_row_by_button(self.starting_locations_table, button)
+        self._refresh_starting_location_dropdowns()
+
+    def _starting_locations_from_table(self) -> list[dict[str, Any]]:
+        """Reads requested starting location rows from the wizard table."""
+
+        return _starting_locations_from_table(self.starting_locations_table)
+
+    def _selected_starting_location_for_setup(self) -> dict[str, str]:
+        """Returns the Locations-page selected start location, if any."""
+
+        if not hasattr(self, "start_location_combo"):
+            return {}
+
+        row_id = self.start_location_combo.currentData()
+
+        if row_id in (None, ""):
+            return {}
+
+        row = _starting_location_row_for_id(self.starting_locations_table, row_id)
+
+        if row < 0:
+            return {}
+
+        name_widget = self.starting_locations_table.cellWidget(row, 0)
+        mode_widget = self.starting_locations_table.cellWidget(row, 2)
+        name = name_widget.text().strip() if isinstance(name_widget, QLineEdit) else ""
+
+        if not name:
+            return {}
+
+        return {
+            "name": name,
+            "location_mode": (
+                str(mode_widget.currentData())
+                if isinstance(mode_widget, QComboBox)
+                else "suggestion"
+            ),
+        }
+
+    def _sync_start_location_from_locations_combo(self) -> None:
+        """Uses the Locations-page selection as the actual starting location."""
+
+        if not hasattr(self, "start_location_combo"):
+            return
+
+        row_id = self.start_location_combo.currentData()
+        if row_id in (None, ""):
+            return
+
+        row = _starting_location_row_for_id(self.starting_locations_table, row_id)
+
+        if row < 0:
+            return
+
+        name_widget = self.starting_locations_table.cellWidget(row, 0)
+        mode_widget = self.starting_locations_table.cellWidget(row, 2)
+        name = name_widget.text().strip() if isinstance(name_widget, QLineEdit) else ""
+
+        if not name:
+            return
+
+        self.start_location_input.setText(name)
+
+        if isinstance(mode_widget, QComboBox):
+            _set_combo_to_data(
+                self.start_location_mode_combo,
+                str(mode_widget.currentData() or "suggestion"),
+            )
+
+    def _refresh_starting_location_dropdowns(self) -> None:
+        """Keeps start and parent-location dropdowns aligned with live row names."""
+
+        if not hasattr(self, "starting_locations_table"):
+            return
+
+        locations = _starting_location_options_from_table(self.starting_locations_table)
+        selected_start = (
+            self.start_location_combo.currentData()
+            if hasattr(self, "start_location_combo")
+            else ""
+        )
+
+        if hasattr(self, "start_location_combo"):
+            self.start_location_combo.blockSignals(True)
+            self.start_location_combo.clear()
+            self.start_location_combo.addItem("Select from starting locations", "")
+
+            for row_id, name in locations:
+                self.start_location_combo.addItem(name, row_id)
+
+            _set_combo_to_data(self.start_location_combo, str(selected_start or ""))
+            self.start_location_combo.blockSignals(False)
+
+        valid_ids = {row_id for row_id, _name in locations}
+
+        for row in range(self.starting_locations_table.rowCount()):
+            row_id = _starting_location_row_id_for_row(self.starting_locations_table, row)
+            sublocation_widget = self.starting_locations_table.cellWidget(row, 3)
+            parent_widget = self.starting_locations_table.cellWidget(row, 4)
+            parent_selected = (
+                parent_widget.currentData()
+                if isinstance(parent_widget, QComboBox)
+                else ""
+            )
+            is_sublocation = (
+                sublocation_widget.isChecked()
+                if isinstance(sublocation_widget, QCheckBox)
+                else False
+            )
+
+            if isinstance(parent_widget, QComboBox):
+                parent_widget.blockSignals(True)
+                parent_widget.clear()
+                parent_widget.addItem("Select containing location", "")
+
+                for option_id, name in locations:
+                    if option_id == row_id:
+                        continue
+                    parent_widget.addItem(name, option_id)
+
+                if str(parent_selected or "") in valid_ids:
+                    _set_combo_to_data(parent_widget, str(parent_selected))
+                else:
+                    pending_parent = str(
+                        parent_widget.property("pending_parent_location") or ""
+                    ).strip()
+
+                    if pending_parent:
+                        _set_combo_to_text(parent_widget, pending_parent)
+                        parent_widget.setProperty("pending_parent_location", "")
+
+                parent_widget.setVisible(is_sublocation)
+                parent_widget.blockSignals(False)
+
+        if str(selected_start or "") not in valid_ids and hasattr(
+            self,
+            "start_location_combo",
+        ):
+            self.start_location_combo.setCurrentIndex(0)
+            if selected_start not in (None, ""):
+                self.start_location_input.clear()
+            return
+
+        self._sync_start_location_from_locations_combo()
+
+    def _select_starting_location_combo_by_name(self, name: str) -> None:
+        """Selects a structured start-location row by visible location name."""
+
+        if not hasattr(self, "start_location_combo"):
+            return
+
+        clean_name = str(name or "").strip().casefold()
+
+        if not clean_name:
+            return
+
+        for index in range(self.start_location_combo.count()):
+            if self.start_location_combo.itemText(index).strip().casefold() == clean_name:
+                self.start_location_combo.setCurrentIndex(index)
+                return
 
     def _build_starting_task_page(self) -> None:
         """Builds the optional opening quest page."""
@@ -10695,6 +10946,142 @@ def _set_table_column_widths(table: QTableWidget, widths: tuple[int, ...]) -> No
             table.setColumnWidth(column, width)
 
 
+def _append_starting_location_table_row(
+    table: QTableWidget,
+    location: dict[str, Any],
+    row_id: int,
+    remove_callback: Callable[[QPushButton], None],
+) -> None:
+    """Adds one editable starting location row to table."""
+
+    row = table.rowCount()
+    table.insertRow(row)
+    table.setRowHeight(row, 36)
+
+    name_input = _table_line_edit(str(location.get("name", "")))
+    name_input.setProperty("starting_location_row_id", str(row_id))
+    description_input = _table_line_edit(str(location.get("description", "")))
+    mode_input = _table_combo_box(
+        {"suggestion": "Suggestion", "exact": "Exact"},
+        str(location.get("location_mode", "suggestion") or "suggestion"),
+    )
+    sublocation_input = QCheckBox()
+    sublocation_input.setChecked(bool(location.get("is_sublocation", False)))
+    parent_input = QComboBox()
+    parent_input.setMinimumWidth(TABLE_INLINE_EDITOR_MIN_WIDTH)
+    parent_input.setMinimumHeight(TABLE_INLINE_EDITOR_HEIGHT)
+    parent_input.setProperty(
+        "pending_parent_location",
+        str(location.get("parent_location", "") or ""),
+    )
+    parent_input.setVisible(sublocation_input.isChecked())
+    remove_button = QPushButton("Remove Location")
+    remove_button.setMinimumWidth(TABLE_INLINE_BUTTON_MIN_WIDTH)
+    remove_button.setMinimumHeight(TABLE_INLINE_EDITOR_HEIGHT)
+    remove_button.clicked.connect(
+        lambda _checked=False, button=remove_button: remove_callback(button)
+    )
+
+    table.setCellWidget(row, 0, name_input)
+    table.setCellWidget(row, 1, description_input)
+    table.setCellWidget(row, 2, mode_input)
+    table.setCellWidget(row, 3, sublocation_input)
+    table.setCellWidget(row, 4, parent_input)
+    table.setCellWidget(row, 5, remove_button)
+    _set_table_column_widths(table, STARTING_LOCATION_COLUMN_WIDTHS)
+
+
+def _starting_locations_from_table(table: QTableWidget) -> list[dict[str, Any]]:
+    """Reads requested starting location rows from table."""
+
+    locations: list[dict[str, Any]] = []
+
+    for row in range(table.rowCount()):
+        name_widget = table.cellWidget(row, 0)
+        description_widget = table.cellWidget(row, 1)
+        mode_widget = table.cellWidget(row, 2)
+        sublocation_widget = table.cellWidget(row, 3)
+        parent_widget = table.cellWidget(row, 4)
+        name = name_widget.text().strip() if isinstance(name_widget, QLineEdit) else ""
+        description = (
+            description_widget.text().strip()
+            if isinstance(description_widget, QLineEdit)
+            else ""
+        )
+        location_mode = (
+            str(mode_widget.currentData())
+            if isinstance(mode_widget, QComboBox)
+            else "suggestion"
+        )
+        if location_mode not in {"suggestion", "exact"}:
+            location_mode = "suggestion"
+        is_sublocation = (
+            sublocation_widget.isChecked()
+            if isinstance(sublocation_widget, QCheckBox)
+            else False
+        )
+        parent_location = (
+            str(parent_widget.currentText()).strip()
+            if isinstance(parent_widget, QComboBox)
+            and parent_widget.currentData() not in (None, "")
+            else ""
+        )
+
+        locations.append(
+            {
+                "name": name,
+                "description": description,
+                "location_mode": location_mode,
+                "is_sublocation": is_sublocation,
+                "parent_location": parent_location if is_sublocation else "",
+                "requires_ai_invention": not name or not description,
+            }
+        )
+
+    return locations
+
+
+def _starting_location_row_id_for_row(table: QTableWidget, row: int) -> str:
+    """Returns the stable id assigned to a starting-location row."""
+
+    name_widget = table.cellWidget(row, 0)
+
+    if not isinstance(name_widget, QLineEdit):
+        return ""
+
+    return str(name_widget.property("starting_location_row_id") or "")
+
+
+def _starting_location_row_for_id(table: QTableWidget, row_id: Any) -> int:
+    """Returns the row matching row_id, or -1."""
+
+    target_id = str(row_id)
+
+    for row in range(table.rowCount()):
+        if _starting_location_row_id_for_row(table, row) == target_id:
+            return row
+
+    return -1
+
+
+def _starting_location_options_from_table(
+    table: QTableWidget,
+) -> list[tuple[str, str]]:
+    """Returns nonblank starting-location names keyed by stable row id."""
+
+    options: list[tuple[str, str]] = []
+
+    for row in range(table.rowCount()):
+        row_id = _starting_location_row_id_for_row(table, row)
+        name_widget = table.cellWidget(row, 0)
+        name = name_widget.text().strip() if isinstance(name_widget, QLineEdit) else ""
+
+        if row_id and name:
+            options.append((row_id, name))
+
+    return options
+
+
 def _append_starting_npc_table_row(
     table: QTableWidget,
     npc: dict[str, Any],
@@ -11907,6 +12294,19 @@ def _set_combo_to_data(combo: QComboBox, value: str) -> None:
 
     for index in range(combo.count()):
         if combo.itemData(index) == value:
+            combo.setCurrentIndex(index)
+            return
+
+    combo.setCurrentIndex(0)
+
+
+def _set_combo_to_text(combo: QComboBox, text: str) -> None:
+    """Selects a combo-box item by its visible text."""
+
+    clean_text = str(text or "").strip().casefold()
+
+    for index in range(combo.count()):
+        if combo.itemText(index).strip().casefold() == clean_text:
             combo.setCurrentIndex(index)
             return
 
