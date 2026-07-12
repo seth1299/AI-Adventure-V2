@@ -190,6 +190,7 @@ class ReagentKnowledge:
 
     id: int | None = None
     name: str = ""
+    category: str = "Material"
     description: str = ""
     location: str = ""
     uses: list[str] = field(default_factory=list)
@@ -206,6 +207,7 @@ class RecipeIngredient:
     """One known-reagent ingredient in an alchemical recipe."""
 
     reagent_name: str = ""
+    item_uuid: str = ""
     quantity: int = 1
     measure_amount: int = 1
     measure_unit: str = "each"
@@ -225,6 +227,7 @@ class RecipeKnowledge:
     ingredients: list[RecipeIngredient] = field(default_factory=list)
     result: str = ""
     notes: str = ""
+    value_base_units: int = 0
     discovered_at: str = ""
 
     def to_dict(self) -> dict[str, Any]:

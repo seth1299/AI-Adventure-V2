@@ -452,7 +452,12 @@ class AiContextBuilder:
                         for item in state.inventory.items[:MAX_INVENTORY_CONTEXT_ITEMS]
                     ],
                     "container_rule": (
-                        "Container metadata is authoritative hidden state. Never "
+                        "Container metadata is authoritative hidden state. Classify "
+                        "an item as a Container only when its primary function is "
+                        "holding physical contents that can be put in and taken out. "
+                        "Items that store writing, records, instructions, or "
+                        "information are not Containers merely because they store "
+                        "information. Never "
                         "reveal or award a closed container's contents. Use "
                         "ContainerOpenedEvent only after required lock/trap checks "
                         "succeed, then ContainerContentsTakenEvent only when the "
@@ -478,9 +483,16 @@ class AiContextBuilder:
                             "longer owns."
                         ),
                         "possession_rule": (
-                            "Only state.inventory.items are current possessions. "
+                        "Only state.inventory.items are current possessions. Each "
+                        "inventory item includes quantity, quantity_unit, and "
+                        "storage_location (home or actively_carried); use the latter "
+                        "to distinguish Home storage from what the Player Character "
+                        "is carrying. "
                             "Use item_catalog to remember descriptions, categories, "
-                            "and values for previously seen items."
+                            "and values for previously seen items. Each item also "
+                            "has metadata.item_uuid, a stable internal identity; "
+                            "reuse it for the same item and do not split one item "
+                            "into duplicate definitions because of name variations."
                         ),
                     },
                 },
@@ -563,15 +575,25 @@ class AiContextBuilder:
                     ],
                     "rules": {
                         "reagent_fields": (
-                            "Crafting items/materials use only name, description, "
-                            "location, and uses as player-known structured fields."
+                            "Crafting items/materials use name, category, description, "
+                            "location, and uses as player-known structured fields. "
+                            "The uses list describes generalized symptoms or effects, "
+                            "such as sleep aid or pain relief, not detailed recipes "
+                            "or procedures. Use Container for vials, bottles, jars, "
+                            "and similar vessels."
                         ),
                         "recipe_ingredient_rule": (
                             "Recipe ingredients are structured entries that must "
                             "use item names from state.item_catalog.items whose "
                             "category is one of "
                             f"{CRAFTING_INGREDIENT_CATEGORY_NAMES}, plus quantity, "
-                            "measure_amount, and measure_unit. "
+                            "measure_amount, and a finite measure_unit. Never use "
+                            "a measure_unit that conflicts with the matching inventory "
+                            "item's quantity_unit. quantity times measure_amount is the "
+                            "total consumed per crafted result. Match ingredients by "
+                            "metadata.item_uuid, using the name only for display. Never use "
+                            "vague units such as pinch or handful. Recipes also carry "
+                            "value_base_units as the current or estimated result value. "
                             "state.alchemy.known_reagents stores crafting knowledge, "
                             "but item_catalog categories decide whether an item can "
                             "be chosen as a recipe ingredient."
@@ -584,6 +606,11 @@ class AiContextBuilder:
                         "check_formula": "d20 + bonus vs dc",
                         "bonus_formula": "level * 2",
                         "levels": "1-5",
+                        "maximum_level_rule": (
+                            "Level 5 is the absolute maximum. Never create a skill "
+                            "requirement, progression target, or secret reveal condition "
+                            "that requires a skill level above 5."
+                        ),
                         "uncertain_action_rule": (
                             "Suggest SkillCheckRequestedEvent before narrating a "
                             "final outcome only when the current command has "
@@ -660,6 +687,29 @@ class AiContextBuilder:
                     "tasks": [
                         _active_task_context(task)
                         for task in state.active_tasks.tasks[:MAX_ACTIVE_TASK_CONTEXT_ITEMS]
+                    ],
+                },
+                "calendar_events": {
+                    "rules": {
+                        "purpose": (
+                            "Persistent player-visible dates, festivals, deadlines, "
+                            "appointments, completions, and cultural observances."
+                        ),
+                        "upsert_rule": (
+                            "Use CalendarEventUpsertedEvent to create or update a "
+                            "stable event_id. Use recurrence yearly for annual events "
+                            "and none for a specific year. duration_days may span "
+                            "multiple consecutive days."
+                        ),
+                        "delete_rule": (
+                            "Use CalendarEventDeletedEvent only when a stored event "
+                            "is cancelled or should no longer exist."
+                        ),
+                    },
+                    "events": [
+                        _compact_context_value(event)
+                        for event in state.settings.values.get("calendar.events", [])[:40]
+                        if isinstance(event, dict)
                     ],
                 },
                 "audio": {
@@ -856,6 +906,8 @@ class AiContextBuilder:
                 "item_catalog": (
                     "Use state.item_catalog.items as the master list of remembered "
                     "item definitions. It preserves descriptions, categories, values, "
+                    "and metadata.item_uuid stable internal identities; reuse the same "
+                    "item_uuid for the same item even when its display name changes. "
                     "and equipment metadata for items even after they leave inventory. "
                     "Use Weapon metadata for weapon_hands, damage dice, attack range, "
                     "and optional ammunition_type_required, clip_size, and "

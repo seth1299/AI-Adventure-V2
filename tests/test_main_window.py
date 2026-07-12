@@ -30,8 +30,10 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMessageBox,
     QPushButton,
+    QScrollArea,
     QSlider,
     QSpinBox,
+    QTabWidget,
     QTableWidget,
     QWidget,
 )
@@ -67,6 +69,8 @@ from ai_adventure.ui.main_window import (
     TTSSettingsDialog,
     TravelScreen,
     _next_available_save_title,
+    _NoWheelComboBox,
+    _NoWheelSpinBox,
     _player_command_markdown,
     _preserve_player_character_text,
     _set_combo_to_data,
@@ -202,7 +206,11 @@ class MainWindowTests(unittest.TestCase):
                 self.assertIn("Character", tab_names)
                 self.assertNotIn("World", tab_names)
                 self.assertIn("Travel", tab_names)
-                self.assertIn("Active Tasks", tab_names)
+                self.assertNotIn("Active Tasks", tab_names)
+                self.assertEqual(
+                    window.game_shell.calendar_screen.views.tabText(2),
+                    "Tasks & Deadlines",
+                )
                 self.assertIn("Crafting", tab_names)
                 self.assertFalse(window.windowIcon().isNull())
                 npc_headers = [
@@ -1352,8 +1360,9 @@ class MainWindowTests(unittest.TestCase):
             ]
             self.assertEqual(
                 tab_names,
-                ["Character", "Inventory", "Combat", "Settings"],
+                ["Character", "Calendar", "Inventory", "Combat", "Settings"],
             )
+            self.assertFalse(shell.calendar_screen.settings_button.isHidden())
             self.assertTrue(shell.character_screen.health_current_input.isEnabled())
             self.assertFalse(shell.combat_screen.add_group.isHidden())
         finally:
@@ -1632,6 +1641,7 @@ class MainWindowTests(unittest.TestCase):
                             ],
                             "result": "A sterile patch for sealing a sample breach.",
                             "notes": "Standard expedition field method.",
+                            "value_base_units": 45,
                         }
                     ],
                 ),
@@ -1642,9 +1652,11 @@ class MainWindowTests(unittest.TestCase):
             catalog = repository.list_item_catalog()
 
             self.assertEqual(crafting_items[0]["name"], "Sterile Culture Gel")
+            self.assertEqual(crafting_items[0]["category"], "Crafting Item")
             self.assertEqual(crafting_items[0]["uses"], ["sample preservation", "field cultures"])
             self.assertEqual(recipes[0]["name"], "Emergency Culture Patch")
             self.assertEqual(recipes[0]["ingredients"][0]["measure_unit"], "mL")
+            self.assertEqual(recipes[0]["value_base_units"], 45)
             self.assertEqual(
                 next(item for item in catalog if item["name"] == "Sterile Culture Gel")[
                     "category"
@@ -2169,6 +2181,137 @@ class MainWindowTests(unittest.TestCase):
             )
             window.close()
 
+    def test_ai_new_game_state_restores_omitted_requested_locations(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            _ensure_qt_application()
+            temp_path = Path(temp_dir)
+            (temp_path / "saves").mkdir(parents=True, exist_ok=True)
+            (temp_path / "logs").mkdir(parents=True, exist_ok=True)
+            setup = normalize_new_game_setup(
+                {
+                    "title": "Structured Locations",
+                    "start_location": "Kit's Alchemy",
+                    "start_location_mode": "suggestion",
+                    "starting_locations": [
+                        {
+                            "name": "Kit's Alchemy",
+                            "description": "Kit's working alchemy shop.",
+                            "location_mode": "suggestion",
+                            "is_sublocation": True,
+                            "parent_location": "Main City",
+                        },
+                        {
+                            "name": "Main City",
+                            "description": "The main city where most play occurs.",
+                            "location_mode": "suggestion",
+                        },
+                        {
+                            "name": "Nearby Wilderness",
+                            "description": "A nearby foraging area.",
+                            "location_mode": "suggestion",
+                        },
+                    ],
+                }
+            )
+            repository = SaveRepository.create_new_save(
+                temp_path,
+                "Structured Locations",
+                setup=setup,
+            )
+            window = MainWindow(
+                app_paths=AppPaths(
+                    app_data_dir=temp_path,
+                    saves_dir=temp_path / "saves",
+                    logs_dir=temp_path / "logs",
+                    log_file=temp_path / "logs" / "ai_adventure.log",
+                )
+            )
+
+            window._apply_new_game_ai_state(
+                repository,
+                setup,
+                SimpleNamespace(
+                    start_location="Kit's Alchemy",
+                    locations=[
+                        {
+                            "name": "Kit's Alchemy",
+                            "description": "Starting location.",
+                            "x_miles": 0,
+                            "y_miles": 0,
+                            "terrain": "",
+                            "travel_multiplier": 1.0,
+                            "travel_notes": "",
+                            "source_index": 0,
+                        },
+                        {
+                            "name": "Central Expanse",
+                            "description": "The settled heartland.",
+                            "x_miles": 0.5,
+                            "y_miles": 0.5,
+                            "terrain": "Plains",
+                            "travel_multiplier": 1.0,
+                            "travel_notes": "",
+                            "source_index": 1,
+                        },
+                        {
+                            "name": "Sun-Dappled Glade",
+                            "description": "A bright foraging wood.",
+                            "x_miles": 1.0,
+                            "y_miles": 1.0,
+                            "terrain": "Forest",
+                            "travel_multiplier": 0.9,
+                            "travel_notes": "Beyond Main City.",
+                            "source_index": 2,
+                        },
+                    ],
+                    known_crafting_items=[
+                        {
+                            "name": "Dried Sage",
+                            "category": "Material",
+                            "description": "A medicinal herb.",
+                            "location": "Nearby Wilderness",
+                            "uses": ["Healing salve"],
+                        }
+                    ],
+                    known_crafting_recipes=[],
+                    starting_calendar={},
+                    start_weather="",
+                    finalized_starting_currency_balance_base_units=None,
+                    finalized_currency_denominations=[],
+                    finalized_currency_description="",
+                    selected_genre="",
+                    finalized_character={},
+                    finalized_skills=[],
+                    finalized_starter_items=[],
+                ),
+            )
+
+            locations = {
+                location["name"]: location
+                for location in repository.get_travel_locations()
+            }
+            self.assertEqual(
+                set(locations),
+                {"Kit's Alchemy", "Central Expanse", "Sun-Dappled Glade"},
+            )
+            self.assertEqual(
+                locations["Kit's Alchemy"]["description"],
+                "Kit's working alchemy shop.",
+            )
+            self.assertIn(
+                "Located within Central Expanse.",
+                locations["Kit's Alchemy"]["travel_notes"],
+            )
+            self.assertEqual(
+                locations["Sun-Dappled Glade"]["travel_notes"],
+                "Beyond Central Expanse.",
+            )
+            self.assertEqual(
+                repository.list_crafting_items()[0]["location"],
+                "Sun-Dappled Glade",
+            )
+            window.close()
+
     def test_ai_new_game_state_accepts_partial_ai_starter_inventory(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             _ensure_qt_application()
@@ -2287,6 +2430,26 @@ class MainWindowTests(unittest.TestCase):
                 location="Moonlit stone basins",
                 uses=["cooling draughts"],
             )
+            repository.set_currency_denominations(
+                [
+                    {"name": "Crown", "plural_name": "Crowns", "value": 12},
+                    {"name": "Bit", "plural_name": "Bits", "value": 1},
+                ]
+            )
+            repository.add_crafting_recipe(
+                name="Moon Draught",
+                ingredients=[
+                    {
+                        "reagent_name": "Moon Salt",
+                        "quantity": 1,
+                        "measure_amount": 1,
+                        "measure_unit": "pinch",
+                    }
+                ],
+                result="Moon Draught",
+                notes="Serve cold.",
+                value_base_units=30,
+            )
             screen = AlchemyNotebookScreen()
             screen.set_repository(repository)
 
@@ -2315,22 +2478,32 @@ class MainWindowTests(unittest.TestCase):
             screen.reagent_table.selectRow(0)
             QApplication.processEvents()
 
-            self.assertEqual(screen.reagent_table.columnCount(), 4)
+            self.assertEqual(screen.reagent_table.columnCount(), 5)
             self.assertEqual(
                 _require(screen.reagent_table.horizontalHeaderItem(1)).text(),
-                "Description",
+                "Category",
             )
             self.assertEqual(screen.tabs.tabText(0), "Items")
             self.assertEqual(screen.reagent_name_input.placeholderText(), "Item or material name")
             self.assertEqual(
                 screen.recipe_reagent_combo.placeholderText(),
-                "Search material, ingredient, reagent, or crafting item",
+                "Search the Crafting Items list",
             )
             self.assertEqual(
                 _require(screen.recipe_ingredient_table.horizontalHeaderItem(0)).text(),
                 "Item",
             )
+            self.assertEqual(screen.recipe_table.columnCount(), 5)
+            self.assertEqual(
+                _require(screen.recipe_table.horizontalHeaderItem(3)).text(),
+                "Estimated Value",
+            )
+            self.assertEqual(
+                _require(screen.recipe_table.item(0, 3)).text(),
+                "2 Crowns and 6 Bits",
+            )
             self.assertEqual(screen.reagent_name_input.text(), "Moon Salt")
+            self.assertEqual(screen.reagent_category_combo.currentText(), "Material")
             self.assertEqual(screen.reagent_description_input.text(), "Crystals hum softly.")
             self.assertEqual(screen.reagent_location_input.text(), "Moonlit stone basins")
             self.assertEqual(screen.reagent_uses_input.text(), "cooling draughts")
@@ -2357,7 +2530,7 @@ class MainWindowTests(unittest.TestCase):
             )
             repository.add_inventory_item(
                 name="Stirring Rod",
-                category="Tool",
+                category="Material",
                 quantity=1,
                 description="A glass rod for stirring mixtures.",
                 value_base_units=3,
@@ -2637,7 +2810,7 @@ class MainWindowTests(unittest.TestCase):
             self.assertEqual(changed_sources, [shell.calendar_screen])
             shell.close()
 
-    def test_calendar_screen_centers_month_and_summary_on_dedicated_rows(self) -> None:
+    def test_calendar_screen_has_month_year_and_task_views(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             _ensure_qt_application()
             repository = SaveRepository.create_new_save(Path(temp_dir), "Calendar Layout Test")
@@ -2645,10 +2818,10 @@ class MainWindowTests(unittest.TestCase):
             screen.set_repository(repository)
 
             try:
-                layout = screen.layout()
-                self.assertIsNotNone(layout)
-                self.assertIs(layout.itemAt(1).widget(), screen.month_label)
-                self.assertIs(layout.itemAt(2).widget(), screen.summary_label)
+                self.assertEqual(
+                    [screen.views.tabText(index) for index in range(screen.views.count())],
+                    ["Month", "Year Overview", "Tasks & Deadlines"],
+                )
                 self.assertEqual(
                     screen.month_label.alignment(),
                     Qt.AlignmentFlag.AlignCenter,
@@ -2661,11 +2834,8 @@ class MainWindowTests(unittest.TestCase):
                     screen.table.horizontalHeader().sectionResizeMode(0),
                     QHeaderView.ResizeMode.Stretch,
                 )
-                self.assertIsNotNone(screen.table.cellWidget(0, 0))
-                self.assertEqual(
-                    screen.table.cellWidget(0, 0).objectName(),
-                    "currentCalendarDay",
-                )
+                self.assertTrue(screen.settings_button.isHidden())
+                self.assertEqual(screen.summary_label.text(), "Season: Spring")
             finally:
                 screen.close()
 
@@ -2893,8 +3063,33 @@ class MainWindowTests(unittest.TestCase):
             try:
                 dialog.template_name_input.setText("Mystery Shell")
                 dialog.genre_input.setText("Cozy mystery")
-                dialog.start_location_input.setText("Rainy Office")
-                _set_combo_to_data(dialog.start_location_mode_combo, "exact")
+                dialog._append_starting_location_row(
+                    {
+                        "name": "Rainy Office",
+                        "description": "A cramped office above a rainy street.",
+                        "location_mode": "exact",
+                    }
+                )
+                dialog._append_starting_location_row(
+                    {
+                        "name": "Evidence Locker",
+                        "description": "A secure room inside the office.",
+                        "location_mode": "suggestion",
+                        "is_sublocation": True,
+                        "parent_location": "Rainy Office",
+                    }
+                )
+                dialog.start_location_combo.setCurrentIndex(
+                    dialog.start_location_combo.findText("Rainy Office")
+                )
+                dialog._append_starting_npc_row(
+                    {
+                        "name": "Archivist Pell",
+                        "location": "Rainy Office",
+                        "description": "Knows the case files.",
+                        "description_mode": "exact",
+                    }
+                )
                 dialog.character_name_input.clear()
                 dialog.skill_inputs[0][1].setText("Observation")
                 dialog.skill_inputs[0][2].setText("Spotting small clues.")
@@ -2933,6 +3128,22 @@ class MainWindowTests(unittest.TestCase):
                 self.assertEqual(templates[0].setup["specified_genre"], "Cozy mystery")
                 self.assertEqual(templates[0].setup["start_location"], "Rainy Office")
                 self.assertEqual(templates[0].setup["start_location_mode"], "exact")
+                self.assertEqual(
+                    templates[0].setup["starting_locations"][0]["name"],
+                    "Rainy Office",
+                )
+                self.assertEqual(
+                    templates[0].setup["starting_locations"][1]["parent_location"],
+                    "Rainy Office",
+                )
+                self.assertEqual(
+                    templates[0].setup["starting_npcs"][0]["name"],
+                    "Archivist Pell",
+                )
+                self.assertEqual(
+                    templates[0].setup["starting_npcs"][0]["description_mode"],
+                    "exact",
+                )
                 self.assertEqual(templates[0].setup["narration"]["tense"], "past")
                 self.assertEqual(
                     templates[0].setup["narration"]["style"],
@@ -2967,6 +3178,29 @@ class MainWindowTests(unittest.TestCase):
                     dialog._delete_template()
 
                 self.assertEqual(load_new_game_templates(template_path, normalize_setups=False), [])
+            finally:
+                dialog.close()
+
+    def test_new_game_template_manager_editor_tabs_are_scrollable(self) -> None:
+        _ensure_qt_application()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            template_path = Path(temp_dir) / "new_game_templates.json"
+            dialog = NewGameTemplateManagerDialog(template_path=template_path)
+
+            try:
+                tabs = _require_widget(dialog.findChild(QTabWidget), QTabWidget)
+
+                self.assertEqual(tabs.count(), 6)
+
+                for index in range(tabs.count()):
+                    scroll_area = _require_widget(tabs.widget(index), QScrollArea)
+                    self.assertTrue(scroll_area.widgetResizable())
+                    self.assertIsNotNone(scroll_area.widget())
+
+                details_scroll_area = _require_widget(tabs.widget(5), QScrollArea)
+                details_content = _require(details_scroll_area.widget())
+                self.assertIs(dialog.starter_items_table.parentWidget(), details_content)
             finally:
                 dialog.close()
 
@@ -3857,6 +4091,8 @@ class MainWindowTests(unittest.TestCase):
         )
 
         self.assertEqual(wizard.title_input.text(), "Template Adventure")
+        self.assertTrue(wizard.start_location_input.isHidden())
+        self.assertTrue(wizard.start_location_mode_combo.isHidden())
         self.assertEqual(wizard.character_name_input.text(), "Iris Vale")
         self.assertEqual(wizard.skill_inputs[0][1].text(), "Skill 0")
         self.assertEqual(wizard.skill_inputs[0][2].text(), "Skill 0 description.")
@@ -4003,12 +4239,55 @@ class MainWindowTests(unittest.TestCase):
         self.assertIn("Bread costs 2 base units", setup["currency_description"])
         wizard.close()
 
+    def test_new_game_wizard_uses_no_wheel_value_controls(self) -> None:
+        _ensure_qt_application()
+        wizard = NewGameWizard()
+
+        try:
+            wizard._append_starting_location_row({})
+            wizard._append_starter_item_row({})
+
+            for combo in wizard.findChildren(QComboBox):
+                self.assertIsInstance(combo, _NoWheelComboBox)
+
+            for spin_box in wizard.findChildren(QSpinBox):
+                self.assertIsInstance(spin_box, _NoWheelSpinBox)
+        finally:
+            wizard.close()
+
+    def test_no_wheel_value_controls_ignore_wheel_events(self) -> None:
+        _ensure_qt_application()
+
+        combo = _NoWheelComboBox()
+        combo.addItem("First", "first")
+        combo.addItem("Second", "second")
+        combo.setCurrentIndex(0)
+        combo_wheel = QEvent(QEvent.Type.Wheel)
+
+        combo.wheelEvent(combo_wheel)
+
+        self.assertEqual(combo.currentIndex(), 0)
+        self.assertFalse(combo_wheel.isAccepted())
+
+        spin_box = _NoWheelSpinBox()
+        spin_box.setRange(0, 10)
+        spin_box.setValue(5)
+        spin_wheel = QEvent(QEvent.Type.Wheel)
+
+        spin_box.wheelEvent(spin_wheel)
+
+        self.assertEqual(spin_box.value(), 5)
+        self.assertFalse(spin_wheel.isAccepted())
+
     def test_new_game_wizard_location_dropdowns_update_live(self) -> None:
         _ensure_qt_application()
         wizard = NewGameWizard()
 
         try:
             wizard._append_starting_location_row({})
+            self.assertTrue(
+                _table_cell(wizard.starting_locations_table, 0, 4, QComboBox).isHidden()
+            )
             _table_cell(wizard.starting_locations_table, 0, 0, QLineEdit).setText(
                 "Broad City"
             )
@@ -4032,6 +4311,7 @@ class MainWindowTests(unittest.TestCase):
                 QComboBox,
             )
 
+            self.assertFalse(parent_combo.isHidden())
             self.assertNotEqual(parent_combo.findText("Broad City"), -1)
             self.assertEqual(parent_combo.findText("Blacksmith Shop"), -1)
             parent_combo.setCurrentIndex(parent_combo.findText("Broad City"))
@@ -4050,6 +4330,64 @@ class MainWindowTests(unittest.TestCase):
             self.assertEqual(parent_combo.findText("Broad City"), -1)
             self.assertNotEqual(wizard.start_location_combo.findText("Blacksmith Shop"), -1)
             self.assertEqual(wizard.start_location_combo.currentText(), "Blacksmith Shop")
+        finally:
+            wizard.close()
+
+    def test_new_game_wizard_no_starting_npcs_confirms_and_disables_add(self) -> None:
+        _ensure_qt_application()
+        wizard = NewGameWizard()
+
+        try:
+            wizard._append_starting_npc_row({"name": "Guide"})
+
+            with patch(
+                "ai_adventure.ui.main_window.QMessageBox.question",
+                return_value=QMessageBox.StandardButton.No,
+            ):
+                wizard.no_starting_npcs_checkbox.setChecked(True)
+
+            self.assertFalse(wizard.no_starting_npcs_checkbox.isChecked())
+            self.assertEqual(wizard.starting_npcs_table.rowCount(), 1)
+            self.assertTrue(wizard.add_npc_button.isEnabled())
+
+            with patch(
+                "ai_adventure.ui.main_window.QMessageBox.question",
+                return_value=QMessageBox.StandardButton.Yes,
+            ):
+                wizard.no_starting_npcs_checkbox.setChecked(True)
+
+            self.assertTrue(wizard.no_starting_npcs_checkbox.isChecked())
+            self.assertEqual(wizard.starting_npcs_table.rowCount(), 0)
+            self.assertFalse(wizard.add_npc_button.isEnabled())
+            self.assertFalse(wizard.starting_npcs_table.isEnabled())
+            self.assertEqual(wizard.build_setup()["starting_npcs"], [])
+            self.assertTrue(wizard.build_setup()["no_starting_npcs"])
+
+            wizard.no_starting_npcs_checkbox.setChecked(False)
+
+            self.assertTrue(wizard.add_npc_button.isEnabled())
+            self.assertTrue(wizard.starting_npcs_table.isEnabled())
+        finally:
+            wizard.close()
+
+    def test_new_game_wizard_inventory_currency_page_is_scrollable(self) -> None:
+        _ensure_qt_application()
+        wizard = NewGameWizard()
+
+        try:
+            scroll_areas = wizard.findChildren(QScrollArea)
+            inventory_scroll_area = next(
+                (
+                    scroll_area
+                    for scroll_area in scroll_areas
+                    if scroll_area.widget() is not None
+                    and wizard.starter_items_table.parentWidget() is scroll_area.widget()
+                ),
+                None,
+            )
+
+            self.assertIsNotNone(inventory_scroll_area)
+            self.assertTrue(_require(inventory_scroll_area).widgetResizable())
         finally:
             wizard.close()
 

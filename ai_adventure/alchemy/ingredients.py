@@ -15,8 +15,6 @@ COMMON_MEASUREMENT_UNITS: tuple[str, ...] = (
     "kg",
     "oz",
     "lbs",
-    "pinch",
-    "handful",
 )
 
 DEFAULT_MEASUREMENT_UNIT = "each"
@@ -25,6 +23,7 @@ CRAFTING_INGREDIENT_CATEGORIES: tuple[str, ...] = (
     "Ingredient",
     "Reagent",
     "Crafting Item",
+    "Container",
 )
 CRAFTING_INGREDIENT_CATEGORY_NAMES = ", ".join(CRAFTING_INGREDIENT_CATEGORIES)
 
@@ -111,12 +110,16 @@ def normalize_recipe_ingredient(value: Any) -> dict[str, Any] | None:
         )
     )
 
-    return {
+    normalized = {
         "reagent_name": name,
         "quantity": quantity,
         "measure_amount": measure_amount,
         "measure_unit": measure_unit,
     }
+    item_uuid = str(value.get("item_uuid", "") or "").strip()
+    if item_uuid:
+        normalized["item_uuid"] = item_uuid
+    return normalized
 
 
 def normalize_measurement_unit(value: Any) -> str:
@@ -144,13 +147,8 @@ def format_recipe_ingredient(ingredient: dict[str, Any]) -> str:
     measure_amount = normalized["measure_amount"]
     measure_unit = normalized["measure_unit"]
 
-    if measure_unit == DEFAULT_MEASUREMENT_UNIT and measure_amount == 1:
-        return f"{name} (x{quantity})"
-
-    return (
-        f"{name} (x{quantity}) "
-        f"({_format_measurement(measure_amount, measure_unit)})"
-    )
+    total_amount = quantity * measure_amount
+    return f"{name} ({_format_measurement(total_amount, measure_unit)})"
 
 
 def format_recipe_ingredients(ingredients: Any) -> str:
@@ -174,6 +172,7 @@ def _looks_like_ingredient_object(value: dict[Any, Any]) -> bool:
         keys.intersection(
             {
                 "reagent_name",
+                "item_uuid",
                 "name",
                 "ingredient",
                 "item_name",

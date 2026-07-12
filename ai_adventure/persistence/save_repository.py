@@ -5,6 +5,7 @@ import logging
 import re
 import shutil
 import sqlite3
+import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -579,12 +580,16 @@ class SaveRepository:
             quantity = 1
 
         clean_value = max(0, _safe_int(value_base_units, default=0) or 0)
+        raw_metadata = metadata if isinstance(metadata, dict) else {}
         clean_metadata = normalize_item_metadata(
             metadata,
             name=clean_name,
             category=category,
             description=description,
         )
+        clean_metadata["quantity_unit"] = _inventory_quantity_unit(raw_metadata)
+        clean_metadata["storage_location"] = _inventory_storage_location(raw_metadata)
+        clean_metadata["item_uuid"] = str(raw_metadata.get("item_uuid", "")).strip() or str(uuid.uuid4())
         metadata_json = _encode_json_dict(clean_metadata)
 
         with self._connect() as connection:
@@ -956,16 +961,20 @@ class SaveRepository:
             )
             updated_quantity = int(row["quantity"])
             updated_value = int(row["value_base_units"])
-            updated_metadata = (
-                normalize_item_metadata(
-                    metadata,
-                    name=str(updated_name),
-                    category=str(updated_category),
-                    description=str(updated_description),
-                )
-                if metadata is not None or category is not None or description is not None
-                else _decode_json_dict(row["metadata_json"], "inventory item metadata")
+            existing_metadata = _decode_json_dict(
+                row["metadata_json"], "inventory item metadata"
             )
+            metadata_updates = metadata if isinstance(metadata, dict) else {}
+            updated_metadata = normalize_item_metadata(
+                {**existing_metadata, **metadata_updates},
+                name=str(updated_name),
+                category=str(updated_category),
+                description=str(updated_description),
+            )
+            merged_metadata = {**existing_metadata, **metadata_updates}
+            updated_metadata["quantity_unit"] = _inventory_quantity_unit(merged_metadata)
+            updated_metadata["storage_location"] = _inventory_storage_location(merged_metadata)
+            updated_metadata["item_uuid"] = str(merged_metadata.get("item_uuid", "")).strip() or str(uuid.uuid4())
 
             if quantity is not None:
                 if quantity <= 0:
@@ -1024,6 +1033,7 @@ class SaveRepository:
         self,
         *,
         name: str,
+        category: str = "Material",
         description: str = "",
         location: str = "",
         uses: list[str] | None = None,
@@ -1046,6 +1056,7 @@ class SaveRepository:
             return
 
         discovered_at = datetime.now().isoformat(timespec="seconds")
+        clean_category = category.strip() or "Material"
         clean_description = description.strip() or notes.strip()
         clean_location = location.strip()
         clean_uses = uses or []
@@ -1055,19 +1066,22 @@ class SaveRepository:
                 """
                 INSERT INTO crafting_items (
                     name,
+                    category,
                     description,
                     location,
                     uses_json,
                     discovered_at
                 )
-                VALUES (?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?)
                 ON CONFLICT(name) DO UPDATE SET
+                    category = excluded.category,
                     description = excluded.description,
                     location = excluded.location,
                     uses_json = excluded.uses_json
                 """,
                 (
                     clean_name,
+                    clean_category,
                     clean_description,
                     clean_location,
                     _encode_string_list(clean_uses),
@@ -1077,7 +1091,7 @@ class SaveRepository:
             _upsert_item_catalog_entry(
                 connection,
                 name=clean_name,
-                category="Material",
+                category=clean_category,
                 description=clean_description,
                 value_base_units=0,
             )
@@ -1098,6 +1112,7 @@ class SaveRepository:
                 SELECT
                     id,
                     name,
+                    category,
                     description,
                     location,
                     uses_json,
@@ -1114,6 +1129,7 @@ class SaveRepository:
                 {
                     "id": row["id"],
                     "name": row["name"],
+                    "category": row["category"],
                     "description": row["description"],
                     "location": row["location"],
                     "uses": _decode_string_list(row["uses_json"], "uses"),
@@ -1130,6 +1146,7 @@ class SaveRepository:
         ingredients: list[dict[str, Any]] | list[str],
         result: str,
         notes: str = "",
+        value_base_units: int = 0,
     ) -> None:
         """
         Adds or updates a discovered crafting recipe.
@@ -1149,8 +1166,25 @@ class SaveRepository:
 
         discovered_at = datetime.now().isoformat(timespec="seconds")
         clean_ingredients = normalize_recipe_ingredients(ingredients)
+        clean_value = max(0, _safe_int(value_base_units, default=0) or 0)
 
         with self._connect() as connection:
+            catalog_rows = connection.execute(
+                "SELECT name, metadata_json FROM item_catalog"
+            ).fetchall()
+            catalog_uuids = {
+                str(row["name"]).casefold(): str(
+                    _decode_json_dict(row["metadata_json"], "item catalog metadata").get("item_uuid", "")
+                ).strip()
+                for row in catalog_rows
+            }
+            for ingredient in clean_ingredients:
+                item_uuid = catalog_uuids.get(
+                    str(ingredient.get("reagent_name", "")).casefold(),
+                    str(ingredient.get("item_uuid", "")),
+                )
+                if item_uuid:
+                    ingredient["item_uuid"] = item_uuid
             connection.execute(
                 """
                 INSERT INTO crafting_recipes (
@@ -1158,19 +1192,22 @@ class SaveRepository:
                     ingredients_json,
                     result,
                     notes,
+                    value_base_units,
                     discovered_at
                 )
-                VALUES (?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?)
                 ON CONFLICT(name) DO UPDATE SET
                     ingredients_json = excluded.ingredients_json,
                     result = excluded.result,
-                    notes = excluded.notes
+                    notes = excluded.notes,
+                    value_base_units = excluded.value_base_units
                 """,
                 (
                     clean_name,
                     json.dumps(clean_ingredients, ensure_ascii=False),
                     result.strip(),
                     notes.strip(),
+                    clean_value,
                     discovered_at,
                 ),
             )
@@ -1194,6 +1231,7 @@ class SaveRepository:
                     ingredients_json,
                     result,
                     notes,
+                    value_base_units,
                     discovered_at
                 FROM crafting_recipes
                 ORDER BY name COLLATE NOCASE
@@ -1212,6 +1250,7 @@ class SaveRepository:
                     ),
                     "result": row["result"],
                     "notes": row["notes"],
+                    "value_base_units": row["value_base_units"],
                     "discovered_at": row["discovered_at"],
                 }
             )
@@ -2995,6 +3034,64 @@ class SaveRepository:
         )
         return max(0, _safe_int(stored_minute, default=DEFAULT_START_ELAPSED_MINUTES))
 
+    def list_calendar_events(self) -> list[dict[str, Any]]:
+        """Returns normalized persistent calendar events for this save."""
+
+        raw_events = self.get_setting("calendar.events", [])
+        if not isinstance(raw_events, list):
+            return []
+
+        events: list[dict[str, Any]] = []
+        seen_ids: set[str] = set()
+        for raw_event in raw_events:
+            event = _normalize_calendar_event(raw_event)
+            event_id = event.get("event_id", "")
+            if not event_id or event_id in seen_ids:
+                continue
+            seen_ids.add(event_id)
+            events.append(event)
+        return sorted(
+            events,
+            key=lambda event: (
+                int(event["month"]),
+                int(event["day"]),
+                str(event["title"]).casefold(),
+            ),
+        )
+
+    def upsert_calendar_event(self, event: Any) -> dict[str, Any] | None:
+        """Creates or updates one persistent calendar event."""
+
+        clean_event = _normalize_calendar_event(event)
+        if not clean_event.get("event_id") or not clean_event.get("title"):
+            LOGGER.warning("Skipped invalid calendar event: %r", event)
+            return None
+
+        events = self.list_calendar_events()
+        replaced = False
+        for index, existing in enumerate(events):
+            if existing["event_id"] == clean_event["event_id"]:
+                events[index] = clean_event
+                replaced = True
+                break
+        if not replaced:
+            events.append(clean_event)
+        self.set_setting("calendar.events", events)
+        self.append_history("calendar", f"Saved calendar event: {clean_event['title']}.")
+        return clean_event
+
+    def delete_calendar_event(self, event_id: str) -> bool:
+        """Deletes one persistent calendar event by stable identifier."""
+
+        clean_id = str(event_id or "").strip()
+        events = self.list_calendar_events()
+        remaining = [event for event in events if event["event_id"] != clean_id]
+        if len(remaining) == len(events):
+            return False
+        self.set_setting("calendar.events", remaining)
+        self.append_history("calendar", f"Deleted calendar event: {clean_id}.")
+        return True
+
     def get_player_equipment(self) -> dict[str, str]:
         """Reads current player equipment."""
 
@@ -3112,6 +3209,7 @@ class SaveRepository:
                 CREATE TABLE IF NOT EXISTS crafting_items (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     name TEXT NOT NULL UNIQUE,
+                    category TEXT NOT NULL DEFAULT 'Material',
                     description TEXT NOT NULL DEFAULT '',
                     location TEXT NOT NULL DEFAULT '',
                     uses_json TEXT NOT NULL DEFAULT '[]',
@@ -3124,6 +3222,7 @@ class SaveRepository:
                     ingredients_json TEXT NOT NULL DEFAULT '[]',
                     result TEXT NOT NULL DEFAULT '',
                     notes TEXT NOT NULL DEFAULT '',
+                    value_base_units INTEGER NOT NULL DEFAULT 0,
                     discovered_at TEXT NOT NULL
                 );
 
@@ -3227,6 +3326,18 @@ class SaveRepository:
             )
             _ensure_column(
                 connection,
+                "crafting_items",
+                "category",
+                "TEXT NOT NULL DEFAULT 'Material'",
+            )
+            _ensure_column(
+                connection,
+                "crafting_recipes",
+                "value_base_units",
+                "INTEGER NOT NULL DEFAULT 0",
+            )
+            _ensure_column(
+                connection,
                 "inventory_items",
                 "metadata_json",
                 "TEXT NOT NULL DEFAULT '{}'",
@@ -3264,6 +3375,7 @@ class SaveRepository:
             self._migrate_calendar_minute_from_game_state(connection)
             self._coalesce_inventory_stacks(connection)
             self._seed_item_catalog_from_inventory(connection)
+            self._synchronize_item_identity_metadata(connection)
 
     def _migrate_calendar_minute_from_game_state(
         self,
@@ -3403,6 +3515,34 @@ class SaveRepository:
                 value_base_units=int(row["value_base_units"]),
                 metadata=_decode_json_dict(row["metadata_json"], "inventory item metadata"),
             )
+
+    def _synchronize_item_identity_metadata(self, connection: sqlite3.Connection) -> None:
+        """Backfills one stable UUID across catalog and matching inventory rows."""
+
+        catalog_rows = connection.execute(
+            "SELECT id, name, metadata_json FROM item_catalog ORDER BY id ASC"
+        ).fetchall()
+        for row in catalog_rows:
+            catalog_metadata = _decode_json_dict(row["metadata_json"], "item catalog metadata")
+            item_uuid = str(catalog_metadata.get("item_uuid", "")).strip() or str(uuid.uuid4())
+            catalog_metadata["item_uuid"] = item_uuid
+            connection.execute(
+                "UPDATE item_catalog SET metadata_json = ? WHERE id = ?",
+                (_encode_json_dict(catalog_metadata), row["id"]),
+            )
+            inventory_rows = connection.execute(
+                "SELECT id, metadata_json FROM inventory_items WHERE name = ? COLLATE NOCASE",
+                (row["name"],),
+            ).fetchall()
+            for inventory_row in inventory_rows:
+                inventory_metadata = _decode_json_dict(
+                    inventory_row["metadata_json"], "inventory item metadata"
+                )
+                inventory_metadata["item_uuid"] = item_uuid
+                connection.execute(
+                    "UPDATE inventory_items SET metadata_json = ? WHERE id = ?",
+                    (_encode_json_dict(inventory_metadata), inventory_row["id"]),
+                )
 
 
 def _slugify(value: str) -> str:
@@ -3748,12 +3888,16 @@ def _upsert_item_catalog_entry(
     clean_category = category.strip()
     clean_description = description.strip()
     clean_value = max(0, _safe_int(value_base_units, default=0) or 0)
+    raw_metadata = metadata if isinstance(metadata, dict) else {}
     clean_metadata = normalize_item_metadata(
         metadata,
         name=clean_name,
         category=clean_category,
         description=clean_description,
     )
+    # Keep a stable, AI-facing identity separate from the player-visible name.
+    # Older saves are upgraded lazily the first time an item is touched/read.
+    clean_metadata["item_uuid"] = str(raw_metadata.get("item_uuid", "")).strip() or str(uuid.uuid4())
     metadata_json = _encode_json_dict(clean_metadata)
     now = datetime.now().isoformat(timespec="seconds")
     row = connection.execute(
@@ -3822,20 +3966,28 @@ def _inventory_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
     """Converts an inventory row to a plain dictionary."""
 
     metadata = _decode_json_dict(row["metadata_json"], "inventory item metadata")
+    metadata["quantity_unit"] = _inventory_quantity_unit(metadata)
+    metadata["storage_location"] = _inventory_storage_location(metadata)
+    normalized_metadata = normalize_item_metadata(
+        metadata,
+        name=str(row["name"]),
+        category=str(row["category"]),
+        description=str(row["description"]),
+    )
+    normalized_metadata["quantity_unit"] = metadata["quantity_unit"]
+    normalized_metadata["storage_location"] = metadata["storage_location"]
+    normalized_metadata["item_uuid"] = str(metadata.get("item_uuid", "")).strip()
     return {
         "id": row["id"],
         "name": row["name"],
         "category": row["category"],
         "quantity": row["quantity"],
+        "quantity_unit": metadata["quantity_unit"],
+        "storage_location": metadata["storage_location"],
         "equipped": bool(row["equipped"]),
         "description": row["description"],
         "value_base_units": row["value_base_units"],
-        "metadata": normalize_item_metadata(
-            metadata,
-            name=str(row["name"]),
-            category=str(row["category"]),
-            description=str(row["description"]),
-        ),
+        "metadata": normalized_metadata,
     }
 
 
@@ -3843,18 +3995,21 @@ def _item_catalog_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
     """Converts an item catalog row to a plain dictionary."""
 
     metadata = _decode_json_dict(row["metadata_json"], "item catalog metadata")
+    metadata.setdefault("item_uuid", str(uuid.uuid5(uuid.NAMESPACE_URL, f"ai-adventure:item:{row['id']}")))
+    normalized_metadata = normalize_item_metadata(
+        metadata,
+        name=str(row["name"]),
+        category=str(row["category"]),
+        description=str(row["description"]),
+    )
+    normalized_metadata["item_uuid"] = str(metadata["item_uuid"])
     return {
         "id": row["id"],
         "name": row["name"],
         "category": row["category"],
         "description": row["description"],
         "value_base_units": row["value_base_units"],
-        "metadata": normalize_item_metadata(
-            metadata,
-            name=str(row["name"]),
-            category=str(row["category"]),
-            description=str(row["description"]),
-        ),
+        "metadata": normalized_metadata,
         "first_seen_at": row["first_seen_at"],
         "updated_at": row["updated_at"],
     }
@@ -3881,6 +4036,47 @@ def _npc_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
     }
+
+
+def _inventory_quantity_unit(metadata: dict[str, Any]) -> str:
+    """Returns the persisted measurement unit for an inventory quantity."""
+
+    value = str(metadata.get("quantity_unit", "each") or "each").strip()
+    return value or "each"
+
+
+def _normalize_calendar_event(raw_event: Any) -> dict[str, Any]:
+    """Normalizes a one-time or yearly recurring calendar event."""
+
+    if not isinstance(raw_event, dict):
+        return {}
+    title = str(raw_event.get("title", raw_event.get("name", "")) or "").strip()
+    event_id = str(raw_event.get("event_id", raw_event.get("id", "")) or "").strip()
+    if not event_id and title:
+        event_id = re.sub(r"[^a-z0-9]+", "_", title.casefold()).strip("_")
+    recurrence = str(raw_event.get("recurrence", "none") or "none").strip().casefold()
+    if recurrence not in {"none", "yearly"}:
+        recurrence = "none"
+    return {
+        "event_id": event_id,
+        "title": title,
+        "description": str(raw_event.get("description", "") or "").strip(),
+        "category": str(raw_event.get("category", "Event") or "Event").strip(),
+        "month": max(1, _safe_int(raw_event.get("month", 1), default=1)),
+        "day": max(1, _safe_int(raw_event.get("day", 1), default=1)),
+        "duration_days": max(1, _safe_int(raw_event.get("duration_days", 1), default=1)),
+        "recurrence": recurrence,
+        "year": max(1, _safe_int(raw_event.get("year", 1), default=1)),
+        "importance": str(raw_event.get("importance", "") or "").strip(),
+        "details": str(raw_event.get("details", raw_event.get("notes", "")) or "").strip(),
+    }
+
+
+def _inventory_storage_location(metadata: dict[str, Any]) -> str:
+    """Returns the persisted inventory storage bucket."""
+
+    value = str(metadata.get("storage_location", "actively_carried") or "actively_carried").strip().casefold()
+    return value if value in {"home", "actively_carried"} else "actively_carried"
 
 
 def _gm_secret_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:

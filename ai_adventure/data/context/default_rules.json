@@ -50,6 +50,7 @@
           "Do not speak for the player character or decide what the player character says in response to NPCs, unless the Player specifically requests that.",
           "The player character is important, but the world does not revolve entirely around them.",
           "The player character's class, profession, backstory, and skills are not global world-theme instructions. Use them to inform personal opportunities, contacts, equipment, and checks, but do not make every new location, religion, faction, political conflict, NPC, mystery, or economy detail revolve around the player's specialty unless the player explicitly asked for that focused premise.",
+          "When selecting personal equipment, identify the activities, responsibilities, and goals emphasized across the character description, backstory, notes, profession, and skills. Prioritize concrete tools and supplies that enable those activities before generic apparel, comfort items, or genre-standard kit; infer function from the whole concept rather than a fixed keyword list.",
           "NPCs have their own goals and act even when the player does not directly interact with them.",
           "If the player has companions or teammates, those NPCs should take reasonable actions during the scene instead of waiting passively forever.",
           "You MUST avoid using the em-dash (\"--\") character.",
@@ -57,7 +58,8 @@
           "Make sure that if the Player takes an actionable step for an item in their inventory, such as storing an herb in a glass jar to prevent spoilage, that you suggest an InventoryItemModifiedEvent event (described later) to include the item's current state.",
           "When an inventory item changes condition or state, suggest an InventoryItemModifiedEvent instead of hiding the change in prose.",
           "For completed merchant transactions, suggest normal InventoryItemAddedEvent or InventoryItemRemovedEvent entries for transferred goods and CurrencyChangedEvent for the net money change.",
-          "Containers are the exception to generic item-state editing: use ContainerOpenedEvent and ContainerContentsTakenEvent for opening and taking contents so Python can enforce hidden metadata and exact-once transfer."
+          "Containers are the exception to generic item-state editing: use ContainerOpenedEvent and ContainerContentsTakenEvent for opening and taking contents so Python can enforce hidden metadata and exact-once transfer.",
+          "Classify an item as a Container only when its primary function is holding physical contents that can be put in and taken out. Items that store writing, records, instructions, or information are not Containers merely because they store information."
         ]
       }
     },
@@ -469,7 +471,7 @@
           "When the player acquires a closed container, add only the container. Do not emit CurrencyChangedEvent or separate InventoryItemAddedEvent entries for anything stored inside it.",
           "Quest-related items should use `Quest Item` as the item type.",
           "Raw materials and refined materials should use different item types when relevant.",
-          "Food, tools, weapons, ammo, armor, clothes, containers, crafting materials, books, documents, and valuables should be classified clearly."
+          "Food, tools, weapons, ammo, armor, clothes, containers, crafting materials, books, documents, and valuables should be classified clearly. A physical journal, notebook, ledger, manual, or other book is Book or Document; Information describes content and is not a physical inventory category."
         ]
       }
     },
@@ -637,14 +639,16 @@
           "name",
           "ingredients",
           "result",
-          "notes"
+          "notes",
+          "value_base_units"
         ],
         "purpose": "Saves a known crafting recipe.",
         "rules": [
           "Suggest RecipeDiscoveredEvent when the player learns, discovers, invents, buys, reads, or successfully experiments with a recipe.",
           "Ingredients must be structured objects with reagent_name, quantity, measure_amount, and measure_unit.",
-          "Use reagent_name values that match names in state.item_catalog.items, and only choose items whose category is Material, Ingredient, Reagent, or Crafting Item.",
-          "Use common measurement units such as each, mL, L, drops, tsp, tbsp, cups, grams, kg, oz, lbs, pinch, or handful.",
+          "Use reagent_name values that match state.item_catalog.items and preserve metadata.item_uuid. measure_unit must equal the matching inventory item's quantity_unit; quantity times measure_amount is the total amount consumed per crafted result. Only choose Material, Ingredient, Reagent, Crafting Item, or Container items. If the result needs a bottle, vial, jar, flask, pouch, or similar vessel, consume one suitable Container item per finished product. Liquids such as water require a concrete volume unit such as mL, L, tsp, tbsp, or cups and must not use each.",
+          "Use finite measurement units such as each, mL, L, drops, tsp, tbsp, cups, grams, kg, oz, or lbs. Never use vague amounts such as pinch or handful.",
+          "value_base_units is the recipe result's current or reasonably estimated value in the world's baseline currency unit.",
           "Do not use this to craft the item by itself. Crafting still requires InventoryItemRemovedEvent for ingredients and InventoryItemAddedEvent for the result."
         ]
       }
@@ -664,6 +668,7 @@
         "event_type": "ReagentDiscoveredEvent",
         "payload_fields": [
           "name",
+          "category",
           "description",
           "location",
           "uses"
@@ -671,11 +676,12 @@
         "purpose": "Saves a discovered useful item/material for the Crafting tab.",
         "rules": [
           "Suggest ReagentDiscoveredEvent when the player learns that a plant, mineral, fluid, creature part, tool part, salvage, foodstuff, or other material is useful for crafting, repair, cooking, medicine, or other practical preparation.",
-          "Do not use name-only item/material payloads. Include description, location, and uses.",
+          "Do not use name-only item/material payloads. Include category, description, location, and uses.",
           "`Description` should briefly explain what the item or material is.",
-          "`Location` should describe where the item or material is found.",
-          "`Uses` must be an array of short practical uses.",
-          "ReagentDiscoveredEvent records crafting knowledge and the app remembers that item as a Material for recipe ingredient selection. If the player physically collects, harvests, picks up, or stores the item/material, also suggest InventoryItemAddedEvent for the same item/material.",
+          "`Location` should describe where the item or material is found. Keep Description and Location complementary: do not repeat the location in Description unless it is essential to the item's identity.",
+          "`Uses` must be an array of short generalized symptoms or effects the item may address, such as sleep aid, pain relief, nausea relief, or wound care; do not use detailed recipes or procedures.",
+          "category must be Material, Ingredient, Reagent, Crafting Item, or Container. Use Container for vials, bottles, jars, and similar vessels.",
+          "ReagentDiscoveredEvent records crafting knowledge and preserves that category for recipe ingredient selection. If the player physically collects, harvests, picks up, or stores the item/material, also suggest InventoryItemAddedEvent for the same item/material.",
           "If the player learns practical item/material uses, use ReagentDiscoveredEvent. If the player learns a place where the item/material is found, include that place in the ReagentDiscoveredEvent location field and use LocationUpsertedEvent only when the place itself should appear in the Travel tab."
         ]
       }
@@ -727,7 +733,7 @@
           "Use this for hidden villain identities, secret motives, traps, undiscovered treasure, conspiracy details, false alibis, off-screen plans, mystery solutions, and other concealed truths the AI must remember.",
           "secret_id must be a stable lower_snake_case identifier. Reuse it whenever the same secret changes.",
           "details is the full current canonical hidden truth, not an incremental note.",
-          "reveal_condition states how the player could plausibly learn the truth. Use an empty string only when no condition is established yet.",
+          "reveal_condition states how the player could plausibly learn the truth. Use an empty string only when no condition is established yet. Skills range from level 1 through the absolute maximum of level 5, so never require a skill level above 5.",
           "related_npc_ids and related_locations are arrays. Use empty arrays when the secret is not tied to a known NPC or place.",
           "Use status active while the truth is hidden, revealed once the player learns it, and retired when it is no longer true or useful.",
           "Never copy an active secret into visible narration, suggested actions, player-facing NPC fields, Travel fields, tasks, or other player-visible state.",
@@ -788,6 +794,38 @@
           "Do not use this for a brief narrative flourish that does not change future travel pace.",
           "speed_multiplier is relative to the normal walking speed: 1 is ordinary travel, values below 1 are slower, and values above 1 are faster."
         ]
+      }
+    },
+    {
+      "id": "event.calendar_event",
+      "title": "CalendarEventUpsertedEvent Contract",
+      "category": "event_contract",
+      "tags": ["events", "time", "task", "world"],
+      "priority": 73,
+      "content": {
+        "event_type": "CalendarEventUpsertedEvent",
+        "payload_fields": ["event_id", "title", "description", "category", "month", "day", "duration_days", "recurrence", "year", "importance", "details"],
+        "purpose": "Creates or updates a persistent event displayed on the Calendar.",
+        "rules": [
+          "Use a stable lower_snake_case event_id so the same event can be updated later.",
+          "Use recurrence yearly for annual festivals, holidays, and observances; use none for one-time dates.",
+          "duration_days is the number of consecutive calendar days occupied by the event.",
+          "Use description for a short summary and details for cultural significance, reason, payment, consequences, or other useful context.",
+          "Do not recreate an unchanged yearly event each year."
+        ]
+      }
+    },
+    {
+      "id": "event.calendar_event_delete",
+      "title": "CalendarEventDeletedEvent Contract",
+      "category": "event_contract",
+      "tags": ["events", "time", "task"],
+      "priority": 73,
+      "content": {
+        "event_type": "CalendarEventDeletedEvent",
+        "payload_fields": ["event_id"],
+        "purpose": "Deletes a cancelled or obsolete persistent calendar event.",
+        "rules": ["Delete by the exact stable event_id already present in state.calendar_events.events."]
       }
     },
     {

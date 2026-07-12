@@ -18,7 +18,7 @@ from PySide6.QtCore import (
     Signal,
     Slot,
 )
-from PySide6.QtGui import QColor, QIcon, QPalette, QStandardItem, QStandardItemModel
+from PySide6.QtGui import QColor, QIcon, QMouseEvent, QPalette, QStandardItem, QStandardItemModel
 from PySide6.QtWidgets import (
     QAbstractSpinBox,
     QApplication,
@@ -60,6 +60,7 @@ from PySide6.QtWidgets import (
 from ai_adventure.alchemy.ingredients import (
     COMMON_MEASUREMENT_UNITS,
     CRAFTING_INGREDIENT_CATEGORY_NAMES,
+    CRAFTING_INGREDIENT_CATEGORIES,
     format_recipe_ingredients,
     is_crafting_ingredient_category,
     normalize_recipe_ingredient,
@@ -268,6 +269,22 @@ from ai_adventure.persistence.save_repository import (
 
 
 LOGGER = logging.getLogger(__name__)
+
+
+class _NoWheelComboBox(QComboBox):
+    """Combo box that does not change selection from mouse-wheel scrolling."""
+
+    def wheelEvent(self, event: Any) -> None:
+        event.ignore()
+
+
+class _NoWheelSpinBox(QSpinBox):
+    """Spin box that does not change value from mouse-wheel scrolling."""
+
+    def wheelEvent(self, event: Any) -> None:
+        event.ignore()
+
+
 GM_THINKING_TEXT = "GM is thinking..."
 STORY_REVEAL_STALL_TIMEOUT_MS = 8000
 NPC_TURN_DELAY_MS = 2000
@@ -358,6 +375,36 @@ def _use_soft_table_selection(table: QTableWidget) -> None:
     """Keeps table selection while hiding the gaudy per-cell focus cursor."""
 
     table.setItemDelegate(_NoCellFocusDelegate(table))
+    _allow_selected_row_deselection(table)
+
+
+class _DeselectSelectedRowFilter(QObject):
+    """Clears a table row when the user clicks its already-selected row."""
+
+    def __init__(self, table: QTableWidget) -> None:
+        super().__init__(table)
+        self.table = table
+
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:
+        if event.type() == QEvent.Type.MouseButtonPress and isinstance(event, QMouseEvent):
+            index = self.table.indexAt(event.position().toPoint())
+            if index.isValid() and self.table.selectionModel().isRowSelected(
+                index.row(), index.parent()
+            ):
+                self.table.clearSelection()
+                self.table.setCurrentItem(None)
+                return True
+        return super().eventFilter(watched, event)
+
+
+def _allow_selected_row_deselection(table: QTableWidget) -> None:
+    """Lets a second click on the selected row return the table to no selection."""
+
+    if hasattr(table, "_deselect_selected_row_filter"):
+        return
+    deselect_filter = _DeselectSelectedRowFilter(table)
+    table.viewport().installEventFilter(deselect_filter)
+    table._deselect_selected_row_filter = deselect_filter  # type: ignore[attr-defined]
 
 
 def _table_item(text: Any, sort_value: Any | None = None) -> QTableWidgetItem:
@@ -1084,9 +1131,22 @@ class MainWindow(QMainWindow):
         if start_location:
             repository.set_state_value("location", start_location)
 
+        finalized_location_aliases: dict[str, str] = {}
         if getattr(result, "locations", None):
+            travel_locations = _travel_locations_for_save(
+                result.locations,
+                setup,
+                result,
+            )
+            finalized_location_aliases = _finalized_location_aliases(
+                travel_locations,
+                setup,
+            )
             repository.set_travel_locations(
-                _travel_locations_for_save(result.locations, setup, result)
+                _replace_location_aliases_in_travel_locations(
+                    travel_locations,
+                    finalized_location_aliases,
+                )
             )
 
         repository.ensure_travel_locations()
@@ -1196,7 +1256,11 @@ class MainWindow(QMainWindow):
         if finalized_starter_items:
             repository.replace_inventory_items(finalized_starter_items)
 
-        _apply_new_game_crafting_knowledge(repository, result)
+        _apply_new_game_crafting_knowledge(
+            repository,
+            result,
+            location_aliases=finalized_location_aliases,
+        )
 
     def _apply_fallback_currency_if_needed(
         self,
@@ -1404,7 +1468,7 @@ class CustomVoiceDialog(QDialog):
         self.setWindowTitle("Custom Voices")
         self.resize(620, 520)
 
-        self.custom_voice_combo = QComboBox()
+        self.custom_voice_combo = _NoWheelComboBox()
         self.custom_voice_combo.currentIndexChanged.connect(lambda _index: self._sync_action_states())
         self.load_custom_voice_button = QPushButton("Load")
         self.load_custom_voice_button.clicked.connect(self._load_selected_custom_voice)
@@ -1430,8 +1494,8 @@ class CustomVoiceDialog(QDialog):
         )
         self.tts_speed_slider.valueChanged.connect(lambda _value: self._mark_blend_in_use())
 
-        self.voice_a_combo = QComboBox()
-        self.voice_b_combo = QComboBox()
+        self.voice_a_combo = _NoWheelComboBox()
+        self.voice_b_combo = _NoWheelComboBox()
         _populate_narrator_voice_combo(
             self.voice_a_combo,
             DEFAULT_NARRATOR_VOICE,
@@ -1839,14 +1903,14 @@ class TTSSettingsWidget(QWidget):
             lambda value: self.tts_speed_label.setText(f"{value}%")
         )
 
-        self.voice_mode_combo = QComboBox()
+        self.voice_mode_combo = _NoWheelComboBox()
         self.voice_mode_combo.addItem("Preset Voice", "preset")
         self.voice_mode_combo.addItem("Custom Blend", "blend")
         self.voice_mode_combo.currentIndexChanged.connect(
             lambda _index: self._sync_control_states(self.narrator_enabled_checkbox.isChecked())
         )
 
-        self.preset_voice_combo = QComboBox()
+        self.preset_voice_combo = _NoWheelComboBox()
         self.tts_voice_combo = self.preset_voice_combo
         _populate_narrator_voice_combo(
             self.preset_voice_combo,
@@ -2094,7 +2158,7 @@ class TTSSettingsDialog(QDialog):
         return self.tts_settings_widget.custom_voice_library_changed
 
 
-class ContentCategoryComboBox(QComboBox):
+class ContentCategoryComboBox(_NoWheelComboBox):
     """Checkable multi-select dropdown for Gemini harm categories."""
 
     selection_changed = Signal()
@@ -2264,7 +2328,7 @@ class AISettingsDialog(QDialog):
         self.setWindowTitle("A.I. Settings")
         self.resize(640, 720)
 
-        self.model_intelligence_combo = QComboBox()
+        self.model_intelligence_combo = _NoWheelComboBox()
         self._add_mode_options(
             self.model_intelligence_combo,
             MODEL_INTELLIGENCE_OPTIONS,
@@ -2275,12 +2339,12 @@ class AISettingsDialog(QDialog):
         )
         self.model_intelligence_description = self._description_label()
 
-        self.model_tone_combo = QComboBox()
+        self.model_tone_combo = _NoWheelComboBox()
         self._add_mode_options(self.model_tone_combo, MODEL_TONE_OPTIONS)
         _set_combo_to_data(self.model_tone_combo, modes["model_tone"])
         self.model_tone_description = self._description_label()
 
-        self.response_length_combo = QComboBox()
+        self.response_length_combo = _NoWheelComboBox()
         self._add_mode_options(self.response_length_combo, RESPONSE_LENGTH_OPTIONS)
         _set_combo_to_data(self.response_length_combo, modes["response_length"])
         self.response_length_description = self._description_label()
@@ -2290,14 +2354,14 @@ class AISettingsDialog(QDialog):
         )
         self.model_content_description = self._description_label()
 
-        self.narration_tense_combo = QComboBox()
+        self.narration_tense_combo = _NoWheelComboBox()
         _add_combo_options(self.narration_tense_combo, NARRATION_TENSE_OPTIONS)
         _set_combo_to_data(self.narration_tense_combo, narration["tense"])
         self.narration_tense_description = self._description_label(
             "Controls the grammatical tense used for player-facing narration."
         )
 
-        self.narration_style_combo = QComboBox()
+        self.narration_style_combo = _NoWheelComboBox()
         _add_combo_options(self.narration_style_combo, NARRATION_STYLE_OPTIONS)
         _set_combo_to_data(self.narration_style_combo, narration["style"])
         self.narration_style_description = self._description_label(
@@ -2972,13 +3036,15 @@ class NewGameTemplateManagerDialog(QDialog):
         self.genre_input.setPlaceholderText("Genre or adventure type")
         self.start_location_input = QLineEdit()
         self.start_location_input.setPlaceholderText("Starting place")
-        self.start_location_mode_combo = QComboBox()
+        self.start_location_input.setVisible(False)
+        self.start_location_mode_combo = _NoWheelComboBox()
         self.start_location_mode_combo.addItem("Use as suggestion", "suggestion")
         self.start_location_mode_combo.addItem("Use exactly this", "exact")
-        self.narration_tense_combo = QComboBox()
+        self.start_location_mode_combo.setVisible(False)
+        self.narration_tense_combo = _NoWheelComboBox()
         _add_combo_options(self.narration_tense_combo, NARRATION_TENSE_OPTIONS)
         _set_combo_to_data(self.narration_tense_combo, DEFAULT_NARRATION_TENSE)
-        self.narration_style_combo = QComboBox()
+        self.narration_style_combo = _NoWheelComboBox()
         _add_combo_options(self.narration_style_combo, NARRATION_STYLE_OPTIONS)
         _set_combo_to_data(self.narration_style_combo, DEFAULT_NARRATION_STYLE)
         self.game_style_input = QTextEdit()
@@ -2996,6 +3062,36 @@ class NewGameTemplateManagerDialog(QDialog):
         self.character_notes_input.setPlaceholderText("Other player-character notes...")
 
         self.skill_inputs: list[tuple[int, QLineEdit, QLineEdit]] = []
+        self._starting_location_row_id_counter = 0
+        self.start_location_combo = _NoWheelComboBox()
+        self.start_location_combo.addItem("Select from starting locations", "")
+        self.start_location_combo.currentIndexChanged.connect(
+            lambda _index: self._sync_template_start_location_from_locations_combo()
+        )
+        self.starting_locations_table = QTableWidget(0, 6)
+        self.starting_locations_table.setHorizontalHeaderLabels(
+            ["Name", "Description", "Location Mode", "Sublocation?", "Within", ""]
+        )
+        _configure_inline_table(
+            self.starting_locations_table,
+            STARTING_LOCATION_COLUMN_WIDTHS,
+            minimum_height=240,
+        )
+        self.add_location_button = QPushButton("Add Location")
+        self.add_location_button.clicked.connect(
+            lambda: self._append_starting_location_row({})
+        )
+        self.starting_npcs_table = QTableWidget(0, 5)
+        self.starting_npcs_table.setHorizontalHeaderLabels(
+            ["Name", "Location", "Description", "Description Mode", ""]
+        )
+        _configure_inline_table(
+            self.starting_npcs_table,
+            STARTING_NPC_COLUMN_WIDTHS,
+            minimum_height=240,
+        )
+        self.add_npc_button = QPushButton("Add NPC")
+        self.add_npc_button.clicked.connect(lambda: self._append_starting_npc_row({}))
         self.starter_items_table = QTableWidget(0, 6)
         self.starter_items_table.setHorizontalHeaderLabels(
             ["Name", "Amount", "Category", "Description", "Value", ""]
@@ -3066,7 +3162,7 @@ class NewGameTemplateManagerDialog(QDialog):
             lambda: self._append_economy_example_row({})
         )
         self._legacy_currency_description = ""
-        self.calendar_type_combo = QComboBox()
+        self.calendar_type_combo = _NoWheelComboBox()
         self.calendar_type_combo.addItem("Gregorian-style calendar", "gregorian")
         self.calendar_type_combo.addItem("AI-generated calendar", "ai_generated")
         self.calendar_type_combo.addItem("Keep/custom calendar", "custom")
@@ -3081,10 +3177,12 @@ class NewGameTemplateManagerDialog(QDialog):
         left_panel.setMinimumWidth(260)
 
         tabs = QTabWidget()
-        tabs.addTab(self._build_overview_tab(), "Overview")
-        tabs.addTab(self._build_character_tab(), "Character")
-        tabs.addTab(self._build_skills_tab(), "Skills")
-        tabs.addTab(self._build_world_tab(), "Details")
+        tabs.addTab(_scrollable_widget(self._build_overview_tab()), "Overview")
+        tabs.addTab(_scrollable_widget(self._build_character_tab()), "Character")
+        tabs.addTab(_scrollable_widget(self._build_skills_tab()), "Skills")
+        tabs.addTab(_scrollable_widget(self._build_locations_tab()), "Locations")
+        tabs.addTab(_scrollable_widget(self._build_npcs_tab()), "NPCs")
+        tabs.addTab(_scrollable_widget(self._build_world_tab()), "Details")
 
         close_button = QPushButton("Close")
         close_button.clicked.connect(self.accept)
@@ -3114,8 +3212,6 @@ class NewGameTemplateManagerDialog(QDialog):
         form = QFormLayout()
         form.addRow("Template Name:", self.template_name_input)
         form.addRow("Genre:", self.genre_input)
-        form.addRow("Starting Location:", self.start_location_input)
-        form.addRow("Location Handling:", self.start_location_mode_combo)
         form.addRow("Narration Tense:", self.narration_tense_combo)
         form.addRow("Narration Style:", self.narration_style_combo)
         form.addRow("Game Style:", self.game_style_input)
@@ -3158,6 +3254,33 @@ class NewGameTemplateManagerDialog(QDialog):
             layout.addWidget(description_input, row, 2)
 
         layout.setRowStretch(len(SKILL_LEVEL_PLAN) + 1, 1)
+        tab = QWidget()
+        tab.setLayout(layout)
+        return tab
+
+    def _build_locations_tab(self) -> QWidget:
+        """Builds the template starting locations tab."""
+
+        layout = QVBoxLayout()
+        form = QFormLayout()
+        form.addRow("Start Location:", self.start_location_combo)
+        layout.addLayout(form)
+        layout.addWidget(self.starting_locations_table)
+        layout.addWidget(_button_row(self.add_location_button))
+        layout.addStretch()
+
+        tab = QWidget()
+        tab.setLayout(layout)
+        return tab
+
+    def _build_npcs_tab(self) -> QWidget:
+        """Builds the template starting NPCs tab."""
+
+        layout = QVBoxLayout()
+        layout.addWidget(self.starting_npcs_table)
+        layout.addWidget(_button_row(self.add_npc_button))
+        layout.addStretch()
+
         tab = QWidget()
         tab.setLayout(layout)
         return tab
@@ -3245,6 +3368,22 @@ class NewGameTemplateManagerDialog(QDialog):
         _set_combo_to_data(self.narration_style_combo, narration["style"])
         self.game_style_input.setPlainText(str(setup.get("game_style", "") or ""))
         self.world_context_input.setPlainText(str(setup.get("world_context", "") or ""))
+        self.starting_locations_table.setRowCount(0)
+        self._starting_location_row_id_counter = 0
+
+        for location in self._starting_locations_for_editor(
+            setup.get("starting_locations", [])
+        ):
+            self._append_starting_location_row(location)
+
+        self._select_starting_location_combo_by_name(
+            str(setup.get("start_location", "") or "")
+        )
+        self.starting_npcs_table.setRowCount(0)
+
+        for npc in self._starting_npcs_for_editor(setup.get("starting_npcs", [])):
+            self._append_starting_npc_row(npc)
+
         self.character_name_input.setText(str(character.get("name", "") or ""))
         self.appearance_input.setPlainText(str(character.get("appearance", "") or ""))
         self.backstory_input.setPlainText(str(character.get("backstory", "") or ""))
@@ -3358,9 +3497,16 @@ class NewGameTemplateManagerDialog(QDialog):
         setup["title"] = self.template_name_input.text().strip()
         setup["specified_genre"] = self.genre_input.text().strip()
         setup["game_style"] = self.game_style_input.toPlainText().strip()
-        setup["start_location"] = self.start_location_input.text().strip()
+        selected_start_location = self._selected_starting_location_for_setup()
+        setup["starting_locations"] = self._starting_locations_from_table()
+        setup["starting_npcs"] = self._starting_npcs_from_table()
+        setup["start_location"] = (
+            selected_start_location.get("name") or self.start_location_input.text().strip()
+        )
         setup["start_location_mode"] = (
-            self.start_location_mode_combo.currentData() or "suggestion"
+            selected_start_location.get("location_mode")
+            or self.start_location_mode_combo.currentData()
+            or "suggestion"
         )
         setup["world_context"] = self.world_context_input.toPlainText().strip()
         setup["narration"] = {
@@ -3404,6 +3550,172 @@ class NewGameTemplateManagerDialog(QDialog):
             setup["calendar"] = {**existing_calendar, "calendar_type": "custom"}
 
         return setup
+
+    def _append_starting_location_row(self, location: dict[str, Any]) -> None:
+        """Adds one starting location row to the template editor."""
+
+        self._starting_location_row_id_counter += 1
+        _append_starting_location_table_row(
+            self.starting_locations_table,
+            location,
+            self._starting_location_row_id_counter,
+            self._remove_starting_location_row,
+        )
+        row = self.starting_locations_table.rowCount() - 1
+        name_widget = self.starting_locations_table.cellWidget(row, 0)
+        sublocation_widget = self.starting_locations_table.cellWidget(row, 3)
+        parent_widget = self.starting_locations_table.cellWidget(row, 4)
+
+        if isinstance(name_widget, QLineEdit):
+            name_widget.textChanged.connect(
+                lambda _text: self._refresh_starting_location_dropdowns()
+            )
+
+        if isinstance(sublocation_widget, QCheckBox):
+            sublocation_widget.toggled.connect(
+                lambda _checked: self._refresh_starting_location_dropdowns()
+            )
+
+        if isinstance(parent_widget, QComboBox):
+            parent_widget.currentIndexChanged.connect(
+                lambda _index: self._refresh_starting_location_dropdowns()
+            )
+
+        self._refresh_starting_location_dropdowns()
+
+    def _remove_starting_location_row(self, button: QPushButton) -> None:
+        """Removes the starting location row containing button."""
+
+        _remove_table_row_by_button(self.starting_locations_table, button)
+        self._refresh_starting_location_dropdowns()
+
+    def _starting_locations_from_table(self) -> list[dict[str, Any]]:
+        """Reads requested starting location rows from the template editor."""
+
+        return _starting_locations_from_table(self.starting_locations_table)
+
+    def _selected_starting_location_for_setup(self) -> dict[str, str]:
+        """Returns the selected template start location, if any."""
+
+        row_id = self.start_location_combo.currentData()
+
+        if row_id in (None, ""):
+            return {}
+
+        row = _starting_location_row_for_id(self.starting_locations_table, row_id)
+
+        if row < 0:
+            return {}
+
+        name_widget = self.starting_locations_table.cellWidget(row, 0)
+        mode_widget = self.starting_locations_table.cellWidget(row, 2)
+        name = name_widget.text().strip() if isinstance(name_widget, QLineEdit) else ""
+
+        if not name:
+            return {}
+
+        return {
+            "name": name,
+            "location_mode": (
+                str(mode_widget.currentData())
+                if isinstance(mode_widget, QComboBox)
+                else "suggestion"
+            ),
+        }
+
+    def _sync_template_start_location_from_locations_combo(self) -> None:
+        """Updates hidden start-location fields from the template Locations tab."""
+
+        selected_start_location = self._selected_starting_location_for_setup()
+
+        if not selected_start_location:
+            return
+
+        self.start_location_input.setText(selected_start_location["name"])
+        _set_combo_to_data(
+            self.start_location_mode_combo,
+            selected_start_location["location_mode"],
+        )
+
+    def _refresh_starting_location_dropdowns(self) -> None:
+        """Keeps template start and parent-location dropdowns aligned."""
+
+        locations = _starting_location_options_from_table(self.starting_locations_table)
+        selected_start = self.start_location_combo.currentData()
+        self.start_location_combo.blockSignals(True)
+        self.start_location_combo.clear()
+        self.start_location_combo.addItem("Select from starting locations", "")
+
+        for row_id, name in locations:
+            self.start_location_combo.addItem(name, row_id)
+
+        _set_combo_to_data(self.start_location_combo, str(selected_start or ""))
+        self.start_location_combo.blockSignals(False)
+        _sync_starting_location_parent_dropdowns(
+            self.starting_locations_table,
+            locations,
+        )
+        valid_ids = {row_id for row_id, _name in locations}
+
+        if str(selected_start or "") not in valid_ids:
+            self.start_location_combo.setCurrentIndex(0)
+            if selected_start not in (None, ""):
+                self.start_location_input.clear()
+            return
+
+        self._sync_template_start_location_from_locations_combo()
+
+    def _select_starting_location_combo_by_name(self, name: str) -> None:
+        """Selects a structured template start-location row by visible name."""
+
+        clean_name = str(name or "").strip().casefold()
+
+        if not clean_name:
+            return
+
+        for index in range(self.start_location_combo.count()):
+            if self.start_location_combo.itemText(index).strip().casefold() == clean_name:
+                self.start_location_combo.setCurrentIndex(index)
+                return
+
+    def _append_starting_npc_row(self, npc: dict[str, Any]) -> None:
+        """Adds one requested starting NPC row to the template editor."""
+
+        _append_starting_npc_table_row(
+            self.starting_npcs_table,
+            npc,
+            self._remove_starting_npc_row,
+        )
+
+    def _remove_starting_npc_row(self, button: QPushButton) -> None:
+        """Removes the starting NPC row containing button."""
+
+        _remove_table_row_by_button(self.starting_npcs_table, button)
+
+    def _starting_npcs_from_table(self) -> list[dict[str, Any]]:
+        """Reads requested starting NPC rows from the template editor."""
+
+        return _starting_npcs_from_table(self.starting_npcs_table)
+
+    @staticmethod
+    def _starting_locations_for_editor(raw_locations: Any) -> list[dict[str, Any]]:
+        """Returns current starting locations as table rows."""
+
+        return [
+            location
+            for location in (raw_locations if isinstance(raw_locations, list) else [])
+            if isinstance(location, dict)
+        ]
+
+    @staticmethod
+    def _starting_npcs_for_editor(raw_npcs: Any) -> list[dict[str, Any]]:
+        """Returns current starting NPCs as table rows."""
+
+        return [
+            npc
+            for npc in (raw_npcs if isinstance(raw_npcs, list) else [])
+            if isinstance(npc, dict)
+        ]
 
     def _skills_for_editor(self, raw_skills: Any) -> list[dict[str, Any]]:
         """Returns sparse template skills positioned by explicit level."""
@@ -3973,6 +4285,9 @@ class NewGameWizard(QWizard):
             "skills": skills,
             "starter_items": self._starter_items_from_table(),
             "starting_npcs": self._starting_npcs_from_table(),
+            "no_starting_npcs": self.no_starting_npcs_checkbox.isChecked()
+            if hasattr(self, "no_starting_npcs_checkbox")
+            else False,
             "starting_locations": self._starting_locations_from_table(),
             "starting_task": self._starting_task_from_controls(),
             "calendar": calendar_settings,
@@ -4033,10 +4348,19 @@ class NewGameWizard(QWizard):
 
         self._select_starting_location_combo_by_name(clean_setup["start_location"])
         self._load_starting_task(clean_setup["starting_task"])
+        no_starting_npcs = bool(clean_setup.get("no_starting_npcs", False))
         self.starting_npcs_table.setRowCount(0)
 
         for npc in clean_setup["starting_npcs"]:
             self._append_starting_npc_row(npc)
+
+        if hasattr(self, "no_starting_npcs_checkbox"):
+            self.no_starting_npcs_checkbox.blockSignals(True)
+            self.no_starting_npcs_checkbox.setChecked(
+                no_starting_npcs and self.starting_npcs_table.rowCount() == 0
+            )
+            self.no_starting_npcs_checkbox.blockSignals(False)
+            self._sync_starting_npcs_controls()
 
         self._apply_new_game_ai_settings(
             {
@@ -4197,16 +4521,18 @@ class NewGameWizard(QWizard):
         self.start_location_input.setPlaceholderText(
             "Optional: deserted island, frozen sea, crime scene, ruined store..."
         )
-        self.start_location_mode_combo = QComboBox()
+        self.start_location_input.setVisible(False)
+        self.start_location_mode_combo = _NoWheelComboBox()
         self.start_location_mode_combo.addItem("Use as suggestion", "suggestion")
         self.start_location_mode_combo.addItem("Use exactly this", "exact")
+        self.start_location_mode_combo.setVisible(False)
 
-        self.narration_tense_combo = QComboBox(page)
+        self.narration_tense_combo = _NoWheelComboBox(page)
         _add_combo_options(self.narration_tense_combo, NARRATION_TENSE_OPTIONS)
         _set_combo_to_data(self.narration_tense_combo, DEFAULT_NARRATION_TENSE)
         self.narration_tense_combo.setVisible(False)
 
-        self.narration_style_combo = QComboBox(page)
+        self.narration_style_combo = _NoWheelComboBox(page)
         _add_combo_options(self.narration_style_combo, NARRATION_STYLE_OPTIONS)
         _set_combo_to_data(self.narration_style_combo, DEFAULT_NARRATION_STYLE)
         self.narration_style_combo.setVisible(False)
@@ -4229,8 +4555,6 @@ class NewGameWizard(QWizard):
         layout.addRow("Game Name:", self.title_input)
         layout.addRow("Genre:", self.genre_input)
         layout.addRow("Game Style:", self.game_style_input)
-        layout.addRow("Starting Location:", self.start_location_input)
-        layout.addRow("Location Handling:", self.start_location_mode_combo)
         layout.addRow("Artificial Intelligence:", self.ai_settings_button)
         layout.addRow("", self.ai_settings_summary_label)
         layout.addRow("World Details:", self.world_context_input)
@@ -4245,7 +4569,7 @@ class NewGameWizard(QWizard):
         page.setTitle("Locations")
         page.setSubTitle("Add starting locations the player character may know.")
 
-        self.start_location_combo = QComboBox()
+        self.start_location_combo = _NoWheelComboBox()
         self.start_location_combo.addItem("Select from starting locations", "")
         self.start_location_combo.currentIndexChanged.connect(
             lambda _index: self._sync_start_location_from_locations_combo()
@@ -4407,45 +4731,10 @@ class NewGameWizard(QWizard):
             self.start_location_combo.blockSignals(False)
 
         valid_ids = {row_id for row_id, _name in locations}
-
-        for row in range(self.starting_locations_table.rowCount()):
-            row_id = _starting_location_row_id_for_row(self.starting_locations_table, row)
-            sublocation_widget = self.starting_locations_table.cellWidget(row, 3)
-            parent_widget = self.starting_locations_table.cellWidget(row, 4)
-            parent_selected = (
-                parent_widget.currentData()
-                if isinstance(parent_widget, QComboBox)
-                else ""
-            )
-            is_sublocation = (
-                sublocation_widget.isChecked()
-                if isinstance(sublocation_widget, QCheckBox)
-                else False
-            )
-
-            if isinstance(parent_widget, QComboBox):
-                parent_widget.blockSignals(True)
-                parent_widget.clear()
-                parent_widget.addItem("Select containing location", "")
-
-                for option_id, name in locations:
-                    if option_id == row_id:
-                        continue
-                    parent_widget.addItem(name, option_id)
-
-                if str(parent_selected or "") in valid_ids:
-                    _set_combo_to_data(parent_widget, str(parent_selected))
-                else:
-                    pending_parent = str(
-                        parent_widget.property("pending_parent_location") or ""
-                    ).strip()
-
-                    if pending_parent:
-                        _set_combo_to_text(parent_widget, pending_parent)
-                        parent_widget.setProperty("pending_parent_location", "")
-
-                parent_widget.setVisible(is_sublocation)
-                parent_widget.blockSignals(False)
+        _sync_starting_location_parent_dropdowns(
+            self.starting_locations_table,
+            locations,
+        )
 
         if str(selected_start or "") not in valid_ids and hasattr(
             self,
@@ -4481,7 +4770,7 @@ class NewGameWizard(QWizard):
         page.setTitle("Starting Quest")
         page.setSubTitle("Choose whether the save starts with an active quest.")
 
-        self.starting_task_mode_combo = QComboBox()
+        self.starting_task_mode_combo = _NoWheelComboBox()
         self.starting_task_mode_combo.addItem("No starting quest", "none")
         self.starting_task_mode_combo.addItem("Let the A.I. create one", "ai")
         self.starting_task_mode_combo.addItem("Use a custom starting quest", "custom")
@@ -4594,16 +4883,22 @@ class NewGameWizard(QWizard):
             minimum_height=240,
         )
 
-        add_npc_button = QPushButton("Add NPC")
-        add_npc_button.clicked.connect(lambda: self._append_starting_npc_row({}))
+        self.no_starting_npcs_checkbox = QCheckBox("No starting NPCs")
+        self.no_starting_npcs_checkbox.toggled.connect(
+            self._handle_no_starting_npcs_toggled
+        )
+        self.add_npc_button = QPushButton("Add NPC")
+        self.add_npc_button.clicked.connect(lambda: self._append_starting_npc_row({}))
 
         layout = QVBoxLayout()
+        layout.addWidget(self.no_starting_npcs_checkbox)
         layout.addWidget(self.starting_npcs_table)
-        layout.addWidget(_button_row(add_npc_button))
+        layout.addWidget(_button_row(self.add_npc_button))
         layout.addStretch()
         page.setLayout(layout)
 
         self.addPage(page)
+        self._sync_starting_npcs_controls()
 
     def _append_starting_npc_row(self, npc: dict[str, Any]) -> None:
         """Adds one requested starting NPC row to the wizard table."""
@@ -4622,7 +4917,44 @@ class NewGameWizard(QWizard):
     def _starting_npcs_from_table(self) -> list[dict[str, Any]]:
         """Reads requested starting NPC rows from the wizard table."""
 
+        if (
+            hasattr(self, "no_starting_npcs_checkbox")
+            and self.no_starting_npcs_checkbox.isChecked()
+        ):
+            return []
+
         return _starting_npcs_from_table(self.starting_npcs_table)
+
+    def _handle_no_starting_npcs_toggled(self, checked: bool) -> None:
+        """Confirms and applies the no-starting-NPCs option."""
+
+        if checked and self.starting_npcs_table.rowCount() > 0:
+            result = QMessageBox.question(
+                self,
+                "Clear Starting NPCs",
+                "Are you sure you want to clear all NPCs?",
+            )
+
+            if result != QMessageBox.StandardButton.Yes:
+                self.no_starting_npcs_checkbox.blockSignals(True)
+                self.no_starting_npcs_checkbox.setChecked(False)
+                self.no_starting_npcs_checkbox.blockSignals(False)
+                self._sync_starting_npcs_controls()
+                return
+
+            self.starting_npcs_table.setRowCount(0)
+
+        self._sync_starting_npcs_controls()
+
+    def _sync_starting_npcs_controls(self) -> None:
+        """Disables starting NPC editing while the no-NPCs option is active."""
+
+        if not hasattr(self, "no_starting_npcs_checkbox"):
+            return
+
+        allow_npcs = not self.no_starting_npcs_checkbox.isChecked()
+        self.starting_npcs_table.setEnabled(allow_npcs)
+        self.add_npc_button.setEnabled(allow_npcs)
 
     def _build_character_page(self) -> None:
         """Builds the character page."""
@@ -4799,7 +5131,18 @@ class NewGameWizard(QWizard):
         layout.addRow("", add_currency_button)
         layout.addRow("Economy Notes:", self.economy_examples_table)
         layout.addRow("", add_economy_example_button)
-        page.setLayout(layout)
+
+        content = QWidget()
+        content.setLayout(layout)
+
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setFrameShape(QScrollArea.Shape.NoFrame)
+        scroll_area.setWidget(content)
+
+        page_layout = QVBoxLayout()
+        page_layout.addWidget(scroll_area)
+        page.setLayout(page_layout)
 
         self.addPage(page)
 
@@ -5025,7 +5368,7 @@ class NewGameWizard(QWizard):
         page.setTitle("Calendar and Time")
         page.setSubTitle("Choose whether to use a standard, custom, or AI-generated calendar.")
 
-        self.calendar_type_combo = QComboBox()
+        self.calendar_type_combo = _NoWheelComboBox()
         self.calendar_type_combo.addItem("Default Gregorian Calendar", "gregorian")
         self.calendar_type_combo.addItem("Custom Calendar", "custom")
         self.calendar_type_combo.addItem("AI-Generated Calendar", "ai_generated")
@@ -5146,7 +5489,7 @@ class GameShell(QWidget):
         self.travel_screen = TravelScreen(
             on_travel_requested=self._submit_travel_request,
         )
-        self.calendar_screen = CalendarScreen()
+        self.calendar_screen = CalendarScreen(playtesting_tools=self.playtesting_tools)
         self.inventory_screen = InventoryScreen(
             playtesting_tools=self.playtesting_tools,
         )
@@ -5156,7 +5499,9 @@ class GameShell(QWidget):
         self.npcs_screen = NpcsScreen()
         self.active_tasks_screen = ActiveTasksScreen()
         self.skills_screen = SkillsScreen()
-        self.alchemy_screen = AlchemyNotebookScreen()
+        self.alchemy_screen = AlchemyNotebookScreen(
+            playtesting_tools=self.playtesting_tools,
+        )
         self.history_screen = HistoryScreen()
         self.settings_screen = SettingsScreen(
             on_audio_settings_changed=self._apply_audio_settings,
@@ -5169,6 +5514,7 @@ class GameShell(QWidget):
             custom_voice_storage_path=self.custom_voice_storage_path,
             ai_enabled=self.ai_enabled,
             music_enabled=not self.playtesting_tools,
+            playtesting_tools=self.playtesting_tools,
         )
 
         self.screens: list[RepositoryBackedWidget] = [
@@ -5191,6 +5537,7 @@ class GameShell(QWidget):
 
         if self.playtesting_tools:
             self.tabs.addTab(self.character_screen, "Character")
+            self.tabs.addTab(self.calendar_screen, "Calendar")
             self.tabs.addTab(self.inventory_screen, "Inventory")
             self.tabs.addTab(self.combat_screen, "Combat")
             self.tabs.addTab(self.settings_screen, "Settings")
@@ -5202,7 +5549,6 @@ class GameShell(QWidget):
             self.tabs.addTab(self.inventory_screen, "Inventory")
             self.tabs.addTab(self.combat_screen, "Combat")
             self.tabs.addTab(self.npcs_screen, "NPCs")
-            self.tabs.addTab(self.active_tasks_screen, "Active Tasks")
             self.tabs.addTab(self.skills_screen, "Skills")
             self.tabs.addTab(self.alchemy_screen, "Crafting")
             self.tabs.addTab(self.history_screen, "Journal")
@@ -7961,9 +8307,10 @@ class TravelScreen(RepositoryBackedWidget):
 class CalendarScreen(RepositoryBackedWidget):
     """Player-facing custom calendar view."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, playtesting_tools: bool = False) -> None:
         super().__init__()
 
+        self.playtesting_tools = bool(playtesting_tools)
         self.month_offset = 0
         self.month_label = QLabel("-")
         self.month_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -7981,6 +8328,7 @@ class CalendarScreen(RepositoryBackedWidget):
         self.settings_button = QPushButton("Calendar Settings")
         self.settings_button.clicked.connect(self._open_calendar_settings_dialog)
         self.settings_button.setEnabled(False)
+        self.settings_button.setVisible(self.playtesting_tools)
 
         navigation_row = QHBoxLayout()
         navigation_row.addWidget(previous_button)
@@ -7991,6 +8339,7 @@ class CalendarScreen(RepositoryBackedWidget):
 
         self.summary_label = QLabel("-")
         self.summary_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.summary_label.setStyleSheet("font-size: 16px; font-weight: 600;")
 
         self.table = QTableWidget(0, 0)
         self.table.setObjectName("calendarGrid")
@@ -8000,12 +8349,37 @@ class CalendarScreen(RepositoryBackedWidget):
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self.table.verticalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
         self.table.verticalHeader().setVisible(False)
+        self.table.cellClicked.connect(self._open_day_events)
+
+        self.year_table = QTableWidget(0, 0)
+        self.year_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.year_table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
+        _use_soft_table_selection(self.year_table)
+        self.year_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.year_table.verticalHeader().setVisible(False)
+
+        self.tasks_table = QTableWidget(0, 5)
+        self.tasks_table.setHorizontalHeaderLabels(
+            ["Task", "Category", "Due", "Location", "Reward"]
+        )
+        self.tasks_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        _use_soft_table_selection(self.tasks_table)
+        self.tasks_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+
+        self.views = QTabWidget()
+        month_page = QWidget()
+        month_layout = QVBoxLayout()
+        month_layout.addLayout(navigation_row)
+        month_layout.addWidget(self.month_label, alignment=Qt.AlignmentFlag.AlignCenter)
+        month_layout.addWidget(self.summary_label, alignment=Qt.AlignmentFlag.AlignCenter)
+        month_layout.addWidget(self.table)
+        month_page.setLayout(month_layout)
+        self.views.addTab(month_page, "Month")
+        self.views.addTab(self.year_table, "Year Overview")
+        self.views.addTab(self.tasks_table, "Tasks & Deadlines")
 
         layout = QVBoxLayout()
-        layout.addLayout(navigation_row)
-        layout.addWidget(self.month_label, alignment=Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(self.summary_label, alignment=Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(self.table)
+        layout.addWidget(self.views)
 
         self.setLayout(layout)
 
@@ -8026,20 +8400,24 @@ class CalendarScreen(RepositoryBackedWidget):
             self.table.setRowCount(0)
             self.table.setColumnCount(0)
             self.settings_button.setEnabled(False)
+            self.year_table.setRowCount(0)
+            self.tasks_table.setRowCount(0)
             return
 
         self.settings_button.setEnabled(True)
         state = StateManager(repository).load_state()
         grid = build_month_grid(state.calendar.to_dict(), self.month_offset)
+        calendar_events = repository.list_calendar_events()
+        calendar_events.extend(
+            self._task_deadline_events(
+                repository.list_active_tasks(),
+                repository.get_calendar_settings(),
+            )
+        )
         self.month_offset = int(grid["month_offset"])
 
         self.month_label.setText(f"{grid['month_name']} - Year {grid['year']}")
-        self.summary_label.setText(
-            (
-                f"Today: {state.calendar.date_label}, {state.calendar.time_label} "
-                f"| Season: {state.calendar.season_name}"
-            )
-        )
+        self.summary_label.setText(f"Season: {state.calendar.season_name}")
         self.table.setColumnCount(int(grid["days_per_week"]))
         self.table.setRowCount(int(grid["weeks_per_month"]))
         self.table.setHorizontalHeaderLabels([str(name) for name in grid["day_names"]])
@@ -8047,28 +8425,166 @@ class CalendarScreen(RepositoryBackedWidget):
         for row_index, week in enumerate(grid["rows"]):
             for column_index, day in enumerate(week):
                 self.table.removeCellWidget(row_index, column_index)
+                events = self._events_for_day(
+                    calendar_events,
+                    int(grid["year"]),
+                    int(grid["month_index"]),
+                    int(day["day_of_month"]),
+                    int(state.calendar.days_per_month),
+                    int(state.calendar.days_per_year),
+                )
+                event_titles = [str(event.get("title", "")) for event in events[:3]]
                 label = str(day["day_of_month"])
+                if event_titles:
+                    label += "\n" + "\n".join(f"• {title}" for title in event_titles)
+                    if len(events) > 3:
+                        label += f"\n+{len(events) - 3} more"
 
                 if day["is_current_day"]:
-                    label = f"{label}\nToday"
+                    label = f"{day['day_of_month']} · Today" + ("\n" + "\n".join(f"• {title}" for title in event_titles) if event_titles else "")
 
                 item = QTableWidgetItem(label)
                 item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                item.setData(Qt.ItemDataRole.UserRole, events)
                 self.table.setItem(row_index, column_index, item)
 
                 if day["is_current_day"]:
                     item.setToolTip("Current day")
-                    current_day_label = QLabel(label)
-                    current_day_label.setObjectName("currentCalendarDay")
-                    current_day_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-                    current_day_label.setToolTip("Current day")
-                    self.table.setCellWidget(
-                        row_index,
-                        column_index,
-                        current_day_label,
-                    )
+                    font = item.font()
+                    font.setBold(True)
+                    item.setFont(font)
+
+                if events:
+                    item.setToolTip("\n".join(event_titles))
 
         self.table.resizeRowsToContents()
+        self._refresh_year_overview(state.calendar.to_dict(), calendar_events)
+        self._refresh_tasks(repository)
+
+    @staticmethod
+    def _task_deadline_events(
+        tasks: list[dict[str, Any]],
+        settings: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        """Projects dated active tasks into calendar day cells."""
+
+        events: list[dict[str, Any]] = []
+        for task in tasks:
+            due_minute = _safe_int(task.get("due_elapsed_minutes", -1), -1)
+            if due_minute < 0:
+                continue
+            due = build_calendar_snapshot(due_minute, settings)
+            events.append(
+                {
+                    "event_id": f"active_task_{task.get('name', '')}",
+                    "title": str(task.get("name", "Task Deadline")),
+                    "description": str(task.get("description", "")),
+                    "details": "\n".join(
+                        value for value in [
+                            str(task.get("description", "")),
+                            f"Requester: {task.get('requester', '')}",
+                            f"Reward: {task.get('reward', '')}",
+                            f"Location: {task.get('location', '')}",
+                        ] if value and not value.endswith(": ")
+                    ),
+                    "category": str(task.get("category", "Task")),
+                    "month": int(due["month_number"]),
+                    "day": int(due["day_of_month"]),
+                    "duration_days": 1,
+                    "recurrence": "none",
+                    "year": int(due["year"]),
+                }
+            )
+        return events
+
+    @staticmethod
+    def _events_for_day(
+        events: list[dict[str, Any]],
+        year: int,
+        month_index: int,
+        day: int,
+        days_per_month: int,
+        days_per_year: int,
+    ) -> list[dict[str, Any]]:
+        """Returns events whose date range includes the requested day."""
+
+        target = month_index * days_per_month + day
+        matches: list[dict[str, Any]] = []
+        for event in events:
+            if event.get("recurrence") != "yearly" and int(event.get("year", 1)) != year:
+                continue
+            start = (int(event.get("month", 1)) - 1) * days_per_month + int(event.get("day", 1))
+            duration = max(1, int(event.get("duration_days", 1)))
+            if any(((start - 1 + offset) % days_per_year) + 1 == target for offset in range(duration)):
+                matches.append(event)
+        return matches
+
+    def _open_day_events(self, row: int, column: int) -> None:
+        """Shows details for calendar events listed in a day cell."""
+
+        item = self.table.item(row, column)
+        events = item.data(Qt.ItemDataRole.UserRole) if item is not None else []
+        if not isinstance(events, list) or not events:
+            return
+        body = []
+        for event in events:
+            recurrence = "Repeats yearly" if event.get("recurrence") == "yearly" else f"Year {event.get('year', 1)}"
+            details = str(event.get("details", "") or event.get("description", ""))
+            body.append(
+                f"{event.get('title', 'Event')}\n{event.get('category', 'Event')} · {recurrence}\n{details}"
+            )
+        QMessageBox.information(self, "Calendar Events", "\n\n".join(body))
+
+    def _refresh_year_overview(
+        self,
+        calendar: dict[str, Any],
+        events: list[dict[str, Any]],
+    ) -> None:
+        """Builds a season-grouped overview of every month in the current year."""
+
+        settings = calendar.get("settings", {})
+        months = list(settings.get("month_names", []))
+        seasons = list(settings.get("seasons", []))
+        season_count = max(1, len(seasons))
+        grouped: list[list[int]] = [[] for _ in range(season_count)]
+        for month_index in range(len(months)):
+            grouped[min(month_index * season_count // max(1, len(months)), season_count - 1)].append(month_index)
+        self.year_table.setColumnCount(season_count)
+        self.year_table.setHorizontalHeaderLabels([
+            str(season.get("name", f"Season {index + 1}")) for index, season in enumerate(seasons)
+        ] or ["Year"])
+        self.year_table.setRowCount(max((len(group) for group in grouped), default=0))
+        year = int(calendar.get("year", 1))
+        for column, month_indexes in enumerate(grouped):
+            for row, month_index in enumerate(month_indexes):
+                month_events = [
+                    event for event in events
+                    if int(event.get("month", 1)) == month_index + 1
+                    and (event.get("recurrence") == "yearly" or int(event.get("year", 1)) == year)
+                ]
+                text = str(months[month_index])
+                if month_events:
+                    text += "\n" + "\n".join(f"• {event['title']}" for event in month_events[:4])
+                year_item = QTableWidgetItem(text)
+                year_item.setTextAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignHCenter)
+                self.year_table.setItem(row, column, year_item)
+        self.year_table.resizeRowsToContents()
+
+    def _refresh_tasks(self, repository: SaveRepository) -> None:
+        """Projects active tasks and deadlines into the Calendar tab."""
+
+        tasks = repository.list_active_tasks()
+        self.tasks_table.setRowCount(len(tasks))
+        for row, task in enumerate(tasks):
+            values = [
+                task.get("name", ""),
+                task.get("category", ""),
+                task.get("due_date", "N/A"),
+                task.get("location", ""),
+                task.get("reward", ""),
+            ]
+            for column, value in enumerate(values):
+                self.tasks_table.setItem(row, column, _table_item(str(value)))
 
     def return_to_current_month(self) -> None:
         """Returns the grid to the current month and refreshes."""
@@ -8131,19 +8647,19 @@ class CalendarSettingsDialog(QDialog):
         self.setWindowTitle("Calendar Settings")
         calendar_settings = dict(settings or DEFAULT_CALENDAR_SETTINGS)
 
-        self.days_per_week_input = QSpinBox()
+        self.days_per_week_input = _NoWheelSpinBox()
         self.days_per_week_input.setRange(1, 14)
         self.days_per_week_input.setValue(int(calendar_settings["days_per_week"]))
 
-        self.weeks_per_month_input = QSpinBox()
+        self.weeks_per_month_input = _NoWheelSpinBox()
         self.weeks_per_month_input.setRange(1, 12)
         self.weeks_per_month_input.setValue(int(calendar_settings["weeks_per_month"]))
 
-        self.months_per_year_input = QSpinBox()
+        self.months_per_year_input = _NoWheelSpinBox()
         self.months_per_year_input.setRange(1, 24)
         self.months_per_year_input.setValue(int(calendar_settings["months_per_year"]))
 
-        self.seasons_per_year_input = QSpinBox()
+        self.seasons_per_year_input = _NoWheelSpinBox()
         self.seasons_per_year_input.setRange(1, 12)
         self.seasons_per_year_input.setValue(int(calendar_settings["seasons_per_year"]))
 
@@ -8162,7 +8678,7 @@ class CalendarSettingsDialog(QDialog):
             )
         )
 
-        self.time_display_combo = QComboBox()
+        self.time_display_combo = _NoWheelComboBox()
         self.time_display_combo.addItem("Narrative", "narrative")
         self.time_display_combo.addItem("12-hour", "12_hour")
         self.time_display_combo.addItem("24-hour", "24_hour")
@@ -8224,9 +8740,9 @@ class InventoryScreen(RepositoryBackedWidget):
         self._loading_item_editor = False
         self._sort_column = 0
         self._sort_order = Qt.SortOrder.AscendingOrder
-        self.table = QTableWidget(0, 5)
+        self.table = QTableWidget(0, 7)
         self.table.setHorizontalHeaderLabels(
-            ["Name", "Category", "Qty", "Value", "Description"]
+            ["Name", "Category", "Quantity", "Unit", "Storage", "Value", "Description"]
         )
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
@@ -8261,6 +8777,10 @@ class InventoryScreen(RepositoryBackedWidget):
         self.item_quantity_input = QSpinBox()
         self.item_quantity_input.setRange(1, 9999)
         self.item_quantity_input.setValue(1)
+        self.item_quantity_unit_input = QLineEdit("each")
+        self.item_storage_location_combo = QComboBox()
+        self.item_storage_location_combo.addItem("Actively Carried", "actively_carried")
+        self.item_storage_location_combo.addItem("Home", "home")
         self.item_value_input = QSpinBox()
         self.item_value_input.setRange(0, 999999999)
         self.item_description_input = QLineEdit()
@@ -8306,6 +8826,8 @@ class InventoryScreen(RepositoryBackedWidget):
         general_form.addRow("Name:", self.item_name_input)
         general_form.addRow("Type:", self.item_type_combo)
         general_form.addRow("Quantity:", self.item_quantity_input)
+        general_form.addRow("Unit:", self.item_quantity_unit_input)
+        general_form.addRow("Storage:", self.item_storage_location_combo)
         general_form.addRow("Value (base units):", self.item_value_input)
         general_form.addRow("Description:", self.item_description_input)
 
@@ -8383,9 +8905,12 @@ class InventoryScreen(RepositoryBackedWidget):
             quantity = int(item.get("quantity", 0))
             value_base_units = int(item.get("value_base_units", 0))
             self.table.setItem(row_index, 2, _table_item(str(quantity), quantity))
+            self.table.setItem(row_index, 3, _table_item(str(item.get("quantity_unit", "each"))))
+            storage = str(item.get("storage_location", "actively_carried"))
+            self.table.setItem(row_index, 4, _table_item("Home" if storage == "home" else "Actively Carried"))
             self.table.setItem(
                 row_index,
-                3,
+                5,
                 _table_item(
                     format_currency_amount(
                         value_base_units,
@@ -8394,7 +8919,7 @@ class InventoryScreen(RepositoryBackedWidget):
                     value_base_units,
                 ),
             )
-            self.table.setItem(row_index, 4, _table_item(str(item.get("description", ""))))
+            self.table.setItem(row_index, 6, _table_item(str(item.get("description", ""))))
 
         _resize_wrapping_table_rows(self.table)
 
@@ -8449,6 +8974,8 @@ class InventoryScreen(RepositoryBackedWidget):
         self.item_name_input.setText(selected_name)
         _set_combo_to_data(self.item_type_combo, item_type)
         self.item_quantity_input.setValue(max(1, int(selected_item.get("quantity", 1))))
+        self.item_quantity_unit_input.setText(str(selected_item.get("quantity_unit", "each")))
+        _set_combo_to_data(self.item_storage_location_combo, str(selected_item.get("storage_location", "actively_carried")))
         self.item_value_input.setValue(max(0, int(selected_item.get("value_base_units", 0))))
         self.item_description_input.setText(str(selected_item.get("description", "")))
         _set_combo_to_data(
@@ -8541,6 +9068,9 @@ class InventoryScreen(RepositoryBackedWidget):
             metadata["ammunition_type"] = (
                 self.ammunition_type_name_input.text().strip() or name
             )
+
+        metadata["quantity_unit"] = self.item_quantity_unit_input.text().strip() or "each"
+        metadata["storage_location"] = self.item_storage_location_combo.currentData() or "actively_carried"
 
         if self._selected_item_name:
             repository.modify_inventory_item(
@@ -8647,9 +9177,15 @@ class InventoryScreen(RepositoryBackedWidget):
             return _safe_int(item.get("quantity", 0), 0), name
 
         if self._sort_column == 3:
-            return _safe_int(item.get("value_base_units", 0), 0), name
+            return str(item.get("quantity_unit", "each")).casefold(), name
 
         if self._sort_column == 4:
+            return str(item.get("storage_location", "actively_carried")).casefold(), name
+
+        if self._sort_column == 5:
+            return _safe_int(item.get("value_base_units", 0), 0), name
+
+        if self._sort_column == 6:
             return str(item.get("description", "")).casefold(), name
 
         return name, name
@@ -8935,9 +9471,10 @@ class SkillsScreen(RepositoryBackedWidget):
 class AlchemyNotebookScreen(RepositoryBackedWidget):
     """Crafting screen for useful items/materials and recipes."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, playtesting_tools: bool = False) -> None:
         super().__init__()
 
+        self.playtesting_tools = bool(playtesting_tools)
         self.tabs = QTabWidget()
         self._reagent_rows: list[dict[str, Any]] = []
         self._recipe_ingredient_rows: list[dict[str, Any]] = []
@@ -8946,6 +9483,7 @@ class AlchemyNotebookScreen(RepositoryBackedWidget):
         self._reagent_sort_order = Qt.SortOrder.AscendingOrder
         self._recipe_sort_column = 0
         self._recipe_sort_order = Qt.SortOrder.AscendingOrder
+        self._recipe_rows: list[dict[str, Any]] = []
 
         self._setup_reagents_tab()
         self._setup_recipes_tab()
@@ -8972,30 +9510,34 @@ class AlchemyNotebookScreen(RepositoryBackedWidget):
     def _setup_reagents_tab(self) -> None:
         """Builds the structured useful item/material discovery tab."""
 
-        self.reagent_table = QTableWidget(0, 4)
+        self.reagent_table = QTableWidget(0, 5)
         self.reagent_table.setHorizontalHeaderLabels(
-            ["Name", "Description", "Location", "Uses"]
+            ["Name", "Category", "Description", "Location", "Uses"]
         )
         self.reagent_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.reagent_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.reagent_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        _allow_selected_row_deselection(self.reagent_table)
         _enable_table_sorting(self.reagent_table, self._sort_reagents_by_column)
         self.reagent_table.horizontalHeader().setSortIndicator(
             self._reagent_sort_column,
             self._reagent_sort_order,
         )
-        _configure_wrapping_table(self.reagent_table, {1, 2, 3})
+        _configure_wrapping_table(self.reagent_table, {2, 3, 4})
         self.reagent_table.itemSelectionChanged.connect(self._load_selected_reagent)
 
         self.reagent_name_input = QLineEdit()
         self.reagent_name_input.setPlaceholderText("Item or material name")
+        self.reagent_category_combo = _NoWheelComboBox()
+        for category in CRAFTING_INGREDIENT_CATEGORIES:
+            self.reagent_category_combo.addItem(category, category)
         self.reagent_description_input = QLineEdit()
         self.reagent_description_input.setPlaceholderText("Short description")
         self.reagent_location_input = QLineEdit()
         self.reagent_location_input.setPlaceholderText("Where this item or material is found")
         self.reagent_uses_input = QLineEdit()
         self.reagent_uses_input.setPlaceholderText(
-            "Comma-separated uses, such as repair, dye, medicine, fuel"
+            "Generalized symptoms/effects, e.g. sleep aid, pain relief"
         )
 
         save_button = QPushButton("Add / Update Item")
@@ -9010,13 +9552,18 @@ class AlchemyNotebookScreen(RepositoryBackedWidget):
 
         form = QFormLayout()
         form.addRow("Name:", self.reagent_name_input)
+        form.addRow("Category:", self.reagent_category_combo)
         form.addRow("Description:", self.reagent_description_input)
         form.addRow("Location:", self.reagent_location_input)
         form.addRow("Uses:", self.reagent_uses_input)
         form.addRow(button_row)
 
+        form_widget = QWidget()
+        form_widget.setLayout(form)
+        form_widget.setVisible(self.playtesting_tools)
+
         layout = QVBoxLayout()
-        layout.addLayout(form)
+        layout.addWidget(form_widget)
         layout.addWidget(self.reagent_table)
 
         wrapper = QWidget()
@@ -9026,9 +9573,9 @@ class AlchemyNotebookScreen(RepositoryBackedWidget):
     def _setup_recipes_tab(self) -> None:
         """Builds the structured recipe discovery tab."""
 
-        self.recipe_table = QTableWidget(0, 4)
+        self.recipe_table = QTableWidget(0, 5)
         self.recipe_table.setHorizontalHeaderLabels(
-            ["Name", "Ingredients", "Result", "Notes"]
+            ["Name", "Ingredients", "Result", "Estimated Value", "Notes"]
         )
         self.recipe_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         _enable_table_sorting(self.recipe_table, self._sort_recipes_by_column)
@@ -9036,19 +9583,33 @@ class AlchemyNotebookScreen(RepositoryBackedWidget):
             self._recipe_sort_column,
             self._recipe_sort_order,
         )
-        _configure_wrapping_table(self.recipe_table, {1, 2, 3})
+        _configure_wrapping_table(self.recipe_table, {1, 2, 4})
+        self.recipe_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.recipe_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        _allow_selected_row_deselection(self.recipe_table)
+        self.recipe_table.itemSelectionChanged.connect(self._update_recipe_craftability)
+
+        self.recipe_craftability_label = QLabel(
+            "Select a recipe to see what you can craft."
+        )
+        self.recipe_craftability_label.setWordWrap(True)
+        self.recipe_craftability_label.setObjectName("recipeCraftabilityLabel")
 
         self.recipe_name_input = QLineEdit()
         self.recipe_name_input.setPlaceholderText("Recipe name")
         self.recipe_result_input = QLineEdit()
         self.recipe_result_input.setPlaceholderText("Recipe result")
+        self.recipe_value_input = _NoWheelSpinBox()
+        self.recipe_value_input.setRange(0, 999_999_999)
         self.recipe_notes_input = QTextEdit()
         self.recipe_notes_input.setPlaceholderText("Recipe notes")
 
         self.recipe_reagent_combo = QComboBox()
         self.recipe_reagent_combo.setEditable(True)
         self.recipe_reagent_combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
-        self.recipe_reagent_combo.setPlaceholderText("Search material, ingredient, reagent, or crafting item")
+        self.recipe_reagent_combo.setPlaceholderText(
+            "Search the Crafting Items list"
+        )
         self.recipe_reagent_combo.setMinimumWidth(220)
         self.recipe_reagent_choice_model = QStringListModel(self)
         self.recipe_reagent_completer = QCompleter(
@@ -9107,6 +9668,7 @@ class AlchemyNotebookScreen(RepositoryBackedWidget):
         self.recipe_ingredient_table.setSelectionMode(
             QTableWidget.SelectionMode.SingleSelection
         )
+        _allow_selected_row_deselection(self.recipe_ingredient_table)
         _use_soft_table_selection(self.recipe_ingredient_table)
 
         save_button = QPushButton("Add / Update Recipe")
@@ -9124,11 +9686,17 @@ class AlchemyNotebookScreen(RepositoryBackedWidget):
         form.addRow("Ingredient:", ingredient_controls)
         form.addRow("Selected Ingredients:", self.recipe_ingredient_table)
         form.addRow("Result:", self.recipe_result_input)
+        form.addRow("Estimated Value (base units):", self.recipe_value_input)
         form.addRow("Notes:", self.recipe_notes_input)
         form.addRow(button_row)
 
+        form_widget = QWidget()
+        form_widget.setLayout(form)
+        form_widget.setVisible(self.playtesting_tools)
+
         layout = QVBoxLayout()
-        layout.addLayout(form)
+        layout.addWidget(form_widget)
+        layout.addWidget(self.recipe_craftability_label)
         layout.addWidget(self.recipe_table)
 
         wrapper = QWidget()
@@ -9167,9 +9735,10 @@ class AlchemyNotebookScreen(RepositoryBackedWidget):
 
         for row_index, reagent in enumerate(reagents):
             self.reagent_table.setItem(row_index, 0, _table_item(str(reagent.get("name", ""))))
-            self.reagent_table.setItem(row_index, 1, _table_item(str(reagent.get("description", ""))))
-            self.reagent_table.setItem(row_index, 2, _table_item(str(reagent.get("location", ""))))
-            self.reagent_table.setItem(row_index, 3, _table_item(_join_list(reagent.get("uses", []))))
+            self.reagent_table.setItem(row_index, 1, _table_item(str(reagent.get("category", ""))))
+            self.reagent_table.setItem(row_index, 2, _table_item(str(reagent.get("description", ""))))
+            self.reagent_table.setItem(row_index, 3, _table_item(str(reagent.get("location", ""))))
+            self.reagent_table.setItem(row_index, 4, _table_item(_join_list(reagent.get("uses", []))))
 
         _resize_wrapping_table_rows(self.reagent_table)
         self._refreshing_reagents = False
@@ -9186,19 +9755,93 @@ class AlchemyNotebookScreen(RepositoryBackedWidget):
         """Reloads the recipe table."""
 
         recipes = repository.list_crafting_recipes()
+        denominations = repository.get_currency_denominations()
         recipes.sort(
             key=self._recipe_sort_key,
             reverse=_sort_descending(self._recipe_sort_order),
         )
+        self._recipe_rows = recipes
         self.recipe_table.setRowCount(len(recipes))
 
         for row_index, recipe in enumerate(recipes):
             self.recipe_table.setItem(row_index, 0, _table_item(str(recipe.get("name", ""))))
             self.recipe_table.setItem(row_index, 1, _table_item(format_recipe_ingredients(recipe.get("ingredients", []))))
             self.recipe_table.setItem(row_index, 2, _table_item(str(recipe.get("result", ""))))
-            self.recipe_table.setItem(row_index, 3, _table_item(str(recipe.get("notes", ""))))
+            value_base_units = _safe_int(recipe.get("value_base_units", 0), 0)
+            self.recipe_table.setItem(
+                row_index,
+                3,
+                _table_item(
+                    format_currency_amount(value_base_units, denominations),
+                    value_base_units,
+                ),
+            )
+            self.recipe_table.setItem(row_index, 4, _table_item(str(recipe.get("notes", ""))))
 
         _resize_wrapping_table_rows(self.recipe_table)
+        self._update_recipe_craftability()
+
+    def _update_recipe_craftability(self) -> None:
+        """Shows exact owned ingredient counts and the limiting reagent."""
+
+        repository = self.repository()
+        row_index = self.recipe_table.currentRow()
+        if repository is None or row_index < 0 or row_index >= len(self._recipe_rows):
+            self.recipe_craftability_label.setText(
+                "Select a recipe to see what you can craft."
+            )
+            return
+
+        recipe = self._recipe_rows[row_index]
+        inventory: dict[str, tuple[int, str]] = {}
+        for item in repository.list_inventory_items():
+            name = str(item.get("name", "")).strip().casefold()
+            metadata = item.get("metadata", {}) if isinstance(item.get("metadata"), dict) else {}
+            key = str(metadata.get("item_uuid", "")).strip() or name
+            unit = str(item.get("quantity_unit", "each") or "each").strip()
+            previous_quantity, _previous_unit = inventory.get(key, (0, unit))
+            inventory[key] = (
+                previous_quantity + max(0, _safe_int(item.get("quantity", 0), 0)),
+                unit,
+            )
+
+        details: list[str] = []
+        craftable = None
+        limiting: list[str] = []
+        for ingredient in normalize_recipe_ingredients(recipe.get("ingredients", [])):
+            name = str(ingredient.get("reagent_name", "")).strip()
+            key = str(ingredient.get("item_uuid", "")).strip() or name.casefold()
+            recipe_unit = str(ingredient.get("measure_unit", "each") or "each")
+            required = max(1, _safe_int(ingredient.get("quantity", 1), 1)) * max(
+                1, _safe_int(ingredient.get("measure_amount", 1), 1)
+            )
+            owned, inventory_unit = inventory.get(key, (0, recipe_unit))
+            if inventory_unit.casefold() != recipe_unit.casefold():
+                craftable = 0
+                limiting.append(name)
+                details.append(
+                    f"{name}: {owned} {inventory_unit} owned / "
+                    f"{required} {recipe_unit} required (unit mismatch)"
+                )
+                continue
+            possible = owned // required
+            craftable = possible if craftable is None else min(craftable, possible)
+            if possible == craftable:
+                limiting.append(name)
+            details.append(
+                f"{name}: {owned} {inventory_unit} owned / "
+                f"{required} {recipe_unit} per item"
+            )
+
+        if craftable is None:
+            self.recipe_craftability_label.setText("This recipe has no ingredients.")
+            return
+        limit_text = ", ".join(limiting) if limiting else "none"
+        self.recipe_craftability_label.setText(
+            f"Can currently craft: {craftable} × {recipe.get('name', 'item')}\n"
+            f"Ingredients:\n  • " + "\n  • ".join(details) + "\n"
+            f"Limiting reagent: {limit_text}"
+        )
 
     def _save_reagent(self) -> None:
         """Adds or updates a known crafting item/material."""
@@ -9216,12 +9859,14 @@ class AlchemyNotebookScreen(RepositoryBackedWidget):
 
         repository.add_crafting_item(
             name=name,
+            category=str(self.reagent_category_combo.currentData() or "Material"),
             description=self.reagent_description_input.text(),
             location=self.reagent_location_input.text(),
             uses=_split_list(self.reagent_uses_input.text()),
         )
 
         self.reagent_name_input.clear()
+        self.reagent_category_combo.setCurrentIndex(0)
         self.reagent_description_input.clear()
         self.reagent_location_input.clear()
         self.reagent_uses_input.clear()
@@ -9245,6 +9890,10 @@ class AlchemyNotebookScreen(RepositoryBackedWidget):
 
         reagent = self._reagent_rows[row_index]
         self.reagent_name_input.setText(str(reagent.get("name", "")))
+        _set_combo_to_data(
+            self.reagent_category_combo,
+            str(reagent.get("category", "Material")),
+        )
         self.reagent_description_input.setText(str(reagent.get("description", "")))
         self.reagent_location_input.setText(str(reagent.get("location", "")))
         self.reagent_uses_input.setText(_join_list(reagent.get("uses", [])))
@@ -9254,6 +9903,7 @@ class AlchemyNotebookScreen(RepositoryBackedWidget):
 
         self.reagent_table.clearSelection()
         self.reagent_name_input.clear()
+        self.reagent_category_combo.setCurrentIndex(0)
         self.reagent_description_input.clear()
         self.reagent_location_input.clear()
         self.reagent_uses_input.clear()
@@ -9263,7 +9913,9 @@ class AlchemyNotebookScreen(RepositoryBackedWidget):
 
         current_text = self.recipe_reagent_combo.currentText().strip()
         self.recipe_reagent_combo.clear()
-        choices = _crafting_ingredient_catalog_choices(repository.list_item_catalog())
+        choices = _crafting_ingredient_catalog_choices(
+            repository.list_crafting_items()
+        )
         choice_labels: list[str] = []
 
         for item in choices:
@@ -9323,6 +9975,9 @@ class AlchemyNotebookScreen(RepositoryBackedWidget):
     def _add_recipe_ingredient(self) -> None:
         """Adds a structured known-item ingredient to the draft recipe."""
 
+        repository = self.repository()
+        if repository is None:
+            return
         selected_name = self._selected_recipe_reagent_name()
 
         if not selected_name:
@@ -9339,6 +9994,14 @@ class AlchemyNotebookScreen(RepositoryBackedWidget):
         ingredient = normalize_recipe_ingredient(
             {
                 "reagent_name": selected_name,
+                "item_uuid": next(
+                    (
+                        str(item.get("metadata", {}).get("item_uuid", ""))
+                        for item in repository.list_item_catalog()
+                        if str(item.get("name", "")).casefold() == selected_name.casefold()
+                    ),
+                    "",
+                ),
                 "quantity": self.recipe_quantity_input.value(),
                 "measure_amount": self.recipe_measure_amount_input.value(),
                 "measure_unit": self.recipe_measure_unit_combo.currentData(),
@@ -9426,6 +10089,7 @@ class AlchemyNotebookScreen(RepositoryBackedWidget):
         self._recipe_ingredient_rows.clear()
         self._refresh_recipe_ingredient_table()
         self.recipe_result_input.clear()
+        self.recipe_value_input.setValue(0)
         self.recipe_notes_input.clear()
         self.recipe_quantity_input.setValue(1)
         self.recipe_measure_amount_input.setValue(1)
@@ -9458,6 +10122,7 @@ class AlchemyNotebookScreen(RepositoryBackedWidget):
             ingredients=list(self._recipe_ingredient_rows),
             result=self.recipe_result_input.text(),
             notes=self.recipe_notes_input.toPlainText(),
+            value_base_units=self.recipe_value_input.value(),
         )
 
         self._clear_recipe_form()
@@ -9493,12 +10158,15 @@ class AlchemyNotebookScreen(RepositoryBackedWidget):
         name = str(reagent.get("name", "")).casefold()
 
         if self._reagent_sort_column == 1:
-            return str(reagent.get("description", "")).casefold(), name
+            return str(reagent.get("category", "")).casefold(), name
 
         if self._reagent_sort_column == 2:
-            return str(reagent.get("location", "")).casefold(), name
+            return str(reagent.get("description", "")).casefold(), name
 
         if self._reagent_sort_column == 3:
+            return str(reagent.get("location", "")).casefold(), name
+
+        if self._reagent_sort_column == 4:
             return _join_list(reagent.get("uses", [])).casefold(), name
 
         return name, name
@@ -9515,6 +10183,9 @@ class AlchemyNotebookScreen(RepositoryBackedWidget):
             return str(recipe.get("result", "")).casefold(), name
 
         if self._recipe_sort_column == 3:
+            return str(recipe.get("value_base_units", 0)).zfill(12), name
+
+        if self._recipe_sort_column == 4:
             return str(recipe.get("notes", "")).casefold(), name
 
         return name, name
@@ -9614,6 +10285,7 @@ class SettingsScreen(RepositoryBackedWidget):
         custom_voice_storage_path: Path | str | None = None,
         ai_enabled: bool = True,
         music_enabled: bool = True,
+        playtesting_tools: bool = False,
     ) -> None:
         super().__init__()
 
@@ -9627,6 +10299,7 @@ class SettingsScreen(RepositoryBackedWidget):
         self.custom_voice_storage_path = custom_voice_storage_path
         self.ai_enabled = bool(ai_enabled)
         self.music_feature_enabled = bool(music_enabled)
+        self.playtesting_tools = bool(playtesting_tools)
         self.narrator_enabled_checkbox: QCheckBox | None = None
         self.tts_volume_slider: QSlider | None = None
         self.tts_volume_label: QLabel | None = None
@@ -9697,8 +10370,9 @@ class SettingsScreen(RepositoryBackedWidget):
         if self.custom_voice_button is not None:
             layout.addRow("Custom Voices:", self.custom_voice_button)
 
-        layout.addRow("Currencies:", self.currency_rows_widget)
-        layout.addRow("", self.add_settings_currency_button)
+        if self.playtesting_tools:
+            layout.addRow("Currencies:", self.currency_rows_widget)
+            layout.addRow("", self.add_settings_currency_button)
 
         self.setLayout(layout)
 
@@ -10894,6 +11568,16 @@ def _combo_current_data_text(combo: QComboBox | None, default: str) -> str:
     return str(value or default)
 
 
+def _scrollable_widget(content: QWidget) -> QScrollArea:
+    """Wraps tall dialog content so outer action buttons remain visible."""
+
+    scroll_area = QScrollArea()
+    scroll_area.setWidgetResizable(True)
+    scroll_area.setFrameShape(QScrollArea.Shape.NoFrame)
+    scroll_area.setWidget(content)
+    return scroll_area
+
+
 def _row_for_cell_widget(table: QTableWidget, widget: QWidget) -> int:
     """Returns the table row containing widget, or -1 when not found."""
 
@@ -10919,7 +11603,7 @@ def _table_line_edit(text: str) -> QLineEdit:
 def _table_spin_box(minimum: int, maximum: int) -> QSpinBox:
     """Builds an inline table number editor with table-wide sizing."""
 
-    spin_box = QSpinBox()
+    spin_box = _NoWheelSpinBox()
     spin_box.setMinimum(minimum)
     spin_box.setMaximum(maximum)
     spin_box.setMinimumWidth(TABLE_INLINE_EDITOR_MIN_WIDTH)
@@ -10930,7 +11614,7 @@ def _table_spin_box(minimum: int, maximum: int) -> QSpinBox:
 def _table_combo_box(options: dict[str, str], current_value: str) -> QComboBox:
     """Builds an inline table combo box."""
 
-    combo = QComboBox()
+    combo = _NoWheelComboBox()
     _add_combo_options(combo, options)
     _set_combo_to_data(combo, current_value)
     combo.setMinimumWidth(TABLE_INLINE_EDITOR_MIN_WIDTH)
@@ -10967,7 +11651,7 @@ def _append_starting_location_table_row(
     )
     sublocation_input = QCheckBox()
     sublocation_input.setChecked(bool(location.get("is_sublocation", False)))
-    parent_input = QComboBox()
+    parent_input = _NoWheelComboBox()
     parent_input.setMinimumWidth(TABLE_INLINE_EDITOR_MIN_WIDTH)
     parent_input.setMinimumHeight(TABLE_INLINE_EDITOR_HEIGHT)
     parent_input.setProperty(
@@ -10988,6 +11672,7 @@ def _append_starting_location_table_row(
     table.setCellWidget(row, 3, sublocation_input)
     table.setCellWidget(row, 4, parent_input)
     table.setCellWidget(row, 5, remove_button)
+    parent_input.setVisible(sublocation_input.isChecked())
     _set_table_column_widths(table, STARTING_LOCATION_COLUMN_WIDTHS)
 
 
@@ -11034,7 +11719,9 @@ def _starting_locations_from_table(table: QTableWidget) -> list[dict[str, Any]]:
                 "location_mode": location_mode,
                 "is_sublocation": is_sublocation,
                 "parent_location": parent_location if is_sublocation else "",
-                "requires_ai_invention": not name or not description,
+                "requires_ai_invention": (
+                    location_mode == "suggestion" or not name or not description
+                ),
             }
         )
 
@@ -11080,6 +11767,56 @@ def _starting_location_options_from_table(
             options.append((row_id, name))
 
     return options
+
+
+def _sync_starting_location_parent_dropdowns(
+    table: QTableWidget,
+    locations: list[tuple[str, str]],
+) -> None:
+    """Keeps each sublocation parent dropdown hidden until needed and up to date."""
+
+    valid_ids = {row_id for row_id, _name in locations}
+
+    for row in range(table.rowCount()):
+        row_id = _starting_location_row_id_for_row(table, row)
+        sublocation_widget = table.cellWidget(row, 3)
+        parent_widget = table.cellWidget(row, 4)
+        parent_selected = (
+            parent_widget.currentData()
+            if isinstance(parent_widget, QComboBox)
+            else ""
+        )
+        is_sublocation = (
+            sublocation_widget.isChecked()
+            if isinstance(sublocation_widget, QCheckBox)
+            else False
+        )
+
+        if not isinstance(parent_widget, QComboBox):
+            continue
+
+        parent_widget.blockSignals(True)
+        parent_widget.clear()
+        parent_widget.addItem("Select containing location", "")
+
+        for option_id, name in locations:
+            if option_id == row_id:
+                continue
+            parent_widget.addItem(name, option_id)
+
+        if str(parent_selected or "") in valid_ids:
+            _set_combo_to_data(parent_widget, str(parent_selected))
+        else:
+            pending_parent = str(
+                parent_widget.property("pending_parent_location") or ""
+            ).strip()
+
+            if pending_parent:
+                _set_combo_to_text(parent_widget, pending_parent)
+                parent_widget.setProperty("pending_parent_location", "")
+
+        parent_widget.blockSignals(False)
+        parent_widget.setVisible(is_sublocation)
 
 
 def _append_starting_npc_table_row(
@@ -11175,6 +11912,7 @@ def _configure_inline_table(
     table.setAlternatingRowColors(True)
     table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
     table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+    _use_soft_table_selection(table)
     _set_table_column_widths(table, widths)
 
 
@@ -11707,12 +12445,105 @@ def _travel_locations_for_save(
     setup: dict[str, Any],
     result: Any,
 ) -> list[dict[str, Any]]:
-    """Returns AI locations with exact requested start location preserved."""
+    """Merges AI locations with every structured player-requested location."""
 
     locations = [
         location.to_dict()
         for location in normalize_known_locations(raw_locations)
     ]
+    source_indexes_by_name: dict[str, int] = {}
+    if isinstance(raw_locations, list):
+        for raw_location in raw_locations:
+            if not isinstance(raw_location, dict):
+                continue
+            name = str(raw_location.get("name", "") or "").strip().casefold()
+            if not name:
+                continue
+            source_indexes_by_name[name] = _safe_int(
+                raw_location.get("source_index", -1),
+                -1,
+            )
+    for location in locations:
+        location["source_index"] = source_indexes_by_name.get(
+            str(location.get("name", "")).casefold(),
+            -1,
+        )
+
+    requested_locations = setup.get("starting_locations", [])
+    if isinstance(requested_locations, list):
+        for source_index, raw_requested_location in enumerate(requested_locations):
+            if not isinstance(raw_requested_location, dict):
+                continue
+
+            requested_name = str(
+                raw_requested_location.get("name", "") or ""
+            ).strip()
+            requested_description = str(
+                raw_requested_location.get("description", "") or ""
+            ).strip()
+            mode = str(
+                raw_requested_location.get("location_mode", "suggestion")
+                or "suggestion"
+            ).casefold()
+            matched_location = next(
+                (
+                    location
+                    for location in locations
+                    if _safe_int(location.get("source_index", -1), -1)
+                    == source_index
+                ),
+                None,
+            )
+            if matched_location is None and requested_name:
+                matched_location = next(
+                    (
+                        location
+                        for location in locations
+                        if str(location.get("name", "")).strip().casefold()
+                        == requested_name.casefold()
+                    ),
+                    None,
+                )
+
+            if matched_location is None:
+                if not requested_name:
+                    continue
+                matched_location = {
+                    "name": requested_name,
+                    "description": requested_description,
+                    "x_miles": None,
+                    "y_miles": None,
+                    "terrain": "",
+                    "travel_multiplier": 1.0,
+                    "travel_notes": "",
+                    "source_index": source_index,
+                }
+                locations.append(matched_location)
+
+            if mode == "exact":
+                if requested_name:
+                    matched_location["name"] = requested_name
+                matched_location["description"] = requested_description
+            elif requested_description and str(
+                matched_location.get("description", "")
+            ).strip().casefold() in {"", "starting location."}:
+                matched_location["description"] = requested_description
+
+            parent_location = str(
+                raw_requested_location.get("parent_location", "") or ""
+            ).strip()
+            if bool(raw_requested_location.get("is_sublocation")) and parent_location:
+                relationship_note = f"Located within {parent_location}."
+                existing_notes = str(
+                    matched_location.get("travel_notes", "") or ""
+                ).strip()
+                if relationship_note.casefold() not in existing_notes.casefold():
+                    matched_location["travel_notes"] = " ".join(
+                        value
+                        for value in [existing_notes, relationship_note]
+                        if value
+                    )
+
     requested_location = str(setup.get("start_location", "") or "").strip()
     ai_location = str(getattr(result, "start_location", "") or "").strip()
 
@@ -11752,9 +12583,82 @@ def _travel_locations_for_save(
     ]
 
 
+def _finalized_location_aliases(
+    locations: list[dict[str, Any]],
+    setup: dict[str, Any],
+) -> dict[str, str]:
+    """Maps wizard suggestion names to their finalized AI location names."""
+
+    requested_locations = setup.get("starting_locations", [])
+    if not isinstance(requested_locations, list):
+        return {}
+
+    finalized_names_by_source_index = {
+        _safe_int(location.get("source_index", -1), -1): str(
+            location.get("name", "") or ""
+        ).strip()
+        for location in locations
+        if _safe_int(location.get("source_index", -1), -1) >= 0
+        and str(location.get("name", "") or "").strip()
+    }
+    aliases: dict[str, str] = {}
+
+    for source_index, raw_requested_location in enumerate(requested_locations):
+        if not isinstance(raw_requested_location, dict):
+            continue
+        requested_name = str(raw_requested_location.get("name", "") or "").strip()
+        finalized_name = finalized_names_by_source_index.get(source_index, "")
+        if (
+            requested_name
+            and finalized_name
+            and requested_name.casefold() != finalized_name.casefold()
+        ):
+            aliases[requested_name] = finalized_name
+
+    return aliases
+
+
+def _replace_location_aliases(text: Any, aliases: dict[str, str]) -> str:
+    """Reconciles free-text setup location references with finalized names."""
+
+    clean_text = str(text or "")
+    for old_name, finalized_name in sorted(
+        aliases.items(),
+        key=lambda item: len(item[0]),
+        reverse=True,
+    ):
+        clean_text = re.sub(
+            rf"(?<!\w){re.escape(old_name)}(?!\w)",
+            lambda _match, replacement=finalized_name: replacement,
+            clean_text,
+            flags=re.IGNORECASE,
+        )
+    return clean_text
+
+
+def _replace_location_aliases_in_travel_locations(
+    locations: list[dict[str, Any]],
+    aliases: dict[str, str],
+) -> list[dict[str, Any]]:
+    """Updates player-facing location prose after suggestion names are finalized."""
+
+    if not aliases:
+        return locations
+
+    for location in locations:
+        for field_name in ("description", "travel_notes"):
+            location[field_name] = _replace_location_aliases(
+                location.get(field_name, ""),
+                aliases,
+            )
+    return locations
+
+
 def _apply_new_game_crafting_knowledge(
     repository: SaveRepository,
     result: Any,
+    *,
+    location_aliases: dict[str, str] | None = None,
 ) -> None:
     """Persists AI-finalized starting Crafting tab knowledge."""
 
@@ -11781,8 +12685,12 @@ def _apply_new_game_crafting_knowledge(
 
         repository.add_crafting_item(
             name=name,
+            category=category,
             description=description,
-            location=str(raw_item.get("location", "") or "").strip(),
+            location=_replace_location_aliases(
+                raw_item.get("location", ""),
+                location_aliases or {},
+            ).strip(),
             uses=uses,
         )
         repository.upsert_item_catalog_entry(
@@ -11828,6 +12736,10 @@ def _apply_new_game_crafting_knowledge(
             ingredients=ingredients,
             result=result_text,
             notes=str(raw_recipe.get("notes", "") or "").strip(),
+            value_base_units=max(
+                0,
+                _safe_int(raw_recipe.get("value_base_units", 0), 0),
+            ),
         )
 
 

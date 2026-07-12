@@ -476,6 +476,10 @@ class ContextBuilderTests(unittest.TestCase):
             "Do not speak for the player character",
             packet_json,
         )
+        self.assertIn(
+            "not Containers merely because they store information",
+            packet_json,
+        )
         self.assertIn("multiple entries", packet["response_contract"]["events"])
         self.assertIn(
             "one NpcUpsertedEvent per distinct meaningful NPC",

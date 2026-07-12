@@ -226,6 +226,7 @@ class StateManager:
                 ReagentKnowledge(
                     id=_read_optional_int(row, "id"),
                     name=_read_string(row, "name", ""),
+                    category=_read_string(row, "category", "Material"),
                     description=_read_string(row, "description", ""),
                     location=_read_string(row, "location", ""),
                     uses=_read_string_list(row, "uses"),
@@ -241,6 +242,7 @@ class StateManager:
                     ingredients=[
                         RecipeIngredient(
                             reagent_name=_read_string(ingredient, "reagent_name", ""),
+                            item_uuid=_read_string(ingredient, "item_uuid", ""),
                             quantity=_read_int(ingredient, "quantity", 1),
                             measure_amount=_read_int(ingredient, "measure_amount", 1),
                             measure_unit=_read_string(ingredient, "measure_unit", "each"),
@@ -249,6 +251,7 @@ class StateManager:
                     ],
                     result=_read_string(row, "result", ""),
                     notes=_read_string(row, "notes", ""),
+                    value_base_units=_read_int(row, "value_base_units", 0),
                     discovered_at=_read_string(row, "discovered_at", ""),
                 )
             )

@@ -35,6 +35,7 @@ from ai_adventure.currency import (
 )
 from ai_adventure.locations import clean_player_location_name, normalize_known_locations
 from ai_adventure.new_game_setup import STARTER_INVENTORY_MIN_ITEMS
+from ai_adventure.skills.rules import MAX_SKILL_LEVEL
 
 LOGGER = logging.getLogger(__name__)
 
@@ -97,6 +98,8 @@ KNOWN_EVENT_TYPE_NAMES = [
     "TravelModeChangedEvent",
     "ActiveTaskUpsertedEvent",
     "ActiveTaskCompletedEvent",
+    "CalendarEventUpsertedEvent",
+    "CalendarEventDeletedEvent",
     "SpellLearnedEvent",
     "NpcUpsertedEvent",
     "NpcKnowledgeAddedEvent",
@@ -165,6 +168,7 @@ RECIPE_INGREDIENT_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
         "reagent_name": {"type": "string"},
+        "item_uuid": {"type": "string", "description": "Stable UUID copied from the matching state.item_catalog.items metadata."},
         "quantity": {"type": "integer", "minimum": 1},
         "measure_amount": {"type": "integer", "minimum": 1},
         "measure_unit": {
@@ -207,8 +211,9 @@ NEW_GAME_CRAFTING_RECIPE_SCHEMA: dict[str, Any] = {
         "ingredients": NONEMPTY_RECIPE_INGREDIENT_LIST_SCHEMA,
         "result": {"type": "string"},
         "notes": {"type": "string"},
+        "value_base_units": {"type": "integer", "minimum": 0},
     },
-    "required": ["name", "ingredients", "result", "notes"],
+    "required": ["name", "ingredients", "result", "notes", "value_base_units"],
     "additionalProperties": False,
 }
 INT_OR_AUTO_SCHEMA: dict[str, Any] = {
@@ -393,8 +398,11 @@ EVENT_RESPONSE_SCHEMA: dict[str, Any] = {
             {
                 "item_type": {"type": "string"},
                 "item_name": {"type": "string"},
+                "item_uuid": {"type": "string", "description": "Existing catalog UUID when this is a known item; otherwise use an empty string and Python assigns one."},
                 "description": {"type": "string"},
                 "amount": {"type": "integer", "minimum": 1},
+                "quantity_unit": {"type": "string", "description": "Unit for the amount, such as each, bottle, vial, gram, kilogram, liter, or meter."},
+                "storage_location": {"type": "string", "enum": ["home", "actively_carried"]},
                 "value_base_units": {"type": "integer", "minimum": 1},
                 "weapon_hands": {
                     "type": "string",
@@ -434,6 +442,8 @@ EVENT_RESPONSE_SCHEMA: dict[str, Any] = {
                 "new_description": {"type": "string"},
                 "new_amount": INT_OR_SKIP_SCHEMA,
                 "new_value_base_units": INT_OR_SKIP_SCHEMA,
+                "item_uuid": {"type": "string"},
+                "quantity_unit": {"type": "string", "description": "Replacement unit measured by new_amount, such as each, grams, mL, bottle, or vial."},
                 "weapon_hands": {
                     "type": "string",
                     "enum": ["one-handed", "two-handed", ""],
@@ -617,8 +627,33 @@ EVENT_RESPONSE_SCHEMA: dict[str, Any] = {
                 "ingredients": NONEMPTY_RECIPE_INGREDIENT_LIST_SCHEMA,
                 "result": {"type": "string"},
                 "notes": {"type": "string"},
+                "value_base_units": {"type": "integer", "minimum": 0},
             },
-            ["name", "ingredients", "result", "notes"],
+            ["name", "ingredients", "result", "notes", "value_base_units"],
+        ),
+        _event_response_schema(
+            "CalendarEventUpsertedEvent",
+            {
+                "event_id": {"type": "string"},
+                "title": {"type": "string"},
+                "description": {"type": "string"},
+                "category": {"type": "string"},
+                "month": {"type": "integer", "minimum": 1},
+                "day": {"type": "integer", "minimum": 1},
+                "duration_days": {"type": "integer", "minimum": 1},
+                "recurrence": {"type": "string", "enum": ["none", "yearly"]},
+                "year": {"type": "integer", "minimum": 1},
+                "importance": {"type": "string"},
+                "details": {"type": "string"},
+            },
+            ["event_id", "title", "description", "category", "month", "day", "duration_days", "recurrence", "year", "importance", "details"],
+            description="Creates or updates a persistent one-time or yearly calendar event.",
+        ),
+        _event_response_schema(
+            "CalendarEventDeletedEvent",
+            {"event_id": {"type": "string"}},
+            ["event_id"],
+            description="Deletes a persistent calendar event by stable identifier.",
         ),
         _event_response_schema(
             "ReagentDiscoveredEvent",
@@ -627,11 +662,17 @@ EVENT_RESPONSE_SCHEMA: dict[str, Any] = {
                 "description": {"type": "string"},
                 "location": {"type": "string"},
                 "uses": NONEMPTY_STRING_LIST_SCHEMA,
+                "category": {
+                    "type": "string",
+                    "enum": list(CRAFTING_INGREDIENT_CATEGORIES),
+                },
             },
-            ["name", "description", "location", "uses"],
+            ["name", "description", "location", "uses", "category"],
             description=(
                 "Stores a simplified useful crafting item/material; name-only "
-                "payloads are incomplete."
+                "payloads are incomplete. The uses list should contain "
+                "generalized symptoms or effects the item may address, such as "
+                "sleep aid or pain relief, not detailed recipes or procedures."
             ),
         ),
         _event_response_schema(
@@ -901,6 +942,7 @@ NEW_GAME_RESPONSE_JSON_SCHEMA: dict[str, Any] = {
                     "terrain": {"type": "string"},
                     "travel_multiplier": {"type": "number", "minimum": 0.1, "maximum": 3.0},
                     "travel_notes": {"type": "string"},
+                    "source_index": {"type": "integer", "minimum": -1},
                 },
                 "required": [
                     "name",
@@ -910,6 +952,7 @@ NEW_GAME_RESPONSE_JSON_SCHEMA: dict[str, Any] = {
                     "terrain",
                     "travel_multiplier",
                     "travel_notes",
+                    "source_index",
                 ],
                 "additionalProperties": False,
             },
@@ -1003,8 +1046,26 @@ NEW_GAME_RESPONSE_JSON_SCHEMA: dict[str, Any] = {
                 "type": "object",
                 "properties": {
                     "name": {"type": "string"},
-                    "category": {"type": "string"},
+                    "category": {
+                        "type": "string",
+                        "description": (
+                        "The item's actual primary function. Use Container only "
+                        "for an item whose primary function is holding physical "
+                        "contents that can be put in and taken out, not for an "
+                        "item that stores writing, records, or information. A "
+                        "physical journal, notebook, ledger, manual, or other book "
+                        "should be categorized as Book or Document, not Information."
+                        ),
+                    },
                     "quantity": {"type": "integer", "minimum": 1},
+                    "quantity_unit": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": (
+                            "What the quantity measures, such as each, bundle, "
+                            "bottle, vial, gram, kilogram, ounce, liter, or meter."
+                        ),
+                    },
                     "description": {"type": "string"},
                     "value_base_units": {"type": "integer", "minimum": 0},
                     "weapon_hands": {
@@ -1037,6 +1098,7 @@ NEW_GAME_RESPONSE_JSON_SCHEMA: dict[str, Any] = {
                     "name",
                     "category",
                     "quantity",
+                    "quantity_unit",
                     "description",
                     "value_base_units",
                     "source_index",
@@ -1689,6 +1751,16 @@ def build_gemini_story_prompt(context_packet: dict[str, Any]) -> str:
         "dice, raw roll numbers, totals, DCs, or game mechanics in the story.\n"
         "- Every InventoryItemAddedEvent payload must include value_base_units "
         "as an integer of at least 1.\n"
+        "- Every InventoryItemAddedEvent must also include quantity_unit and "
+        "storage_location. quantity_unit states what the amount measures, such "
+        "as each, grams, mL, bottle, or vial. For recipe ingredients, the matching "
+        "inventory item's quantity_unit must equal measure_unit. Use "
+        "InventoryItemModifiedEvent with quantity_unit to correct an existing "
+        "ingredient stack whose stored unit is wrong. Preserve item_uuid whenever "
+        "the item already exists in state.item_catalog.items. "
+        "as each, bottle, vial, gram, kilogram, liter, or meter. Use exactly "
+        "home for items stored at the player's Home and actively_carried for "
+        "items currently carried by the Player Character.\n"
         "- For weapons, set item_type='Weapon' and include weapon_hands "
         "('one-handed' or 'two-handed') plus damage as a dice expression such "
         "as 1d6, 1d8, or 2d6. Any player weapon must have average damage "
@@ -1706,7 +1778,10 @@ def build_gemini_story_prompt(context_packet: dict[str, Any]) -> str:
         "Armor clearly so the Character sheet can equip them.\n"
         "- state.item_catalog.items is the master list of known item definitions. "
         "Use it to remember item descriptions after items leave inventory, but "
-        "only state.inventory.items are current possessions.\n"
+        "only state.inventory.items are current possessions. Each catalog entry's "
+        "metadata.item_uuid is its stable internal identity: preserve and reuse it "
+        "when referring to the same item, even if its player-facing name changes. "
+        "Do not invent duplicate item definitions merely because wording differs.\n"
         "- Containers are inventory items with item_type='Container' and a required "
         "container metadata object. When the player acquires a closed pouch, purse, "
         "chest, box, bag, or similar object, add only that container. Store its exact "
@@ -1733,17 +1808,36 @@ def build_gemini_story_prompt(context_packet: dict[str, Any]) -> str:
         "damage totals, deaths, victory, defeat, or loot recovery after combat "
         "starts. The Python application handles combat deterministically in the "
         "Combat tab and blocks Story input until combat is resolved.\n"
+        "- When a structured record has separate Location and Description fields, "
+        "keep them complementary: Description should explain what the thing is, "
+        "looks like, does, or means, while Location should contain where it is "
+        "found or situated. Do not repeat the location in the description unless "
+        "the location itself is an essential part of the object's identity.\n"
         "- ReagentDiscoveredEvent records Crafting tab knowledge for useful "
-        "items/materials only and uses exactly name, description, location, "
-        "and uses. If the player physically collects, harvests, picks up, or "
+        "items/materials only and uses exactly name, category, description, "
+        "location, and uses. Use Container for vials, bottles, jars, and similar "
+        "vessels. If the player physically collects, harvests, picks up, or "
         "stores that item/material, also suggest InventoryItemAddedEvent for "
-        "the same item/material.\n"
+        "the same item/material. The uses list is for generalized symptoms or "
+        "effects, such as sleep aid or pain relief, rather than detailed recipes "
+        "or procedures.\n"
         "- RecipeDiscoveredEvent ingredients must be structured entries using "
         "item names from state.item_catalog.items in the reagent_name field. "
+        "Use the matching catalog metadata.item_uuid to identify which definition "
+        "the name refers to; reagent_name remains the required player-facing field. "
+        "Set measure_unit to the same unit as that item's inventory quantity_unit; "
+        "quantity times measure_amount is the total amount consumed per crafted result. "
         "Only items with category "
         f"{CRAFTING_INGREDIENT_CATEGORY_NAMES} may be used as recipe ingredients. "
-        "Include quantity, measure_amount, and measure_unit from the listed "
-        "common measurement units.\n"
+        "If the finished product must physically be stored in a bottle, vial, jar, "
+        "flask, pouch, or similar vessel, include one suitable Container-category "
+        "item as a consumed ingredient for each finished product. "
+        "Include quantity, measure_amount, and a finite measure_unit from the listed "
+        "common measurement units. Liquids such as water must use a concrete volume "
+        "unit such as mL, L, tsp, tbsp, or cups; never use each or vague units such "
+        "as pinch or handful for an uncountable substance. "
+        "Include value_base_units as the recipe result's current or reasonably "
+        "estimated value in the baseline currency unit.\n"
         "- If the narration says the player physically gains, collects, harvests, "
         "finds and keeps, or fills a basket/container with usable items, also "
         "suggest InventoryItemAddedEvent for those items. Do not describe a "
@@ -1773,10 +1867,17 @@ def build_gemini_story_prompt(context_packet: dict[str, Any]) -> str:
         "due_elapsed_minutes must be the absolute in-world elapsed minute for "
         "that deadline. Use 'Unknown' only when a value exists but is genuinely "
         "unclear.\n"
+        "- Use CalendarEventUpsertedEvent for meaningful dated events the player "
+        "should see on the Calendar: festivals, holidays, appointments, promised "
+        "completion dates, deliveries, deadlines, and similar milestones. Use a "
+        "stable lower_snake_case event_id so later turns can edit it. Use recurrence "
+        "yearly for annual observances and none for one-time events; duration_days "
+        "covers consecutive days. Use CalendarEventDeletedEvent only to cancel a "
+        "stored event. Do not recreate an unchanged yearly event each year.\n"
         "- Follow the selected Response Length mode. Within that mode, scale detail "
         "to the importance, risk, and consequences of the action, and address every "
         "part of the player's query without padding.\n"
-        "When creating items, ensure that you give a quantifiable amount or size for the item, rather than using phrases such as \"a pile of [ore/apples/etc.]\".\n"
+        "When creating items, ensure that you give a quantifiable amount and an explicit quantity_unit for the item, rather than using phrases such as \"a pile of [ore/apples/etc.]\".\n"
         "- Do not invent hidden state, inventory, recipes, or flags as confirmed facts.\n\n"
         "Context packet:\n"
         f"{packet_json}"
@@ -1865,12 +1966,18 @@ def build_gemini_new_game_prompt(setup_packet: dict[str, Any]) -> str:
         "Use setup.starting_locations as structured player-requested starting "
         "Travel-tab locations; do not parse starting locations out of ordinary "
         "setup prose or plaintext fields. For each setup.starting_locations row, "
-        "include one corresponding entry in locations. Fill blank name or "
+        "include one corresponding entry in locations and set source_index to that "
+        "row's zero-based index. Use source_index=-1 only for extra locations. "
+        "Fill blank name or "
         "description fields with fitting specifics. If location_mode is exact, "
         "copy name and description into the locations entry unchanged, while "
         "still filling terrain, coordinates, travel_multiplier, and route notes. "
         "If location_mode is suggestion, treat name and description as inspiration "
-        "and put the finalized player-facing values in the locations entry. "
+        "and put the finalized player-facing values in the locations entry. Once "
+        "you finalize a suggested location name, use that finalized name consistently "
+        "in every other returned field, including descriptions, travel_notes, "
+        "known_crafting_items.location, NPC details, tasks, secrets, and opening "
+        "prose; never reuse the superseded setup placeholder or suggestion name. "
         "If is_sublocation is true and parent_location is set, treat the location "
         "as existing inside that parent location; reflect that relationship in "
         "the returned location description and travel_notes without creating a "
@@ -1906,12 +2013,13 @@ def build_gemini_new_game_prompt(setup_packet: dict[str, Any]) -> str:
         "or reasonably inferred experience. Omniscient styles may use a broader "
         "narrative camera, but must not reveal secrets, hidden state, mystery "
         "solutions, or NPC-private facts.\n"
-        "- introductory_message must match setup_packet.current_calendar and "
-        "setup_packet.current_weather unless you intentionally return "
-        "starting_calendar and/or weather fields to change the starting date, "
-        "season, time, or weather. For example, do not mention autumn winds while "
-        "starting_calendar/current_calendar says Spring unless you return a "
-        "starting_calendar for Autumn.\n"
+        "- When setup_packet.current_calendar is present, introductory_message must "
+        "match it unless you intentionally return starting_calendar to change the "
+        "starting date, season, or time. When setup.calendar.ai_generated is true, "
+        "current_calendar is deliberately absent: invent calendar_settings and "
+        "starting_calendar first, then make introductory_message match those generated "
+        "values. introductory_message must match setup_packet.current_weather unless "
+        "you return weather to change it.\n"
         "- start_location must be the actual named location where the player starts. "
         "If setup.start_location is blank/default, choose any coherent starting "
         "location for the selected genre and character. The player does not need "
@@ -1954,7 +2062,10 @@ def build_gemini_new_game_prompt(setup_packet: dict[str, Any]) -> str:
         "embellish, paraphrase, or reinterpret a player-provided character name, "
         "appearance, backstory, or notes field.\n"
         "- skills must contain every starting skill with name, description, and level. "
-        "If setup.skills[N].name is nonblank, copy that exact skill name unchanged "
+        "Skill levels range from 1 through 5, and 5 is the absolute maximum. Never "
+        "create a prerequisite, progression target, or gm_secrets reveal_condition "
+        "that requires a skill level above 5. If setup.skills[N].name is nonblank, "
+        "copy that exact skill name unchanged "
         "in skills[N].name. Do not rename, embellish, specialize, hyphenate, or "
         "reinterpret player-provided skill names. If only the description is blank, "
         "fill the description for that exact named skill. Only invent a skill name "
@@ -1999,13 +2110,29 @@ def build_gemini_new_game_prompt(setup_packet: dict[str, Any]) -> str:
         "items that best fits the concept rather than copying the request "
         "verbatim. If setup.starter_items is blank, invent at least five items "
         "that fit the finalized character backstory, finalized skills, selected "
-        "genre, starting location, weather, and economy. Do not include setup "
-        "bookkeeping words such as Starting, Starter, Initial, Amount, Quantity, "
+        "genre, starting location, weather, and economy. First identify the "
+        "activities, responsibilities, and goals that the player emphasizes in "
+        "the character description, backstory, notes, profession, and skills. "
+        "Prioritize concrete tools and supplies that enable those emphasized "
+        "activities before adding generic apparel, comfort items, or genre-standard "
+        "kit. Infer function from the whole character concept rather than matching "
+        "a fixed keyword list. Assign each item's category from its actual primary "
+        "function. A Container must primarily hold physical contents that can be "
+        "put in and taken out; an object that stores writing, records, instructions, "
+        "or information is not a Container merely because it stores information. "
+        "Do not include setup "
+                "bookkeeping words such as Starting, Starter, Initial, Amount, Quantity, "
         "Count, or Total in item names. Generalize resource names to the actual "
         "inventory item, such as Fuel instead of Starting Fuel Amount, Food instead "
         "of Starting Food Amount, and Water instead of Starting Water Quantity. Put "
         "quantities in quantity, not name. Each item must include "
-        "name, category, quantity, description, value_base_units, and source_index.\n"
+                "name, category, quantity, quantity_unit, description, value_base_units, "
+                "and source_index. quantity_unit is mandatory: use a concrete unit such "
+                "as each, bundle, bottle, vial, gram, kilogram, ounce, liter, or meter; "
+                "never leave it implicit. Classify physical objects by their primary "
+                "function: a journal, notebook, ledger, manual, or other book is Book "
+                "or Document, not Information. Information describes content, not a "
+                "physical inventory category.\n"
         "- Do not create closed or hidden-content containers in starting_items. "
         "The new-game schema intentionally keeps starter inventory flat for Gemini "
         "compatibility. If the opening scene later awards a closed pouch, chest, "
@@ -2019,7 +2146,11 @@ def build_gemini_new_game_prompt(setup_packet: dict[str, Any]) -> str:
         "useful known items/materials and recipes as fit the backstory. Recipe "
         "ingredients must use item names from known_crafting_items or other known "
         "item catalog entries. Ingredient objects must use reagent_name, quantity, "
-        "measure_amount, and measure_unit. Do not add those ingredients to "
+        "measure_amount, and a finite measure_unit from the schema enum. Do not use "
+        "vague units such as pinch or handful. Categorize vials, bottles, jars, and "
+        "similar vessels as Container. Every recipe must include value_base_units "
+        "as a reasonable estimated result value in the baseline currency unit. "
+        "Do not add those ingredients to "
         "starting_items unless the player physically possesses them.\n"
         "- If setup.currency_denominations is empty, currency_denominations must "
         "contain at least one and at most four concrete denominations that fit "
@@ -3598,9 +3729,9 @@ def _parse_new_game_gm_secrets(raw_secrets: Any) -> list[dict[str, Any]]:
                 "secret_id": secret_id,
                 "title": title,
                 "details": details,
-                "reveal_condition": str(
+                "reveal_condition": _clamp_skill_levels_in_text(
                     raw_secret.get("reveal_condition", "")
-                ).strip(),
+                ),
                 "related_npc_ids": [
                     str(value).strip()
                     for value in raw_secret.get("related_npc_ids", [])
@@ -3629,6 +3760,19 @@ def _parse_new_game_locations(
     """Parses player-known location metadata and anchors the starting map origin."""
 
     locations = normalize_known_locations(raw_locations)
+    source_indexes_by_name: dict[str, int] = {}
+    if isinstance(raw_locations, list):
+        for raw_location in raw_locations:
+            if not isinstance(raw_location, dict):
+                continue
+            name = clean_player_location_name(raw_location.get("name", ""))
+            if not name:
+                continue
+            try:
+                source_index = int(raw_location.get("source_index", -1))
+            except (TypeError, ValueError):
+                source_index = -1
+            source_indexes_by_name[name.casefold()] = max(-1, source_index)
     clean_start_location = clean_player_location_name(start_location)
 
     if clean_start_location:
@@ -3657,7 +3801,31 @@ def _parse_new_game_locations(
                 ]
             )
 
-    return [location.to_dict() for location in locations]
+    parsed_locations: list[dict[str, Any]] = []
+    for location in locations:
+        location_data = location.to_dict()
+        location_data["source_index"] = source_indexes_by_name.get(
+            location.name.casefold(),
+            -1,
+        )
+        parsed_locations.append(location_data)
+    return parsed_locations
+
+
+def _clamp_skill_levels_in_text(value: Any) -> str:
+    """Clamps explicit skill-level references to the supported maximum."""
+
+    text = str(value or "").strip()
+
+    def replace_level(match: re.Match[str]) -> str:
+        level = min(int(match.group(2)), MAX_SKILL_LEVEL)
+        return f"{match.group(1)}{level}"
+
+    return re.sub(
+        r"(?i)(\b(?:skill\s+)?level\s+)(\d+)\b",
+        replace_level,
+        text,
+    )
 
 
 def _parse_new_game_calendar_settings(raw_calendar_settings: Any) -> dict[str, Any]:
@@ -3768,8 +3936,9 @@ def _parse_new_game_starter_items(raw_items: Any) -> list[dict[str, Any]]:
         items.append(
             {
                 "name": name,
-                "category": str(raw_item.get("category", "Item")).strip() or "Item",
+                "category": _normalize_starter_item_category(raw_item),
                 "quantity": max(1, quantity),
+                "quantity_unit": str(raw_item.get("quantity_unit", "each") or "each").strip() or "each",
                 "description": str(raw_item.get("description", "")).strip(),
                 "value_base_units": max(0, value_base_units),
                 "source_index": _parse_optional_source_index(raw_item),
@@ -3867,11 +4036,31 @@ def _parse_new_game_crafting_recipes(raw_recipes: Any) -> list[dict[str, Any]]:
                 "ingredients": ingredients,
                 "result": result,
                 "notes": str(raw_recipe.get("notes", "")).strip(),
+                "value_base_units": max(
+                    0,
+                    _coerce_int(raw_recipe.get("value_base_units"), default=0),
+                ),
             }
         )
         seen_names.add(name.casefold())
 
     return recipes
+
+
+def _normalize_starter_item_category(raw_item: dict[str, Any]) -> str:
+    """Returns a concrete category for a finalized starter item."""
+
+    category = str(raw_item.get("category", "Item") or "Item").strip()
+    folded = category.casefold()
+    text = " ".join(
+        str(raw_item.get(field, "") or "")
+        for field in ("name", "description", "item_type")
+    ).casefold()
+    if folded in {"information", "info", "knowledge"}:
+        if any(word in text for word in ("book", "journal", "notebook", "manual", "ledger", "tome")):
+            return "Book"
+        return "Document"
+    return category or "Item"
 
 
 def _generalized_starter_item_name(raw_name: Any) -> str:

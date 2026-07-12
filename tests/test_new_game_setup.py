@@ -813,6 +813,10 @@ class NewGameSetupTests(unittest.TestCase):
         self.assertIn("short, broad place name", packet["requirements"]["starting_location"])
         self.assertIn("travel_locations", packet["requirements"])
         self.assertIn("setup.starting_locations", packet["requirements"]["travel_locations"])
+        self.assertIn(
+            "never reuse the superseded setup placeholder",
+            packet["requirements"]["travel_locations"],
+        )
         self.assertIn("location_mode is exact", packet["requirements"]["travel_locations"])
         self.assertIn("do not parse starting locations", packet["requirements"]["travel_locations"])
         self.assertIn("is_sublocation is true", packet["requirements"]["travel_locations"])
@@ -854,6 +858,14 @@ class NewGameSetupTests(unittest.TestCase):
         self.assertIn("at least five", packet["requirements"]["starter_inventory"])
         self.assertIn("has no maximum count", packet["requirements"]["starter_inventory"])
         self.assertIn("starting_items", packet["requirements"]["starter_inventory"])
+        self.assertIn(
+            "Prioritize concrete tools and supplies",
+            packet["requirements"]["starter_inventory"],
+        )
+        self.assertIn(
+            "not a Container merely because it stores information",
+            packet["requirements"]["starter_inventory"],
+        )
         self.assertIn("source_index", packet["requirements"]["starter_inventory"])
         self.assertIn("Fuel instead of Starting Fuel Amount", packet["requirements"]["starter_inventory"])
         self.assertIn("Put quantities in quantity, not name", packet["requirements"]["starter_inventory"])
@@ -914,6 +926,11 @@ class NewGameSetupTests(unittest.TestCase):
 
         self.assertTrue(packet["setup"]["calendar"]["ai_generated"])
         self.assertEqual(packet["setup"]["calendar"]["calendar_type"], "ai_generated")
+        self.assertEqual(
+            packet["setup"]["calendar"],
+            {"calendar_type": "ai_generated", "ai_generated": True},
+        )
+        self.assertNotIn("current_calendar", packet)
         self.assertIn("invent calendar_settings", packet["requirements"]["calendar_generation"])
 
     def test_setup_packet_does_not_require_large_requested_starter_inventory_count(self) -> None:
@@ -983,6 +1000,16 @@ class NewGameSetupTests(unittest.TestCase):
             packet["requirements"]["events"],
         )
 
+        no_npc_setup = normalize_new_game_setup(
+            {
+                "no_starting_npcs": True,
+                "starting_npcs": [{"name": "Should Be Cleared"}],
+            }
+        )
+
+        self.assertTrue(no_npc_setup["no_starting_npcs"])
+        self.assertEqual(no_npc_setup["starting_npcs"], [])
+
     def test_setup_packet_uses_structured_starting_locations_instead_of_plaintext_parsing(self) -> None:
         setup = normalize_new_game_setup(
             {
@@ -1015,6 +1042,9 @@ class NewGameSetupTests(unittest.TestCase):
         self.assertEqual(
             packet["setup"]["starting_locations"][1]["location_mode"],
             "exact",
+        )
+        self.assertFalse(
+            packet["setup"]["starting_locations"][1]["requires_ai_invention"]
         )
         self.assertTrue(packet["setup"]["starting_locations"][2]["requires_ai_invention"])
         self.assertTrue(packet["setup"]["starting_locations"][2]["is_sublocation"])

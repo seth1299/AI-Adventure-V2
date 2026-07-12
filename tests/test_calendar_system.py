@@ -126,6 +126,37 @@ class CalendarSystemTests(unittest.TestCase):
             self.assertEqual(migrated_repository.get_current_calendar_minute(), 1234)
             self.assertNotIn("elapsed_minutes", migrated_repository.get_state_snapshot())
 
+    def test_calendar_events_persist_update_and_delete(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = SaveRepository.create_new_save(Path(temp_dir), "Calendar Events")
+            saved = repository.upsert_calendar_event(
+                {
+                    "event_id": "week_of_bloom",
+                    "title": "Week of Bloom",
+                    "description": "An annual city festival.",
+                    "category": "Festival",
+                    "month": 2,
+                    "day": 4,
+                    "duration_days": 7,
+                    "recurrence": "yearly",
+                    "year": 1,
+                    "details": "Markets close and lantern processions fill the streets.",
+                }
+            )
+
+            self.assertIsNotNone(saved)
+            self.assertEqual(repository.list_calendar_events()[0]["duration_days"], 7)
+            repository.upsert_calendar_event(
+                {
+                    **repository.list_calendar_events()[0],
+                    "title": "Grand Week of Bloom",
+                }
+            )
+            self.assertEqual(len(repository.list_calendar_events()), 1)
+            self.assertEqual(repository.list_calendar_events()[0]["title"], "Grand Week of Bloom")
+            self.assertTrue(repository.delete_calendar_event("week_of_bloom"))
+            self.assertEqual(repository.list_calendar_events(), [])
+
 
 if __name__ == "__main__":
     unittest.main()

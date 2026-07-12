@@ -236,7 +236,12 @@ def normalize_new_game_setup(raw_setup: Any) -> dict[str, Any]:
     custom_ai_context = _clean_text(raw_ai_settings.get("additional_context"))
     skills = _normalize_skills(raw_setup.get("skills", []))
     starter_items = _normalize_starter_items(raw_setup.get("starter_items", []))
-    starting_npcs = _normalize_starting_npcs(raw_setup.get("starting_npcs", []))
+    no_starting_npcs = bool(raw_setup.get("no_starting_npcs", False))
+    starting_npcs = (
+        []
+        if no_starting_npcs
+        else _normalize_starting_npcs(raw_setup.get("starting_npcs", []))
+    )
     starting_locations = _normalize_starting_locations(
         raw_setup.get("starting_locations", [])
     )
@@ -255,6 +260,7 @@ def normalize_new_game_setup(raw_setup: Any) -> dict[str, Any]:
         "skills": skills,
         "starter_items": starter_items,
         "starting_npcs": starting_npcs,
+        "no_starting_npcs": no_starting_npcs,
         "starting_locations": starting_locations,
         "starting_task": starting_task,
         "calendar": calendar_settings,
@@ -372,10 +378,13 @@ def build_new_game_setup_packet(
     """Builds a compact AI-facing setup packet for world synthesis."""
 
     clean_setup = normalize_new_game_setup(setup)
-    current_calendar = build_calendar_snapshot(
-        DEFAULT_START_ELAPSED_MINUTES,
-        clean_setup["calendar"],
-    )
+    calendar_is_ai_generated = bool(clean_setup["calendar"].get("ai_generated"))
+    packet_setup = dict(clean_setup)
+    if calendar_is_ai_generated:
+        packet_setup["calendar"] = {
+            "calendar_type": "ai_generated",
+            "ai_generated": True,
+        }
     clean_music_tracks = [
         str(track).strip()
         for track in (valid_music_tracks or [])
@@ -385,12 +394,11 @@ def build_new_game_setup_packet(
     starter_item_count = len(clean_setup["starter_items"])
     ai_mode_preferences = normalize_ai_mode_preferences(clean_setup["ai_settings"])
 
-    return {
+    packet = {
         "schema_version": 1,
         "packet_type": "new_game_setup",
-        "setup": clean_setup,
+        "setup": packet_setup,
         "player_ai_preferences": ai_mode_preferences,
-        "current_calendar": current_calendar,
         "current_weather": "Clear",
         "requirements": {
             "world_summary": (
@@ -438,12 +446,12 @@ def build_new_game_setup_packet(
                 "completeness or hidden-information rules."
             ),
             "calendar_weather_consistency": (
-                "Opening prose must match current_calendar and current_weather unless "
-                "you return starting_calendar and/or weather fields that intentionally "
-                "change them. If you mention autumn, winter, cold nights, summer heat, "
-                "rain, snow, storms, dawn, evening, or similar seasonal/time/weather "
-                "details, those details must match the structured starting_calendar "
-                "and weather you return."
+                "When current_calendar is present, opening prose must match it unless "
+                "you return starting_calendar that intentionally changes it. When "
+                "setup.calendar.ai_generated is true, current_calendar is deliberately "
+                "omitted: invent calendar_settings and starting_calendar first, then "
+                "make opening prose match those generated values. Opening prose must "
+                "also match current_weather unless the returned weather changes it."
             ),
             "calendar_generation": (
                 "If setup.calendar.ai_generated is true, invent calendar_settings "
@@ -557,12 +565,19 @@ def build_new_game_setup_packet(
                 "starting Travel-tab locations; do not parse starting locations "
                 "out of ordinary setup prose or plaintext fields. For each "
                 "setup.starting_locations row, include one corresponding entry in "
-                "locations. Fill blank name or description fields with fitting "
+                "locations and set source_index to that row's zero-based index. "
+                "Use source_index=-1 only for extra locations not based on a "
+                "requested row. Fill blank name or description fields with fitting "
                 "specifics. If location_mode is exact, copy name and description "
                 "into the locations entry unchanged, while still filling terrain, "
                 "coordinates, travel_multiplier, and route notes. If location_mode "
                 "is suggestion, treat name and description as inspiration and put "
-                "the finalized player-facing values in the locations entry. "
+                "the finalized player-facing values in the locations entry. Once "
+                "a suggested location name is finalized, use that finalized name "
+                "consistently in every other returned field, including descriptions, "
+                "travel_notes, known_crafting_items.location, NPC details, tasks, "
+                "secrets, and opening prose; never reuse the superseded setup "
+                "placeholder or suggestion name. "
                 "If is_sublocation is true and parent_location is set, treat the "
                 "location as existing inside that parent location; reflect that "
                 "relationship in the returned location description and travel_notes "
@@ -597,7 +612,19 @@ def build_new_game_setup_packet(
                 "items/materials and recipes as fit the backstory. Recipe "
                 "ingredients must use item names from known_crafting_items or "
                 "other known item catalog entries and use quantity, measure_amount, "
-                "and measure_unit."
+                "and a finite measure_unit from the supplied enum. Do not use vague "
+                "units, and keep each ingredient measure_unit equal to the matching "
+                "starting item's quantity_unit. quantity times measure_amount is the "
+                "total amount consumed per crafted result. Do not use vague "
+                "units such as pinch or handful. Categorize vials, bottles, jars, "
+                "and similar vessels as Container. Each recipe must include "
+                "value_base_units as a reasonable estimated result value in the "
+                "world's baseline currency unit."
+            ),
+            "skill_limits": (
+                "Skills use levels 1 through 5, with 5 as the absolute maximum. "
+                "Never create a skill, prerequisite, progression target, or GM-secret "
+                "reveal condition that requires a skill level above 5."
             ),
             "skill_generation": (
                 "If a setup.skills entry has a nonblank name, copy that exact name "
@@ -626,6 +653,17 @@ def build_new_game_setup_packet(
                 "player-requested items, then invent enough additional concrete "
                 "items that fit the finalized character, genre, starting location, "
                 "weather, and opening situation to reach the minimum. "
+                "First identify the activities, responsibilities, and goals that "
+                "the player emphasizes in the character description, backstory, "
+                "notes, profession, and skills. Prioritize concrete tools and "
+                "supplies that enable those emphasized activities before generic "
+                "apparel, comfort items, or genre-standard kit. Infer function "
+                "from the whole character concept rather than matching a fixed "
+                "keyword list. Assign each item's category from its actual primary "
+                "function. A Container must primarily hold physical contents that "
+                "can be put in and taken out; an object that stores writing, records, "
+                "instructions, or information is not a Container merely because it "
+                "stores information. "
                 "Preserve any player-provided starter items with "
                 "requires_ai_invention=false. "
                 "When a setup.starter_items entry has requires_ai_invention=true or "
@@ -648,7 +686,11 @@ def build_new_game_setup_packet(
                 "of Starting Water Quantity. Put quantities in quantity, not name. Do not "
                 "use a generic fantasy kit unless the character and genre actually "
                 "justify it. Each item must include name, category, quantity, "
-                "description, value_base_units, and source_index."
+                "description, value_base_units, and source_index. Every item must "
+                "also include quantity_unit, such as each, bundle, bottle, vial, "
+                "gram, kilogram, ounce, liter, or meter. Classify a physical journal, "
+                "notebook, ledger, manual, or other book as Book or Document, not "
+                "Information; Information describes content, not a physical item."
             ),
             "currency_generation": (
                 "If setup.currency_denominations is empty, create a finalized "
@@ -723,6 +765,12 @@ def build_new_game_setup_packet(
         },
         "creative_ideas": creative_ideas,
     }
+    if not calendar_is_ai_generated:
+        packet["current_calendar"] = build_calendar_snapshot(
+            DEFAULT_START_ELAPSED_MINUTES,
+            clean_setup["calendar"],
+        )
+    return packet
 
 
 def fallback_world_summary(setup: dict[str, Any]) -> str:
@@ -819,6 +867,12 @@ def _fields_requiring_ai_invention(clean_setup: dict[str, Any]) -> list[str]:
 
     if any(bool(item.get("requires_ai_invention")) for item in clean_setup["starter_items"]):
         invention_fields.append("starter inventory based on character and skills")
+
+    if any(
+        bool(location.get("requires_ai_invention"))
+        for location in clean_setup["starting_locations"]
+    ):
+        invention_fields.append("suggested or incomplete starting locations")
 
     if clean_setup["starting_task"]["mode"] == "ai":
         invention_fields.append("opening quest/task")
@@ -1122,7 +1176,9 @@ def _normalize_starting_locations(raw_locations: Any) -> list[dict[str, Any]]:
                 "location_mode": location_mode,
                 "is_sublocation": is_sublocation,
                 "parent_location": parent_location if is_sublocation else "",
-                "requires_ai_invention": not name or not description,
+                "requires_ai_invention": (
+                    location_mode == "suggestion" or not name or not description
+                ),
             }
         )
 

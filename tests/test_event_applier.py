@@ -980,6 +980,7 @@ class EventApplierTests(unittest.TestCase):
                         "type": "ReagentDiscoveredEvent",
                         "payload": {
                             "name": "Moonwater",
+                            "category": "Ingredient",
                             "description": "Water prepared under moonlight.",
                             "location": "Open bowls left beneath a full moon",
                             "uses": ["sleep draughts"],
@@ -989,6 +990,7 @@ class EventApplierTests(unittest.TestCase):
                         "type": "ReagentDiscoveredEvent",
                         "payload": {
                             "name": "Mooncap Fungus",
+                            "category": "Reagent",
                             "description": "Soft blue fungus that releases a drowsy scent.",
                             "location": "Damp cave mouths and shaded roots",
                             "uses": ["sleep draughts"],
@@ -1014,6 +1016,7 @@ class EventApplierTests(unittest.TestCase):
                             ],
                             "result": "Invites sleep.",
                             "notes": "Best brewed at low heat.",
+                            "value_base_units": 16,
                         },
                     },
                 ]
@@ -1028,10 +1031,11 @@ class EventApplierTests(unittest.TestCase):
             self.assertEqual(moonwater["location"], "Open bowls left beneath a full moon")
             catalog = repository.list_item_catalog()
             catalog_moonwater = next(item for item in catalog if item["name"] == "Moonwater")
-            self.assertEqual(catalog_moonwater["category"], "Material")
+            self.assertEqual(catalog_moonwater["category"], "Ingredient")
             self.assertEqual(recipes[0]["name"], "Quiet Sleep Draught")
             self.assertEqual(recipes[0]["ingredients"][0]["reagent_name"], "Moonwater")
             self.assertEqual(recipes[0]["ingredients"][0]["measure_unit"], "mL")
+            self.assertEqual(recipes[0]["value_base_units"], 16)
 
     def test_recipe_discovery_requires_allowed_item_catalog_category(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

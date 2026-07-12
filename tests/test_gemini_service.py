@@ -1302,6 +1302,7 @@ class GeminiServiceTests(unittest.TestCase):
                     "type": "ReagentDiscoveredEvent",
                     "payload": {
                         "name": "Moss-Vein Tallow",
+                        "category": "Material",
                         "description": "Waxy tallow threaded with moss-green veins.",
                         "location": "Damp shaded valley crevices",
                         "uses": ["stabilizing volatile mixtures"],
@@ -1530,6 +1531,12 @@ class GeminiServiceTests(unittest.TestCase):
         }
 
         self.assertEqual(rule_event_types - set(KNOWN_EVENT_TYPE_NAMES), set())
+        rules_json = json.dumps(rules_data)
+        self.assertIn("Prioritize concrete tools and supplies", rules_json)
+        self.assertIn(
+            "not Containers merely because they store information",
+            rules_json,
+        )
 
     def test_new_game_request_uses_structured_output_schema(self) -> None:
         fake_client_class = self._install_fake_genai_client(
@@ -2273,7 +2280,7 @@ class GeminiServiceTests(unittest.TestCase):
                         "secret_id": "station_master_is_villain",
                         "title": "Station Master's Identity",
                         "details": "The station master directs the canal murders.",
-                        "reveal_condition": "The player deciphers the black ledger.",
+                        "reveal_condition": "When Alchemy Level 7 is reached.",
                         "related_npc_ids": ["station_master"],
                         "related_locations": ["Rainmarket Station"],
                     }
@@ -2290,6 +2297,7 @@ class GeminiServiceTests(unittest.TestCase):
                         "terrain": "Canal streets",
                         "travel_multiplier": 0.9,
                         "travel_notes": "Crowded at morning and dusk.",
+                        "source_index": 0,
                     },
                     {
                         "name": "North Lock",
@@ -2299,6 +2307,7 @@ class GeminiServiceTests(unittest.TestCase):
                         "terrain": "Cobblestone",
                         "travel_multiplier": 1.0,
                         "travel_notes": "The gate closes after dark.",
+                        "source_index": -1,
                     },
                 ],
                 "start_location": "Rainmarket Station, beneath the old canal clock",
@@ -2414,12 +2423,13 @@ class GeminiServiceTests(unittest.TestCase):
                             {
                                 "reagent_name": "Canal Salt",
                                 "quantity": 1,
-                                "measure_amount": 1,
-                                "measure_unit": "pinch",
+                                "measure_amount": 2,
+                                "measure_unit": "grams",
                             },
                         ],
                         "result": "Reveals faint hidden script.",
                         "notes": "Useful for ledger work.",
+                        "value_base_units": 18,
                     }
                 ],
                 "currency_denominations": [
@@ -2467,8 +2477,10 @@ class GeminiServiceTests(unittest.TestCase):
         self.assertIn("bare category labels as final proper nouns", prompt)
         self.assertIn("the Police Department", prompt)
         self.assertEqual(result.locations[0]["name"], "Rainmarket Station")
+        self.assertEqual(result.locations[0]["source_index"], 0)
         self.assertEqual((result.locations[0]["x_miles"], result.locations[0]["y_miles"]), (0.0, 0.0))
         self.assertIn("setup.starting_locations", prompt)
+        self.assertIn("never reuse the superseded setup placeholder", prompt)
         self.assertIn("do not parse starting locations out of ordinary setup prose", prompt)
         self.assertIn("location_mode is exact", prompt)
         self.assertIn("is_sublocation is true", prompt)
@@ -2502,6 +2514,8 @@ class GeminiServiceTests(unittest.TestCase):
         self.assertIn("Y/N's Office", prompt)
         self.assertIn("does not need to start in a tavern", prompt)
         self.assertIn("starting_items must contain at least five", prompt)
+        self.assertIn("Prioritize concrete tools and supplies", prompt)
+        self.assertIn("not a Container merely because it stores information", prompt)
         self.assertIn("has no maximum item count", prompt)
         self.assertIn("invent enough additional concrete items", prompt)
         self.assertIn("Do not return starter weapons with damage of 1d4", prompt)
@@ -2556,7 +2570,7 @@ class GeminiServiceTests(unittest.TestCase):
         self.assertNotIn("Primary Training", prompt)
         self.assertNotIn("Signature Expertise", prompt)
         self.assertIn("current_calendar", prompt)
-        self.assertIn("do not mention autumn winds", prompt)
+        self.assertIn("current_calendar is deliberately absent", prompt)
         self.assertIn("setup.calendar.ai_generated", prompt)
         self.assertIn("invent calendar_settings", prompt)
         self.assertIn("Do not copy the default Gregorian calendar", prompt)
@@ -2575,6 +2589,10 @@ class GeminiServiceTests(unittest.TestCase):
             "station_master_is_villain",
         )
         self.assertEqual(result.gm_secrets[0]["status"], "active")
+        self.assertEqual(
+            result.gm_secrets[0]["reveal_condition"],
+            "When Alchemy Level 5 is reached.",
+        )
         self.assertEqual(result.start_location, "Rainmarket Station")
         self.assertEqual(result.selected_genre, "Realistic detective mystery")
         self.assertEqual(result.calendar_settings["days_per_week"], 8)
@@ -2590,6 +2608,10 @@ class GeminiServiceTests(unittest.TestCase):
         self.assertEqual(result.known_crafting_items[0]["name"], "Moonwater")
         self.assertEqual(result.known_crafting_items[1]["category"], "Reagent")
         self.assertEqual(result.known_crafting_recipes[0]["name"], "Mistglass Tincture")
+        self.assertEqual(
+            result.known_crafting_recipes[0]["value_base_units"],
+            18,
+        )
         self.assertEqual(
             result.known_crafting_recipes[0]["ingredients"][0]["measure_unit"],
             "mL",
@@ -2951,6 +2973,24 @@ class GeminiServiceTests(unittest.TestCase):
             sys.modules.pop("google.genai", None)
         else:
             sys.modules["google.genai"] = old_genai
+
+
+    def test_parse_starter_item_normalizes_information_journal_and_quantity_unit(self) -> None:
+        result = _parse_new_game_starter_items(
+            [
+                {
+                    "name": "Journal",
+                    "category": "Information",
+                    "quantity": 1,
+                    "description": "A leather-bound book of field notes.",
+                    "value_base_units": 5,
+                    "source_index": -1,
+                }
+            ]
+        )
+
+        self.assertEqual(result[0]["category"], "Book")
+        self.assertEqual(result[0]["quantity_unit"], "each")
 
 
 if __name__ == "__main__":

@@ -64,7 +64,7 @@
       "content": {
         "guidelines": [
           "Use only listed inventory items as confirmed possessions.",
-          "Use the item catalog as remembered item definitions only; catalog entries are not current possessions unless they also appear in inventory.",
+          "Use the item catalog as remembered item definitions only; catalog entries are not current possessions unless they also appear in inventory. Each entry's metadata.item_uuid is its stable internal identity; preserve it and do not create duplicate definitions for name variations.",
           "When an item could be gained, lost, or consumed, suggest a structured inventory event.",
           "Describe item use in the fiction, but leave quantities to the application.",
           "A container must store its exact hidden currency/items, open and contents-taken state, locked/trapped state, notice/disarm/lockpick skills and DCs, and failure consequences in metadata.",
@@ -81,10 +81,12 @@
       "content": {
         "guidelines": [
           "Treat known crafting items/materials and recipes as discovered knowledge.",
+          "Treat state.calendar_events.events as persistent player-visible dates. Use CalendarEventUpsertedEvent for festivals, holidays, appointments, deliveries, deadlines, and other dated milestones; use yearly recurrence for annual events and CalendarEventDeletedEvent when a stored event is cancelled.",
           "Undiscovered recipes should be hinted at through observation and experimentation.",
           "When new practical crafting knowledge is discovered, suggest a recipe, useful item/material, or notebook event.",
-          "When the player learns an item's or material's description, source location, or crafting uses, use ReagentDiscoveredEvent with name, description, location, and uses. If the source location itself should appear in Travel, also use LocationUpsertedEvent.",
-          "Recipe ingredients must use item names from state.item_catalog.items in the reagent_name field, and only items categorized as Material, Ingredient, Reagent, or Crafting Item can be recipe ingredients.",
+          "When the player learns an item's or material's description, source location, or crafting uses, use ReagentDiscoveredEvent with name, category, description, location, and uses. Keep Description and Location complementary: Description explains the item itself, while Location says where it is found; do not repeat the location in Description unless essential to the item's identity. The uses list should describe generalized symptoms or effects the item may address, such as sleep aid or pain relief, rather than detailed recipes or procedures. Use Container for vials, bottles, jars, and similar vessels. If the source location itself should appear in Travel, also use LocationUpsertedEvent.",
+          "Classify an item by its physical primary function. A journal, notebook, ledger, manual, or other book is Book or Document; Information describes content and is not a physical inventory category. Classify an item as a Container only when its primary function is holding physical contents that can be put in and taken out. Items that store writing, records, instructions, or information are not Containers merely because they store information.",
+          "Recipe ingredients must use item names from state.item_catalog.items in reagent_name and preserve the matching metadata.item_uuid identity. measure_unit must equal the matching inventory item's quantity_unit, and quantity times measure_amount is the total consumed per crafted result. Only Material, Ingredient, Reagent, Crafting Item, or Container items may be ingredients. If the finished product needs a bottle, vial, jar, flask, pouch, or similar vessel, include one suitable Container item as a consumed ingredient per finished product. Liquids such as water require a concrete volume unit such as mL, L, tsp, tbsp, or cups; never use each or vague units such as pinch or handful for uncountable substances. Include value_base_units as the current or estimated result value.",
           "If the player physically collects, harvests, picks up, or stores a crafting item/material, also suggest InventoryItemAddedEvent for that same item/material."
         ]
       }
@@ -103,6 +105,7 @@
           "Any weapon given to the player must feel mechanically worthwhile: its average damage must be strictly higher than the player's unarmed base damage of 1d4. Do not create player weapons with damage of 1d4 or anything weaker; use at least 1d6 for ordinary one-handed weapons and at least 1d10 for ordinary two-handed weapons unless a stronger fitting expression is appropriate.",
           "Routine movement, paying a known price, receiving ordinary goods, eating, drinking, and casual conversation are not skill checks unless the player adds a contested, risky, hidden, time-sensitive, or deceptive goal.",
           "Use SkillXpAddedEvent only after meaningful use, training, study, or practice.",
+          "Skill levels range from 1 through 5, and 5 is the absolute maximum. Never create a skill requirement, progression target, or secret reveal condition above level 5.",
           "Do not use SkillXpAddedEvent as a substitute for resolving an uncertain action.",
           "Preserve player-provided starting skill names exactly; do not replace them with narrower, more local, hyphenated, or hyper-specific variants.",
           "Do not narrate final success or failure until the Python application has resolved the skill check.",

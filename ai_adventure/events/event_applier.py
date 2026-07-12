@@ -254,6 +254,12 @@ class EventApplier:
             if event_type == "ActiveTaskCompletedEvent":
                 return self._apply_active_task_completed(event_type, payload)
 
+            if event_type == "CalendarEventUpsertedEvent":
+                return self._apply_calendar_event_upserted(event_type, payload)
+
+            if event_type == "CalendarEventDeletedEvent":
+                return self._apply_calendar_event_deleted(event_type, payload)
+
             if event_type == "SpellLearnedEvent":
                 return self._apply_spell_learned(event_type, payload)
 
@@ -291,6 +297,8 @@ class EventApplier:
         quantity = _first_int(payload, 1, "amount", "quantity")
         category = _first_text(payload, "item_type", "category")
         description = _first_text(payload, "description", "desc")
+        quantity_unit = _first_text(payload, "quantity_unit", "unit", "measure_unit") or "each"
+        storage_location = _first_text(payload, "storage_location") or "actively_carried"
         value_base_units = max(
             1,
             _first_int(
@@ -308,7 +316,7 @@ class EventApplier:
             quantity=quantity,
             description=description,
             value_base_units=value_base_units,
-            metadata=payload,
+            metadata={**payload, "quantity_unit": quantity_unit, "storage_location": storage_location},
         )
 
         return AppliedEventResult(
@@ -386,6 +394,41 @@ class EventApplier:
             event_type,
             "applied",
             f"Modified inventory item: {target_name}.",
+            payload,
+        )
+
+    def _apply_calendar_event_upserted(
+        self,
+        event_type: str,
+        payload: dict[str, Any],
+    ) -> AppliedEventResult:
+        """Creates or updates a persistent calendar event."""
+
+        saved = self.repository.upsert_calendar_event(payload)
+        if saved is None:
+            return _invalid(event_type, payload, "Calendar event id and title are required.")
+        return AppliedEventResult(
+            event_type,
+            "applied",
+            f"Saved calendar event: {saved['title']}.",
+            saved,
+        )
+
+    def _apply_calendar_event_deleted(
+        self,
+        event_type: str,
+        payload: dict[str, Any],
+    ) -> AppliedEventResult:
+        """Deletes a persistent calendar event."""
+
+        event_id = _first_text(payload, "event_id", "id")
+        if not event_id:
+            return _invalid(event_type, payload, "Calendar event id is required.")
+        deleted = self.repository.delete_calendar_event(event_id)
+        return AppliedEventResult(
+            event_type,
+            "applied" if deleted else "skipped",
+            f"Deleted calendar event: {event_id}." if deleted else f"Calendar event not found: {event_id}.",
             payload,
         )
 
@@ -1111,6 +1154,10 @@ class EventApplier:
             ingredients=ingredients,
             result=_first_text(payload, "result", "description"),
             notes=_first_text(payload, "notes"),
+            value_base_units=max(
+                0,
+                _safe_int(payload.get("value_base_units"), default=0) or 0,
+            ),
         )
 
         return AppliedEventResult(
@@ -1135,6 +1182,14 @@ class EventApplier:
         description = _first_text(payload, "description", "notes")
         location = _first_text(payload, "location", "found_at", "source")
         uses = _as_string_list(payload.get("uses", []))
+        category = _first_text(payload, "category") or "Material"
+        if not is_crafting_ingredient_category(category):
+            return _invalid(
+                event_type,
+                payload,
+                "Reagent category must be one of "
+                f"{CRAFTING_INGREDIENT_CATEGORY_NAMES}.",
+            )
 
         if not description:
             return _invalid(event_type, payload, "Reagent description is required.")
@@ -1147,13 +1202,14 @@ class EventApplier:
 
         self.repository.add_crafting_item(
             name=name,
+            category=category,
             description=description,
             location=location,
             uses=uses,
         )
         self.repository.upsert_item_catalog_entry(
             name=name,
-            category="Material",
+            category=category,
             description=description,
         )
 
