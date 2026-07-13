@@ -31,6 +31,7 @@ from ai_adventure.currency import (
     DEFAULT_CURRENCY_DENOMINATIONS,
     normalize_currency_denominations,
 )
+from ai_adventure.item_categories import normalize_inventory_category
 from ai_adventure.new_game_setup import normalize_new_game_setup
 from ai_adventure.narration_preferences import (
     DEFAULT_NARRATION_STYLE,
@@ -570,6 +571,15 @@ class SaveRepository:
         if not clean_name:
             LOGGER.error("Attempted to add inventory item with blank name.")
             return
+
+        category = normalize_inventory_category(
+            category,
+            name=clean_name,
+            description=description,
+            item_type=(metadata or {}).get("item_type", "")
+            if isinstance(metadata, dict)
+            else "",
+        )
 
         if quantity <= 0:
             LOGGER.warning(

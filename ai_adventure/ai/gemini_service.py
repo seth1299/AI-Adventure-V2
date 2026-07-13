@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import re
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -15,6 +16,7 @@ from ai_adventure.alchemy.ingredients import (
     is_crafting_ingredient_category,
     normalize_recipe_ingredients,
 )
+from ai_adventure.item_categories import normalize_inventory_category
 from ai_adventure.ai.modes import (
     ALL_CONTENT_HARM_CATEGORIES,
     ai_mode_preferences_from_context_packet,
@@ -41,7 +43,10 @@ LOGGER = logging.getLogger(__name__)
 
 
 DEFAULT_GEMINI_MODEL = "gemini-3.1-flash-lite"
+CREATIVE_TERM_REPAIR_MODEL = DEFAULT_GEMINI_MODEL
 CREATIVE_TERM_REPAIR_ATTEMPTS = 4
+MODEL_REQUEST_ATTEMPTS = 2
+MODEL_RETRY_DELAY_SECONDS = 1.0
 FALLBACK_SUGGESTED_ACTIONS = [
     "Look around and take stock of the situation.",
     "Check your inventory, tasks, or surroundings.",
@@ -71,7 +76,6 @@ CHECK_WARRANTING_ACTION_RE = re.compile(
 )
 KNOWN_TEXT_MODELS = {
     "gemini-3.1-flash-lite",
-    "gemini-3.1-flash-lite-preview",
     "gemini-2.5-flash",
     "gemini-2.5-flash-lite",
     "gemini-2.5-pro",
@@ -1055,7 +1059,9 @@ NEW_GAME_RESPONSE_JSON_SCHEMA: dict[str, Any] = {
                         "contents that can be put in and taken out, not for an "
                         "item that stores writing, records, or information. A "
                         "physical journal, notebook, ledger, manual, or other book "
-                        "should be categorized as Book or Document, not Information."
+                        "should be categorized as Book or Document, not Information. "
+                        "Classify a finished poison or toxin as Poison, even when it "
+                        "is stored in a vial and was crafted from ingredients."
                         ),
                     },
                     "quantity": {"type": "integer", "minimum": 1},
@@ -1239,6 +1245,10 @@ class GeminiConfigurationError(RuntimeError):
     """Raised when Gemini is requested without required configuration."""
 
 
+class GeminiRequestError(RuntimeError):
+    """Raised when a Gemini request fails after safe retries are exhausted."""
+
+
 class GeminiNarrationService:
     """Calls Gemini with structured story context packets."""
 
@@ -1288,7 +1298,8 @@ class GeminiNarrationService:
             ),
         )
         LOGGER.info("Sending story context packet to Gemini model %s.", self.settings.model)
-        response = client.models.generate_content(
+        response = _generate_content_with_retry(
+            client,
             model=self.settings.model,
             contents=prompt,
             config=_structured_output_config(
@@ -1296,7 +1307,8 @@ class GeminiNarrationService:
                 model=self.settings.model,
                 ai_preferences=ai_preferences,
                 apply_response_length=True,
-            ),  # type: ignore[arg-type]
+            ),
+            request_label="story request",
         )
         raw_text = _repair_gemini_creative_terms(
             client,
@@ -1364,14 +1376,16 @@ class GeminiNarrationService:
             ),
         )
         LOGGER.info("Sending skill-check planning packet to Gemini model %s.", self.settings.model)
-        response = client.models.generate_content(
+        response = _generate_content_with_retry(
+            client,
             model=self.settings.model,
             contents=prompt,
             config=_structured_output_config(
                 SKILL_CHECK_PLAN_RESPONSE_JSON_SCHEMA,
                 model=self.settings.model,
                 ai_preferences=ai_preferences,
-            ),  # type: ignore[arg-type]
+            ),
+            request_label="skill-check planning request",
         )
         raw_text = _repair_gemini_creative_terms(
             client,
@@ -1424,7 +1438,8 @@ class GeminiNarrationService:
 
         LOGGER.info("Sending new-game setup packet to Gemini model %s.", self.settings.model)
         LOGGER.info(f"NEW GAME PROMPT: \n\n{prompt}")
-        response = client.models.generate_content(
+        response = _generate_content_with_retry(
+            client,
             model=self.settings.model,
             contents=prompt,
             config=_structured_output_config(
@@ -1433,7 +1448,8 @@ class GeminiNarrationService:
                 ai_preferences=ai_preferences,
                 apply_response_length=True,
                 response_length_scope="new_game",
-            ),  # type: ignore[arg-type]
+            ),
+            request_label="new-game request",
         )
         raw_text = _repair_gemini_creative_terms(
             client,
@@ -1444,6 +1460,8 @@ class GeminiNarrationService:
             ai_preferences=ai_preferences,
             apply_response_length=True,
             response_length_scope="new_game",
+            additional_forbidden_terms=_suggested_setup_location_terms(setup_packet),
+            setup_packet=setup_packet,
         )
         LOGGER.info("Gemini raw new-game response:\n%s", raw_text)
 
@@ -1764,6 +1782,13 @@ def build_gemini_story_prompt(context_packet: dict[str, Any]) -> str:
         "as each, bottle, vial, gram, kilogram, liter, or meter. Use exactly "
         "home for items stored at the player's Home and actively_carried for "
         "items currently carried by the Player Character.\n"
+        "- Classify inventory by the finished item's present primary function, not "
+        "by its origin or packaging. Ingredient, Reagent, Material, and Crafting "
+        "Item are inputs that can be consumed by recipes. A ready-to-use poison or "
+        "toxin is Poison, including one stored in a vial; the vial does not make "
+        "the mixture an Ingredient or Container. Reserve Ingredient or Reagent for "
+        "raw inputs such as venom glands, toxic herbs, or extracts that still need "
+        "processing.\n"
         "- For weapons, set item_type='Weapon' and include weapon_hands "
         "('one-handed' or 'two-handed') plus damage as a dice expression such "
         "as 1d6, 1d8, or 2d6. Any player weapon must have average damage "
@@ -2297,11 +2322,17 @@ def _repair_gemini_creative_terms(
     ai_preferences: dict[str, Any] | None = None,
     apply_response_length: bool = False,
     response_length_scope: str = "story",
+    additional_forbidden_terms: tuple[str, ...] | list[str] | None = None,
+    setup_packet: dict[str, Any] | None = None,
 ) -> str:
     """Asks Gemini to rewrite a response when it uses banned generated names."""
 
     candidate_text = raw_text
-    banned_terms = find_banned_creative_terms(candidate_text)
+    detection_terms = _combined_creative_terms(additional_forbidden_terms)
+    banned_terms = _unique_terms(
+        find_banned_creative_terms(candidate_text, terms=detection_terms),
+        _unfinalized_suggested_location_terms(candidate_text, setup_packet),
+    )
 
     if not banned_terms:
         return raw_text
@@ -2326,25 +2357,30 @@ def _repair_gemini_creative_terms(
         )
 
         try:
-            response = client.models.generate_content(
-                model=model,
+            response = _generate_content_with_retry(
+                client,
+                model=CREATIVE_TERM_REPAIR_MODEL,
                 contents=repair_prompt,
-                config=_structured_output_config(
-                    schema,
-                    model=model,
+                config=_creative_term_repair_config(
                     ai_preferences=ai_preferences,
-                    apply_response_length=apply_response_length,
-                    response_length_scope=response_length_scope,
-                ),  # type: ignore[arg-type]
+                ),
+                request_label=f"{response_label} repair attempt {attempt}",
             )
-        except Exception:
-            LOGGER.exception(
-                "Gemini %s repair attempt %s/%s failed.",
+        except GeminiRequestError as error:
+            LOGGER.warning(
+                "Gemini %s repair attempt %s/%s failed: %s",
                 response_label,
                 attempt,
                 CREATIVE_TERM_REPAIR_ATTEMPTS,
+                error,
             )
-            return str(_sanitize_gemini_creative_terms(candidate_text, response_label))
+            return str(
+                _sanitize_gemini_creative_terms(
+                    candidate_text,
+                    response_label,
+                    terms=detection_terms,
+                )
+            )
 
         repaired_text = str(getattr(response, "text", "") or "").strip()
 
@@ -2357,7 +2393,10 @@ def _repair_gemini_creative_terms(
             )
             continue
 
-        repaired_banned_terms = find_banned_creative_terms(repaired_text)
+        repaired_banned_terms = _unique_terms(
+            find_banned_creative_terms(repaired_text, terms=detection_terms),
+            _unfinalized_suggested_location_terms(repaired_text, setup_packet),
+        )
 
         if not repaired_banned_terms:
             LOGGER.info(
@@ -2384,7 +2423,129 @@ def _repair_gemini_creative_terms(
         response_label,
         CREATIVE_TERM_REPAIR_ATTEMPTS,
     )
-    return str(_sanitize_gemini_creative_terms(candidate_text, response_label))
+    return str(
+        _sanitize_gemini_creative_terms(
+            candidate_text,
+            response_label,
+            terms=detection_terms,
+        )
+    )
+
+
+def _combined_creative_terms(
+    additional_terms: tuple[str, ...] | list[str] | None,
+) -> tuple[str, ...]:
+    """Combines packaged bans with request-specific placeholder exclusions."""
+
+    combined = list(default_banned_creative_terms())
+    seen = {term.casefold() for term in combined}
+
+    for raw_term in additional_terms or ():
+        term = str(raw_term or "").strip()
+        if term and term.casefold() not in seen:
+            combined.append(term)
+            seen.add(term.casefold())
+
+    return tuple(combined)
+
+
+def _unique_terms(*groups: list[str]) -> list[str]:
+    """Returns case-insensitively unique terms while preserving order."""
+
+    result: list[str] = []
+    seen: set[str] = set()
+    for group in groups:
+        for term in group:
+            folded = term.casefold()
+            if folded not in seen:
+                result.append(term)
+                seen.add(folded)
+    return result
+
+
+def _suggested_setup_location_terms(setup_packet: dict[str, Any]) -> tuple[str, ...]:
+    """Returns suggestion-mode location labels that Gemini must replace."""
+
+    setup = setup_packet.get("setup", {})
+    if not isinstance(setup, dict):
+        return ()
+
+    terms: list[str] = []
+    if str(setup.get("start_location_mode", "suggestion")).casefold() != "exact":
+        start_location = str(setup.get("start_location", "") or "").strip()
+        if start_location:
+            terms.append(start_location)
+
+    raw_locations = setup.get("starting_locations", [])
+    if isinstance(raw_locations, list):
+        for raw_location in raw_locations:
+            if not isinstance(raw_location, dict):
+                continue
+            if str(raw_location.get("location_mode", "suggestion")).casefold() == "exact":
+                continue
+            name = str(raw_location.get("name", "") or "").strip()
+            if name:
+                terms.append(name)
+
+    return tuple(dict.fromkeys(terms))
+
+
+def _unfinalized_suggested_location_terms(
+    raw_text: str,
+    setup_packet: dict[str, Any] | None,
+) -> list[str]:
+    """Returns suggested location labels that were omitted or reused unchanged."""
+
+    if not setup_packet:
+        return []
+    try:
+        data = json.loads(_strip_json_fence(raw_text.strip()))
+    except (json.JSONDecodeError, AttributeError):
+        return list(_suggested_setup_location_terms(setup_packet))
+    if not isinstance(data, dict):
+        return list(_suggested_setup_location_terms(setup_packet))
+
+    setup = setup_packet.get("setup", {})
+    raw_locations = setup.get("starting_locations", []) if isinstance(setup, dict) else []
+    returned_locations = data.get("locations", [])
+    if not isinstance(raw_locations, list) or not isinstance(returned_locations, list):
+        return list(_suggested_setup_location_terms(setup_packet))
+
+    unresolved: list[str] = []
+    if isinstance(setup, dict) and str(
+        setup.get("start_location_mode", "suggestion")
+    ).casefold() != "exact":
+        requested_start = str(setup.get("start_location", "") or "").strip()
+        finalized_start = str(data.get("start_location", "") or "").strip()
+        if requested_start and (
+            not finalized_start
+            or finalized_start.casefold() == requested_start.casefold()
+        ):
+            unresolved.append(requested_start)
+
+    for source_index, requested in enumerate(raw_locations):
+        if not isinstance(requested, dict):
+            continue
+        if str(requested.get("location_mode", "suggestion")).casefold() == "exact":
+            continue
+        requested_name = str(requested.get("name", "") or "").strip()
+        if not requested_name:
+            continue
+        match = next(
+            (
+                location
+                for location in returned_locations
+                if isinstance(location, dict)
+                and _coerce_int(location.get("source_index"), default=-1)
+                == source_index
+            ),
+            None,
+        )
+        finalized_name = str(match.get("name", "") or "").strip() if match else ""
+        if not finalized_name or finalized_name.casefold() == requested_name.casefold():
+            unresolved.append(requested_name)
+
+    return unresolved
 
 
 def _forbidden_creative_terms_for_repair(observed_terms: list[str]) -> list[str]:
@@ -2423,19 +2584,143 @@ def _creative_terms_repair_prompt(
         "Do not use placeholders such as unnamed place, unnamed person, the city, "
         "the person, Local Item, or Local Skill unless the original text was already "
         "generic.\n"
-        "Preserve the same facts, tone, structure, and player-facing intent. Return "
-        "only one JSON object that matches the configured schema.\n\n"
+        "Change only the offending proper nouns and references to them. Preserve "
+        "every other value, key, array entry, fact, and structure exactly. Return "
+        "only the repaired JSON object.\n\n"
         f"Observed offending terms in the current JSON: {', '.join(observed_terms)}\n"
-        f"Full forbidden terms list: {', '.join(forbidden_terms)}\n\n"
-        "JSON response to repair:\n"
+        "Do not reuse or closely respell any observed term. Do not introduce any "
+        "other new proper nouns except the direct replacements.\n\n"
+        "JSON to repair:\n"
         f"{raw_text}"
     )
 
 
-def _sanitize_gemini_creative_terms(value: Any, response_label: str) -> Any:
+def _creative_term_repair_config(
+    *,
+    ai_preferences: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Builds the small, low-latency config used only for JSON name repair."""
+
+    preferences = normalize_ai_mode_preferences(ai_preferences)
+    return {
+        "response_mime_type": "application/json",
+        "safety_settings": _content_safety_settings(
+            preferences["allowed_content_categories"]
+        ),
+        "thinking_config": _thinking_config(
+            CREATIVE_TERM_REPAIR_MODEL,
+            "minimal",
+        ),
+    }
+
+
+def _generate_content_with_retry(
+    client: Any,
+    *,
+    model: str,
+    contents: str,
+    config: dict[str, Any],
+    request_label: str,
+) -> Any:
+    """Calls Gemini with one bounded retry for temporary service failures."""
+
+    active_config = dict(config)
+    for attempt in range(1, MODEL_REQUEST_ATTEMPTS + 1):
+        try:
+            return client.models.generate_content(
+                model=model,
+                contents=contents,
+                config=active_config,
+            )
+        except Exception as error:
+            transient = _is_transient_model_error(error)
+            if (
+                _is_invalid_argument_model_error(error)
+                and "response_json_schema" in active_config
+                and attempt < MODEL_REQUEST_ATTEMPTS
+            ):
+                LOGGER.warning(
+                    "Gemini %s rejected the structured-output schema. Retrying "
+                    "once with JSON MIME mode and local response validation.",
+                    request_label,
+                )
+                active_config = {
+                    key: value
+                    for key, value in active_config.items()
+                    if key != "response_json_schema"
+                }
+                continue
+            if transient and attempt < MODEL_REQUEST_ATTEMPTS:
+                LOGGER.warning(
+                    "Gemini %s temporarily failed (%s). Retrying %s/%s in %.1fs.",
+                    request_label,
+                    _model_error_summary(error),
+                    attempt + 1,
+                    MODEL_REQUEST_ATTEMPTS,
+                    MODEL_RETRY_DELAY_SECONDS,
+                )
+                time.sleep(MODEL_RETRY_DELAY_SECONDS)
+                continue
+
+            summary = _model_error_summary(error)
+            LOGGER.warning(
+                "Gemini %s failed after %s attempt(s): %s",
+                request_label,
+                attempt,
+                summary,
+            )
+            if transient:
+                raise GeminiRequestError(
+                    "Gemini is temporarily unavailable. Your progress is safe; "
+                    "please try again shortly."
+                ) from None
+            raise GeminiRequestError(
+                f"Gemini could not complete the request: {summary}"
+            ) from None
+
+    raise GeminiRequestError("Gemini could not complete the request.")
+
+
+def _is_transient_model_error(error: Exception) -> bool:
+    """Returns whether an SDK or network error is safe to retry briefly."""
+
+    text = str(error).casefold()
+    status_code = getattr(error, "status_code", getattr(error, "code", None))
+    return status_code in {429, 500, 502, 503, 504} or any(
+        marker in text
+        for marker in (
+            "429", "500", "502", "503", "504", "unavailable", "high demand",
+            "timed out", "timeout", "temporarily", "connection reset",
+        )
+    )
+
+
+def _is_invalid_argument_model_error(error: Exception) -> bool:
+    """Returns whether Gemini rejected one or more request arguments."""
+
+    text = str(error).casefold()
+    status_code = getattr(error, "status_code", getattr(error, "code", None))
+    return status_code == 400 or (
+        "400" in text and ("invalid_argument" in text or "invalid argument" in text)
+    )
+
+
+def _model_error_summary(error: Exception) -> str:
+    """Returns a concise single-line model error without an SDK traceback."""
+
+    summary = " ".join(str(error).split())
+    return summary[:300] or type(error).__name__
+
+
+def _sanitize_gemini_creative_terms(
+    value: Any,
+    response_label: str,
+    *,
+    terms: tuple[str, ...] | list[str] | None = None,
+) -> Any:
     """Removes banned generated-name terms before AI output reaches state or UI."""
 
-    banned_terms = find_banned_creative_terms(value)
+    banned_terms = find_banned_creative_terms(value, terms=terms)
 
     if not banned_terms:
         return value
@@ -2453,14 +2738,14 @@ def _sanitize_gemini_creative_terms(value: Any, response_label: str) -> Any:
         try:
             data = json.loads(clean_text)
         except json.JSONDecodeError:
-            return sanitize_banned_creative_terms_in_data(value)
+            return sanitize_banned_creative_terms_in_data(value, terms=terms)
 
         return json.dumps(
-            sanitize_banned_creative_terms_in_data(data),
+            sanitize_banned_creative_terms_in_data(data, terms=terms),
             ensure_ascii=False,
         )
 
-    return sanitize_banned_creative_terms_in_data(value)
+    return sanitize_banned_creative_terms_in_data(value, terms=terms)
 
 
 def _banned_terms_from_context(context_packet: dict[str, Any]) -> list[str]:
@@ -4055,17 +4340,12 @@ def _parse_new_game_crafting_recipes(raw_recipes: Any) -> list[dict[str, Any]]:
 def _normalize_starter_item_category(raw_item: dict[str, Any]) -> str:
     """Returns a concrete category for a finalized starter item."""
 
-    category = str(raw_item.get("category", "Item") or "Item").strip()
-    folded = category.casefold()
-    text = " ".join(
-        str(raw_item.get(field, "") or "")
-        for field in ("name", "description", "item_type")
-    ).casefold()
-    if folded in {"information", "info", "knowledge"}:
-        if any(word in text for word in ("book", "journal", "notebook", "manual", "ledger", "tome")):
-            return "Book"
-        return "Document"
-    return category or "Item"
+    return normalize_inventory_category(
+        raw_item.get("category", "Item"),
+        name=raw_item.get("name", ""),
+        description=raw_item.get("description", ""),
+        item_type=raw_item.get("item_type", ""),
+    )
 
 
 def _generalized_starter_item_name(raw_name: Any) -> str:

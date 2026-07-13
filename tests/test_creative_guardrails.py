@@ -14,6 +14,39 @@ class CreativeGuardrailTests(unittest.TestCase):
 
         self.assertIn("Aethelgard", found_terms)
 
+    def test_detects_close_spelling_variant_inside_titled_npc_name(self) -> None:
+        found_terms = find_banned_creative_terms(
+            "Kaelen the Red",
+            terms=("Kaelan",),
+        )
+
+        self.assertEqual(found_terms, ["Kaelan"])
+
+    def test_sanitizes_close_spelling_variant_inside_titled_npc_name(self) -> None:
+        sanitized = sanitize_banned_creative_terms(
+            "Kaelen the Red",
+            terms=("Kaelan",),
+            replacement="Marrec",
+        )
+
+        self.assertEqual(sanitized, "Marrec the Red")
+
+    def test_fuzzy_matching_does_not_ban_unrelated_capitalized_word(self) -> None:
+        found_terms = find_banned_creative_terms(
+            "Kaelen met the Scarlet courier.",
+            terms=("Kaelan",),
+        )
+
+        self.assertEqual(found_terms, ["Kaelan"])
+        self.assertEqual(
+            sanitize_banned_creative_terms(
+                "Scarlet courier",
+                terms=("Kaelan",),
+                replacement="Marrec",
+            ),
+            "Scarlet courier",
+        )
+
     def test_sanitizer_preserves_lowercase_common_words(self) -> None:
         sanitized = sanitize_banned_creative_terms(
             "Aethelgard rises beyond verdant moss."

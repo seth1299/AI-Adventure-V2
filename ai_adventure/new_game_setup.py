@@ -769,6 +769,12 @@ def build_new_game_setup_packet(
                 "opening quest; custom means use provided fields and have the AI "
                 "fill blanks from the rest of the setup."
             ),
+            "category_rule": (
+                "Classify each finalized item by its present primary function, not "
+                "its origin or packaging. A ready-to-use poison or toxin is Poison "
+                "even in a vial; Ingredient or Reagent is for a recipe input that "
+                "still needs processing."
+            ),
         },
         "turn_prompt": _turn_prompt_for_setup(clean_setup),
         "character_generation_guidance": _character_generation_guidance(clean_setup),

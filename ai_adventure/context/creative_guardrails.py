@@ -11,6 +11,9 @@ from ai_adventure.context.creative_ideas import CreativeIdeasLibrary
 LOGGER = logging.getLogger(__name__)
 DEFAULT_BANNED_TERM_REPLACEMENT = "the city"
 _TERM_SEPARATOR_PATTERN = r"[\s\-_']*"
+_PROPER_NOUN_TOKEN_PATTERN = re.compile(r"(?<![A-Za-z0-9])[A-Z][A-Za-z]{4,}(?![A-Za-z0-9])")
+_FUZZY_NAME_MIN_LENGTH = 5
+_FUZZY_NAME_MAX_DISTANCE = 1
 
 
 @lru_cache(maxsize=1)
@@ -36,11 +39,18 @@ def find_banned_creative_terms(
     seen: set[str] = set()
 
     for text in _iter_text_values(value):
+        exact_tokens = {
+            _normalized_name_token(match.group(0))
+            for banned_term in banned_terms
+            if banned_term
+            for match in _banned_term_pattern(banned_term).finditer(text)
+            if _looks_like_generated_proper_noun(match.group(0))
+        }
         for term in banned_terms:
             if not term:
                 continue
 
-            if _contains_banned_creative_term(text, term):
+            if _contains_banned_creative_term(text, term, exact_tokens=exact_tokens):
                 folded = term.casefold()
 
                 if folded not in seen:
@@ -84,6 +94,12 @@ def sanitize_banned_creative_terms(
             ),
             clean_text,
         )
+
+    clean_text = _sanitize_fuzzy_banned_name_tokens(
+        clean_text,
+        banned_terms=banned_terms,
+        replacement=replacement,
+    )
 
     return _clean_replacement_artifacts(clean_text, replacement=replacement)
 
@@ -176,14 +192,105 @@ def _iter_text_values(value: Any) -> list[str]:
     return []
 
 
-def _contains_banned_creative_term(text: str, term: str) -> bool:
+def _contains_banned_creative_term(
+    text: str,
+    term: str,
+    *,
+    exact_tokens: set[str] | None = None,
+) -> bool:
     """Returns True when text contains a proper-noun-looking banned term."""
 
     pattern = _banned_term_pattern(term)
-    return any(
+    if any(
         _looks_like_generated_proper_noun(match.group(0))
         for match in pattern.finditer(text)
+    ):
+        return True
+
+    return any(
+        _normalized_name_token(match.group(0)) not in (exact_tokens or set())
+        and _is_close_banned_name_variant(match.group(0), term)
+        for match in _PROPER_NOUN_TOKEN_PATTERN.finditer(text)
     )
+
+
+def _sanitize_fuzzy_banned_name_tokens(
+    text: str,
+    *,
+    banned_terms: tuple[str, ...],
+    replacement: str,
+) -> str:
+    """Replaces capitalized one-edit variants of sufficiently long banned names."""
+
+    def replace_match(match: re.Match[str]) -> str:
+        token = match.group(0)
+
+        if any(_is_close_banned_name_variant(token, term) for term in banned_terms):
+            return replacement
+
+        return token
+
+    return _PROPER_NOUN_TOKEN_PATTERN.sub(replace_match, text)
+
+
+def _is_close_banned_name_variant(candidate: str, banned_term: str) -> bool:
+    """Returns whether one proper-name token is one edit from a banned term."""
+
+    clean_candidate = _normalized_name_token(candidate)
+    clean_term = _normalized_name_token(banned_term)
+
+    if (
+        len(clean_candidate) < _FUZZY_NAME_MIN_LENGTH
+        or len(clean_term) < _FUZZY_NAME_MIN_LENGTH
+        or " " in banned_term.strip()
+        or abs(len(clean_candidate) - len(clean_term)) > _FUZZY_NAME_MAX_DISTANCE
+        or clean_candidate == clean_term
+    ):
+        return False
+
+    return _edit_distance_at_most_one(clean_candidate, clean_term)
+
+
+def _normalized_name_token(value: str) -> str:
+    """Returns the alphanumeric case-insensitive form used for name comparison."""
+
+    return "".join(char for char in value.casefold() if char.isalnum())
+
+
+def _edit_distance_at_most_one(left: str, right: str) -> bool:
+    """Returns whether two strings have a Levenshtein distance of at most one."""
+
+    if left == right:
+        return True
+
+    if abs(len(left) - len(right)) > 1:
+        return False
+
+    if len(left) > len(right):
+        left, right = right, left
+
+    left_index = 0
+    right_index = 0
+    edits = 0
+
+    while left_index < len(left) and right_index < len(right):
+        if left[left_index] == right[right_index]:
+            left_index += 1
+            right_index += 1
+            continue
+
+        edits += 1
+        if edits > 1:
+            return False
+
+        if len(left) == len(right):
+            left_index += 1
+        right_index += 1
+
+    if left_index < len(left) or right_index < len(right):
+        edits += 1
+
+    return edits <= 1
 
 
 def _banned_term_pattern(term: str) -> re.Pattern[str]:

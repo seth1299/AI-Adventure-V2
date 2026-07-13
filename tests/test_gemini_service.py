@@ -7,9 +7,11 @@ import tempfile
 import types
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from ai_adventure.ai.gemini_service import (
     DEFAULT_GEMINI_MODEL,
+    CREATIVE_TERM_REPAIR_MODEL,
     EVENT_RESPONSE_SCHEMA,
     KNOWN_EVENT_TYPE_NAMES,
     NEW_GAME_EVENT_RESPONSE_SCHEMA,
@@ -17,6 +19,7 @@ from ai_adventure.ai.gemini_service import (
     SKILL_CHECK_PLAN_RESPONSE_JSON_SCHEMA,
     STORY_RESPONSE_JSON_SCHEMA,
     GeminiNarrationService,
+    GeminiRequestError,
     GeminiSettings,
     build_skill_check_plan_prompt,
     build_gemini_new_game_prompt,
@@ -28,9 +31,12 @@ from ai_adventure.ai.gemini_service import (
     parse_gemini_story_response,
     _drop_unwarranted_skill_check_events,
     _filter_unwarranted_planned_skill_checks,
+    _generate_content_with_retry,
     _json_schema_shape_errors,
     _normalize_visible_currency_phrasing,
     _parse_new_game_starter_items,
+    _suggested_setup_location_terms,
+    _unfinalized_suggested_location_terms,
 )
 
 
@@ -64,6 +70,36 @@ def _container_metadata() -> dict[str, object]:
 
 
 class GeminiServiceTests(unittest.TestCase):
+    def test_suggestion_location_labels_require_finalized_replacements(self) -> None:
+        packet = {
+            "setup": {
+                "start_location": "The Rusty Dagger Inn",
+                "start_location_mode": "suggestion",
+                "starting_locations": [
+                    {"name": "Main City", "location_mode": "suggestion"},
+                    {"name": "Overarching Region", "location_mode": "suggestion"},
+                    {"name": "Thieves' Guild", "location_mode": "exact"},
+                ],
+            }
+        }
+        raw_text = json.dumps({
+            "start_location": "The Rusty Dagger Inn",
+            "locations": [
+                {"name": "Main City", "source_index": 0},
+                {"name": "Mistmarch", "source_index": 1},
+                {"name": "Thieves' Guild", "source_index": 2},
+            ],
+        })
+
+        self.assertEqual(
+            _suggested_setup_location_terms(packet),
+            ("The Rusty Dagger Inn", "Main City", "Overarching Region"),
+        )
+        self.assertEqual(
+            _unfinalized_suggested_location_terms(raw_text, packet),
+            ["The Rusty Dagger Inn", "Main City"],
+        )
+
     def test_new_game_starter_item_parser_preserves_firearm_metadata(self) -> None:
         items = _parse_new_game_starter_items(
             [
@@ -1792,19 +1828,96 @@ class GeminiServiceTests(unittest.TestCase):
 
         self.assertEqual(len(calls), 3)
         self.assertIn("Attempt 1", first_repair_prompt)
-        self.assertIn("Full forbidden terms list", first_repair_prompt)
-        self.assertIn("Elias", first_repair_prompt)
-        self.assertIn("Silas", first_repair_prompt)
-        self.assertIn("Vane", first_repair_prompt)
+        self.assertNotIn("Full forbidden terms list", first_repair_prompt)
+        self.assertIn("Observed offending terms in the current JSON: Oakhaven", first_repair_prompt)
         self.assertIn("Attempt 2", second_repair_prompt)
         self.assertIn(
             "Observed offending terms in the current JSON: Elias, Silas, Vane",
             second_repair_prompt,
         )
         self.assertIn("repair attempt 1/4 still contained", "\n".join(logs.output))
+        for repair_call in calls[1:]:
+            self.assertEqual(repair_call["model"], CREATIVE_TERM_REPAIR_MODEL)
+            self.assertEqual(
+                repair_call["config"]["thinking_config"],
+                {"thinking_level": "minimal"},
+            )
+            self.assertNotIn("response_json_schema", repair_call["config"])
         self.assertIn("Brassgate", result.world_summary)
         for term in ("Oakhaven", "Elias", "Silas", "Vane"):
             self.assertNotIn(term, combined_output)
+
+    def test_model_request_retries_transient_503_then_succeeds(self) -> None:
+        class Models:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def generate_content(self, **_kwargs: object) -> object:
+                self.calls += 1
+                if self.calls == 1:
+                    raise RuntimeError("503 UNAVAILABLE: high demand")
+                return object()
+
+        models = Models()
+        with patch("ai_adventure.ai.gemini_service.time.sleep") as sleep:
+            result = _generate_content_with_retry(
+                types.SimpleNamespace(models=models),
+                model="gemini-3.1-flash-lite",
+                contents="{}",
+                config={"response_mime_type": "application/json"},
+                request_label="test request",
+            )
+
+        self.assertIsNotNone(result)
+        self.assertEqual(models.calls, 2)
+        sleep.assert_called_once()
+
+    def test_model_request_raises_clean_error_without_sdk_traceback(self) -> None:
+        class Models:
+            def generate_content(self, **_kwargs: object) -> object:
+                raise RuntimeError("400 INVALID_ARGUMENT: bad request")
+
+        with self.assertRaisesRegex(GeminiRequestError, "could not complete"):
+            _generate_content_with_retry(
+                types.SimpleNamespace(models=Models()),
+                model="gemini-3.1-flash-lite",
+                contents="{}",
+                config={},
+                request_label="test request",
+            )
+
+    def test_model_request_retries_invalid_schema_without_server_schema(self) -> None:
+        class Models:
+            def __init__(self) -> None:
+                self.configs: list[dict[str, object]] = []
+
+            def generate_content(self, **kwargs: object) -> object:
+                config = dict(kwargs.get("config", {}))
+                self.configs.append(config)
+                if len(self.configs) == 1:
+                    raise RuntimeError("400 INVALID_ARGUMENT: invalid argument")
+                return object()
+
+        models = Models()
+        result = _generate_content_with_retry(
+            types.SimpleNamespace(models=models),
+            model="gemini-3.1-flash-lite",
+            contents="{}",
+            config={
+                "response_mime_type": "application/json",
+                "response_json_schema": {"type": "object"},
+                "thinking_config": {"thinking_level": "minimal"},
+            },
+            request_label="story request",
+        )
+
+        self.assertIsNotNone(result)
+        self.assertIn("response_json_schema", models.configs[0])
+        self.assertNotIn("response_json_schema", models.configs[1])
+        self.assertEqual(
+            models.configs[1]["response_mime_type"],
+            "application/json",
+        )
 
     def test_build_prompt_contains_strict_json_contract(self) -> None:
         prompt = build_gemini_story_prompt(
@@ -2991,6 +3104,36 @@ class GeminiServiceTests(unittest.TestCase):
 
         self.assertEqual(result[0]["category"], "Book")
         self.assertEqual(result[0]["quantity_unit"], "each")
+
+    def test_parse_starter_item_normalizes_finished_toxin_to_poison(self) -> None:
+        result = _parse_new_game_starter_items(
+            [{
+                "name": "Vial of Paralyzing Toxin",
+                "category": "Ingredient",
+                "quantity": 2,
+                "quantity_unit": "each",
+                "description": "A potent liquid that numbs limbs on contact.",
+                "value_base_units": 6,
+                "source_index": -1,
+            }]
+        )
+
+        self.assertEqual(result[0]["category"], "Poison")
+
+    def test_parse_starter_item_keeps_raw_venom_gland_as_ingredient(self) -> None:
+        result = _parse_new_game_starter_items(
+            [{
+                "name": "Spider Venom Gland",
+                "category": "Ingredient",
+                "quantity": 1,
+                "quantity_unit": "each",
+                "description": "A raw gland that can be processed into poison.",
+                "value_base_units": 2,
+                "source_index": -1,
+            }]
+        )
+
+        self.assertEqual(result[0]["category"], "Ingredient")
 
 
 if __name__ == "__main__":

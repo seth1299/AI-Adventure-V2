@@ -464,6 +464,13 @@ class AiContextBuilder:
                         "player explicitly takes the contents. Python transfers "
                         "the exact stored currency/items once."
                     ),
+                    "category_rule": (
+                        "Classify inventory by the finished item's present primary "
+                        "function, not its origin or packaging. A ready-to-use poison "
+                        "or toxin is Poison even when stored in a vial; reserve "
+                        "Ingredient, Reagent, Material, and Crafting Item for recipe "
+                        "inputs that still need processing."
+                    ),
                 },
                 "item_catalog": {
                     "items": [

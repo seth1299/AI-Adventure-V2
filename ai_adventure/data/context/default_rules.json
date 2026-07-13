@@ -472,7 +472,7 @@
           "When the player acquires a closed container, add only the container. Do not emit CurrencyChangedEvent or separate InventoryItemAddedEvent entries for anything stored inside it.",
           "Quest-related items should use `Quest Item` as the item type.",
           "Raw materials and refined materials should use different item types when relevant.",
-          "Food, tools, weapons, ammo, armor, clothes, containers, crafting materials, books, documents, and valuables should be classified clearly. A physical journal, notebook, ledger, manual, or other book is Book or Document; Information describes content and is not a physical inventory category."
+          "Food, tools, weapons, ammo, armor, clothes, containers, crafting materials, books, documents, poisons, and valuables should be classified clearly by their finished present primary function, not their origin or packaging. A ready-to-use poison or toxin is Poison even when stored in a vial; reserve Ingredient, Reagent, Material, and Crafting Item for recipe inputs that still need processing. A physical journal, notebook, ledger, manual, or other book is Book or Document; Information describes content and is not a physical inventory category."
         ]
       }
     },

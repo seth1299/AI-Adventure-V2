@@ -68,6 +68,35 @@ def _test_container_metadata(
 
 
 class EventApplierTests(unittest.TestCase):
+    def test_inventory_item_added_normalizes_finished_toxin_to_poison(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = SaveRepository.create_new_save(
+                Path(temp_dir),
+                "Poison Category Test",
+            )
+
+            EventApplier(repository).apply_event({
+                "type": "InventoryItemAddedEvent",
+                "payload": {
+                    "item_type": "Ingredient",
+                    "item_name": "Vial of Paralyzing Toxin",
+                    "description": "A potent liquid that numbs limbs on contact.",
+                    "amount": 2,
+                    "value_base_units": 6,
+                },
+            })
+
+            item = next(
+                row for row in repository.list_inventory_items()
+                if row["name"] == "Vial of Paralyzing Toxin"
+            )
+            catalog_item = next(
+                row for row in repository.list_item_catalog()
+                if row["name"] == "Vial of Paralyzing Toxin"
+            )
+            self.assertEqual(item["category"], "Poison")
+            self.assertEqual(catalog_item["category"], "Poison")
+
     def test_inventory_item_added_upgrades_player_weapon_damage_above_unarmed(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             repository = SaveRepository.create_new_save(Path(temp_dir), "Weapon Floor Test")

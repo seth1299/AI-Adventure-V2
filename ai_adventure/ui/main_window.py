@@ -141,11 +141,13 @@ if is_ai_enabled():
     from ai_adventure.ai.gemini_service import (
         GeminiConfigurationError,
         GeminiNarrationService,
+        GeminiRequestError,
         format_story_message,
     )
 else:
     GeminiNarrationService = None
     GeminiConfigurationError = RuntimeError
+    GeminiRequestError = RuntimeError
 
     def format_story_message(text: str) -> str:
         """Returns plain story text when the AI presentation layer is excluded."""
@@ -628,6 +630,9 @@ class _GeminiStoryWorker(QObject):
         except GeminiConfigurationError as error:
             LOGGER.warning("Gemini narration skipped: %s", error)
             self.configuration_error.emit(str(error))
+        except GeminiRequestError as error:
+            LOGGER.warning("Gemini narration request ended cleanly: %s", error)
+            self.failed.emit()
         except Exception:
             LOGGER.exception("Gemini narration request failed.")
             self.failed.emit()
@@ -663,6 +668,9 @@ class _GeminiSkillCheckPlanWorker(QObject):
         except GeminiConfigurationError as error:
             LOGGER.warning("Gemini skill-check planning skipped: %s", error)
             self.configuration_error.emit(str(error))
+        except GeminiRequestError as error:
+            LOGGER.warning("Gemini skill-check request ended cleanly: %s", error)
+            self.failed.emit()
         except Exception:
             LOGGER.exception("Gemini skill-check planning request failed.")
             self.failed.emit()
@@ -1123,6 +1131,19 @@ class MainWindow(QMainWindow):
             self._apply_fallback_currency_if_needed(repository, setup)
             repository.set_world_summary(fallback_world_summary(setup))
             repository.append_history("story", fallback_introductory_message(setup))
+            return
+        except GeminiRequestError as error:
+            LOGGER.warning("Gemini new-game synthesis ended cleanly: %s", error)
+            self._apply_fallback_currency_if_needed(repository, setup)
+            repository.set_world_summary(fallback_world_summary(setup))
+            repository.append_history(
+                "story",
+                (
+                    "Gemini is temporarily unavailable, so this new game opened "
+                    "with a local fallback. Your save is safe; try another action "
+                    "shortly."
+                ),
+            )
             return
         except Exception:
             LOGGER.exception("Gemini new-game synthesis failed.")
@@ -6323,7 +6344,10 @@ class StoryScreen(RepositoryBackedWidget):
         if repository is not None:
             repository.append_history(
                 "story",
-                "The narration falters for a moment. Check the application log for details.",
+                (
+                    "Gemini is temporarily unavailable. Your action was recorded "
+                    "and your save is safe; please try again shortly."
+                ),
             )
 
         self.refresh()
@@ -12758,6 +12782,13 @@ def _travel_locations_for_save(
 
             if matched_location is None:
                 if not requested_name:
+                    continue
+                if mode != "exact":
+                    LOGGER.warning(
+                        "Gemini omitted suggested location %r; not persisting its "
+                        "unfinalized placeholder name.",
+                        requested_name,
+                    )
                     continue
                 matched_location = {
                     "name": requested_name,

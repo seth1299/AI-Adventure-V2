@@ -16,7 +16,7 @@ def configure_logging(log_file: Path) -> None:
         log_file.parent.mkdir(parents=True, exist_ok=True)
 
     root_logger = logging.getLogger()
-    root_logger.setLevel(logging.DEBUG)
+    root_logger.setLevel(logging.INFO)
 
     # Avoid duplicate handlers when restarting from an interactive environment.
     root_logger.handlers.clear()
