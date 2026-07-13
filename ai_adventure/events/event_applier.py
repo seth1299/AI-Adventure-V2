@@ -881,7 +881,14 @@ class EventApplier:
         skill = self.repository.get_skill(name)
 
         if skill is None:
-            self.repository.upsert_skill(name, "Untrained or newly revealed skill.", 1)
+            description = _first_text(payload, "skill_description", "description")
+            if not description:
+                return _invalid(
+                    event_type,
+                    payload,
+                    "skill_description is required when checking a new skill.",
+                )
+            self.repository.upsert_skill(name, description, 1)
             skill = self.repository.get_skill(name)
 
         if skill is None:

@@ -611,6 +611,11 @@ class AiContextBuilder:
                             "requirement, progression target, or secret reveal condition "
                             "that requires a skill level above 5."
                         ),
+                        "unknown_skill_rule": (
+                            "skill_name may identify a generalized capability absent "
+                            "from known_skills. When it does, include skill_description "
+                            "so Python can create the new skill at level 1 before rolling."
+                        ),
                         "uncertain_action_rule": (
                             "Suggest SkillCheckRequestedEvent before narrating a "
                             "final outcome only when the current command has "

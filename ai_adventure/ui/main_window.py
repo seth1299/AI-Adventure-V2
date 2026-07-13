@@ -237,6 +237,7 @@ from ai_adventure.events.event_applier import EventApplier
 from ai_adventure.new_game_setup import (
     GREGORIAN_CALENDAR_SETTINGS,
     SKILL_LEVEL_PLAN,
+    SKILL_PRESET_LEVEL_PLANS,
     STARTER_INVENTORY_MIN_ITEMS,
     ai_generated_calendar_settings_or_fallback,
     build_new_game_setup_packet,
@@ -266,6 +267,7 @@ from ai_adventure.persistence.save_repository import (
     SaveRepository,
     SaveSummary,
 )
+from ai_adventure.skills.rules import MAX_SKILL_LEVEL, XP_THRESHOLDS_BY_LEVEL
 
 
 LOGGER = logging.getLogger(__name__)
@@ -405,6 +407,70 @@ def _allow_selected_row_deselection(table: QTableWidget) -> None:
     deselect_filter = _DeselectSelectedRowFilter(table)
     table.viewport().installEventFilter(deselect_filter)
     table._deselect_selected_row_filter = deselect_filter  # type: ignore[attr-defined]
+
+
+class _TableEditorWheelFilter(QObject):
+    """Prevents wheel events from changing editors embedded in tables."""
+
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:
+        if event.type() == QEvent.Type.Wheel and isinstance(
+            watched, (QComboBox, QAbstractSpinBox)
+        ):
+            event.ignore()
+            return True
+        return super().eventFilter(watched, event)
+
+
+class _AppTableWidget(QTableWidget):
+    """Application-wide table defaults and reusable removable-row behavior."""
+
+    def __init__(self, rows: int = 0, columns: int = 0, parent: QWidget | None = None) -> None:
+        super().__init__(rows, columns, parent)
+        self._editor_wheel_filter = _TableEditorWheelFilter(self)
+        _use_soft_table_selection(self)
+
+    def setCellWidget(self, row: int, column: int, widget: QWidget) -> None:
+        """Installs shared wheel protection on every embedded table editor."""
+
+        super().setCellWidget(row, column, widget)
+        editors = [widget, *widget.findChildren(QWidget)]
+        for editor in editors:
+            if isinstance(editor, (QComboBox, QAbstractSpinBox)):
+                editor.installEventFilter(self._editor_wheel_filter)
+
+    def checked_rows(self, checkbox_column: int | None = None) -> list[int]:
+        column = self.columnCount() - 1 if checkbox_column is None else checkbox_column
+        rows: list[int] = []
+        for row in range(self.rowCount()):
+            cell_widget = self.cellWidget(row, column)
+            checkbox = (
+                cell_widget.findChild(QCheckBox)
+                if cell_widget is not None
+                else None
+            )
+            item = self.item(row, column)
+            if (
+                isinstance(checkbox, QCheckBox) and checkbox.isChecked()
+            ) or (
+                item is not None and item.checkState() == Qt.CheckState.Checked
+            ):
+                rows.append(row)
+        return rows
+
+    def remove_checked_rows(
+        self,
+        checkbox_column: int | None = None,
+        *,
+        preserve_first_row: bool = False,
+    ) -> list[int]:
+        rows = [
+            row
+            for row in self.checked_rows(checkbox_column)
+            if not preserve_first_row or row != 0
+        ]
+        for row in reversed(rows):
+            self.removeRow(row)
+        return rows
 
 
 def _table_item(text: Any, sort_value: Any | None = None) -> QTableWidgetItem:
@@ -1236,9 +1302,13 @@ class MainWindow(QMainWindow):
             if character.get("notes"):
                 repository.set_setting("player.notes", character["notes"])
 
-        finalized_skills = _finalized_skills_for_save(
-            result.finalized_skills,
-            setup.get("skills", []),
+        finalized_skills = (
+            []
+            if setup.get("skill_preset") == "blank"
+            else _finalized_skills_for_save(
+                result.finalized_skills,
+                setup.get("skills", []),
+            )
         )
 
         if finalized_skills:
@@ -3068,9 +3138,9 @@ class NewGameTemplateManagerDialog(QDialog):
         self.start_location_combo.currentIndexChanged.connect(
             lambda _index: self._sync_template_start_location_from_locations_combo()
         )
-        self.starting_locations_table = QTableWidget(0, 6)
+        self.starting_locations_table = _AppTableWidget(0, 6)
         self.starting_locations_table.setHorizontalHeaderLabels(
-            ["Name", "Description", "Location Mode", "Sublocation?", "Within", ""]
+            ["Name", "Description", "Location Mode", "Sublocation?", "Within", "Remove"]
         )
         _configure_inline_table(
             self.starting_locations_table,
@@ -3081,9 +3151,9 @@ class NewGameTemplateManagerDialog(QDialog):
         self.add_location_button.clicked.connect(
             lambda: self._append_starting_location_row({})
         )
-        self.starting_npcs_table = QTableWidget(0, 5)
+        self.starting_npcs_table = _AppTableWidget(0, 5)
         self.starting_npcs_table.setHorizontalHeaderLabels(
-            ["Name", "Location", "Description", "Description Mode", ""]
+            ["Name", "Location", "Description", "Description Mode", "Remove"]
         )
         _configure_inline_table(
             self.starting_npcs_table,
@@ -3092,9 +3162,9 @@ class NewGameTemplateManagerDialog(QDialog):
         )
         self.add_npc_button = QPushButton("Add NPC")
         self.add_npc_button.clicked.connect(lambda: self._append_starting_npc_row({}))
-        self.starter_items_table = QTableWidget(0, 6)
+        self.starter_items_table = _AppTableWidget(0, 6)
         self.starter_items_table.setHorizontalHeaderLabels(
-            ["Name", "Amount", "Category", "Description", "Value", ""]
+            ["Name", "Amount", "Category", "Description", "Value", "Remove"]
         )
         _configure_inline_table(
             self.starter_items_table,
@@ -3105,7 +3175,7 @@ class NewGameTemplateManagerDialog(QDialog):
         self.add_starter_item_button.clicked.connect(
             lambda: self._append_starter_item_row({})
         )
-        self.starter_weapons_table = QTableWidget(0, 9)
+        self.starter_weapons_table = _AppTableWidget(0, 9)
         self.starter_weapons_table.setHorizontalHeaderLabels(
             [
                 "Name",
@@ -3116,7 +3186,7 @@ class NewGameTemplateManagerDialog(QDialog):
                 "Range",
                 "Ammo Type",
                 "Clip Size",
-                "",
+                "Remove",
             ]
         )
         _configure_inline_table(
@@ -3128,9 +3198,9 @@ class NewGameTemplateManagerDialog(QDialog):
         self.add_starter_weapon_button.clicked.connect(
             lambda: self._append_starter_weapon_row({})
         )
-        self.starter_armor_table = QTableWidget(0, 6)
+        self.starter_armor_table = _AppTableWidget(0, 6)
         self.starter_armor_table.setHorizontalHeaderLabels(
-            ["Name", "Amount", "Covers", "Armor Bonus", "Value", ""]
+            ["Name", "Amount", "Covers", "Armor Bonus", "Value", "Remove"]
         )
         _configure_inline_table(
             self.starter_armor_table,
@@ -3141,8 +3211,8 @@ class NewGameTemplateManagerDialog(QDialog):
         self.add_starter_armor_button.clicked.connect(
             lambda: self._append_starter_armor_row({})
         )
-        self.currency_table = QTableWidget(0, 4)
-        self.currency_table.setHorizontalHeaderLabels(["Name", "Plural Name", "Base Value", ""])
+        self.currency_table = _AppTableWidget(0, 4)
+        self.currency_table.setHorizontalHeaderLabels(["Name", "Plural Name", "Base Value", "Remove"])
         _configure_inline_table(
             self.currency_table,
             CURRENCY_COLUMN_WIDTHS,
@@ -3150,8 +3220,8 @@ class NewGameTemplateManagerDialog(QDialog):
         )
         self.add_currency_button = QPushButton("Add Currency")
         self.add_currency_button.clicked.connect(lambda: self._append_currency_row({}))
-        self.economy_examples_table = QTableWidget(0, 3)
-        self.economy_examples_table.setHorizontalHeaderLabels(["Item", "Base Units", ""])
+        self.economy_examples_table = _AppTableWidget(0, 3)
+        self.economy_examples_table.setHorizontalHeaderLabels(["Item", "Base Units", "Remove"])
         _configure_inline_table(
             self.economy_examples_table,
             ECONOMY_EXAMPLE_COLUMN_WIDTHS,
@@ -3266,7 +3336,16 @@ class NewGameTemplateManagerDialog(QDialog):
         form.addRow("Start Location:", self.start_location_combo)
         layout.addLayout(form)
         layout.addWidget(self.starting_locations_table)
-        layout.addWidget(_button_row(self.add_location_button))
+        layout.addWidget(
+            _button_row(
+                self.add_location_button,
+                _bulk_remove_button(
+                    self.starting_locations_table,
+                    label="Remove Selected Locations",
+                    after_remove=self._refresh_starting_location_dropdowns,
+                ),
+            )
+        )
         layout.addStretch()
 
         tab = QWidget()
@@ -3278,7 +3357,12 @@ class NewGameTemplateManagerDialog(QDialog):
 
         layout = QVBoxLayout()
         layout.addWidget(self.starting_npcs_table)
-        layout.addWidget(_button_row(self.add_npc_button))
+        layout.addWidget(
+            _button_row(
+                self.add_npc_button,
+                _bulk_remove_button(self.starting_npcs_table, label="Remove Selected NPCs"),
+            )
+        )
         layout.addStretch()
 
         tab = QWidget()
@@ -3291,15 +3375,15 @@ class NewGameTemplateManagerDialog(QDialog):
         form = QFormLayout()
         form.addRow("World Details:", self.world_context_input)
         form.addRow("Starter Items:", self.starter_items_table)
-        form.addRow("", self.add_starter_item_button)
+        form.addRow("", _button_row(self.add_starter_item_button, _bulk_remove_button(self.starter_items_table, label="Remove Selected Items")))
         form.addRow("Starter Weapons:", self.starter_weapons_table)
-        form.addRow("", self.add_starter_weapon_button)
+        form.addRow("", _button_row(self.add_starter_weapon_button, _bulk_remove_button(self.starter_weapons_table, label="Remove Selected Weapons")))
         form.addRow("Starter Armor:", self.starter_armor_table)
-        form.addRow("", self.add_starter_armor_button)
+        form.addRow("", _button_row(self.add_starter_armor_button, _bulk_remove_button(self.starter_armor_table, label="Remove Selected Armor")))
         form.addRow("Currencies:", self.currency_table)
-        form.addRow("", self.add_currency_button)
+        form.addRow("", _button_row(self.add_currency_button, _bulk_remove_button(self.currency_table, label="Remove Selected Currencies", preserve_first_row=True, after_remove=lambda: _sync_currency_base_value_row(self.currency_table))))
         form.addRow("Economy Notes:", self.economy_examples_table)
-        form.addRow("", self.add_economy_example_button)
+        form.addRow("", _button_row(self.add_economy_example_button, _bulk_remove_button(self.economy_examples_table, label="Remove Selected Economy Items")))
         form.addRow("Calendar:", self.calendar_type_combo)
 
         tab = QWidget()
@@ -4283,6 +4367,8 @@ class NewGameWizard(QWizard):
                 "notes": self.character_notes_input.toPlainText(),
             },
             "skills": skills,
+            "skill_preset": str(self.skill_preset_combo.currentData() or "professional"),
+            "skill_level_plan": [level for level, _name, _description in self.skill_inputs],
             "starter_items": self._starter_items_from_table(),
             "starting_npcs": self._starting_npcs_from_table(),
             "no_starting_npcs": self.no_starting_npcs_checkbox.isChecked()
@@ -4375,10 +4461,22 @@ class NewGameWizard(QWizard):
         self.backstory_input.setPlainText(character["backstory"])
         self.character_notes_input.setPlainText(character["notes"])
 
-        for index, (_, skill_input, description_input) in enumerate(self.skill_inputs):
-            skill = clean_setup["skills"][index] if index < len(clean_setup["skills"]) else {}
-            skill_input.setText(str(skill.get("name", "")))
-            description_input.setText(str(skill.get("description", "")))
+        preset_index = self.skill_preset_combo.findData(clean_setup.get("skill_preset", "professional"))
+        self.skill_preset_combo.setCurrentIndex(max(0, preset_index))
+        if clean_setup.get("skill_preset") == "custom":
+            for table in self.skill_tables.values():
+                table.setRowCount(0)
+            for skill in clean_setup["skills"]:
+                self._add_starting_skill_row(
+                    _safe_int(skill.get("level"), 1),
+                    str(skill.get("name", "")),
+                    str(skill.get("description", "")),
+                )
+        else:
+            for index, (_, skill_input, description_input) in enumerate(self.skill_inputs):
+                skill = clean_setup["skills"][index] if index < len(clean_setup["skills"]) else {}
+                skill_input.setText(str(skill.get("name", "")))
+                description_input.setText(str(skill.get("description", "")))
 
         self.starter_items_table.setRowCount(0)
         self.starter_weapons_table.setRowCount(0)
@@ -4575,9 +4673,9 @@ class NewGameWizard(QWizard):
             lambda _index: self._sync_start_location_from_locations_combo()
         )
 
-        self.starting_locations_table = QTableWidget(0, 6)
+        self.starting_locations_table = _AppTableWidget(0, 6)
         self.starting_locations_table.setHorizontalHeaderLabels(
-            ["Name", "Description", "Location Mode", "Sublocation?", "Within", ""]
+            ["Name", "Description", "Location Mode", "Sublocation?", "Within", "Remove"]
         )
         _configure_inline_table(
             self.starting_locations_table,
@@ -4589,13 +4687,18 @@ class NewGameWizard(QWizard):
         add_location_button.clicked.connect(
             lambda: self._append_starting_location_row({})
         )
+        remove_locations_button = _bulk_remove_button(
+            self.starting_locations_table,
+            label="Remove Selected Locations",
+            after_remove=self._refresh_starting_location_dropdowns,
+        )
 
         layout = QVBoxLayout()
         form = QFormLayout()
         form.addRow("Start Location:", self.start_location_combo)
         layout.addLayout(form)
         layout.addWidget(self.starting_locations_table)
-        layout.addWidget(_button_row(add_location_button))
+        layout.addWidget(_button_row(add_location_button, remove_locations_button))
         layout.addStretch()
         page.setLayout(layout)
 
@@ -4873,9 +4976,9 @@ class NewGameWizard(QWizard):
         page.setTitle("NPCs")
         page.setSubTitle("Add starting NPCs the player character may know.")
 
-        self.starting_npcs_table = QTableWidget(0, 5)
+        self.starting_npcs_table = _AppTableWidget(0, 5)
         self.starting_npcs_table.setHorizontalHeaderLabels(
-            ["Name", "Location", "Description", "Description Mode", ""]
+            ["Name", "Location", "Description", "Description Mode", "Remove"]
         )
         _configure_inline_table(
             self.starting_npcs_table,
@@ -4889,11 +4992,15 @@ class NewGameWizard(QWizard):
         )
         self.add_npc_button = QPushButton("Add NPC")
         self.add_npc_button.clicked.connect(lambda: self._append_starting_npc_row({}))
+        self.remove_npcs_button = _bulk_remove_button(
+            self.starting_npcs_table,
+            label="Remove Selected NPCs",
+        )
 
         layout = QVBoxLayout()
         layout.addWidget(self.no_starting_npcs_checkbox)
         layout.addWidget(self.starting_npcs_table)
-        layout.addWidget(_button_row(self.add_npc_button))
+        layout.addWidget(_button_row(self.add_npc_button, self.remove_npcs_button))
         layout.addStretch()
         page.setLayout(layout)
 
@@ -4955,6 +5062,7 @@ class NewGameWizard(QWizard):
         allow_npcs = not self.no_starting_npcs_checkbox.isChecked()
         self.starting_npcs_table.setEnabled(allow_npcs)
         self.add_npc_button.setEnabled(allow_npcs)
+        self.remove_npcs_button.setEnabled(allow_npcs)
 
     def _build_character_page(self) -> None:
         """Builds the character page."""
@@ -4988,38 +5096,64 @@ class NewGameWizard(QWizard):
 
         page = QWizardPage()
         page.setTitle("Skills")
-        page.setSubTitle("Name the character's starting skills and describe what each means in play.")
+        page.setSubTitle("Choose a starting experience profile, then name and describe its skills.")
 
         self.skill_inputs: list[tuple[int, QLineEdit, QLineEdit]] = []
+        self.skill_tables: dict[int, QTableWidget] = {}
+        self.skill_table_controls: dict[int, QWidget] = {}
         content = QWidget()
         layout = QVBoxLayout()
 
-        for level in sorted(set(SKILL_LEVEL_PLAN), reverse=True):
-            skill_count = SKILL_LEVEL_PLAN.count(level)
+        self.skill_preset_combo = _NoWheelComboBox()
+        preset_options = (
+            ("Professional Adventurer", "professional"),
+            ("Experienced Adventurer", "experienced"),
+            ("Average Adventurer", "average"),
+            ("Beginner Adventurer", "beginner"),
+            ("Blank Slate / Hardcore Mode", "blank"),
+            ("Custom", "custom"),
+        )
+        for label, key in preset_options:
+            self.skill_preset_combo.addItem(label, key)
+        layout.addWidget(QLabel("Starting Skill Profile"))
+        layout.addWidget(self.skill_preset_combo)
+
+        for level in range(5, 0, -1):
             group = QGroupBox(f"Level {level}")
-            group_layout = QGridLayout()
-            group_layout.setColumnStretch(0, 1)
-            group_layout.setColumnStretch(1, 2)
+            group_layout = QVBoxLayout()
 
             meaning_label = QLabel(SKILL_LEVEL_DESCRIPTIONS[level])
             meaning_label.setWordWrap(True)
-            group_layout.addWidget(meaning_label, 0, 0, 1, 2)
-            group_layout.addWidget(QLabel("Skill"), 1, 0)
-            group_layout.addWidget(QLabel("Description for AI"), 1, 1)
+            group_layout.addWidget(meaning_label)
+            table = _AppTableWidget(0, 3)
+            table.setHorizontalHeaderLabels(["Remove", "Skill", "Description for AI"])
+            table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+            table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+            table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+            table.verticalHeader().setVisible(False)
+            table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
+            self.skill_tables[level] = table
 
-            for row_index in range(skill_count):
-                skill_input = QLineEdit()
-                skill_input.setPlaceholderText("Skill name")
-                description_input = QLineEdit()
-                description_input.setPlaceholderText(
-                    "What this skill covers, how it shows up, or what makes it distinct"
-                )
-                self.skill_inputs.append((level, skill_input, description_input))
-                group_layout.addWidget(skill_input, row_index + 2, 0)
-                group_layout.addWidget(description_input, row_index + 2, 1)
+            add_button = QPushButton("Add Skill")
+            remove_button = QPushButton("Remove Selected Skills")
+            add_button.clicked.connect(lambda _checked=False, skill_level=level: self._add_starting_skill_row(skill_level))
+            remove_button.clicked.connect(lambda _checked=False, skill_level=level: self._remove_selected_starting_skill_rows(skill_level))
+            controls = QWidget()
+            controls_layout = QHBoxLayout()
+            controls_layout.setContentsMargins(0, 0, 0, 0)
+            controls_layout.addWidget(add_button)
+            controls_layout.addWidget(remove_button)
+            controls_layout.addStretch()
+            controls.setLayout(controls_layout)
+            group_layout.addWidget(controls)
+            group_layout.addWidget(table)
+            self.skill_table_controls[level] = controls
 
             group.setLayout(group_layout)
             layout.addWidget(group)
+
+        self.skill_preset_combo.currentIndexChanged.connect(self._apply_starting_skill_preset)
+        self._apply_starting_skill_preset()
 
         layout.addStretch()
         content.setLayout(layout)
@@ -5034,6 +5168,60 @@ class NewGameWizard(QWizard):
         page.setLayout(page_layout)
         self.addPage(page)
 
+    def _add_starting_skill_row(
+        self,
+        level: int,
+        name: str = "",
+        description: str = "",
+    ) -> None:
+        table = self.skill_tables[level]
+        row = table.rowCount()
+        table.insertRow(row)
+        _set_checked_row_checkbox(
+            table,
+            row,
+            0,
+            "Check this skill, then click Remove Selected Skills.",
+        )
+        skill_input = QLineEdit(name)
+        skill_input.setPlaceholderText("Skill name")
+        description_input = QLineEdit(description)
+        description_input.setPlaceholderText("What this skill covers and when it applies")
+        table.setCellWidget(row, 1, skill_input)
+        table.setCellWidget(row, 2, description_input)
+        self._sync_starting_skill_inputs()
+
+    def _remove_selected_starting_skill_rows(self, level: int) -> None:
+        table = self.skill_tables[level]
+        checked_rows = table.checked_rows(0)
+        for row in reversed(checked_rows):
+            table.removeRow(row)
+        self._sync_starting_skill_inputs()
+
+    def _sync_starting_skill_inputs(self) -> None:
+        self.skill_inputs = []
+        for level in range(5, 0, -1):
+            table = self.skill_tables[level]
+            for row in range(table.rowCount()):
+                name_input = table.cellWidget(row, 1)
+                description_input = table.cellWidget(row, 2)
+                if isinstance(name_input, QLineEdit) and isinstance(description_input, QLineEdit):
+                    self.skill_inputs.append((level, name_input, description_input))
+
+    def _apply_starting_skill_preset(self, _index: int = -1) -> None:
+        preset = str(self.skill_preset_combo.currentData() or "professional")
+        plan = SKILL_PRESET_LEVEL_PLANS.get(preset, [])
+        is_custom = preset == "custom"
+        for level, table in self.skill_tables.items():
+            table.setRowCount(0)
+            table.setColumnHidden(0, not is_custom)
+            count = plan.count(level)
+            for _unused in range(count):
+                self._add_starting_skill_row(level)
+            table.parentWidget().setVisible(is_custom or count > 0)
+            self.skill_table_controls[level].setVisible(is_custom)
+        self._sync_starting_skill_inputs()
+
     def _build_inventory_currency_page(self) -> None:
         """Builds the starter inventory and currency page."""
 
@@ -5041,9 +5229,9 @@ class NewGameWizard(QWizard):
         page.setTitle("Inventory and Currency")
         page.setSubTitle("Add requested starter items and describe the world's money.")
 
-        self.starter_items_table = QTableWidget(0, 6)
+        self.starter_items_table = _AppTableWidget(0, 6)
         self.starter_items_table.setHorizontalHeaderLabels(
-            ["Name", "Amount", "Category", "Description", "Value", ""]
+            ["Name", "Amount", "Category", "Description", "Value", "Remove"]
         )
         self.starter_items_table.setMinimumHeight(170)
         self.starter_items_table.verticalHeader().setVisible(False)
@@ -5056,8 +5244,9 @@ class NewGameWizard(QWizard):
 
         add_item_button = QPushButton("Add Item")
         add_item_button.clicked.connect(lambda: self._append_starter_item_row({}))
+        remove_item_button = _bulk_remove_button(self.starter_items_table, label="Remove Selected Items")
 
-        self.starter_weapons_table = QTableWidget(0, 9)
+        self.starter_weapons_table = _AppTableWidget(0, 9)
         self.starter_weapons_table.setHorizontalHeaderLabels(
             [
                 "Name",
@@ -5068,7 +5257,7 @@ class NewGameWizard(QWizard):
                 "Range",
                 "Ammo Type",
                 "Clip Size",
-                "",
+                "Remove",
             ]
         )
         _configure_inline_table(
@@ -5079,10 +5268,11 @@ class NewGameWizard(QWizard):
 
         add_weapon_button = QPushButton("Add Weapon")
         add_weapon_button.clicked.connect(lambda: self._append_starter_weapon_row({}))
+        remove_weapon_button = _bulk_remove_button(self.starter_weapons_table, label="Remove Selected Weapons")
 
-        self.starter_armor_table = QTableWidget(0, 6)
+        self.starter_armor_table = _AppTableWidget(0, 6)
         self.starter_armor_table.setHorizontalHeaderLabels(
-            ["Name", "Amount", "Covers", "Armor Bonus", "Value", ""]
+            ["Name", "Amount", "Covers", "Armor Bonus", "Value", "Remove"]
         )
         _configure_inline_table(
             self.starter_armor_table,
@@ -5092,9 +5282,10 @@ class NewGameWizard(QWizard):
 
         add_armor_button = QPushButton("Add Armor")
         add_armor_button.clicked.connect(lambda: self._append_starter_armor_row({}))
+        remove_armor_button = _bulk_remove_button(self.starter_armor_table, label="Remove Selected Armor")
 
-        self.currency_table = QTableWidget(0, 4)
-        self.currency_table.setHorizontalHeaderLabels(["Name", "Plural Name", "Base Value", ""])
+        self.currency_table = _AppTableWidget(0, 4)
+        self.currency_table.setHorizontalHeaderLabels(["Name", "Plural Name", "Base Value", "Remove"])
         self.currency_table.setMinimumHeight(180)
         self.currency_table.verticalHeader().setVisible(False)
         self.currency_table.verticalHeader().setDefaultSectionSize(36)
@@ -5106,9 +5297,15 @@ class NewGameWizard(QWizard):
 
         add_currency_button = QPushButton("Add Currency")
         add_currency_button.clicked.connect(lambda: self._append_currency_row({}))
+        remove_currency_button = _bulk_remove_button(
+            self.currency_table,
+            label="Remove Selected Currencies",
+            preserve_first_row=True,
+            after_remove=lambda: _sync_currency_base_value_row(self.currency_table),
+        )
 
-        self.economy_examples_table = QTableWidget(0, 3)
-        self.economy_examples_table.setHorizontalHeaderLabels(["Item", "Base Units", ""])
+        self.economy_examples_table = _AppTableWidget(0, 3)
+        self.economy_examples_table.setHorizontalHeaderLabels(["Item", "Base Units", "Remove"])
         _configure_inline_table(
             self.economy_examples_table,
             ECONOMY_EXAMPLE_COLUMN_WIDTHS,
@@ -5119,18 +5316,22 @@ class NewGameWizard(QWizard):
         add_economy_example_button.clicked.connect(
             lambda: self._append_economy_example_row({})
         )
+        remove_economy_example_button = _bulk_remove_button(
+            self.economy_examples_table,
+            label="Remove Selected Economy Items",
+        )
 
         layout = QFormLayout()
         layout.addRow("Starter Items:", self.starter_items_table)
-        layout.addRow("", add_item_button)
+        layout.addRow("", _button_row(add_item_button, remove_item_button))
         layout.addRow("Starter Weapons:", self.starter_weapons_table)
-        layout.addRow("", add_weapon_button)
+        layout.addRow("", _button_row(add_weapon_button, remove_weapon_button))
         layout.addRow("Starter Armor:", self.starter_armor_table)
-        layout.addRow("", add_armor_button)
+        layout.addRow("", _button_row(add_armor_button, remove_armor_button))
         layout.addRow("Currencies:", self.currency_table)
-        layout.addRow("", add_currency_button)
+        layout.addRow("", _button_row(add_currency_button, remove_currency_button))
         layout.addRow("Economy Notes:", self.economy_examples_table)
-        layout.addRow("", add_economy_example_button)
+        layout.addRow("", _button_row(add_economy_example_button, remove_economy_example_button))
 
         content = QWidget()
         content.setLayout(layout)
@@ -6915,7 +7116,7 @@ class CombatScreen(RepositoryBackedWidget):
         self.npc_turn_timer.setInterval(NPC_TURN_DELAY_MS)
         self.npc_turn_timer.timeout.connect(self._resolve_scheduled_npc_turn)
         self.status_label = QLabel("No active combat.")
-        self.combatants_table = QTableWidget(0, 11)
+        self.combatants_table = _AppTableWidget(0, 11)
         self.combatants_table.setHorizontalHeaderLabels(
             [
                 "Turn",
@@ -8341,7 +8542,7 @@ class CalendarScreen(RepositoryBackedWidget):
         self.summary_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.summary_label.setStyleSheet("font-size: 16px; font-weight: 600;")
 
-        self.table = QTableWidget(0, 0)
+        self.table = _AppTableWidget(0, 0)
         self.table.setObjectName("calendarGrid")
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
@@ -8351,14 +8552,14 @@ class CalendarScreen(RepositoryBackedWidget):
         self.table.verticalHeader().setVisible(False)
         self.table.cellClicked.connect(self._open_day_events)
 
-        self.year_table = QTableWidget(0, 0)
+        self.year_table = _AppTableWidget(0, 0)
         self.year_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.year_table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
         _use_soft_table_selection(self.year_table)
         self.year_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self.year_table.verticalHeader().setVisible(False)
 
-        self.tasks_table = QTableWidget(0, 5)
+        self.tasks_table = _AppTableWidget(0, 5)
         self.tasks_table.setHorizontalHeaderLabels(
             ["Task", "Category", "Due", "Location", "Reward"]
         )
@@ -8740,7 +8941,7 @@ class InventoryScreen(RepositoryBackedWidget):
         self._loading_item_editor = False
         self._sort_column = 0
         self._sort_order = Qt.SortOrder.AscendingOrder
-        self.table = QTableWidget(0, 7)
+        self.table = _AppTableWidget(0, 7)
         self.table.setHorizontalHeaderLabels(
             ["Name", "Category", "Quantity", "Unit", "Storage", "Value", "Description"]
         )
@@ -9199,7 +9400,7 @@ class NpcsScreen(RepositoryBackedWidget):
 
         self._sort_column = 0
         self._sort_order = Qt.SortOrder.AscendingOrder
-        self.table = QTableWidget(0, 3)
+        self.table = _AppTableWidget(0, 3)
         self.table.setHorizontalHeaderLabels(
             ["Name", "Location", "Notes"]
         )
@@ -9277,7 +9478,7 @@ class ActiveTasksScreen(RepositoryBackedWidget):
 
         self._sort_column = 0
         self._sort_order = Qt.SortOrder.AscendingOrder
-        self.table = QTableWidget(0, 8)
+        self.table = _AppTableWidget(0, 8)
         self.table.setHorizontalHeaderLabels(
             [
                 "Task",
@@ -9393,9 +9594,9 @@ class SkillsScreen(RepositoryBackedWidget):
 
         self._sort_column = 0
         self._sort_order = Qt.SortOrder.AscendingOrder
-        self.skills_table = QTableWidget(0, 3)
+        self.skills_table = _AppTableWidget(0, 4)
         self.skills_table.setHorizontalHeaderLabels(
-            ["Skill", "Training", "Description"]
+            ["Skill", "Training", "XP Progress", "Description"]
         )
         self.skills_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         _configure_wrapping_table(self.skills_table, set())
@@ -9438,6 +9639,11 @@ class SkillsScreen(RepositoryBackedWidget):
             self.skills_table.setItem(
                 row_index,
                 2,
+                _table_item(_skill_xp_progress_label(skill), _safe_int(skill.get("xp", 0), 0)),
+            )
+            self.skills_table.setItem(
+                row_index,
+                3,
                 _table_item(str(skill.get("description", ""))),
             )
 
@@ -9463,6 +9669,9 @@ class SkillsScreen(RepositoryBackedWidget):
             return _safe_int(skill.get("level", 1), 1), name
 
         if self._sort_column == 2:
+            return _safe_int(skill.get("xp", 0), 0), name
+
+        if self._sort_column == 3:
             return str(skill.get("description", "")).casefold(), name
 
         return name, name
@@ -9510,7 +9719,7 @@ class AlchemyNotebookScreen(RepositoryBackedWidget):
     def _setup_reagents_tab(self) -> None:
         """Builds the structured useful item/material discovery tab."""
 
-        self.reagent_table = QTableWidget(0, 5)
+        self.reagent_table = _AppTableWidget(0, 5)
         self.reagent_table.setHorizontalHeaderLabels(
             ["Name", "Category", "Description", "Location", "Uses"]
         )
@@ -9573,7 +9782,7 @@ class AlchemyNotebookScreen(RepositoryBackedWidget):
     def _setup_recipes_tab(self) -> None:
         """Builds the structured recipe discovery tab."""
 
-        self.recipe_table = QTableWidget(0, 5)
+        self.recipe_table = _AppTableWidget(0, 5)
         self.recipe_table.setHorizontalHeaderLabels(
             ["Name", "Ingredients", "Result", "Estimated Value", "Notes"]
         )
@@ -9657,7 +9866,7 @@ class AlchemyNotebookScreen(RepositoryBackedWidget):
         ingredient_controls.addWidget(add_ingredient_button)
         ingredient_controls.addWidget(remove_ingredient_button)
 
-        self.recipe_ingredient_table = QTableWidget(0, 4)
+        self.recipe_ingredient_table = _AppTableWidget(0, 4)
         self.recipe_ingredient_table.setHorizontalHeaderLabels(
             ["Item", "Count", "Amount", "Unit"]
         )
@@ -11659,19 +11868,13 @@ def _append_starting_location_table_row(
         str(location.get("parent_location", "") or ""),
     )
     parent_input.setVisible(sublocation_input.isChecked())
-    remove_button = QPushButton("Remove Location")
-    remove_button.setMinimumWidth(TABLE_INLINE_BUTTON_MIN_WIDTH)
-    remove_button.setMinimumHeight(TABLE_INLINE_EDITOR_HEIGHT)
-    remove_button.clicked.connect(
-        lambda _checked=False, button=remove_button: remove_callback(button)
-    )
 
     table.setCellWidget(row, 0, name_input)
     table.setCellWidget(row, 1, description_input)
     table.setCellWidget(row, 2, mode_input)
     table.setCellWidget(row, 3, sublocation_input)
     table.setCellWidget(row, 4, parent_input)
-    table.setCellWidget(row, 5, remove_button)
+    _set_checked_row_checkbox(table, row, 5, "Select this location for removal.")
     parent_input.setVisible(sublocation_input.isChecked())
     _set_table_column_widths(table, STARTING_LOCATION_COLUMN_WIDTHS)
 
@@ -11839,18 +12042,12 @@ def _append_starting_npc_table_row(
         {"suggestion": "Suggestion", "exact": "Exact"},
         str(npc.get("description_mode", "suggestion") or "suggestion"),
     )
-    remove_button = QPushButton("Remove NPC")
-    remove_button.setMinimumWidth(TABLE_INLINE_BUTTON_MIN_WIDTH)
-    remove_button.setMinimumHeight(TABLE_INLINE_EDITOR_HEIGHT)
-    remove_button.clicked.connect(
-        lambda _checked=False, button=remove_button: remove_callback(button)
-    )
 
     table.setCellWidget(row, 0, name_input)
     table.setCellWidget(row, 1, location_input)
     table.setCellWidget(row, 2, description_input)
     table.setCellWidget(row, 3, mode_input)
-    table.setCellWidget(row, 4, remove_button)
+    _set_checked_row_checkbox(table, row, 4, "Select this NPC for removal.")
     _set_table_column_widths(table, STARTING_NPC_COLUMN_WIDTHS)
 
 
@@ -11916,6 +12113,73 @@ def _configure_inline_table(
     _set_table_column_widths(table, widths)
 
 
+def _set_checked_row_checkbox(
+    table: QTableWidget,
+    row: int,
+    column: int,
+    tooltip: str,
+) -> QCheckBox:
+    """Adds a real, centered checkbox widget used for bulk row removal."""
+
+    checkbox = QCheckBox()
+    checkbox.setToolTip(tooltip)
+    checkbox.setCursor(Qt.CursorShape.PointingHandCursor)
+    container = QWidget()
+    layout = QHBoxLayout()
+    layout.setContentsMargins(0, 0, 0, 0)
+    layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+    layout.addWidget(checkbox)
+    container.setLayout(layout)
+    table.setCellWidget(row, column, container)
+    return checkbox
+
+
+def _remove_checked_table_rows(
+    table: QTableWidget,
+    *,
+    preserve_first_row: bool = False,
+) -> list[int]:
+    """Removes every checked row and returns their original indexes."""
+
+    if isinstance(table, _AppTableWidget):
+        return table.remove_checked_rows(preserve_first_row=preserve_first_row)
+
+    checkbox_column = table.columnCount() - 1
+    rows = [
+        row
+        for row in range(table.rowCount())
+        if (not preserve_first_row or row != 0)
+        and table.item(row, checkbox_column) is not None
+        and table.item(row, checkbox_column).checkState() == Qt.CheckState.Checked
+    ]
+    for row in reversed(rows):
+        table.removeRow(row)
+    return rows
+
+
+def _bulk_remove_button(
+    table: QTableWidget,
+    *,
+    label: str = "Remove Selected",
+    preserve_first_row: bool = False,
+    after_remove: Callable[[], None] | None = None,
+) -> QPushButton:
+    """Builds a button that removes all checkbox-selected rows from a table."""
+
+    button = QPushButton(label)
+
+    def remove_selected() -> None:
+        removed_rows = _remove_checked_table_rows(
+            table,
+            preserve_first_row=preserve_first_row,
+        )
+        if removed_rows and after_remove is not None:
+            after_remove()
+
+    button.clicked.connect(remove_selected)
+    return button
+
+
 def _append_starter_item_table_row(
     table: QTableWidget,
     item: dict[str, Any],
@@ -11936,19 +12200,13 @@ def _append_starter_item_table_row(
     value_input = _table_spin_box(0, 1_000_000_000)
     value_input.setValue(_safe_int(item.get("value_base_units", 0), 0))
 
-    remove_button = QPushButton("Remove")
-    remove_button.setMinimumWidth(TABLE_INLINE_BUTTON_MIN_WIDTH)
-    remove_button.setMinimumHeight(TABLE_INLINE_EDITOR_HEIGHT)
-    remove_button.clicked.connect(
-        lambda _checked=False, button=remove_button: remove_callback(button)
-    )
 
     table.setCellWidget(row, 0, name_input)
     table.setCellWidget(row, 1, quantity_input)
     table.setCellWidget(row, 2, category_input)
     table.setCellWidget(row, 3, description_input)
     table.setCellWidget(row, 4, value_input)
-    table.setCellWidget(row, 5, remove_button)
+    _set_checked_row_checkbox(table, row, 5, "Select this item for removal.")
     _set_table_column_widths(table, STARTER_ITEM_COLUMN_WIDTHS)
 
 
@@ -12057,12 +12315,6 @@ def _append_starter_weapon_table_row(
     ammo_input = _table_line_edit(_metadata_text(item, "ammunition_type_required"))
     clip_size_input = _table_spin_box(0, 999)
     clip_size_input.setValue(max(0, _metadata_int(item, "clip_size", 0)))
-    remove_button = QPushButton("Remove")
-    remove_button.setMinimumWidth(TABLE_INLINE_BUTTON_MIN_WIDTH)
-    remove_button.setMinimumHeight(TABLE_INLINE_EDITOR_HEIGHT)
-    remove_button.clicked.connect(
-        lambda _checked=False, button=remove_button: remove_callback(button)
-    )
 
     table.setCellWidget(row, 0, name_input)
     table.setCellWidget(row, 1, quantity_input)
@@ -12072,7 +12324,7 @@ def _append_starter_weapon_table_row(
     table.setCellWidget(row, 5, range_input)
     table.setCellWidget(row, 6, ammo_input)
     table.setCellWidget(row, 7, clip_size_input)
-    table.setCellWidget(row, 8, remove_button)
+    _set_checked_row_checkbox(table, row, 8, "Select this weapon for removal.")
     _set_table_column_widths(table, STARTER_WEAPON_COLUMN_WIDTHS)
 
 
@@ -12170,19 +12422,13 @@ def _append_starter_armor_table_row(
     armor_rating_input.setValue(max(0, _metadata_int(item, "armor_rating", 1)))
     value_input = _table_spin_box(0, 1_000_000_000)
     value_input.setValue(_safe_int(item.get("value_base_units", 0), 0))
-    remove_button = QPushButton("Remove")
-    remove_button.setMinimumWidth(TABLE_INLINE_BUTTON_MIN_WIDTH)
-    remove_button.setMinimumHeight(TABLE_INLINE_EDITOR_HEIGHT)
-    remove_button.clicked.connect(
-        lambda _checked=False, button=remove_button: remove_callback(button)
-    )
 
     table.setCellWidget(row, 0, name_input)
     table.setCellWidget(row, 1, quantity_input)
     table.setCellWidget(row, 2, covers_input)
     table.setCellWidget(row, 3, armor_rating_input)
     table.setCellWidget(row, 4, value_input)
-    table.setCellWidget(row, 5, remove_button)
+    _set_checked_row_checkbox(table, row, 5, "Select this armor for removal.")
     _set_table_column_widths(table, STARTER_ARMOR_COLUMN_WIDTHS)
 
 
@@ -12244,18 +12490,24 @@ def _append_currency_table_row(
     name_input = _table_line_edit(name)
     plural_name_input = _table_line_edit(plural_name)
     value_input = _table_spin_box(1, 1_000_000_000)
-    value_input.setValue(_safe_int(denomination.get("value", 1), 1))
-    remove_button = QPushButton("Remove")
-    remove_button.setMinimumWidth(TABLE_INLINE_BUTTON_MIN_WIDTH)
-    remove_button.setMinimumHeight(TABLE_INLINE_EDITOR_HEIGHT)
-    remove_button.clicked.connect(
-        lambda _checked=False, button=remove_button: remove_callback(button)
-    )
+    if "value" in denomination:
+        default_value = _safe_int(denomination.get("value"), 1)
+    elif row > 0:
+        previous_value_input = table.cellWidget(row - 1, 2)
+        previous_value = (
+            previous_value_input.value()
+            if isinstance(previous_value_input, QSpinBox)
+            else 1
+        )
+        default_value = min(1_000_000_000, max(1, previous_value) * 10)
+    else:
+        default_value = 1
+    value_input.setValue(default_value)
 
     table.setCellWidget(row, 0, name_input)
     table.setCellWidget(row, 1, plural_name_input)
     table.setCellWidget(row, 2, value_input)
-    table.setCellWidget(row, 3, remove_button)
+    _set_checked_row_checkbox(table, row, 3, "Select this denomination for removal.")
     _sync_currency_base_value_row(table)
     _set_table_column_widths(table, CURRENCY_COLUMN_WIDTHS)
 
@@ -12277,11 +12529,16 @@ def _sync_currency_base_value_row(table: QTableWidget) -> None:
             value_widget.setEnabled(True)
             value_widget.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.UpDownArrows)
 
-        remove_widget = table.cellWidget(row, 3)
-
-        if isinstance(remove_widget, QPushButton):
-            remove_widget.setVisible(row != 0)
-            remove_widget.setEnabled(row != 0)
+        remove_container = table.cellWidget(row, 3)
+        remove_checkbox = (
+            remove_container.findChild(QCheckBox)
+            if remove_container is not None
+            else None
+        )
+        if isinstance(remove_checkbox, QCheckBox):
+            remove_checkbox.setChecked(False)
+            remove_checkbox.setEnabled(row != 0)
+            remove_checkbox.setVisible(row != 0)
 
 
 def _currency_denominations_from_table(table: QTableWidget) -> list[dict[str, Any]]:
@@ -12328,16 +12585,10 @@ def _append_economy_example_table_row(
     name_input = _table_line_edit(str(example.get("name", "")))
     value_input = _table_spin_box(1, 1_000_000_000)
     value_input.setValue(_safe_int(example.get("value_base_units", 1), 1))
-    remove_button = QPushButton("Remove")
-    remove_button.setMinimumWidth(TABLE_INLINE_BUTTON_MIN_WIDTH)
-    remove_button.setMinimumHeight(TABLE_INLINE_EDITOR_HEIGHT)
-    remove_button.clicked.connect(
-        lambda _checked=False, button=remove_button: remove_callback(button)
-    )
 
     table.setCellWidget(row, 0, name_input)
     table.setCellWidget(row, 1, value_input)
-    table.setCellWidget(row, 2, remove_button)
+    _set_checked_row_checkbox(table, row, 2, "Select this economy example for removal.")
     _set_table_column_widths(table, ECONOMY_EXAMPLE_COLUMN_WIDTHS)
 
 
@@ -13362,3 +13613,13 @@ def _skill_level_label(level: int) -> str:
         5: "Master",
     }
     return labels.get(level, "Unknown")
+
+
+def _skill_xp_progress_label(skill: dict[str, Any]) -> str:
+    """Formats cumulative skill XP against the next level threshold."""
+
+    level = max(1, min(MAX_SKILL_LEVEL, _safe_int(skill.get("level", 1), 1)))
+    xp = max(0, _safe_int(skill.get("xp", 0), 0))
+    if level >= MAX_SKILL_LEVEL:
+        return f"{xp} / MAX"
+    return f"{xp} / {XP_THRESHOLDS_BY_LEVEL[level + 1]}"

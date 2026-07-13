@@ -19,7 +19,14 @@ from ai_adventure.currency import (
 from ai_adventure.narration_preferences import normalize_narration_preferences
 
 
-SKILL_LEVEL_PLAN = [5, 4, 4, 3, 3, 3, 2, 2, 2, 2, 1, 1, 1, 1, 1]
+SKILL_PRESET_LEVEL_PLANS: dict[str, list[int]] = {
+    "professional": [5, 4, 4, 3, 3, 3, 2, 2, 2, 2, 1, 1, 1, 1, 1],
+    "experienced": [4, 3, 3, 2, 2, 2, 1, 1, 1, 1],
+    "average": [3, 2, 2, 1, 1, 1],
+    "beginner": [2, 1, 1],
+    "blank": [],
+}
+SKILL_LEVEL_PLAN = SKILL_PRESET_LEVEL_PLANS["professional"]
 STARTER_INVENTORY_MIN_ITEMS = 5
 
 CHARACTER_GENDER_PRESENTATION_HINTS = [
@@ -234,7 +241,9 @@ def normalize_new_game_setup(raw_setup: Any) -> dict[str, Any]:
         raw_ai_settings = {}
     ai_mode_preferences = normalize_ai_mode_preferences(raw_ai_settings)
     custom_ai_context = _clean_text(raw_ai_settings.get("additional_context"))
-    skills = _normalize_skills(raw_setup.get("skills", []))
+    skill_preset = _normalize_skill_preset(raw_setup.get("skill_preset"))
+    skill_level_plan = _skill_level_plan_for_setup(raw_setup, skill_preset)
+    skills = _normalize_skills(raw_setup.get("skills", []), skill_level_plan)
     starter_items = _normalize_starter_items(raw_setup.get("starter_items", []))
     no_starting_npcs = bool(raw_setup.get("no_starting_npcs", False))
     starting_npcs = (
@@ -258,6 +267,8 @@ def normalize_new_game_setup(raw_setup: Any) -> dict[str, Any]:
             "notes": _clean_text(character.get("notes")),
         },
         "skills": skills,
+        "skill_preset": skill_preset,
+        "skill_level_plan": skill_level_plan,
         "starter_items": starter_items,
         "starting_npcs": starting_npcs,
         "no_starting_npcs": no_starting_npcs,
@@ -627,6 +638,9 @@ def build_new_game_setup_packet(
                 "reveal condition that requires a skill level above 5."
             ),
             "skill_generation": (
+                "Return exactly the starting skill slots supplied in setup.skills, "
+                "preserving every slot's level. If setup.skills is empty for Blank "
+                "Slate / Hardcore Mode, return no starting skills. "
                 "If a setup.skills entry has a nonblank name, copy that exact name "
                 "unchanged and fill only missing description text for that slot. "
                 "Invent a distinct setting-appropriate skill name only when the "
@@ -996,22 +1010,38 @@ def _has_ai_skill_placeholders(skills: list[dict[str, Any]]) -> bool:
     return any(bool(skill.get("requires_ai_invention")) for skill in skills)
 
 
-def _normalize_skills(raw_skills: Any) -> list[dict[str, Any]]:
-    """Normalizes skills into the required level spread."""
+def _normalize_skill_preset(value: Any) -> str:
+    clean_value = _clean_text(value).casefold().replace(" ", "_")
+    aliases = {"blank_slate": "blank", "hardcore": "blank", "custom_mode": "custom"}
+    clean_value = aliases.get(clean_value, clean_value)
+    return clean_value if clean_value in {*SKILL_PRESET_LEVEL_PLANS, "custom"} else "professional"
+
+
+def _skill_level_plan_for_setup(raw_setup: dict[str, Any], preset: str) -> list[int]:
+    if preset != "custom":
+        return list(SKILL_PRESET_LEVEL_PLANS[preset])
+    raw_plan = raw_setup.get("skill_level_plan", [])
+    if not isinstance(raw_plan, list):
+        raw_plan = []
+    return [max(1, min(5, _safe_int(level, 1))) for level in raw_plan]
+
+
+def _normalize_skills(raw_skills: Any, level_plan: list[int]) -> list[dict[str, Any]]:
+    """Normalizes skills into the selected preset or custom level spread."""
 
     input_skills = raw_skills if isinstance(raw_skills, list) else []
-    normalized: list[dict[str, Any] | None] = [None for _level in SKILL_LEVEL_PLAN]
+    normalized: list[dict[str, Any] | None] = [None for _level in level_plan]
     next_position = 0
 
-    for raw_skill in input_skills[: len(SKILL_LEVEL_PLAN)]:
+    for raw_skill in input_skills[: len(level_plan)]:
         if not isinstance(raw_skill, dict):
             raw_skill = {"name": str(raw_skill)}
 
         requested_level = _safe_int(raw_skill.get("level"), 0)
         target_index = -1
 
-        if requested_level in SKILL_LEVEL_PLAN:
-            for index, level in enumerate(SKILL_LEVEL_PLAN):
+        if requested_level in level_plan:
+            for index, level in enumerate(level_plan):
                 if level == requested_level and normalized[index] is None:
                     target_index = index
                     break
@@ -1025,7 +1055,7 @@ def _normalize_skills(raw_skills: Any) -> list[dict[str, Any]]:
 
             target_index = next_position
 
-        level = SKILL_LEVEL_PLAN[target_index]
+        level = level_plan[target_index]
         name = _clean_text(raw_skill.get("name"))
         description = _clean_text(raw_skill.get("description"))
         requires_ai_invention = bool(raw_skill.get("requires_ai_invention"))
@@ -1044,7 +1074,7 @@ def _normalize_skills(raw_skills: Any) -> list[dict[str, Any]]:
         if skill is not None:
             continue
 
-        level = SKILL_LEVEL_PLAN[index]
+        level = level_plan[index]
         normalized[index] = {
             "name": "",
             "description": "",

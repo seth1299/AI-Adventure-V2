@@ -4521,7 +4521,8 @@ class MainWindowTests(unittest.TestCase):
             self.assertIsInstance(_table_cell(wizard.starter_items_table, 0, 0, QLineEdit), QLineEdit)
             item_quantity = _table_cell(wizard.starter_items_table, 0, 1, QSpinBox)
             item_category = _table_cell(wizard.starter_items_table, 0, 2, QLineEdit)
-            item_remove = _table_cell(wizard.starter_items_table, 0, 5, QPushButton)
+            item_remove_container = wizard.starter_items_table.cellWidget(0, 5)
+            item_remove = item_remove_container.findChild(QCheckBox)
             self.assertEqual(item_quantity.value(), 2)
             self.assertEqual(
                 item_quantity.minimumWidth(),
@@ -4535,7 +4536,8 @@ class MainWindowTests(unittest.TestCase):
             self.assertEqual(item_quantity.value(), 1)
             item_quantity.stepUp()
             self.assertEqual(item_quantity.value(), 2)
-            item_remove.click()
+            item_remove.setChecked(True)
+            wizard.starter_items_table.remove_checked_rows()
             self.assertEqual(wizard.starter_items_table.rowCount(), 0)
 
             wizard._append_starter_weapon_row(
@@ -4599,8 +4601,8 @@ class MainWindowTests(unittest.TestCase):
             base_currency_value = _table_cell(wizard.currency_table, 0, 2, QSpinBox)
             crown_currency_value = _table_cell(wizard.currency_table, 1, 2, QSpinBox)
             crown_currency_name = _table_cell(wizard.currency_table, 1, 0, QLineEdit)
-            base_currency_remove = _table_cell(wizard.currency_table, 0, 3, QPushButton)
-            crown_currency_remove = _table_cell(wizard.currency_table, 1, 3, QPushButton)
+            base_currency_remove = wizard.currency_table.cellWidget(0, 3).findChild(QCheckBox)
+            crown_currency_remove = wizard.currency_table.cellWidget(1, 3).findChild(QCheckBox)
             self.assertFalse(base_currency_value.isEnabled())
             self.assertEqual(base_currency_value.value(), 1)
             self.assertEqual(
@@ -4623,9 +4625,11 @@ class MainWindowTests(unittest.TestCase):
             self.assertEqual(crown_currency_value.value(), 11)
             crown_currency_value.stepUp()
             self.assertEqual(crown_currency_value.value(), 12)
-            base_currency_remove.click()
+            base_currency_remove.setChecked(True)
+            wizard.currency_table.remove_checked_rows(preserve_first_row=True)
             self.assertEqual(wizard.currency_table.rowCount(), 2)
-            crown_currency_remove.click()
+            crown_currency_remove.setChecked(True)
+            wizard.currency_table.remove_checked_rows(preserve_first_row=True)
             self.assertEqual(wizard.currency_table.rowCount(), 1)
             self.assertEqual(_table_cell(wizard.currency_table, 0, 0, QLineEdit).text(), "Bit")
             remaining_currency_value = _table_cell(wizard.currency_table, 0, 2, QSpinBox)
@@ -4636,11 +4640,19 @@ class MainWindowTests(unittest.TestCase):
                 QAbstractSpinBox.ButtonSymbols.NoButtons,
             )
 
+            wizard._append_currency_row({})
+            self.assertEqual(
+                _table_cell(wizard.currency_table, 1, 2, QSpinBox).value(),
+                10,
+            )
+
             wizard._append_economy_example_row({"name": "Bread", "value_base_units": 2})
             self.assertEqual(wizard.economy_examples_table.rowCount(), 1)
             self.assertEqual(_table_cell(wizard.economy_examples_table, 0, 0, QLineEdit).text(), "Bread")
             self.assertEqual(_table_cell(wizard.economy_examples_table, 0, 1, QSpinBox).value(), 2)
-            _table_cell(wizard.economy_examples_table, 0, 2, QPushButton).click()
+            economy_remove = wizard.economy_examples_table.cellWidget(0, 2).findChild(QCheckBox)
+            economy_remove.setChecked(True)
+            wizard.economy_examples_table.remove_checked_rows()
             self.assertEqual(wizard.economy_examples_table.rowCount(), 0)
         finally:
             wizard.close()
@@ -4917,6 +4929,38 @@ class MainWindowTests(unittest.TestCase):
             self.assertEqual(level_groups, ["Level 5", "Level 4", "Level 3", "Level 2", "Level 1"])
             self.assertEqual([entry[0] for entry in wizard.skill_inputs], [5, 4, 4, 3, 3, 3, 2, 2, 2, 2, 1, 1, 1, 1, 1])
             self.assertEqual(len(wizard.skill_inputs[0]), 3)
+            self.assertTrue(
+                all(table.isColumnHidden(0) for table in wizard.skill_tables.values())
+            )
+            wizard.skill_preset_combo.setCurrentIndex(
+                wizard.skill_preset_combo.findData("custom")
+            )
+            self.assertTrue(
+                all(not table.isColumnHidden(0) for table in wizard.skill_tables.values())
+            )
+            self.assertTrue(
+                any(
+                    button.text() == "Remove Selected Skills" and button.isVisible()
+                    for button in wizard.findChildren(QPushButton)
+                )
+            )
+            wizard._add_starting_skill_row(3, "First", "First description.")
+            wizard._add_starting_skill_row(3, "Middle", "Middle description.")
+            wizard._add_starting_skill_row(3, "Last", "Last description.")
+            level_three_table = wizard.skill_tables[3]
+            remove_container = level_three_table.cellWidget(1, 0)
+            self.assertIsNotNone(remove_container)
+            remove_checkbox = remove_container.findChild(QCheckBox)
+            self.assertIsNotNone(remove_checkbox)
+            remove_checkbox.setChecked(True)
+            wizard._remove_selected_starting_skill_rows(3)
+            self.assertEqual(level_three_table.rowCount(), 2)
+            self.assertEqual(level_three_table.cellWidget(0, 1).text(), "First")
+            self.assertEqual(level_three_table.cellWidget(1, 1).text(), "Last")
+
+            wizard.skill_preset_combo.setCurrentIndex(
+                wizard.skill_preset_combo.findData("professional")
+            )
 
             wizard.skill_inputs[0][1].setText("Smithing")
             wizard.skill_inputs[0][2].setText("Forge repair, tool-making, and metalwork.")

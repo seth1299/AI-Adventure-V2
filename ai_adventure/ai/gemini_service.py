@@ -370,6 +370,7 @@ EVENT_RESPONSE_SCHEMA: dict[str, Any] = {
             "SkillCheckRequestedEvent",
             {
                 "skill_name": {"type": "string"},
+                "skill_description": {"type": "string"},
                 "dc": {"type": "integer", "minimum": 1},
                 "difficulty": {"type": "string"},
             },
@@ -1717,7 +1718,9 @@ def build_gemini_story_prompt(context_packet: dict[str, Any]) -> str:
         "a check merely because an action could theoretically vary in quality or "
         "take extra time; use checks only when failure or partial success would "
         "matter in the current scene. Do not use SkillXpAddedEvent as a substitute "
-        "for a warranted check.\n"
+        "for a warranted check. skill_name may be a generalized capability absent "
+        "from state.skills.known_skills; for an unknown skill, also include a clear "
+        "skill_description so Python can create it at level 1 before rolling.\n"
         "- Routine movement, paying a known price, receiving ordinary goods, "
         "eating, drinking, and casual conversation are not skill checks unless "
         "the player adds a contested, risky, hidden, time-sensitive, or "
@@ -2062,6 +2065,8 @@ def build_gemini_new_game_prompt(setup_packet: dict[str, Any]) -> str:
         "embellish, paraphrase, or reinterpret a player-provided character name, "
         "appearance, backstory, or notes field.\n"
         "- skills must contain every starting skill with name, description, and level. "
+        "Return exactly the skill slots present in setup.skills, preserving every "
+        "slot's level; when setup.skills is empty, return an empty skills array. "
         "Skill levels range from 1 through 5, and 5 is the absolute maximum. Never "
         "create a prerequisite, progression target, or gm_secrets reveal_condition "
         "that requires a skill level above 5. If setup.skills[N].name is nonblank, "

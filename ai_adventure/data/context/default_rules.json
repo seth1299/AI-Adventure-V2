@@ -294,6 +294,7 @@
         "purpose": "Suggest SkillCheckRequestedEvent before narrating the final outcome only when the current command has meaningful uncertainty, opposition, hidden information, danger, scarcity, time pressure, or consequences. Do not request checks merely because an action could theoretically vary in quality or take extra time. Routine movement, paying a known price, receiving ordinary goods, eating, drinking, and casual conversation are not checks unless the player adds a contested, risky, hidden, time-sensitive, or deceptive goal.",
         "rules": [
           "Suggest SkillCheckRequestedEvent only when the current command has meaningful stakes: uncertainty, opposition, hidden information, danger, resource pressure, time pressure, or consequences.",
+          "skill_name may be absent from state.skills.known_skills. When requesting a check for an unknown skill, include skill_description describing its generalized capability; Python creates it at level 1 before rolling.",
           "Do not request a check merely because an action could theoretically vary in quality or take extra time.",
           "Foraging, harvesting, searching, researching, identifying, crafting experiments, persuasion, stealth, and combat need checks only when real stakes are present.",
           "Do not request checks for routine movement, paying a known price, receiving ordinary goods, eating, drinking, or casual conversation unless the player adds a contested, risky, hidden, time-sensitive, or deceptive goal.",

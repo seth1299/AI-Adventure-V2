@@ -7,6 +7,7 @@ from pathlib import Path
 from ai_adventure.new_game_setup import (
     CHARACTER_GENDER_PRESENTATION_HINTS,
     SKILL_LEVEL_PLAN,
+    SKILL_PRESET_LEVEL_PLANS,
     ai_generated_calendar_settings_or_fallback,
     build_new_game_setup_packet,
     calendar_looks_like_generic_fantasy_artisan,
@@ -30,6 +31,36 @@ from ai_adventure.persistence.save_repository import (
 
 
 class NewGameSetupTests(unittest.TestCase):
+    def test_starting_skill_presets_control_exact_level_plan(self) -> None:
+        for preset, expected_plan in SKILL_PRESET_LEVEL_PLANS.items():
+            with self.subTest(preset=preset):
+                setup = normalize_new_game_setup({"skill_preset": preset})
+                self.assertEqual(setup["skill_level_plan"], expected_plan)
+                self.assertEqual(
+                    [skill["level"] for skill in setup["skills"]],
+                    expected_plan,
+                )
+
+    def test_custom_starting_skills_allow_any_level_mix(self) -> None:
+        setup = normalize_new_game_setup(
+            {
+                "skill_preset": "custom",
+                "skill_level_plan": [5, 5, 2, 1, 1, 1],
+                "skills": [
+                    {"name": f"Custom Skill {index}", "description": "Useful capability."}
+                    for index in range(6)
+                ],
+            }
+        )
+        self.assertEqual([skill["level"] for skill in setup["skills"]], [5, 5, 2, 1, 1, 1])
+
+    def test_blank_slate_has_no_starting_skill_slots(self) -> None:
+        setup = normalize_new_game_setup(
+            {"skill_preset": "blank", "skills": [{"name": "Should Be Removed"}]}
+        )
+        self.assertEqual(setup["skills"], [])
+        self.assertEqual(setup["skill_level_plan"], [])
+
     def test_normalized_setup_enforces_skill_spread_and_preserves_requested_items(self) -> None:
         setup = normalize_new_game_setup(
             {

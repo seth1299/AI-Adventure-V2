@@ -130,6 +130,33 @@ class SkillSystemTests(unittest.TestCase):
                 any("d20" in str(entry.get("content", "")) for entry in history)
             )
 
+    def test_unknown_skill_check_requires_and_persists_description(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = SaveRepository.create_new_save(Path(temp_dir), "Skill Test")
+            applier = EventApplier(repository, rng=random.Random(2))
+
+            missing_description = applier.apply_event(
+                {"type": "SkillCheckRequestedEvent", "payload": {"skill_name": "Sailing"}}
+            )
+            created = applier.apply_event(
+                {
+                    "type": "SkillCheckRequestedEvent",
+                    "payload": {
+                        "skill_name": "Sailing",
+                        "skill_description": "Operating and navigating watercraft.",
+                        "dc": 10,
+                    },
+                }
+            )
+
+            self.assertEqual(missing_description.status, "skipped")
+            self.assertEqual(created.status, "applied")
+            skill = repository.get_skill("Sailing")
+            self.assertIsNotNone(skill)
+            assert skill is not None
+            self.assertEqual(skill["level"], 1)
+            self.assertEqual(skill["description"], "Operating and navigating watercraft.")
+
     def test_state_manager_and_context_include_skills(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             repository = SaveRepository.create_new_save(Path(temp_dir), "Skill Test")
