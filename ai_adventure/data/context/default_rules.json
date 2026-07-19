@@ -262,6 +262,7 @@
         "rules": [
           "Every in-game response must include in structured event data exactly one StatusUpdatedEvent event.",
           "This must be the final structured event in an in-game response.",
+          "The StatusUpdatedEvent payload must always include all three required fields: location, minutes_passed, and weather. Never emit a partial payload with only one or two of these fields. Use `AUTO` for location when the player remains in the current location, `AUTO` for weather when it is unchanged, and `AUTO` or 0 for minutes_passed when appropriate.",
           "`Location` is the player's current or new location. Use `AUTO` for `Location` if the player remains in the same location.",
           "`Location` must be a short, broad place name such as a room, building, street, district, ship, campsite, or landmark. Do not include scenic clauses, exact position, floor, view, weather, or nearby landmark details in `Location`; put those details in visible narration instead. Example: use \"Y/N's Office\", not \"Y/N's Office, high up near the penthouse, overlooking the Hudson River\".",
           "Set `discover_location` to true only when the player has actually reached a newly discovered location that should be added to the Travel tab. Otherwise omit it or use false.",

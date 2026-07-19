@@ -430,8 +430,9 @@ def build_new_game_setup_packet(
             ),
             "start_location": (
                 "setup.start_location_mode controls how to treat the requested "
-                "starting location. suggestion means use it as inspiration and "
-                "you may replace it with a more specific fitting location. exact "
+                "starting location. suggestion means use it only as inspiration "
+                "and return a materially different finalized location name; never "
+                "copy the suggested text unchanged. exact "
                 "means return setup.start_location unchanged as start_location and "
                 "use that exact name consistently in introductory_message, "
                 "locations, and any opening events."
@@ -491,8 +492,9 @@ def build_new_game_setup_packet(
                 "name, location, or description fields with fitting specifics. "
                 "If description_mode is exact, copy description into "
                 "payload.public_description unchanged; if description_mode is "
-                "suggestion, treat description as inspiration and put the final "
-                "description you choose into payload.public_description. Return AI-only "
+                "suggestion, use description only as inspiration and write a "
+                "materially different payload.public_description; never copy the "
+                "suggested description unchanged. Return AI-only "
                 "hidden identities, motives, mystery solutions, off-screen plans, "
                 "and other concealed truths in the dedicated gm_secrets setup "
                 "field; never place those truths in player-facing setup fields."
@@ -566,7 +568,8 @@ def build_new_game_setup_packet(
                 "the opening scene instead of start_location. If setup."
                 "start_location_mode is exact, return setup.start_location "
                 "unchanged as the final start_location. If it is suggestion, treat "
-                "setup.start_location as inspiration that may be replaced."
+                "setup.start_location only as inspiration and return a materially "
+                "different final name; never copy the suggestion unchanged."
             ),
             "travel_locations": (
                 "Return a locations array for the Travel tab containing exactly "
@@ -582,8 +585,9 @@ def build_new_game_setup_packet(
                 "specifics. If location_mode is exact, copy name and description "
                 "into the locations entry unchanged, while still filling terrain, "
                 "coordinates, travel_multiplier, and route notes. If location_mode "
-                "is suggestion, treat name and description as inspiration and put "
-                "the finalized player-facing values in the locations entry. Once "
+                "is suggestion, use name and description only as inspiration and "
+                "return materially different finalized values for both nonblank "
+                "fields; never copy either suggestion unchanged. Once "
                 "a suggested location name is finalized, use that finalized name "
                 "consistently in every other returned field, including descriptions, "
                 "travel_notes, known_crafting_items.location, NPC details, tasks, "
@@ -704,7 +708,12 @@ def build_new_game_setup_packet(
                 "also include quantity_unit, such as each, bundle, bottle, vial, "
                 "gram, kilogram, ounce, liter, or meter. Classify a physical journal, "
                 "notebook, ledger, manual, or other book as Book or Document, not "
-                "Information; Information describes content, not a physical item."
+                "Information; Information describes content, not a physical item. "
+                "Every finalized starting item must also include storage_location. "
+                "Use home for items kept in the player's house, workshop, base, room, "
+                "or other home storage, and actively_carried only for items the Player "
+                "Character is actually carrying. Interpret phrases such as 'kept in "
+                "their house' in item_request as home storage."
             ),
             "currency_generation": (
                 "If setup.currency_denominations is empty, create a finalized "
@@ -870,7 +879,10 @@ def _fields_requiring_ai_invention(clean_setup: dict[str, Any]) -> list[str]:
     if not clean_setup["specified_genre"]:
         invention_fields.append("specific genre or premise")
 
-    if not clean_setup["start_location"]:
+    if (
+        not clean_setup["start_location"]
+        or clean_setup["start_location_mode"] == "suggestion"
+    ):
         invention_fields.append("specific starting location")
 
     if not clean_setup["world_context"]:
@@ -893,6 +905,12 @@ def _fields_requiring_ai_invention(clean_setup: dict[str, Any]) -> list[str]:
         for location in clean_setup["starting_locations"]
     ):
         invention_fields.append("suggested or incomplete starting locations")
+
+    if any(
+        bool(npc.get("requires_ai_invention"))
+        for npc in clean_setup["starting_npcs"]
+    ):
+        invention_fields.append("suggested or incomplete starting NPCs")
 
     if clean_setup["starting_task"]["mode"] == "ai":
         invention_fields.append("opening quest/task")
@@ -1167,7 +1185,12 @@ def _normalize_starting_npcs(raw_npcs: Any) -> list[dict[str, Any]]:
                 "location": location,
                 "description": description,
                 "description_mode": description_mode,
-                "requires_ai_invention": not name or not location or not description,
+                "requires_ai_invention": (
+                    description_mode == "suggestion"
+                    or not name
+                    or not location
+                    or not description
+                ),
             }
         )
 
@@ -1235,6 +1258,9 @@ def _starter_item_with_metadata(
         or _clean_text(metadata.get("item_type"))
         or category
     ).title()
+    base_item["storage_location"] = _normalize_starter_storage_location(
+        raw_item.get("storage_location", metadata.get("storage_location", "actively_carried"))
+    )
 
     if item_type == "Weapon" or category == "Weapon":
         base_item["category"] = "Weapon"
@@ -1314,6 +1340,13 @@ def _starter_item_with_metadata(
         )
 
     return base_item
+
+
+def _normalize_starter_storage_location(raw_value: Any) -> str:
+    """Normalizes a starter item's independent free-text storage label."""
+
+    value = " ".join(_clean_text(raw_value).split())
+    return value[:120] or "actively_carried"
 
 
 def _normalize_text_list(raw_values: Any) -> list[str]:

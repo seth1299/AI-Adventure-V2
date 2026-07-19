@@ -31,6 +31,23 @@ from ai_adventure.persistence.save_repository import (
 
 
 class NewGameSetupTests(unittest.TestCase):
+    def test_normalize_new_game_setup_preserves_starter_storage_location(self) -> None:
+        setup = normalize_new_game_setup(
+            {
+                "starter_items": [
+                    {
+                        "name": "Loaded Revolver",
+                        "storage_location": "Detective's Car",
+                    }
+                ]
+            }
+        )
+
+        self.assertEqual(
+            setup["starter_items"][0]["storage_location"],
+            "Detective's Car",
+        )
+
     def test_starting_skill_presets_control_exact_level_plan(self) -> None:
         for preset, expected_plan in SKILL_PRESET_LEVEL_PLANS.items():
             with self.subTest(preset=preset):
@@ -1025,6 +1042,8 @@ class NewGameSetupTests(unittest.TestCase):
         )
         self.assertIn("setup.starting_npcs", packet["requirements"]["events"])
         self.assertIn("payload.public_description", packet["requirements"]["events"])
+        self.assertIn("materially different", packet["requirements"]["events"])
+        self.assertIn("suggested or incomplete starting NPCs", packet["fields_requiring_ai_invention"])
         self.assertIn("Do not parse NPCs out of ordinary setup prose", packet["requirements"]["events"])
         self.assertNotIn(
             "the captain, the engineer, and the weapons expert",
@@ -1084,6 +1103,7 @@ class NewGameSetupTests(unittest.TestCase):
             "Rainmarket Station",
         )
         self.assertIn("setup.starting_locations", packet["requirements"]["travel_locations"])
+        self.assertIn("materially different", packet["requirements"]["travel_locations"])
         self.assertIn("locations entry unchanged", packet["requirements"]["travel_locations"])
         self.assertIn("parent_location is set", packet["requirements"]["travel_locations"])
         self.assertIn(

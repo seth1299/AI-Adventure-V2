@@ -4083,10 +4083,10 @@ def _normalize_calendar_event(raw_event: Any) -> dict[str, Any]:
 
 
 def _inventory_storage_location(metadata: dict[str, Any]) -> str:
-    """Returns the persisted inventory storage bucket."""
+    """Returns the persisted free-text inventory storage label."""
 
-    value = str(metadata.get("storage_location", "actively_carried") or "actively_carried").strip().casefold()
-    return value if value in {"home", "actively_carried"} else "actively_carried"
+    value = " ".join(str(metadata.get("storage_location", "actively_carried") or "actively_carried").strip().split())
+    return value[:120] or "actively_carried"
 
 
 def _gm_secret_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:

@@ -492,9 +492,9 @@ class AiContextBuilder:
                         "possession_rule": (
                         "Only state.inventory.items are current possessions. Each "
                         "inventory item includes quantity, quantity_unit, and "
-                        "storage_location (home or actively_carried); use the latter "
-                        "to distinguish Home storage from what the Player Character "
-                        "is carrying. "
+                        "storage_location, a free-text storage label independent of "
+                        "Travel-tab locations; use actively_carried only when the "
+                        "Player Character is carrying it. "
                             "Use item_catalog to remember descriptions, categories, "
                             "and values for previously seen items. Each item also "
                             "has metadata.item_uuid, a stable internal identity; "
@@ -848,6 +848,15 @@ class AiContextBuilder:
                     "change is proposed. The Python application validates and "
                     "applies events. Include multiple entries of the same event type "
                     "when multiple distinct state changes happen in one turn."
+                ),
+                "status_event": (
+                    "For every in-game response, include exactly one final "
+                    "StatusUpdatedEvent. Its payload must always include all three "
+                    "required fields: location, minutes_passed, and weather. Use "
+                    "location='AUTO' when the player remains in the current "
+                    "location, weather='AUTO' when unchanged, and minutes_passed "
+                    "='AUTO' or 0 when appropriate. Never send a partial status "
+                    "payload containing only minutes_passed."
                 ),
                 "skill_checks": (
                     "Suggest SkillCheckRequestedEvent with skill_name and either dc "

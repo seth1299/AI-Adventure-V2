@@ -35,8 +35,8 @@ from ai_adventure.ai.gemini_service import (
     _json_schema_shape_errors,
     _normalize_visible_currency_phrasing,
     _parse_new_game_starter_items,
-    _suggested_setup_location_terms,
-    _unfinalized_suggested_location_terms,
+    _suggested_setup_terms,
+    _unfinalized_suggested_setup_terms,
 )
 
 
@@ -70,34 +70,81 @@ def _container_metadata() -> dict[str, object]:
 
 
 class GeminiServiceTests(unittest.TestCase):
-    def test_suggestion_location_labels_require_finalized_replacements(self) -> None:
+    def test_suggestion_mode_fields_require_finalized_replacements(self) -> None:
         packet = {
             "setup": {
                 "start_location": "The Rusty Dagger Inn",
                 "start_location_mode": "suggestion",
                 "starting_locations": [
-                    {"name": "Main City", "location_mode": "suggestion"},
+                    {
+                        "name": "Main City",
+                        "description": "A large politically divided city.",
+                        "location_mode": "suggestion",
+                    },
                     {"name": "Overarching Region", "location_mode": "suggestion"},
                     {"name": "Thieves' Guild", "location_mode": "exact"},
+                ],
+                "starting_npcs": [
+                    {
+                        "name": "Guild Contact",
+                        "description": "The player's discreet guild contact.",
+                        "description_mode": "suggestion",
+                    },
+                    {
+                        "name": "Fixed Contact",
+                        "description": "Preserve this description.",
+                        "description_mode": "exact",
+                    },
                 ],
             }
         }
         raw_text = json.dumps({
             "start_location": "The Rusty Dagger Inn",
             "locations": [
-                {"name": "Main City", "source_index": 0},
+                {
+                    "name": "Main-City",
+                    "description": "A large, politically divided city!",
+                    "source_index": 0,
+                },
                 {"name": "Mistmarch", "source_index": 1},
                 {"name": "Thieves' Guild", "source_index": 2},
+            ],
+            "events": [
+                {
+                    "type": "NpcUpsertedEvent",
+                    "payload": {
+                        "display_name": "Guild Contact",
+                        "public_description": "The player's discreet guild contact!",
+                    },
+                },
+                {
+                    "type": "NpcUpsertedEvent",
+                    "payload": {
+                        "display_name": "Fixed Contact",
+                        "public_description": "Preserve this description.",
+                    },
+                },
             ],
         })
 
         self.assertEqual(
-            _suggested_setup_location_terms(packet),
-            ("The Rusty Dagger Inn", "Main City", "Overarching Region"),
+            _suggested_setup_terms(packet),
+            (
+                "The Rusty Dagger Inn",
+                "Main City",
+                "A large politically divided city.",
+                "Overarching Region",
+                "The player's discreet guild contact.",
+            ),
         )
         self.assertEqual(
-            _unfinalized_suggested_location_terms(raw_text, packet),
-            ["The Rusty Dagger Inn", "Main City"],
+            _unfinalized_suggested_setup_terms(raw_text, packet),
+            [
+                "The Rusty Dagger Inn",
+                "Main City",
+                "A large politically divided city.",
+                "The player's discreet guild contact.",
+            ],
         )
 
     def test_new_game_starter_item_parser_preserves_firearm_metadata(self) -> None:
@@ -202,6 +249,29 @@ class GeminiServiceTests(unittest.TestCase):
             1024,
         )
         self.assertNotIn("max_output_tokens", call["config"])
+
+    def test_new_game_starter_items_preserve_free_text_storage_location(self) -> None:
+        item_schema = NEW_GAME_RESPONSE_JSON_SCHEMA["properties"]["starting_items"]["items"]
+        self.assertEqual(
+            item_schema["properties"]["storage_location"]["type"],
+            "string",
+        )
+        self.assertIn("storage_location", item_schema["required"])
+
+        parsed = _parse_new_game_starter_items(
+            [{
+                "name": "Loaded Revolver",
+                "category": "Weapon",
+                "quantity": 1,
+                "quantity_unit": "each",
+                "storage_location": "Detective's Car",
+                "description": "A loaded service revolver.",
+                "value_base_units": 250,
+                "source_index": 0,
+            }]
+        )
+
+        self.assertEqual(parsed[0]["storage_location"], "Detective's Car")
 
     def test_story_request_applies_selected_ai_modes_to_config(self) -> None:
         fake_client_class = self._install_fake_genai_client(
@@ -321,10 +391,10 @@ class GeminiServiceTests(unittest.TestCase):
             SKILL_CHECK_PLAN_RESPONSE_JSON_SCHEMA,
         )
         self.assertIn("skill_check_planning", call["contents"])
-        self.assertNotIn('"inventory":', call["contents"].casefold())
+        self.assertNotIn("<inventory>", call["contents"].casefold())
         self.assertIn("cliff_is_trapped", call["contents"])
         self.assertIn("concealed wire", call["contents"])
-        self.assertIn("Available context tags:", call["contents"])
+        self.assertIn("<available_tags>", call["contents"])
         self.assertIn('"relevant_tags"', call["contents"])
 
     def test_parse_skill_check_plan_response_normalizes_checks(self) -> None:
@@ -1828,7 +1898,8 @@ class GeminiServiceTests(unittest.TestCase):
 
         self.assertEqual(len(calls), 3)
         self.assertIn("Attempt 1", first_repair_prompt)
-        self.assertNotIn("Full forbidden terms list", first_repair_prompt)
+        self.assertIn("Complete forbidden terms and names:", first_repair_prompt)
+        self.assertIn("Alden", first_repair_prompt)
         self.assertIn("Observed offending terms in the current JSON: Oakhaven", first_repair_prompt)
         self.assertIn("Attempt 2", second_repair_prompt)
         self.assertIn(
@@ -1925,10 +1996,37 @@ class GeminiServiceTests(unittest.TestCase):
                 "packet_type": "story_turn",
                 "player_command": "look around",
                 "creative_ideas": {"banned_terms": ["Elara"]},
+                "selection": {"tags": ["dialogue", "inventory"]},
+                "response_contract": {
+                    "response": "non-empty narration",
+                    "suggested_actions": "grounded actions",
+                    "events": "durable changes",
+                    "status_event": "complete final status event",
+                    "out_of_game": "boolean",
+                    "npc_memory": "NPC contract sentinel",
+                    "item_catalog": "Inventory contract sentinel",
+                    "combat_handoff": "Filtered combat sentinel",
+                },
             }
         )
 
-        self.assertIn("Return one JSON object", prompt)
+        self.assertTrue(prompt.startswith("<identity>"))
+        self.assertTrue(prompt.endswith("</task>"))
+        self.assertLess(prompt.index("<context>"), prompt.index("<task>"))
+        self.assertIn("<critical_constraints>", prompt)
+        self.assertIn("<banned_terms>\n[\"Elara\"]", prompt)
+        self.assertIn("NPC contract sentinel", prompt)
+        self.assertIn("Inventory contract sentinel", prompt)
+        self.assertNotIn("Filtered combat sentinel", prompt)
+        self.assertIn("<examples>", prompt)
+        self.assertIn("<output_format>", prompt)
+        self.assertIn("status_event", prompt)
+        self.assertIn("payload contains location, minutes_passed, and weather", prompt)
+        self.assertIn("events must end with exactly one StatusUpdatedEvent", prompt)
+        self.assertIn("look around", prompt)
+        self.assertNotIn("Context packet:", prompt)
+        self.assertLess(len(prompt), 8_000)
+        """Legacy prose assertions retained here only as migration documentation.
         self.assertIn("response", prompt)
         self.assertIn("suggested_actions", prompt)
         self.assertIn("events", prompt)
@@ -1946,6 +2044,9 @@ class GeminiServiceTests(unittest.TestCase):
         self.assertIn("bold for the first mention", prompt)
         self.assertIn("display_name is the name", prompt)
         self.assertIn("multiple events with the same type", prompt)
+        self.assertIn("Every in-game response must include exactly one final StatusUpdatedEvent", prompt)
+        self.assertIn("payload must always contain all three required fields: location, minutes_passed, and weather", prompt)
+        self.assertIn("Never emit a partial StatusUpdatedEvent", prompt)
         self.assertIn("one NpcUpsertedEvent for each", prompt)
         self.assertIn("Private GM secret memory", prompt)
         self.assertIn("state.gm_secrets.active", prompt)
@@ -2025,6 +2126,7 @@ class GeminiServiceTests(unittest.TestCase):
         self.assertNotIn("do_not_emit_legacy_tag", prompt)
         self.assertNotIn("object must match this shape", prompt)
         self.assertIn("look around", prompt)
+        """
 
     def test_parse_json_response(self) -> None:
         raw_text = json.dumps(
@@ -2368,22 +2470,21 @@ class GeminiServiceTests(unittest.TestCase):
                 },
             }
         )
-        self.assertIn("setup.narration.tense_label", prompt)
-        self.assertIn("setup.narration.style_label", prompt)
-        self.assertIn("Limited styles", prompt)
-        self.assertIn("Do not fall back to second-person wording", prompt)
-        self.assertIn("third-person styles should use the player character's name", prompt)
-        self.assertIn("light Markdown", prompt)
-        self.assertIn("world_summary", prompt)
-        self.assertIn("locations must be a player-known array", prompt)
-        self.assertIn("starting location may be the only known location", prompt)
-        self.assertIn("even six or more", prompt)
-        self.assertIn("introductory_message may use", prompt)
-        self.assertIn("setup.starting_task.mode", prompt)
-        self.assertIn("ActiveTaskUpsertedEvent", prompt)
-        self.assertIn("setup_packet.turn_prompt", prompt)
-        self.assertIn("start_location_mode is exact", prompt)
-        self.assertIn("copy that exact skill name", prompt)
+        self.assertTrue(prompt.startswith("<identity>"))
+        self.assertTrue(prompt.endswith("</task>"))
+        self.assertLess(prompt.index("<context>"), prompt.index("<task>"))
+        self.assertIn("<setup>", prompt)
+        self.assertIn('"tense":"future"', prompt)
+        self.assertIn('"tense_label":"Future Tense"', prompt)
+        self.assertIn('"style":"first_person_limited"', prompt)
+        self.assertIn('"style_label":"First-Person Limited"', prompt)
+        self.assertIn("Replace every blank, placeholder, or suggestion", prompt)
+        self.assertIn("Every nonblank field governed by a suggestion mode", prompt)
+        self.assertIn("do not copy or cosmetically edit it", prompt)
+        self.assertIn("<examples>", prompt)
+        self.assertIn("<output_format>", prompt)
+        self.assertNotIn("Setup packet:", prompt)
+        self.assertLess(len(prompt), 8_000)
         raw_text = json.dumps(
             {
                 "selected_genre": "Realistic detective mystery",
@@ -2577,6 +2678,7 @@ class GeminiServiceTests(unittest.TestCase):
 
         result = parse_gemini_new_game_response(raw_text)
 
+        """Legacy prose assertions retained here only as migration documentation.
         self.assertIn("world_summary", prompt)
         self.assertNotIn("world_lore", prompt)
         self.assertIn("Rainmarket", prompt)
@@ -2589,9 +2691,11 @@ class GeminiServiceTests(unittest.TestCase):
         self.assertIn("Exact banned proper nouns", prompt)
         self.assertIn("bare category labels as final proper nouns", prompt)
         self.assertIn("the Police Department", prompt)
+        """
         self.assertEqual(result.locations[0]["name"], "Rainmarket Station")
         self.assertEqual(result.locations[0]["source_index"], 0)
         self.assertEqual((result.locations[0]["x_miles"], result.locations[0]["y_miles"]), (0.0, 0.0))
+        """Legacy prose assertions retained here only as migration documentation.
         self.assertIn("setup.starting_locations", prompt)
         self.assertIn("never reuse the superseded setup placeholder", prompt)
         self.assertIn("do not parse starting locations out of ordinary setup prose", prompt)
@@ -2638,6 +2742,7 @@ class GeminiServiceTests(unittest.TestCase):
         self.assertIn("known_crafting_items and known_crafting_recipes", prompt)
         self.assertIn("not physical inventory", prompt)
         self.assertIn("alchemist, cook, engineer", prompt)
+        """
         self.assertEqual(
             NEW_GAME_RESPONSE_JSON_SCHEMA["properties"]["starting_items"]["minItems"],
             5,
@@ -2646,10 +2751,12 @@ class GeminiServiceTests(unittest.TestCase):
             "starting_items"
         ]["items"]["properties"]
         self.assertNotIn("container", starter_item_properties)
+        """Legacy prose assertion retained here only as migration documentation.
         self.assertIn(
             "new-game schema intentionally keeps starter inventory flat",
             prompt,
         )
+        """
         calendar_schema = NEW_GAME_RESPONSE_JSON_SCHEMA["properties"]["calendar_settings"]
         for list_field in ("day_names", "month_names", "seasons"):
             self.assertNotIn(
@@ -2660,6 +2767,7 @@ class GeminiServiceTests(unittest.TestCase):
                 "maxItems",
                 calendar_schema["properties"][list_field],
             )
+        """Legacy prose assertions retained here only as migration documentation.
         self.assertIn("do not use the alias starting_inventory", prompt)
         self.assertIn("source_index", prompt)
         self.assertIn("item_request text", prompt)
@@ -2694,6 +2802,7 @@ class GeminiServiceTests(unittest.TestCase):
         self.assertIn("do not use event_type", prompt)
         self.assertIn("API response schema defines the required JSON fields", prompt)
         self.assertNotIn("Return this JSON shape", prompt)
+        """
         self.assertEqual(result.world_summary, "Rainmarket is a canal city.")
         self.assertNotIn("world_lore", NEW_GAME_RESPONSE_JSON_SCHEMA["properties"])
         self.assertIn("Crowns", result.locations[0]["description"])

@@ -304,7 +304,7 @@ TABLE_INLINE_EDITOR_MIN_WIDTH = 132
 TABLE_INLINE_BUTTON_MIN_WIDTH = 96
 TABLE_CELL_HORIZONTAL_PADDING = 10
 TABLE_CELL_VERTICAL_PADDING = 4
-STARTER_ITEM_COLUMN_WIDTHS = (140, 132, 140, 220, 132, 100)
+STARTER_ITEM_COLUMN_WIDTHS = (140, 132, 140, 220, 132, 150, 100)
 STARTER_WEAPON_COLUMN_WIDTHS = (150, 132, 100, 96, 120, 120, 132, 132, 100)
 STARTER_ARMOR_COLUMN_WIDTHS = (150, 132, 220, 132, 132, 100)
 STARTING_NPC_COLUMN_WIDTHS = (150, 160, 260, 132, 100)
@@ -3116,6 +3116,8 @@ class NewGameTemplateManagerDialog(QDialog):
 
         new_button = QPushButton("New")
         new_button.clicked.connect(self._new_template)
+        duplicate_button = QPushButton("Duplicate")
+        duplicate_button.clicked.connect(self._duplicate_template)
         save_button = QPushButton("Update Template")
         save_button.clicked.connect(self._save_template)
         delete_button = QPushButton("Delete")
@@ -3143,6 +3145,13 @@ class NewGameTemplateManagerDialog(QDialog):
         self.world_context_input = QTextEdit()
         self.world_context_input.setPlaceholderText("World facts, factions, locations, constraints...")
 
+        self._new_game_ai_settings = normalize_ai_mode_preferences({})
+        self.ai_settings_button = QPushButton("A.I. Settings...")
+        self.ai_settings_button.clicked.connect(self._open_template_ai_settings)
+        self.ai_settings_summary_label = QLabel()
+        self.ai_settings_summary_label.setWordWrap(True)
+        self.ai_settings_summary_label.setStyleSheet("font-size: 11px;")
+
         self.character_name_input = QLineEdit()
         self.character_name_input.setPlaceholderText("Player character name")
         self.appearance_input = QTextEdit()
@@ -3153,6 +3162,8 @@ class NewGameTemplateManagerDialog(QDialog):
         self.character_notes_input.setPlaceholderText("Other player-character notes...")
 
         self.skill_inputs: list[tuple[int, QLineEdit, QLineEdit]] = []
+        self.skill_tables: dict[int, QTableWidget] = {}
+        self.skill_table_controls: dict[int, QWidget] = {}
         self._starting_location_row_id_counter = 0
         self.start_location_combo = _NoWheelComboBox()
         self.start_location_combo.addItem("Select from starting locations", "")
@@ -3183,9 +3194,9 @@ class NewGameTemplateManagerDialog(QDialog):
         )
         self.add_npc_button = QPushButton("Add NPC")
         self.add_npc_button.clicked.connect(lambda: self._append_starting_npc_row({}))
-        self.starter_items_table = _AppTableWidget(0, 6)
+        self.starter_items_table = _AppTableWidget(0, 7)
         self.starter_items_table.setHorizontalHeaderLabels(
-            ["Name", "Amount", "Category", "Description", "Value", "Remove"]
+            ["Name", "Amount", "Category", "Description", "Value", "Storage", "Remove"]
         )
         _configure_inline_table(
             self.starter_items_table,
@@ -3258,7 +3269,43 @@ class NewGameTemplateManagerDialog(QDialog):
         self.calendar_type_combo.addItem("AI-generated calendar", "ai_generated")
         self.calendar_type_combo.addItem("Keep/custom calendar", "custom")
 
-        template_buttons = _button_row(new_button, save_button, delete_button)
+        self.starting_task_mode_combo = _NoWheelComboBox()
+        self.starting_task_mode_combo.addItem("No starting quest", "none")
+        self.starting_task_mode_combo.addItem("Let the A.I. create one", "ai")
+        self.starting_task_mode_combo.addItem("Use a custom starting quest", "custom")
+        self.starting_task_mode_combo.currentIndexChanged.connect(
+            lambda _index: self._sync_template_starting_task_controls()
+        )
+        self.starting_task_name_input = QLineEdit()
+        self.starting_task_description_input = QTextEdit()
+        self.starting_task_requester_input = QLineEdit()
+        self.starting_task_location_input = QLineEdit()
+        self.starting_task_reward_input = QLineEdit()
+        self.starting_task_due_date_input = QLineEdit()
+        self.starting_task_custom_group = QGroupBox("Custom Quest Draft")
+        task_form = QFormLayout()
+        task_form.addRow("Name:", self.starting_task_name_input)
+        task_form.addRow("Description:", self.starting_task_description_input)
+        task_form.addRow("Requester:", self.starting_task_requester_input)
+        task_form.addRow("Location:", self.starting_task_location_input)
+        task_form.addRow("Reward:", self.starting_task_reward_input)
+        task_form.addRow("Due:", self.starting_task_due_date_input)
+        self.starting_task_custom_group.setLayout(task_form)
+
+        self.music_enabled_checkbox = QCheckBox("Music enabled")
+        self.music_volume_slider = QSlider(Qt.Orientation.Horizontal)
+        self.music_volume_slider.setRange(0, 100)
+        self.music_volume_label = QLabel()
+        self.music_volume_slider.valueChanged.connect(
+            lambda value: self.music_volume_label.setText(f"{value}%")
+        )
+        self.template_tts_settings_widget = TTSSettingsWidget(
+            audio_settings={},
+            voice_options=available_narrator_voices(),
+            custom_voice_storage_path=None,
+        )
+
+        template_buttons = _button_row(new_button, duplicate_button, save_button, delete_button)
         left_layout = QVBoxLayout()
         left_layout.addWidget(QLabel("Templates"))
         left_layout.addWidget(self.template_list)
@@ -3271,9 +3318,11 @@ class NewGameTemplateManagerDialog(QDialog):
         tabs.addTab(_scrollable_widget(self._build_overview_tab()), "Overview")
         tabs.addTab(_scrollable_widget(self._build_character_tab()), "Character")
         tabs.addTab(_scrollable_widget(self._build_skills_tab()), "Skills")
+        tabs.addTab(_scrollable_widget(self._build_starting_task_tab()), "Starting Quest")
         tabs.addTab(_scrollable_widget(self._build_locations_tab()), "Locations")
         tabs.addTab(_scrollable_widget(self._build_npcs_tab()), "NPCs")
-        tabs.addTab(_scrollable_widget(self._build_world_tab()), "Details")
+        tabs.addTab(_scrollable_widget(self._build_world_tab()), "Inventory & World")
+        tabs.addTab(_scrollable_widget(self._build_audio_tab()), "Audio")
 
         close_button = QPushButton("Close")
         close_button.clicked.connect(self.accept)
@@ -3306,6 +3355,8 @@ class NewGameTemplateManagerDialog(QDialog):
         form.addRow("Narration Tense:", self.narration_tense_combo)
         form.addRow("Narration Style:", self.narration_style_combo)
         form.addRow("Game Style:", self.game_style_input)
+        form.addRow("Artificial Intelligence:", self.ai_settings_button)
+        form.addRow("", self.ai_settings_summary_label)
 
         tab = QWidget()
         tab.setLayout(form)
@@ -3327,26 +3378,56 @@ class NewGameTemplateManagerDialog(QDialog):
     def _build_skills_tab(self) -> QWidget:
         """Builds the starting skills template tab."""
 
-        layout = QGridLayout()
-        layout.addWidget(QLabel("Level"), 0, 0)
-        layout.addWidget(QLabel("Skill"), 0, 1)
-        layout.addWidget(QLabel("Description"), 0, 2)
-        layout.setColumnStretch(1, 1)
-        layout.setColumnStretch(2, 2)
-
-        for row, level in enumerate(SKILL_LEVEL_PLAN, start=1):
-            skill_input = QLineEdit()
-            skill_input.setPlaceholderText("Skill name")
-            description_input = QLineEdit()
-            description_input.setPlaceholderText("What this skill covers")
-            self.skill_inputs.append((level, skill_input, description_input))
-            layout.addWidget(QLabel(str(level)), row, 0)
-            layout.addWidget(skill_input, row, 1)
-            layout.addWidget(description_input, row, 2)
-
-        layout.setRowStretch(len(SKILL_LEVEL_PLAN) + 1, 1)
+        layout = QVBoxLayout()
+        self.skill_preset_combo = _NoWheelComboBox()
+        for label, key in (("Professional Adventurer", "professional"), ("Experienced Adventurer", "experienced"), ("Average Adventurer", "average"), ("Beginner Adventurer", "beginner"), ("Blank Slate / Hardcore Mode", "blank"), ("Custom", "custom")):
+            self.skill_preset_combo.addItem(label, key)
+        layout.addWidget(QLabel("Starting Skill Profile"))
+        layout.addWidget(self.skill_preset_combo)
+        for level in range(5, 0, -1):
+            group = QGroupBox(f"Level {level}")
+            group_layout = QVBoxLayout()
+            table = _AppTableWidget(0, 3)
+            table.setHorizontalHeaderLabels(["Remove", "Skill", "Description for AI"])
+            table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+            table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+            table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+            self.skill_tables[level] = table
+            add_button = QPushButton("Add Skill")
+            add_button.clicked.connect(lambda _checked=False, skill_level=level: self._add_template_skill_row(skill_level))
+            remove_button = QPushButton("Remove Selected Skills")
+            remove_button.clicked.connect(lambda _checked=False, skill_level=level: self._remove_template_skill_rows(skill_level))
+            controls = _button_row(add_button, remove_button)
+            self.skill_table_controls[level] = controls
+            group_layout.addWidget(table)
+            group_layout.addWidget(controls)
+            group.setLayout(group_layout)
+            layout.addWidget(group)
+        self.skill_preset_combo.currentIndexChanged.connect(self._apply_template_skill_preset)
+        self._apply_template_skill_preset()
+        layout.addStretch()
         tab = QWidget()
         tab.setLayout(layout)
+        return tab
+
+    def _build_starting_task_tab(self) -> QWidget:
+        layout = QVBoxLayout()
+        form = QFormLayout()
+        form.addRow("Starting Quest:", self.starting_task_mode_combo)
+        layout.addLayout(form)
+        layout.addWidget(self.starting_task_custom_group)
+        layout.addStretch()
+        tab = QWidget()
+        tab.setLayout(layout)
+        return tab
+
+    def _build_audio_tab(self) -> QWidget:
+        form = QFormLayout()
+        form.addRow("Background Music:", self.music_enabled_checkbox)
+        form.addRow("Music Volume:", _slider_row(self.music_volume_slider, self.music_volume_label))
+        form.addRow("Narration / TTS:", self.template_tts_settings_widget)
+        tab = QWidget()
+        tab.setLayout(form)
         return tab
 
     def _build_locations_tab(self) -> QWidget:
@@ -3444,6 +3525,53 @@ class NewGameTemplateManagerDialog(QDialog):
         self.template_list.clearSelection()
         self._load_setup_into_editor("New Template", {})
 
+    def _duplicate_template(self) -> None:
+        """Creates and selects a copy of the current template."""
+        source_name = self.active_template_name or self.template_name_input.text().strip()
+        if not source_name:
+            return
+        setup = self._build_setup_from_editor()
+        existing = {template.name.casefold() for template in self.templates}
+        candidate = f"{source_name} Copy"
+        suffix = 2
+        while candidate.casefold() in existing:
+            candidate = f"{source_name} Copy {suffix}"
+            suffix += 1
+        if not save_new_game_template(self.template_path, setup, template_name=candidate, normalize_setup=False):
+            QMessageBox.warning(self, "Template Not Duplicated", "Could not duplicate the template.")
+            return
+        self.active_template_name = candidate
+        self.active_setup = setup
+        self._refresh_templates(selected_name=candidate)
+
+    def _open_template_ai_settings(self) -> None:
+        dialog = AISettingsDialog(
+            self,
+            settings={
+                **self._new_game_ai_settings,
+                "narration_tense": self.narration_tense_combo.currentData(),
+                "narration_style": self.narration_style_combo.currentData(),
+            },
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        settings = dialog.build_ai_settings()
+        self._new_game_ai_settings = {
+            key: value for key, value in settings.items()
+            if key not in {"narration_tense", "narration_style"}
+        }
+        _set_combo_to_data(self.narration_tense_combo, settings["narration_tense"])
+        _set_combo_to_data(self.narration_style_combo, settings["narration_style"])
+        self._refresh_template_ai_settings_summary()
+
+    def _refresh_template_ai_settings_summary(self) -> None:
+        modes = normalize_ai_mode_preferences(self._new_game_ai_settings)
+        self.ai_settings_summary_label.setText(
+            f"{modes['model_intelligence'].title()} model, "
+            f"{modes['model_tone'].title()} tone, "
+            f"{modes['response_length'].title()} responses"
+        )
+
     def _load_selected_template(self, row: int) -> None:
         """Loads the selected stored template into the editor."""
 
@@ -3496,15 +3624,13 @@ class NewGameTemplateManagerDialog(QDialog):
 
         skills = self._skills_for_editor(setup.get("skills", []))
 
-        for index, (_level, skill_input, description_input) in enumerate(self.skill_inputs):
-            skill = skills[index] if index < len(skills) else {}
-            skill_input.setText(str(skill.get("name", "") or ""))
-            description_input.setText(str(skill.get("description", "") or ""))
+        preset_index = self.skill_preset_combo.findData(setup.get("skill_preset", "professional"))
+        self.skill_preset_combo.setCurrentIndex(max(0, preset_index))
+        self._load_template_skills(skills)
 
         self.starter_items_table.setRowCount(0)
         self.starter_weapons_table.setRowCount(0)
         self.starter_armor_table.setRowCount(0)
-
         for item in self._starter_items_for_editor(setup.get("starter_items", [])):
             kind = _starter_item_kind(item)
 
@@ -3536,6 +3662,16 @@ class NewGameTemplateManagerDialog(QDialog):
             self.calendar_type_combo,
             self._template_calendar_type(setup.get("calendar", {})),
         )
+        self._load_template_starting_task(setup.get("starting_task", setup.get("starting_quest", {})))
+        audio = setup.get("audio", {}) if isinstance(setup.get("audio"), dict) else {}
+        self.music_enabled_checkbox.setChecked(bool(audio.get("music_enabled", True)))
+        self.music_volume_slider.setValue(_safe_int(audio.get("music_volume"), 25))
+        self.music_volume_label.setText(f"{self.music_volume_slider.value()}%")
+        self.template_tts_settings_widget.load_audio_settings(audio)
+        ai_settings = setup.get("ai_settings", {}) if isinstance(setup.get("ai_settings"), dict) else {}
+        self._new_game_ai_settings = normalize_ai_mode_preferences(ai_settings)
+        self._new_game_ai_settings["additional_context"] = str(ai_settings.get("additional_context", "") or "")
+        self._refresh_template_ai_settings_summary()
 
     def _save_template(self) -> None:
         """Saves the current editor contents as a reusable template."""
@@ -3626,14 +3762,11 @@ class NewGameTemplateManagerDialog(QDialog):
             "notes": self.character_notes_input.toPlainText().strip(),
         }
         setup["skills"] = [
-            {
-                "name": skill_input.text().strip(),
-                "description": description_input.text().strip(),
-                "level": level,
-            }
-            for level, skill_input, description_input in self.skill_inputs
-            if skill_input.text().strip() or description_input.text().strip()
+            skill for level in range(5, 0, -1)
+            for skill in self._template_skills_from_table(level)
         ]
+        setup["skill_preset"] = str(self.skill_preset_combo.currentData() or "professional")
+        setup["skill_level_plan"] = [level for level, _name, _description in self.skill_inputs]
         setup["starter_items"] = self._starter_items_from_table()
         setup["currency_denominations"] = self._currency_denominations_from_table()
         setup["economy_examples"] = self._economy_examples_from_table()
@@ -3654,7 +3787,108 @@ class NewGameTemplateManagerDialog(QDialog):
             )
             setup["calendar"] = {**existing_calendar, "calendar_type": "custom"}
 
+        setup["starting_task"] = self._template_starting_task_from_controls()
+        setup["audio"] = {
+            "music_enabled": self.music_enabled_checkbox.isChecked(),
+            "music_volume": self.music_volume_slider.value(),
+            **self.template_tts_settings_widget.build_audio_settings(),
+        }
+        setup["ai_settings"] = dict(self._new_game_ai_settings)
+
         return setup
+
+    def _add_template_skill_row(self, level: int, name: str = "", description: str = "") -> None:
+        table = self.skill_tables[level]
+        row = table.rowCount()
+        table.insertRow(row)
+        _set_checked_row_checkbox(table, row, 0, "Check this skill, then click Remove Selected Skills.")
+        table.setCellWidget(row, 1, QLineEdit(name))
+        table.setCellWidget(row, 2, QLineEdit(description))
+        self._sync_template_skill_inputs()
+
+    def _remove_template_skill_rows(self, level: int) -> None:
+        table = self.skill_tables[level]
+        for row in reversed(table.checked_rows(0)):
+            table.removeRow(row)
+        self._sync_template_skill_inputs()
+
+    def _sync_template_skill_inputs(self) -> None:
+        self.skill_inputs = []
+        for level in range(5, 0, -1):
+            table = self.skill_tables[level]
+            for row in range(table.rowCount()):
+                name = table.cellWidget(row, 1)
+                description = table.cellWidget(row, 2)
+                if isinstance(name, QLineEdit) and isinstance(description, QLineEdit):
+                    self.skill_inputs.append((level, name, description))
+
+    def _apply_template_skill_preset(self, _index: int = -1) -> None:
+        preset = str(self.skill_preset_combo.currentData() or "professional")
+        plan = SKILL_PRESET_LEVEL_PLANS.get(preset, [])
+        custom = preset == "custom"
+        for level, table in self.skill_tables.items():
+            table.setRowCount(0)
+            count = plan.count(level)
+            for _unused in range(count):
+                self._add_template_skill_row(level)
+            table.parentWidget().setVisible(custom or count > 0)
+            self.skill_table_controls[level].setVisible(custom)
+        self._sync_template_skill_inputs()
+
+    def _load_template_skills(self, skills: list[dict[str, Any]]) -> None:
+        for table in self.skill_tables.values():
+            table.setRowCount(0)
+        for skill in skills:
+            level = _safe_int(skill.get("level"), 1)
+            self._add_template_skill_row(
+                min(5, max(1, level)),
+                str(skill.get("name", "") or ""),
+                str(skill.get("description", "") or ""),
+            )
+        self._sync_template_skill_inputs()
+
+    def _template_skills_from_table(self, level: int) -> list[dict[str, Any]]:
+        table = self.skill_tables[level]
+        skills = []
+        for row in range(table.rowCount()):
+            name = table.cellWidget(row, 1)
+            description = table.cellWidget(row, 2)
+            if isinstance(name, QLineEdit) and isinstance(description, QLineEdit):
+                if name.text().strip() or description.text().strip():
+                    skills.append({"name": name.text().strip(), "description": description.text().strip(), "level": level})
+        return skills
+
+    def _sync_template_starting_task_controls(self) -> None:
+        self.starting_task_custom_group.setVisible(
+            self.starting_task_mode_combo.currentData() == "custom"
+        )
+
+    def _template_starting_task_from_controls(self) -> dict[str, Any]:
+        mode = str(self.starting_task_mode_combo.currentData() or "none")
+        task = {"mode": mode}
+        if mode == "custom":
+            task["task"] = {
+                "name": self.starting_task_name_input.text().strip(),
+                "description": self.starting_task_description_input.toPlainText().strip(),
+                "requester": self.starting_task_requester_input.text().strip(),
+                "location": self.starting_task_location_input.text().strip(),
+                "reward": self.starting_task_reward_input.text().strip(),
+                "due_date": self.starting_task_due_date_input.text().strip(),
+            }
+        return task
+
+    def _load_template_starting_task(self, starting_task: Any) -> None:
+        task_setup = starting_task if isinstance(starting_task, dict) else {}
+        mode = str(task_setup.get("mode", "none") or "none")
+        _set_combo_to_data(self.starting_task_mode_combo, mode)
+        task = task_setup.get("task", {}) if isinstance(task_setup.get("task"), dict) else {}
+        self.starting_task_name_input.setText(str(task.get("name", "") or ""))
+        self.starting_task_description_input.setPlainText(str(task.get("description", "") or ""))
+        self.starting_task_requester_input.setText(str(task.get("requester", "") or ""))
+        self.starting_task_location_input.setText(str(task.get("location", "") or ""))
+        self.starting_task_reward_input.setText(str(task.get("reward", "") or ""))
+        self.starting_task_due_date_input.setText(str(task.get("due_date", "") or ""))
+        self._sync_template_starting_task_controls()
 
     def _append_starting_location_row(self, location: dict[str, Any]) -> None:
         """Adds one starting location row to the template editor."""
@@ -4502,11 +4736,22 @@ class NewGameWizard(QWizard):
         self.starter_items_table.setRowCount(0)
         self.starter_weapons_table.setRowCount(0)
         self.starter_armor_table.setRowCount(0)
+        self.starter_item_suggestions_table.setRowCount(0)
+        self.starter_weapon_suggestions_table.setRowCount(0)
+        self.starter_armor_suggestions_table.setRowCount(0)
 
         for item in clean_setup["starter_items"]:
             kind = _starter_item_kind(item)
 
-            if kind == "Weapon":
+            if item.get("requires_ai_invention") and item.get("item_request"):
+                suggestion_table = {
+                    "Weapon": self.starter_weapon_suggestions_table,
+                    "Armor": self.starter_armor_suggestions_table,
+                }.get(kind, self.starter_item_suggestions_table)
+                _append_starter_suggestion_table_row(
+                    suggestion_table, kind, str(item.get("item_request", ""))
+                )
+            elif kind == "Weapon":
                 self._append_starter_weapon_row(item)
             elif kind == "Armor":
                 self._append_starter_armor_row(item)
@@ -5250,9 +5495,9 @@ class NewGameWizard(QWizard):
         page.setTitle("Inventory and Currency")
         page.setSubTitle("Add requested starter items and describe the world's money.")
 
-        self.starter_items_table = _AppTableWidget(0, 6)
+        self.starter_items_table = _AppTableWidget(0, 7)
         self.starter_items_table.setHorizontalHeaderLabels(
-            ["Name", "Amount", "Category", "Description", "Value", "Remove"]
+            ["Name", "Amount", "Category", "Description", "Value", "Storage", "Remove"]
         )
         self.starter_items_table.setMinimumHeight(170)
         self.starter_items_table.verticalHeader().setVisible(False)
@@ -5266,6 +5511,17 @@ class NewGameWizard(QWizard):
         add_item_button = QPushButton("Add Item")
         add_item_button.clicked.connect(lambda: self._append_starter_item_row({}))
         remove_item_button = _bulk_remove_button(self.starter_items_table, label="Remove Selected Items")
+
+        self.starter_item_suggestions_table = _build_starter_suggestion_table("Item")
+        add_item_suggestion_button = QPushButton("Add Item Suggestion")
+        add_item_suggestion_button.clicked.connect(
+            lambda: _append_starter_suggestion_table_row(
+                self.starter_item_suggestions_table, "Item"
+            )
+        )
+        remove_item_suggestion_button = _bulk_remove_button(
+            self.starter_item_suggestions_table, label="Remove Selected Suggestions"
+        )
 
         self.starter_weapons_table = _AppTableWidget(0, 9)
         self.starter_weapons_table.setHorizontalHeaderLabels(
@@ -5291,6 +5547,17 @@ class NewGameWizard(QWizard):
         add_weapon_button.clicked.connect(lambda: self._append_starter_weapon_row({}))
         remove_weapon_button = _bulk_remove_button(self.starter_weapons_table, label="Remove Selected Weapons")
 
+        self.starter_weapon_suggestions_table = _build_starter_suggestion_table("Weapon")
+        add_weapon_suggestion_button = QPushButton("Add Weapon Suggestion")
+        add_weapon_suggestion_button.clicked.connect(
+            lambda: _append_starter_suggestion_table_row(
+                self.starter_weapon_suggestions_table, "Weapon"
+            )
+        )
+        remove_weapon_suggestion_button = _bulk_remove_button(
+            self.starter_weapon_suggestions_table, label="Remove Selected Suggestions"
+        )
+
         self.starter_armor_table = _AppTableWidget(0, 6)
         self.starter_armor_table.setHorizontalHeaderLabels(
             ["Name", "Amount", "Covers", "Armor Bonus", "Value", "Remove"]
@@ -5304,6 +5571,17 @@ class NewGameWizard(QWizard):
         add_armor_button = QPushButton("Add Armor")
         add_armor_button.clicked.connect(lambda: self._append_starter_armor_row({}))
         remove_armor_button = _bulk_remove_button(self.starter_armor_table, label="Remove Selected Armor")
+
+        self.starter_armor_suggestions_table = _build_starter_suggestion_table("Armor")
+        add_armor_suggestion_button = QPushButton("Add Armor Suggestion")
+        add_armor_suggestion_button.clicked.connect(
+            lambda: _append_starter_suggestion_table_row(
+                self.starter_armor_suggestions_table, "Armor"
+            )
+        )
+        remove_armor_suggestion_button = _bulk_remove_button(
+            self.starter_armor_suggestions_table, label="Remove Selected Suggestions"
+        )
 
         self.currency_table = _AppTableWidget(0, 4)
         self.currency_table.setHorizontalHeaderLabels(["Name", "Plural Name", "Base Value", "Remove"])
@@ -5345,10 +5623,16 @@ class NewGameWizard(QWizard):
         layout = QFormLayout()
         layout.addRow("Starter Items:", self.starter_items_table)
         layout.addRow("", _button_row(add_item_button, remove_item_button))
+        layout.addRow("Item Suggestions:", self.starter_item_suggestions_table)
+        layout.addRow("", _button_row(add_item_suggestion_button, remove_item_suggestion_button))
         layout.addRow("Starter Weapons:", self.starter_weapons_table)
         layout.addRow("", _button_row(add_weapon_button, remove_weapon_button))
+        layout.addRow("Weapon Suggestions:", self.starter_weapon_suggestions_table)
+        layout.addRow("", _button_row(add_weapon_suggestion_button, remove_weapon_suggestion_button))
         layout.addRow("Starter Armor:", self.starter_armor_table)
         layout.addRow("", _button_row(add_armor_button, remove_armor_button))
+        layout.addRow("Armor Suggestions:", self.starter_armor_suggestions_table)
+        layout.addRow("", _button_row(add_armor_suggestion_button, remove_armor_suggestion_button))
         layout.addRow("Currencies:", self.currency_table)
         layout.addRow("", _button_row(add_currency_button, remove_currency_button))
         layout.addRow("Economy Notes:", self.economy_examples_table)
@@ -5506,6 +5790,9 @@ class NewGameWizard(QWizard):
             *_starter_items_from_table(self.starter_items_table),
             *_starter_weapons_from_table(self.starter_weapons_table),
             *_starter_armor_from_table(self.starter_armor_table),
+            *_starter_suggestions_from_table(self.starter_item_suggestions_table, "Item"),
+            *_starter_suggestions_from_table(self.starter_weapon_suggestions_table, "Weapon"),
+            *_starter_suggestions_from_table(self.starter_armor_suggestions_table, "Armor"),
         ]
 
     def _append_starter_weapon_row(self, item: dict[str, Any]) -> None:
@@ -9004,6 +9291,7 @@ class InventoryScreen(RepositoryBackedWidget):
         self.item_quantity_input.setValue(1)
         self.item_quantity_unit_input = QLineEdit("each")
         self.item_storage_location_combo = QComboBox()
+        self.item_storage_location_combo.setEditable(True)
         self.item_storage_location_combo.addItem("Actively Carried", "actively_carried")
         self.item_storage_location_combo.addItem("Home", "home")
         self.item_value_input = QSpinBox()
@@ -9200,7 +9488,11 @@ class InventoryScreen(RepositoryBackedWidget):
         _set_combo_to_data(self.item_type_combo, item_type)
         self.item_quantity_input.setValue(max(1, int(selected_item.get("quantity", 1))))
         self.item_quantity_unit_input.setText(str(selected_item.get("quantity_unit", "each")))
-        _set_combo_to_data(self.item_storage_location_combo, str(selected_item.get("storage_location", "actively_carried")))
+        storage_value = str(selected_item.get("storage_location", "actively_carried") or "actively_carried").strip()
+        if storage_value.casefold() in {"home", "actively_carried"}:
+            _set_combo_to_data(self.item_storage_location_combo, storage_value)
+        else:
+            self.item_storage_location_combo.setEditText(storage_value)
         self.item_value_input.setValue(max(0, int(selected_item.get("value_base_units", 0))))
         self.item_description_input.setText(str(selected_item.get("description", "")))
         _set_combo_to_data(
@@ -9295,7 +9587,10 @@ class InventoryScreen(RepositoryBackedWidget):
             )
 
         metadata["quantity_unit"] = self.item_quantity_unit_input.text().strip() or "each"
-        metadata["storage_location"] = self.item_storage_location_combo.currentData() or "actively_carried"
+        metadata["storage_location"] = (
+            self.item_storage_location_combo.currentText().strip()[:120]
+            or "actively_carried"
+        )
 
         if self._selected_item_name:
             repository.modify_inventory_item(
@@ -12111,7 +12406,12 @@ def _starting_npcs_from_table(table: QTableWidget) -> list[dict[str, Any]]:
                 "location": location,
                 "description": description,
                 "description_mode": description_mode,
-                "requires_ai_invention": not name or not location or not description,
+                "requires_ai_invention": (
+                    description_mode == "suggestion"
+                    or not name
+                    or not location
+                    or not description
+                ),
             }
         )
 
@@ -12204,6 +12504,67 @@ def _bulk_remove_button(
     return button
 
 
+def _build_starter_suggestion_table(kind: str) -> _AppTableWidget:
+    """Builds the compact single-column table used for AI item concepts."""
+
+    table = _AppTableWidget(0, 2)
+    table.setHorizontalHeaderLabels(["Suggestion", "Remove"])
+    # Give the table a real viewport.  With the old 70px minimum, the header
+    # consumed nearly all available space and the suggestion editor was
+    # effectively unreadable.  The maximum keeps the wizard compact while
+    # allowing the table's own vertical scrollbar to handle longer lists.
+    _configure_inline_table(table, [520, 90], minimum_height=190)
+    table.setMaximumHeight(240)
+    table.setToolTip(
+        f"Enter a {kind.lower()} concept such as 'Iron Sword'. Gemini will create "
+        "the item's description, value, and other details."
+    )
+    return table
+
+
+def _append_starter_suggestion_table_row(
+    table: QTableWidget,
+    kind: str,
+    suggestion: str = "",
+) -> None:
+    """Adds one natural-language starter-item suggestion row."""
+
+    row = table.rowCount()
+    table.insertRow(row)
+    table.setRowHeight(row, 36)
+    suggestion_input = _table_line_edit(suggestion)
+    suggestion_input.setPlaceholderText(f"e.g. {'Iron Sword' if kind == 'Weapon' else 'Leather Satchel'}")
+    table.setCellWidget(row, 0, suggestion_input)
+    _set_checked_row_checkbox(table, row, 1, f"Select this {kind.lower()} suggestion for removal.")
+
+
+def _starter_suggestions_from_table(
+    table: QTableWidget,
+    kind: str,
+) -> list[dict[str, Any]]:
+    """Reads natural-language starter-item suggestions from a compact table."""
+
+    suggestions: list[dict[str, Any]] = []
+    for row in range(table.rowCount()):
+        widget = table.cellWidget(row, 0)
+        suggestion = widget.text().strip() if isinstance(widget, QLineEdit) else ""
+        if not suggestion:
+            continue
+        item: dict[str, Any] = {
+            "name": "",
+            "category": kind,
+            "quantity": 1,
+            "description": "",
+            "value_base_units": 0,
+            "item_request": suggestion,
+            "requires_ai_invention": True,
+        }
+        if kind in {"Weapon", "Armor"}:
+            item["item_type"] = kind
+        suggestions.append(item)
+    return suggestions
+
+
 def _append_starter_item_table_row(
     table: QTableWidget,
     item: dict[str, Any],
@@ -12224,13 +12585,23 @@ def _append_starter_item_table_row(
     value_input = _table_spin_box(0, 1_000_000_000)
     value_input.setValue(_safe_int(item.get("value_base_units", 0), 0))
 
+    storage_input = QComboBox()
+    storage_input.setEditable(True)
+    storage_input.addItem("Actively Carried", "actively_carried")
+    storage_input.addItem("Home", "home")
+    storage_value = str(item.get("storage_location", "actively_carried") or "actively_carried").strip()
+    if storage_value.casefold() in {"home", "actively_carried"}:
+        _set_combo_to_data(storage_input, storage_value)
+    else:
+        storage_input.setEditText(storage_value)
 
     table.setCellWidget(row, 0, name_input)
     table.setCellWidget(row, 1, quantity_input)
     table.setCellWidget(row, 2, category_input)
     table.setCellWidget(row, 3, description_input)
     table.setCellWidget(row, 4, value_input)
-    _set_checked_row_checkbox(table, row, 5, "Select this item for removal.")
+    table.setCellWidget(row, 5, storage_input)
+    _set_checked_row_checkbox(table, row, 6, "Select this item for removal.")
     _set_table_column_widths(table, STARTER_ITEM_COLUMN_WIDTHS)
 
 
@@ -12245,6 +12616,7 @@ def _starter_items_from_table(table: QTableWidget) -> list[dict[str, Any]]:
         category_widget = table.cellWidget(row, 2)
         description_widget = table.cellWidget(row, 3)
         value_widget = table.cellWidget(row, 4)
+        storage_widget = table.cellWidget(row, 5)
         name = name_widget.text().strip() if isinstance(name_widget, QLineEdit) else ""
 
         if not name:
@@ -12266,6 +12638,11 @@ def _starter_items_from_table(table: QTableWidget) -> list[dict[str, Any]]:
                     else ""
                 ),
                 "value_base_units": value_widget.value() if isinstance(value_widget, QSpinBox) else 0,
+                "storage_location": (
+                    str(storage_widget.currentData() or "actively_carried")
+                    if isinstance(storage_widget, QComboBox)
+                    else "actively_carried"
+                ),
                 "item_request": "",
                 "requires_ai_invention": False,
             }
@@ -13178,6 +13555,21 @@ def _starter_items_for_save(
         setup_items = []
 
     completed_items = [item for item in ai_items if isinstance(item, dict)]
+    for item in completed_items:
+        source_index = _optional_int(item.get("source_index"))
+        if source_index is None or not (0 <= source_index < len(setup_items)):
+            continue
+        setup_item = setup_items[source_index]
+        if not isinstance(setup_item, dict) or bool(setup_item.get("requires_ai_invention")):
+            continue
+        item["storage_location"] = (
+            " ".join(
+                str(setup_item.get("storage_location", "actively_carried") or "actively_carried")
+                .strip()
+                .split()
+            )[:120]
+            or "actively_carried"
+        )
     original_completed_count = len(completed_items)
     used_source_indexes = {
         source_index
@@ -13275,6 +13667,14 @@ def _fallback_starter_item_from_setup(
         or item_request
         or "Player-requested starter item awaiting AI detail.",
         "value_base_units": max(0, _safe_int(raw_item.get("value_base_units"), 0)),
+            "storage_location": (
+                " ".join(
+                    str(raw_item.get("storage_location", "actively_carried") or "actively_carried")
+                    .strip()
+                    .split()
+                )[:120]
+                or "actively_carried"
+            ),
         "source_index": source_index,
         **{
             field_name: raw_item[field_name]
