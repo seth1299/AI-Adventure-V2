@@ -469,6 +469,19 @@ class NewGameSetupTests(unittest.TestCase):
             self.assertTrue(first_repository.db_path.exists())
             self.assertTrue(second_repository.db_path.exists())
 
+    def test_list_saves_does_not_update_database_timestamps(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            saves_dir = Path(temp_dir)
+            repository = SaveRepository.create_new_save(saves_dir, "Timestamp Test")
+            db_path = repository.db_path
+            before = db_path.stat().st_mtime_ns
+
+            saves = SaveRepository.list_saves(saves_dir)
+
+            self.assertEqual(len(saves), 1)
+            self.assertEqual(saves[0].title, "Timestamp Test")
+            self.assertEqual(db_path.stat().st_mtime_ns, before)
+
     def test_save_repository_renames_and_deletes_existing_save(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             saves_dir = Path(temp_dir)

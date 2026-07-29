@@ -66,6 +66,11 @@ from ai_adventure.alchemy.ingredients import (
     normalize_recipe_ingredient,
     normalize_recipe_ingredients,
 )
+from ai_adventure.app.api_key_store import (
+    read_api_key,
+    record_terms_acceptance,
+    write_api_key,
+)
 from ai_adventure.app.app_paths import AppPaths
 from ai_adventure.app.features import (
     is_ai_enabled,
@@ -396,7 +401,7 @@ class _DeselectSelectedRowFilter(QObject):
                 index.row(), index.parent()
             ):
                 self.table.clearSelection()
-                self.table.setCurrentItem(None)
+                self.table.setCurrentCell(-1, -1)
                 return True
         return super().eventFilter(watched, event)
 
@@ -612,9 +617,14 @@ class _GeminiStoryWorker(QObject):
     failed = Signal()
     finished = Signal()
 
-    def __init__(self, context_packet: dict[str, Any]) -> None:
+    def __init__(
+        self,
+        context_packet: dict[str, Any],
+        api_key_path: Path | None = None,
+    ) -> None:
         super().__init__()
         self._context_packet = context_packet
+        self._api_key_path = api_key_path
 
     @Slot()
     def run(self) -> None:
@@ -624,7 +634,7 @@ class _GeminiStoryWorker(QObject):
             if GeminiNarrationService is None:
                 raise GeminiConfigurationError("AI generation is disabled in this build.")
 
-            result = GeminiNarrationService().generate_story_response(
+            result = GeminiNarrationService(api_key_path=self._api_key_path).generate_story_response(
                 self._context_packet
             )
         except GeminiConfigurationError as error:
@@ -650,9 +660,14 @@ class _GeminiSkillCheckPlanWorker(QObject):
     failed = Signal()
     finished = Signal()
 
-    def __init__(self, context_packet: dict[str, Any]) -> None:
+    def __init__(
+        self,
+        context_packet: dict[str, Any],
+        api_key_path: Path | None = None,
+    ) -> None:
         super().__init__()
         self._context_packet = context_packet
+        self._api_key_path = api_key_path
 
     @Slot()
     def run(self) -> None:
@@ -662,7 +677,7 @@ class _GeminiSkillCheckPlanWorker(QObject):
             if GeminiNarrationService is None:
                 raise GeminiConfigurationError("AI generation is disabled in this build.")
 
-            result = GeminiNarrationService().plan_story_skill_checks(
+            result = GeminiNarrationService(api_key_path=self._api_key_path).plan_story_skill_checks(
                 self._context_packet
             )
         except GeminiConfigurationError as error:
@@ -771,6 +786,7 @@ class MainWindow(QMainWindow):
             on_app_tts_settings_saved=self._persist_app_tts_settings,
             global_tts_settings_provider=lambda: self.app_settings["audio"],
             custom_voice_storage_path=self.app_paths.app_settings_path,
+            gemini_api_key_path=self.app_paths.gemini_api_key_path,
             playtesting_tools=self.playtesting_build,
             ai_enabled=self.ai_enabled,
         )
@@ -818,6 +834,8 @@ class MainWindow(QMainWindow):
             on_sample_voice=self._play_narrator_sample,
             on_tts_settings_saved=self._persist_app_tts_settings,
             custom_voice_storage_path=self.app_paths.app_settings_path,
+            api_key_path=self.app_paths.gemini_api_key_path,
+            terms_acceptance_path=self.app_paths.gemini_terms_acceptance_path,
         )
 
         while True:
@@ -1116,7 +1134,9 @@ class MainWindow(QMainWindow):
             return
 
         try:
-            result = GeminiNarrationService().generate_new_game_world(
+            result = GeminiNarrationService(
+                api_key_path=self.app_paths.gemini_api_key_path,
+            ).generate_new_game_world(
                 build_new_game_setup_packet(
                     setup,
                     valid_music_tracks=(
@@ -3162,7 +3182,7 @@ class NewGameTemplateManagerDialog(QDialog):
         self.character_notes_input.setPlaceholderText("Other player-character notes...")
 
         self.skill_inputs: list[tuple[int, QLineEdit, QLineEdit]] = []
-        self.skill_tables: dict[int, QTableWidget] = {}
+        self.skill_tables: dict[int, _AppTableWidget] = {}
         self.skill_table_controls: dict[int, QWidget] = {}
         self._starting_location_row_id_counter = 0
         self.start_location_combo = _NoWheelComboBox()
@@ -3191,6 +3211,10 @@ class NewGameTemplateManagerDialog(QDialog):
             self.starting_npcs_table,
             STARTING_NPC_COLUMN_WIDTHS,
             minimum_height=240,
+        )
+        self.no_starting_npcs_checkbox = QCheckBox("No starting NPCs")
+        self.no_starting_npcs_checkbox.toggled.connect(
+            self._handle_template_no_starting_npcs_toggled
         )
         self.add_npc_button = QPushButton("Add NPC")
         self.add_npc_button.clicked.connect(lambda: self._append_starting_npc_row({}))
@@ -3242,6 +3266,27 @@ class NewGameTemplateManagerDialog(QDialog):
         self.add_starter_armor_button = QPushButton("Add Armor")
         self.add_starter_armor_button.clicked.connect(
             lambda: self._append_starter_armor_row({})
+        )
+        self.starter_item_suggestions_table = _build_starter_suggestion_table("Item")
+        self.starter_weapon_suggestions_table = _build_starter_suggestion_table("Weapon")
+        self.starter_armor_suggestions_table = _build_starter_suggestion_table("Armor")
+        self.add_item_suggestion_button = QPushButton("Add Item Suggestion")
+        self.add_item_suggestion_button.clicked.connect(
+            lambda: _append_starter_suggestion_table_row(
+                self.starter_item_suggestions_table, "Item"
+            )
+        )
+        self.add_weapon_suggestion_button = QPushButton("Add Weapon Suggestion")
+        self.add_weapon_suggestion_button.clicked.connect(
+            lambda: _append_starter_suggestion_table_row(
+                self.starter_weapon_suggestions_table, "Weapon"
+            )
+        )
+        self.add_armor_suggestion_button = QPushButton("Add Armor Suggestion")
+        self.add_armor_suggestion_button.clicked.connect(
+            lambda: _append_starter_suggestion_table_row(
+                self.starter_armor_suggestions_table, "Armor"
+            )
         )
         self.currency_table = _AppTableWidget(0, 4)
         self.currency_table.setHorizontalHeaderLabels(["Name", "Plural Name", "Base Value", "Remove"])
@@ -3458,6 +3503,7 @@ class NewGameTemplateManagerDialog(QDialog):
         """Builds the template starting NPCs tab."""
 
         layout = QVBoxLayout()
+        layout.addWidget(self.no_starting_npcs_checkbox)
         layout.addWidget(self.starting_npcs_table)
         layout.addWidget(
             _button_row(
@@ -3471,6 +3517,20 @@ class NewGameTemplateManagerDialog(QDialog):
         tab.setLayout(layout)
         return tab
 
+    def _handle_template_no_starting_npcs_toggled(self, checked: bool) -> None:
+        """Clears and disables template NPC rows when none are requested."""
+
+        if checked:
+            self.starting_npcs_table.setRowCount(0)
+        self._sync_template_no_starting_npcs_controls()
+
+    def _sync_template_no_starting_npcs_controls(self) -> None:
+        """Keeps template NPC editing aligned with the no-NPC option."""
+
+        allow_npcs = not self.no_starting_npcs_checkbox.isChecked()
+        self.starting_npcs_table.setEnabled(allow_npcs)
+        self.add_npc_button.setEnabled(allow_npcs)
+
     def _build_world_tab(self) -> QWidget:
         """Builds the world, items, economy, and calendar template tab."""
 
@@ -3478,10 +3538,25 @@ class NewGameTemplateManagerDialog(QDialog):
         form.addRow("World Details:", self.world_context_input)
         form.addRow("Starter Items:", self.starter_items_table)
         form.addRow("", _button_row(self.add_starter_item_button, _bulk_remove_button(self.starter_items_table, label="Remove Selected Items")))
+        form.addRow("Item Suggestions:", self.starter_item_suggestions_table)
+        form.addRow("", _button_row(
+            self.add_item_suggestion_button,
+            _bulk_remove_button(self.starter_item_suggestions_table, label="Remove Selected Suggestions"),
+        ))
         form.addRow("Starter Weapons:", self.starter_weapons_table)
         form.addRow("", _button_row(self.add_starter_weapon_button, _bulk_remove_button(self.starter_weapons_table, label="Remove Selected Weapons")))
+        form.addRow("Weapon Suggestions:", self.starter_weapon_suggestions_table)
+        form.addRow("", _button_row(
+            self.add_weapon_suggestion_button,
+            _bulk_remove_button(self.starter_weapon_suggestions_table, label="Remove Selected Suggestions"),
+        ))
         form.addRow("Starter Armor:", self.starter_armor_table)
         form.addRow("", _button_row(self.add_starter_armor_button, _bulk_remove_button(self.starter_armor_table, label="Remove Selected Armor")))
+        form.addRow("Armor Suggestions:", self.starter_armor_suggestions_table)
+        form.addRow("", _button_row(
+            self.add_armor_suggestion_button,
+            _bulk_remove_button(self.starter_armor_suggestions_table, label="Remove Selected Suggestions"),
+        ))
         form.addRow("Currencies:", self.currency_table)
         form.addRow("", _button_row(self.add_currency_button, _bulk_remove_button(self.currency_table, label="Remove Selected Currencies", preserve_first_row=True, after_remove=lambda: _sync_currency_base_value_row(self.currency_table))))
         form.addRow("Economy Notes:", self.economy_examples_table)
@@ -3609,6 +3684,7 @@ class NewGameTemplateManagerDialog(QDialog):
         ):
             self._append_starting_location_row(location)
 
+        self._refresh_starting_location_dropdowns()
         self._select_starting_location_combo_by_name(
             str(setup.get("start_location", "") or "")
         )
@@ -3616,6 +3692,14 @@ class NewGameTemplateManagerDialog(QDialog):
 
         for npc in self._starting_npcs_for_editor(setup.get("starting_npcs", [])):
             self._append_starting_npc_row(npc)
+
+        self.no_starting_npcs_checkbox.blockSignals(True)
+        self.no_starting_npcs_checkbox.setChecked(
+            bool(setup.get("no_starting_npcs", False))
+            and self.starting_npcs_table.rowCount() == 0
+        )
+        self.no_starting_npcs_checkbox.blockSignals(False)
+        self._sync_template_no_starting_npcs_controls()
 
         self.character_name_input.setText(str(character.get("name", "") or ""))
         self.appearance_input.setPlainText(str(character.get("appearance", "") or ""))
@@ -3631,10 +3715,21 @@ class NewGameTemplateManagerDialog(QDialog):
         self.starter_items_table.setRowCount(0)
         self.starter_weapons_table.setRowCount(0)
         self.starter_armor_table.setRowCount(0)
+        self.starter_item_suggestions_table.setRowCount(0)
+        self.starter_weapon_suggestions_table.setRowCount(0)
+        self.starter_armor_suggestions_table.setRowCount(0)
         for item in self._starter_items_for_editor(setup.get("starter_items", [])):
             kind = _starter_item_kind(item)
 
-            if kind == "Weapon":
+            if item.get("requires_ai_invention") and item.get("item_request"):
+                suggestion_table = {
+                    "Weapon": self.starter_weapon_suggestions_table,
+                    "Armor": self.starter_armor_suggestions_table,
+                }.get(kind, self.starter_item_suggestions_table)
+                _append_starter_suggestion_table_row(
+                    suggestion_table, kind, str(item.get("item_request", ""))
+                )
+            elif kind == "Weapon":
                 self._append_starter_weapon_row(item)
             elif kind == "Armor":
                 self._append_starter_armor_row(item)
@@ -3741,6 +3836,7 @@ class NewGameTemplateManagerDialog(QDialog):
         selected_start_location = self._selected_starting_location_for_setup()
         setup["starting_locations"] = self._starting_locations_from_table()
         setup["starting_npcs"] = self._starting_npcs_from_table()
+        setup["no_starting_npcs"] = self.no_starting_npcs_checkbox.isChecked()
         setup["start_location"] = (
             selected_start_location.get("name") or self.start_location_input.text().strip()
         )
@@ -3767,7 +3863,18 @@ class NewGameTemplateManagerDialog(QDialog):
         ]
         setup["skill_preset"] = str(self.skill_preset_combo.currentData() or "professional")
         setup["skill_level_plan"] = [level for level, _name, _description in self.skill_inputs]
-        setup["starter_items"] = self._starter_items_from_table()
+        setup["starter_items"] = [
+            *self._starter_items_from_table(),
+            *_starter_suggestions_from_table(
+                self.starter_item_suggestions_table, "Item"
+            ),
+            *_starter_suggestions_from_table(
+                self.starter_weapon_suggestions_table, "Weapon"
+            ),
+            *_starter_suggestions_from_table(
+                self.starter_armor_suggestions_table, "Armor"
+            ),
+        ]
         setup["currency_denominations"] = self._currency_denominations_from_table()
         setup["economy_examples"] = self._economy_examples_from_table()
         setup["currency_description"] = (
@@ -3831,7 +3938,9 @@ class NewGameTemplateManagerDialog(QDialog):
             count = plan.count(level)
             for _unused in range(count):
                 self._add_template_skill_row(level)
-            table.parentWidget().setVisible(custom or count > 0)
+            parent_widget = table.parentWidget()
+            if parent_widget is not None:
+                parent_widget.setVisible(custom or count > 0)
             self.skill_table_controls[level].setVisible(custom)
         self._sync_template_skill_inputs()
 
@@ -3865,7 +3974,7 @@ class NewGameTemplateManagerDialog(QDialog):
 
     def _template_starting_task_from_controls(self) -> dict[str, Any]:
         mode = str(self.starting_task_mode_combo.currentData() or "none")
-        task = {"mode": mode}
+        task: dict[str, Any] = {"mode": mode}
         if mode == "custom":
             task["task"] = {
                 "name": self.starting_task_name_input.text().strip(),
@@ -4231,6 +4340,196 @@ class NewGameTemplateManagerDialog(QDialog):
         return "gregorian"
 
 
+class _GeminiApiKeyWizardPage(QWizardPage):
+    """Collects consent and the local Google Gemini API key."""
+
+    def __init__(
+        self,
+        api_key_path: Path,
+        terms_acceptance_path: Path,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+
+        self.api_key_path = api_key_path.expanduser().resolve()
+        self.terms_acceptance_path = terms_acceptance_path.expanduser().resolve()
+        self.setTitle("Google Gemini API Key")
+        self.setSubTitle(
+            "Enter the key this device will use for Gemini-powered adventures."
+        )
+
+        self.api_key_input = QLineEdit()
+        self.api_key_input.setEchoMode(QLineEdit.EchoMode.Password)
+        self.api_key_input.setPlaceholderText("Paste your Google Gemini API Key")
+        self.api_key_input.setText(read_api_key(self.api_key_path))
+        self.api_key_input.setToolTip(
+            "The key is kept locally and is never included in save files or templates."
+        )
+
+        self.terms_text = QTextEdit()
+        self.terms_text.setReadOnly(True)
+        self.terms_text.setMinimumHeight(250)
+        self.terms_text.setMaximumHeight(360)
+        self.terms_text.setPlainText(self._terms_text())
+
+        self.help_link = QLabel(
+            '<a href="api-key-help">What is a Google Gemini API Key?</a>'
+        )
+        self.help_link.setTextFormat(Qt.TextFormat.RichText)
+        self.help_link.setTextInteractionFlags(
+            Qt.TextInteractionFlag.LinksAccessibleByMouse
+            | Qt.TextInteractionFlag.LinksAccessibleByKeyboard
+        )
+        self.help_link.setOpenExternalLinks(False)
+        self.help_link.setStyleSheet("color: #2563eb; font-size: 12px;")
+        self.help_link.linkActivated.connect(self._show_api_key_help)
+
+        self.terms_checkbox = QCheckBox(
+            "I have read and agree to the Terms of Use."
+        )
+        self.security_checkbox = QCheckBox(
+            "I understand that providing and storing my Google Gemini API Key, "
+            "even locally on my own device, is insecure."
+        )
+
+        self.api_key_input.textChanged.connect(self.completeChanged)
+        self.terms_checkbox.toggled.connect(self.completeChanged)
+        self.security_checkbox.toggled.connect(self.completeChanged)
+
+        layout = QVBoxLayout()
+        layout.addWidget(QLabel("Google Gemini API Key:"))
+        layout.addWidget(self.api_key_input)
+        layout.addSpacing(8)
+        layout.addWidget(QLabel("Terms of Use and Arbitration Notice:"))
+        layout.addWidget(self.terms_text)
+        layout.addWidget(self.help_link, alignment=Qt.AlignmentFlag.AlignLeft)
+        layout.addWidget(self.terms_checkbox)
+        layout.addWidget(self.security_checkbox)
+        self.setLayout(layout)
+
+    def isComplete(self) -> bool:
+        """Requires a key and both acknowledgements before advancing."""
+
+        return bool(self.api_key_input.text().strip()) and all(
+            checkbox.isChecked()
+            for checkbox in (self.terms_checkbox, self.security_checkbox)
+        )
+
+    def validatePage(self) -> bool:
+        """Stores the key locally when the user advances past this page."""
+
+        if not self.api_key_input.text().strip():
+            QMessageBox.warning(
+                self,
+                "Missing Google Gemini API Key",
+                "Enter a Google Gemini API key before continuing.",
+            )
+            return False
+
+        if not self.terms_checkbox.isChecked() or not self.security_checkbox.isChecked():
+            QMessageBox.warning(
+                self,
+                "Acknowledgements Required",
+                "Read and accept both acknowledgements before continuing.",
+            )
+            return False
+
+        try:
+            write_api_key(self.api_key_path, self.api_key_input.text())
+            record_terms_acceptance(
+                self.terms_acceptance_path,
+                self.terms_text.toPlainText(),
+            )
+        except (OSError, ValueError) as error:
+            LOGGER.exception("Failed to store the local Gemini API key.")
+            QMessageBox.critical(
+                self,
+                "Could Not Store API Key",
+                f"The API key could not be stored locally:\n{error}",
+            )
+            return False
+
+        return True
+
+    def _terms_text(self) -> str:
+        """Returns the visible local-storage terms and arbitration notice."""
+
+        return (
+            "AI Adventure Local API-Key Terms of Use and Arbitration Notice\n\n"
+            "1. Local storage. By entering a Google Gemini API Key, you authorize "
+            "AI Adventure to use it to authenticate requests to Google's Gemini "
+            "service. AI Adventure will store the key only in the following local "
+            "file on this device:\n\n"
+            f"{self.api_key_path}\n\n"
+            "On Windows, the key is encrypted at rest with Windows Data Protection "
+            "API (DPAPI), tied to the current Windows user. AI Adventure does not "
+            "hard-code or store a separate decryption key. The key is decrypted only "
+            "in memory when a Gemini request needs it.\n\n"
+            "The key is not written to save files, new-game templates, logs, story "
+            "history, prompts, or any AI Adventure cloud service. AI Adventure has "
+            "no remote key-storage service and will never upload this key for storage "
+            "in a cloud, database, synchronization service, or other remote location.\n\n"
+            "After both acknowledgements are accepted, AI Adventure also writes a "
+            "small local receipt containing the UTC timestamp, terms version, and a "
+            "fingerprint of this text. The receipt never contains the API key and is "
+            "not uploaded or included in saves.\n\n"
+            "2. Requests to Google. The original key must be available locally because "
+            "it is sent through the Google Gemini SDK as the credential for a request. "
+            "A one-way hash or Caesar/substitution cipher is not used: a hash cannot "
+            "authenticate with Gemini, and a simple substitution would only disguise "
+            "the key rather than protect it. Google "
+            "may process the credential under Google's own terms and policies; this "
+            "notice describes AI Adventure's storage behavior, not Google's systems.\n\n"
+            "3. Security. Anyone or any software with access to this device or the "
+            "local file may be able to read or misuse the key. You are responsible for "
+            "protecting this device, revoking exposed keys, and following Google's "
+            "key-management guidance. Do not share the key in screenshots, messages, "
+            "save files, or bug reports.\n\n"
+            "4. Arbitration. To the maximum extent permitted by applicable law, any "
+            "dispute between you and the publisher of AI Adventure concerning this "
+            "local API-key handling notice will be resolved individually through "
+            "binding arbitration rather than a class action or class-wide proceeding. "
+            "This clause does not change Google's separate terms, does not authorize "
+            "remote storage, and does not limit rights that cannot legally be waived. "
+            "This product notice is not a substitute for jurisdiction-specific legal "
+            "review."
+        )
+
+    def _show_api_key_help(self, _link: str) -> None:
+        """Shows plain-language instructions for obtaining a Gemini API key."""
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("What is a Google Gemini API Key?")
+        dialog.resize(600, 440)
+
+        explanation = QTextEdit()
+        explanation.setReadOnly(True)
+        explanation.setPlainText(
+            "An API key is a secret-looking string that identifies your Google "
+            "project when an application asks Google Gemini to do work. It is similar "
+            "to a password for a program: keep it private, use only keys you created, "
+            "and revoke it if you think it was exposed.\n\n"
+            "To get one, sign in to Google AI Studio, open the API-key area, choose "
+            "Create API key, and select or create a Google Cloud project when Google "
+            "asks you to do so. Copy the key once it is shown.\n\n"
+            "In AI Adventure, paste that key into the field on the previous page. The "
+            "wizard will save it only to the local path shown in the Terms of Use. "
+            "You do not need to edit a .env file. If the key is ever exposed, revoke "
+            "it in Google AI Studio and create a replacement.\n\n"
+            "Google's screens and account requirements can change, so follow the "
+            "current instructions shown by Google when creating or managing your key."
+        )
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        buttons.rejected.connect(dialog.reject)
+
+        layout = QVBoxLayout()
+        layout.addWidget(explanation)
+        layout.addWidget(buttons)
+        dialog.setLayout(layout)
+        dialog.exec()
+
+
 class NewGameWizard(QWizard):
     """Multi-step new-game setup flow."""
 
@@ -4245,6 +4544,8 @@ class NewGameWizard(QWizard):
         on_sample_voice: SampleVoiceCallback | None = None,
         on_tts_settings_saved: Callable[[dict[str, Any]], None] | None = None,
         custom_voice_storage_path: Path | str | None = None,
+        api_key_path: Path | str | None = None,
+        terms_acceptance_path: Path | str | None = None,
     ) -> None:
         super().__init__(parent)
 
@@ -4253,6 +4554,16 @@ class NewGameWizard(QWizard):
         self.on_sample_voice = on_sample_voice
         self.on_tts_settings_saved = on_tts_settings_saved
         self.custom_voice_storage_path = custom_voice_storage_path
+        self.api_key_path = (
+            Path(api_key_path).expanduser().resolve()
+            if api_key_path is not None
+            else AppPaths.create().gemini_api_key_path
+        )
+        self.terms_acceptance_path = (
+            Path(terms_acceptance_path).expanduser().resolve()
+            if terms_acceptance_path is not None
+            else self.api_key_path.parent / "gemini_api_key_terms_acceptance.json"
+        )
         self.audio_defaults = normalize_app_settings(
             {"audio": audio_defaults or {}},
             tts_enabled=self.tts_enabled,
@@ -4282,6 +4593,7 @@ class NewGameWizard(QWizard):
         self._apply_theme()
 
         self._build_adventure_page()
+        self._build_api_key_page()
         self._build_starting_locations_page()
         self._build_starting_task_page()
         self._build_starting_npcs_page()
@@ -4687,6 +4999,7 @@ class NewGameWizard(QWizard):
         for location in clean_setup["starting_locations"]:
             self._append_starting_location_row(location)
 
+        self._refresh_starting_location_dropdowns()
         self._select_starting_location_combo_by_name(clean_setup["start_location"])
         self._load_starting_task(clean_setup["starting_task"])
         no_starting_npcs = bool(clean_setup.get("no_starting_npcs", False))
@@ -4925,6 +5238,16 @@ class NewGameWizard(QWizard):
         page.setLayout(layout)
 
         self.addPage(page)
+
+    def _build_api_key_page(self) -> None:
+        """Builds the local Gemini API-key and consent page."""
+
+        self.api_key_page = _GeminiApiKeyWizardPage(
+            self.api_key_path,
+            self.terms_acceptance_path,
+            self,
+        )
+        self.addPage(self.api_key_page)
 
     def _build_starting_locations_page(self) -> None:
         """Builds the requested starting Travel locations page."""
@@ -5365,7 +5688,7 @@ class NewGameWizard(QWizard):
         page.setSubTitle("Choose a starting experience profile, then name and describe its skills.")
 
         self.skill_inputs: list[tuple[int, QLineEdit, QLineEdit]] = []
-        self.skill_tables: dict[int, QTableWidget] = {}
+        self.skill_tables: dict[int, _AppTableWidget] = {}
         self.skill_table_controls: dict[int, QWidget] = {}
         content = QWidget()
         layout = QVBoxLayout()
@@ -5484,7 +5807,9 @@ class NewGameWizard(QWizard):
             count = plan.count(level)
             for _unused in range(count):
                 self._add_starting_skill_row(level)
-            table.parentWidget().setVisible(is_custom or count > 0)
+            parent_widget = table.parentWidget()
+            if parent_widget is not None:
+                parent_widget.setVisible(is_custom or count > 0)
             self.skill_table_controls[level].setVisible(is_custom)
         self._sync_starting_skill_inputs()
 
@@ -5953,6 +6278,7 @@ class GameShell(QWidget):
         on_app_tts_settings_saved: Callable[[dict[str, Any]], None] | None = None,
         global_tts_settings_provider: Callable[[], dict[str, Any]] | None = None,
         custom_voice_storage_path: Path | str | None = None,
+        gemini_api_key_path: Path | str | None = None,
         playtesting_tools: bool = False,
         ai_enabled: bool = True,
     ) -> None:
@@ -5971,6 +6297,11 @@ class GameShell(QWidget):
         self.on_app_tts_settings_saved = on_app_tts_settings_saved
         self.global_tts_settings_provider = global_tts_settings_provider
         self.custom_voice_storage_path = custom_voice_storage_path
+        self.gemini_api_key_path = (
+            Path(gemini_api_key_path).expanduser().resolve()
+            if gemini_api_key_path is not None
+            else None
+        )
         self.playtesting_tools = bool(playtesting_tools)
         self.ai_enabled = bool(ai_enabled)
         self.repository: SaveRepository | None = None
@@ -5991,6 +6322,7 @@ class GameShell(QWidget):
         self.story_screen = StoryScreen(
             sound_manager=self.sound_manager,
             narration_player=self.narration_player,
+            api_key_path=self.gemini_api_key_path,
         )
         self.character_screen = CharacterScreen(
             playtesting_tools=self.playtesting_tools,
@@ -6183,11 +6515,17 @@ class StoryScreen(RepositoryBackedWidget):
         *,
         sound_manager: SoundManagerProtocol | None = None,
         narration_player: NarrationPlayerProtocol | None = None,
+        api_key_path: Path | str | None = None,
     ) -> None:
         super().__init__()
 
         self.sound_manager = sound_manager
         self.narration_player = narration_player
+        self.api_key_path = (
+            Path(api_key_path).expanduser().resolve()
+            if api_key_path is not None
+            else None
+        )
         self._revealing_story_id: int | None = None
         self._revealed_story_chunks: list[str] = []
         self._story_reveal_generation = 0
@@ -6455,7 +6793,7 @@ class StoryScreen(RepositoryBackedWidget):
         """Starts one background pre-narration skill-check planning request."""
 
         thread = QThread(self)
-        worker = _GeminiSkillCheckPlanWorker(context_packet)
+        worker = _GeminiSkillCheckPlanWorker(context_packet, self.api_key_path)
         worker.moveToThread(thread)
 
         thread.started.connect(worker.run)
@@ -6535,7 +6873,7 @@ class StoryScreen(RepositoryBackedWidget):
         """Starts one background Gemini story request."""
 
         thread = QThread(self)
-        worker = _GeminiStoryWorker(context_packet)
+        worker = _GeminiStoryWorker(context_packet, self.api_key_path)
         worker.moveToThread(thread)
 
         thread.started.connect(worker.run)
@@ -12317,6 +12655,13 @@ def _sync_starting_location_parent_dropdowns(
         if not isinstance(parent_widget, QComboBox):
             continue
 
+        previous_parent_text = parent_widget.currentText().strip()
+        pending_parent = str(
+            parent_widget.property("pending_parent_location") or ""
+        ).strip()
+        if not pending_parent and parent_widget.currentData() in (None, ""):
+            pending_parent = previous_parent_text
+
         parent_widget.blockSignals(True)
         parent_widget.clear()
         parent_widget.addItem("Select containing location", "")
@@ -12326,16 +12671,12 @@ def _sync_starting_location_parent_dropdowns(
                 continue
             parent_widget.addItem(name, option_id)
 
-        if str(parent_selected or "") in valid_ids:
-            _set_combo_to_data(parent_widget, str(parent_selected))
-        else:
-            pending_parent = str(
-                parent_widget.property("pending_parent_location") or ""
-            ).strip()
-
-            if pending_parent:
-                _set_combo_to_text(parent_widget, pending_parent)
+        if pending_parent:
+            _set_combo_to_text(parent_widget, pending_parent)
+            if parent_widget.currentData() not in (None, ""):
                 parent_widget.setProperty("pending_parent_location", "")
+        elif str(parent_selected or "") in valid_ids:
+            _set_combo_to_data(parent_widget, str(parent_selected))
 
         parent_widget.blockSignals(False)
         parent_widget.setVisible(is_sublocation)
@@ -12469,13 +12810,13 @@ def _remove_checked_table_rows(
         return table.remove_checked_rows(preserve_first_row=preserve_first_row)
 
     checkbox_column = table.columnCount() - 1
-    rows = [
-        row
-        for row in range(table.rowCount())
-        if (not preserve_first_row or row != 0)
-        and table.item(row, checkbox_column) is not None
-        and table.item(row, checkbox_column).checkState() == Qt.CheckState.Checked
-    ]
+    rows: list[int] = []
+    for row in range(table.rowCount()):
+        if preserve_first_row and row == 0:
+            continue
+        item = table.item(row, checkbox_column)
+        if item is not None and item.checkState() == Qt.CheckState.Checked:
+            rows.append(row)
     for row in reversed(rows):
         table.removeRow(row)
     return rows
@@ -12513,7 +12854,7 @@ def _build_starter_suggestion_table(kind: str) -> _AppTableWidget:
     # consumed nearly all available space and the suggestion editor was
     # effectively unreadable.  The maximum keeps the wizard compact while
     # allowing the table's own vertical scrollbar to handle longer lists.
-    _configure_inline_table(table, [520, 90], minimum_height=190)
+    _configure_inline_table(table, (520, 90), minimum_height=190)
     table.setMaximumHeight(240)
     table.setToolTip(
         f"Enter a {kind.lower()} concept such as 'Iron Sword'. Gemini will create "
@@ -13935,7 +14276,7 @@ def _player_command_markdown(command: str) -> str:
     first_line, *remaining_lines = lines
     formatted_lines = [f"**You:** {first_line}"]
     formatted_lines.extend(remaining_lines)
-    return "\n".join(formatted_lines)
+    return "\n\n".join(formatted_lines)
 
 
 def _safe_int(value, default: int) -> int:

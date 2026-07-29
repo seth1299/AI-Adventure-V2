@@ -324,9 +324,8 @@ class SaveRepository:
 
         for db_path in saves_dir.glob(f"*/{cls.DATABASE_NAME}"):
             try:
-                repository = cls(db_path)
-                title = repository.get_meta("title", default=db_path.parent.name)
                 modified = datetime.fromtimestamp(db_path.stat().st_mtime)
+                title = cls._read_save_title(db_path, default=db_path.parent.name)
                 summaries.append(
                     SaveSummary(
                         title=title,
@@ -339,6 +338,24 @@ class SaveRepository:
 
         summaries.sort(key=lambda summary: summary.last_modified, reverse=True)
         return summaries
+
+    @staticmethod
+    def _read_save_title(db_path: Path, *, default: str) -> str:
+        """Reads a save title without initializing or modifying the database."""
+
+        read_only_uri = f"{db_path.resolve().as_uri()}?mode=ro"
+        connection = sqlite3.connect(read_only_uri, uri=True)
+        try:
+            row = connection.execute(
+                "SELECT value FROM meta WHERE key = ?",
+                ("title",),
+            ).fetchone()
+        finally:
+            connection.close()
+
+        if row is None or not str(row[0]).strip():
+            return default
+        return str(row[0])
 
     @classmethod
     def save_title_exists(cls, saves_dir: Path, title: str) -> bool:

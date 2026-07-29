@@ -17,6 +17,8 @@ from ai_adventure.alchemy.ingredients import (
     is_crafting_ingredient_category,
     normalize_recipe_ingredients,
 )
+from ai_adventure.app.api_key_store import read_api_key
+from ai_adventure.app.app_paths import AppPaths
 from ai_adventure.item_categories import normalize_inventory_category
 from ai_adventure.ai.modes import (
     ALL_CONTENT_HARM_CATEGORIES,
@@ -1187,6 +1189,7 @@ NEW_GAME_RESPONSE_JSON_SCHEMA: dict[str, Any] = {
     "required": [
         "selected_genre",
         "world_summary",
+        "locations",
         "gm_secrets",
         "start_location",
         "starting_calendar",
@@ -1276,13 +1279,19 @@ class GeminiRequestError(RuntimeError):
 class GeminiNarrationService:
     """Calls Gemini with structured story context packets."""
 
-    def __init__(self, settings: GeminiSettings | None = None) -> None:
+    def __init__(
+        self,
+        settings: GeminiSettings | None = None,
+        *,
+        api_key_path: Path | None = None,
+    ) -> None:
         """
         Args:
-            settings: Gemini runtime settings. Defaults to environment settings.
+            settings: Gemini runtime settings. Defaults to the local app-data key.
+            api_key_path: Optional local key path used when settings are omitted.
         """
 
-        self.settings = settings or load_gemini_settings()
+        self.settings = settings or load_gemini_settings(api_key_path=api_key_path)
 
     def generate_story_response(
         self,
@@ -1300,7 +1309,7 @@ class GeminiNarrationService:
 
         if not self.settings.is_configured:
             raise GeminiConfigurationError(
-                "GEMINI_API_KEY is not configured. Add it to .env or the environment."
+                "A Google Gemini API key is not configured. Enter one in the New Game Wizard."
             )
 
         try:
@@ -1382,7 +1391,7 @@ class GeminiNarrationService:
 
         if not self.settings.is_configured:
             raise GeminiConfigurationError(
-                "GEMINI_API_KEY is not configured. Add it to .env or the environment."
+                "A Google Gemini API key is not configured. Enter one in the New Game Wizard."
             )
 
         try:
@@ -1450,7 +1459,7 @@ class GeminiNarrationService:
 
         if not self.settings.is_configured:
             raise GeminiConfigurationError(
-                "GEMINI_API_KEY is not configured. Add it to .env or the environment."
+                "A Google Gemini API key is not configured. Enter one in the New Game Wizard."
             )
 
         try:
@@ -1492,8 +1501,15 @@ class GeminiNarrationService:
             ai_preferences=ai_preferences,
             apply_response_length=True,
             response_length_scope="new_game",
-            additional_forbidden_terms=_suggested_setup_terms(setup_packet),
-            setup_packet=setup_packet,
+            additional_forbidden_terms=_banned_terms_from_context(setup_packet),
+            setup_packet=None,
+        )
+        raw_text = _repair_gemini_suggested_setup_fields(
+            client,
+            self.settings.model,
+            raw_text,
+            setup_packet,
+            ai_preferences=ai_preferences,
         )
         LOGGER.info("Gemini raw new-game response:\n%s", raw_text)
 
@@ -1512,18 +1528,24 @@ class GeminiNarrationService:
         return parse_gemini_new_game_response(raw_text, setup_packet=setup_packet)
 
 
-def load_gemini_settings(env_path: Path | None = None) -> GeminiSettings:
+def load_gemini_settings(
+    *,
+    api_key_path: Path | None = None,
+    model_env_path: Path | None = None,
+) -> GeminiSettings:
+    """Loads the Gemini key from local app data and the model from settings.
+
+    The API key is never read from an environment variable or a ``.env`` file.
+    ``model_env_path`` remains an optional compatibility seam for installations
+    that keep a non-secret model override in a local configuration file.
     """
-    Loads Gemini settings from .env and environment variables.
 
-    Args:
-        env_path: Optional explicit .env path.
-
-    Returns:
-        Gemini settings.
-    """
-
-    env_values = _read_env_file(env_path or Path(".env"))
+    env_values = _read_env_file(model_env_path) if model_env_path is not None else {}
+    key_path = (
+        Path(api_key_path).expanduser().resolve()
+        if api_key_path is not None
+        else AppPaths.create().gemini_api_key_path
+    )
 
     model = (
         os.getenv("GEMINI_MODEL")
@@ -1539,11 +1561,7 @@ def load_gemini_settings(env_path: Path | None = None) -> GeminiSettings:
         )
 
     return GeminiSettings(
-        api_key=(
-            os.getenv("GEMINI_API_KEY")
-            or env_values.get("GEMINI_API_KEY")
-            or ""
-        ).strip(),
+        api_key=read_api_key(key_path),
         model=model,
     )
 
@@ -2754,6 +2772,78 @@ def _repair_gemini_creative_terms(
     )
 
 
+def _repair_gemini_suggested_setup_fields(
+    client: Any,
+    model: str,
+    raw_text: str,
+    setup_packet: dict[str, Any],
+    *,
+    ai_preferences: dict[str, Any] | None = None,
+) -> str:
+    """Repairs reused wizard suggestions without treating them as global bans."""
+
+    candidate_text = raw_text
+    paths = _unfinalized_suggested_setup_paths(candidate_text, setup_packet)
+
+    for attempt in range(1, CREATIVE_TERM_REPAIR_ATTEMPTS + 1):
+        if not paths:
+            return candidate_text
+
+        LOGGER.warning(
+            "Gemini new-game response reused suggestion field(s): %s. "
+            "Requesting targeted repair attempt %s/%s.",
+            ", ".join(paths),
+            attempt,
+            CREATIVE_TERM_REPAIR_ATTEMPTS,
+        )
+        repair_prompt = (
+            f"Repair AI Adventure new-game response JSON. Attempt {attempt}.\n\n"
+            "The JSON below reused or omitted one or more player-provided values "
+            "that were marked as suggestions. Replace only the affected fields with "
+            "materially different finalized values. Do not copy, lightly edit, or "
+            "repeat the original suggestion. Preserve all other values, keys, array "
+            "entries, facts, and structure exactly. Return only the repaired JSON "
+            "object.\n\n"
+            f"Affected JSON paths: {', '.join(paths)}\n"
+            "The affected paths are validation targets, not terms to quote or repeat.\n\n"
+            "JSON to repair:\n"
+            f"{candidate_text}"
+        )
+
+        try:
+            response = _generate_content_with_retry(
+                client,
+                model=CREATIVE_TERM_REPAIR_MODEL,
+                contents=repair_prompt,
+                config=_creative_term_repair_config(
+                    ai_preferences=ai_preferences,
+                ),
+                request_label=f"new-game suggestion repair attempt {attempt}",
+            )
+        except GeminiRequestError as error:
+            LOGGER.warning(
+                "Gemini new-game suggestion repair attempt %s/%s failed: %s",
+                attempt,
+                CREATIVE_TERM_REPAIR_ATTEMPTS,
+                error,
+            )
+            break
+
+        repaired_text = str(getattr(response, "text", "") or "").strip()
+        if repaired_text:
+            candidate_text = repaired_text
+            paths = _unfinalized_suggested_setup_paths(candidate_text, setup_packet)
+
+    if paths:
+        LOGGER.warning(
+            "Gemini new-game response still reused suggestion field(s) after %s "
+            "targeted repair attempts: %s.",
+            CREATIVE_TERM_REPAIR_ATTEMPTS,
+            ", ".join(paths),
+        )
+    return candidate_text
+
+
 def _combined_creative_terms(
     additional_terms: tuple[str, ...] | list[str] | None,
 ) -> tuple[str, ...]:
@@ -2940,6 +3030,127 @@ def _unfinalized_suggested_setup_terms(
                 unresolved.append(requested_description)
 
     return unresolved
+
+
+def _unfinalized_suggested_setup_paths(
+    raw_text: str,
+    setup_packet: dict[str, Any] | None,
+) -> list[str]:
+    """Returns JSON paths for omitted or substantially reused wizard suggestions."""
+
+    if not setup_packet:
+        return []
+
+    try:
+        data = json.loads(_strip_json_fence(raw_text.strip()))
+    except (json.JSONDecodeError, AttributeError):
+        return ["response JSON"]
+
+    if not isinstance(data, dict):
+        return ["response JSON"]
+
+    setup = setup_packet.get("setup", {})
+    if not isinstance(setup, dict):
+        return []
+
+    paths: list[str] = []
+    if str(setup.get("start_location_mode", "suggestion")).casefold() != "exact":
+        requested_start = str(setup.get("start_location", "") or "").strip()
+        finalized_start = str(data.get("start_location", "") or "").strip()
+        if requested_start and (
+            not finalized_start
+            or _suggestion_text_is_unchanged(requested_start, finalized_start)
+        ):
+            paths.append("start_location")
+
+    raw_locations = setup.get("starting_locations", [])
+    returned_locations = data.get("locations")
+    if not isinstance(raw_locations, list) or not isinstance(returned_locations, list):
+        if isinstance(raw_locations, list) and raw_locations:
+            paths.append("locations")
+    else:
+        for source_index, requested in enumerate(raw_locations):
+            if not isinstance(requested, dict):
+                continue
+            if str(requested.get("location_mode", "suggestion")).casefold() == "exact":
+                continue
+
+            match = next(
+                (
+                    location
+                    for location in returned_locations
+                    if isinstance(location, dict)
+                    and _coerce_int(location.get("source_index"), default=-1)
+                    == source_index
+                ),
+                None,
+            )
+            if match is None:
+                paths.append(f"locations[source_index={source_index}]")
+                continue
+
+            requested_name = str(requested.get("name", "") or "").strip()
+            finalized_name = str(match.get("name", "") or "").strip()
+            if requested_name and (
+                not finalized_name
+                or _suggestion_text_is_unchanged(requested_name, finalized_name)
+            ):
+                paths.append(f"locations[source_index={source_index}].name")
+
+            requested_description = str(requested.get("description", "") or "").strip()
+            finalized_description = str(match.get("description", "") or "").strip()
+            if requested_description and (
+                not finalized_description
+                or _suggestion_text_is_unchanged(
+                    requested_description,
+                    finalized_description,
+                )
+            ):
+                paths.append(f"locations[source_index={source_index}].description")
+
+    raw_npcs = setup.get("starting_npcs", [])
+    returned_events = data.get("events", [])
+    npc_payloads = [
+        event.get("payload", {})
+        for event in returned_events
+        if isinstance(event, dict)
+        and event.get("type") == "NpcUpsertedEvent"
+        and isinstance(event.get("payload"), dict)
+    ] if isinstance(returned_events, list) else []
+    if isinstance(raw_npcs, list):
+        for source_index, requested in enumerate(raw_npcs):
+            if not isinstance(requested, dict):
+                continue
+            if str(requested.get("description_mode", "suggestion")).casefold() == "exact":
+                continue
+            requested_description = str(requested.get("description", "") or "").strip()
+            if not requested_description:
+                continue
+            requested_name = str(requested.get("name", "") or "").strip()
+            match = next(
+                (
+                    payload
+                    for payload in npc_payloads
+                    if requested_name
+                    and str(payload.get("display_name", "") or "").strip().casefold()
+                    == requested_name.casefold()
+                ),
+                npc_payloads[source_index] if source_index < len(npc_payloads) else None,
+            )
+            finalized_description = (
+                str(match.get("public_description", "") or "").strip()
+                if isinstance(match, dict)
+                else ""
+            )
+            if not finalized_description or _suggestion_text_is_unchanged(
+                requested_description,
+                finalized_description,
+            ):
+                paths.append(
+                    f"events[NpcUpsertedEvent][{source_index}].payload.public_description"
+                )
+
+    return paths
 
 
 def _suggestion_text_is_unchanged(suggestion: str, finalized: str) -> bool:
@@ -4543,7 +4754,29 @@ def _parse_new_game_calendar_settings(raw_calendar_settings: Any) -> dict[str, A
     if not isinstance(raw_calendar_settings, dict) or not raw_calendar_settings:
         return {}
 
-    return normalize_calendar_settings(raw_calendar_settings)
+    calendar_settings = dict(raw_calendar_settings)
+    raw_seasons = calendar_settings.get("seasons")
+
+    if isinstance(raw_seasons, list):
+        normalized_seasons: list[Any] = []
+        for raw_season in raw_seasons:
+            if not isinstance(raw_season, dict):
+                normalized_seasons.append(raw_season)
+                continue
+
+            season = dict(raw_season)
+            if "weather_hint" not in season and "weather_heat" in season:
+                LOGGER.warning(
+                    "Gemini new-game calendar used weather_heat; normalizing it "
+                    "to weather_hint."
+                )
+                season["weather_hint"] = season.pop("weather_heat")
+            else:
+                season.pop("weather_heat", None)
+            normalized_seasons.append(season)
+        calendar_settings["seasons"] = normalized_seasons
+
+    return normalize_calendar_settings(calendar_settings)
 
 
 def _parse_new_game_starting_calendar(raw_calendar: Any) -> dict[str, Any]:

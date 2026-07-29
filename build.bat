@@ -18,11 +18,6 @@ if not exist "%ENTRYPOINT%" (
     exit /b 1
 )
 
-if not exist ".env" (
-    echo ERROR: Missing required .env file.
-    exit /b 1
-)
-
 if not exist "%TTS_MODEL%" (
     echo ERROR: Missing Kokoro ONNX model: "%TTS_MODEL%"
     exit /b 1
@@ -86,7 +81,7 @@ if errorlevel 1 (
 
 "%PYTHON%" -m ai_adventure.app.build_support
 if errorlevel 1 (
-    echo ERROR: Failed to copy .env to dist.
+    echo ERROR: Failed to prepare the dist directory.
     exit /b 1
 )
 

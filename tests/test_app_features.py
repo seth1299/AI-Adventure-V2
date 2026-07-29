@@ -31,6 +31,7 @@ class AppFeatureTests(unittest.TestCase):
                 os.environ,
                 {
                     "APPDATA": temp_dir,
+                    "LOCALAPPDATA": temp_dir,
                     "AI_ADVENTURE_PLAYTESTING_BUILD": "1",
                 },
                 clear=False,
@@ -42,6 +43,22 @@ class AppFeatureTests(unittest.TestCase):
                 Path(temp_dir) / "AI Adventure Playtesting",
             )
             self.assertTrue(app_paths.saves_dir.is_dir())
+            self.assertEqual(
+                app_paths.gemini_api_key_path,
+                (
+                    Path(temp_dir)
+                    / "AI Adventure Playtesting"
+                    / "gemini_api_key.txt"
+                ).resolve(),
+            )
+            self.assertEqual(
+                app_paths.gemini_terms_acceptance_path,
+                (
+                    Path(temp_dir)
+                    / "AI Adventure Playtesting"
+                    / "gemini_api_key_terms_acceptance.json"
+                ).resolve(),
+            )
 
     def test_playtesting_build_uses_minimal_dependencies_and_no_env_file(self) -> None:
         project_root = Path(__file__).resolve().parents[1]

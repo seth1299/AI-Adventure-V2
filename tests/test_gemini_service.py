@@ -9,6 +9,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from ai_adventure.app.api_key_store import write_api_key
 from ai_adventure.ai.gemini_service import (
     DEFAULT_GEMINI_MODEL,
     CREATIVE_TERM_REPAIR_MODEL,
@@ -34,8 +35,10 @@ from ai_adventure.ai.gemini_service import (
     _generate_content_with_retry,
     _json_schema_shape_errors,
     _normalize_visible_currency_phrasing,
+    _parse_new_game_calendar_settings,
     _parse_new_game_starter_items,
     _suggested_setup_terms,
+    _unfinalized_suggested_setup_paths,
     _unfinalized_suggested_setup_terms,
 )
 
@@ -146,6 +149,34 @@ class GeminiServiceTests(unittest.TestCase):
                 "The player's discreet guild contact.",
             ],
         )
+        self.assertEqual(
+            _unfinalized_suggested_setup_paths(raw_text, packet),
+            [
+                "start_location",
+                "locations[source_index=0].name",
+                "locations[source_index=0].description",
+                "events[NpcUpsertedEvent][0].payload.public_description",
+            ],
+        )
+
+    def test_new_game_calendar_normalizes_weather_heat_alias(self) -> None:
+        settings = _parse_new_game_calendar_settings(
+            {
+                "days_per_week": 7,
+                "weeks_per_month": 4,
+                "months_per_year": 12,
+                "seasons_per_year": 1,
+                "day_names": ["Day"],
+                "month_names": ["Month"],
+                "seasons": [{"name": "Summerheat", "weather_heat": "Hot and clear"}],
+                "time_display": "12_hour",
+            }
+        )
+
+        self.assertEqual(settings["seasons"][0]["weather_hint"], "Hot and clear")
+
+    def test_new_game_schema_requires_locations(self) -> None:
+        self.assertIn("locations", NEW_GAME_RESPONSE_JSON_SCHEMA["required"])
 
     def test_new_game_starter_item_parser_preserves_firearm_metadata(self) -> None:
         items = _parse_new_game_starter_items(
@@ -172,29 +203,34 @@ class GeminiServiceTests(unittest.TestCase):
         self.assertEqual(items[0]["clip_size"], 12)
         self.assertEqual(items[0]["bullets_per_attack"], 2)
 
-    def test_load_gemini_settings_reads_env_file(self) -> None:
+    def test_load_gemini_settings_reads_local_key_and_optional_model_file(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             env_path = Path(temp_dir) / ".env"
             env_path.write_text(
                 "GEMINI_API_KEY=test-key\nGEMINI_MODEL=gemini-2.5-pro\n",
                 encoding="utf-8",
             )
+            key_path = Path(temp_dir) / "gemini_api_key.txt"
+            write_api_key(key_path, "local-key")
 
             old_key = os.environ.pop("GEMINI_API_KEY", None)
             old_model = os.environ.pop("GEMINI_MODEL", None)
 
             try:
-                settings = load_gemini_settings(env_path)
+                settings = load_gemini_settings(
+                    api_key_path=key_path,
+                    model_env_path=env_path,
+                )
             finally:
                 if old_key is not None:
                     os.environ["GEMINI_API_KEY"] = old_key
                 if old_model is not None:
                     os.environ["GEMINI_MODEL"] = old_model
 
-            self.assertEqual(settings.api_key, "test-key")
+            self.assertEqual(settings.api_key, "local-key")
             self.assertEqual(settings.model, "gemini-2.5-pro")
 
-    def test_load_gemini_settings_uses_default_model(self) -> None:
+    def test_load_gemini_settings_ignores_api_key_in_model_file(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             env_path = Path(temp_dir) / ".env"
             env_path.write_text("GEMINI_API_KEY=test-key\n", encoding="utf-8")
@@ -202,12 +238,22 @@ class GeminiServiceTests(unittest.TestCase):
             old_model = os.environ.pop("GEMINI_MODEL", None)
 
             try:
-                settings = load_gemini_settings(env_path)
+                settings = load_gemini_settings(model_env_path=env_path)
             finally:
                 if old_model is not None:
                     os.environ["GEMINI_MODEL"] = old_model
 
+            self.assertEqual(settings.api_key, "")
             self.assertEqual(settings.model, DEFAULT_GEMINI_MODEL)
+
+    def test_gemini_service_uses_explicit_local_api_key_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            key_path = Path(temp_dir) / "gemini_api_key.txt"
+            write_api_key(key_path, "explicit-local-key")
+
+            service = GeminiNarrationService(api_key_path=key_path)
+
+            self.assertEqual(service.settings.api_key, "explicit-local-key")
 
     def test_story_request_uses_structured_output_schema(self) -> None:
         fake_client_class = self._install_fake_genai_client(

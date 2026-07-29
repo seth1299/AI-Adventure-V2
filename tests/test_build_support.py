@@ -4,22 +4,22 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from ai_adventure.app.build_support import copy_env_to_dist
+from ai_adventure.app.build_support import prepare_dist_directory
 
 
 class BuildSupportTests(unittest.TestCase):
-    def test_copy_env_to_dist_preserves_the_source_contents(self) -> None:
+    def test_prepare_dist_directory_does_not_copy_env_files(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             project_root = Path(temp_dir)
             source = project_root / ".env"
             source.write_text("GEMINI_API_KEY=test-key\n", encoding="utf-8")
 
-            destination = copy_env_to_dist(project_root)
+            destination = prepare_dist_directory(project_root)
 
-            self.assertEqual(destination, project_root / "dist" / ".env")
-            self.assertEqual(destination.read_text(encoding="utf-8"), "GEMINI_API_KEY=test-key\n")
+            self.assertEqual(destination, project_root / "dist")
+            self.assertFalse((destination / ".env").exists())
 
-    def test_copy_env_to_dist_requires_a_source_file(self) -> None:
+    def test_prepare_dist_directory_creates_output_directory(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            with self.assertRaises(FileNotFoundError):
-                copy_env_to_dist(Path(temp_dir))
+            destination = prepare_dist_directory(Path(temp_dir))
+            self.assertTrue(destination.is_dir())

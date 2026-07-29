@@ -121,12 +121,12 @@ class ContextReferenceLoader:
             raise ValueError(f"Context section content must be an object: {section_id}")
 
         return ContextSection(
-            id=section_id,
-            title=title,
-            category=category,
-            tags=tuple(tag.strip().lower() for tag in raw_tags),
-            priority=priority,
-            content=content,
+            section_id,
+            title,
+            category,
+            tuple(tag.strip().lower() for tag in raw_tags),
+            priority,
+            content,
         )
 
     def _merge_libraries(self, libraries: list[ContextLibrary]) -> ContextLibrary:

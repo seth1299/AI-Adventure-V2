@@ -14,6 +14,7 @@ class AppPaths:
 
     Args:
         app_data_dir: Root directory for saves, logs, and user settings.
+        local_app_data_dir: Device-local root used for credentials and receipts.
         saves_dir: Directory containing save folders.
         logs_dir: Directory containing log files.
         log_file: Main application log file.
@@ -23,6 +24,7 @@ class AppPaths:
     saves_dir: Path
     logs_dir: Path
     log_file: Path
+    local_app_data_dir: Path | None = None
 
     @property
     def repo_root(self) -> Path:
@@ -103,6 +105,20 @@ class AppPaths:
         return self.app_data_dir / "settings.json"
 
     @property
+    def gemini_api_key_path(self) -> Path:
+        """Returns the exact local file used for the Gemini API key."""
+
+        storage_root = self.local_app_data_dir or self.app_data_dir
+        return (storage_root / "gemini_api_key.txt").expanduser().resolve()
+
+    @property
+    def gemini_terms_acceptance_path(self) -> Path:
+        """Returns the local, non-secret terms-acceptance receipt path."""
+
+        storage_root = self.local_app_data_dir or self.app_data_dir
+        return (storage_root / "gemini_api_key_terms_acceptance.json").expanduser().resolve()
+
+    @property
     def kokoro_model_path(self) -> Path:
         """Returns the best known Kokoro ONNX model path."""
 
@@ -138,6 +154,7 @@ class AppPaths:
         """
 
         app_data_env = os.getenv("APPDATA")
+        local_app_data_env = os.getenv("LOCALAPPDATA")
 
         app_directory_name = (
             "AI Adventure Playtesting"
@@ -155,6 +172,11 @@ class AppPaths:
             )
             app_data_dir = Path.home() / fallback_directory_name
 
+        if local_app_data_env is not None and local_app_data_env.strip():
+            local_app_data_dir = Path(local_app_data_env) / app_directory_name
+        else:
+            local_app_data_dir = app_data_dir
+
         saves_dir = app_data_dir / "saves"
         logs_dir = app_data_dir / "logs"
         sounds_dir = app_data_dir / "sounds"
@@ -171,6 +193,7 @@ class AppPaths:
             saves_dir=saves_dir,
             logs_dir=logs_dir,
             log_file=log_file,
+            local_app_data_dir=local_app_data_dir,
         )
 
     def _first_existing_path(

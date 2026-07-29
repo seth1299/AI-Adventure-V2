@@ -4,10 +4,10 @@ from __future__ import annotations
 MAX_SKILL_LEVEL = 5
 XP_THRESHOLDS_BY_LEVEL = {
     1: 0,
-    2: 10,
-    3: 25,
-    4: 45,
-    5: 70,
+    2: 8,
+    3: 16,
+    4: 24,
+    5: 32,
 }
 DIFFICULTY_DCS = {
     "trivial": 6,

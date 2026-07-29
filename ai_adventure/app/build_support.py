@@ -2,33 +2,27 @@
 
 from __future__ import annotations
 
-import shutil
 from pathlib import Path
 
 
-def copy_env_to_dist(project_root: Path) -> Path:
-    """Copies the project's required .env file beside the built executable."""
+def prepare_dist_directory(project_root: Path) -> Path:
+    """Ensures the build output directory exists without copying secrets."""
 
-    source = project_root / ".env"
-
-    if not source.is_file():
-        raise FileNotFoundError(f"Required build configuration file is missing: {source}")
-
-    destination = project_root / "dist" / ".env"
+    destination = project_root / "dist"
     destination.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(source, destination)
+    destination.mkdir(parents=True, exist_ok=True)
     return destination
 
 
 def main() -> int:
-    """Copies .env to dist for the batch build scripts."""
+    """Prepares the build output directory for the batch build scripts."""
 
     project_root = Path(__file__).resolve().parents[2]
 
     try:
-        copy_env_to_dist(project_root)
+        prepare_dist_directory(project_root)
     except OSError as error:
-        print(f"ERROR: Could not copy .env to dist: {error}")
+        print(f"ERROR: Could not prepare the dist directory: {error}")
         return 1
 
     return 0
