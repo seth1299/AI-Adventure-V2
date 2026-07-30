@@ -1,15 +1,18 @@
 from __future__ import annotations
 
+import json
 import re
 import logging
 import importlib
 import random
+import uuid
 from pathlib import Path
 from typing import Any, Callable, Protocol
 
 from PySide6.QtCore import (
     QEvent,
     QObject,
+    QPoint,
     QSize,
     QStringListModel,
     Qt,
@@ -18,7 +21,17 @@ from PySide6.QtCore import (
     Signal,
     Slot,
 )
-from PySide6.QtGui import QColor, QIcon, QMouseEvent, QPalette, QStandardItem, QStandardItemModel
+from PySide6.QtGui import (
+    QColor,
+    QFontMetrics,
+    QIcon,
+    QMouseEvent,
+    QPalette,
+    QStandardItem,
+    QStandardItemModel,
+    QTextBlockFormat,
+    QTextCursor,
+)
 from PySide6.QtWidgets import (
     QAbstractSpinBox,
     QApplication,
@@ -27,6 +40,7 @@ from PySide6.QtWidgets import (
     QCompleter,
     QDialog,
     QDialogButtonBox,
+    QFrame,
     QFormLayout,
     QGridLayout,
     QGroupBox,
@@ -37,9 +51,12 @@ from PySide6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QPushButton,
+    QPlainTextEdit,
     QScrollArea,
+    QSizePolicy,
     QHeaderView,
     QSlider,
     QSpinBox,
@@ -48,6 +65,7 @@ from PySide6.QtWidgets import (
     QStyledItemDelegate,
     QStyleOptionViewItem,
     QTabWidget,
+    QTabBar,
     QTableWidget,
     QTableWidgetItem,
     QTextEdit,
@@ -61,11 +79,13 @@ from ai_adventure.alchemy.ingredients import (
     COMMON_MEASUREMENT_UNITS,
     CRAFTING_INGREDIENT_CATEGORY_NAMES,
     CRAFTING_INGREDIENT_CATEGORIES,
+    CRAFTING_ITEM_RARITIES,
     format_recipe_ingredients,
     is_crafting_ingredient_category,
     normalize_recipe_ingredient,
     normalize_recipe_ingredients,
 )
+from ai_adventure.ascii_art import normalize_ascii_art
 from ai_adventure.app.api_key_store import (
     read_api_key,
     record_terms_acceptance,
@@ -196,6 +216,7 @@ from ai_adventure.calendar_system import (
     DEFAULT_START_ELAPSED_MINUTES,
     build_calendar_snapshot,
     build_month_grid,
+    format_time_of_day,
     resolve_starting_calendar_minute,
 )
 from ai_adventure.combat import (
@@ -6268,6 +6289,75 @@ class NewGameWizard(QWizard):
         self._custom_calendar_settings = dialog.build_settings()
 
 
+class _DetachableTabBar(QTabBar):
+    """Movable tab bar that requests detachment after an outside drag release."""
+
+    detach_requested = Signal(str, QPoint)
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._pressed_tab_key = ""
+        self._press_global_position = QPoint()
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:
+        """Remembers the stable key for the tab being dragged."""
+
+        index = self.tabAt(event.position().toPoint())
+        self._pressed_tab_key = (
+            str(self.tabData(index) or "") if index >= 0 else ""
+        )
+        self._press_global_position = event.globalPosition().toPoint()
+        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event: QMouseEvent) -> None:
+        """Detaches a dragged tab when the pointer is released outside the bar."""
+
+        global_position = event.globalPosition().toPoint()
+        dragged_far_enough = (
+            global_position - self._press_global_position
+        ).manhattanLength() >= QApplication.startDragDistance()
+        released_outside = not self.rect().contains(event.position().toPoint())
+        tab_key = self._pressed_tab_key
+        super().mouseReleaseEvent(event)
+        self._pressed_tab_key = ""
+
+        if tab_key and dragged_far_enough and released_outside:
+            self.detach_requested.emit(tab_key, global_position)
+
+
+class _DetachedTabWindow(QMainWindow):
+    """Independent, non-modal window containing one detached game screen."""
+
+    return_requested = Signal(str)
+
+    def __init__(
+        self,
+        tab_key: str,
+        title: str,
+        screen: QWidget,
+        parent: QWidget,
+    ) -> None:
+        super().__init__(parent, Qt.WindowType.Window)
+        self.tab_key = tab_key
+        self.setWindowTitle(title)
+        self.setWindowModality(Qt.WindowModality.NonModal)
+        self.setWindowFlag(Qt.WindowType.WindowMaximizeButtonHint, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        self.setCentralWidget(screen)
+        # QTabWidget.removeTab() leaves its page explicitly hidden. Reparenting
+        # the page as a central widget does not clear that hidden state, so make
+        # the transferred screen visible before this window is shown.
+        screen.show()
+        self.resize(1000, 720)
+
+    def closeEvent(self, event: Any) -> None:
+        """Returns the screen to the main tab strip before destroying the window."""
+
+        self.takeCentralWidget()
+        self.return_requested.emit(self.tab_key)
+        event.accept()
+
+
 class GameShell(QWidget):
     """In-game shell containing the core play screens."""
 
@@ -6322,6 +6412,14 @@ class GameShell(QWidget):
         top_bar.addWidget(menu_button)
 
         self.tabs = QTabWidget()
+        self.tab_bar = _DetachableTabBar(self.tabs)
+        self.tabs.setTabBar(self.tab_bar)
+        self.tabs.setMovable(True)
+        self.tabs.setTabsClosable(True)
+        self.tabs.setDocumentMode(True)
+        self._tab_specs: dict[str, tuple[RepositoryBackedWidget, str, bool]] = {}
+        self._tab_order: list[str] = []
+        self._detached_windows: dict[str, _DetachedTabWindow] = {}
 
         self.story_screen = StoryScreen(
             sound_manager=self.sound_manager,
@@ -6380,31 +6478,206 @@ class GameShell(QWidget):
         for screen in self.screens:
             screen.on_repository_changed = self._handle_screen_repository_changed
 
-        if self.playtesting_tools:
-            self.tabs.addTab(self.character_screen, "Character")
-            self.tabs.addTab(self.calendar_screen, "Calendar")
-            self.tabs.addTab(self.inventory_screen, "Inventory")
-            self.tabs.addTab(self.combat_screen, "Combat")
-            self.tabs.addTab(self.settings_screen, "Settings")
-        else:
-            self.tabs.addTab(self.story_screen, "Story")
-            self.tabs.addTab(self.character_screen, "Character")
-            self.tabs.addTab(self.travel_screen, "Travel")
-            self.tabs.addTab(self.calendar_screen, "Calendar")
-            self.tabs.addTab(self.inventory_screen, "Inventory")
-            self.tabs.addTab(self.combat_screen, "Combat")
-            self.tabs.addTab(self.npcs_screen, "NPCs")
-            self.tabs.addTab(self.skills_screen, "Skills")
-            self.tabs.addTab(self.alchemy_screen, "Crafting")
-            self.tabs.addTab(self.history_screen, "Journal")
-            self.tabs.addTab(self.settings_screen, "Settings")
+        visible_tabs = (
+            [
+                ("character", self.character_screen, "Character", True),
+                ("calendar", self.calendar_screen, "Calendar", True),
+                ("inventory", self.inventory_screen, "Inventory", True),
+                ("combat", self.combat_screen, "Combat", True),
+                ("settings", self.settings_screen, "Settings", True),
+            ]
+            if self.playtesting_tools
+            else [
+                ("conversation", self.story_screen, "Conversation", False),
+                ("character", self.character_screen, "Character", True),
+                ("travel", self.travel_screen, "Travel", True),
+                ("calendar", self.calendar_screen, "Calendar", True),
+                ("inventory", self.inventory_screen, "Inventory", True),
+                ("combat", self.combat_screen, "Combat", True),
+                ("npcs", self.npcs_screen, "NPCs", True),
+                ("skills", self.skills_screen, "Skills", True),
+                ("crafting", self.alchemy_screen, "Crafting", True),
+                ("journal", self.history_screen, "Journal", True),
+                ("settings", self.settings_screen, "Settings", True),
+            ]
+        )
+        for tab_key, screen, label, closable in visible_tabs:
+            self._register_tab(tab_key, screen, label, closable)
+
+        self.add_tab_button = QPushButton("+")
+        self.add_tab_button.setToolTip("Restore a closed tab")
+        self.add_tab_button.setFixedWidth(34)
+        self.add_tab_button.setStyleSheet("font-size: 18px; font-weight: 700;")
+        self.add_tab_menu = QMenu(self.add_tab_button)
+        self.add_tab_menu.aboutToShow.connect(self._rebuild_add_tab_menu)
+        self.add_tab_button.setMenu(self.add_tab_menu)
+        self.tabs.setCornerWidget(
+            self.add_tab_button,
+            Qt.Corner.TopRightCorner,
+        )
+
+        self.tabs.tabCloseRequested.connect(self._close_tab)
+        self.tab_bar.detach_requested.connect(self._detach_tab)
+        self.tab_bar.tabMoved.connect(lambda _from, _to: self._sync_protected_tab_button())
         self.tabs.currentChanged.connect(self._handle_tab_changed)
+        self._sync_protected_tab_button()
 
         layout = QVBoxLayout()
         layout.addLayout(top_bar)
         layout.addWidget(self.tabs)
 
         self.setLayout(layout)
+
+    def _register_tab(
+        self,
+        tab_key: str,
+        screen: RepositoryBackedWidget,
+        label: str,
+        closable: bool,
+    ) -> None:
+        """Registers and initially opens one restorable game tab."""
+
+        self._tab_specs[tab_key] = (screen, label, closable)
+        self._tab_order.append(tab_key)
+        index = self.tabs.addTab(screen, label)
+        self.tab_bar.setTabData(index, tab_key)
+
+    def _tab_index_for_key(self, tab_key: str) -> int:
+        """Returns the current docked index for a stable tab key."""
+
+        for index in range(self.tabs.count()):
+            if str(self.tab_bar.tabData(index) or "") == tab_key:
+                return index
+        return -1
+
+    def _sync_protected_tab_button(self) -> None:
+        """Removes the close affordance from the protected Conversation tab."""
+
+        for index in range(self.tabs.count()):
+            tab_key = str(self.tab_bar.tabData(index) or "")
+            spec = self._tab_specs.get(tab_key)
+            if spec is not None and not spec[2]:
+                self.tab_bar.setTabButton(
+                    index,
+                    QTabBar.ButtonPosition.RightSide,
+                    None,
+                )
+
+    @Slot(int)
+    def _close_tab(self, index: int) -> None:
+        """Hides one closable tab until the player restores it from the plus menu."""
+
+        tab_key = str(self.tab_bar.tabData(index) or "")
+        spec = self._tab_specs.get(tab_key)
+        if spec is None or not spec[2]:
+            return
+
+        screen = self.tabs.widget(index)
+        self.tabs.removeTab(index)
+        if screen is not None:
+            screen.hide()
+        self._rebuild_add_tab_menu()
+
+    def _rebuild_add_tab_menu(self) -> None:
+        """Lists every tab that is currently neither docked nor detached."""
+
+        self.add_tab_menu.clear()
+        missing_keys = [
+            tab_key
+            for tab_key in self._tab_order
+            if self._tab_index_for_key(tab_key) < 0
+            and tab_key not in self._detached_windows
+        ]
+        if not missing_keys:
+            action = self.add_tab_menu.addAction("All tabs are open")
+            action.setEnabled(False)
+            return
+
+        for tab_key in missing_keys:
+            _screen, label, _closable = self._tab_specs[tab_key]
+            action = self.add_tab_menu.addAction(label)
+            action.triggered.connect(
+                lambda _checked=False, key=tab_key: self._restore_tab(key)
+            )
+
+    def _restore_tab(self, tab_key: str) -> None:
+        """Returns one closed or detached screen to the main tab strip."""
+
+        spec = self._tab_specs.get(tab_key)
+        if spec is None:
+            return
+
+        existing_index = self._tab_index_for_key(tab_key)
+        if existing_index >= 0:
+            self.tabs.setCurrentIndex(existing_index)
+            return
+
+        screen, label, _closable = spec
+        screen.setParent(self.tabs)
+        index = self.tabs.addTab(screen, label)
+        self.tab_bar.setTabData(index, tab_key)
+        screen.show()
+        self.tabs.setCurrentIndex(index)
+        self._sync_protected_tab_button()
+
+    @Slot(str, QPoint)
+    def _detach_tab(self, tab_key: str, global_position: QPoint) -> None:
+        """Moves one docked tab into an independent, maximizable window."""
+
+        index = self._tab_index_for_key(tab_key)
+        spec = self._tab_specs.get(tab_key)
+        if index < 0 or spec is None or tab_key in self._detached_windows:
+            return
+
+        screen, label, _closable = spec
+        self.tabs.removeTab(index)
+        window = _DetachedTabWindow(
+            tab_key,
+            self._detached_window_title(label),
+            screen,
+            self,
+        )
+        window.return_requested.connect(self._return_detached_tab)
+        self._detached_windows[tab_key] = window
+        window.move(global_position - QPoint(80, 24))
+        window.show()
+
+    @Slot(str)
+    def _return_detached_tab(self, tab_key: str) -> None:
+        """Redocks a screen when its independent window is closed."""
+
+        self._detached_windows.pop(tab_key, None)
+        self._restore_tab(tab_key)
+
+    def _detached_window_title(self, label: str) -> str:
+        """Builds a useful title for a detached game-screen window."""
+
+        adventure_title = self.title_label.text().strip()
+        if not adventure_title or adventure_title == "No Save Loaded":
+            return f"{label} - AI Adventure"
+        return f"{label} - {adventure_title}"
+
+    def _refresh_detached_window_titles(self) -> None:
+        """Keeps detached windows aligned with the active save title."""
+
+        for tab_key, window in self._detached_windows.items():
+            spec = self._tab_specs.get(tab_key)
+            if spec is not None:
+                window.setWindowTitle(self._detached_window_title(spec[1]))
+
+    def hideEvent(self, event: Any) -> None:
+        """Hides detached screens when the game shell itself leaves view."""
+
+        for window in self._detached_windows.values():
+            window.hide()
+        super().hideEvent(event)
+
+    def showEvent(self, event: Any) -> None:
+        """Restores detached screens when the player returns to the game shell."""
+
+        super().showEvent(event)
+        for window in self._detached_windows.values():
+            window.show()
 
     def set_repository(self, repository: SaveRepository | None) -> None:
         """
@@ -6421,6 +6694,8 @@ class GameShell(QWidget):
         else:
             title = repository.get_meta("title", default="Untitled Adventure")
             self.title_label.setText(title)
+
+        self._refresh_detached_window_titles()
 
         for screen in self.screens:
             screen.set_repository(repository)
@@ -6509,7 +6784,7 @@ class GameShell(QWidget):
 
 
 class StoryScreen(RepositoryBackedWidget):
-    """Story screen for player input and narrative output."""
+    """Conversation screen for live-game actions and out-of-game AI chat."""
 
     _narration_chunk_ready = Signal(int, str)
     _narration_complete = Signal(int)
@@ -6537,9 +6812,11 @@ class StoryScreen(RepositoryBackedWidget):
         self._gemini_worker: QObject | None = None
         self._pending_skill_check_event_results: list[Any] = []
         self._pending_travel_request: dict[str, Any] | None = None
+        self._pending_conversation_mode = "live_game"
         self._waiting_for_gm = False
         self._combat_active = False
         self._default_input_placeholder = "Enter a player action..."
+        self._out_of_game_input_placeholder = "Ask the AI about the adventure..."
         self._narration_chunk_ready.connect(self._append_revealed_story_chunk)
         self._narration_complete.connect(self._complete_revealed_story)
         self.location_value = QLabel("-")
@@ -6554,8 +6831,26 @@ class StoryScreen(RepositoryBackedWidget):
         status_row.addWidget(_status_label("Weather", self.weather_value))
         status_row.addStretch()
 
-        self.story_output = QTextEdit()
-        self.story_output.setReadOnly(True)
+        self.conversation_scroll = QScrollArea()
+        self.conversation_scroll.setWidgetResizable(True)
+        self.conversation_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.conversation_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        self.conversation_contents = QWidget()
+        self.conversation_layout = QVBoxLayout(self.conversation_contents)
+        self.conversation_layout.setContentsMargins(12, 12, 12, 12)
+        self.conversation_layout.setSpacing(12)
+        self.conversation_layout.addStretch()
+        self.conversation_scroll.setWidget(self.conversation_contents)
+
+        self.mode_button = QPushButton("Mode: Live Game")
+        self.mode_button.setCheckable(True)
+        self.mode_button.setToolTip(
+            "Switch between story actions and out-of-game questions for the AI."
+        )
+        self.mode_button.toggled.connect(self._set_out_of_game_mode)
+        self._update_mode_button_style()
 
         self.player_input = QLineEdit()
         self.player_input.setPlaceholderText(self._default_input_placeholder)
@@ -6570,13 +6865,14 @@ class StoryScreen(RepositoryBackedWidget):
         self.continue_button.setEnabled(False)
 
         input_row = QHBoxLayout()
+        input_row.addWidget(self.mode_button)
         input_row.addWidget(self.player_input)
         input_row.addWidget(self.submit_button)
         input_row.addWidget(self.continue_button)
 
         layout = QVBoxLayout()
         layout.addLayout(status_row)
-        layout.addWidget(self.story_output)
+        layout.addWidget(self.conversation_scroll)
         layout.addLayout(input_row)
 
         self.setLayout(layout)
@@ -6586,6 +6882,8 @@ class StoryScreen(RepositoryBackedWidget):
 
         self._clear_story_reveal_state()
         self._pending_travel_request = None
+        self._pending_conversation_mode = "live_game"
+        self.mode_button.setChecked(False)
         super().set_repository(repository)
 
     def refresh(self) -> None:
@@ -6594,7 +6892,7 @@ class StoryScreen(RepositoryBackedWidget):
         repository = self.repository()
 
         if repository is None:
-            self.story_output.clear()
+            self._clear_conversation_messages()
             self.location_value.setText("-")
             self.day_value.setText("-")
             self.time_value.setText("-")
@@ -6612,33 +6910,200 @@ class StoryScreen(RepositoryBackedWidget):
         self.weather_value.setText(state.world.weather or "-")
 
         entries = repository.list_history()
-        story_lines: list[str] = []
+        conversation_entries: list[tuple[str, str, str, int]] = []
 
         for entry in entries:
             kind = str(entry.get("kind", "misc")).casefold()
             content = str(entry.get("content", ""))
 
-            if kind == "player":
-                story_lines.append(_player_command_markdown(content))
-            elif kind == "story":
+            if kind in {"player", "player_oog"}:
+                conversation_entries.append(
+                    ("player", "out_of_game" if kind == "player_oog" else "live_game", content, -1)
+                )
+            elif kind in {"story", "story_oog"}:
                 entry_id = _safe_int(entry.get("id"), -1)
 
                 if entry_id == self._revealing_story_id:
                     if self._revealed_story_chunks:
-                        story_lines.append("\n\n".join(self._revealed_story_chunks))
+                        conversation_entries.append(
+                            ("ai", "live_game", "\n\n".join(self._revealed_story_chunks), entry_id)
+                        )
                 else:
-                    story_lines.append(format_story_message(content))
+                    conversation_entries.append(
+                        (
+                            "ai",
+                            "out_of_game" if kind == "story_oog" else "live_game",
+                            format_story_message(content),
+                            entry_id,
+                        )
+                    )
 
-        output = "\n\n".join(story_lines)
-        _set_markdown_text(self.story_output, output)
-        self.story_output.moveCursor(self.story_output.textCursor().MoveOperation.End)
+        self._render_conversation(conversation_entries)
         self._sync_story_input_state()
         self._update_continue_button_state()
 
-    def _submit_player_action(self) -> None:
-        """Records a player action and requests AI narration when configured."""
+    def _clear_conversation_messages(self) -> None:
+        """Removes all rendered conversation bubbles while preserving the stretch."""
 
-        self._submit_player_command(self.player_input.text().strip())
+        while self.conversation_layout.count() > 1:
+            item = self.conversation_layout.takeAt(0)
+            widget = item.widget() if item is not None else None
+            if widget is not None:
+                widget.deleteLater()
+
+    def _render_conversation(
+        self,
+        entries: list[tuple[str, str, str, int]],
+    ) -> None:
+        """Rebuilds the modern, role-aligned conversation timeline."""
+
+        self._clear_conversation_messages()
+        for role, mode, content, _entry_id in entries:
+            self.conversation_layout.insertWidget(
+                self.conversation_layout.count() - 1,
+                self._conversation_bubble(role, mode, content),
+            )
+        QTimer.singleShot(0, self._scroll_conversation_to_bottom)
+
+    def _conversation_bubble(self, role: str, mode: str, content: str) -> QWidget:
+        """Builds one readable AI or player chat bubble."""
+
+        is_player = role == "player"
+        is_out_of_game = mode == "out_of_game"
+        row = QWidget()
+        row_layout = QHBoxLayout(row)
+        row_layout.setContentsMargins(0, 0, 0, 0)
+
+        bubble = QFrame()
+        bubble.setObjectName("conversationBubble")
+        bubble.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
+        bubble_layout = QVBoxLayout(bubble)
+        bubble_layout.setContentsMargins(14, 10, 14, 10)
+        bubble_layout.setSpacing(5)
+
+        speaker = "You" if is_player else "AI Game Master"
+        mode_label = "Out-of-Game" if is_out_of_game else "Live Game"
+        header = QLabel(f"{speaker}  |  {mode_label}")
+        header.setStyleSheet("font-size: 11px; font-weight: 700;")
+        read_aloud_button = QPushButton("Read Aloud")
+        read_aloud_button.setEnabled(self.narration_player is not None)
+        read_aloud_button.setToolTip(
+            "Regenerate and play this message with the local narrator. No AI request is sent."
+            if self.narration_player is not None
+            else "Local narrator playback is unavailable in this build."
+        )
+        read_aloud_button.setStyleSheet(
+            "QPushButton { background-color: rgba(255, 255, 255, 28); "
+            "color: white; border: 1px solid rgba(255, 255, 255, 70); "
+            "border-radius: 7px; padding: 3px 9px; font-size: 11px; } "
+            "QPushButton:hover { background-color: rgba(255, 255, 255, 48); }"
+        )
+        read_aloud_button.clicked.connect(
+            lambda _checked=False, message_text=content: (
+                self._read_conversation_message_aloud(message_text)
+            )
+        )
+
+        header_row = QHBoxLayout()
+        header_row.setContentsMargins(0, 0, 0, 0)
+        header_row.addWidget(header)
+        header_row.addStretch()
+        header_row.addWidget(read_aloud_button)
+        bubble_layout.addLayout(header_row)
+
+        message = QTextEdit()
+        message.setReadOnly(True)
+        message.setFrameShape(QFrame.Shape.NoFrame)
+        message.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        message.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        message.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
+        message.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        message.setStyleSheet("background: transparent; border: none; padding: 0;")
+        _set_markdown_text(message, content)
+        message.document().setDocumentMargin(0)
+
+        def resize_message(*_args: Any) -> None:
+            message.setFixedHeight(max(24, int(message.document().size().height()) + 4))
+
+        message.document().documentLayout().documentSizeChanged.connect(resize_message)
+        resize_message()
+        bubble_layout.addWidget(message)
+
+        if is_player:
+            background = "#6d28d9" if is_out_of_game else "#2563eb"
+            bubble.setStyleSheet(
+                "QFrame#conversationBubble {"
+                f"background-color: {background}; border-radius: 14px;"
+                "} QFrame#conversationBubble QLabel, QFrame#conversationBubble QTextEdit {"
+                "color: white; }"
+            )
+            row_layout.addWidget(bubble, 1)
+        else:
+            background = "#3f3f46" if is_out_of_game else "#334155"
+            bubble.setStyleSheet(
+                "QFrame#conversationBubble {"
+                f"background-color: {background}; border-radius: 14px;"
+                "} QFrame#conversationBubble QLabel, QFrame#conversationBubble QTextEdit {"
+                "color: white; }"
+            )
+            row_layout.addWidget(bubble, 1)
+        return row
+
+    def _read_conversation_message_aloud(self, text: str) -> bool:
+        """Regenerates one bubble's speech locally without contacting Gemini."""
+
+        if self.narration_player is None:
+            return False
+
+        repository = self.repository()
+        if repository is not None:
+            _apply_audio_settings_to_managers(
+                repository,
+                sound_manager=self.sound_manager,
+                narration_player=self.narration_player,
+            )
+
+        return bool(self.narration_player.play_sample(text=text))
+
+    def _scroll_conversation_to_bottom(self) -> None:
+        """Keeps the newest message visible after a refresh."""
+
+        bar = self.conversation_scroll.verticalScrollBar()
+        bar.setValue(bar.maximum())
+
+    def _set_out_of_game_mode(self, enabled: bool) -> None:
+        """Switches the explicit player-to-AI conversation mode."""
+
+        self._update_mode_button_style()
+        self._sync_story_input_state()
+        self._update_continue_button_state()
+
+    def _update_mode_button_style(self) -> None:
+        """Makes the active mode obvious without relying on button state alone."""
+
+        if self.mode_button.isChecked():
+            self.mode_button.setText("Mode: Out-of-Game")
+            self.mode_button.setStyleSheet(
+                "QPushButton { background-color: #6d28d9; color: white; font-weight: 700; }"
+            )
+        else:
+            self.mode_button.setText("Mode: Live Game")
+            self.mode_button.setStyleSheet(
+                "QPushButton { background-color: #2563eb; color: white; font-weight: 700; }"
+            )
+
+    def _conversation_mode(self) -> str:
+        """Returns the mode selected by the player."""
+
+        return "out_of_game" if self.mode_button.isChecked() else "live_game"
+
+    def _submit_player_action(self) -> None:
+        """Records a player message in the explicitly selected mode."""
+
+        self._submit_player_command(
+            self.player_input.text().strip(),
+            conversation_mode=self._conversation_mode(),
+        )
 
     def submit_travel_request(
         self,
@@ -6679,6 +7144,7 @@ class StoryScreen(RepositoryBackedWidget):
 
         return self._submit_player_command(
             player_text,
+            conversation_mode="live_game",
             travel_request={
                 "active": True,
                 "origin": origin.to_dict() if origin is not None else {},
@@ -6696,11 +7162,13 @@ class StoryScreen(RepositoryBackedWidget):
         self,
         player_text: str,
         *,
+        conversation_mode: str = "live_game",
         travel_request: dict[str, Any] | None = None,
     ) -> bool:
-        """Records one submitted command and starts its normal Gemini turn."""
+        """Records one submitted message and starts its mode-specific Gemini request."""
 
-        if self._waiting_for_gm or self._combat_active:
+        clean_mode = "out_of_game" if conversation_mode == "out_of_game" else "live_game"
+        if self._waiting_for_gm or (self._combat_active and clean_mode == "live_game"):
             return False
 
         repository = self.repository()
@@ -6714,19 +7182,30 @@ class StoryScreen(RepositoryBackedWidget):
             LOGGER.warning("Skipped blank player action.")
             return False
 
-        repository.append_history("player", player_text)
+        repository.append_history(
+            "player_oog" if clean_mode == "out_of_game" else "player",
+            player_text,
+        )
         self.player_input.clear()
         self._pending_skill_check_event_results = []
         self._pending_travel_request = travel_request
+        self._pending_conversation_mode = clean_mode
         self._set_waiting_for_gm(True)
         self.refresh()
 
-        context_packet = self._build_story_context_packet(repository, player_text)
+        context_packet = self._build_story_context_packet(
+            repository,
+            player_text,
+            conversation_mode=clean_mode,
+        )
 
         if travel_request is not None:
             context_packet["travel_request"] = travel_request
 
-        self._start_skill_check_planning_request(context_packet)
+        if clean_mode == "out_of_game":
+            self._start_gemini_story_request(context_packet)
+        else:
+            self._start_skill_check_planning_request(context_packet)
         return True
 
     def _continue_story_response(self) -> None:
@@ -6749,6 +7228,7 @@ class StoryScreen(RepositoryBackedWidget):
         player_text = self._latest_player_command() or "Continue the previous narration."
         self._pending_skill_check_event_results = []
         self._pending_travel_request = None
+        self._pending_conversation_mode = "live_game"
         self._set_waiting_for_gm(True)
         self.refresh()
 
@@ -6766,6 +7246,7 @@ class StoryScreen(RepositoryBackedWidget):
         repository: SaveRepository,
         player_text: str,
         *,
+        conversation_mode: str = "live_game",
         resolved_skill_checks: list[dict[str, Any]] | None = None,
         planner_context_tags: list[str] | None = None,
     ) -> dict[str, Any]:
@@ -6785,6 +7266,7 @@ class StoryScreen(RepositoryBackedWidget):
         return AiContextBuilder.from_default_library().build_story_context(
             state,
             player_command=player_text,
+            conversation_mode=conversation_mode,
             relevant_npcs=relevant_npcs,
             gm_secrets=gm_secrets,
             valid_music_tracks=valid_music_tracks,
@@ -6864,6 +7346,7 @@ class StoryScreen(RepositoryBackedWidget):
         context_packet = self._build_story_context_packet(
             repository,
             player_text,
+            conversation_mode=self._pending_conversation_mode,
             resolved_skill_checks=resolved_skill_checks,
             planner_context_tags=getattr(plan_result, "relevant_tags", None),
         )
@@ -6904,11 +7387,16 @@ class StoryScreen(RepositoryBackedWidget):
         if repository is None:
             self._set_waiting_for_gm(False)
             self._pending_travel_request = None
+            self._pending_conversation_mode = "live_game"
             return
 
-        repository.append_history("story", result.narrative_text)
+        is_out_of_game = self._pending_conversation_mode == "out_of_game"
+        repository.append_history(
+            "story_oog" if is_out_of_game else "story",
+            result.narrative_text,
+        )
 
-        if result.suggested_events:
+        if result.suggested_events and not is_out_of_game:
             event_results = EventApplier(repository).apply_events(
                 result.suggested_events,
                 prior_results=self._pending_skill_check_event_results,
@@ -6931,9 +7419,10 @@ class StoryScreen(RepositoryBackedWidget):
 
         self._pending_skill_check_event_results = []
         self._pending_travel_request = None
+        self._pending_conversation_mode = "live_game"
         latest_story = self._latest_story_entry()
 
-        if latest_story is not None and self._reveal_story_with_narration(
+        if not is_out_of_game and latest_story is not None and self._reveal_story_with_narration(
             int(latest_story["id"]),
             result.narrative_text,
         ):
@@ -6947,12 +7436,14 @@ class StoryScreen(RepositoryBackedWidget):
         """Displays the configured-no-key fallback after a recorded player action."""
 
         repository = self.repository()
+        is_out_of_game = self._pending_conversation_mode == "out_of_game"
         self._pending_skill_check_event_results = []
         self._pending_travel_request = None
+        self._pending_conversation_mode = "live_game"
 
         if repository is not None:
             repository.append_history(
-                "story",
+                "story_oog" if is_out_of_game else "story",
                 (
                     "No Gemini API key is configured yet. "
                     "This action was recorded successfully."
@@ -6967,12 +7458,14 @@ class StoryScreen(RepositoryBackedWidget):
         """Displays the generic Gemini failure fallback."""
 
         repository = self.repository()
+        is_out_of_game = self._pending_conversation_mode == "out_of_game"
         self._pending_skill_check_event_results = []
         self._pending_travel_request = None
+        self._pending_conversation_mode = "live_game"
 
         if repository is not None:
             repository.append_history(
-                "story",
+                "story_oog" if is_out_of_game else "story",
                 (
                     "Gemini is temporarily unavailable. Your action was recorded "
                     "and your save is safe; please try again shortly."
@@ -7008,24 +7501,32 @@ class StoryScreen(RepositoryBackedWidget):
             self.player_input.setToolTip(GM_THINKING_TEXT)
             self.submit_button.setToolTip(GM_THINKING_TEXT)
             self.continue_button.setToolTip(GM_THINKING_TEXT)
-        elif self._combat_active:
+        elif self._combat_active and self._conversation_mode() == "live_game":
             tooltip = "Resolve the active combat in the Combat tab before sending story actions."
             self.player_input.setPlaceholderText("Combat is active...")
             self.player_input.setToolTip(tooltip)
             self.submit_button.setToolTip(tooltip)
             self.continue_button.setToolTip(tooltip)
         else:
-            self.player_input.setPlaceholderText(self._default_input_placeholder)
+            self.player_input.setPlaceholderText(
+                self._out_of_game_input_placeholder
+                if self._conversation_mode() == "out_of_game"
+                else self._default_input_placeholder
+            )
             self.player_input.setToolTip("")
             self.submit_button.setToolTip("")
-            self.continue_button.setToolTip("Ask the GM to expand the latest response.")
+            self.continue_button.setToolTip(
+                "Ask the GM to expand the latest live-game response."
+            )
 
     def _sync_story_input_state(self) -> None:
-        """Enables story input only when GM and combat state permit it."""
+        """Enables input according to request state, combat, and explicit mode."""
 
-        can_submit = not self._waiting_for_gm and not self._combat_active
+        is_out_of_game = self._conversation_mode() == "out_of_game"
+        can_submit = not self._waiting_for_gm and (not self._combat_active or is_out_of_game)
         self.player_input.setEnabled(can_submit)
         self.submit_button.setEnabled(can_submit)
+        self.mode_button.setEnabled(not self._waiting_for_gm)
 
         if self._waiting_for_gm:
             self.player_input.setPlaceholderText(GM_THINKING_TEXT)
@@ -7034,7 +7535,7 @@ class StoryScreen(RepositoryBackedWidget):
             self.continue_button.setToolTip(GM_THINKING_TEXT)
             return
 
-        if self._combat_active:
+        if self._combat_active and not is_out_of_game:
             tooltip = "Resolve the active combat in the Combat tab before sending story actions."
             self.player_input.setPlaceholderText("Combat is active...")
             self.player_input.setToolTip(tooltip)
@@ -7042,10 +7543,19 @@ class StoryScreen(RepositoryBackedWidget):
             self.continue_button.setToolTip(tooltip)
             return
 
-        self.player_input.setPlaceholderText(self._default_input_placeholder)
+        self.player_input.setPlaceholderText(
+            self._out_of_game_input_placeholder
+            if is_out_of_game
+            else self._default_input_placeholder
+        )
         self.player_input.setToolTip("")
         self.submit_button.setToolTip("")
-        self.continue_button.setToolTip("Ask the GM to expand the latest response.")
+        if is_out_of_game:
+            self.player_input.setToolTip(
+                "Out-of-game messages are saved in the conversation but cannot change game state or advance a turn."
+            )
+            self.submit_button.setToolTip(self.player_input.toolTip())
+        self.continue_button.setToolTip("Ask the GM to expand the latest live-game response.")
 
     def _update_continue_button_state(self) -> None:
         """Enables Continue only when there is a story response to expand."""
@@ -7056,6 +7566,7 @@ class StoryScreen(RepositoryBackedWidget):
         self.continue_button.setEnabled(
             not self._waiting_for_gm
             and not self._combat_active
+            and self._conversation_mode() == "live_game"
             and self.repository() is not None
             and self._latest_story_entry() is not None
         )
@@ -9179,17 +9690,53 @@ class CalendarScreen(RepositoryBackedWidget):
         next_button = QPushButton("Next")
         next_button.clicked.connect(self._show_next_month)
 
+        self.add_event_button = QPushButton("+ Event")
+        self.add_event_button.setToolTip("Add a private player-created calendar event")
+        self.add_event_button.clicked.connect(self._add_player_event)
+        self.add_event_button.setEnabled(False)
+
         self.settings_button = QPushButton("Calendar Settings")
         self.settings_button.clicked.connect(self._open_calendar_settings_dialog)
         self.settings_button.setEnabled(False)
         self.settings_button.setVisible(self.playtesting_tools)
 
-        navigation_row = QHBoxLayout()
-        navigation_row.addWidget(previous_button)
-        navigation_row.addStretch()
-        navigation_row.addWidget(self.settings_button)
-        navigation_row.addWidget(today_button)
-        navigation_row.addWidget(next_button)
+        navigation_left = QWidget()
+        navigation_left_layout = QHBoxLayout(navigation_left)
+        navigation_left_layout.setContentsMargins(0, 0, 0, 0)
+        navigation_left_layout.addWidget(previous_button)
+        navigation_left_layout.addStretch(1)
+
+        navigation_right = QWidget()
+        navigation_actions = QHBoxLayout(navigation_right)
+        navigation_actions.setContentsMargins(0, 0, 0, 0)
+        navigation_actions.addStretch(1)
+        navigation_actions.addWidget(self.settings_button)
+        navigation_actions.addWidget(self.add_event_button)
+        navigation_actions.addWidget(today_button)
+        navigation_actions.addWidget(next_button)
+
+        side_width = max(
+            navigation_left.sizeHint().width(),
+            navigation_right.sizeHint().width(),
+        )
+        navigation_left.setMinimumWidth(side_width)
+        navigation_right.setMinimumWidth(side_width)
+
+        navigation_row = QGridLayout()
+        navigation_row.addWidget(
+            navigation_left,
+            0,
+            0,
+        )
+        navigation_row.addWidget(
+            self.month_label,
+            0,
+            1,
+            alignment=Qt.AlignmentFlag.AlignCenter,
+        )
+        navigation_row.addWidget(navigation_right, 0, 2)
+        navigation_row.setColumnStretch(0, 1)
+        navigation_row.setColumnStretch(2, 1)
 
         self.summary_label = QLabel("-")
         self.summary_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -9224,7 +9771,6 @@ class CalendarScreen(RepositoryBackedWidget):
         month_page = QWidget()
         month_layout = QVBoxLayout()
         month_layout.addLayout(navigation_row)
-        month_layout.addWidget(self.month_label, alignment=Qt.AlignmentFlag.AlignCenter)
         month_layout.addWidget(self.summary_label, alignment=Qt.AlignmentFlag.AlignCenter)
         month_layout.addWidget(self.table)
         month_page.setLayout(month_layout)
@@ -9254,11 +9800,13 @@ class CalendarScreen(RepositoryBackedWidget):
             self.table.setRowCount(0)
             self.table.setColumnCount(0)
             self.settings_button.setEnabled(False)
+            self.add_event_button.setEnabled(False)
             self.year_table.setRowCount(0)
             self.tasks_table.setRowCount(0)
             return
 
         self.settings_button.setEnabled(True)
+        self.add_event_button.setEnabled(True)
         state = StateManager(repository).load_state()
         grid = build_month_grid(state.calendar.to_dict(), self.month_offset)
         calendar_events = repository.list_calendar_events()
@@ -9287,7 +9835,10 @@ class CalendarScreen(RepositoryBackedWidget):
                     int(state.calendar.days_per_month),
                     int(state.calendar.days_per_year),
                 )
-                event_titles = [str(event.get("title", "")) for event in events[:3]]
+                event_titles = [
+                    self._event_display_title(event, state.calendar.settings)
+                    for event in events[:3]
+                ]
                 label = str(day["day_of_month"])
                 if event_titles:
                     label += "\n" + "\n".join(f"• {title}" for title in event_titles)
@@ -9380,14 +9931,53 @@ class CalendarScreen(RepositoryBackedWidget):
         events = item.data(Qt.ItemDataRole.UserRole) if item is not None else []
         if not isinstance(events, list) or not events:
             return
-        body = []
-        for event in events:
-            recurrence = "Repeats yearly" if event.get("recurrence") == "yearly" else f"Year {event.get('year', 1)}"
-            details = str(event.get("details", "") or event.get("description", ""))
-            body.append(
-                f"{event.get('title', 'Event')}\n{event.get('category', 'Event')} · {recurrence}\n{details}"
-            )
-        QMessageBox.information(self, "Calendar Events", "\n\n".join(body))
+        repository = self.repository()
+        if repository is None:
+            return
+        dialog = CalendarDayEventsDialog(
+            repository=repository,
+            events=events,
+            calendar_settings=repository.get_calendar_settings(),
+            parent=self,
+        )
+        dialog.exec()
+        if dialog.changed:
+            self.refresh()
+            self.notify_repository_changed()
+
+    @staticmethod
+    def _event_display_title(
+        event: dict[str, Any],
+        calendar_settings: dict[str, Any],
+    ) -> str:
+        """Returns a compact title prefixed by its time when one is known."""
+
+        title = str(event.get("title", "Event") or "Event")
+        time_label = _calendar_event_time_label(event, calendar_settings)
+        if not time_label:
+            return title
+        return f"{time_label} — {title}"
+
+    def _add_player_event(self) -> None:
+        """Creates a private player-authored event for the viewed month."""
+
+        repository = self.repository()
+        if repository is None:
+            return
+        state = StateManager(repository).load_state()
+        grid = build_month_grid(state.calendar.to_dict(), self.month_offset)
+        dialog = CalendarPlayerEventDialog(
+            calendar_settings=repository.get_calendar_settings(),
+            default_year=int(grid["year"]),
+            default_month=int(grid["month_index"]) + 1,
+            default_day=1,
+            parent=self,
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        repository.upsert_calendar_event(dialog.build_event())
+        self.refresh()
+        self.notify_repository_changed()
 
     def _refresh_year_overview(
         self,
@@ -9488,6 +10078,342 @@ class CalendarScreen(RepositoryBackedWidget):
         self.notify_repository_changed()
 
 
+class CalendarPlayerEventDialog(QDialog):
+    """Editor for a private player-authored calendar event."""
+
+    def __init__(
+        self,
+        *,
+        calendar_settings: dict[str, Any],
+        default_year: int = 1,
+        default_month: int = 1,
+        default_day: int = 1,
+        event: dict[str, Any] | None = None,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Player Calendar Event")
+        self._event = dict(event or {})
+        settings = dict(calendar_settings)
+
+        self.title_input = QLineEdit(str(self._event.get("title", "")))
+        self.category_input = QLineEdit(str(self._event.get("category", "Reminder")))
+
+        self.month_combo = _NoWheelComboBox()
+        month_names = list(settings.get("month_names", []))
+        for index, name in enumerate(month_names):
+            self.month_combo.addItem(str(name), index + 1)
+        selected_month = max(
+            1,
+            _safe_int(self._event.get("month", default_month), default_month),
+        )
+        selected_month_index = self.month_combo.findData(selected_month)
+        if selected_month_index >= 0:
+            self.month_combo.setCurrentIndex(selected_month_index)
+
+        days_per_month = max(
+            1,
+            _safe_int(settings.get("days_per_week", 7), 7)
+            * _safe_int(settings.get("weeks_per_month", 4), 4),
+        )
+        self.day_input = _NoWheelSpinBox()
+        self.day_input.setRange(1, days_per_month)
+        self.day_input.setValue(
+            min(
+                days_per_month,
+                max(1, _safe_int(self._event.get("day", default_day), default_day)),
+            )
+        )
+
+        self.year_input = _NoWheelSpinBox()
+        self.year_input.setRange(1, 999999)
+        self.year_input.setValue(
+            max(1, _safe_int(self._event.get("year", default_year), default_year))
+        )
+
+        time_minutes = _safe_int(self._event.get("time_of_day_minutes", -1), -1)
+        self.all_day_checkbox = QCheckBox("All day / no exact time")
+        self.all_day_checkbox.setChecked(time_minutes < 0)
+        self.hour_input = _NoWheelSpinBox()
+        self.hour_input.setRange(0, 23)
+        self.hour_input.setValue(max(0, time_minutes) // 60)
+        self.minute_input = _NoWheelSpinBox()
+        self.minute_input.setRange(0, 59)
+        self.minute_input.setValue(max(0, time_minutes) % 60)
+        self.all_day_checkbox.toggled.connect(self._sync_time_inputs)
+
+        time_widget = QWidget()
+        time_layout = QHBoxLayout(time_widget)
+        time_layout.setContentsMargins(0, 0, 0, 0)
+        time_layout.addWidget(QLabel("Hour:"))
+        time_layout.addWidget(self.hour_input)
+        time_layout.addWidget(QLabel("Minute:"))
+        time_layout.addWidget(self.minute_input)
+        time_layout.addWidget(self.all_day_checkbox)
+        time_layout.addStretch(1)
+
+        self.recurrence_combo = _NoWheelComboBox()
+        self.recurrence_combo.addItem("One time", "none")
+        self.recurrence_combo.addItem("Every year", "yearly")
+        _set_combo_to_data(
+            self.recurrence_combo,
+            str(self._event.get("recurrence", "none")),
+        )
+
+        self.duration_input = _NoWheelSpinBox()
+        self.duration_input.setRange(1, max(1, days_per_month * len(month_names)))
+        self.duration_input.setValue(
+            max(1, _safe_int(self._event.get("duration_days", 1), 1))
+        )
+
+        self.description_input = QTextEdit()
+        self.description_input.setMaximumHeight(80)
+        self.description_input.setPlainText(str(self._event.get("description", "")))
+        self.details_input = QTextEdit()
+        self.details_input.setMinimumHeight(120)
+        self.details_input.setPlainText(str(self._event.get("details", "")))
+
+        form = QFormLayout()
+        form.addRow("Title:", self.title_input)
+        form.addRow("Category:", self.category_input)
+        form.addRow("Month:", self.month_combo)
+        form.addRow("Day:", self.day_input)
+        form.addRow("Year:", self.year_input)
+        form.addRow("Time:", time_widget)
+        form.addRow("Repeats:", self.recurrence_combo)
+        form.addRow("Duration (days):", self.duration_input)
+        form.addRow("Short summary:", self.description_input)
+        form.addRow("Full details:", self.details_input)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+
+        layout = QVBoxLayout()
+        layout.addWidget(
+            QLabel(
+                "This is a private player reminder. It is saved in the Calendar "
+                "but is not treated as game canon or sent to the A.I."
+            )
+        )
+        layout.addLayout(form)
+        layout.addWidget(buttons)
+        self.setLayout(layout)
+        self.resize(620, 600)
+        self._sync_time_inputs()
+
+    def _sync_time_inputs(self) -> None:
+        """Disables exact time controls for an all-day event."""
+
+        enabled = not self.all_day_checkbox.isChecked()
+        self.hour_input.setEnabled(enabled)
+        self.minute_input.setEnabled(enabled)
+
+    def accept(self) -> None:
+        """Requires a visible title before saving."""
+
+        if not self.title_input.text().strip():
+            QMessageBox.warning(self, "Calendar Event", "Enter a title for this event.")
+            return
+        super().accept()
+
+    def build_event(self) -> dict[str, Any]:
+        """Returns a normalized player-only event payload."""
+
+        event_id = str(self._event.get("event_id", "")).strip()
+        if not event_id:
+            event_id = f"player_{uuid.uuid4().hex}"
+        time_minutes = -1
+        if not self.all_day_checkbox.isChecked():
+            time_minutes = self.hour_input.value() * 60 + self.minute_input.value()
+        return {
+            "event_id": event_id,
+            "title": self.title_input.text().strip(),
+            "description": self.description_input.toPlainText().strip(),
+            "category": self.category_input.text().strip() or "Reminder",
+            "month": int(self.month_combo.currentData() or 1),
+            "day": self.day_input.value(),
+            "duration_days": self.duration_input.value(),
+            "recurrence": str(self.recurrence_combo.currentData() or "none"),
+            "year": self.year_input.value(),
+            "time_of_day_minutes": time_minutes,
+            "importance": "",
+            "details": self.details_input.toPlainText().strip(),
+            "origin": "player",
+        }
+
+
+class CalendarDayEventsDialog(QDialog):
+    """Detailed day view with safe editing for player-authored events only."""
+
+    def __init__(
+        self,
+        *,
+        repository: SaveRepository,
+        events: list[dict[str, Any]],
+        calendar_settings: dict[str, Any],
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Calendar Events")
+        self.repository = repository
+        self.events = [dict(event) for event in events]
+        self.calendar_settings = dict(calendar_settings)
+        self.changed = False
+
+        self.event_list = QListWidget()
+        self.event_list.currentItemChanged.connect(self._show_selected_event)
+        self.details_output = QTextEdit()
+        self.details_output.setReadOnly(True)
+
+        self.edit_button = QPushButton("Edit Personal Event")
+        self.edit_button.clicked.connect(self._edit_selected_event)
+        self.delete_button = QPushButton("Delete Personal Event")
+        self.delete_button.clicked.connect(self._delete_selected_event)
+        close_button = QPushButton("Close")
+        close_button.clicked.connect(self.accept)
+
+        actions = QHBoxLayout()
+        actions.addWidget(self.edit_button)
+        actions.addWidget(self.delete_button)
+        actions.addStretch(1)
+        actions.addWidget(close_button)
+
+        layout = QVBoxLayout()
+        layout.addWidget(self.event_list)
+        layout.addWidget(self.details_output, 1)
+        layout.addLayout(actions)
+        self.setLayout(layout)
+        self.resize(680, 500)
+        self._reload_events()
+
+    def _reload_events(self, selected_event_id: str = "") -> None:
+        """Reloads event choices after a personal event changes."""
+
+        self.event_list.clear()
+        selected_row = 0
+        for row, event in enumerate(self.events):
+            time_label = _calendar_event_time_label(event, self.calendar_settings)
+            title = str(event.get("title", "Event"))
+            label = f"{time_label} — {title}" if time_label else title
+            if str(event.get("origin", "game")) == "player":
+                label += "  [Personal]"
+            item = QListWidgetItem(label)
+            item.setData(Qt.ItemDataRole.UserRole, event)
+            self.event_list.addItem(item)
+            if str(event.get("event_id", "")) == selected_event_id:
+                selected_row = row
+        if self.event_list.count():
+            self.event_list.setCurrentRow(selected_row)
+        else:
+            self.details_output.clear()
+            self.edit_button.setEnabled(False)
+            self.delete_button.setEnabled(False)
+
+    def _selected_event(self) -> dict[str, Any] | None:
+        """Returns the event attached to the selected list row."""
+
+        item = self.event_list.currentItem()
+        value = item.data(Qt.ItemDataRole.UserRole) if item is not None else None
+        return dict(value) if isinstance(value, dict) else None
+
+    def _show_selected_event(self) -> None:
+        """Shows all player-facing details for the selected event."""
+
+        event = self._selected_event()
+        if event is None:
+            self.details_output.clear()
+            return
+        personal = str(event.get("origin", "game")) == "player"
+        self.edit_button.setEnabled(personal)
+        self.delete_button.setEnabled(personal)
+        recurrence = (
+            "Repeats every year"
+            if event.get("recurrence") == "yearly"
+            else f"Year {event.get('year', 1)}"
+        )
+        time_label = _calendar_event_time_label(event, self.calendar_settings) or "All day"
+        sections = [
+            str(event.get("title", "Event")),
+            (
+                f"{event.get('category', 'Event')} · Month {event.get('month', 1)}, "
+                f"Day {event.get('day', 1)} · {time_label} · {recurrence}"
+            ),
+        ]
+        description = str(event.get("description", "")).strip()
+        details = str(event.get("details", "")).strip()
+        if description:
+            sections.append(description)
+        if details and details != description:
+            sections.append(details)
+        self.details_output.setPlainText("\n\n".join(sections))
+
+    def _edit_selected_event(self) -> None:
+        """Edits only a player-authored event."""
+
+        event = self._selected_event()
+        if event is None or str(event.get("origin", "game")) != "player":
+            return
+        dialog = CalendarPlayerEventDialog(
+            calendar_settings=self.calendar_settings,
+            event=event,
+            parent=self,
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        updated = self.repository.upsert_calendar_event(dialog.build_event())
+        if updated is None:
+            return
+        event_id = str(updated["event_id"])
+        self.events = [
+            updated if str(candidate.get("event_id", "")) == event_id else candidate
+            for candidate in self.events
+        ]
+        self.changed = True
+        self._reload_events(event_id)
+
+    def _delete_selected_event(self) -> None:
+        """Deletes only a player-authored event after confirmation."""
+
+        event = self._selected_event()
+        if event is None or str(event.get("origin", "game")) != "player":
+            return
+        if QMessageBox.question(
+            self,
+            "Delete Personal Event",
+            f"Delete '{event.get('title', 'this event')}'?",
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        event_id = str(event.get("event_id", ""))
+        if not self.repository.delete_calendar_event(event_id):
+            return
+        self.events = [
+            candidate
+            for candidate in self.events
+            if str(candidate.get("event_id", "")) != event_id
+        ]
+        self.changed = True
+        self._reload_events()
+
+
+def _calendar_event_time_label(
+    event: dict[str, Any],
+    calendar_settings: dict[str, Any],
+) -> str:
+    """Formats an exact event time without reducing it to a narrative day part."""
+
+    time_minutes = _safe_int(event.get("time_of_day_minutes", -1), -1)
+    if time_minutes < 0:
+        return ""
+    display_mode = str(calendar_settings.get("time_display", "12_hour"))
+    if display_mode == "narrative":
+        display_mode = "12_hour"
+    return format_time_of_day(time_minutes, display_mode)
+
+
 class CalendarSettingsDialog(QDialog):
     """Dialog for editing save-specific calendar settings."""
 
@@ -9583,8 +10509,335 @@ class CalendarSettingsDialog(QDialog):
         }
 
 
+class InventoryItemDetailsDialog(QDialog):
+    """Application-modal view of one inventory item's player-facing details."""
+
+    def __init__(
+        self,
+        *,
+        item: dict[str, Any],
+        catalog_entry: dict[str, Any] | None,
+        denominations: list[dict[str, Any]],
+        show_structured_details: bool = False,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        quantity = max(0, _safe_int(item.get("quantity", 0), 0))
+        quantity_unit = str(item.get("quantity_unit", "each") or "each")
+        name = _inventory_item_display_name(
+            item.get("name", "Unnamed Item"),
+            quantity,
+            quantity_unit,
+        )
+        self.setWindowTitle(name)
+        self.setModal(True)
+        self.setWindowModality(Qt.WindowModality.ApplicationModal)
+        self.setMinimumSize(520, 520 if show_structured_details else 440)
+
+        title = QLabel(name)
+        title.setObjectName("inventoryItemDetailTitle")
+        title.setStyleSheet("font-size: 20px; font-weight: 700;")
+
+        ascii_art = normalize_ascii_art(
+            (catalog_entry or {}).get("ascii_art", "")
+            or item.get("ascii_art", "")
+            or ""
+        )
+        art_view = QPlainTextEdit()
+        art_view.setObjectName("inventoryAsciiArt")
+        art_view.setReadOnly(True)
+        art_view.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        art_view.setPlainText(
+            ascii_art
+            or "No ASCII art was saved for this item."
+        )
+        art_cursor = art_view.textCursor()
+        art_cursor.select(QTextCursor.SelectionType.Document)
+        art_format = QTextBlockFormat()
+        art_format.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        art_cursor.mergeBlockFormat(art_format)
+        art_cursor.clearSelection()
+        art_view.setTextCursor(art_cursor)
+        art_view.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        art_view.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        art_view.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        art_view.setStyleSheet(
+            "font-family: Consolas, 'Courier New', monospace; padding: 8px;"
+        )
+        art_width, art_height = _size_ascii_art_view(art_view, art_view.toPlainText())
+
+        storage_location = _inventory_location_label(
+            item.get("storage_location", "actively_carried")
+        )
+        summary = QFormLayout()
+        summary.addRow("Category:", _selectable_label(item.get("category", "")))
+        summary.addRow(
+            "Quantity:",
+            _selectable_label(_inventory_quantity_display(quantity, quantity_unit)),
+        )
+        summary.addRow("Stored at:", _selectable_label(storage_location))
+        summary.addRow(
+            "Value:",
+            _selectable_label(
+                format_currency_amount(
+                    max(0, _safe_int(item.get("value_base_units", 0), 0)),
+                    denominations,
+                )
+            ),
+        )
+        if any(item_is_valid_for_slot(item, slot) for slot in EQUIPMENT_SLOTS):
+            summary.addRow(
+                "Equipped:",
+                _selectable_label("Yes" if item.get("equipped") else "No"),
+            )
+
+        description = QTextEdit()
+        description.setReadOnly(True)
+        description.setPlainText(str(item.get("description", "")) or "No description.")
+        description.setMaximumHeight(100)
+
+        metadata_view: QPlainTextEdit | None = None
+        catalog_form: QFormLayout | None = None
+        if show_structured_details:
+            metadata = dict((catalog_entry or {}).get("metadata", {}))
+            inventory_metadata = item.get("metadata", {})
+            if isinstance(inventory_metadata, dict):
+                metadata.update(inventory_metadata)
+            metadata.pop("ascii_art", None)
+            metadata_view = QPlainTextEdit()
+            metadata_view.setObjectName("inventoryStructuredDetails")
+            metadata_view.setReadOnly(True)
+            metadata_view.setPlainText(
+                json.dumps(metadata, indent=2, ensure_ascii=False, sort_keys=True)
+                if metadata
+                else "No additional item details."
+            )
+
+        if show_structured_details and catalog_entry is not None:
+            catalog_form = QFormLayout()
+            catalog_form.addRow(
+                "First created:",
+                _selectable_label(catalog_entry.get("first_seen_at", "")),
+            )
+            catalog_form.addRow(
+                "Last updated:",
+                _selectable_label(catalog_entry.get("updated_at", "")),
+            )
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        buttons.rejected.connect(self.reject)
+
+        layout = QVBoxLayout()
+        layout.addWidget(title)
+        layout.addWidget(art_view, 0, Qt.AlignmentFlag.AlignHCenter)
+        layout.addLayout(summary)
+        layout.addWidget(QLabel("Description"))
+        layout.addWidget(description)
+        if metadata_view is not None:
+            metadata_label = QLabel("All Structured Details")
+            metadata_label.setObjectName("inventoryStructuredDetailsLabel")
+            layout.addWidget(metadata_label)
+            layout.addWidget(metadata_view, 1)
+        if catalog_form is not None:
+            layout.addLayout(catalog_form)
+        layout.addWidget(buttons)
+        self.setLayout(layout)
+        self.resize(
+            max(560, art_width + 48),
+            min(
+                900,
+                max(
+                    580 if show_structured_details else 500,
+                    (500 if show_structured_details else 360) + art_height,
+                ),
+            ),
+        )
+
+
+_INVENTORY_INVARIANT_PLURALS = {
+    "ammunition",
+    "armor",
+    "clothing",
+    "equipment",
+    "food",
+    "footwear",
+    "information",
+    "oil",
+    "pants",
+    "rice",
+    "scissors",
+    "trousers",
+    "water",
+}
+_INVENTORY_UNIT_ABBREVIATIONS = {
+    "cl",
+    "cm",
+    "ft",
+    "g",
+    "gal",
+    "in",
+    "kg",
+    "l",
+    "lb",
+    "lbs",
+    "ml",
+    "mm",
+    "oz",
+    "tbsp",
+    "tsp",
+}
+_INVENTORY_IRREGULAR_PLURALS = {
+    "child": "children",
+    "foot": "feet",
+    "goose": "geese",
+    "knife": "knives",
+    "leaf": "leaves",
+    "loaf": "loaves",
+    "man": "men",
+    "mouse": "mice",
+    "person": "people",
+    "tooth": "teeth",
+    "woman": "women",
+    "wolf": "wolves",
+}
+
+
+def _pluralize_inventory_phrase(value: Any, *, unit: bool = False) -> str:
+    """Pluralizes the final word of a player-facing inventory label."""
+
+    text = " ".join(str(value or "").strip().split())
+    if not text:
+        return text
+    prefix, separator, word = text.rpartition(" ")
+    leading = f"{prefix}{separator}" if separator else ""
+    folded = word.casefold()
+    if folded in _INVENTORY_INVARIANT_PLURALS:
+        return text
+    if unit and folded in _INVENTORY_UNIT_ABBREVIATIONS:
+        return text
+    irregular = _INVENTORY_IRREGULAR_PLURALS.get(folded)
+    if irregular is not None:
+        plural = irregular
+    elif folded.endswith("s") and not folded.endswith(("ss", "us", "is")):
+        return text
+    elif folded.endswith("y") and len(word) > 1 and folded[-2] not in "aeiou":
+        plural = f"{word[:-1]}ies"
+    elif folded.endswith(("s", "x", "z", "ch", "sh")):
+        plural = f"{word}es"
+    else:
+        plural = f"{word}s"
+    if word.isupper():
+        plural = plural.upper()
+    elif word[:1].isupper():
+        plural = plural[:1].upper() + plural[1:]
+    return f"{leading}{plural}"
+
+
+def _inventory_quantity_display(quantity: Any, quantity_unit: Any) -> str:
+    """Formats an inventory amount as xN, omitting the implied `each` unit."""
+
+    count = max(0, _safe_int(quantity, 0))
+    unit = " ".join(str(quantity_unit or "each").strip().split()) or "each"
+    if unit.casefold() == "each":
+        return f"x{count}"
+    display_unit = (
+        _pluralize_inventory_phrase(unit, unit=True)
+        if count != 1
+        else unit
+    )
+    return f"x{count} {display_unit}"
+
+
+def _inventory_item_display_name(name: Any, quantity: Any, quantity_unit: Any) -> str:
+    """Pluralizes countable item names for multi-item `each` stacks."""
+
+    clean_name = str(name or "Unnamed Item").strip() or "Unnamed Item"
+    count = max(0, _safe_int(quantity, 0))
+    unit = str(quantity_unit or "each").strip().casefold() or "each"
+    if count > 1 and unit == "each":
+        return _pluralize_inventory_phrase(clean_name)
+    return clean_name
+
+
+class InventoryLocationPanel(QGroupBox):
+    """Compact list of inventory items stored at one free-text location."""
+
+    def __init__(
+        self,
+        location: str,
+        items: list[dict[str, Any]],
+        on_item_clicked: Callable[[dict[str, Any]], None],
+    ) -> None:
+        super().__init__(f"{_inventory_location_label(location)} ({len(items)})")
+        self.location = location
+        self.item_buttons: list[QPushButton] = []
+        layout = QVBoxLayout()
+
+        for item in sorted(
+            items,
+            key=lambda candidate: str(candidate.get("name", "")).casefold(),
+        ):
+            quantity = max(0, _safe_int(item.get("quantity", 0), 0))
+            unit = str(item.get("quantity_unit", "each") or "each")
+            category = str(item.get("category", "Item") or "Item")
+            display_name = _inventory_item_display_name(
+                item.get("name", "Unnamed Item"),
+                quantity,
+                unit,
+            )
+            display_quantity = _inventory_quantity_display(quantity, unit)
+            button = QPushButton(
+                f"{display_name}\n{display_quantity}  ·  {category}"
+            )
+            button.setObjectName("inventoryItemButton")
+            button.setMinimumHeight(52)
+            button.setToolTip("Open all item details")
+            button.clicked.connect(
+                lambda _checked=False, selected=dict(item): on_item_clicked(selected)
+            )
+            layout.addWidget(button)
+            self.item_buttons.append(button)
+
+        layout.addStretch(1)
+        self.setLayout(layout)
+
+
+def _selectable_label(value: Any) -> QLabel:
+    """Creates a selectable, wrapping value label for a detail form."""
+
+    label = QLabel(str(value or "—"))
+    label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+    label.setWordWrap(True)
+    return label
+
+
+def _size_ascii_art_view(view: QPlainTextEdit, ascii_art: str) -> tuple[int, int]:
+    """Sizes a centered fixed-width art field from its longest line and line count."""
+
+    lines = ascii_art.splitlines() or [ascii_art]
+    metrics = QFontMetrics(view.font())
+    longest_line_width = max(
+        (metrics.horizontalAdvance(line) for line in lines),
+        default=0,
+    )
+    width = max(280, min(900, longest_line_width + 40))
+    height = max(64, min(360, (len(lines) * metrics.lineSpacing()) + 28))
+    view.setFixedSize(width, height)
+    return width, height
+
+
+def _inventory_location_label(value: Any) -> str:
+    """Returns a player-facing label without collapsing custom storage names."""
+
+    location = " ".join(str(value or "actively_carried").strip().split())
+    if location.casefold() == "actively_carried":
+        return "Actively Carried"
+    if location.casefold() == "home":
+        return "Home"
+    return location or "Actively Carried"
+
+
 class InventoryScreen(RepositoryBackedWidget):
-    """Read-only inventory journal."""
+    """Location-grouped inventory journal with modal item details."""
 
     def __init__(self, *, playtesting_tools: bool = False) -> None:
         super().__init__()
@@ -9592,26 +10845,29 @@ class InventoryScreen(RepositoryBackedWidget):
         self.playtesting_tools = bool(playtesting_tools)
         self._selected_item_name = ""
         self._loading_item_editor = False
-        self._sort_column = 0
-        self._sort_order = Qt.SortOrder.AscendingOrder
-        self.table = _AppTableWidget(0, 7)
-        self.table.setHorizontalHeaderLabels(
-            ["Name", "Category", "Quantity", "Unit", "Storage", "Value", "Description"]
-        )
-        self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
-        _configure_wrapping_table(self.table, {4})
-        _enable_table_sorting(self.table, self._sort_by_column)
-        self.table.horizontalHeader().setSortIndicator(self._sort_column, self._sort_order)
+        self._inventory_items: dict[str, dict[str, Any]] = {}
+        self._catalog_by_name: dict[str, dict[str, Any]] = {}
+        self._denominations: list[dict[str, Any]] = []
+        self.location_panels: list[InventoryLocationPanel] = []
         self.currency_label = QLabel("Currency: 0")
+
+        self.inventory_scroll = QScrollArea()
+        self.inventory_scroll.setWidgetResizable(True)
+        self.inventory_scroll.setObjectName("inventoryLocationScroll")
+        self.inventory_panel_host = QWidget()
+        self.inventory_panel_layout = QGridLayout()
+        self.inventory_panel_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+        self.inventory_panel_layout.setHorizontalSpacing(14)
+        self.inventory_panel_layout.setVerticalSpacing(14)
+        self.inventory_panel_host.setLayout(self.inventory_panel_layout)
+        self.inventory_scroll.setWidget(self.inventory_panel_host)
 
         layout = QVBoxLayout()
         layout.addWidget(QLabel("Inventory"))
         layout.addWidget(self.currency_label)
-        layout.addWidget(self.table)
+        layout.addWidget(self.inventory_scroll, 1)
 
         if self.playtesting_tools:
-            self.table.itemSelectionChanged.connect(self._load_selected_item)
             layout.addWidget(self._build_playtesting_item_editor())
 
         self.setLayout(layout)
@@ -9730,17 +10986,32 @@ class InventoryScreen(RepositoryBackedWidget):
         return editor
 
     def refresh(self) -> None:
-        """Reloads inventory table."""
+        """Reloads the location panels and their item buttons."""
 
         repository = self.repository()
 
         if repository is None:
             self.currency_label.setText("Currency: 0")
-            self.table.setRowCount(0)
+            self._inventory_items.clear()
+            self._catalog_by_name.clear()
+            self._replace_location_panels({})
             return
 
         items = repository.list_inventory_items()
         denominations = repository.get_currency_denominations()
+        self._denominations = denominations
+        catalog = repository.list_item_catalog()
+        self._catalog_by_name = {
+            str(entry.get("name", "")).casefold(): entry
+            for entry in catalog
+            if str(entry.get("name", "")).strip()
+        }
+        catalog_by_uuid = {
+            str(entry.get("metadata", {}).get("item_uuid", "")): entry
+            for entry in catalog
+            if isinstance(entry.get("metadata"), dict)
+            and str(entry.get("metadata", {}).get("item_uuid", "")).strip()
+        }
         balance_base_units = _safe_int(
             repository.get_state_value("currency.balance", "0"),
             0,
@@ -9748,46 +11019,90 @@ class InventoryScreen(RepositoryBackedWidget):
         self.currency_label.setText(
             f"Currency: {format_currency_amount(balance_base_units, denominations)}"
         )
-        items.sort(
-            key=self._sort_key,
-            reverse=_sort_descending(self._sort_order),
-        )
-        self.table.setRowCount(len(items))
-
-        for row_index, item in enumerate(items):
-            self.table.setItem(row_index, 0, _table_item(str(item.get("name", ""))))
-            self.table.setItem(row_index, 1, _table_item(str(item.get("category", ""))))
-            quantity = int(item.get("quantity", 0))
-            value_base_units = int(item.get("value_base_units", 0))
-            self.table.setItem(row_index, 2, _table_item(str(quantity), quantity))
-            self.table.setItem(row_index, 3, _table_item(str(item.get("quantity_unit", "each"))))
-            storage = str(item.get("storage_location", "actively_carried"))
-            self.table.setItem(row_index, 4, _table_item("Home" if storage == "home" else "Actively Carried"))
-            self.table.setItem(
-                row_index,
-                5,
-                _table_item(
-                    format_currency_amount(
-                        value_base_units,
-                        denominations,
-                    ),
-                    value_base_units,
-                ),
+        grouped_items: dict[str, list[dict[str, Any]]] = {}
+        self._inventory_items = {}
+        for raw_item in items:
+            item = dict(raw_item)
+            metadata = item.get("metadata", {})
+            item_uuid = (
+                str(metadata.get("item_uuid", ""))
+                if isinstance(metadata, dict)
+                else ""
             )
-            self.table.setItem(row_index, 6, _table_item(str(item.get("description", ""))))
+            item["catalog_entry"] = (
+                catalog_by_uuid.get(item_uuid)
+                or self._catalog_by_name.get(str(item.get("name", "")).casefold())
+            )
+            name = str(item.get("name", ""))
+            if name:
+                self._inventory_items[name.casefold()] = item
+            location = " ".join(
+                str(item.get("storage_location", "actively_carried") or "actively_carried")
+                .strip()
+                .split()
+            )[:120] or "actively_carried"
+            grouped_items.setdefault(location, []).append(item)
 
-        _resize_wrapping_table_rows(self.table)
+        self._replace_location_panels(grouped_items)
 
-        if self.playtesting_tools and self._selected_item_name:
-            for row_index in range(self.table.rowCount()):
-                item = self.table.item(row_index, 0)
+    def _replace_location_panels(
+        self,
+        grouped_items: dict[str, list[dict[str, Any]]],
+    ) -> None:
+        """Rebuilds the modular location-card grid."""
 
-                if (
-                    item is not None
-                    and item.text().casefold() == self._selected_item_name.casefold()
-                ):
-                    self.table.selectRow(row_index)
-                    break
+        while self.inventory_panel_layout.count():
+            layout_item = self.inventory_panel_layout.takeAt(0)
+            if layout_item is None:
+                continue
+            widget = layout_item.widget()
+            if widget is not None:
+                widget.deleteLater()
+
+        self.location_panels.clear()
+        if not grouped_items:
+            empty_label = QLabel("No inventory items are currently stored.")
+            empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.inventory_panel_layout.addWidget(empty_label, 0, 0, 1, 4)
+            return
+
+        def location_key(location: str) -> tuple[int, str]:
+            folded = location.casefold()
+            priority = 0 if folded == "actively_carried" else 1 if folded == "home" else 2
+            return priority, folded
+
+        ordered_locations = sorted(grouped_items, key=location_key)
+        location_count = len(ordered_locations)
+        for index, location in enumerate(ordered_locations):
+            panel = InventoryLocationPanel(
+                location,
+                grouped_items[location],
+                self._open_item_details,
+            )
+            is_unpaired_final_panel = location_count % 2 == 1 and index == location_count - 1
+            column = 1 if is_unpaired_final_panel else (0 if index % 2 == 0 else 2)
+            self.inventory_panel_layout.addWidget(panel, index // 2, column, 1, 2)
+            self.location_panels.append(panel)
+
+        for column in range(4):
+            self.inventory_panel_layout.setColumnStretch(column, 1)
+
+    def _open_item_details(self, item: dict[str, Any]) -> None:
+        """Opens one blocking item-detail dialog and primes playtesting edits."""
+
+        selected_name = str(item.get("name", ""))
+        self._selected_item_name = selected_name
+        if self.playtesting_tools:
+            self._load_selected_item(selected_name)
+        catalog_entry = item.get("catalog_entry")
+        dialog = InventoryItemDetailsDialog(
+            item=item,
+            catalog_entry=catalog_entry if isinstance(catalog_entry, dict) else None,
+            denominations=self._denominations,
+            show_structured_details=self.playtesting_tools,
+            parent=self,
+        )
+        dialog.exec()
 
     def _sync_item_editor_type(self) -> None:
         """Shows metadata fields for the selected playtesting item type."""
@@ -9797,28 +11112,19 @@ class InventoryScreen(RepositoryBackedWidget):
         self.armor_group.setVisible(item_type == "Armor")
         self.ammunition_group.setVisible(item_type == "Ammunition")
 
-    def _load_selected_item(self) -> None:
-        """Loads the selected inventory row into the playtesting editor."""
+    def _load_selected_item(self, selected_name: str | None = None) -> None:
+        """Loads one clicked inventory item into the playtesting editor."""
 
         if not self.playtesting_tools or self._loading_item_editor:
             return
 
-        row_index = self.table.currentRow()
-        name_item = self.table.item(row_index, 0) if row_index >= 0 else None
         repository = self.repository()
 
-        if name_item is None or repository is None:
+        selected_name = str(selected_name or self._selected_item_name).strip()
+        if not selected_name or repository is None:
             return
 
-        selected_name = name_item.text()
-        selected_item = next(
-            (
-                item
-                for item in repository.list_inventory_items()
-                if str(item.get("name", "")).casefold() == selected_name.casefold()
-            ),
-            None,
-        )
+        selected_item = self._inventory_items.get(selected_name.casefold())
 
         if selected_item is None:
             return
@@ -9994,8 +11300,6 @@ class InventoryScreen(RepositoryBackedWidget):
         self._loading_item_editor = True
 
         try:
-            self.table.clearSelection()
-            self.table.setCurrentCell(-1, -1)
             self.item_name_input.clear()
             _set_combo_to_data(self.item_type_combo, "Item")
             self.item_quantity_input.setValue(1)
@@ -10016,43 +11320,6 @@ class InventoryScreen(RepositoryBackedWidget):
         finally:
             self._loading_item_editor = False
 
-    def _sort_by_column(self, column_index: int) -> None:
-        """Sorts inventory by a clicked header column."""
-
-        self._sort_column, self._sort_order = _update_sort_state(
-            self.table,
-            self._sort_column,
-            self._sort_order,
-            column_index,
-        )
-        self.refresh()
-
-    def _sort_key(self, item: dict[str, Any]) -> tuple[Any, str]:
-        """Returns the active inventory sort key."""
-
-        name = str(item.get("name", "")).casefold()
-
-        if self._sort_column == 1:
-            return str(item.get("category", "")).casefold(), name
-
-        if self._sort_column == 2:
-            return _safe_int(item.get("quantity", 0), 0), name
-
-        if self._sort_column == 3:
-            return str(item.get("quantity_unit", "each")).casefold(), name
-
-        if self._sort_column == 4:
-            return str(item.get("storage_location", "actively_carried")).casefold(), name
-
-        if self._sort_column == 5:
-            return _safe_int(item.get("value_base_units", 0), 0), name
-
-        if self._sort_column == 6:
-            return str(item.get("description", "")).casefold(), name
-
-        return name, name
-
-
 class NpcsScreen(RepositoryBackedWidget):
     """Player-facing NPC journal."""
 
@@ -10070,11 +11337,7 @@ class NpcsScreen(RepositoryBackedWidget):
         _enable_table_sorting(self.table, self._sort_by_column)
         self.table.horizontalHeader().setSortIndicator(self._sort_column, self._sort_order)
 
-        refresh_button = QPushButton("Refresh")
-        refresh_button.clicked.connect(self.refresh)
-
         layout = QVBoxLayout()
-        layout.addWidget(refresh_button)
         layout.addWidget(self.table)
 
         self.setLayout(layout)
@@ -10380,9 +11643,12 @@ class AlchemyNotebookScreen(RepositoryBackedWidget):
     def _setup_reagents_tab(self) -> None:
         """Builds the structured useful item/material discovery tab."""
 
-        self.reagent_table = _AppTableWidget(0, 5)
+        self.reagent_table = _AppTableWidget(0, 7)
         self.reagent_table.setHorizontalHeaderLabels(
-            ["Name", "Category", "Description", "Location", "Uses"]
+            [
+                "Name", "Category", "Description", "Typical Areas", "Uses",
+                "Estimated Value", "Notes",
+            ]
         )
         self.reagent_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.reagent_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
@@ -10393,7 +11659,7 @@ class AlchemyNotebookScreen(RepositoryBackedWidget):
             self._reagent_sort_column,
             self._reagent_sort_order,
         )
-        _configure_wrapping_table(self.reagent_table, {2, 3, 4})
+        _configure_wrapping_table(self.reagent_table, {2, 3, 4, 6})
         self.reagent_table.itemSelectionChanged.connect(self._load_selected_reagent)
 
         self.reagent_name_input = QLineEdit()
@@ -10404,11 +11670,23 @@ class AlchemyNotebookScreen(RepositoryBackedWidget):
         self.reagent_description_input = QLineEdit()
         self.reagent_description_input.setPlaceholderText("Short description")
         self.reagent_location_input = QLineEdit()
-        self.reagent_location_input.setPlaceholderText("Where this item or material is found")
+        self.reagent_location_input.setPlaceholderText(
+            "General areas, e.g. Forests, Caves"
+        )
         self.reagent_uses_input = QLineEdit()
         self.reagent_uses_input.setPlaceholderText(
             "Generalized symptoms/effects, e.g. sleep aid, pain relief"
         )
+        self.reagent_rarity_combo = _NoWheelComboBox()
+        for rarity in CRAFTING_ITEM_RARITIES:
+            self.reagent_rarity_combo.addItem(rarity, rarity)
+        self.reagent_value_input = _NoWheelSpinBox()
+        self.reagent_value_input.setRange(0, 999_999_999)
+        self.reagent_notes_input = QTextEdit()
+        self.reagent_notes_input.setPlaceholderText(
+            "Rarity is added automatically; include other useful player notes here."
+        )
+        self.reagent_notes_input.setMaximumHeight(80)
 
         save_button = QPushButton("Add / Update Item")
         save_button.clicked.connect(self._save_reagent)
@@ -10424,8 +11702,11 @@ class AlchemyNotebookScreen(RepositoryBackedWidget):
         form.addRow("Name:", self.reagent_name_input)
         form.addRow("Category:", self.reagent_category_combo)
         form.addRow("Description:", self.reagent_description_input)
-        form.addRow("Location:", self.reagent_location_input)
+        form.addRow("Typical Areas:", self.reagent_location_input)
         form.addRow("Uses:", self.reagent_uses_input)
+        form.addRow("Rarity:", self.reagent_rarity_combo)
+        form.addRow("Estimated Value (base units):", self.reagent_value_input)
+        form.addRow("Notes:", self.reagent_notes_input)
         form.addRow(button_row)
 
         form_widget = QWidget()
@@ -10443,9 +11724,9 @@ class AlchemyNotebookScreen(RepositoryBackedWidget):
     def _setup_recipes_tab(self) -> None:
         """Builds the structured recipe discovery tab."""
 
-        self.recipe_table = _AppTableWidget(0, 5)
+        self.recipe_table = _AppTableWidget(0, 4)
         self.recipe_table.setHorizontalHeaderLabels(
-            ["Name", "Ingredients", "Result", "Estimated Value", "Notes"]
+            ["Name", "Ingredients", "Estimated Value", "Notes"]
         )
         self.recipe_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         _enable_table_sorting(self.recipe_table, self._sort_recipes_by_column)
@@ -10453,7 +11734,7 @@ class AlchemyNotebookScreen(RepositoryBackedWidget):
             self._recipe_sort_column,
             self._recipe_sort_order,
         )
-        _configure_wrapping_table(self.recipe_table, {1, 2, 4})
+        _configure_wrapping_table(self.recipe_table, {1, 3})
         self.recipe_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.recipe_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
         _allow_selected_row_deselection(self.recipe_table)
@@ -10593,6 +11874,7 @@ class AlchemyNotebookScreen(RepositoryBackedWidget):
         """Reloads the known crafting item/material table."""
 
         reagents = repository.list_crafting_items()
+        denominations = repository.get_currency_denominations()
         selected_name = self.reagent_name_input.text().strip()
         reagents.sort(
             key=self._reagent_sort_key,
@@ -10609,6 +11891,20 @@ class AlchemyNotebookScreen(RepositoryBackedWidget):
             self.reagent_table.setItem(row_index, 2, _table_item(str(reagent.get("description", ""))))
             self.reagent_table.setItem(row_index, 3, _table_item(str(reagent.get("location", ""))))
             self.reagent_table.setItem(row_index, 4, _table_item(_join_list(reagent.get("uses", []))))
+            value_base_units = _safe_int(reagent.get("value_base_units", 0), 0)
+            self.reagent_table.setItem(
+                row_index,
+                5,
+                _table_item(
+                    format_currency_amount(value_base_units, denominations),
+                    value_base_units,
+                ),
+            )
+            self.reagent_table.setItem(
+                row_index,
+                6,
+                _table_item(str(reagent.get("notes", ""))),
+            )
 
         _resize_wrapping_table_rows(self.reagent_table)
         self._refreshing_reagents = False
@@ -10636,17 +11932,16 @@ class AlchemyNotebookScreen(RepositoryBackedWidget):
         for row_index, recipe in enumerate(recipes):
             self.recipe_table.setItem(row_index, 0, _table_item(str(recipe.get("name", ""))))
             self.recipe_table.setItem(row_index, 1, _table_item(format_recipe_ingredients(recipe.get("ingredients", []))))
-            self.recipe_table.setItem(row_index, 2, _table_item(str(recipe.get("result", ""))))
             value_base_units = _safe_int(recipe.get("value_base_units", 0), 0)
             self.recipe_table.setItem(
                 row_index,
-                3,
+                2,
                 _table_item(
                     format_currency_amount(value_base_units, denominations),
                     value_base_units,
                 ),
             )
-            self.recipe_table.setItem(row_index, 4, _table_item(str(recipe.get("notes", ""))))
+            self.recipe_table.setItem(row_index, 3, _table_item(str(recipe.get("notes", ""))))
 
         _resize_wrapping_table_rows(self.recipe_table)
         self._update_recipe_craftability()
@@ -10733,6 +12028,9 @@ class AlchemyNotebookScreen(RepositoryBackedWidget):
             description=self.reagent_description_input.text(),
             location=self.reagent_location_input.text(),
             uses=_split_list(self.reagent_uses_input.text()),
+            rarity=str(self.reagent_rarity_combo.currentData() or "Common"),
+            notes=self.reagent_notes_input.toPlainText(),
+            value_base_units=self.reagent_value_input.value(),
         )
 
         self.reagent_name_input.clear()
@@ -10740,6 +12038,9 @@ class AlchemyNotebookScreen(RepositoryBackedWidget):
         self.reagent_description_input.clear()
         self.reagent_location_input.clear()
         self.reagent_uses_input.clear()
+        self.reagent_rarity_combo.setCurrentIndex(0)
+        self.reagent_value_input.setValue(0)
+        self.reagent_notes_input.clear()
 
         self.refresh()
         self.notify_repository_changed()
@@ -10767,6 +12068,14 @@ class AlchemyNotebookScreen(RepositoryBackedWidget):
         self.reagent_description_input.setText(str(reagent.get("description", "")))
         self.reagent_location_input.setText(str(reagent.get("location", "")))
         self.reagent_uses_input.setText(_join_list(reagent.get("uses", [])))
+        _set_combo_to_data(
+            self.reagent_rarity_combo,
+            str(reagent.get("rarity", "Common")),
+        )
+        self.reagent_value_input.setValue(
+            max(0, _safe_int(reagent.get("value_base_units", 0), 0))
+        )
+        self.reagent_notes_input.setPlainText(str(reagent.get("notes", "")))
 
     def _clear_reagent_form(self) -> None:
         """Clears item edit controls and table selection."""
@@ -10777,6 +12086,9 @@ class AlchemyNotebookScreen(RepositoryBackedWidget):
         self.reagent_description_input.clear()
         self.reagent_location_input.clear()
         self.reagent_uses_input.clear()
+        self.reagent_rarity_combo.setCurrentIndex(0)
+        self.reagent_value_input.setValue(0)
+        self.reagent_notes_input.clear()
 
     def _refresh_recipe_reagent_choices(self, repository: SaveRepository) -> None:
         """Reloads the category-filtered item dropdown used by recipe ingredients."""
@@ -11039,6 +12351,12 @@ class AlchemyNotebookScreen(RepositoryBackedWidget):
         if self._reagent_sort_column == 4:
             return _join_list(reagent.get("uses", [])).casefold(), name
 
+        if self._reagent_sort_column == 5:
+            return str(reagent.get("value_base_units", 0)).zfill(12), name
+
+        if self._reagent_sort_column == 6:
+            return str(reagent.get("notes", "")).casefold(), name
+
         return name, name
 
     def _recipe_sort_key(self, recipe: dict[str, Any]) -> tuple[str, str]:
@@ -11050,12 +12368,9 @@ class AlchemyNotebookScreen(RepositoryBackedWidget):
             return format_recipe_ingredients(recipe.get("ingredients", [])).casefold(), name
 
         if self._recipe_sort_column == 2:
-            return str(recipe.get("result", "")).casefold(), name
-
-        if self._recipe_sort_column == 3:
             return str(recipe.get("value_base_units", 0)).zfill(12), name
 
-        if self._recipe_sort_column == 4:
+        if self._recipe_sort_column == 3:
             return str(recipe.get("notes", "")).casefold(), name
 
         return name, name
@@ -13691,16 +15006,29 @@ def _apply_new_game_crafting_knowledge(
             name=name,
             category=category,
             description=description,
-            location=_replace_location_aliases(
-                raw_item.get("location", ""),
-                location_aliases or {},
-            ).strip(),
+            location=str(raw_item.get("location", "") or "").strip(),
             uses=uses,
+            rarity=str(raw_item.get("rarity", "Common") or "Common"),
+            notes=str(raw_item.get("notes", "") or "").strip(),
+            value_base_units=max(
+                0,
+                _safe_int(raw_item.get("value_base_units", 0), 0),
+            ),
+            ascii_art=str(raw_item.get("ascii_art", "") or "").strip("\r\n"),
+            item_uuid=str(raw_item.get("item_uuid", "") or "").strip(),
         )
         repository.upsert_item_catalog_entry(
             name=name,
             category=category,
             description=description,
+            value_base_units=max(
+                0,
+                _safe_int(raw_item.get("value_base_units", 0), 0),
+            ),
+            metadata={
+                "ascii_art": raw_item.get("ascii_art", ""),
+                "item_uuid": raw_item.get("item_uuid", ""),
+            },
         )
 
     allowed_ingredient_names = {

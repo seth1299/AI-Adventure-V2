@@ -140,12 +140,18 @@ class CalendarSystemTests(unittest.TestCase):
                     "duration_days": 7,
                     "recurrence": "yearly",
                     "year": 1,
+                    "time_of_day_minutes": 20 * 60 + 15,
                     "details": "Markets close and lantern processions fill the streets.",
                 }
             )
 
             self.assertIsNotNone(saved)
             self.assertEqual(repository.list_calendar_events()[0]["duration_days"], 7)
+            self.assertEqual(repository.list_calendar_events()[0]["origin"], "game")
+            self.assertEqual(
+                repository.list_calendar_events()[0]["time_of_day_minutes"],
+                20 * 60 + 15,
+            )
             repository.upsert_calendar_event(
                 {
                     **repository.list_calendar_events()[0],
@@ -156,6 +162,36 @@ class CalendarSystemTests(unittest.TestCase):
             self.assertEqual(repository.list_calendar_events()[0]["title"], "Grand Week of Bloom")
             self.assertTrue(repository.delete_calendar_event("week_of_bloom"))
             self.assertEqual(repository.list_calendar_events(), [])
+
+    def test_player_calendar_events_are_flagged_and_do_not_enter_history(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = SaveRepository.create_new_save(Path(temp_dir), "Private Calendar")
+            history_count = len(repository.list_history())
+
+            saved = repository.upsert_calendar_event(
+                {
+                    "event_id": "player_private_reminder",
+                    "title": "Check the hidden compartment",
+                    "description": "Personal reminder",
+                    "category": "Reminder",
+                    "month": 1,
+                    "day": 3,
+                    "duration_days": 1,
+                    "recurrence": "none",
+                    "year": 1,
+                    "time_of_day_minutes": 9 * 60 + 30,
+                    "details": "Look behind the loose panel.",
+                    "origin": "player",
+                }
+            )
+
+            self.assertIsNotNone(saved)
+            assert saved is not None
+            self.assertEqual(saved["origin"], "player")
+            self.assertEqual(saved["time_of_day_minutes"], 570)
+            self.assertEqual(len(repository.list_history()), history_count)
+            self.assertTrue(repository.delete_calendar_event(saved["event_id"]))
+            self.assertEqual(len(repository.list_history()), history_count)
 
 
 if __name__ == "__main__":

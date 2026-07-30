@@ -14,7 +14,9 @@ from ai_adventure.alchemy.ingredients import (
     COMMON_MEASUREMENT_UNITS,
     CRAFTING_INGREDIENT_CATEGORY_NAMES,
     CRAFTING_INGREDIENT_CATEGORIES,
+    CRAFTING_ITEM_RARITIES,
     is_crafting_ingredient_category,
+    normalize_crafting_item_rarity,
     normalize_recipe_ingredients,
 )
 from ai_adventure.app.api_key_store import read_api_key
@@ -78,6 +80,7 @@ CHECK_WARRANTING_ACTION_RE = re.compile(
     re.IGNORECASE,
 )
 KNOWN_TEXT_MODELS = {
+    "gemini-3.5-flash-lite",
     "gemini-3.1-flash-lite",
     "gemini-2.5-flash",
     "gemini-2.5-flash-lite",
@@ -130,9 +133,22 @@ GM_SECRET_RECORD_PROPERTIES: dict[str, Any] = {
     "title": {"type": "string"},
     "details": {
         "type": "string",
-        "description": "Canonical GM-only truth; never player-facing.",
+        "description": (
+            "Canonical truth unknown to both the player and Player Character; "
+            "never use the Player Character's own conscious actions, firsthand "
+            "observations, memories, possessions, or deliberately hidden items "
+            "unless established state explicitly provides a credible knowledge "
+            "barrier such as amnesia, memory alteration, unconsciousness, or deception."
+        ),
     },
-    "reveal_condition": {"type": "string"},
+    "reveal_condition": {
+        "type": "string",
+        "description": (
+            "A plausible way to discover an externally hidden truth; never a skill "
+            "check or search that makes the Player Character rediscover something "
+            "they knowingly did, witnessed, possessed, or deliberately stored."
+        ),
+    },
     "related_npc_ids": STRING_LIST_SCHEMA,
     "related_locations": STRING_LIST_SCHEMA,
     "status": {
@@ -205,10 +221,31 @@ NEW_GAME_CRAFTING_ITEM_SCHEMA: dict[str, Any] = {
             "enum": list(CRAFTING_INGREDIENT_CATEGORIES),
         },
         "description": {"type": "string"},
-        "location": {"type": "string"},
+        "ascii_art": {
+            "type": "string",
+            "minLength": 3,
+            "maxLength": 1200,
+            "description": "Original 3-12 line fixed-width depiction, without Markdown fences.",
+        },
+        "location": {
+            "type": "string",
+            "description": (
+                "Comma-separated generalized environments or source areas, such as "
+                "Forests, Caves; never a specific established Travel-tab location."
+            ),
+        },
         "uses": STRING_LIST_SCHEMA,
+        "rarity": {"type": "string", "enum": list(CRAFTING_ITEM_RARITIES)},
+        "notes": {
+            "type": "string",
+            "description": "Player-facing notes that explicitly state Rarity: <rarity>.",
+        },
+        "value_base_units": {"type": "integer", "minimum": 0},
     },
-    "required": ["name", "category", "description", "location", "uses"],
+    "required": [
+        "name", "category", "description", "ascii_art", "location", "uses",
+        "rarity", "notes", "value_base_units",
+    ],
     "additionalProperties": False,
 }
 NEW_GAME_CRAFTING_RECIPE_SCHEMA: dict[str, Any] = {
@@ -408,6 +445,16 @@ EVENT_RESPONSE_SCHEMA: dict[str, Any] = {
                 "item_name": {"type": "string"},
                 "item_uuid": {"type": "string", "description": "Existing catalog UUID when this is a known item; otherwise use an empty string and Python assigns one."},
                 "description": {"type": "string"},
+                "ascii_art": {
+                    "type": "string",
+                    "minLength": 3,
+                    "maxLength": 1200,
+                    "description": (
+                        "Original fixed-width ASCII art depicting the item. Use 3-12 "
+                        "lines, no Markdown fence, and keep each line at most 40 characters. "
+                        "Do not double-escape line breaks or place visible backslash-n text in the art."
+                    ),
+                },
                 "amount": {"type": "integer", "minimum": 1},
                 "quantity_unit": {"type": "string", "description": "Unit for the amount, such as each, bottle, vial, gram, kilogram, liter, or meter."},
                 "storage_location": {
@@ -441,7 +488,14 @@ EVENT_RESPONSE_SCHEMA: dict[str, Any] = {
                 "armor_rating": INT_OR_SKIP_SCHEMA,
                 "container": CONTAINER_METADATA_SCHEMA,
             },
-            ["item_type", "item_name", "description", "amount", "value_base_units"],
+            [
+                "item_type",
+                "item_name",
+                "description",
+                "ascii_art",
+                "amount",
+                "value_base_units",
+            ],
         ),
         _event_response_schema(
             "InventoryItemRemovedEvent",
@@ -661,10 +715,19 @@ EVENT_RESPONSE_SCHEMA: dict[str, Any] = {
                 "duration_days": {"type": "integer", "minimum": 1},
                 "recurrence": {"type": "string", "enum": ["none", "yearly"]},
                 "year": {"type": "integer", "minimum": 1},
+                "time_of_day_minutes": {
+                    "type": "integer",
+                    "minimum": -1,
+                    "maximum": 1439,
+                    "description": (
+                        "Exact local minute after midnight, or -1 when the event is all-day "
+                        "or no exact time is known."
+                    ),
+                },
                 "importance": {"type": "string"},
                 "details": {"type": "string"},
             },
-            ["event_id", "title", "description", "category", "month", "day", "duration_days", "recurrence", "year", "importance", "details"],
+            ["event_id", "title", "description", "category", "month", "day", "duration_days", "recurrence", "year", "time_of_day_minutes", "importance", "details"],
             description="Creates or updates a persistent one-time or yearly calendar event.",
         ),
         _event_response_schema(
@@ -677,20 +740,50 @@ EVENT_RESPONSE_SCHEMA: dict[str, Any] = {
             "ReagentDiscoveredEvent",
             {
                 "name": {"type": "string"},
+                "item_uuid": {"type": "string"},
                 "description": {"type": "string"},
-                "location": {"type": "string"},
+                "ascii_art": {
+                    "type": "string",
+                    "minLength": 3,
+                    "maxLength": 1200,
+                    "description": "Original 3-12 line fixed-width depiction, without Markdown fences.",
+                },
+                "location": {
+                    "type": "string",
+                    "description": (
+                        "Comma-separated generalized environments or source areas "
+                        "such as Forests, Caves; never a specific named Travel location."
+                    ),
+                },
                 "uses": NONEMPTY_STRING_LIST_SCHEMA,
+                "rarity": {"type": "string", "enum": list(CRAFTING_ITEM_RARITIES)},
+                "notes": {
+                    "type": "string",
+                    "description": "Player-facing notes that explicitly state Rarity: <rarity>.",
+                },
+                "value_base_units": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": (
+                        "Per-unit value in the world's baseline currency; Rare and Very "
+                        "Rare items should cost materially more than comparable Common items."
+                    ),
+                },
                 "category": {
                     "type": "string",
                     "enum": list(CRAFTING_INGREDIENT_CATEGORIES),
                 },
             },
-            ["name", "description", "location", "uses", "category"],
+            [
+                "name", "description", "ascii_art", "location", "uses", "category",
+                "rarity", "notes", "value_base_units",
+            ],
             description=(
                 "Stores a simplified useful crafting item/material; name-only "
                 "payloads are incomplete. The uses list should contain "
-                "generalized symptoms or effects the item may address, such as "
-                "sleep aid or pain relief, not detailed recipes or procedures."
+                "generalized symptoms or effects the item may address. location is "
+                "general habitat/source-area knowledge, not a specific map location. "
+                "notes must state rarity, and value_base_units must reflect it."
             ),
         ),
         _event_response_schema(
@@ -978,8 +1071,10 @@ NEW_GAME_RESPONSE_JSON_SCHEMA: dict[str, Any] = {
         "gm_secrets": {
             "type": "array",
             "description": (
-                "Private AI-only starting truths for continuity and mystery logic; "
-                "never player-facing."
+                "Private AI-only starting truths unknown to both the player and the "
+                "Player Character. Never invent a past Player Character action, "
+                "memory, possession, or deliberately hidden item as a secret unless "
+                "the setup explicitly establishes a credible knowledge barrier."
             ),
             "items": NEW_GAME_GM_SECRET_RECORD_SCHEMA,
         },
@@ -1099,6 +1194,16 @@ NEW_GAME_RESPONSE_JSON_SCHEMA: dict[str, Any] = {
                         ),
                     },
                     "description": {"type": "string"},
+                    "ascii_art": {
+                        "type": "string",
+                        "minLength": 3,
+                        "maxLength": 1200,
+                        "description": (
+                            "Original fixed-width ASCII art depicting the item. Use "
+                            "3-12 lines, no Markdown fence, with lines at most 40 characters. "
+                            "Do not double-escape line breaks or place visible backslash-n text in the art."
+                        ),
+                    },
                     "value_base_units": {"type": "integer", "minimum": 0},
                     "weapon_hands": {
                         "type": "string",
@@ -1133,6 +1238,7 @@ NEW_GAME_RESPONSE_JSON_SCHEMA: dict[str, Any] = {
                     "quantity_unit",
                     "storage_location",
                     "description",
+                    "ascii_art",
                     "value_base_units",
                     "source_index",
                 ],
@@ -1366,6 +1472,7 @@ class GeminiNarrationService:
             )
 
         result = parse_gemini_story_response(raw_text, context_packet=context_packet)
+        result = _enforce_explicit_conversation_mode(result, context_packet)
         result = _drop_unwarranted_skill_check_events(result, context_packet)
         result = _drop_duplicate_resolved_skill_check_events(result, context_packet)
         result = _ensure_in_game_suggested_actions(result, context_packet)
@@ -1511,7 +1618,7 @@ class GeminiNarrationService:
             setup_packet,
             ai_preferences=ai_preferences,
         )
-        LOGGER.info("Gemini raw new-game response:\n%s", raw_text)
+        LOGGER.info("Gemini raw new-game response:\n%s", _pretty_json_for_log(raw_text))
 
         if not raw_text:
             LOGGER.warning("Gemini returned an empty new-game response.")
@@ -1670,6 +1777,11 @@ def _build_xml_story_prompt(context_packet: dict[str, Any]) -> str:
     """Builds a concise XML-delimited story prompt with the task at the end."""
 
     player_command = str(context_packet.get("player_command", "") or "").strip()
+    conversation_mode = (
+        "out_of_game"
+        if context_packet.get("conversation_mode") == "out_of_game"
+        else "live_game"
+    )
     banned_terms = _banned_terms_from_context(context_packet)
     prompt_packet = _story_prompt_packet(context_packet)
     context_sections = _xml_packet_sections(
@@ -1694,6 +1806,30 @@ def _build_xml_story_prompt(context_packet: dict[str, Any]) -> str:
                 "banned terms, close spellings, hyphenation variants, obvious reskins, "
                 "or bare category-label proper nouns for newly invented names.",
             ),
+            _xml_text_section(
+                "gm_secret_knowledge_boundary",
+                "A GM secret must be unknown to both the player and the Player "
+                "Character. Never create secret memory from the Player Character's "
+                "own conscious actions, firsthand observations, retained memories, "
+                "known possessions, or deliberately hidden or stored items unless "
+                "established state explicitly provides a credible knowledge barrier "
+                "such as amnesia, memory alteration, unconsciousness, or deception. "
+                "A reveal_condition cannot be a skill check or search that makes the "
+                "Player Character rediscover their own knowing act. If the Player "
+                "Character knows a fact, keep it in player-visible narrative or "
+                "appropriate public state rather than SecretUpsertedEvent.",
+            ),
+            _xml_text_section(
+                "conversation_mode",
+                (
+                    f"The player explicitly selected {conversation_mode}. This UI "
+                    "selection is authoritative; never infer a different mode from "
+                    "the message wording. In out_of_game mode, answer the player "
+                    "directly, set out_of_game=true, and return empty suggested_actions "
+                    "and events so no turn or durable state can change. In live_game "
+                    "mode, set out_of_game=false and treat the message as an in-world action."
+                ),
+            ),
             _xml_text_section("presentation", build_ai_mode_prompt_guidance(context_packet)),
             _xml_json_section("banned_terms", banned_terms),
             _xml_text_section(
@@ -1710,7 +1846,7 @@ def _build_xml_story_prompt(context_packet: dict[str, Any]) -> str:
                     },
                     {
                         "situation": "Player receives one ordinary item",
-                        "output": {"response": "The courier hands over the sealed letter.", "suggested_actions": ["Inspect the seal.", "Ask who sent it.", "Put the letter away."], "events": [{"type": "InventoryItemAddedEvent", "payload": {"item_name": "Sealed Letter", "item_type": "Document", "amount": 1, "quantity_unit": "each", "storage_location": "actively_carried", "value_base_units": 1}}], "out_of_game": False},
+                        "output": {"response": "The courier hands over the sealed letter.", "suggested_actions": ["Inspect the seal.", "Ask who sent it.", "Put the letter away."], "events": [{"type": "InventoryItemAddedEvent", "payload": {"item_name": "Sealed Letter", "item_type": "Document", "description": "A folded letter closed with a red wax seal.", "ascii_art": " ______\n/_____/|\n| seal|/", "amount": 1, "quantity_unit": "each", "storage_location": "actively_carried", "value_base_units": 1}}], "out_of_game": False},
                     },
                 ],
             ),
@@ -1718,15 +1854,19 @@ def _build_xml_story_prompt(context_packet: dict[str, Any]) -> str:
                 "output_format",
                 "Return exactly one JSON object matching the configured schema. "
                 "response must be non-empty; suggested_actions and events must be "
-                "arrays; out_of_game must be boolean. For an in-game response, "
+                "arrays; out_of_game must exactly match conversation_mode. For an in-game response, "
                 "events must end with exactly one StatusUpdatedEvent whose payload "
                 "contains location, minutes_passed, and weather; use AUTO when a "
                 "value is unchanged or not otherwise advancing. No surrounding Markdown.",
             ),
             _xml_text_section(
                 "task",
-                "Based on the context above, resolve and narrate this player command, "
-                "then suggest only the state changes it actually warrants:\n"
+                (
+                    "Based on the context above, answer this out-of-game message without "
+                    "changing or advancing the game:\n"
+                    if conversation_mode == "out_of_game"
+                    else "Based on the context above, resolve and narrate this player command, then suggest only the state changes it actually warrants:\n"
+                )
                 + player_command,
             ),
         ]
@@ -1748,7 +1888,7 @@ def _story_prompt_packet(context_packet: dict[str, Any]) -> dict[str, Any]:
 
     always = {
         "response", "suggested_actions", "events", "status_event", "skill_checks",
-        "player_ai_preferences", "creative_ideas", "out_of_game", "event_shape",
+        "player_ai_preferences", "creative_ideas", "conversation_mode", "out_of_game", "event_shape",
         "known_event_types",
     }
     tags_by_contract = {
@@ -1800,7 +1940,31 @@ def _build_xml_new_game_prompt(setup_packet: dict[str, Any]) -> str:
                 "values must remain unchanged. Maintain "
                 "source_index links and consistent finalized names everywhere. Keep GM "
                 "secrets out of player-visible fields. Never use banned terms, close "
-                "variants, reskins, or bare category-label proper nouns.",
+                "variants, reskins, or bare category-label proper nouns for NPC names, "
+                "location names, or references to those names in other fields. Calendar settings are "
+                "exempt from the banned creative terms; calendar day, month, and season "
+                "names only need to obey the separate calendar-generation rules.",
+            ),
+            _xml_text_section(
+                "gm_secret_knowledge_boundary",
+                "A GM secret must be unknown to both the player and the Player "
+                "Character. Never invent a past action the Player Character consciously "
+                "performed, a fact they directly witnessed, a memory or choice they "
+                "retain, a possession they know about, or an item they deliberately hid "
+                "or stored and then label it a GM secret. Such facts are player-known "
+                "backstory, notes, inventory, or public state; if the setup did not "
+                "establish them, omit them rather than secretly inventing them. The only "
+                "exception is when confirmed setup explicitly establishes a credible "
+                "knowledge barrier such as amnesia, memory alteration, unconsciousness, "
+                "or deception about what occurred. A reveal_condition must uncover an "
+                "externally hidden truth; never use a Perception check, search, or other "
+                "roll to make the Player Character rediscover their own knowing act. "
+                "Before returning each gm_secrets record, verify that the Player "
+                "Character does not already know it, that it does not depend on "
+                "inventing their past conduct, and that its reveal condition is not a "
+                "test to remember or notice their own conscious action. If any check "
+                "fails, move the fact to an appropriate player-visible field when "
+                "established by setup, or omit it.",
             ),
             _xml_text_section(
                 "storage_rule",
@@ -1824,6 +1988,14 @@ def _build_xml_new_game_prompt(setup_packet: dict[str, Any]) -> str:
                 [
                     {"suggestion": "Main City", "finalized": "Ironpeak City", "rule": "rename suggestion consistently"},
                     {"item": "Vial of Paralyzing Toxin", "category": "Poison", "quantity_unit": "vial"},
+                    {
+                        "invalid_gm_secret": "The Player Character stole a ledger and knowingly hid it under their floorboards.",
+                        "reason": "The Player Character personally did and remembers this; make it player-known only if setup established it, otherwise omit it.",
+                    },
+                    {
+                        "valid_gm_secret": "An NPC secretly planted a forged ledger beneath the Player Character's floorboards without their knowledge.",
+                        "reason": "The cause and truth are externally hidden from both player and Player Character.",
+                    },
                 ],
             ),
             _xml_text_section(
@@ -1979,6 +2151,13 @@ def build_gemini_story_prompt(context_packet: dict[str, Any]) -> str:
         "must remember across turns. Use those truths for continuity, clues, NPC "
         "behavior, off-screen plans, and mystery logic without stating them in "
         "player-facing narration before the player earns or discovers them.\n"
+        "- A GM secret must be unknown to both the player and the Player Character. "
+        "Never turn the Player Character's own conscious actions, firsthand "
+        "observations, memories, known possessions, or deliberately hidden or stored "
+        "items into secret memory unless established state explicitly supplies a "
+        "credible knowledge barrier such as amnesia, memory alteration, "
+        "unconsciousness, or deception. Never use a skill check or search to make the "
+        "Player Character rediscover their own knowing act.\n"
         "- Suggest SecretUpsertedEvent when a durable hidden fact is created or "
         "materially changes. Reuse its stable secret_id and send the full current "
         "record. Use status='active' while hidden, 'revealed' once the player learns "
@@ -2102,6 +2281,11 @@ def build_gemini_story_prompt(context_packet: dict[str, Any]) -> str:
         "dice, raw roll numbers, totals, DCs, or game mechanics in the story.\n"
         "- Every InventoryItemAddedEvent payload must include value_base_units "
         "as an integer of at least 1.\n"
+        "- Every InventoryItemAddedEvent must include original ascii_art for the "
+        "item: 3-12 fixed-width lines, no Markdown code fence, and no line over "
+        "40 characters. Do not double-escape line breaks or put visible backslash-n "
+        "text in the drawing. When reusing state.item_catalog.items, copy its existing "
+        "ascii_art instead of redrawing the item.\n"
         "- Every InventoryItemAddedEvent must also include quantity_unit and "
         "storage_location. quantity_unit states what the amount measures, such "
         "as each, grams, mL, bottle, or vial. For recipe ingredients, the matching "
@@ -2136,11 +2320,16 @@ def build_gemini_story_prompt(context_packet: dict[str, Any]) -> str:
         "that item contributes. Use category/item_type values of Weapon and "
         "Armor clearly so the Character sheet can equip them.\n"
         "- state.item_catalog.items is the master list of known item definitions. "
-        "Use it to remember item descriptions after items leave inventory, but "
+        "Before inventing an item, look there and prefer a fitting existing "
+        "definition for ordinary loot, purchases, supplies, equipment, and recipe "
+        "results. Create a new definition only when no catalog item reasonably fits. "
+        "Use it to remember item descriptions and ASCII art after items leave inventory, but "
         "only state.inventory.items are current possessions. Each catalog entry's "
         "metadata.item_uuid is its stable internal identity: preserve and reuse it "
         "when referring to the same item, even if its player-facing name changes. "
-        "Do not invent duplicate item definitions merely because wording differs.\n"
+        "Do not invent duplicate item definitions merely because wording differs. "
+        "ReagentDiscoveredEvent also creates or updates a catalog definition, so it "
+        "must include ascii_art and should preserve the matching item_uuid.\n"
         "- Containers are inventory items with item_type='Container' and a required "
         "container metadata object. When the player acquires a closed pouch, purse, "
         "chest, box, bag, or similar object, add only that container. Store its exact "
@@ -2173,13 +2362,19 @@ def build_gemini_story_prompt(context_packet: dict[str, Any]) -> str:
         "found or situated. Do not repeat the location in the description unless "
         "the location itself is an essential part of the object's identity.\n"
         "- ReagentDiscoveredEvent records Crafting tab knowledge for useful "
-        "items/materials only and uses exactly name, category, description, "
-        "location, and uses. Use Container for vials, bottles, jars, and similar "
+        "items/materials only and uses name, category, description, generalized "
+        "location, uses, rarity, notes, and value_base_units. location must list "
+        "broad environments or source areas such as 'Forests, Caves', never a "
+        "specific established Travel-tab location. Use Container for vials, bottles, jars, and similar "
         "vessels. If the player physically collects, harvests, picks up, or "
         "stores that item/material, also suggest InventoryItemAddedEvent for "
         "the same item/material. The uses list is for generalized symptoms or "
         "effects, such as sleep aid or pain relief, rather than detailed recipes "
-        "or procedures.\n"
+        "or procedures. notes must explicitly include 'Rarity: Common', 'Rarity: "
+        "Uncommon', 'Rarity: Rare', or 'Rarity: Very Rare'. Price each entry in "
+        "value_base_units using the world's economy; Rare and Very Rare items must "
+        "be materially more valuable than comparable Common items unless the world "
+        "context explicitly supplies a reason otherwise.\n"
         "- RecipeDiscoveredEvent ingredients must be structured entries using "
         "item names from state.item_catalog.items in the reagent_name field. "
         "Use the matching catalog metadata.item_uuid to identify which definition "
@@ -2228,10 +2423,15 @@ def build_gemini_story_prompt(context_packet: dict[str, Any]) -> str:
         "unclear.\n"
         "- Use CalendarEventUpsertedEvent for meaningful dated events the player "
         "should see on the Calendar: festivals, holidays, appointments, promised "
-        "completion dates, deliveries, deadlines, and similar milestones. Use a "
+        "completion dates, deliveries, deadlines, eclipses, ceremonies, and similar "
+        "milestones. Whenever the narration establishes or reveals a specific date "
+        "or time for such an event, emit the calendar event in that same turn. Use a "
         "stable lower_snake_case event_id so later turns can edit it. Use recurrence "
         "yearly for annual observances and none for one-time events; duration_days "
-        "covers consecutive days. Use CalendarEventDeletedEvent only to cancel a "
+        "covers consecutive days. Set time_of_day_minutes to the exact local minute "
+        "after midnight for timed events such as an eclipse, appointment, deadline, "
+        "or ceremony; use -1 only for an all-day event or when no exact time is known. "
+        "Use CalendarEventDeletedEvent only to cancel a "
         "stored event. Do not recreate an unchanged yearly event each year.\n"
         "- Follow the selected Response Length mode. Within that mode, scale detail "
         "to the importance, risk, and consequences of the action, and address every "
@@ -2337,7 +2537,7 @@ def build_gemini_new_game_prompt(setup_packet: dict[str, Any]) -> str:
         "and put the finalized player-facing values in the locations entry. Once "
         "you finalize a suggested location name, use that finalized name consistently "
         "in every other returned field, including descriptions, travel_notes, "
-        "known_crafting_items.location, NPC details, tasks, secrets, and opening "
+        "NPC details, tasks, secrets, and opening "
         "prose; never reuse the superseded setup placeholder or suggestion name. "
         "If is_sublocation is true and parent_location is set, treat the location "
         "as existing inside that parent location; reflect that relationship in "
@@ -2513,7 +2713,9 @@ def build_gemini_new_game_prompt(setup_packet: dict[str, Any]) -> str:
         "with no relevant training or discoveries. For an alchemist, cook, engineer, "
         "herbalist, survivalist, medic, scientist, crafter, or other profession "
         "that logically starts with practical making knowledge, return as many "
-        "useful known items/materials and recipes as fit the backstory. Recipe "
+        "useful known items/materials and recipes as fit the backstory. Every "
+        "known_crafting_items entry must include original ascii_art using 3-12 "
+        "fixed-width lines, no Markdown fence, and no line over 40 characters. Recipe "
         "ingredients must use item names from known_crafting_items or other known "
         "item catalog entries. Ingredient objects must use reagent_name, quantity, "
         "measure_amount, and a finite measure_unit from the schema enum. Do not use "
@@ -2670,7 +2872,11 @@ def _repair_gemini_creative_terms(
     candidate_text = raw_text
     detection_terms = _combined_creative_terms(additional_forbidden_terms)
     banned_terms = _unique_terms(
-        find_banned_creative_terms(candidate_text, terms=detection_terms),
+        _find_gemini_creative_terms(
+            candidate_text,
+            response_label=response_label,
+            terms=detection_terms,
+        ),
         _unfinalized_suggested_setup_terms(candidate_text, setup_packet),
     )
 
@@ -2734,7 +2940,11 @@ def _repair_gemini_creative_terms(
             continue
 
         repaired_banned_terms = _unique_terms(
-            find_banned_creative_terms(repaired_text, terms=detection_terms),
+            _find_gemini_creative_terms(
+                repaired_text,
+                response_label=response_label,
+                terms=detection_terms,
+            ),
             _unfinalized_suggested_setup_terms(repaired_text, setup_packet),
         )
 
@@ -3350,7 +3560,13 @@ def _sanitize_gemini_creative_terms(
 ) -> Any:
     """Removes banned generated-name terms before AI output reaches state or UI."""
 
-    banned_terms = find_banned_creative_terms(value, terms=terms)
+    excluded_paths = _creative_guardrail_excluded_paths(response_label)
+    scan_value = _json_data_or_original(value)
+    banned_terms = find_banned_creative_terms(
+        scan_value,
+        terms=terms,
+        excluded_paths=excluded_paths,
+    )
 
     if not banned_terms:
         return value
@@ -3368,14 +3584,75 @@ def _sanitize_gemini_creative_terms(
         try:
             data = json.loads(clean_text)
         except json.JSONDecodeError:
-            return sanitize_banned_creative_terms_in_data(value, terms=terms)
+            return sanitize_banned_creative_terms_in_data(
+                value,
+                terms=terms,
+                excluded_paths=excluded_paths,
+            )
 
         return json.dumps(
-            sanitize_banned_creative_terms_in_data(data, terms=terms),
+            sanitize_banned_creative_terms_in_data(
+                data,
+                terms=terms,
+                excluded_paths=excluded_paths,
+            ),
             ensure_ascii=False,
         )
 
-    return sanitize_banned_creative_terms_in_data(value, terms=terms)
+    return sanitize_banned_creative_terms_in_data(
+        value,
+        terms=terms,
+        excluded_paths=excluded_paths,
+    )
+
+
+def _creative_guardrail_excluded_paths(
+    response_label: str,
+) -> tuple[tuple[str, ...], ...]:
+    """Returns structured response paths exempt from creative-name bans."""
+
+    if response_label == "new-game response":
+        return (("calendar_settings",),)
+    return ()
+
+
+def _json_data_or_original(value: Any) -> Any:
+    """Parses a JSON response for path-aware validation when possible."""
+
+    if not isinstance(value, str):
+        return value
+    try:
+        return json.loads(_strip_json_fence(value.strip()))
+    except json.JSONDecodeError:
+        return value
+
+
+def _find_gemini_creative_terms(
+    value: Any,
+    *,
+    response_label: str,
+    terms: tuple[str, ...] | list[str] | None = None,
+) -> list[str]:
+    """Finds banned terms while honoring response-specific path exemptions."""
+
+    return find_banned_creative_terms(
+        _json_data_or_original(value),
+        terms=terms,
+        excluded_paths=_creative_guardrail_excluded_paths(response_label),
+    )
+
+
+def _pretty_json_for_log(raw_text: str) -> str:
+    """Formats JSON responses for readable logs without changing response data."""
+
+    try:
+        return json.dumps(
+            json.loads(_strip_json_fence(raw_text.strip())),
+            ensure_ascii=False,
+            indent=2,
+        )
+    except json.JSONDecodeError:
+        return raw_text
 
 
 def _banned_terms_from_context(context_packet: dict[str, Any]) -> list[str]:
@@ -3761,6 +4038,13 @@ def parse_gemini_story_response(
     suggested_events = [
         event for event in raw_events if isinstance(event, dict)
     ]
+    explicit_out_of_game = (
+        isinstance(context_packet, dict)
+        and context_packet.get("conversation_mode") == "out_of_game"
+    )
+    if explicit_out_of_game:
+        suggested_actions = []
+        suggested_events = []
     event_types = [
         str(event.get("type", "UnknownEvent")).strip() or "UnknownEvent"
         for event in suggested_events
@@ -3781,7 +4065,11 @@ def parse_gemini_story_response(
         narrative_text=narrative_text,
         suggested_actions=suggested_actions,
         suggested_events=suggested_events,
-        out_of_game=bool(data.get("out_of_game", False)),
+        out_of_game=(
+            explicit_out_of_game
+            if isinstance(context_packet, dict) and "conversation_mode" in context_packet
+            else bool(data.get("out_of_game", False))
+        ),
         raw_text=guarded_raw_text,
     )
 
@@ -3861,6 +4149,38 @@ def _ensure_in_game_suggested_actions(
         suggested_actions=fallback_actions,
         suggested_events=result.suggested_events,
         out_of_game=result.out_of_game,
+        raw_text=result.raw_text,
+    )
+
+
+def _enforce_explicit_conversation_mode(
+    result: AiNarrationResult,
+    context_packet: dict[str, Any],
+) -> AiNarrationResult:
+    """Makes the UI-selected conversation mode authoritative over model inference."""
+
+    is_out_of_game = context_packet.get("conversation_mode") == "out_of_game"
+    if (
+        result.out_of_game == is_out_of_game
+        and (not is_out_of_game or not result.suggested_actions)
+        and (not is_out_of_game or not result.suggested_events)
+    ):
+        return result
+
+    if is_out_of_game and (result.suggested_actions or result.suggested_events):
+        LOGGER.warning(
+            "Discarded suggested actions/events from an explicit out-of-game response."
+        )
+    elif result.out_of_game != is_out_of_game:
+        LOGGER.warning(
+            "Corrected Gemini out_of_game flag to match the explicit UI conversation mode."
+        )
+
+    return AiNarrationResult(
+        narrative_text=result.narrative_text,
+        suggested_actions=[] if is_out_of_game else result.suggested_actions,
+        suggested_events=[] if is_out_of_game else result.suggested_events,
+        out_of_game=is_out_of_game,
         raw_text=result.raw_text,
     )
 
@@ -4206,11 +4526,18 @@ def _ensure_inventory_for_collected_reagents(
         inventory_event = {
             "type": "InventoryItemAddedEvent",
             "payload": {
-                "item_type": "Item",
+                "item_type": str(payload.get("category", "Item") or "Item"),
                 "item_name": name,
+                "item_uuid": str(payload.get("item_uuid", "") or ""),
                 "description": _reagent_inventory_description(payload),
+                "ascii_art": str(payload.get("ascii_art", "") or ""),
                 "amount": 1,
-                "value_base_units": 1,
+                "quantity_unit": "each",
+                "storage_location": "actively_carried",
+                "value_base_units": max(
+                    1,
+                    _coerce_int(payload.get("value_base_units"), default=1),
+                ),
             },
         }
         updated_events.append(inventory_event)
@@ -4885,6 +5212,7 @@ def _parse_new_game_starter_items(raw_items: Any) -> list[dict[str, Any]]:
                     raw_item.get("storage_location", "actively_carried")
                 ),
                 "description": str(raw_item.get("description", "")).strip(),
+                "ascii_art": str(raw_item.get("ascii_art", "") or "").strip("\r\n")[:1200],
                 "value_base_units": max(0, value_base_units),
                 "source_index": _parse_optional_source_index(raw_item),
                 **{
@@ -4953,8 +5281,15 @@ def _parse_new_game_crafting_items(raw_items: Any) -> list[dict[str, Any]]:
                 "name": name,
                 "category": category,
                 "description": str(raw_item.get("description", "")).strip(),
+                "ascii_art": str(raw_item.get("ascii_art", "") or "").strip("\r\n")[:1200],
                 "location": str(raw_item.get("location", "")).strip(),
                 "uses": uses,
+                "rarity": normalize_crafting_item_rarity(raw_item.get("rarity")),
+                "notes": str(raw_item.get("notes", "")).strip(),
+                "value_base_units": max(
+                    0,
+                    _coerce_int(raw_item.get("value_base_units"), default=0),
+                ),
             }
         )
         seen_names.add(name.casefold())

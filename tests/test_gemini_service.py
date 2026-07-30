@@ -19,6 +19,7 @@ from ai_adventure.ai.gemini_service import (
     NEW_GAME_RESPONSE_JSON_SCHEMA,
     SKILL_CHECK_PLAN_RESPONSE_JSON_SCHEMA,
     STORY_RESPONSE_JSON_SCHEMA,
+    AiNarrationResult,
     GeminiNarrationService,
     GeminiRequestError,
     GeminiSettings,
@@ -31,12 +32,16 @@ from ai_adventure.ai.gemini_service import (
     parse_skill_check_plan_response,
     parse_gemini_story_response,
     _drop_unwarranted_skill_check_events,
+    _enforce_explicit_conversation_mode,
     _filter_unwarranted_planned_skill_checks,
     _generate_content_with_retry,
     _json_schema_shape_errors,
+    _find_gemini_creative_terms,
     _normalize_visible_currency_phrasing,
     _parse_new_game_calendar_settings,
     _parse_new_game_starter_items,
+    _pretty_json_for_log,
+    _sanitize_gemini_creative_terms,
     _suggested_setup_terms,
     _unfinalized_suggested_setup_paths,
     _unfinalized_suggested_setup_terms,
@@ -73,6 +78,111 @@ def _container_metadata() -> dict[str, object]:
 
 
 class GeminiServiceTests(unittest.TestCase):
+    def test_new_game_creative_guardrails_exempt_calendar_settings(self) -> None:
+        response = {
+            "calendar_settings": {
+                "day_names": ["Aerdas", "Beldas", "Caldas", "Daldas", "Eldas"],
+                "month_names": ["Elias"],
+                "seasons": ["Verdant"],
+            },
+            "locations": [{"name": "Elias"}],
+        }
+
+        self.assertEqual(
+            _find_gemini_creative_terms(
+                json.dumps(response),
+                response_label="new-game response",
+                terms=["Elias", "Verdant"],
+            ),
+            ["Elias"],
+        )
+        sanitized = _sanitize_gemini_creative_terms(
+            response,
+            "new-game response",
+            terms=["Elias", "Verdant"],
+        )
+        self.assertEqual(
+            sanitized["calendar_settings"],
+            response["calendar_settings"],
+        )
+        self.assertEqual(sanitized["locations"][0]["name"], "the city")
+
+    def test_pretty_json_for_log_uses_indented_multiline_output(self) -> None:
+        formatted = _pretty_json_for_log('{"title":"Test","events":[]}')
+
+        self.assertEqual(
+            formatted,
+            '{\n  "title": "Test",\n  "events": []\n}',
+        )
+
+    def test_explicit_out_of_game_mode_discards_actions_and_events(self) -> None:
+        result = _enforce_explicit_conversation_mode(
+            AiNarrationResult(
+                narrative_text="You're right; the map should have been included.",
+                suggested_actions=["Take the map."],
+                suggested_events=[
+                    {
+                        "type": "StatusUpdatedEvent",
+                        "payload": {
+                            "location": "AUTO",
+                            "minutes_passed": 0,
+                            "weather": "AUTO",
+                        },
+                    }
+                ],
+                out_of_game=False,
+            ),
+            {"packet_type": "story_turn", "conversation_mode": "out_of_game"},
+        )
+
+        self.assertTrue(result.out_of_game)
+        self.assertEqual(result.suggested_actions, [])
+        self.assertEqual(result.suggested_events, [])
+
+    def test_story_parser_uses_explicit_mode_instead_of_model_flag(self) -> None:
+        result = parse_gemini_story_response(
+            json.dumps(
+                {
+                    "response": "The earlier clue was found in the cellar.",
+                    "suggested_actions": ["Search the cellar."],
+                    "events": [
+                        {
+                            "type": "StatusUpdatedEvent",
+                            "payload": {
+                                "location": "Cellar",
+                                "minutes_passed": 10,
+                                "weather": "AUTO",
+                            },
+                        }
+                    ],
+                    "out_of_game": False,
+                }
+            ),
+            context_packet={
+                "packet_type": "story_turn",
+                "conversation_mode": "out_of_game",
+            },
+        )
+
+        self.assertTrue(result.out_of_game)
+        self.assertEqual(result.suggested_actions, [])
+        self.assertEqual(result.suggested_events, [])
+        self.assertNotIn("What do you do", result.narrative_text)
+
+    def test_story_prompt_states_explicit_out_of_game_mode(self) -> None:
+        prompt = build_gemini_story_prompt(
+            {
+                "packet_type": "story_turn",
+                "player_command": "Did I find this clue earlier?",
+                "conversation_mode": "out_of_game",
+                "response_contract": {},
+            }
+        )
+
+        self.assertIn("explicitly selected out_of_game", prompt)
+        self.assertIn("never infer a different mode", prompt)
+        self.assertIn("without changing or advancing the game", prompt)
+
     def test_suggestion_mode_fields_require_finalized_replacements(self) -> None:
         packet = {
             "setup": {
@@ -233,12 +343,16 @@ class GeminiServiceTests(unittest.TestCase):
     def test_load_gemini_settings_ignores_api_key_in_model_file(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             env_path = Path(temp_dir) / ".env"
+            key_path = Path(temp_dir) / "gemini_api_key.txt"
             env_path.write_text("GEMINI_API_KEY=test-key\n", encoding="utf-8")
 
             old_model = os.environ.pop("GEMINI_MODEL", None)
 
             try:
-                settings = load_gemini_settings(model_env_path=env_path)
+                settings = load_gemini_settings(
+                    api_key_path=key_path,
+                    model_env_path=env_path,
+                )
             finally:
                 if old_model is not None:
                     os.environ["GEMINI_MODEL"] = old_model
@@ -303,6 +417,8 @@ class GeminiServiceTests(unittest.TestCase):
             "string",
         )
         self.assertIn("storage_location", item_schema["required"])
+        self.assertEqual(item_schema["properties"]["ascii_art"]["type"], "string")
+        self.assertIn("ascii_art", item_schema["required"])
 
         parsed = _parse_new_game_starter_items(
             [{
@@ -312,12 +428,14 @@ class GeminiServiceTests(unittest.TestCase):
                 "quantity_unit": "each",
                 "storage_location": "Detective's Car",
                 "description": "A loaded service revolver.",
+                "ascii_art": " __,\n/ /|\n\\_\\|",
                 "value_base_units": 250,
                 "source_index": 0,
             }]
         )
 
         self.assertEqual(parsed[0]["storage_location"], "Detective's Car")
+        self.assertEqual(parsed[0]["ascii_art"], " __,\n/ /|\n\\_\\|")
 
     def test_story_request_applies_selected_ai_modes_to_config(self) -> None:
         fake_client_class = self._install_fake_genai_client(
@@ -612,6 +730,7 @@ class GeminiServiceTests(unittest.TestCase):
                         "item_type": "Botanical",
                         "item_name": "Silver-Spire Fern",
                         "description": "A cool-natured fern.",
+                        "ascii_art": "  /\\\n /  \\\n  ||",
                         "amount": 2,
                         "value_base_units": 1,
                     },
@@ -652,6 +771,23 @@ class GeminiServiceTests(unittest.TestCase):
             ],
             "out_of_game": False,
         }
+        missing_art_response = {
+            "response": "You pick the fern.",
+            "suggested_actions": [],
+            "events": [
+                {
+                    "type": "InventoryItemAddedEvent",
+                    "payload": {
+                        "item_type": "Botanical",
+                        "item_name": "Silver-Spire Fern",
+                        "description": "A cool-natured fern.",
+                        "amount": 2,
+                        "value_base_units": 1,
+                    },
+                }
+            ],
+            "out_of_game": False,
+        }
 
         self.assertEqual(
             _json_schema_shape_errors(valid_response, STORY_RESPONSE_JSON_SCHEMA),
@@ -665,6 +801,10 @@ class GeminiServiceTests(unittest.TestCase):
             "$.events[0] did not match any allowed schema",
             _json_schema_shape_errors(zero_value_response, STORY_RESPONSE_JSON_SCHEMA),
         )
+        self.assertIn(
+            "$.events[0] did not match any allowed schema",
+            _json_schema_shape_errors(missing_art_response, STORY_RESPONSE_JSON_SCHEMA),
+        )
 
     def test_story_schema_accepts_container_metadata_and_lifecycle_events(self) -> None:
         response = {
@@ -677,6 +817,7 @@ class GeminiServiceTests(unittest.TestCase):
                         "item_type": "Container",
                         "item_name": "Stolen Coin Pouch",
                         "description": "A tied leather pouch.",
+                        "ascii_art": "  ____\n /____\\\n \\____/",
                         "amount": 1,
                         "value_base_units": 2,
                         "container": _container_metadata(),
@@ -1098,9 +1239,14 @@ class GeminiServiceTests(unittest.TestCase):
                             "type": "ReagentDiscoveredEvent",
                             "payload": {
                                 "name": "Blue Cave Salt",
+                                "category": "Reagent",
                                 "description": "Pale blue salt that cools and steadies.",
-                                "location": "Blue cave walls near still pools",
+                                "ascii_art": " .::.\n::::::\n '::'",
+                                "location": "Caves, Underground Pools",
                                 "uses": ["Sleep draughts"],
+                                "rarity": "Rare",
+                                "notes": "Rarity: Rare. Viable deposits are scarce.",
+                                "value_base_units": 31,
                             },
                         },
                         {
@@ -1139,12 +1285,12 @@ class GeminiServiceTests(unittest.TestCase):
 
         self.assertEqual(len(inventory_events), 1)
         self.assertEqual(inventory_events[0]["payload"]["item_name"], "Blue Cave Salt")
-        self.assertEqual(inventory_events[0]["payload"]["item_type"], "Item")
+        self.assertEqual(inventory_events[0]["payload"]["item_type"], "Reagent")
         self.assertEqual(
             inventory_events[0]["payload"]["description"],
             "Pale blue salt that cools and steadies.",
         )
-        self.assertEqual(inventory_events[0]["payload"]["value_base_units"], 1)
+        self.assertEqual(inventory_events[0]["payload"]["value_base_units"], 31)
 
     def test_story_request_trims_narrated_collection_without_inventory_event(self) -> None:
         self._install_fake_genai_client(
@@ -1456,8 +1602,12 @@ class GeminiServiceTests(unittest.TestCase):
                         "name": "Moss-Vein Tallow",
                         "category": "Material",
                         "description": "Waxy tallow threaded with moss-green veins.",
+                        "ascii_art": "  __\n /  \\\n \\__/",
                         "location": "Damp shaded valley crevices",
                         "uses": ["stabilizing volatile mixtures"],
+                        "rarity": "Rare",
+                        "notes": "Rarity: Rare. Difficult to harvest intact.",
+                        "value_base_units": 45,
                     },
                 }
             ],
@@ -1487,6 +1637,20 @@ class GeminiServiceTests(unittest.TestCase):
 
         self.assertEqual(sorted(schema_event_types), sorted(KNOWN_EVENT_TYPE_NAMES))
         self.assertEqual(len(schema_event_types), len(set(schema_event_types)))
+        calendar_schema = next(
+            branch["properties"]["payload"]
+            for branch in EVENT_RESPONSE_SCHEMA["anyOf"]
+            if branch["properties"]["type"]["enum"] == ["CalendarEventUpsertedEvent"]
+        )
+        self.assertIn("time_of_day_minutes", calendar_schema["required"])
+        self.assertEqual(
+            calendar_schema["properties"]["time_of_day_minutes"]["minimum"],
+            -1,
+        )
+        self.assertEqual(
+            calendar_schema["properties"]["time_of_day_minutes"]["maximum"],
+            1439,
+        )
 
     def test_new_game_schema_allows_only_setup_event_types(self) -> None:
         schema_event_types = {
@@ -1508,6 +1672,17 @@ class GeminiServiceTests(unittest.TestCase):
         self.assertIn("known_crafting_recipes", NEW_GAME_RESPONSE_JSON_SCHEMA["properties"])
         self.assertIn("known_crafting_items", NEW_GAME_RESPONSE_JSON_SCHEMA["required"])
         self.assertIn("known_crafting_recipes", NEW_GAME_RESPONSE_JSON_SCHEMA["required"])
+        crafting_item_schema = NEW_GAME_RESPONSE_JSON_SCHEMA["properties"][
+            "known_crafting_items"
+        ]["items"]
+        self.assertIn("ascii_art", crafting_item_schema["required"])
+        self.assertIn("rarity", crafting_item_schema["required"])
+        self.assertIn("notes", crafting_item_schema["required"])
+        self.assertIn("value_base_units", crafting_item_schema["required"])
+        self.assertIn(
+            "generalized environments",
+            crafting_item_schema["properties"]["location"]["description"],
+        )
         self.assertNotIn(
             "maxItems",
             NEW_GAME_RESPONSE_JSON_SCHEMA["properties"]["known_crafting_items"],
@@ -1522,6 +1697,18 @@ class GeminiServiceTests(unittest.TestCase):
         )
         secret_schema = NEW_GAME_RESPONSE_JSON_SCHEMA["properties"]["gm_secrets"]["items"]
         self.assertNotIn("status", secret_schema["properties"])
+        self.assertIn(
+            "unknown to both the player and the Player Character",
+            NEW_GAME_RESPONSE_JSON_SCHEMA["properties"]["gm_secrets"]["description"],
+        )
+        self.assertIn(
+            "own conscious actions",
+            secret_schema["properties"]["details"]["description"],
+        )
+        self.assertIn(
+            "rediscover something they knowingly did",
+            secret_schema["properties"]["reveal_condition"]["description"],
+        )
         self.assertIn(
             "$.status is not allowed",
             _json_schema_shape_errors(
@@ -2063,6 +2250,10 @@ class GeminiServiceTests(unittest.TestCase):
         self.assertTrue(prompt.endswith("</task>"))
         self.assertLess(prompt.index("<context>"), prompt.index("<task>"))
         self.assertIn("<critical_constraints>", prompt)
+        self.assertIn("<gm_secret_knowledge_boundary>", prompt)
+        self.assertIn("unknown to both the player and the Player Character", prompt)
+        self.assertIn("own conscious actions", prompt)
+        self.assertIn("rediscover their own knowing act", prompt)
         self.assertIn("<banned_terms>\n[\"Elara\"]", prompt)
         self.assertIn("NPC contract sentinel", prompt)
         self.assertIn("Inventory contract sentinel", prompt)
@@ -2662,15 +2853,23 @@ class GeminiServiceTests(unittest.TestCase):
                         "name": "Moonwater",
                         "category": "Material",
                         "description": "Water exposed to moonlight for dream work.",
-                        "location": "Prepared under moonlight.",
+                        "ascii_art": " ~~~~\n(____)\n \\__/",
+                        "location": "Moonlit Outdoor Areas",
                         "uses": ["sleep draughts", "gentle washes"],
+                        "rarity": "Uncommon",
+                        "notes": "Rarity: Uncommon. Requires clear night skies.",
+                        "value_base_units": 8,
                     },
                     {
                         "name": "Canal Salt",
                         "category": "Reagent",
                         "description": "Mineral salt from old lock gates.",
-                        "location": "Rainmarket lockhouses.",
+                        "ascii_art": " .::.\n::::::\n '::'",
+                        "location": "Canals, Lockworks",
                         "uses": ["clarifying tinctures"],
+                        "rarity": "Rare",
+                        "notes": "Rarity: Rare. Old deposits are tightly controlled.",
+                        "value_base_units": 28,
                     },
                 ],
                 "known_crafting_recipes": [
@@ -2774,6 +2973,11 @@ class GeminiServiceTests(unittest.TestCase):
         self.assertNotIn("the captain, the engineer, and the weapons expert", prompt)
         self.assertIn("top-level gm_secrets array", prompt)
         self.assertIn("GM-only starting truths", prompt)
+        self.assertIn("<gm_secret_knowledge_boundary>", prompt)
+        self.assertIn("unknown to both the player and the Player Character", prompt)
+        self.assertIn("stole a ledger and knowingly hid it", prompt)
+        self.assertIn("secretly planted a forged ledger", prompt)
+        self.assertIn("amnesia, memory alteration, unconsciousness", prompt)
         self.assertNotIn("gm_secrets array with status", prompt)
         self.assertIn("start_location", prompt)
         self.assertIn("short and broad", prompt)
@@ -2789,6 +2993,11 @@ class GeminiServiceTests(unittest.TestCase):
         self.assertIn("keep its mechanical fields instead of downgrading", prompt)
         self.assertNotIn("starter_inventory_contract is present it defines", prompt)
         self.assertIn("known_crafting_items and known_crafting_recipes", prompt)
+        self.assertIn("generalized environments or source areas", prompt)
+        self.assertIn(
+            "Rare and Very Rare items must be materially more expensive",
+            prompt,
+        )
         self.assertIn("not physical inventory", prompt)
         self.assertIn("alchemist, cook, engineer", prompt)
         """
@@ -2877,6 +3086,9 @@ class GeminiServiceTests(unittest.TestCase):
         self.assertEqual(result.finalized_starter_items[0]["value_base_units"], 4)
         self.assertEqual(result.finalized_starter_items[0]["source_index"], 0)
         self.assertEqual(result.known_crafting_items[0]["name"], "Moonwater")
+        self.assertEqual(result.known_crafting_items[0]["ascii_art"], " ~~~~\n(____)\n \\__/")
+        self.assertEqual(result.known_crafting_items[0]["rarity"], "Uncommon")
+        self.assertEqual(result.known_crafting_items[1]["value_base_units"], 28)
         self.assertEqual(result.known_crafting_items[1]["category"], "Reagent")
         self.assertEqual(result.known_crafting_recipes[0]["name"], "Mistglass Tincture")
         self.assertEqual(

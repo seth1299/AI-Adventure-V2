@@ -109,8 +109,11 @@ class AlchemySystemTests(unittest.TestCase):
                 name="Moon Salt",
                 category="Container",
                 description="Pale crystals that hum under moonlight.",
-                location="Moonlit stone basins",
+                location="Caves, Mineral Basins",
                 uses=["cooling draughts", "mirror inks"],
+                rarity="Rare",
+                notes="Harvested only when the crystals are resonant.",
+                value_base_units=36,
             )
 
             reagents = repository.list_crafting_items()
@@ -119,11 +122,18 @@ class AlchemySystemTests(unittest.TestCase):
             self.assertEqual(reagents[0]["name"], "Moon Salt")
             self.assertEqual(reagents[0]["category"], "Container")
             self.assertEqual(reagents[0]["description"], "Pale crystals that hum under moonlight.")
-            self.assertEqual(reagents[0]["location"], "Moonlit stone basins")
+            self.assertEqual(reagents[0]["location"], "Caves, Mineral Basins")
             self.assertEqual(reagents[0]["uses"], ["cooling draughts", "mirror inks"])
+            self.assertEqual(reagents[0]["rarity"], "Rare")
+            self.assertEqual(
+                reagents[0]["notes"],
+                "Rarity: Rare. Harvested only when the crystals are resonant.",
+            )
+            self.assertEqual(reagents[0]["value_base_units"], 36)
             catalog = repository.list_item_catalog()
             moon_salt = next(item for item in catalog if item["name"] == "Moon Salt")
             self.assertEqual(moon_salt["category"], "Container")
+            self.assertEqual(moon_salt["value_base_units"], 36)
 
     def test_recipe_discovery_persists_structured_fields(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -174,6 +184,9 @@ class AlchemySystemTests(unittest.TestCase):
                 description="Grey fronds that curl toward heat.",
                 location="Charcoal-rich forest clearings",
                 uses=["smoke readings"],
+                rarity="Uncommon",
+                notes="Rarity: Uncommon. Most visible after brushfires.",
+                value_base_units=7,
             )
             repository.add_crafting_recipe(
                 name="Ember Mnemonic",
@@ -195,6 +208,8 @@ class AlchemySystemTests(unittest.TestCase):
             self.assertEqual(state.alchemy.known_reagents[0].name, "Ash Fern")
             self.assertEqual(state.alchemy.known_reagents[0].description, "Grey fronds that curl toward heat.")
             self.assertEqual(state.alchemy.known_reagents[0].location, "Charcoal-rich forest clearings")
+            self.assertEqual(state.alchemy.known_reagents[0].rarity, "Uncommon")
+            self.assertEqual(state.alchemy.known_reagents[0].value_base_units, 7)
             self.assertEqual(state.alchemy.known_recipes[0].name, "Ember Mnemonic")
             self.assertEqual(state.alchemy.known_recipes[0].value_base_units, 11)
             self.assertEqual(
@@ -211,6 +226,7 @@ class AlchemySystemTests(unittest.TestCase):
                 1,
                 "A triangular glass prism.",
                 value_base_units=12,
+                metadata={"ascii_art": "  /\\\n /__\\\n/____\\"},
             )
             repository.remove_inventory_item("Glass Prism", 1)
 
@@ -224,6 +240,26 @@ class AlchemySystemTests(unittest.TestCase):
             prism = next(item for item in catalog if item["name"] == "Glass Prism")
             self.assertNotIn("quantity", prism)
             self.assertEqual(prism["description"], "A triangular glass prism.")
+            self.assertEqual(prism["ascii_art"], "  /\\\n /__\\\n/____\\")
+
+    def test_item_catalog_normalizes_double_escaped_ascii_line_breaks(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = SaveRepository.create_new_save(Path(temp_dir), "ASCII Catalog Test")
+            repository.add_inventory_item(
+                "Lockpick Roll",
+                "Tool",
+                1,
+                "A compact leather tool roll.",
+                metadata={"ascii_art": "+----+\\n| /\\ |\\n+----+"},
+            )
+
+            entry = next(
+                item
+                for item in repository.list_item_catalog()
+                if item["name"] == "Lockpick Roll"
+            )
+
+            self.assertEqual(entry["ascii_art"], "+----+\n| /\\ |\n+----+")
 
 
 if __name__ == "__main__":

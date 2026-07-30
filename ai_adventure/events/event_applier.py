@@ -16,6 +16,7 @@ from ai_adventure.calendar_system import (
 from ai_adventure.alchemy.ingredients import (
     CRAFTING_INGREDIENT_CATEGORY_NAMES,
     is_crafting_ingredient_category,
+    normalize_crafting_item_rarity,
     normalize_recipe_ingredients,
 )
 from ai_adventure.context.creative_guardrails import (
@@ -294,9 +295,27 @@ class EventApplier:
         if not name:
             return _invalid(event_type, payload, "Inventory item name is required.")
 
+        catalog_entry = self._matching_item_catalog_entry(payload, name)
+        catalog_metadata = (
+            dict(catalog_entry.get("metadata", {}))
+            if catalog_entry is not None
+            and isinstance(catalog_entry.get("metadata"), dict)
+            else {}
+        )
+        if catalog_entry is not None:
+            name = str(catalog_entry.get("name", name)).strip() or name
+
         quantity = _first_int(payload, 1, "amount", "quantity")
-        category = _first_text(payload, "item_type", "category")
-        description = _first_text(payload, "description", "desc")
+        category = (
+            str(catalog_entry.get("category", "")).strip()
+            if catalog_entry is not None
+            else ""
+        ) or _first_text(payload, "item_type", "category")
+        description = (
+            str(catalog_entry.get("description", "")).strip()
+            if catalog_entry is not None
+            else ""
+        ) or _first_text(payload, "description", "desc")
         quantity_unit = _first_text(payload, "quantity_unit", "unit", "measure_unit") or "each"
         storage_location = _first_text(payload, "storage_location") or "actively_carried"
         value_base_units = max(
@@ -309,6 +328,20 @@ class EventApplier:
                 "value",
             ),
         )
+        if catalog_entry is not None:
+            value_base_units = max(
+                value_base_units,
+                _safe_int(catalog_entry.get("value_base_units"), default=0) or 0,
+            )
+
+        merged_metadata = {**catalog_metadata, **payload}
+        if catalog_entry is not None:
+            merged_metadata["item_uuid"] = str(
+                catalog_metadata.get("item_uuid", payload.get("item_uuid", ""))
+            ).strip()
+            merged_metadata["ascii_art"] = str(
+                catalog_entry.get("ascii_art", payload.get("ascii_art", "")) or ""
+            ).strip("\r\n")
 
         self.repository.add_inventory_item(
             name=name,
@@ -316,7 +349,11 @@ class EventApplier:
             quantity=quantity,
             description=description,
             value_base_units=value_base_units,
-            metadata={**payload, "quantity_unit": quantity_unit, "storage_location": storage_location},
+            metadata={
+                **merged_metadata,
+                "quantity_unit": quantity_unit,
+                "storage_location": storage_location,
+            },
         )
 
         return AppliedEventResult(
@@ -397,6 +434,31 @@ class EventApplier:
             payload,
         )
 
+    def _matching_item_catalog_entry(
+        self,
+        payload: dict[str, Any],
+        item_name: str,
+    ) -> dict[str, Any] | None:
+        """Finds the authoritative catalog definition requested by Gemini."""
+
+        requested_uuid = str(payload.get("item_uuid", "") or "").strip()
+        folded_name = item_name.casefold()
+        name_match: dict[str, Any] | None = None
+
+        for entry in self.repository.list_item_catalog():
+            metadata = entry.get("metadata", {})
+            entry_uuid = (
+                str(metadata.get("item_uuid", "") or "").strip()
+                if isinstance(metadata, dict)
+                else ""
+            )
+            if requested_uuid and entry_uuid == requested_uuid:
+                return entry
+            if str(entry.get("name", "")).casefold() == folded_name:
+                name_match = entry
+
+        return name_match
+
     def _apply_calendar_event_upserted(
         self,
         event_type: str,
@@ -404,7 +466,26 @@ class EventApplier:
     ) -> AppliedEventResult:
         """Creates or updates a persistent calendar event."""
 
-        saved = self.repository.upsert_calendar_event(payload)
+        event_id = _first_text(payload, "event_id", "id")
+        player_event = next(
+            (
+                event
+                for event in self.repository.list_calendar_events()
+                if str(event.get("event_id", "")) == event_id
+                and str(event.get("origin", "game")) == "player"
+            ),
+            None,
+        )
+        if player_event is not None:
+            return _invalid(
+                event_type,
+                payload,
+                "Player-created calendar events cannot be changed by game events.",
+            )
+
+        canonical_payload = dict(payload)
+        canonical_payload["origin"] = "game"
+        saved = self.repository.upsert_calendar_event(canonical_payload)
         if saved is None:
             return _invalid(event_type, payload, "Calendar event id and title are required.")
         return AppliedEventResult(
@@ -424,6 +505,20 @@ class EventApplier:
         event_id = _first_text(payload, "event_id", "id")
         if not event_id:
             return _invalid(event_type, payload, "Calendar event id is required.")
+        stored_event = next(
+            (
+                event
+                for event in self.repository.list_calendar_events()
+                if str(event.get("event_id", "")) == event_id
+            ),
+            None,
+        )
+        if stored_event is not None and str(stored_event.get("origin", "game")) == "player":
+            return _invalid(
+                event_type,
+                payload,
+                "Player-created calendar events cannot be deleted by game events.",
+            )
         deleted = self.repository.delete_calendar_event(event_id)
         return AppliedEventResult(
             event_type,
@@ -1189,6 +1284,13 @@ class EventApplier:
         description = _first_text(payload, "description", "notes")
         location = _first_text(payload, "location", "found_at", "source")
         uses = _as_string_list(payload.get("uses", []))
+        ascii_art = str(payload.get("ascii_art", "") or "").strip("\r\n")
+        rarity = normalize_crafting_item_rarity(payload.get("rarity"))
+        notes = _first_text(payload, "notes")
+        value_base_units = max(
+            0,
+            _safe_int(payload.get("value_base_units"), default=0) or 0,
+        )
         category = _first_text(payload, "category") or "Material"
         if not is_crafting_ingredient_category(category):
             return _invalid(
@@ -1213,11 +1315,21 @@ class EventApplier:
             description=description,
             location=location,
             uses=uses,
+            rarity=rarity,
+            notes=notes,
+            value_base_units=value_base_units,
+            ascii_art=ascii_art,
+            item_uuid=_first_text(payload, "item_uuid"),
         )
         self.repository.upsert_item_catalog_entry(
             name=name,
             category=category,
             description=description,
+            value_base_units=value_base_units,
+            metadata={
+                "ascii_art": ascii_art,
+                "item_uuid": _first_text(payload, "item_uuid"),
+            },
         )
 
         return AppliedEventResult(

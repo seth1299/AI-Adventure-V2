@@ -19,11 +19,64 @@ from ai_adventure.core.models import (
     InventoryItem,
     InventoryState,
     PlayerState,
+    SettingsState,
     WorldState,
 )
 
 
 class ContextBuilderTests(unittest.TestCase):
+    def test_player_created_calendar_events_are_omitted_from_ai_context(self) -> None:
+        state = AdventureState(
+            settings=SettingsState(
+                values={
+                    "calendar.events": [
+                        {
+                            "event_id": "solar_eclipse",
+                            "title": "Solar Eclipse",
+                            "month": 4,
+                            "day": 12,
+                            "year": 1,
+                            "time_of_day_minutes": 810,
+                            "origin": "game",
+                        },
+                        {
+                            "event_id": "player_private_reminder",
+                            "title": "Check the Hidden Compartment",
+                            "month": 4,
+                            "day": 12,
+                            "year": 1,
+                            "time_of_day_minutes": 825,
+                            "origin": "player",
+                        },
+                    ]
+                }
+            )
+        )
+
+        packet = AiContextBuilder(
+            ContextReferenceLoader().load_default_library()
+        ).build_story_context(state, player_command="I wait for the eclipse.")
+        events = packet["state"]["calendar_events"]["events"]
+
+        self.assertEqual([event["event_id"] for event in events], ["solar_eclipse"])
+        self.assertNotIn("origin", events[0])
+
+    def test_out_of_game_mode_is_explicit_and_authoritative(self) -> None:
+        packet = AiContextBuilder(
+            ContextReferenceLoader().load_default_library()
+        ).build_story_context(
+            AdventureState(),
+            player_command="You forgot to give me the map.",
+            conversation_mode="out_of_game",
+        )
+
+        self.assertEqual(packet["conversation_mode"], "out_of_game")
+        self.assertIn("out_of_game", packet["selection"]["tags"])
+        self.assertIn(
+            "Never infer or override the mode from wording",
+            packet["response_contract"]["conversation_mode"],
+        )
+
     def test_default_library_loads(self) -> None:
         library = ContextReferenceLoader().load_default_library()
 
@@ -99,6 +152,7 @@ class ContextBuilderTests(unittest.TestCase):
                         category="tool",
                         description="A brass lantern.",
                         value_base_units=12,
+                        ascii_art="  ___\n /___\\\n | * |",
                         metadata={"item_type": "Tool"},
                     )
                 ]
@@ -343,6 +397,10 @@ class ContextBuilderTests(unittest.TestCase):
         self.assertEqual(packet["state"]["item_catalog"]["items"][0]["name"], "Lantern")
         self.assertNotIn("quantity", packet["state"]["item_catalog"]["items"][0])
         self.assertEqual(
+            packet["state"]["item_catalog"]["items"][0]["ascii_art"],
+            "  ___\n /___\\\n | * |",
+        )
+        self.assertEqual(
             packet["state"]["item_catalog"]["items"][0]["metadata"]["item_type"],
             "Tool",
         )
@@ -367,6 +425,10 @@ class ContextBuilderTests(unittest.TestCase):
         self.assertIn("response.structured_story_turn", section_ids)
         self.assertIn("inventory.default_guidance", section_ids)
         self.assertIn("crafting.default_guidance", section_ids)
+        self.assertIn(
+            "generalized environments or source areas",
+            packet["state"]["alchemy"]["rules"]["reagent_fields"],
+        )
         self.assertIn("skills.default_guidance", section_ids)
         self.assertIn("event.add", section_ids)
         self.assertIn("event.secret_memory", section_ids)
@@ -449,6 +511,18 @@ class ContextBuilderTests(unittest.TestCase):
         self.assertIn("AI-only", packet["state"]["gm_secrets"]["visibility"])
         self.assertIn(
             "player-visible field",
+            packet["response_contract"]["secret_memory"],
+        )
+        self.assertIn(
+            "unknown to both the player and the Player Character",
+            packet["response_contract"]["secret_memory"],
+        )
+        self.assertIn(
+            "deliberately hidden or stored items",
+            packet["response_contract"]["secret_memory"],
+        )
+        self.assertIn(
+            "rediscover their own knowing act",
             packet["response_contract"]["secret_memory"],
         )
         self.assertIn("currency_transactions", packet["response_contract"])
@@ -591,7 +665,7 @@ class ContextBuilderTests(unittest.TestCase):
         )
 
         self.assertEqual(len(packet["state"]["inventory"]["items"]), 50)
-        self.assertEqual(len(packet["state"]["item_catalog"]["items"]), 60)
+        self.assertEqual(len(packet["state"]["item_catalog"]["items"]), 70)
         self.assertEqual(len(packet["state"]["active_tasks"]["tasks"]), 40)
         self.assertEqual(len(packet["recent_history"]), 8)
         self.assertLessEqual(

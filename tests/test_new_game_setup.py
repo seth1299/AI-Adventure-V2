@@ -901,6 +901,14 @@ class NewGameSetupTests(unittest.TestCase):
         self.assertIn("zero, one, or many", packet["requirements"]["setup_scope_counts"])
         self.assertIn("crafting_knowledge", packet["requirements"])
         self.assertIn("known_crafting_items", packet["requirements"]["crafting_knowledge"])
+        self.assertIn(
+            "generalized environments or source areas",
+            packet["requirements"]["crafting_knowledge"],
+        )
+        self.assertIn(
+            "Rare and Very Rare items must be materially more expensive",
+            packet["requirements"]["crafting_knowledge"],
+        )
         self.assertIn("not physical inventory", packet["requirements"]["crafting_knowledge"])
         self.assertIn("skill_generation", packet["requirements"])
         self.assertIn("copy that exact name", packet["requirements"]["skill_generation"])
@@ -928,6 +936,19 @@ class NewGameSetupTests(unittest.TestCase):
         )
         self.assertIn("the Police Department", packet["requirements"]["creative_ideas"])
         self.assertIn("The Blue Wall", packet["requirements"]["creative_ideas"])
+        self.assertIn("gm_secrets", packet["requirements"])
+        self.assertIn(
+            "unknown to both the player and the Player Character",
+            packet["requirements"]["gm_secrets"],
+        )
+        self.assertIn(
+            "item they deliberately hid or stored",
+            packet["requirements"]["gm_secrets"],
+        )
+        self.assertIn(
+            "cannot be a skill check or search",
+            packet["requirements"]["gm_secrets"],
+        )
         self.assertIn("item_request", packet["requirements"]["starter_inventory"])
         self.assertIn("at least five", packet["requirements"]["starter_inventory"])
         self.assertIn("has no maximum count", packet["requirements"]["starter_inventory"])

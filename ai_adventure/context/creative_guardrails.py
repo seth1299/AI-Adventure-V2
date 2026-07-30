@@ -31,6 +31,7 @@ def find_banned_creative_terms(
     value: Any,
     *,
     terms: tuple[str, ...] | list[str] | None = None,
+    excluded_paths: tuple[tuple[str, ...], ...] = (),
 ) -> list[str]:
     """Returns banned generated-name terms found in text or nested data."""
 
@@ -38,7 +39,7 @@ def find_banned_creative_terms(
     found: list[str] = []
     seen: set[str] = set()
 
-    for text in _iter_text_values(value):
+    for text in _iter_text_values(value, excluded_paths=excluded_paths):
         exact_tokens = {
             _normalized_name_token(match.group(0))
             for banned_term in banned_terms
@@ -109,11 +110,15 @@ def sanitize_banned_creative_terms_in_data(
     *,
     terms: tuple[str, ...] | list[str] | None = None,
     replacement: str = DEFAULT_BANNED_TERM_REPLACEMENT,
+    excluded_paths: tuple[tuple[str, ...], ...] = (),
     _path: tuple[str, ...] = (),
 ) -> Any:
     """Recursively replaces banned generated-name terms in text-like data."""
 
     banned_terms = tuple(terms) if terms is not None else default_banned_creative_terms()
+
+    if any(_path[: len(path)] == path for path in excluded_paths):
+        return value
 
     if isinstance(value, str):
         return sanitize_banned_creative_terms(
@@ -128,6 +133,7 @@ def sanitize_banned_creative_terms_in_data(
                 item,
                 terms=banned_terms,
                 replacement=replacement,
+                excluded_paths=excluded_paths,
                 _path=(*_path, "[]"),
             )
             for item in value
@@ -139,6 +145,7 @@ def sanitize_banned_creative_terms_in_data(
                 item,
                 terms=banned_terms,
                 replacement=replacement,
+                excluded_paths=excluded_paths,
                 _path=(*_path, "[]"),
             )
             for item in value
@@ -156,6 +163,7 @@ def sanitize_banned_creative_terms_in_data(
                 item,
                 terms=banned_terms,
                 replacement=replacement,
+                excluded_paths=excluded_paths,
                 _path=(*_path, str(key)),
             )
             for key, item in value.items()
@@ -164,8 +172,16 @@ def sanitize_banned_creative_terms_in_data(
     return value
 
 
-def _iter_text_values(value: Any) -> list[str]:
+def _iter_text_values(
+    value: Any,
+    *,
+    excluded_paths: tuple[tuple[str, ...], ...] = (),
+    _path: tuple[str, ...] = (),
+) -> list[str]:
     """Returns all string leaves from a nested value."""
+
+    if any(_path[: len(path)] == path for path in excluded_paths):
+        return []
 
     if isinstance(value, str):
         return [value]
@@ -177,7 +193,13 @@ def _iter_text_values(value: Any) -> list[str]:
             if isinstance(key, str):
                 values.append(key)
 
-            values.extend(_iter_text_values(item))
+            values.extend(
+                _iter_text_values(
+                    item,
+                    excluded_paths=excluded_paths,
+                    _path=(*_path, str(key)),
+                )
+            )
 
         return values
 
@@ -185,7 +207,13 @@ def _iter_text_values(value: Any) -> list[str]:
         values: list[str] = []
 
         for item in value:
-            values.extend(_iter_text_values(item))
+            values.extend(
+                _iter_text_values(
+                    item,
+                    excluded_paths=excluded_paths,
+                    _path=(*_path, "[]"),
+                )
+            )
 
         return values
 

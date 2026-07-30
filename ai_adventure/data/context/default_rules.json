@@ -16,9 +16,9 @@
         "description": "The AI must return one machine-readable JSON object. Visible narration is a field, not the entire response envelope.",
         "json_shape": {
           "response": "String. Visible narration only.",
-          "suggested_actions": "Array of 3-4 strings for in-game turns. Empty for fully out-of-game answers.",
+          "suggested_actions": "Array of 3-4 strings for live_game turns. Empty when conversation_mode is out_of_game.",
           "events": "Array of structured event objects. Empty when no state change is proposed.",
-          "out_of_game": "Boolean."
+          "out_of_game": "Boolean. Must exactly match the player's explicit conversation_mode UI selection."
         },
         "event_shape": {
           "type": "String event type name.",
@@ -26,6 +26,7 @@
         },
         "rules": [
           "Return valid JSON only, with no Markdown fence.",
+          "Treat conversation_mode as authoritative. For out_of_game, answer directly with out_of_game=true, suggested_actions=[], and events=[]; do not advance the turn counter or change status, time, combat, skills, inventory, tasks, NPC memory, secrets, music, or any durable state. For live_game, return out_of_game=false and resolve the message in-world. Never infer or override the mode from wording.",
           "Only put player-facing text in response.",
           "Use supported events for inventory, active tasks, skills, currency, combat, recipes, reagents, NPCs, music, spells, flags, travel, locations, and status changes.",
           "The Python application validates events before committing state."
@@ -45,7 +46,7 @@
         "rules": [
           "You are the Game Master for a text-based RPG.",
           "Describe the environment and NPCs/locations clearly. Let state.player_ai_preferences.response_length_instruction decide whether prose is spare or flowery, but never make important game information vague.",
-          "Stay in character unless the player explicitly marks the message as `OOG` or `Out-Of-Game`.",
+          "Stay in character when conversation_mode is live_game. Answer as the AI Game Master when conversation_mode is out_of_game.",
           "Do not repeat the player's prompt back to them.",
           "Do not speak for the player character or decide what the player character says in response to NPCs, unless the Player specifically requests that.",
           "The player character is important, but the world does not revolve entirely around them.",
@@ -146,7 +147,7 @@
           "Instead, you may paraphrase what the Player just said, but as a NON-DIEGETIC comment.",
           "Do not put words into the Player's mouth.",
           "Spoken dialogue must use double quotation marks around the speaker's full spoken sentence or paragraph. Do not use single quotation marks as the outer boundary of dialogue. Use single quotation marks only when an already-double-quoted speaker mentions a named item, title, shop, location, inscription, nickname, or other quoted specific inside that dialogue.",
-          "Assume that whatever the Player is typing inside of Quotation Marks is usually said out loud (still check the context of the scene, but unless the Player is doing an OOG statement to you, Quotation Marks usually means that the Player is directly talking to an NPC). ---"
+          "When conversation_mode is live_game, assume that whatever the Player types inside Quotation Marks is usually said out loud to an NPC, while still checking scene context. In out_of_game mode, treat all wording as a direct message to the AI Game Master. ---"
         ]
       }
     },
@@ -171,14 +172,14 @@
           "Follow state.player_ai_preferences.response_length_instruction and any output-token cap defined by that mode. Within the selected mode, scale response length to the importance, risk, and consequences of the action.",
           "Do not include \"What do you do now?\" or any tense/person-specific end-of-turn prompt in the response field; the application displays that separately based on the selected narration tense and style.",
           "Resolve the player's submitted action instead of ending by restating the action, intent, or search target.",
-          "For in-game turns, include 3-4 suggested_actions as separate strings.",
+          "For live_game turns, include 3-4 suggested_actions as separate strings. For out_of_game, use an empty array.",
           "Use events for state changes instead of embedding commands in narration."
         ],
         "json_response_shape": {
           "response": "Visible player-facing narration.",
-          "suggested_actions": "Array of 3-4 suggested player actions for in-game turns.",
+          "suggested_actions": "Array of 3-4 suggested player actions for live_game turns; empty for out_of_game.",
           "events": "Array of structured event objects. Empty when no state change is proposed.",
-          "out_of_game": "Boolean. True only for fully out-of-game answers."
+          "out_of_game": "Boolean. Must exactly match conversation_mode; never infer it from wording."
         }
       }
     },
@@ -214,11 +215,11 @@
       "priority": 60,
       "content": {
         "rules": [
-          "If the player's entire message is marked `OOG` or `Out-Of-Game`, answer normally and do not advance in-game time.",
-          "Do not suggest StatusUpdatedEvent for fully Out-Of-Game messages.",
-          "If only a small part of the player's message is Out-Of-Game but the player also takes an in-game action, continue the scene normally and suggest structured events as needed."
+          "When conversation_mode is out_of_game, answer the player's question or request directly without advancing in-game time or turns.",
+          "For out_of_game, return out_of_game=true, suggested_actions=[], and events=[]. Do not propose StatusUpdatedEvent or any other durable state change.",
+          "The UI-selected conversation_mode is authoritative for the whole message; never split, infer, or override the mode based on wording."
         ],
-        "purpose": "Refer to this rule when the player is asking a question outside the story instead of taking an in-game action."
+        "purpose": "Defines behavior for the explicit Out-of-Game mode selected by the player."
       }
     },
     {
@@ -272,7 +273,7 @@
           "Do not invent new date labels in event payloads. Advance time only with `minutes_passed`; the Python application derives the displayed calendar date.",
           "Use each season's weather hint as the real-world analogue for weather, temperature, plants, and daylight tone.",
           "Do not include in structured event data passive process time in `MinutesPassed`; passive processes run in the background.",
-          "Do not suggest StatusUpdatedEvent for fully Out-Of-Game messages."
+          "Do not suggest StatusUpdatedEvent when conversation_mode is out_of_game."
         ]
       }
     },
@@ -442,6 +443,7 @@
           "item_type",
           "item_name",
           "description",
+          "ascii_art",
           "amount",
           "value_base_units",
           "weapon_hands",
@@ -463,6 +465,7 @@
           "`Item Type` becomes the inventory category.",
           "`Item Name` should be specific.",
           "`Description` should explain what the item is and include in structured event data important state information, such as what sort of ammunition is used for a bow or a gun.",
+          "`AsciiArt` is required. Create an original fixed-width depiction of the item using 3-12 lines, no Markdown code fence, and no line over 40 characters. Do not double-escape line breaks or put visible backslash-n text inside the drawing. For a reused catalog item, preserve its existing ascii_art exactly.",
           "`Amount` must be a positive integer.",
           "`ValueBaseUnits` is required for every InventoryItemAddedEvent and must be an integer of at least 1, measured in the baseline currency unit from state.currency.baseline_unit.",
           "Weapon items should include weapon_hands and damage dice such as 1d6 or 2d6. Any player weapon must have average damage strictly higher than the player's unarmed base damage of 1d4; do not create player weapons with damage of 1d4 or anything weaker. Use at least 1d6 for ordinary one-handed weapons and at least 1d10 for ordinary two-handed weapons unless a stronger fitting expression is appropriate. Ranged weapons may also include attack_range_feet, ammunition_type_required, clip_size, and bullets_per_attack.",
@@ -472,6 +475,7 @@
           "Container metadata must specify exact hidden currency/items, is_open, contents_taken, is_locked, lockpick_skill, lockpick_dc, lockpick_failure_consequence, is_trapped, trap_notice_skill, trap_notice_dc, trap_disarm_skill, trap_disarm_dc, and trap_failure_consequence.",
           "When the player acquires a closed container, add only the container. Do not emit CurrencyChangedEvent or separate InventoryItemAddedEvent entries for anything stored inside it.",
           "Quest-related items should use `Quest Item` as the item type.",
+          "Before inventing an item, inspect state.item_catalog.items and prefer a fitting existing definition for ordinary loot, purchases, supplies, equipment, and recipe results. Preserve its metadata.item_uuid and ascii_art. Create a new definition only when no catalog item reasonably fits.",
           "Raw materials and refined materials should use different item types when relevant.",
           "Food, tools, weapons, ammo, armor, clothes, containers, crafting materials, books, documents, poisons, and valuables should be classified clearly by their finished present primary function, not their origin or packaging. A ready-to-use poison or toxin is Poison even when stored in a vial; reserve Ingredient, Reagent, Material, and Crafting Item for recipe inputs that still need processing. A physical journal, notebook, ledger, manual, or other book is Book or Document; Information describes content and is not a physical inventory category."
         ]
@@ -672,19 +676,26 @@
           "name",
           "category",
           "description",
+          "ascii_art",
           "location",
-          "uses"
+          "uses",
+          "rarity",
+          "notes",
+          "value_base_units"
         ],
         "purpose": "Saves a discovered useful item/material for the Crafting tab.",
         "rules": [
           "Suggest ReagentDiscoveredEvent when the player learns that a plant, mineral, fluid, creature part, tool part, salvage, foodstuff, or other material is useful for crafting, repair, cooking, medicine, or other practical preparation.",
-          "Do not use name-only item/material payloads. Include category, description, location, and uses.",
+          "Do not use name-only item/material payloads. Include category, description, ascii_art, location, uses, rarity, notes, and value_base_units.",
+          "Create original ascii_art for the item or material using 3-12 fixed-width lines, no Markdown code fence, and no line over 40 characters. Reuse a matching catalog item's existing art and metadata.item_uuid instead of inventing a near-duplicate.",
           "`Description` should briefly explain what the item or material is.",
-          "`Location` should describe where the item or material is found. Keep Description and Location complementary: do not repeat the location in Description unless it is essential to the item's identity.",
+          "`Location` means generalized environments or source areas, not an explicit existing map location. Use concise comma-separated categories such as Forests, Caves, Wetlands, Grasslands, Coastal Waters, Workshops, Farms, or Urban Scrap. Never put a specific Travel-tab location name here.",
           "`Uses` must be an array of short generalized symptoms or effects the item may address, such as sleep aid, pain relief, nausea relief, or wound care; do not use detailed recipes or procedures.",
+          "`rarity` must be Common, Uncommon, Rare, or Very Rare. `notes` must explicitly contain `Rarity: <rarity>.` followed by any other useful player-known notes.",
+          "`value_base_units` is the reasonable per-unit price in the world's baseline currency. Price against the supplied economy and comparable goods. Rare and Very Rare items must be materially more expensive than comparable Common items unless the setting explicitly establishes a reason otherwise.",
           "category must be Material, Ingredient, Reagent, Crafting Item, or Container. Use Container for vials, bottles, jars, and similar vessels.",
           "ReagentDiscoveredEvent records crafting knowledge and preserves that category for recipe ingredient selection. If the player physically collects, harvests, picks up, or stores the item/material, also suggest InventoryItemAddedEvent for the same item/material.",
-          "If the player learns practical item/material uses, use ReagentDiscoveredEvent. If the player learns a place where the item/material is found, include that place in the ReagentDiscoveredEvent location field and use LocationUpsertedEvent only when the place itself should appear in the Travel tab."
+          "If the player learns practical item/material uses, use ReagentDiscoveredEvent. Keep its location field generalized; use LocationUpsertedEvent separately when a specific discovered place should appear in the Travel tab."
         ]
       }
     },
@@ -732,6 +743,10 @@
         ],
         "purpose": "Creates or replaces one private database-backed GM memory record that is sent to the AI but never shown in player-facing screens.",
         "rules": [
+          "A GM secret must be unknown to both the player and the Player Character. Player-hidden and character-hidden are both required.",
+          "Never invent the Player Character's own conscious past action, firsthand observation, retained memory, known possession, or deliberately hidden or stored item as a GM secret. These are player-known facts when established, and should be omitted rather than secretly invented when setup did not establish them.",
+          "The only exception is when established state explicitly supplies a credible knowledge barrier such as amnesia, memory alteration, unconsciousness, or deception about what occurred.",
+          "A reveal_condition must describe discovering an externally hidden truth. Never use a Perception check, search, or other skill check to make the Player Character rediscover their own knowing act.",
           "Use this for hidden villain identities, secret motives, traps, undiscovered treasure, conspiracy details, false alibis, off-screen plans, mystery solutions, and other concealed truths the AI must remember.",
           "secret_id must be a stable lower_snake_case identifier. Reuse it whenever the same secret changes.",
           "details is the full current canonical hidden truth, not an incremental note.",
@@ -806,12 +821,14 @@
       "priority": 73,
       "content": {
         "event_type": "CalendarEventUpsertedEvent",
-        "payload_fields": ["event_id", "title", "description", "category", "month", "day", "duration_days", "recurrence", "year", "importance", "details"],
+        "payload_fields": ["event_id", "title", "description", "category", "month", "day", "duration_days", "recurrence", "year", "time_of_day_minutes", "importance", "details"],
         "purpose": "Creates or updates a persistent event displayed on the Calendar.",
         "rules": [
           "Use a stable lower_snake_case event_id so the same event can be updated later.",
           "Use recurrence yearly for annual festivals, holidays, and observances; use none for one-time dates.",
           "duration_days is the number of consecutive calendar days occupied by the event.",
+          "time_of_day_minutes is the exact local minute after midnight from 0 through 1439; use -1 only for an all-day event or when no exact time is known.",
+          "Whenever narration establishes or reveals a meaningful future occurrence such as an eclipse, festival, appointment, ceremony, delivery, or deadline at a specific date or time, emit this event in the same turn.",
           "Use description for a short summary and details for cultural significance, reason, payment, consequences, or other useful context.",
           "Do not recreate an unchanged yearly event each year."
         ]
@@ -981,7 +998,7 @@
           "Do not invent stat events. Track durable changes with the supported event types in the response contract.",
           "Do not create items with InventoryItemModifiedEvent; use InventoryItemAddedEvent.",
           "Do not reveal secret information in visible narration or suggested events unless the player has learned it.",
-          "Do not suggest StatusUpdatedEvent for fully Out-Of-Game messages.",
+          "Do not suggest StatusUpdatedEvent when conversation_mode is out_of_game.",
           "Do not invent sound filenames.",
           "Do not invent event names.",
           "Do not speak for the player character or repeat text that the Player input inside of the prompt unless it is required. Do not invent player-character dialogue, questions, promises, purchases, attacks, or choices. Do not simply re-iterate the exact text that the user input."

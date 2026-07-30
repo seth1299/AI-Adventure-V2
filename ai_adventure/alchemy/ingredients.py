@@ -26,6 +26,22 @@ CRAFTING_INGREDIENT_CATEGORIES: tuple[str, ...] = (
     "Container",
 )
 CRAFTING_INGREDIENT_CATEGORY_NAMES = ", ".join(CRAFTING_INGREDIENT_CATEGORIES)
+CRAFTING_ITEM_RARITIES: tuple[str, ...] = (
+    "Common",
+    "Uncommon",
+    "Rare",
+    "Very Rare",
+)
+
+
+def normalize_crafting_item_rarity(value: Any) -> str:
+    """Returns the canonical crafting-item rarity label."""
+
+    clean_value = str(value or "").strip().casefold()
+    for rarity in CRAFTING_ITEM_RARITIES:
+        if clean_value == rarity.casefold():
+            return rarity
+    return "Common"
 
 
 def is_crafting_ingredient_category(value: Any) -> bool:

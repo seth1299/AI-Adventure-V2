@@ -68,6 +68,113 @@ def _test_container_metadata(
 
 
 class EventApplierTests(unittest.TestCase):
+    def test_calendar_game_events_store_exact_time_and_cannot_change_player_events(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = SaveRepository.create_new_save(Path(temp_dir), "Calendar Boundary")
+            repository.upsert_calendar_event(
+                {
+                    "event_id": "player_private_reminder",
+                    "title": "Bring a spyglass",
+                    "month": 3,
+                    "day": 9,
+                    "year": 1,
+                    "time_of_day_minutes": 720,
+                    "origin": "player",
+                }
+            )
+            applier = EventApplier(repository)
+
+            eclipse_result = applier.apply_event(
+                {
+                    "type": "CalendarEventUpsertedEvent",
+                    "payload": {
+                        "event_id": "lunar_eclipse",
+                        "title": "Lunar Eclipse",
+                        "description": "The moon passes into shadow.",
+                        "category": "Astronomical Event",
+                        "month": 3,
+                        "day": 9,
+                        "duration_days": 1,
+                        "recurrence": "none",
+                        "year": 1,
+                        "time_of_day_minutes": 21 * 60 + 10,
+                        "importance": "Major",
+                        "details": "Totality begins at 9:10 P.M. and lasts forty minutes.",
+                    },
+                }
+            )
+            overwrite_result = applier.apply_event(
+                {
+                    "type": "CalendarEventUpsertedEvent",
+                    "payload": {
+                        "event_id": "player_private_reminder",
+                        "title": "Canonicalized Reminder",
+                    },
+                }
+            )
+            delete_result = applier.apply_event(
+                {
+                    "type": "CalendarEventDeletedEvent",
+                    "payload": {"event_id": "player_private_reminder"},
+                }
+            )
+
+            events = {
+                event["event_id"]: event
+                for event in repository.list_calendar_events()
+            }
+            self.assertEqual(eclipse_result.status, "applied")
+            self.assertEqual(events["lunar_eclipse"]["origin"], "game")
+            self.assertEqual(events["lunar_eclipse"]["time_of_day_minutes"], 1270)
+            self.assertEqual(overwrite_result.status, "skipped")
+            self.assertEqual(delete_result.status, "skipped")
+            self.assertEqual(
+                events["player_private_reminder"]["title"],
+                "Bring a spyglass",
+            )
+
+    def test_inventory_item_added_reuses_catalog_definition_by_uuid(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = SaveRepository.create_new_save(Path(temp_dir), "Catalog Reuse Test")
+            repository.upsert_item_catalog_entry(
+                name="Brass Lantern",
+                category="Tool",
+                description="A hooded lantern with a warm brass frame.",
+                value_base_units=12,
+                metadata={
+                    "item_type": "Tool",
+                    "item_uuid": "known-lantern-uuid",
+                    "ascii_art": "  ___\n /___\\\n | * |",
+                },
+            )
+
+            result = EventApplier(repository).apply_event(
+                {
+                    "type": "InventoryItemAddedEvent",
+                    "payload": {
+                        "item_type": "Gear",
+                        "item_name": "Old Brass Light",
+                        "item_uuid": "known-lantern-uuid",
+                        "description": "A differently worded duplicate.",
+                        "ascii_art": "duplicate art",
+                        "amount": 1,
+                        "quantity_unit": "each",
+                        "storage_location": "Pack Mule",
+                        "value_base_units": 2,
+                    },
+                }
+            )
+
+            inventory = repository.list_inventory_items()
+            catalog = repository.list_item_catalog()
+            self.assertEqual(result.status, "applied")
+            lantern = next(item for item in inventory if item["name"] == "Brass Lantern")
+            self.assertNotIn("Old Brass Light", {item["name"] for item in inventory})
+            self.assertEqual(lantern["storage_location"], "Pack Mule")
+            catalog_lantern = next(item for item in catalog if item["name"] == "Brass Lantern")
+            self.assertNotIn("Old Brass Light", {item["name"] for item in catalog})
+            self.assertEqual(catalog_lantern["ascii_art"], "  ___\n /___\\\n | * |")
+
     def test_inventory_item_added_normalizes_finished_toxin_to_poison(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             repository = SaveRepository.create_new_save(
@@ -1014,6 +1121,7 @@ class EventApplierTests(unittest.TestCase):
                             "name": "Moonwater",
                             "category": "Ingredient",
                             "description": "Water prepared under moonlight.",
+                            "ascii_art": " ~~~~\n(____)\n \\__/",
                             "location": "Open bowls left beneath a full moon",
                             "uses": ["sleep draughts"],
                         },
@@ -1024,8 +1132,12 @@ class EventApplierTests(unittest.TestCase):
                             "name": "Mooncap Fungus",
                             "category": "Reagent",
                             "description": "Soft blue fungus that releases a drowsy scent.",
+                            "ascii_art": "  _\n (_ )\n /_|",
                             "location": "Damp cave mouths and shaded roots",
                             "uses": ["sleep draughts"],
+                            "rarity": "Rare",
+                            "notes": "Rarity: Rare. Fruiting bodies appear briefly.",
+                            "value_base_units": 24,
                         },
                     },
                     {
@@ -1064,6 +1176,14 @@ class EventApplierTests(unittest.TestCase):
             catalog = repository.list_item_catalog()
             catalog_moonwater = next(item for item in catalog if item["name"] == "Moonwater")
             self.assertEqual(catalog_moonwater["category"], "Ingredient")
+            self.assertEqual(catalog_moonwater["ascii_art"], " ~~~~\n(____)\n \\__/")
+            mooncap = next(
+                reagent for reagent in reagents
+                if reagent["name"] == "Mooncap Fungus"
+            )
+            self.assertEqual(mooncap["rarity"], "Rare")
+            self.assertEqual(mooncap["value_base_units"], 24)
+            self.assertIn("Rarity: Rare.", mooncap["notes"])
             self.assertEqual(recipes[0]["name"], "Quiet Sleep Draught")
             self.assertEqual(recipes[0]["ingredients"][0]["reagent_name"], "Moonwater")
             self.assertEqual(recipes[0]["ingredients"][0]["measure_unit"], "mL")

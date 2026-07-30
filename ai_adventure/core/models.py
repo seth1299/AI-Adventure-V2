@@ -113,6 +113,7 @@ class ItemCatalogEntry:
     category: str = ""
     description: str = ""
     value_base_units: int = 0
+    ascii_art: str = ""
     metadata: dict[str, Any] = field(default_factory=dict)
     first_seen_at: str = ""
     updated_at: str = ""
@@ -194,6 +195,9 @@ class ReagentKnowledge:
     description: str = ""
     location: str = ""
     uses: list[str] = field(default_factory=list)
+    rarity: str = "Common"
+    notes: str = ""
+    value_base_units: int = 0
     discovered_at: str = ""
 
     def to_dict(self) -> dict[str, Any]:

@@ -13,7 +13,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from ai_adventure.alchemy.ingredients import normalize_recipe_ingredients
+from ai_adventure.alchemy.ingredients import (
+    normalize_crafting_item_rarity,
+    normalize_recipe_ingredients,
+)
+from ai_adventure.ascii_art import normalize_ascii_art
 from ai_adventure.ai.modes import (
     default_ai_mode_settings,
     normalize_ai_mode_preferences,
@@ -642,6 +646,9 @@ class SaveRepository:
         clean_metadata["quantity_unit"] = _inventory_quantity_unit(raw_metadata)
         clean_metadata["storage_location"] = _inventory_storage_location(raw_metadata)
         clean_metadata["item_uuid"] = str(raw_metadata.get("item_uuid", "")).strip() or str(uuid.uuid4())
+        clean_metadata["ascii_art"] = normalize_ascii_art(
+            raw_metadata.get("ascii_art", "")
+        )
         metadata_json = _encode_json_dict(clean_metadata)
 
         with self._connect() as connection:
@@ -791,6 +798,22 @@ class SaveRepository:
             except (TypeError, ValueError):
                 value_base_units = 0
 
+            raw_metadata = raw_item.get("metadata", raw_item)
+            raw_metadata = raw_metadata if isinstance(raw_metadata, dict) else {}
+            clean_metadata = normalize_item_metadata(
+                raw_metadata,
+                name=name,
+                category=str(raw_item.get("category", "Item")),
+                description=str(raw_item.get("description", "")),
+            )
+            clean_metadata["quantity_unit"] = _inventory_quantity_unit(raw_metadata)
+            clean_metadata["storage_location"] = _inventory_storage_location(raw_metadata)
+            clean_metadata["item_uuid"] = (
+                str(raw_metadata.get("item_uuid", "")).strip() or str(uuid.uuid4())
+            )
+            clean_metadata["ascii_art"] = normalize_ascii_art(
+                raw_metadata.get("ascii_art", "")
+            )
             clean_items.append(
                 {
                     "name": name,
@@ -798,12 +821,7 @@ class SaveRepository:
                     "quantity": max(1, quantity),
                     "description": str(raw_item.get("description", "")).strip(),
                     "value_base_units": max(0, value_base_units),
-                    "metadata": normalize_item_metadata(
-                        raw_item.get("metadata", raw_item),
-                        name=name,
-                        category=str(raw_item.get("category", "Item")),
-                        description=str(raw_item.get("description", "")),
-                    ),
+                    "metadata": clean_metadata,
                 }
             )
             seen_names.add(name.casefold())
@@ -892,6 +910,7 @@ class SaveRepository:
                     category,
                     description,
                     value_base_units,
+                    ascii_art,
                     metadata_json,
                     first_seen_at,
                     updated_at
@@ -1090,6 +1109,10 @@ class SaveRepository:
         location: str = "",
         uses: list[str] | None = None,
         notes: str = "",
+        rarity: str = "Common",
+        value_base_units: int = 0,
+        ascii_art: str = "",
+        item_uuid: str = "",
     ) -> None:
         """
         Adds or updates a discovered useful crafting item/material.
@@ -1097,8 +1120,10 @@ class SaveRepository:
         Args:
             name: Item/material name.
             description: Short player-facing description.
-            location: Where the reagent is commonly found.
+            location: General environments or source areas where it is commonly found.
             uses: Known uses or experimentation hints.
+            rarity: Common, Uncommon, Rare, or Very Rare.
+            value_base_units: Reasonable per-unit value in baseline currency units.
         """
 
         clean_name = name.strip()
@@ -1112,6 +1137,17 @@ class SaveRepository:
         clean_description = description.strip() or notes.strip()
         clean_location = location.strip()
         clean_uses = uses or []
+        clean_rarity = normalize_crafting_item_rarity(rarity)
+        clean_value = max(0, _safe_int(value_base_units, default=0) or 0)
+        clean_notes = re.sub(
+            r"^\s*rarity\s*:\s*(?:common|uncommon|rare|very rare)\s*\.?\s*",
+            "",
+            notes.strip(),
+            flags=re.IGNORECASE,
+        )
+        clean_notes = f"Rarity: {clean_rarity}." + (
+            f" {clean_notes}" if clean_notes else ""
+        )
 
         with self._connect() as connection:
             connection.execute(
@@ -1122,14 +1158,20 @@ class SaveRepository:
                     description,
                     location,
                     uses_json,
+                    rarity,
+                    notes,
+                    value_base_units,
                     discovered_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(name) DO UPDATE SET
                     category = excluded.category,
                     description = excluded.description,
                     location = excluded.location,
-                    uses_json = excluded.uses_json
+                    uses_json = excluded.uses_json,
+                    rarity = excluded.rarity,
+                    notes = excluded.notes,
+                    value_base_units = excluded.value_base_units
                 """,
                 (
                     clean_name,
@@ -1137,6 +1179,9 @@ class SaveRepository:
                     clean_description,
                     clean_location,
                     _encode_string_list(clean_uses),
+                    clean_rarity,
+                    clean_notes,
+                    clean_value,
                     discovered_at,
                 ),
             )
@@ -1145,7 +1190,11 @@ class SaveRepository:
                 name=clean_name,
                 category=clean_category,
                 description=clean_description,
-                value_base_units=0,
+                value_base_units=clean_value,
+                metadata={
+                    "ascii_art": ascii_art,
+                    "item_uuid": item_uuid,
+                },
             )
 
         self.append_history("crafting", f"Discovered crafting item/material: {clean_name}.")
@@ -1168,6 +1217,9 @@ class SaveRepository:
                     description,
                     location,
                     uses_json,
+                    rarity,
+                    notes,
+                    value_base_units,
                     discovered_at
                 FROM crafting_items
                 ORDER BY name COLLATE NOCASE
@@ -1185,6 +1237,11 @@ class SaveRepository:
                     "description": row["description"],
                     "location": row["location"],
                     "uses": _decode_string_list(row["uses_json"], "uses"),
+                    "rarity": normalize_crafting_item_rarity(row["rarity"]),
+                    "notes": row["notes"] or (
+                        f"Rarity: {normalize_crafting_item_rarity(row['rarity'])}."
+                    ),
+                    "value_base_units": max(0, int(row["value_base_units"] or 0)),
                     "discovered_at": row["discovered_at"],
                 }
             )
@@ -3105,8 +3162,10 @@ class SaveRepository:
         return sorted(
             events,
             key=lambda event: (
+                int(event["year"]) if event["recurrence"] != "yearly" else 0,
                 int(event["month"]),
                 int(event["day"]),
+                int(event["time_of_day_minutes"]),
                 str(event["title"]).casefold(),
             ),
         )
@@ -3129,7 +3188,8 @@ class SaveRepository:
         if not replaced:
             events.append(clean_event)
         self.set_setting("calendar.events", events)
-        self.append_history("calendar", f"Saved calendar event: {clean_event['title']}.")
+        if clean_event["origin"] != "player":
+            self.append_history("calendar", f"Saved calendar event: {clean_event['title']}.")
         return clean_event
 
     def delete_calendar_event(self, event_id: str) -> bool:
@@ -3137,11 +3197,16 @@ class SaveRepository:
 
         clean_id = str(event_id or "").strip()
         events = self.list_calendar_events()
+        deleted_event = next(
+            (event for event in events if event["event_id"] == clean_id),
+            None,
+        )
         remaining = [event for event in events if event["event_id"] != clean_id]
         if len(remaining) == len(events):
             return False
         self.set_setting("calendar.events", remaining)
-        self.append_history("calendar", f"Deleted calendar event: {clean_id}.")
+        if deleted_event is not None and deleted_event["origin"] != "player":
+            self.append_history("calendar", f"Deleted calendar event: {clean_id}.")
         return True
 
     def get_player_equipment(self) -> dict[str, str]:
@@ -3253,6 +3318,7 @@ class SaveRepository:
                     category TEXT NOT NULL DEFAULT '',
                     description TEXT NOT NULL DEFAULT '',
                     value_base_units INTEGER NOT NULL DEFAULT 0,
+                    ascii_art TEXT NOT NULL DEFAULT '',
                     metadata_json TEXT NOT NULL DEFAULT '{}',
                     first_seen_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
@@ -3265,6 +3331,9 @@ class SaveRepository:
                     description TEXT NOT NULL DEFAULT '',
                     location TEXT NOT NULL DEFAULT '',
                     uses_json TEXT NOT NULL DEFAULT '[]',
+                    rarity TEXT NOT NULL DEFAULT 'Common',
+                    notes TEXT NOT NULL DEFAULT '',
+                    value_base_units INTEGER NOT NULL DEFAULT 0,
                     discovered_at TEXT NOT NULL
                 );
 
@@ -3381,6 +3450,24 @@ class SaveRepository:
                 "crafting_items",
                 "category",
                 "TEXT NOT NULL DEFAULT 'Material'",
+            )
+            _ensure_column(
+                connection,
+                "crafting_items",
+                "rarity",
+                "TEXT NOT NULL DEFAULT 'Common'",
+            )
+            _ensure_column(
+                connection,
+                "crafting_items",
+                "notes",
+                "TEXT NOT NULL DEFAULT ''",
+            )
+            _ensure_column(
+                connection,
+                "crafting_items",
+                "value_base_units",
+                "INTEGER NOT NULL DEFAULT 0",
             )
             _ensure_column(
                 connection,
@@ -3941,6 +4028,7 @@ def _upsert_item_catalog_entry(
     clean_description = description.strip()
     clean_value = max(0, _safe_int(value_base_units, default=0) or 0)
     raw_metadata = metadata if isinstance(metadata, dict) else {}
+    clean_ascii_art = normalize_ascii_art(raw_metadata.get("ascii_art", ""))
     clean_metadata = normalize_item_metadata(
         metadata,
         name=clean_name,
@@ -3948,13 +4036,12 @@ def _upsert_item_catalog_entry(
         description=clean_description,
     )
     # Keep a stable, AI-facing identity separate from the player-visible name.
-    # Older saves are upgraded lazily the first time an item is touched/read.
     clean_metadata["item_uuid"] = str(raw_metadata.get("item_uuid", "")).strip() or str(uuid.uuid4())
     metadata_json = _encode_json_dict(clean_metadata)
     now = datetime.now().isoformat(timespec="seconds")
     row = connection.execute(
         """
-        SELECT id, category, description, value_base_units, metadata_json, first_seen_at
+        SELECT id, category, description, value_base_units, ascii_art, metadata_json, first_seen_at
         FROM item_catalog
         WHERE name = ? COLLATE NOCASE
         ORDER BY id ASC
@@ -3971,23 +4058,35 @@ def _upsert_item_catalog_entry(
                 category,
                 description,
                 value_base_units,
+                ascii_art,
                 metadata_json,
                 first_seen_at,
                 updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 clean_name,
                 clean_category,
                 clean_description,
                 clean_value,
+                clean_ascii_art,
                 metadata_json,
                 now,
                 now,
             ),
         )
         return
+
+    existing_metadata = _decode_json_dict(
+        row["metadata_json"],
+        "item catalog metadata",
+    )
+    if not str(raw_metadata.get("item_uuid", "")).strip():
+        clean_metadata["item_uuid"] = str(
+            existing_metadata.get("item_uuid", clean_metadata["item_uuid"])
+        ).strip()
+    metadata_json = _encode_json_dict(clean_metadata)
 
     connection.execute(
         """
@@ -3996,6 +4095,7 @@ def _upsert_item_catalog_entry(
             category = ?,
             description = ?,
             value_base_units = ?,
+            ascii_art = ?,
             metadata_json = ?,
             updated_at = ?
         WHERE id = ?
@@ -4005,6 +4105,7 @@ def _upsert_item_catalog_entry(
             clean_category or str(row["category"]),
             clean_description or str(row["description"]),
             clean_value if clean_value > 0 else int(row["value_base_units"]),
+            clean_ascii_art or str(row["ascii_art"]),
             metadata_json
             if clean_metadata.get("item_type") != "Item"
             else str(row["metadata_json"]),
@@ -4061,6 +4162,7 @@ def _item_catalog_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
         "category": row["category"],
         "description": row["description"],
         "value_base_units": row["value_base_units"],
+        "ascii_art": normalize_ascii_art(row["ascii_art"]),
         "metadata": normalized_metadata,
         "first_seen_at": row["first_seen_at"],
         "updated_at": row["updated_at"],
@@ -4109,6 +4211,17 @@ def _normalize_calendar_event(raw_event: Any) -> dict[str, Any]:
     recurrence = str(raw_event.get("recurrence", "none") or "none").strip().casefold()
     if recurrence not in {"none", "yearly"}:
         recurrence = "none"
+    origin = str(raw_event.get("origin", "game") or "game").strip().casefold()
+    if origin not in {"game", "player"}:
+        origin = "game"
+    time_of_day_minutes = _safe_int(
+        raw_event.get("time_of_day_minutes", -1),
+        default=-1,
+    )
+    if time_of_day_minutes < 0:
+        time_of_day_minutes = -1
+    else:
+        time_of_day_minutes = min(1439, time_of_day_minutes)
     return {
         "event_id": event_id,
         "title": title,
@@ -4119,8 +4232,10 @@ def _normalize_calendar_event(raw_event: Any) -> dict[str, Any]:
         "duration_days": max(1, _safe_int(raw_event.get("duration_days", 1), default=1)),
         "recurrence": recurrence,
         "year": max(1, _safe_int(raw_event.get("year", 1), default=1)),
+        "time_of_day_minutes": time_of_day_minutes,
         "importance": str(raw_event.get("importance", "") or "").strip(),
         "details": str(raw_event.get("details", raw_event.get("notes", "")) or "").strip(),
+        "origin": origin,
     }
 
 

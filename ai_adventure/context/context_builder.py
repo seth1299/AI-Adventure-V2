@@ -23,7 +23,6 @@ MAX_SHORT_CONTEXT_TEXT_CHARS = 500
 MAX_CONTEXT_DICT_ITEMS = 50
 MAX_CONTEXT_LIST_ITEMS = 40
 MAX_INVENTORY_CONTEXT_ITEMS = 50
-MAX_ITEM_CATALOG_CONTEXT_ITEMS = 60
 MAX_CRAFTING_CONTEXT_ENTRIES = 40
 MAX_ACTIVE_TASK_CONTEXT_ITEMS = 40
 
@@ -221,6 +220,7 @@ class AiContextBuilder:
         state: AdventureState,
         *,
         player_command: str,
+        conversation_mode: str = "live_game",
         relevant_npcs: list[dict[str, Any]] | None = None,
         gm_secrets: list[dict[str, Any]] | None = None,
         valid_music_tracks: list[str] | None = None,
@@ -234,6 +234,7 @@ class AiContextBuilder:
         Args:
             state: Current composed adventure state.
             player_command: The player's pending command.
+            conversation_mode: Explicit UI-selected mode: live_game or out_of_game.
             relevant_npcs: NPC memory profiles likely relevant this turn.
             gm_secrets: Active private GM-memory records for every turn.
             valid_music_tracks: Playable background music filenames.
@@ -247,12 +248,17 @@ class AiContextBuilder:
         """
 
         clean_command = player_command.strip()
+        clean_conversation_mode = (
+            "out_of_game" if conversation_mode == "out_of_game" else "live_game"
+        )
         selected_tags = (
             infer_context_tags(clean_command)
             if planner_context_tags is None
             else _normalize_planner_context_tags(planner_context_tags)
         )
         selected_tags.add("story")
+        if clean_conversation_mode == "out_of_game":
+            selected_tags.add("out_of_game")
         clean_music_tracks = [
             str(track).strip()
             for track in (valid_music_tracks or [])
@@ -298,6 +304,7 @@ class AiContextBuilder:
             "schema_version": 1,
             "packet_type": "story_turn",
             "player_command": clean_command,
+            "conversation_mode": clean_conversation_mode,
             "selection": {
                 "tags": sorted(selected_tags),
                 "max_history_entries": self.max_history_entries,
@@ -479,15 +486,17 @@ class AiContextBuilder:
                             "category": item.category,
                             "description": _compact_text(item.description),
                             "value_base_units": item.value_base_units,
+                            "ascii_art": item.ascii_art,
                             "metadata": _compact_context_value(item.metadata),
                         }
-                        for item in state.item_catalog.items[:MAX_ITEM_CATALOG_CONTEXT_ITEMS]
+                        for item in state.item_catalog.items
                     ],
                     "rules": {
                         "purpose": (
                             "This is the durable master list of known item "
                             "definitions. It may include items the player no "
-                            "longer owns."
+                            "longer owns. Prefer reusing a fitting existing "
+                            "definition over inventing a near-duplicate."
                         ),
                         "possession_rule": (
                         "Only state.inventory.items are current possessions. Each "
@@ -496,7 +505,7 @@ class AiContextBuilder:
                         "Travel-tab locations; use actively_carried only when the "
                         "Player Character is carrying it. "
                             "Use item_catalog to remember descriptions, categories, "
-                            "and values for previously seen items. Each item also "
+                            "values, and ASCII art for previously seen items. Each item also "
                             "has metadata.item_uuid, a stable internal identity; "
                             "reuse it for the same item and do not split one item "
                             "into duplicate definitions because of name variations."
@@ -582,8 +591,13 @@ class AiContextBuilder:
                     ],
                     "rules": {
                         "reagent_fields": (
-                            "Crafting items/materials use name, category, description, "
-                            "location, and uses as player-known structured fields. "
+                              "Crafting items/materials use name, category, description, "
+                              "location, uses, rarity, notes, and value_base_units as "
+                              "player-known structured fields. location lists generalized "
+                              "environments or source areas such as Forests or Caves, not "
+                              "a specific Travel-tab place. notes explicitly states rarity, "
+                              "and Rare or Very Rare items should be priced materially above "
+                              "comparable Common items unless world context says otherwise. "
                             "The uses list describes generalized symptoms or effects, "
                             "such as sleep aid or pain relief, not detailed recipes "
                             "or procedures. Use Container for vials, bottles, jars, "
@@ -711,7 +725,11 @@ class AiContextBuilder:
                             "Use CalendarEventUpsertedEvent to create or update a "
                             "stable event_id. Use recurrence yearly for annual events "
                             "and none for a specific year. duration_days may span "
-                            "multiple consecutive days."
+                            "multiple consecutive days. Set time_of_day_minutes to an "
+                            "exact local minute after midnight for a timed event, or -1 "
+                            "for an all-day event or unknown time. Emit the event in the "
+                            "same turn whenever narration establishes or reveals a "
+                            "meaningful future date or exact time."
                         ),
                         "delete_rule": (
                             "Use CalendarEventDeletedEvent only when a stored event "
@@ -719,9 +737,19 @@ class AiContextBuilder:
                         ),
                     },
                     "events": [
-                        _compact_context_value(event)
-                        for event in state.settings.values.get("calendar.events", [])[:40]
-                        if isinstance(event, dict)
+                        _compact_context_value(
+                            {
+                                key: value
+                                for key, value in event.items()
+                                if key != "origin"
+                            }
+                        )
+                        for event in [
+                            candidate
+                            for candidate in state.settings.values.get("calendar.events", [])
+                            if isinstance(candidate, dict)
+                            and str(candidate.get("origin", "game")).casefold() != "player"
+                        ][:40]
                     ],
                 },
                 "audio": {
@@ -800,6 +828,13 @@ class AiContextBuilder:
                             "Treat active records as authoritative hidden truth for "
                             "mystery logic, clues, NPC behavior, and off-screen plans."
                         ),
+                        "knowledge_boundary": (
+                            "A GM secret must be unknown to both the player and the "
+                            "Player Character. Their own conscious actions, firsthand "
+                            "observations, memories, known possessions, and deliberately "
+                            "hidden or stored items are not secrets unless established "
+                            "state explicitly supplies a credible knowledge barrier."
+                        ),
                         "non_disclosure": (
                             "Do not quote, summarize, or reveal an active secret in "
                             "response, suggested_actions, or player-visible event "
@@ -848,6 +883,15 @@ class AiContextBuilder:
                     "change is proposed. The Python application validates and "
                     "applies events. Include multiple entries of the same event type "
                     "when multiple distinct state changes happen in one turn."
+                ),
+                "conversation_mode": (
+                    "conversation_mode is selected explicitly by the player in the UI "
+                    "and is authoritative. For out_of_game, answer the player's question "
+                    "or request directly, return out_of_game=true, suggested_actions=[], "
+                    "and events=[]; do not advance time, turns, status, combat, skills, "
+                    "inventory, tasks, NPC memory, secrets, music, or any durable state. "
+                    "For live_game, return out_of_game=false and resolve the message as "
+                    "an in-world action. Never infer or override the mode from wording."
                 ),
                 "status_event": (
                     "For every in-game response, include exactly one final "
@@ -926,10 +970,12 @@ class AiContextBuilder:
                 ),
                 "item_catalog": (
                     "Use state.item_catalog.items as the master list of remembered "
-                    "item definitions. It preserves descriptions, categories, values, "
+                    "item definitions. Before inventing an item, reuse a fitting "
+                    "existing catalog definition whenever one can serve the story. "
+                    "It preserves descriptions, categories, values, ASCII art, "
                     "and metadata.item_uuid stable internal identities; reuse the same "
                     "item_uuid for the same item even when its display name changes. "
-                    "and equipment metadata for items even after they leave inventory. "
+                    "It also preserves equipment metadata after items leave inventory. "
                     "Use Weapon metadata for weapon_hands, damage dice, attack range, "
                     "and optional ammunition_type_required, clip_size, and "
                     "bullets_per_attack. Ammunition items use matching "
@@ -981,7 +1027,17 @@ class AiContextBuilder:
                     "Use state.gm_secrets.active as authoritative AI-only hidden "
                     "truth. Suggest SecretUpsertedEvent to create or replace a "
                     "durable secret, reusing its stable secret_id. Keep active "
-                    "details out of narration and every player-visible field. Set "
+                    "details out of narration and every player-visible field. A GM "
+                    "secret must be unknown to both the player and the Player Character. "
+                    "Never use the Player Character's own conscious actions, firsthand "
+                    "observations, memories, known possessions, or deliberately hidden "
+                    "or stored items unless established state explicitly provides a "
+                    "credible knowledge barrier such as amnesia, memory alteration, "
+                    "unconsciousness, or deception. A reveal_condition cannot be a "
+                    "skill check or search that makes the Player Character rediscover "
+                    "their own knowing act. If the Player Character knows a fact, keep "
+                    "it in player-visible narrative or appropriate public state rather "
+                    "than secret memory. Set "
                     "status to revealed when the player learns the truth and also "
                     "write the newly player-known fact through the appropriate "
                     "public NPC, Location, task, flag, item/material, or other "
@@ -1015,7 +1071,10 @@ class AiContextBuilder:
                     "attacks, turns, reloading, damage, victory, "
                     "defeat, or loot in story prose; the Combat tab owns those mechanics."
                 ),
-                "out_of_game": "Boolean. True only for fully out-of-game answers.",
+                "out_of_game": (
+                    "Boolean. Must be true exactly when conversation_mode is out_of_game; "
+                    "the explicit UI mode is authoritative."
+                ),
                 "event_shape": {
                     "type": "Required event type name.",
                     "payload": "Object containing event-specific data.",

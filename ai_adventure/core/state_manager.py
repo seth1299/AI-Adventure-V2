@@ -205,6 +205,7 @@ class StateManager:
                     category=_read_string(row, "category", ""),
                     description=_read_string(row, "description", ""),
                     value_base_units=_read_int(row, "value_base_units", 0),
+                    ascii_art=_read_string(row, "ascii_art", ""),
                     metadata=dict(row.get("metadata", {}))
                     if isinstance(row.get("metadata"), dict)
                     else {},
@@ -230,6 +231,9 @@ class StateManager:
                     description=_read_string(row, "description", ""),
                     location=_read_string(row, "location", ""),
                     uses=_read_string_list(row, "uses"),
+                    rarity=_read_string(row, "rarity", "Common"),
+                    notes=_read_string(row, "notes", ""),
+                    value_base_units=_read_int(row, "value_base_units", 0),
                     discovered_at=_read_string(row, "discovered_at", ""),
                 )
             )
