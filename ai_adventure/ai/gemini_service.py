@@ -45,7 +45,7 @@ from ai_adventure.skills.rules import MAX_SKILL_LEVEL
 LOGGER = logging.getLogger(__name__)
 
 
-DEFAULT_GEMINI_MODEL = "gemini-3.1-flash-lite"
+DEFAULT_GEMINI_MODEL = "gemini-3.5-flash-lite"
 CREATIVE_TERM_REPAIR_MODEL = DEFAULT_GEMINI_MODEL
 CREATIVE_TERM_REPAIR_ATTEMPTS = 4
 MODEL_REQUEST_ATTEMPTS = 2

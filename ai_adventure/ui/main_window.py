@@ -1538,12 +1538,16 @@ class MainWindow(QMainWindow):
 
         for summary in SaveRepository.list_saves(self.app_paths.saves_dir):
             try:
-                repository = SaveRepository(summary.db_path)
+                theme = SaveRepository.read_save_setting(
+                    summary.db_path,
+                    "theme",
+                    "Light",
+                )
             except Exception:
                 LOGGER.exception("Failed to read theme from save: %s", summary.db_path)
                 continue
 
-            return _normalize_theme_name(repository.get_setting("theme", "Light"))
+            return _normalize_theme_name(theme)
 
         return "Light"
 

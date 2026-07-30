@@ -2009,7 +2009,10 @@ class GeminiServiceTests(unittest.TestCase):
                 self.configs: list[dict[str, object]] = []
 
             def generate_content(self, **kwargs: object) -> object:
-                config = dict(kwargs.get("config", {}))
+                raw_config = kwargs.get("config", {})
+                config: dict[str, object] = (
+                    dict(raw_config) if isinstance(raw_config, dict) else {}
+                )
                 self.configs.append(config)
                 if len(self.configs) == 1:
                     raise RuntimeError("400 INVALID_ARGUMENT: invalid argument")

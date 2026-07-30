@@ -9,7 +9,7 @@ from dataclasses import dataclass
 import importlib
 from pathlib import Path
 from collections.abc import Callable
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Literal, cast
 
 from ai_adventure.audio.ssmd import strip_ssmd_markup_for_plain_tts
 from ai_adventure.audio.tts_settings import (
@@ -25,6 +25,17 @@ from ai_adventure.audio.voices import (
 LOGGER = logging.getLogger(__name__)
 PYKOKORO_MODEL_QUALITY = "q8"
 PYKOKORO_SPACY_MODEL = "en_core_web_sm"
+PykokoroModelQuality = Literal[
+    "fp32",
+    "fp16",
+    "fp16-gpu",
+    "q8",
+    "q8f16",
+    "q4",
+    "q4f16",
+    "uint8",
+    "uint8f16",
+]
 
 
 @dataclass(frozen=True)
@@ -84,7 +95,9 @@ class PyKokoroTTSEngine(TTSEngine):
         self._GenerationConfig = GenerationConfig
         self._TokenizerConfig = TokenizerConfig
         self._VoiceBlend = VoiceBlend
-        self.model_quality = _normalize_pykokoro_model_quality(model_quality)
+        self.model_quality: PykokoroModelQuality = _normalize_pykokoro_model_quality(
+            model_quality
+        )
         self._pipeline_cache: dict[tuple[str, float, str], Any] = {}
         LOGGER.info("PyKokoro TTS initialized with %s model quality.", self.model_quality)
 
@@ -217,11 +230,8 @@ class KokoroOnnxTTSEngine(TTSEngine):
         output_path = self.output_directory / f"ai_adventure_tts_{uuid.uuid4().hex}.wav"
         voice_id = normalize_narrator_voice_spec(request.voice or self.DEFAULT_VOICE)
         voice = self._voice_for_spec(voice_id)
-        language_voice_id = (
-            str(parse_voice_blend_spec(voice_id)["voice_a"])
-            if parse_voice_blend_spec(voice_id) is not None
-            else voice_id
-        )
+        blend = parse_voice_blend_spec(voice_id)
+        language_voice_id = str(blend["voice_a"]) if blend is not None else voice_id
         language_code = self.LANGUAGE_BY_VOICE_PREFIX.get(
             language_voice_id[:1].lower(),
             str(request.language or "en-us").strip() or "en-us",
@@ -387,15 +397,25 @@ def _preferred_tts_engine_name() -> str:
     return "kokoro_onnx"
 
 
-def _normalize_pykokoro_model_quality(value: str) -> str:
+def _normalize_pykokoro_model_quality(value: str) -> PykokoroModelQuality:
     """Returns a supported PyKokoro model quality, defaulting to Q8."""
 
     clean_value = str(value or "").strip().casefold()
 
-    if clean_value in {"fp32", "fp16", "q8", "q4", "uint8"}:
-        return clean_value
+    if clean_value in {
+        "fp32",
+        "fp16",
+        "fp16-gpu",
+        "q8",
+        "q8f16",
+        "q4",
+        "q4f16",
+        "uint8",
+        "uint8f16",
+    }:
+        return cast(PykokoroModelQuality, clean_value)
 
-    return PYKOKORO_MODEL_QUALITY
+    return cast(PykokoroModelQuality, PYKOKORO_MODEL_QUALITY)
 
 
 def _resolve_pykokoro_spacy_model() -> str:

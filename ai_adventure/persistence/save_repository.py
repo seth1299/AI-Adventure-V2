@@ -357,6 +357,31 @@ class SaveRepository:
             return default
         return str(row[0])
 
+    @staticmethod
+    def read_save_setting(db_path: Path, key: str, default: Any = None) -> Any:
+        """Reads one setting without initializing or modifying the database."""
+
+        if not key.strip():
+            return default
+
+        read_only_uri = f"{db_path.resolve().as_uri()}?mode=ro"
+        connection = sqlite3.connect(read_only_uri, uri=True)
+        try:
+            row = connection.execute(
+                "SELECT value_json FROM settings WHERE key = ?",
+                (key,),
+            ).fetchone()
+        finally:
+            connection.close()
+
+        if row is None:
+            return default
+
+        try:
+            return json.loads(str(row[0]))
+        except (TypeError, ValueError):
+            return default
+
     @classmethod
     def save_title_exists(cls, saves_dir: Path, title: str) -> bool:
         """Returns True when a save already uses this player-facing title."""

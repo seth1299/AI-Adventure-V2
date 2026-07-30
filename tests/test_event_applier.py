@@ -6,7 +6,7 @@ import unittest
 import sqlite3
 import random
 from pathlib import Path
-from typing import TypeVar
+from typing import TypeVar, cast
 
 from ai_adventure.calendar_system import build_calendar_snapshot
 from ai_adventure.events.event_applier import EventApplier
@@ -313,7 +313,10 @@ class EventApplierTests(unittest.TestCase):
                 metadata={
                     **_test_container_metadata(),
                     "container": {
-                        **_test_container_metadata()["container"],
+                        **cast(
+                            dict[str, object],
+                            _test_container_metadata()["container"],
+                        ),
                         "is_open": True,
                     },
                 },

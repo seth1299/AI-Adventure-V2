@@ -482,6 +482,19 @@ class NewGameSetupTests(unittest.TestCase):
             self.assertEqual(saves[0].title, "Timestamp Test")
             self.assertEqual(db_path.stat().st_mtime_ns, before)
 
+    def test_read_save_setting_does_not_update_database_timestamp(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            saves_dir = Path(temp_dir)
+            repository = SaveRepository.create_new_save(saves_dir, "Theme Test")
+            repository.set_setting("theme", "Dark")
+            db_path = repository.db_path
+            before = db_path.stat().st_mtime_ns
+
+            theme = SaveRepository.read_save_setting(db_path, "theme", "Light")
+
+            self.assertEqual(theme, "Dark")
+            self.assertEqual(db_path.stat().st_mtime_ns, before)
+
     def test_save_repository_renames_and_deletes_existing_save(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             saves_dir = Path(temp_dir)

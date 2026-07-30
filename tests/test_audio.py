@@ -305,8 +305,8 @@ class AudioTests(unittest.TestCase):
                 for name, module in original_modules.items():
                     if module is None:
                         sys.modules.pop(name, None)
-                else:
-                    sys.modules[name] = module
+                    else:
+                        sys.modules[name] = module
 
     def test_preferred_tts_engine_defaults_to_kokoro_onnx(self) -> None:
         calls = []

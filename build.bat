@@ -52,7 +52,6 @@ if errorlevel 1 (
     --windowed ^
     --name "%APP_NAME%" ^
     --add-data "ai_adventure\data\context;ai_adventure\data\context" ^
-    --add-data "ai_adventure\data\alchemy;ai_adventure\data\alchemy" ^
     --add-data "%APP_ICON%;ai_adventure\data" ^
     --add-data "ai_adventure\audio\music_tracks;ai_adventure\audio\music_tracks" ^
     --add-data "%TTS_MODEL%;ai_adventure\audio\tts" ^
