@@ -35,6 +35,7 @@ from ai_adventure.ui.main_window import (
     InventoryScreen,
     NpcsScreen,
     StoryScreen,
+    _apply_audio_settings_to_managers,
     _inventory_item_display_name,
     _inventory_quantity_display,
 )
@@ -107,6 +108,117 @@ class InventoryUiTests(unittest.TestCase):
             QTextEdit.LineWrapMode.WidgetWidth,
         )
 
+        screen.close()
+
+    def test_live_game_ai_headers_number_turns_without_counting_out_of_game(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = SaveRepository.create_new_save(Path(temp_dir), "Turn Header Test")
+            repository.append_history("story", "The first live response.")
+            repository.append_history("story_oog", "The out-of-game answer.")
+            repository.append_history("story", "The second live response.")
+            screen = StoryScreen()
+            screen.set_repository(repository)
+            screen.show()
+            self.app.processEvents()
+
+            headers = {
+                label.text()
+                for label in screen.findChildren(QLabel)
+                if label.text().startswith("AI Game Master")
+            }
+
+            self.assertIn("AI Game Master  |  Live Game  |  Turn #1", headers)
+            self.assertIn("AI Game Master  |  Out-of-Game", headers)
+            self.assertIn("AI Game Master  |  Live Game  |  Turn #2", headers)
+            self.assertNotIn("AI Game Master  |  Out-of-Game  |  Turn #2", headers)
+            screen.close()
+
+    def test_saved_music_and_sound_effect_are_started_independently(self) -> None:
+        class FakeSoundManager:
+            def __init__(self) -> None:
+                self.music_played = ""
+                self.effect_played = ""
+
+            def get_valid_track_names(self) -> list[str]:
+                return []
+
+            def get_valid_sound_effect_names(self) -> list[str]:
+                return []
+
+            def set_music_volume(self, volume: float | int | None) -> None:
+                pass
+
+            def set_music_enabled(self, enabled: bool) -> None:
+                pass
+
+            def set_sound_effects_volume(self, volume: float | int | None) -> None:
+                pass
+
+            def set_sound_effects_enabled(self, enabled: bool) -> None:
+                pass
+
+            def play_music(self, track_name_or_path: str | Path | None) -> None:
+                self.music_played = str(track_name_or_path or "")
+
+            def play_music_preview(
+                self,
+                track_name_or_path: str | Path | None,
+            ) -> None:
+                pass
+
+            def play_sound_effect(
+                self,
+                track_name_or_path: str | Path | None,
+            ) -> None:
+                self.effect_played = str(track_name_or_path or "")
+
+            def stop_music(self, *, clear_current: bool = True) -> None:
+                pass
+
+            def stop_sound_effect(self, *, clear_current: bool = True) -> None:
+                pass
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = SaveRepository.create_new_save(Path(temp_dir), "Audio Sync Test")
+            repository.set_setting("audio.current_music", "Slow Jazz.mp3")
+            repository.set_setting("audio.current_sound_effect", "Steady Rain.wav")
+            manager = FakeSoundManager()
+
+            _apply_audio_settings_to_managers(
+                repository,
+                sound_manager=manager,
+                narration_player=None,
+            )
+
+            self.assertEqual(manager.music_played, "Slow Jazz.mp3")
+            self.assertEqual(manager.effect_played, "Steady Rain.wav")
+
+    def test_conversation_refresh_preserves_reader_position_and_adds_bottom_buffer(self) -> None:
+        screen = StoryScreen()
+        screen.resize(900, 600)
+        entries = [
+            (
+                "ai",
+                "live_game",
+                f"Message {index}: " + ("A long readable sentence. " * 12),
+                index,
+            )
+            for index in range(8)
+        ]
+        screen._render_conversation(entries)
+        screen.show()
+        self.app.processEvents()
+
+        bar = screen.conversation_scroll.verticalScrollBar()
+        self.assertGreater(bar.maximum(), 0)
+        self.assertGreater(screen.conversation_bottom_padding.height(), 0)
+
+        bar.setValue(max(0, bar.maximum() - 140))
+        old_value = bar.value()
+        screen._render_conversation(entries)
+        self.app.processEvents()
+
+        self.assertLessEqual(abs(bar.value() - old_value), 2)
         screen.close()
 
     def test_recipe_table_uses_notes_instead_of_redundant_result_column(self) -> None:
@@ -316,6 +428,14 @@ class InventoryUiTests(unittest.TestCase):
                 art_view.document().firstBlock().blockFormat().alignment(),
                 Qt.AlignmentFlag.AlignCenter,
             )
+            art_blocks = art_view.document().begin()
+            while art_blocks.isValid():
+                self.assertEqual(
+                    art_blocks.blockFormat().alignment(),
+                    Qt.AlignmentFlag.AlignCenter,
+                )
+                art_blocks = art_blocks.next()
+            self.assertGreater(art_view.viewportMargins().top(), 0)
             dialog_labels = [label.text() for label in dialog.findChildren(QLabel)]
             self.assertNotIn("Item Art", dialog_labels)
             self.assertNotIn("Equipped:", dialog_labels)

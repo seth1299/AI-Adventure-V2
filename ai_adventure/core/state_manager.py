@@ -89,6 +89,9 @@ class StateManager:
             ),
             player=PlayerState(
                 name=str(settings.values.get("player_name", "")),
+                name_pronunciation=str(
+                    settings.values.get("player.name_pronunciation", "")
+                ),
                 appearance=str(settings.values.get("player.appearance", "")),
                 backstory=str(settings.values.get("player.backstory", "")),
                 condition=_read_string(state_snapshot, "condition", "Healthy"),
@@ -177,7 +180,7 @@ class StateManager:
         for row in self.repository.list_inventory_items():
             items.append(
                 InventoryItem(
-                    id=_read_optional_int(row, "id"),
+                    id=_read_optional_id(row, "id"),
                     name=_read_string(row, "name", ""),
                     category=_read_string(row, "category", ""),
                     quantity=_read_int(row, "quantity", 1),
@@ -200,7 +203,7 @@ class StateManager:
         for row in self.repository.list_item_catalog():
             items.append(
                 ItemCatalogEntry(
-                    id=_read_optional_int(row, "id"),
+                    id=_read_optional_id(row, "id"),
                     name=_read_string(row, "name", ""),
                     category=_read_string(row, "category", ""),
                     description=_read_string(row, "description", ""),
@@ -225,7 +228,7 @@ class StateManager:
         for row in self.repository.list_crafting_items():
             known_reagents.append(
                 ReagentKnowledge(
-                    id=_read_optional_int(row, "id"),
+                    id=_read_optional_id(row, "id"),
                     name=_read_string(row, "name", ""),
                     category=_read_string(row, "category", "Material"),
                     description=_read_string(row, "description", ""),
@@ -241,7 +244,7 @@ class StateManager:
         for row in self.repository.list_crafting_recipes():
             known_recipes.append(
                 RecipeKnowledge(
-                    id=_read_optional_int(row, "id"),
+                    id=_read_optional_id(row, "id"),
                     name=_read_string(row, "name", ""),
                     ingredients=[
                         RecipeIngredient(
@@ -274,7 +277,7 @@ class StateManager:
         for row in self.repository.list_skills():
             skills.append(
                 Skill(
-                    id=_read_optional_int(row, "id"),
+                    id=_read_optional_id(row, "id"),
                     name=_read_string(row, "name", ""),
                     description=_read_string(row, "description", ""),
                     level=_read_int(row, "level", 1),
@@ -308,7 +311,7 @@ class StateManager:
         for row in self.repository.list_active_tasks():
             tasks.append(
                 ActiveTask(
-                    id=_read_optional_int(row, "id"),
+                    id=_read_optional_id(row, "id"),
                     name=_read_string(row, "name", ""),
                     category=_read_string(row, "category", "Task"),
                     status=_read_string(row, "status", "Active"),
@@ -335,6 +338,7 @@ class StateManager:
             entries.append(
                 HistoryEntry(
                     id=_read_optional_int(row, "id"),
+                    message_id=_read_string(row, "message_id", ""),
                     kind=_read_string(row, "kind", "misc"),
                     content=_read_string(row, "content", ""),
                     created_at=_read_string(row, "created_at", ""),
@@ -389,14 +393,24 @@ def _read_int(row: dict[str, Any], key: str, default: int) -> int:
         return default
 
 
-def _read_optional_int(row: dict[str, Any], key: str) -> int | None:
-    """Reads an optional integer value from a row-like dictionary."""
+def _read_optional_id(row: dict[str, Any], key: str) -> str | None:
+    """Reads an optional alphanumeric record ID from a row-like dictionary."""
 
     value = row.get(key)
 
     if value is None:
         return None
 
+    clean_value = str(value).strip()
+    return clean_value or None
+
+
+def _read_optional_int(row: dict[str, Any], key: str) -> int | None:
+    """Reads an optional integer value from a row-like dictionary."""
+
+    value = row.get(key)
+    if value is None:
+        return None
     try:
         return int(value)
     except (TypeError, ValueError):

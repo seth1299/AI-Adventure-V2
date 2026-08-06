@@ -25,6 +25,8 @@ from ai_adventure.ai.gemini_service import (
     GeminiSettings,
     build_skill_check_plan_prompt,
     build_gemini_new_game_prompt,
+    build_new_game_response_schema,
+    build_story_response_schema,
     build_gemini_story_prompt,
     format_story_message,
     load_gemini_settings,
@@ -35,6 +37,8 @@ from ai_adventure.ai.gemini_service import (
     _enforce_explicit_conversation_mode,
     _filter_unwarranted_planned_skill_checks,
     _generate_content_with_retry,
+    _model_error_diagnostics,
+    _model_request_diagnostics,
     _json_schema_shape_errors,
     _find_gemini_creative_terms,
     _normalize_visible_currency_phrasing,
@@ -288,6 +292,91 @@ class GeminiServiceTests(unittest.TestCase):
     def test_new_game_schema_requires_locations(self) -> None:
         self.assertIn("locations", NEW_GAME_RESPONSE_JSON_SCHEMA["required"])
 
+    def test_new_game_dynamic_schema_omits_authoritative_setup_fields(self) -> None:
+        packet = {
+            "packet_type": "new_game_setup",
+            "setup": {
+                "specified_genre": "Urban fantasy",
+                "start_location": "Kit's Hideout",
+                "start_location_mode": "exact",
+                "character": {
+                    "name": "Kit",
+                    "appearance": "A short-haired human rogue.",
+                    "backstory": "Kit grew up on the city streets.",
+                    "notes": "Distrusts wealthy patrons.",
+                },
+                "skills": [
+                    {
+                        "name": "Stealth",
+                        "description": "Moving without being noticed.",
+                        "level": 4,
+                        "requires_ai_invention": False,
+                    }
+                ],
+                "currency_denominations": [
+                    {"name": "Copper", "plural_name": "Copper", "value": 1}
+                ],
+                "calendar": {"calendar_type": "custom", "ai_generated": False},
+                "starting_npcs": [],
+                "starting_task": {"mode": "none"},
+                "audio": {"music_enabled": False},
+            },
+            "audio": {"valid_music_tracks": ["City.mp3"]},
+        }
+
+        schema = build_new_game_response_schema(packet)
+
+        for field_name in (
+            "selected_genre",
+            "start_location",
+            "calendar_settings",
+            "starting_calendar",
+            "character",
+            "skills",
+            "currency_denominations",
+            "currency_description",
+            "events",
+        ):
+            self.assertNotIn(field_name, schema["properties"])
+            self.assertNotIn(field_name, schema["required"])
+        self.assertIn("world_summary", schema["required"])
+        self.assertIn("starting_items", schema["required"])
+        self.assertIn("suggested_actions", schema["required"])
+        self.assertIn(
+            "description",
+            schema["properties"]["starting_items"]["items"]["properties"],
+        )
+        self.assertNotIn(
+            "maxItems",
+            schema["properties"]["pronunciation_map"],
+        )
+
+    def test_new_game_dynamic_schema_keeps_only_missing_character_fields(self) -> None:
+        schema = build_new_game_response_schema(
+            {
+                "setup": {
+                    "character": {
+                        "name": "Kit",
+                        "appearance": "",
+                        "backstory": "A complete backstory.",
+                        "notes": "",
+                    },
+                    "calendar": {"ai_generated": True},
+                    "starting_npcs": [],
+                    "starting_task": {"mode": "none"},
+                }
+            }
+        )
+
+        character_schema = schema["properties"]["character"]
+        self.assertEqual(
+            list(character_schema["properties"]),
+            ["appearance", "notes"],
+        )
+        self.assertEqual(character_schema["required"], ["appearance", "notes"])
+        self.assertIn("calendar_settings", schema["required"])
+        self.assertIn("starting_calendar", schema["required"])
+
     def test_new_game_starter_item_parser_preserves_firearm_metadata(self) -> None:
         items = _parse_new_game_starter_items(
             [
@@ -398,7 +487,7 @@ class GeminiServiceTests(unittest.TestCase):
         self.assertEqual(call["config"]["response_mime_type"], "application/json")
         self.assertEqual(
             call["config"]["response_json_schema"],
-            STORY_RESPONSE_JSON_SCHEMA,
+            build_story_response_schema({"packet_type": "story_turn"}),
         )
         self.assertEqual(
             call["config"]["safety_settings"][0]["threshold"],
@@ -409,6 +498,39 @@ class GeminiServiceTests(unittest.TestCase):
             1024,
         )
         self.assertNotIn("max_output_tokens", call["config"])
+
+    def test_story_dynamic_schema_keeps_only_turn_relevant_event_types(self) -> None:
+        schema = build_story_response_schema(
+            {
+                "selection": {
+                    "tags": ["dialogue", "quest", "scene", "story", "music"]
+                }
+            }
+        )
+        event_types = {
+            branch["properties"]["type"]["enum"][0]
+            for branch in schema["properties"]["events"]["items"]["anyOf"]
+        }
+
+        self.assertEqual(
+            event_types,
+            {
+                "StatusUpdatedEvent",
+                "SkillCheckRequestedEvent",
+                "MusicChangedEvent",
+                "SoundEffectChangedEvent",
+                "FlagSetEvent",
+                "LocationUpsertedEvent",
+                "ActiveTaskUpsertedEvent",
+                "ActiveTaskCompletedEvent",
+                "NpcUpsertedEvent",
+                "NpcKnowledgeAddedEvent",
+                "SecretUpsertedEvent",
+            },
+        )
+        self.assertNotIn("InventoryItemAddedEvent", event_types)
+        self.assertNotIn("description", schema["properties"]["events"])
+        self.assertNotIn("maxItems", schema["properties"]["pronunciation_map"])
 
     def test_new_game_starter_items_preserve_free_text_storage_location(self) -> None:
         item_schema = NEW_GAME_RESPONSE_JSON_SCHEMA["properties"]["starting_items"]["items"]
@@ -1224,6 +1346,88 @@ class GeminiServiceTests(unittest.TestCase):
 
         self.assertEqual(event_types, ["StatusUpdatedEvent"])
 
+    def test_story_request_synchronizes_explicit_rain_with_status_weather(self) -> None:
+        self._install_fake_genai_client(
+            json.dumps(
+                {
+                    "response": (
+                        "Outside, the rain beat a steady rhythm against the frosted "
+                        "glass of the office door."
+                    ),
+                    "suggested_actions": ["Look outside."],
+                    "events": [
+                        {
+                            "type": "StatusUpdatedEvent",
+                            "payload": {
+                                "location": "AUTO",
+                                "minutes_passed": 0,
+                                "weather": "AUTO",
+                            },
+                        }
+                    ],
+                    "out_of_game": False,
+                }
+            )
+        )
+
+        try:
+            service = GeminiNarrationService(
+                GeminiSettings(api_key="test-key", model="gemini-2.5-flash")
+            )
+            result = service.generate_story_response(
+                {
+                    "packet_type": "story_turn",
+                    "player_command": "Look around the office.",
+                    "state": {
+                        "scene": {
+                            "location": "Schue Detective Office",
+                            "weather": "Clear",
+                        }
+                    },
+                }
+            )
+        finally:
+            self._remove_fake_genai_client()
+
+        self.assertEqual(result.suggested_events[-1]["payload"]["weather"], "Rain")
+
+    def test_story_request_keeps_status_weather_when_narration_does_not_change_it(self) -> None:
+        self._install_fake_genai_client(
+            json.dumps(
+                {
+                    "response": "The neon sign hums beyond the office window.",
+                    "suggested_actions": ["Check the unpaid bills."],
+                    "events": [
+                        {
+                            "type": "StatusUpdatedEvent",
+                            "payload": {
+                                "location": "AUTO",
+                                "minutes_passed": 0,
+                                "weather": "AUTO",
+                            },
+                        }
+                    ],
+                    "out_of_game": False,
+                }
+            )
+        )
+
+        try:
+            service = GeminiNarrationService(
+                GeminiSettings(api_key="test-key", model="gemini-2.5-flash")
+            )
+            result = service.generate_story_response(
+                {
+                    "packet_type": "story_turn",
+                    "player_command": "Look around the office.",
+                    "state": {"scene": {"weather": "Clear"}},
+                }
+            )
+        finally:
+            self._remove_fake_genai_client()
+
+        self.assertEqual(result.suggested_events[-1]["payload"]["weather"], "AUTO")
+
     def test_story_request_adds_inventory_for_collected_reagent(self) -> None:
         self._install_fake_genai_client(
             json.dumps(
@@ -1664,6 +1868,7 @@ class GeminiServiceTests(unittest.TestCase):
                 "NpcUpsertedEvent",
                 "ActiveTaskUpsertedEvent",
                 "MusicChangedEvent",
+                "SoundEffectChangedEvent",
             },
         )
         self.assertIn("gm_secrets", NEW_GAME_RESPONSE_JSON_SCHEMA["properties"])
@@ -1933,12 +2138,89 @@ class GeminiServiceTests(unittest.TestCase):
         self.assertEqual(call["config"]["response_mime_type"], "application/json")
         self.assertEqual(
             call["config"]["response_json_schema"],
-            NEW_GAME_RESPONSE_JSON_SCHEMA,
+            build_new_game_response_schema({"packet_type": "new_game_setup"}),
         )
         self.assertEqual(
             call["config"]["safety_settings"][0]["threshold"],
             "OFF",
         )
+
+    def test_new_game_request_uses_condensed_schema_for_completed_setup(self) -> None:
+        response = {
+            "world_summary": "A compact city of steep roofs and narrow alleys.",
+            "locations": [],
+            "gm_secrets": [],
+            "weather": "Clear",
+            "starting_items": [
+                {
+                    "name": f"Useful Item {index}",
+                    "category": "Tool",
+                    "quantity": 1,
+                    "quantity_unit": "each",
+                    "storage_location": "actively_carried",
+                    "description": "A useful personal item.",
+                    "ascii_art": " ___\n|___|\n | |",
+                    "value_base_units": index + 1,
+                    "source_index": -1,
+                }
+                for index in range(5)
+            ],
+            "known_crafting_items": [],
+            "known_crafting_recipes": [],
+            "starting_currency_balance_base_units": 20,
+            "introductory_message": "Morning light reaches the loft.",
+            "suggested_actions": ["Look outside.", "Check your gear.", "Leave quietly."],
+        }
+        packet = {
+            "packet_type": "new_game_setup",
+            "setup": {
+                "specified_genre": "Urban fantasy",
+                "start_location": "Kit's Hideout",
+                "start_location_mode": "exact",
+                "character": {
+                    "name": "Kit",
+                    "appearance": "A short-haired human rogue.",
+                    "backstory": "Kit grew up on the city streets.",
+                    "notes": "Distrusts wealthy patrons.",
+                },
+                "skills": [
+                    {
+                        "name": "Stealth",
+                        "description": "Moving without being noticed.",
+                        "level": 4,
+                        "requires_ai_invention": False,
+                    }
+                ],
+                "currency_denominations": [
+                    {"name": "Copper", "plural_name": "Copper", "value": 1}
+                ],
+                "currency_description": "Copper is the baseline coin.",
+                "calendar": {"calendar_type": "custom", "ai_generated": False},
+                "starting_npcs": [],
+                "starting_task": {"mode": "none"},
+                "audio": {"music_enabled": False},
+            },
+            "audio": {"valid_music_tracks": ["City.mp3"]},
+        }
+        fake_client_class = self._install_fake_genai_client(json.dumps(response))
+
+        try:
+            result = GeminiNarrationService(
+                GeminiSettings(api_key="test-key", model="gemini-2.5-flash")
+            ).generate_new_game_world(packet)
+        finally:
+            self._remove_fake_genai_client()
+
+        call = fake_client_class.last_client.models.calls[0]
+        schema = call["config"]["response_json_schema"]
+        self.assertEqual(result.selected_genre, "Urban fantasy")
+        self.assertEqual(result.start_location, "Kit's Hideout")
+        self.assertNotIn("character", schema["properties"])
+        self.assertNotIn("skills", schema["properties"])
+        self.assertNotIn("currency_denominations", schema["properties"])
+        self.assertNotIn("events", schema["properties"])
+        self.assertIn('"required_output_fields"', call["contents"])
+        self.assertNotIn('"character_generation"', call["contents"])
 
     def test_new_game_request_applies_wizard_ai_modes(self) -> None:
         fake_client_class = self._install_fake_genai_client("{}")
@@ -2190,6 +2472,48 @@ class GeminiServiceTests(unittest.TestCase):
                 request_label="test request",
             )
 
+    def test_model_request_diagnostics_identify_schema_fields_without_prompt_text(self) -> None:
+        diagnostics = _model_request_diagnostics(
+            model="gemini-3.5-flash-lite",
+            contents="secret prompt text",
+            config={
+                "response_mime_type": "application/json",
+                "response_json_schema": {
+                    "type": "object",
+                    "properties": {
+                        "events": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {"status": {"type": "string"}},
+                            },
+                        }
+                    },
+                    "required": ["events"],
+                },
+                "thinking_config": {"thinking_level": "minimal"},
+            },
+        )
+
+        self.assertIn('"model": "gemini-3.5-flash-lite"', diagnostics)
+        self.assertIn("schema_status_property_paths", diagnostics)
+        self.assertIn("$.properties.events.items.properties.status", diagnostics)
+        self.assertNotIn("secret prompt text", diagnostics)
+
+    def test_model_error_diagnostics_include_google_status_metadata(self) -> None:
+        error = types.SimpleNamespace(
+            code=400,
+            status="INVALID_ARGUMENT",
+            message="Request contains an invalid argument.",
+            details={"error": {"status": "INVALID_ARGUMENT"}},
+        )
+
+        diagnostics = _model_error_diagnostics(error)  # type: ignore[arg-type]
+
+        self.assertIn('"code": 400', diagnostics)
+        self.assertIn('"status": "INVALID_ARGUMENT"', diagnostics)
+        self.assertIn('"details"', diagnostics)
+
     def test_model_request_retries_invalid_schema_without_server_schema(self) -> None:
         class Models:
             def __init__(self) -> None:
@@ -2226,6 +2550,35 @@ class GeminiServiceTests(unittest.TestCase):
             "application/json",
         )
 
+    def test_new_game_request_never_drops_server_schema_after_rejection(self) -> None:
+        class Models:
+            def __init__(self) -> None:
+                self.configs: list[dict[str, object]] = []
+
+            def generate_content(self, **kwargs: object) -> object:
+                raw_config = kwargs.get("config", {})
+                self.configs.append(
+                    dict(raw_config) if isinstance(raw_config, dict) else {}
+                )
+                raise RuntimeError("400 INVALID_ARGUMENT: invalid schema")
+
+        models = Models()
+        with self.assertRaises(GeminiRequestError):
+            _generate_content_with_retry(
+                types.SimpleNamespace(models=models),
+                model="gemini-3.5-flash-lite",
+                contents="{}",
+                config={
+                    "response_mime_type": "application/json",
+                    "response_json_schema": {"type": "object"},
+                },
+                request_label="new-game request",
+                allow_schema_fallback=False,
+            )
+
+        self.assertEqual(len(models.configs), 1)
+        self.assertIn("response_json_schema", models.configs[0])
+
     def test_build_prompt_contains_strict_json_contract(self) -> None:
         prompt = build_gemini_story_prompt(
             {
@@ -2258,11 +2611,16 @@ class GeminiServiceTests(unittest.TestCase):
         self.assertIn("NPC contract sentinel", prompt)
         self.assertIn("Inventory contract sentinel", prompt)
         self.assertNotIn("Filtered combat sentinel", prompt)
+        self.assertIn("InventoryItemAddedEvent", prompt)
+        self.assertIn("NpcUpsertedEvent", prompt)
+        self.assertNotIn("CombatStartedEvent", prompt)
         self.assertIn("<examples>", prompt)
         self.assertIn("<output_format>", prompt)
         self.assertIn("status_event", prompt)
         self.assertIn("payload contains location, minutes_passed, and weather", prompt)
         self.assertIn("events must end with exactly one StatusUpdatedEvent", prompt)
+        self.assertIn("fully resolve and narrate this player command", prompt)
+        self.assertIn("including any immediate NPC response", prompt)
         self.assertIn("look around", prompt)
         self.assertNotIn("Context packet:", prompt)
         self.assertLess(len(prompt), 8_000)
@@ -2348,6 +2706,11 @@ class GeminiServiceTests(unittest.TestCase):
         self.assertIn("ReagentDiscoveredEvent records Crafting tab knowledge", prompt)
         self.assertIn("useful items/materials", prompt)
         self.assertIn("RecipeDiscoveredEvent ingredients must be structured entries", prompt)
+        self.assertIn("Recipe notes must be self-contained", prompt)
+        self.assertIn("intended purpose/effect", prompt)
+        self.assertIn("expected strength or outcome", prompt)
+        self.assertIn("onset, duration", prompt)
+        self.assertIn("notes must end with exactly one sentence", prompt)
         self.assertIn("Only items with category Material, Ingredient, Reagent, Crafting Item", prompt)
         self.assertIn("Do not describe a successful bounty", prompt)
         self.assertIn("actions with meaningful uncertainty", prompt)
@@ -2940,6 +3303,7 @@ class GeminiServiceTests(unittest.TestCase):
         self.assertIn("bare category labels as final proper nouns", prompt)
         self.assertIn("the Police Department", prompt)
         """
+
         self.assertEqual(result.locations[0]["name"], "Rainmarket Station")
         self.assertEqual(result.locations[0]["source_index"], 0)
         self.assertEqual((result.locations[0]["x_miles"], result.locations[0]["y_miles"]), (0.0, 0.0))
@@ -3053,6 +3417,10 @@ class GeminiServiceTests(unittest.TestCase):
         self.assertIn("setup.calendar.ai_generated", prompt)
         self.assertIn("invent calendar_settings", prompt)
         self.assertIn("Do not copy the default Gregorian calendar", prompt)
+        self.assertIn(
+            "Never use Monday, Tuesday, Wednesday, Thursday, Friday, Saturday, or Sunday",
+            prompt,
+        )
         self.assertIn("generic fantasy/artisan defaults", prompt)
         self.assertIn("not hearth, market, lantern", prompt)
         self.assertIn("January-through-December", prompt)
@@ -3504,6 +3872,21 @@ class GeminiServiceTests(unittest.TestCase):
         )
 
         self.assertEqual(result[0]["category"], "Ingredient")
+
+
+    def test_regeneration_reason_is_in_story_prompt(self) -> None:
+        prompt = build_gemini_story_prompt(
+            {
+                "player_command": "Open the locked door.",
+                "conversation_mode": "live_game",
+                "regeneration_request": {
+                    "active": True,
+                    "reason": "Make the discovery more cautious and investigative.",
+                },
+            }
+        )
+
+        self.assertIn("Make the discovery more cautious and investigative.", prompt)
 
 
 if __name__ == "__main__":

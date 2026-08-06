@@ -23,6 +23,7 @@ class PlayerState:
     """State that belongs directly to the player character."""
 
     name: str = ""
+    name_pronunciation: str = ""
     appearance: str = ""
     backstory: str = ""
     condition: str = "Healthy"
@@ -77,7 +78,7 @@ class TravelState:
 class InventoryItem:
     """An item owned by the player."""
 
-    id: int | None = None
+    id: str | None = None
     name: str = ""
     category: str = ""
     quantity: int = 1
@@ -108,7 +109,7 @@ class InventoryState:
 class ItemCatalogEntry:
     """A remembered item definition, whether or not it is currently owned."""
 
-    id: int | None = None
+    id: str | None = None
     name: str = ""
     category: str = ""
     description: str = ""
@@ -189,7 +190,7 @@ class CalendarState:
 class ReagentKnowledge:
     """A discovered useful crafting item/material."""
 
-    id: int | None = None
+    id: str | None = None
     name: str = ""
     category: str = "Material"
     description: str = ""
@@ -226,7 +227,7 @@ class RecipeIngredient:
 class RecipeKnowledge:
     """A discovered alchemical recipe."""
 
-    id: int | None = None
+    id: str | None = None
     name: str = ""
     ingredients: list[RecipeIngredient] = field(default_factory=list)
     result: str = ""
@@ -261,6 +262,7 @@ class HistoryEntry:
     """One durable history timeline entry."""
 
     id: int | None = None
+    message_id: str = ""
     kind: str = "misc"
     content: str = ""
     created_at: str = ""
@@ -287,7 +289,7 @@ class HistoryState:
 class Skill:
     """A player skill with a plain reliability bonus."""
 
-    id: int | None = None
+    id: str | None = None
     name: str = ""
     description: str = ""
     level: int = 1
@@ -340,7 +342,7 @@ class SkillsState:
 class ActiveTask:
     """A visible ongoing quest, commission, order, or other obligation."""
 
-    id: int | None = None
+    id: str | None = None
     name: str = ""
     category: str = "Task"
     status: str = "Active"

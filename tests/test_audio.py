@@ -22,12 +22,103 @@ from ai_adventure.audio.tts_settings import (
     normalize_narrator_voice_spec,
     parse_voice_blend_spec,
 )
-from ai_adventure.audio.sound_manager import prepare_sound_directory
+from ai_adventure.audio.sound_manager import (
+    SOUND_EFFECT_CHANNEL_INDEX,
+    SoundManager,
+    prepare_sound_directory,
+)
 from ai_adventure.audio.tts import tts_manager
 from ai_adventure.audio.tts.tts_manager import PyKokoroTTSEngine
 
 
 class AudioTests(unittest.TestCase):
+    def test_music_and_looping_sound_effect_play_on_independent_channels(self) -> None:
+        class FakeMusic:
+            def __init__(self) -> None:
+                self.stop_calls = 0
+                self.loaded = ""
+                self.play_loops: list[int] = []
+
+            def get_busy(self) -> bool:
+                return bool(self.play_loops)
+
+            def stop(self) -> None:
+                self.stop_calls += 1
+
+            def load(self, path: str) -> None:
+                self.loaded = path
+
+            def set_volume(self, _volume: float) -> None:
+                pass
+
+            def play(self, loops: int) -> None:
+                self.play_loops.append(loops)
+
+        class FakeChannel:
+            def __init__(self) -> None:
+                self.stop_calls = 0
+                self.played: list[tuple[object, int]] = []
+
+            def get_busy(self) -> bool:
+                return bool(self.played)
+
+            def stop(self) -> None:
+                self.stop_calls += 1
+
+            def set_volume(self, _volume: float) -> None:
+                pass
+
+            def play(self, sound: object, *, loops: int = 0) -> None:
+                self.played.append((sound, loops))
+
+        fake_music = FakeMusic()
+        fake_channels: dict[int, FakeChannel] = {}
+
+        class FakeMixer:
+            music = fake_music
+
+            @staticmethod
+            def get_init() -> bool:
+                return True
+
+            @staticmethod
+            def Channel(index: int) -> FakeChannel:
+                return fake_channels.setdefault(index, FakeChannel())
+
+            @staticmethod
+            def Sound(path: str) -> object:
+                return types.SimpleNamespace(path=path)
+
+        fake_pygame = types.ModuleType("pygame")
+        setattr(fake_pygame, "mixer", FakeMixer)
+        original_pygame = sys.modules.get("pygame")
+
+        try:
+            sys.modules["pygame"] = fake_pygame
+            with TemporaryDirectory() as temp_dir:
+                music_path = Path(temp_dir) / "Slow Jazz.mp3"
+                effect_path = Path(temp_dir) / "Steady Rain.wav"
+                music_path.write_bytes(b"music")
+                effect_path.write_bytes(b"rain")
+                manager = SoundManager(temp_dir)
+                manager.play_music(music_path.name)
+                music_stop_calls = fake_music.stop_calls
+                manager.play_sound_effect(effect_path.name)
+
+                self.assertEqual(manager.current_music, music_path.name)
+                self.assertEqual(manager.current_sound_effect, effect_path.name)
+                self.assertEqual(fake_music.stop_calls, music_stop_calls)
+                self.assertEqual(fake_music.play_loops, [-1])
+                self.assertEqual(
+                    fake_channels[SOUND_EFFECT_CHANNEL_INDEX].played[0][1],
+                    -1,
+                )
+        finally:
+            if original_pygame is None:
+                sys.modules.pop("pygame", None)
+            else:
+                sys.modules["pygame"] = original_pygame
+
     def test_sanitize_tts_text_removes_embedded_events_and_action_suggestions(self) -> None:
         text = sanitize_tts_text(
             "The room falls quiet. "

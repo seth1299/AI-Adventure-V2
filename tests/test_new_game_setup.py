@@ -272,6 +272,38 @@ class NewGameSetupTests(unittest.TestCase):
         self.assertEqual(fallback["day_names"][0], "Dawn")
         self.assertEqual(fallback["month_names"][0], "First Light")
 
+    def test_ai_generated_calendar_fallback_rejects_any_gregorian_weekday(self) -> None:
+        fallback = ai_generated_calendar_settings_or_fallback(
+            {
+                "days_per_week": 7,
+                "weeks_per_month": 4,
+                "months_per_year": 4,
+                "seasons_per_year": 2,
+                "day_names": [
+                    "Solday",
+                    "Monday",
+                    "Tuesday",
+                    "Wednesday",
+                    "Thursday",
+                    "Friday",
+                    "Satsday",
+                ],
+                "month_names": ["Firstbloom", "Highsun", "Leafturn", "Longnight"],
+                "seasons": [
+                    {"name": "Bloom", "weather_hint": "spring"},
+                    {"name": "Frost", "weather_hint": "winter"},
+                ],
+                "time_display": "narrative",
+            }
+        )
+
+        self.assertEqual(fallback["day_names"][0], "Dawn")
+        self.assertTrue(
+            {"Monday", "Tuesday", "Wednesday", "Thursday", "Friday"}.isdisjoint(
+                fallback["day_names"]
+            )
+        )
+
     def test_ai_generated_calendar_fallback_rejects_artisan_names_for_sci_fi(self) -> None:
         raw_calendar = {
             "days_per_week": 8,
@@ -685,6 +717,28 @@ class NewGameSetupTests(unittest.TestCase):
             packet["requirements"]["starting_currency_balance"],
         )
 
+    def test_opening_scene_request_is_preserved_and_sent_as_scene_guidance(self) -> None:
+        setup = normalize_new_game_setup(
+            {
+                "start_location": "The Agency Office",
+                "opening_scene_request": (
+                    "Begin with a threatening newspaper clipping arriving before dawn."
+                ),
+            }
+        )
+        packet = build_new_game_setup_packet(setup)
+
+        self.assertEqual(
+            setup["opening_scene_request"],
+            "Begin with a threatening newspaper clipping arriving before dawn.",
+        )
+        self.assertEqual(
+            packet["setup"]["opening_scene_request"],
+            setup["opening_scene_request"],
+        )
+        self.assertIn("setup.opening_scene_request", packet["requirements"]["opening_scene"])
+        self.assertIn("finalized in-world narration", packet["requirements"]["opening_scene"])
+
     def test_new_game_templates_round_trip_multiple_normalized_setups(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             template_path = Path(temp_dir) / "new_game_templates.json"
@@ -863,6 +917,7 @@ class NewGameSetupTests(unittest.TestCase):
         packet = build_new_game_setup_packet(
             normalize_new_game_setup({}),
             valid_music_tracks=["Town Village City.mp3"],
+            valid_sound_effect_tracks=["Steady Rain.wav"],
         )
 
         invention_fields = packet["fields_requiring_ai_invention"]
@@ -929,7 +984,14 @@ class NewGameSetupTests(unittest.TestCase):
         self.assertIn("creative_ideas", packet["requirements"])
         self.assertIn("high-priority style seeds", packet["requirements"]["creative_ideas"])
         self.assertIn("hard exclusion list", packet["requirements"]["creative_ideas"])
-        self.assertIn("scan every string key and value", packet["requirements"]["creative_ideas"])
+        self.assertIn(
+            "Calendar settings are exempt",
+            packet["requirements"]["creative_ideas"],
+        )
+        self.assertIn(
+            "NPC or location name",
+            packet["requirements"]["creative_ideas"],
+        )
         self.assertIn(
             "bare category labels as final proper nouns",
             packet["requirements"]["creative_ideas"],
@@ -1008,7 +1070,12 @@ class NewGameSetupTests(unittest.TestCase):
             },
         )
         self.assertIn("starting_music", packet["requirements"])
+        self.assertIn("starting_sound_effect", packet["requirements"])
         self.assertEqual(packet["audio"]["valid_music_tracks"], ["Town Village City.mp3"])
+        self.assertEqual(
+            packet["audio"]["valid_sound_effect_tracks"],
+            ["Steady Rain.wav"],
+        )
         self.assertEqual(packet["current_calendar"]["season_hint"], "spring")
         self.assertEqual(packet["current_weather"], "Clear")
         self.assertIn("calendar_weather_consistency", packet["requirements"])
@@ -1027,6 +1094,28 @@ class NewGameSetupTests(unittest.TestCase):
         )
         self.assertNotIn("current_calendar", packet)
         self.assertIn("invent calendar_settings", packet["requirements"]["calendar_generation"])
+        self.assertIn(
+            "Never use Monday, Tuesday, Wednesday, Thursday, Friday, Saturday, or Sunday",
+            packet["requirements"]["calendar_generation"],
+        )
+
+    def test_ai_calendar_generation_guidance_survives_normalization_and_packet_building(self) -> None:
+        setup = normalize_new_game_setup(
+            {
+                "calendar": {
+                    "calendar_type": "ai_generated",
+                    "generation_guidance": "Use Emberfall as one month name; start in late autumn on day 18.",
+                }
+            }
+        )
+
+        packet = build_new_game_setup_packet(setup)
+
+        self.assertEqual(
+            packet["setup"]["calendar"]["generation_guidance"],
+            "Use Emberfall as one month name; start in late autumn on day 18.",
+        )
+        self.assertIn("generation_guidance", packet["requirements"]["calendar_generation"])
 
     def test_setup_packet_does_not_require_large_requested_starter_inventory_count(self) -> None:
         setup = normalize_new_game_setup(

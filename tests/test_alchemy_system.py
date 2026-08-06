@@ -127,13 +127,35 @@ class AlchemySystemTests(unittest.TestCase):
             self.assertEqual(reagents[0]["rarity"], "Rare")
             self.assertEqual(
                 reagents[0]["notes"],
-                "Rarity: Rare. Harvested only when the crystals are resonant.",
+                "Harvested only when the crystals are resonant. Rarity: Rare.",
             )
             self.assertEqual(reagents[0]["value_base_units"], 36)
             catalog = repository.list_item_catalog()
             moon_salt = next(item for item in catalog if item["name"] == "Moon Salt")
             self.assertEqual(moon_salt["category"], "Container")
             self.assertEqual(moon_salt["value_base_units"], 36)
+
+    def test_crafting_item_notes_have_one_rarity_suffix(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = SaveRepository.create_new_save(Path(temp_dir), "Rarity Notes Test")
+            repository.add_crafting_item(
+                name="Noxious Herb Extract",
+                description="A concentrated botanical essence.",
+                notes=(
+                    "Rarity: Common. Commonly found in damp urban alleys. "
+                    "Rarity: Common."
+                ),
+                rarity="Common",
+            )
+
+            notes = repository.list_crafting_items()[0]["notes"]
+
+            self.assertEqual(
+                notes,
+                "Commonly found in damp urban alleys. Rarity: Common.",
+            )
+            self.assertEqual(notes.count("Rarity:"), 1)
+            self.assertTrue(notes.endswith("Rarity: Common."))
 
     def test_recipe_discovery_persists_structured_fields(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

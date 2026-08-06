@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import os
 import re
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
@@ -39,6 +40,10 @@ from ai_adventure.context.tags import CONTEXT_TAG_DESCRIPTIONS, PLANNABLE_CONTEX
 from ai_adventure.currency import (
     normalize_currency_denominations,
     normalize_visible_currency_text,
+)
+from ai_adventure.audio.pronunciation import (
+    merge_pronunciation_maps,
+    normalize_pronunciation_map,
 )
 from ai_adventure.locations import clean_player_location_name, normalize_known_locations
 from ai_adventure.new_game_setup import STARTER_INVENTORY_MIN_ITEMS
@@ -79,6 +84,38 @@ CHECK_WARRANTING_ACTION_RE = re.compile(
     r")\b",
     re.IGNORECASE,
 )
+OBVIOUS_NARRATED_WEATHER_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    (
+        "Rain",
+        re.compile(
+            r"\b(?:the\s+)?(?:rain|drizzle|downpour)\s+"
+            r"(?:beats?|beat|falls?|fell|patters?|pattered|drums?|drummed|"
+            r"lashes?|lashed|pours?|poured|spatters?|spattered|taps?|tapped|"
+            r"hammers?|hammered)\b|"
+            r"\b(?:begins?|began|starts?|started)\s+to\s+(?:rain|drizzle)\b|"
+            r"\b(?:steady|heavy|light|cold|warm|driving|pouring|torrential)\s+"
+            r"(?:rain|drizzle)\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "Snow",
+        re.compile(
+            r"\b(?:the\s+)?snow\s+(?:falls?|fell|drifts?|drifted|swirls?|swirled)\b|"
+            r"\b(?:begins?|began|starts?|started)\s+to\s+snow\b|"
+            r"\b(?:steady|heavy|light|driving|powdery)\s+snow\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "Fog",
+        re.compile(
+            r"\b(?:thick|dense|heavy|rolling|bank of)\s+(?:fog|mist)\b|"
+            r"\b(?:fog|mist)\s+(?:rolls?|rolled|hangs?|hung|blankets?|blanketed)\b",
+            re.IGNORECASE,
+        ),
+    ),
+)
 KNOWN_TEXT_MODELS = {
     "gemini-3.5-flash-lite",
     "gemini-3.1-flash-lite",
@@ -103,6 +140,7 @@ KNOWN_EVENT_TYPE_NAMES = [
     "CurrencyChangedEvent",
     "CurrencyDefinedEvent",
     "MusicChangedEvent",
+    "SoundEffectChangedEvent",
     "FlagSetEvent",
     "LocationUpsertedEvent",
     "TravelModeChangedEvent",
@@ -238,7 +276,10 @@ NEW_GAME_CRAFTING_ITEM_SCHEMA: dict[str, Any] = {
         "rarity": {"type": "string", "enum": list(CRAFTING_ITEM_RARITIES)},
         "notes": {
             "type": "string",
-            "description": "Player-facing notes that explicitly state Rarity: <rarity>.",
+            "description": (
+                "Player-facing notes with exactly one final sentence in the form "
+                "Rarity: <rarity>."
+            ),
         },
         "value_base_units": {"type": "integer", "minimum": 0},
     },
@@ -254,7 +295,15 @@ NEW_GAME_CRAFTING_RECIPE_SCHEMA: dict[str, Any] = {
         "name": {"type": "string"},
         "ingredients": NONEMPTY_RECIPE_INGREDIENT_LIST_SCHEMA,
         "result": {"type": "string"},
-        "notes": {"type": "string"},
+        "notes": {
+            "type": "string",
+            "description": (
+                "Self-contained player-facing notes. State the recipe's intended "
+                "purpose/effect, expected strength or outcome, onset, duration, "
+                "and important use conditions; say unknown or not applicable when "
+                "a detail is not established. Do not rely on the recipe name alone."
+            ),
+        },
         "value_base_units": {"type": "integer", "minimum": 0},
     },
     "required": ["name", "ingredients", "result", "notes", "value_base_units"],
@@ -698,7 +747,15 @@ EVENT_RESPONSE_SCHEMA: dict[str, Any] = {
                 "name": {"type": "string"},
                 "ingredients": NONEMPTY_RECIPE_INGREDIENT_LIST_SCHEMA,
                 "result": {"type": "string"},
-                "notes": {"type": "string"},
+                "notes": {
+                    "type": "string",
+                    "description": (
+                        "Self-contained player-facing notes. State the recipe's "
+                        "intended purpose/effect, expected strength or outcome, "
+                        "onset, duration, and important use conditions; say unknown "
+                        "or not applicable when a detail is not established."
+                    ),
+                },
                 "value_base_units": {"type": "integer", "minimum": 0},
             },
             ["name", "ingredients", "result", "notes", "value_base_units"],
@@ -759,7 +816,10 @@ EVENT_RESPONSE_SCHEMA: dict[str, Any] = {
                 "rarity": {"type": "string", "enum": list(CRAFTING_ITEM_RARITIES)},
                 "notes": {
                     "type": "string",
-                    "description": "Player-facing notes that explicitly state Rarity: <rarity>.",
+                    "description": (
+                        "Player-facing notes with exactly one final sentence in the form "
+                        "Rarity: <rarity>."
+                    ),
                 },
                 "value_base_units": {
                     "type": "integer",
@@ -783,7 +843,8 @@ EVENT_RESPONSE_SCHEMA: dict[str, Any] = {
                 "payloads are incomplete. The uses list should contain "
                 "generalized symptoms or effects the item may address. location is "
                 "general habitat/source-area knowledge, not a specific map location. "
-                "notes must state rarity, and value_base_units must reflect it."
+                "notes must end with exactly one rarity sentence, and value_base_units "
+                "must reflect it."
             ),
         ),
         _event_response_schema(
@@ -811,6 +872,19 @@ EVENT_RESPONSE_SCHEMA: dict[str, Any] = {
         _event_response_schema(
             "MusicChangedEvent",
             {"filename": {"type": "string"}},
+            ["filename"],
+        ),
+        _event_response_schema(
+            "SoundEffectChangedEvent",
+            {
+                "filename": {
+                    "type": "string",
+                    "description": (
+                        "Exact valid ambient sound filename, or STOP to end the "
+                        "current ambient effect."
+                    ),
+                }
+            },
             ["filename"],
         ),
         _event_response_schema(
@@ -936,6 +1010,7 @@ NEW_GAME_EVENT_TYPE_NAMES = (
     "NpcUpsertedEvent",
     "ActiveTaskUpsertedEvent",
     "MusicChangedEvent",
+    "SoundEffectChangedEvent",
 )
 NEW_GAME_ACTIVE_TASK_EVENT_RESPONSE_SCHEMA: dict[str, Any] = _event_response_schema(
     "ActiveTaskUpsertedEvent",
@@ -997,9 +1072,149 @@ STORY_RESPONSE_JSON_SCHEMA: dict[str, Any] = {
             "type": "boolean",
             "description": "True only when the response is fully out-of-game.",
         },
+        "pronunciation_map": {
+            "type": "array",
+            "description": (
+                "Map exact visible names or recurring terms used in this response "
+                "to phonetic spellings for TTS only. Include places, NPCs, items, "
+                "factions, creatures, spells, and other names likely to recur. "
+                "Do not alter the response text to add pronunciation hints."
+            ),
+            "maxItems": 40,
+            "items": {
+                "type": "object",
+                "properties": {
+                    "term": {"type": "string"},
+                    "phonetic": {"type": "string"},
+                },
+                "required": ["term", "phonetic"],
+                "additionalProperties": False,
+            },
+        },
     },
-    "required": ["response", "suggested_actions", "events", "out_of_game"],
+    "required": [
+        "response",
+        "suggested_actions",
+        "events",
+        "out_of_game",
+    ],
     "additionalProperties": False,
+}
+STORY_BASE_EVENT_TYPE_NAMES: tuple[str, ...] = (
+    "StatusUpdatedEvent",
+    "SkillCheckRequestedEvent",
+)
+STORY_EVENT_TYPE_NAMES_BY_CONTEXT_TAG: dict[str, tuple[str, ...]] = {
+    "alchemy": (
+        "InventoryItemAddedEvent",
+        "InventoryItemRemovedEvent",
+        "InventoryItemModifiedEvent",
+        "RecipeDiscoveredEvent",
+        "ReagentDiscoveredEvent",
+    ),
+    "character": ("SkillUpsertedEvent", "FlagSetEvent"),
+    "combat": (
+        "CombatStartedEvent",
+        "InventoryItemAddedEvent",
+        "InventoryItemRemovedEvent",
+        "InventoryItemModifiedEvent",
+    ),
+    "crafting": (
+        "InventoryItemAddedEvent",
+        "InventoryItemRemovedEvent",
+        "InventoryItemModifiedEvent",
+        "RecipeDiscoveredEvent",
+        "ReagentDiscoveredEvent",
+    ),
+    "crime": (
+        "InventoryItemAddedEvent",
+        "InventoryItemRemovedEvent",
+        "CurrencyChangedEvent",
+        "FlagSetEvent",
+        "ActiveTaskUpsertedEvent",
+        "ActiveTaskCompletedEvent",
+        "NpcUpsertedEvent",
+        "NpcKnowledgeAddedEvent",
+        "SecretUpsertedEvent",
+    ),
+    "currency": ("CurrencyChangedEvent", "CurrencyDefinedEvent"),
+    "dialogue": (
+        "ActiveTaskUpsertedEvent",
+        "ActiveTaskCompletedEvent",
+        "NpcUpsertedEvent",
+        "NpcKnowledgeAddedEvent",
+        "SecretUpsertedEvent",
+    ),
+    "events": ("FlagSetEvent",),
+    "exploration": (
+        "InventoryItemAddedEvent",
+        "ReagentDiscoveredEvent",
+        "FlagSetEvent",
+        "LocationUpsertedEvent",
+        "SecretUpsertedEvent",
+    ),
+    "inventory": (
+        "InventoryItemAddedEvent",
+        "InventoryItemRemovedEvent",
+        "InventoryItemModifiedEvent",
+        "ContainerOpenedEvent",
+        "ContainerContentsTakenEvent",
+    ),
+    "lore": (
+        "FlagSetEvent",
+        "LocationUpsertedEvent",
+        "NpcUpsertedEvent",
+        "NpcKnowledgeAddedEvent",
+        "SecretUpsertedEvent",
+    ),
+    "magic": ("InventoryItemModifiedEvent", "FlagSetEvent", "SpellLearnedEvent"),
+    "merchant": (
+        "InventoryItemAddedEvent",
+        "InventoryItemRemovedEvent",
+        "InventoryItemModifiedEvent",
+        "CurrencyChangedEvent",
+        "CurrencyDefinedEvent",
+    ),
+    "music": ("MusicChangedEvent", "SoundEffectChangedEvent"),
+    "naming": ("LocationUpsertedEvent", "NpcUpsertedEvent"),
+    "quest": (
+        "FlagSetEvent",
+        "ActiveTaskUpsertedEvent",
+        "ActiveTaskCompletedEvent",
+        "NpcUpsertedEvent",
+        "SecretUpsertedEvent",
+    ),
+    "reagent": (
+        "InventoryItemAddedEvent",
+        "InventoryItemRemovedEvent",
+        "InventoryItemModifiedEvent",
+        "ReagentDiscoveredEvent",
+    ),
+    "recipe": (
+        "InventoryItemAddedEvent",
+        "InventoryItemRemovedEvent",
+        "InventoryItemModifiedEvent",
+        "RecipeDiscoveredEvent",
+        "ReagentDiscoveredEvent",
+    ),
+    "scene": ("LocationUpsertedEvent", "NpcUpsertedEvent"),
+    "skill": (
+        "SkillCheckRequestedEvent",
+        "SkillUpsertedEvent",
+        "SkillXpAddedEvent",
+    ),
+    "spell": ("SpellLearnedEvent",),
+    "state": ("FlagSetEvent",),
+    "task": ("ActiveTaskUpsertedEvent", "ActiveTaskCompletedEvent"),
+    "time": ("CalendarEventUpsertedEvent", "CalendarEventDeletedEvent"),
+    "travel": ("LocationUpsertedEvent", "TravelModeChangedEvent"),
+    "uncertainty": ("SkillCheckRequestedEvent",),
+    "world": (
+        "FlagSetEvent",
+        "LocationUpsertedEvent",
+        "NpcUpsertedEvent",
+        "SecretUpsertedEvent",
+    ),
 }
 SKILL_CHECK_PLAN_RESPONSE_JSON_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -1285,6 +1500,24 @@ NEW_GAME_RESPONSE_JSON_SCHEMA: dict[str, Any] = {
             ),
         },
         "introductory_message": {"type": "string"},
+        "pronunciation_map": {
+            "type": "array",
+            "description": (
+                "Map exact visible names or recurring terms introduced in the initial "
+                "world to phonetic spellings for TTS only. Include locations, NPCs, "
+                "items, factions, creatures, spells, and other recurring names."
+            ),
+            "maxItems": 80,
+            "items": {
+                "type": "object",
+                "properties": {
+                    "term": {"type": "string"},
+                    "phonetic": {"type": "string"},
+                },
+                "required": ["term", "phonetic"],
+                "additionalProperties": False,
+            },
+        },
         "suggested_actions": {
             "type": "array",
             "description": "Three or four short player-facing action options for the opening scene.",
@@ -1314,6 +1547,258 @@ NEW_GAME_RESPONSE_JSON_SCHEMA: dict[str, Any] = {
     "additionalProperties": False,
 }
 
+
+def build_new_game_response_schema(setup_packet: dict[str, Any]) -> dict[str, Any]:
+    """Builds the smallest new-game schema needed for this exact setup packet."""
+
+    schema = copy.deepcopy(NEW_GAME_RESPONSE_JSON_SCHEMA)
+    properties = schema["properties"]
+    required = schema["required"]
+    setup = setup_packet.get("setup", {})
+    if not isinstance(setup, dict):
+        setup = {}
+
+    def omit(field_name: str) -> None:
+        properties.pop(field_name, None)
+        if field_name in required:
+            required.remove(field_name)
+
+    if str(setup.get("specified_genre", "") or "").strip():
+        omit("selected_genre")
+
+    if (
+        str(setup.get("start_location_mode", "suggestion") or "suggestion")
+        .strip()
+        .casefold()
+        == "exact"
+        and str(setup.get("start_location", "") or "").strip()
+    ):
+        omit("start_location")
+
+    calendar = setup.get("calendar", {})
+    calendar_is_ai_generated = (
+        isinstance(calendar, dict) and bool(calendar.get("ai_generated", False))
+    )
+    if not calendar_is_ai_generated:
+        omit("calendar_settings")
+        omit("starting_calendar")
+    elif "calendar_settings" not in required:
+        required.append("calendar_settings")
+
+    character = setup.get("character", {})
+    if not isinstance(character, dict):
+        character = {}
+    missing_character_fields = [
+        field_name
+        for field_name in ("name", "appearance", "backstory", "notes")
+        if not str(character.get(field_name, "") or "").strip()
+        or (field_name == "name" and str(character.get(field_name, "")).strip() == "Player Name")
+    ]
+    if not missing_character_fields:
+        omit("character")
+    else:
+        character_schema = properties["character"]
+        character_schema["properties"] = {
+            field_name: character_schema["properties"][field_name]
+            for field_name in missing_character_fields
+        }
+        character_schema["required"] = list(missing_character_fields)
+
+    skills = setup.get("skills", [])
+    if not isinstance(skills, list):
+        skills = []
+    skills_need_invention = any(
+        isinstance(skill, dict)
+        and (
+            bool(skill.get("requires_ai_invention", False))
+            or not str(skill.get("name", "") or "").strip()
+            or not str(skill.get("description", "") or "").strip()
+        )
+        for skill in skills
+    )
+    if not skills or not skills_need_invention:
+        omit("skills")
+
+    denominations = setup.get("currency_denominations", [])
+    if isinstance(denominations, list) and denominations:
+        omit("currency_denominations")
+        omit("currency_description")
+
+    event_types: list[str] = []
+    starting_npcs = setup.get("starting_npcs", [])
+    if isinstance(starting_npcs, list) and starting_npcs:
+        event_types.append("NpcUpsertedEvent")
+    starting_task = setup.get("starting_task", {})
+    if (
+        isinstance(starting_task, dict)
+        and str(starting_task.get("mode", "none") or "none").casefold() != "none"
+    ):
+        event_types.append("ActiveTaskUpsertedEvent")
+    audio = setup_packet.get("audio", {})
+    if not isinstance(audio, dict):
+        audio = {}
+    valid_music_tracks = audio.get("valid_music_tracks", [])
+    valid_sound_effect_tracks = audio.get("valid_sound_effect_tracks", [])
+    setup_audio = setup.get("audio", {})
+    music_enabled = not isinstance(setup_audio, dict) or bool(
+        setup_audio.get("music_enabled", True)
+    )
+    if music_enabled and isinstance(valid_music_tracks, list) and valid_music_tracks:
+        event_types.append("MusicChangedEvent")
+    sound_effects_enabled = not isinstance(setup_audio, dict) or bool(
+        setup_audio.get("sound_effects_enabled", True)
+    )
+    if (
+        sound_effects_enabled
+        and isinstance(valid_sound_effect_tracks, list)
+        and valid_sound_effect_tracks
+    ):
+        event_types.append("SoundEffectChangedEvent")
+
+    if not event_types:
+        omit("events")
+    else:
+        event_branches = [
+            branch
+            for branch in NEW_GAME_EVENT_RESPONSE_SCHEMA["anyOf"]
+            if branch["properties"]["type"]["enum"][0] in event_types
+        ]
+        properties["events"]["items"] = (
+            event_branches[0]
+            if len(event_branches) == 1
+            else {"anyOf": event_branches}
+        )
+
+    if "suggested_actions" in properties and "suggested_actions" not in required:
+        required.append("suggested_actions")
+    return _condense_response_schema_for_api(schema)
+
+
+def _condense_response_schema_for_api(
+    value: Any,
+    *,
+    property_map: bool = False,
+) -> Any:
+    """Removes prompt prose and locally enforced bounds from the API schema."""
+
+    if isinstance(value, list):
+        return [_condense_response_schema_for_api(item) for item in value]
+    if not isinstance(value, dict):
+        return value
+    locally_enforced_keywords = {
+        "description",
+        "title",
+        "minimum",
+        "maximum",
+        "minLength",
+        "maxLength",
+        "maxItems",
+    }
+    condensed: dict[str, Any] = {}
+    for key, item in value.items():
+        if not property_map and key in locally_enforced_keywords:
+            continue
+        condensed[key] = _condense_response_schema_for_api(
+            item,
+            property_map=(key == "properties"),
+        )
+    return condensed
+
+
+def _story_event_type_names(context_packet: dict[str, Any]) -> tuple[str, ...]:
+    """Returns enabled story event types in canonical schema order."""
+
+    selection = context_packet.get("selection", {})
+    raw_tags = selection.get("tags", []) if isinstance(selection, dict) else []
+    selected_tags = {
+        str(tag).strip().casefold()
+        for tag in raw_tags
+        if isinstance(tag, str) and str(tag).strip()
+    }
+    enabled_event_types = set(STORY_BASE_EVENT_TYPE_NAMES)
+    for tag in selected_tags:
+        enabled_event_types.update(STORY_EVENT_TYPE_NAMES_BY_CONTEXT_TAG.get(tag, ()))
+    return tuple(
+        event_type
+        for event_type in KNOWN_EVENT_TYPE_NAMES
+        if event_type in enabled_event_types
+    )
+
+
+def build_story_response_schema(context_packet: dict[str, Any]) -> dict[str, Any]:
+    """Builds a compact story schema containing only turn-relevant event types."""
+
+    enabled_event_types = set(_story_event_type_names(context_packet))
+
+    event_branches = [
+        branch
+        for branch in EVENT_RESPONSE_SCHEMA["anyOf"]
+        if branch["properties"]["type"]["enum"][0] in enabled_event_types
+    ]
+    schema = copy.deepcopy(STORY_RESPONSE_JSON_SCHEMA)
+    schema["properties"]["events"]["items"] = (
+        event_branches[0]
+        if len(event_branches) == 1
+        else {"anyOf": event_branches}
+    )
+    return _condense_response_schema_for_api(schema)
+
+
+def _new_game_prompt_packet_for_schema(
+    setup_packet: dict[str, Any],
+    schema: dict[str, Any],
+) -> dict[str, Any]:
+    """Aligns prompt requirements with the setup-specific response schema."""
+
+    packet = copy.deepcopy(setup_packet)
+    output_fields = list(schema.get("required", []))
+    packet["response_contract"] = {
+        "required_output_fields": output_fields,
+        "rule": (
+            "Return exactly the configured fields. Omitted setup fields are already "
+            "authoritative in Python and must not be echoed or rewritten."
+        ),
+    }
+    requirements = packet.get("requirements", {})
+    if not isinstance(requirements, dict):
+        return packet
+    field_requirements = {
+        "selected_genre": ("genre_generation",),
+        "start_location": ("start_location", "starting_location"),
+        "calendar_settings": ("calendar_generation",),
+        "character": ("character_generation",),
+        "skills": ("skill_generation", "skill_limits"),
+        "currency_denominations": ("currency_generation",),
+        "events": (
+            "events",
+            "starting_task",
+            "starting_music",
+            "starting_sound_effect",
+        ),
+    }
+    for output_field, requirement_names in field_requirements.items():
+        if output_field in schema.get("properties", {}):
+            continue
+        for requirement_name in requirement_names:
+            requirements.pop(requirement_name, None)
+    event_schema = schema.get("properties", {}).get("events", {}).get("items", {})
+    event_branches = event_schema.get("anyOf", [event_schema])
+    enabled_event_types = {
+        str(branch.get("properties", {}).get("type", {}).get("enum", [""])[0])
+        for branch in event_branches
+        if isinstance(branch, dict)
+        and branch.get("properties", {}).get("type", {}).get("enum")
+    }
+    if "NpcUpsertedEvent" not in enabled_event_types:
+        requirements.pop("events", None)
+    if "ActiveTaskUpsertedEvent" not in enabled_event_types:
+        requirements.pop("starting_task", None)
+    if "MusicChangedEvent" not in enabled_event_types:
+        requirements.pop("starting_music", None)
+    if "SoundEffectChangedEvent" not in enabled_event_types:
+        requirements.pop("starting_sound_effect", None)
+    return packet
+
 @dataclass(frozen=True)
 class GeminiSettings:
     """Runtime settings for the Gemini API integration."""
@@ -1335,6 +1820,7 @@ class AiNarrationResult:
     narrative_text: str
     suggested_actions: list[str] = field(default_factory=list)
     suggested_events: list[dict[str, Any]] = field(default_factory=list)
+    pronunciation_map: dict[str, str] = field(default_factory=dict)
     out_of_game: bool = False
     raw_text: str = ""
 
@@ -1369,6 +1855,7 @@ class AiWorldSetupResult:
     finalized_currency_denominations: list[dict[str, Any]] = field(default_factory=list)
     finalized_currency_description: str = ""
     finalized_starting_currency_balance_base_units: int | None = None
+    pronunciation_map: dict[str, str] = field(default_factory=dict)
     suggested_actions: list[str] = field(default_factory=list)
     suggested_events: list[dict[str, Any]] = field(default_factory=list)
     raw_text: str = ""
@@ -1426,6 +1913,7 @@ class GeminiNarrationService:
             ) from error
 
         ai_preferences = ai_mode_preferences_from_context_packet(context_packet)
+        response_schema = build_story_response_schema(context_packet)
         prompt = build_gemini_story_prompt(context_packet)
         client = genai.Client(api_key=self.settings.api_key)
 
@@ -1437,12 +1925,23 @@ class GeminiNarrationService:
             ),
         )
         LOGGER.info("Sending story context packet to Gemini model %s.", self.settings.model)
+        LOGGER.info(
+            "Story dynamic response schema: event_types=%s json_chars=%s",
+            [
+                branch["properties"]["type"]["enum"][0]
+                for branch in response_schema["properties"]["events"]["items"].get(
+                    "anyOf",
+                    [response_schema["properties"]["events"]["items"]],
+                )
+            ],
+            len(json.dumps(response_schema, separators=(",", ":"))),
+        )
         response = _generate_content_with_retry(
             client,
             model=self.settings.model,
             contents=prompt,
             config=_structured_output_config(
-                STORY_RESPONSE_JSON_SCHEMA,
+                response_schema,
                 model=self.settings.model,
                 ai_preferences=ai_preferences,
                 apply_response_length=True,
@@ -1458,7 +1957,7 @@ class GeminiNarrationService:
             self.settings.model,
             str(getattr(response, "text", "") or "").strip(),
             "story response",
-            STORY_RESPONSE_JSON_SCHEMA,
+            response_schema,
             ai_preferences=ai_preferences,
             apply_response_length=True,
         )
@@ -1472,6 +1971,7 @@ class GeminiNarrationService:
             )
 
         result = parse_gemini_story_response(raw_text, context_packet=context_packet)
+        response_pronunciation_map = result.pronunciation_map
         result = _enforce_explicit_conversation_mode(result, context_packet)
         result = _drop_unwarranted_skill_check_events(result, context_packet)
         result = _drop_duplicate_resolved_skill_check_events(result, context_packet)
@@ -1480,7 +1980,14 @@ class GeminiNarrationService:
         result = _enforce_container_reward_flow(result, context_packet)
         result = _ensure_inventory_for_collected_reagents(result, context_packet)
         result = _ensure_inventory_for_narrated_collection(result, context_packet)
-        return _normalize_visible_currency_phrasing(result, context_packet)
+        result = _normalize_visible_currency_phrasing(result, context_packet)
+        return replace(
+            result,
+            pronunciation_map=merge_pronunciation_maps(
+                response_pronunciation_map,
+                result.pronunciation_map,
+            ),
+        )
 
     def plan_story_skill_checks(
         self,
@@ -1577,7 +2084,12 @@ class GeminiNarrationService:
             ) from error
 
         ai_preferences = ai_mode_preferences_from_context_packet(setup_packet)
-        prompt = build_gemini_new_game_prompt(setup_packet)
+        response_schema = build_new_game_response_schema(setup_packet)
+        prompt_packet = _new_game_prompt_packet_for_schema(
+            setup_packet,
+            response_schema,
+        )
+        prompt = build_gemini_new_game_prompt(prompt_packet)
         client = genai.Client(api_key=self.settings.api_key)
 
         LOGGER.info("Sending new-game setup packet to Gemini model %s.", self.settings.model)
@@ -1585,26 +2097,33 @@ class GeminiNarrationService:
             "New-game prompt XML section characters: %s",
             json.dumps(_prompt_section_char_counts(prompt), sort_keys=True),
         )
+        LOGGER.info(
+            "New-game dynamic response schema: fields=%s required=%s json_chars=%s",
+            list(response_schema.get("properties", {})),
+            list(response_schema.get("required", [])),
+            len(json.dumps(response_schema, separators=(",", ":"))),
+        )
         LOGGER.info(f"NEW GAME PROMPT: \n\n{prompt}")
         response = _generate_content_with_retry(
             client,
             model=self.settings.model,
             contents=prompt,
             config=_structured_output_config(
-                NEW_GAME_RESPONSE_JSON_SCHEMA,
+                response_schema,
                 model=self.settings.model,
                 ai_preferences=ai_preferences,
                 apply_response_length=True,
                 response_length_scope="new_game",
             ),
             request_label="new-game request",
+            allow_schema_fallback=False,
         )
         raw_text = _repair_gemini_creative_terms(
             client,
             self.settings.model,
             str(getattr(response, "text", "") or "").strip(),
             "new-game response",
-            NEW_GAME_RESPONSE_JSON_SCHEMA,
+            response_schema,
             ai_preferences=ai_preferences,
             apply_response_length=True,
             response_length_scope="new_game",
@@ -1801,10 +2320,18 @@ def _build_xml_story_prompt(context_packet: dict[str, Any]) -> str:
                 "Use only supplied state as confirmed fact. Preserve hidden GM secrets "
                 "and NPC knowledge boundaries. Never invent player-character dialogue, "
                 "choices, or unrequested actions. Resolve the submitted action rather "
-                "than restating it. Suggest only warranted events and checks. Reuse "
+                "than restating it. Complete immediate NPC and world responses now: "
+                "when the player asks an NPC to answer, explain, reply, or tell their "
+                "story, narrate the information that NPC can presently provide instead "
+                "of stopping just before the reply. Suggest only warranted events and checks. Reuse "
                 "stable NPC, item, secret, task, and location identities. Never use "
                 "banned terms, close spellings, hyphenation variants, obvious reskins, "
-                "or bare category-label proper nouns for newly invented names.",
+                "or bare category-label proper nouns for newly invented names. Return "
+                "a pronunciation_map for exact visible names and recurring terms whose "
+                "ordinary spelling may be mispronounced by TTS. Include locations, NPCs, "
+                "items, factions, creatures, spells, and other repeated names. The map "
+                "must never change the player-facing response; it is a TTS-only glossary. "
+                "Honor the player's explicit character-name pronunciation.",
             ),
             _xml_text_section(
                 "gm_secret_knowledge_boundary",
@@ -1856,8 +2383,13 @@ def _build_xml_story_prompt(context_packet: dict[str, Any]) -> str:
                 "response must be non-empty; suggested_actions and events must be "
                 "arrays; out_of_game must exactly match conversation_mode. For an in-game response, "
                 "events must end with exactly one StatusUpdatedEvent whose payload "
-                "contains location, minutes_passed, and weather; use AUTO when a "
-                "value is unchanged or not otherwise advancing. No surrounding Markdown.",
+                "contains location, minutes_passed, and weather; use AUTO only when "
+                "the narration keeps the current value unchanged. If the narration "
+                "introduces rain, snow, fog, or any other current weather different "
+                "from state.scene.weather, set weather to that actual condition rather "
+                "than AUTO. pronunciation_map "
+                "must be an array of {term, phonetic} records with no explanatory "
+                "prose. No surrounding Markdown.",
             ),
             _xml_text_section(
                 "task",
@@ -1865,7 +2397,7 @@ def _build_xml_story_prompt(context_packet: dict[str, Any]) -> str:
                     "Based on the context above, answer this out-of-game message without "
                     "changing or advancing the game:\n"
                     if conversation_mode == "out_of_game"
-                    else "Based on the context above, resolve and narrate this player command, then suggest only the state changes it actually warrants:\n"
+                    else "Based on the context above, fully resolve and narrate this player command, including any immediate NPC response or available answer it requests, then suggest only the state changes it actually warrants:\n"
                 )
                 + player_command,
             ),
@@ -1904,12 +2436,16 @@ def _story_prompt_packet(context_packet: dict[str, Any]) -> dict[str, Any]:
         "currency_transactions": {"currency", "merchant"},
         "combat_handoff": {"combat"},
     }
-    packet["response_contract"] = {
+    filtered_contract = {
         key: value
         for key, value in contract.items()
         if key in always
         or bool(tags_by_contract.get(key, set()) & selected_tags)
     }
+    filtered_contract["known_event_types"] = list(
+        _story_event_type_names(context_packet)
+    )
+    packet["response_contract"] = filtered_contract
     return packet
 
 
@@ -1943,7 +2479,16 @@ def _build_xml_new_game_prompt(setup_packet: dict[str, Any]) -> str:
                 "variants, reskins, or bare category-label proper nouns for NPC names, "
                 "location names, or references to those names in other fields. Calendar settings are "
                 "exempt from the banned creative terms; calendar day, month, and season "
-                "names only need to obey the separate calendar-generation rules.",
+                "names only need to obey the separate calendar-generation rules. Return "
+                "a pronunciation_map for exact visible names and recurring terms whose "
+                "ordinary spelling may be mispronounced by TTS, including locations, "
+                "NPCs, items, factions, creatures, and spells. This map is TTS-only and "
+                "must not insert phonetic spellings into player-facing prose. Honor the "
+                "player's explicit character-name pronunciation. If the setup includes "
+                "opening_scene_request, treat it as optional player-authored guidance "
+                "for the first scene at the selected start_location: honor its intent "
+                "when coherent, but write finalized in-world narration instead of "
+                "copying request text or exposing meta-instructions.",
             ),
             _xml_text_section(
                 "gm_secret_knowledge_boundary",
@@ -2001,7 +2546,9 @@ def _build_xml_new_game_prompt(setup_packet: dict[str, Any]) -> str:
             _xml_text_section(
                 "output_format",
                 "Return exactly one JSON object matching the configured new-game "
-                "schema, with no surrounding Markdown. Complete every required field.",
+                "schema, with no surrounding Markdown. Complete every required field. "
+                "pronunciation_map must be an array of {term, phonetic} records mapping "
+                "exact visible terms to phonetic TTS spellings, with no explanatory prose.",
             ),
             _xml_text_section(
                 "task",
@@ -2238,7 +2785,7 @@ def build_gemini_story_prompt(context_packet: dict[str, Any]) -> str:
         "- events may include multiple entries of the same event type when multiple "
         "distinct state changes happen in the same turn.\n"
         "- If suggesting events, use the event_shape, known_event_types, and selected event contracts from the packet.\n"
-        "- Every in-game response must include exactly one final StatusUpdatedEvent. Its payload must always contain all three required fields: location, minutes_passed, and weather. Use location='AUTO' when the player remains in the current location, weather='AUTO' when the weather is unchanged, and minutes_passed='AUTO' only when the engine should keep time unchanged (or 0 when no meaningful time passed). Never emit a partial StatusUpdatedEvent with only minutes_passed, only location, or only weather.\n"
+        "- Every in-game response must include exactly one final StatusUpdatedEvent. Its payload must always contain all three required fields: location, minutes_passed, and weather. Use location='AUTO' when the player remains in the current location, weather='AUTO' only when the narration preserves the current weather, and minutes_passed='AUTO' only when the engine should keep time unchanged (or 0 when no meaningful time passed). If the narration introduces rain, snow, fog, or any other different current weather, set weather to that actual condition instead of AUTO or the old weather. Never emit a partial StatusUpdatedEvent with only minutes_passed, only location, or only weather.\n"
         "- For actions with meaningful uncertainty, opposition, hidden information, "
         "danger, resource pressure, time pressure, or real consequences, suggest "
         "SkillCheckRequestedEvent before any final outcome event. Do not request "
@@ -2370,8 +2917,9 @@ def build_gemini_story_prompt(context_packet: dict[str, Any]) -> str:
         "stores that item/material, also suggest InventoryItemAddedEvent for "
         "the same item/material. The uses list is for generalized symptoms or "
         "effects, such as sleep aid or pain relief, rather than detailed recipes "
-        "or procedures. notes must explicitly include 'Rarity: Common', 'Rarity: "
-        "Uncommon', 'Rarity: Rare', or 'Rarity: Very Rare'. Price each entry in "
+        "or procedures. notes must end with exactly one sentence containing "
+        "'Rarity: Common', 'Rarity: Uncommon', 'Rarity: Rare', or 'Rarity: Very Rare'. "
+        "Price each entry in "
         "value_base_units using the world's economy; Rare and Very Rare items must "
         "be materially more valuable than comparable Common items unless the world "
         "context explicitly supplies a reason otherwise.\n"
@@ -2390,8 +2938,12 @@ def build_gemini_story_prompt(context_packet: dict[str, Any]) -> str:
         "common measurement units. Liquids such as water must use a concrete volume "
         "unit such as mL, L, tsp, tbsp, or cups; never use each or vague units such "
         "as pinch or handful for an uncountable substance. "
-        "Include value_base_units as the recipe result's current or reasonably "
-        "estimated value in the baseline currency unit.\n"
+         "Include value_base_units as the recipe result's current or reasonably "
+         "estimated value in the baseline currency unit. Recipe notes must be "
+         "self-contained rather than relying on the recipe name or result text: "
+         "state the intended purpose/effect, expected strength or outcome, onset, "
+         "duration, and important use conditions; say unknown or not applicable "
+         "when a detail is not established.\n"
         "- If the narration says the player physically gains, collects, harvests, "
         "finds and keeps, or fills a basket/container with usable items, also "
         "suggest InventoryItemAddedEvent for those items. Do not describe a "
@@ -2558,6 +3110,12 @@ def build_gemini_new_game_prompt(setup_packet: dict[str, Any]) -> str:
         "those names.\n"
         "- introductory_message must be player-facing narration for the first "
         "scene at start_location and must end with setup_packet.turn_prompt.\n"
+        "- If setup.opening_scene_request is non-empty, use it as player-authored "
+        "guidance for the situation, mood, event, or hook of the first scene at "
+        "start_location. Honor its intent when coherent, but transform it into "
+        "finalized in-world prose; do not copy the request verbatim or expose "
+        "meta-instructions. Keep it consistent with the finalized location, "
+        "character, world, and player knowledge.\n"
         "- suggested_actions must contain three or four short opening-scene "
         "actions the player can take next. Keep them concrete, immediate, and "
         "consistent with the introductory_message.\n"
@@ -2603,8 +3161,9 @@ def build_gemini_new_game_prompt(setup_packet: dict[str, Any]) -> str:
         "clear day names, month names, season names, season weather hints, and "
         "a time_display value. Keep the calendar playable: days_per_week 1-14, "
         "weeks_per_month 1-12, months_per_year 1-24, and seasons_per_year 1-12. "
-        "Do not copy the default Gregorian calendar, weekday names, January-"
-        "through-December month names, Spring/Summer/Autumn/Winter as the full "
+        "Do not copy the default Gregorian calendar. Never use Monday, Tuesday, "
+        "Wednesday, Thursday, Friday, Saturday, or Sunday as any day name. Do not "
+        "use January-through-December month names, Spring/Summer/Autumn/Winter as the full "
         "season list, generic Month 1/Month 2 placeholder names, or generic "
         "fantasy/artisan defaults when AI generation is requested. For futuristic, "
         "space, cyberpunk, or science-fiction settings, use calendar names that "
@@ -2742,7 +3301,8 @@ def build_gemini_new_game_prompt(setup_packet: dict[str, Any]) -> str:
         "coin or purse items in starting_items to represent spendable money.\n"
         "- The API response schema defines the required output fields and event "
         "envelope. New-game events may only be NpcUpsertedEvent, "
-        "ActiveTaskUpsertedEvent, or MusicChangedEvent. Put hidden identities, "
+        "ActiveTaskUpsertedEvent, MusicChangedEvent, or "
+        "SoundEffectChangedEvent. Put hidden identities, "
         "motives, mystery solutions, off-screen plans, and other GM-only starting "
         "truths in the top-level gm_secrets array, not in player-facing fields "
         "or the events array. The app stores those starting secrets as active. "
@@ -2777,7 +3337,11 @@ def build_gemini_new_game_prompt(setup_packet: dict[str, Any]) -> str:
         "establishes a new denomination after initial setup. If "
         "setup_packet.audio.valid_music_tracks is non-empty, "
         "use one MusicChangedEvent to choose fitting opening background music; "
-        "its filename must exactly match one listed track. The API response "
+        "its filename must exactly match one listed track. When "
+        "setup_packet.audio.valid_sound_effect_tracks is non-empty and ambient "
+        "sound fits the scene, use one SoundEffectChangedEvent as well; it plays "
+        "independently from music and its filename must exactly match one listed "
+        "sound-effect track. The API response "
         "schema defines the required JSON fields.\n\n"
         "Setup packet:\n"
         f"{packet_json}"
@@ -3461,10 +4025,20 @@ def _generate_content_with_retry(
     contents: str,
     config: dict[str, Any],
     request_label: str,
+    allow_schema_fallback: bool = True,
 ) -> Any:
     """Calls Gemini with one bounded retry for temporary service failures."""
 
     active_config = dict(config)
+    LOGGER.info(
+        "Gemini %s request diagnostics: %s",
+        request_label,
+        _model_request_diagnostics(
+            model=model,
+            contents=contents,
+            config=active_config,
+        ),
+    )
     for attempt in range(1, MODEL_REQUEST_ATTEMPTS + 1):
         try:
             return client.models.generate_content(
@@ -3474,15 +4048,28 @@ def _generate_content_with_retry(
             )
         except Exception as error:
             transient = _is_transient_model_error(error)
+            LOGGER.warning(
+                "Gemini %s attempt %s error diagnostics: %s",
+                request_label,
+                attempt,
+                _model_error_diagnostics(error),
+            )
             if (
                 _is_invalid_argument_model_error(error)
                 and "response_json_schema" in active_config
+                and allow_schema_fallback
                 and attempt < MODEL_REQUEST_ATTEMPTS
             ):
                 LOGGER.warning(
                     "Gemini %s rejected the structured-output schema. Retrying "
-                    "once with JSON MIME mode and local response validation.",
+                    "once with JSON MIME mode and local response validation. "
+                    "request_diagnostics=%s",
                     request_label,
+                    _model_request_diagnostics(
+                        model=model,
+                        contents=contents,
+                        config=active_config,
+                    ),
                 )
                 active_config = {
                     key: value
@@ -3504,10 +4091,15 @@ def _generate_content_with_retry(
 
             summary = _model_error_summary(error)
             LOGGER.warning(
-                "Gemini %s failed after %s attempt(s): %s",
+                "Gemini %s failed after %s attempt(s): %s; final_request_diagnostics=%s",
                 request_label,
                 attempt,
                 summary,
+                _model_request_diagnostics(
+                    model=model,
+                    contents=contents,
+                    config=active_config,
+                ),
             )
             if transient:
                 raise GeminiRequestError(
@@ -3550,6 +4142,99 @@ def _model_error_summary(error: Exception) -> str:
 
     summary = " ".join(str(error).split())
     return summary[:300] or type(error).__name__
+
+
+def _model_error_diagnostics(error: Exception) -> str:
+    """Returns structured SDK error fields without logging a traceback or key."""
+
+    fields: dict[str, Any] = {"exception_type": type(error).__name__}
+    for attribute in ("code", "status", "status_code", "message", "details"):
+        value = getattr(error, attribute, None)
+        if value is not None:
+            fields[attribute] = value
+    if not any(key != "exception_type" for key in fields):
+        fields["summary"] = _model_error_summary(error)
+    return _safe_model_log_json(fields, max_chars=1600)
+
+
+def _model_request_diagnostics(
+    *,
+    model: str,
+    contents: str,
+    config: dict[str, Any],
+) -> str:
+    """Returns safe request metadata useful for diagnosing API rejections."""
+
+    schema = config.get("response_json_schema")
+    schema_properties = (
+        schema.get("properties", {})
+        if isinstance(schema, dict)
+        else {}
+    )
+    diagnostics = {
+        "model": model,
+        "contents_chars": len(contents),
+        "config_keys": sorted(str(key) for key in config),
+        "response_mime_type": config.get("response_mime_type"),
+        "thinking_config": config.get("thinking_config"),
+        "max_output_tokens": config.get("max_output_tokens"),
+        "schema_type": schema.get("type") if isinstance(schema, dict) else None,
+        "schema_top_level_properties": sorted(str(key) for key in schema_properties),
+        "schema_required": (
+            schema.get("required", []) if isinstance(schema, dict) else []
+        ),
+        "schema_status_property_paths": _schema_property_paths(schema, "status"),
+        "schema_opening_scene_request_property_paths": _schema_property_paths(
+            schema,
+            "opening_scene_request",
+        ),
+    }
+    return _safe_model_log_json(diagnostics, max_chars=2400)
+
+
+def _schema_property_paths(schema: Any, property_name: str) -> list[str]:
+    """Finds nested JSON-schema property paths without logging schema contents."""
+
+    paths: list[str] = []
+    visited: set[int] = set()
+
+    def walk(value: Any, path: str) -> None:
+        if len(paths) >= 40 or not isinstance(value, dict):
+            return
+        value_id = id(value)
+        if value_id in visited:
+            return
+        visited.add(value_id)
+
+        properties = value.get("properties")
+        if isinstance(properties, dict):
+            for key, child in properties.items():
+                child_path = f"{path}.properties.{key}"
+                if str(key) == property_name:
+                    paths.append(child_path)
+                walk(child, child_path)
+
+        for collection_key in ("items", "anyOf", "oneOf", "allOf", "not"):
+            child = value.get(collection_key)
+            if isinstance(child, list):
+                for index, item in enumerate(child):
+                    walk(item, f"{path}.{collection_key}[{index}]")
+            elif isinstance(child, dict):
+                walk(child, f"{path}.{collection_key}")
+
+    walk(schema, "$")
+    return paths
+
+
+def _safe_model_log_json(value: Any, *, max_chars: int) -> str:
+    """Serializes diagnostic metadata compactly and bounds log growth."""
+
+    try:
+        rendered = json.dumps(value, ensure_ascii=False, default=str, sort_keys=True)
+    except Exception:
+        rendered = repr(value)
+    rendered = " ".join(rendered.split())
+    return rendered[:max_chars]
 
 
 def _sanitize_gemini_creative_terms(
@@ -4038,6 +4723,7 @@ def parse_gemini_story_response(
     suggested_events = [
         event for event in raw_events if isinstance(event, dict)
     ]
+    pronunciation_map = normalize_pronunciation_map(data.get("pronunciation_map", {}))
     explicit_out_of_game = (
         isinstance(context_packet, dict)
         and context_packet.get("conversation_mode") == "out_of_game"
@@ -4065,6 +4751,7 @@ def parse_gemini_story_response(
         narrative_text=narrative_text,
         suggested_actions=suggested_actions,
         suggested_events=suggested_events,
+        pronunciation_map=pronunciation_map,
         out_of_game=(
             explicit_out_of_game
             if isinstance(context_packet, dict) and "conversation_mode" in context_packet
@@ -4189,7 +4876,7 @@ def _ensure_status_event_for_in_game_response(
     result: AiNarrationResult,
     context_packet: dict[str, Any],
 ) -> AiNarrationResult:
-    """Adds a no-advance status event when Gemini omits one for an in-game turn."""
+    """Ensures in-game narration and its final status event remain aligned."""
 
     if result.out_of_game or _is_continuation_request(context_packet):
         return result
@@ -4197,13 +4884,45 @@ def _ensure_status_event_for_in_game_response(
     if str(context_packet.get("packet_type", "")).strip() != "story_turn":
         return result
 
-    if any(
-        _raw_event_type(event) == "StatusUpdatedEvent"
-        for event in result.suggested_events
-    ):
-        return result
-
     scene = _state_subpacket(context_packet, "scene")
+    status_event_index = next(
+        (
+            index
+            for index, event in enumerate(result.suggested_events)
+            if _raw_event_type(event) == "StatusUpdatedEvent"
+        ),
+        None,
+    )
+    if status_event_index is not None:
+        narrated_weather = _obvious_narrated_weather(result.narrative_text)
+        if not narrated_weather:
+            return result
+
+        status_event = result.suggested_events[status_event_index]
+        raw_payload = status_event.get("payload", {})
+        payload = dict(raw_payload) if isinstance(raw_payload, dict) else {}
+        event_weather = str(payload.get("weather", "AUTO") or "AUTO").strip()
+        effective_weather = (
+            str(scene.get("weather", "") or "").strip()
+            if event_weather.upper() in {"AUTO", "SAME", "SKIP"}
+            else event_weather
+        )
+        if narrated_weather.casefold() in effective_weather.casefold():
+            return result
+
+        payload["weather"] = narrated_weather
+        corrected_event = dict(status_event)
+        corrected_event["payload"] = payload
+        corrected_events = list(result.suggested_events)
+        corrected_events[status_event_index] = corrected_event
+        LOGGER.warning(
+            "Corrected StatusUpdatedEvent weather from %r to %r to match explicit "
+            "current-weather narration.",
+            event_weather,
+            narrated_weather,
+        )
+        return replace(result, suggested_events=corrected_events)
+
     payload = {
         "location": str(scene.get("location", "AUTO") or "AUTO"),
         "minutes_passed": "AUTO",
@@ -4218,13 +4937,19 @@ def _ensure_status_event_for_in_game_response(
         "injecting no-advance status event."
     )
 
-    return AiNarrationResult(
-        narrative_text=result.narrative_text,
-        suggested_actions=result.suggested_actions,
+    return replace(
+        result,
         suggested_events=[*result.suggested_events, status_event],
-        out_of_game=result.out_of_game,
-        raw_text=result.raw_text,
     )
+
+
+def _obvious_narrated_weather(narrative_text: str) -> str:
+    """Returns a weather label for unambiguous present-scene weather prose."""
+
+    for weather, pattern in OBVIOUS_NARRATED_WEATHER_PATTERNS:
+        if pattern.search(narrative_text):
+            return weather
+    return ""
 
 
 def _enforce_container_reward_flow(
@@ -4828,16 +5553,27 @@ def parse_gemini_new_game_response(
     data = _sanitize_gemini_creative_terms(data, "new-game response")
     guarded_raw_text = json.dumps(data, ensure_ascii=False)
 
-    _log_json_schema_warnings(data, NEW_GAME_RESPONSE_JSON_SCHEMA, "new-game response")
+    response_schema = (
+        build_new_game_response_schema(setup_packet)
+        if isinstance(setup_packet, dict)
+        else NEW_GAME_RESPONSE_JSON_SCHEMA
+    )
+    _log_json_schema_warnings(data, response_schema, "new-game response")
+
+    setup = setup_packet.get("setup", {}) if isinstance(setup_packet, dict) else {}
+    if not isinstance(setup, dict):
+        setup = {}
 
     world_summary = str(data.get("world_summary", "")).strip()
     selected_genre = str(
-        data.get("selected_genre", data.get("genre", ""))
+        data.get("selected_genre", setup.get("specified_genre", ""))
     ).strip()
-    start_location = clean_player_location_name(data.get("start_location", ""))
+    start_location = clean_player_location_name(
+        data.get("start_location", setup.get("start_location", ""))
+    )
     calendar_settings = _parse_new_game_calendar_settings(data.get("calendar_settings"))
     starting_calendar = _parse_new_game_starting_calendar(
-        data.get("starting_calendar", data.get("calendar"))
+        data.get("starting_calendar")
     )
     start_weather = str(data.get("weather", data.get("start_weather", ""))).strip()
     locations = _parse_new_game_locations(data.get("locations"), start_location)
@@ -4861,7 +5597,8 @@ def parse_gemini_new_game_response(
     finalized_starting_currency_balance_base_units = (
         _parse_new_game_starting_currency_balance(data)
     )
-    raw_events = data.get("events", data.get("suggested_events", []))
+    pronunciation_map = normalize_pronunciation_map(data.get("pronunciation_map", {}))
+    raw_events = data.get("events", [])
     suggested_actions = _parse_suggested_actions(
         data.get("suggested_actions", []),
         response_label="new-game response",
@@ -4920,6 +5657,7 @@ def parse_gemini_new_game_response(
         finalized_starting_currency_balance_base_units=(
             finalized_starting_currency_balance_base_units
         ),
+        pronunciation_map=pronunciation_map,
         suggested_actions=suggested_actions,
         suggested_events=suggested_events,
         raw_text=guarded_raw_text,

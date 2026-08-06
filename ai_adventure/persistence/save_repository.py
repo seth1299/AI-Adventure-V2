@@ -15,6 +15,7 @@ from typing import Any
 
 from ai_adventure.alchemy.ingredients import (
     normalize_crafting_item_rarity,
+    normalize_crafting_item_notes,
     normalize_recipe_ingredients,
 )
 from ai_adventure.ascii_art import normalize_ascii_art
@@ -27,6 +28,7 @@ from ai_adventure.calendar_system import (
     DEFAULT_START_ELAPSED_MINUTES,
     build_calendar_snapshot,
     normalize_calendar_settings,
+    resolve_starting_calendar_minute,
 )
 from ai_adventure.audio.tts_settings import normalize_tts_audio_fields
 from ai_adventure.audio.voices import DEFAULT_NARRATOR_VOICE
@@ -98,6 +100,7 @@ class SaveRepository:
         """
 
         self.db_path = db_path
+        self._active_message_id: str | None = None
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._initialize_schema()
         self.set_player_equipment(self.get_setting("player.equipment", {}))
@@ -137,6 +140,7 @@ class SaveRepository:
             return repository
 
         repository.set_setting("player_name", "Player Name")
+        repository.set_setting("player.name_pronunciation", "")
         repository.set_setting("player.appearance", "")
         repository.set_setting("player.backstory", "")
         repository.set_setting("player.notes", "")
@@ -145,8 +149,10 @@ class SaveRepository:
         repository.set_setting("ai.narration_style", DEFAULT_NARRATION_STYLE)
         repository._set_default_ai_mode_settings()
         repository.set_setting("audio.music_enabled", True)
+        repository.set_setting("audio.sound_effects_enabled", True)
         repository.set_setting("audio.narrator_enabled", True)
         repository.set_setting("audio.music_volume", 25)
+        repository.set_setting("audio.sound_effects_volume", 35)
         repository.set_setting("audio.tts_volume", 90)
         repository.set_setting("audio.tts_voice", DEFAULT_NARRATOR_VOICE)
         repository.set_setting("audio.tts_speed", 100)
@@ -156,7 +162,9 @@ class SaveRepository:
             normalize_tts_audio_fields({})["tts_voice_blend"],
         )
         repository.set_setting("audio.tts_custom_voices", [])
+        repository.set_setting("tts.pronunciation_map", {})
         repository.set_setting("audio.current_music", "")
+        repository.set_setting("audio.current_sound_effect", "")
         repository.set_journal_notes("")
         repository.set_journal_share_with_ai(False)
         repository.set_currency_denominations(DEFAULT_CURRENCY_DENOMINATIONS)
@@ -246,13 +254,9 @@ class SaveRepository:
         calendar_settings = clean_setup["calendar"]
         audio_settings = clean_setup["audio"]
         narration_preferences = clean_setup["narration"]
-        calendar_snapshot = build_calendar_snapshot(
-            DEFAULT_START_ELAPSED_MINUTES,
-            calendar_settings,
-        )
-
         self.set_meta("title", title)
         self.set_setting("player_name", character["name"])
+        self.set_setting("player.name_pronunciation", character["name_pronunciation"])
         self.set_setting("player.appearance", character["appearance"])
         self.set_setting("player.backstory", character["backstory"])
         self.set_setting("player.notes", character["notes"])
@@ -261,15 +265,25 @@ class SaveRepository:
         self.set_setting("ai.narration_style", narration_preferences["style"])
         self._set_ai_mode_settings(clean_setup["ai_settings"])
         self.set_setting("audio.music_enabled", bool(audio_settings["music_enabled"]))
+        self.set_setting(
+            "audio.sound_effects_enabled",
+            bool(audio_settings["sound_effects_enabled"]),
+        )
         self.set_setting("audio.narrator_enabled", bool(audio_settings["narrator_enabled"]))
         self.set_setting("audio.music_volume", int(audio_settings["music_volume"]))
+        self.set_setting(
+            "audio.sound_effects_volume",
+            int(audio_settings["sound_effects_volume"]),
+        )
         self.set_setting("audio.tts_volume", int(audio_settings["tts_volume"]))
         self.set_setting("audio.tts_voice", audio_settings["tts_voice"])
         self.set_setting("audio.tts_speed", int(audio_settings["tts_speed"]))
         self.set_setting("audio.tts_voice_mode", audio_settings["tts_voice_mode"])
         self.set_setting("audio.tts_voice_blend", audio_settings["tts_voice_blend"])
         self.set_setting("audio.tts_custom_voices", audio_settings["tts_custom_voices"])
+        self.set_setting("tts.pronunciation_map", clean_setup["pronunciation_map"])
         self.set_setting("audio.current_music", "")
+        self.set_setting("audio.current_sound_effect", "")
         self.set_setting("new_game.setup", clean_setup)
         self.set_setting("world.setup_context", clean_setup["world_context"])
         self.set_setting("world.genre", clean_setup["specified_genre"])
@@ -279,9 +293,17 @@ class SaveRepository:
         self.set_journal_share_with_ai(False)
         self.set_currency_denominations(clean_setup["currency_denominations"])
         self.set_calendar_settings(calendar_settings)
-        self.set_current_calendar_minute(DEFAULT_START_ELAPSED_MINUTES)
+        starting_minute = resolve_starting_calendar_minute(
+            clean_setup.get("starting_calendar", {}),
+            calendar_settings,
+            default_current_minute=DEFAULT_START_ELAPSED_MINUTES,
+        )
+        self.set_current_calendar_minute(starting_minute)
         self.set_state_value("location", start_location)
-        self.set_state_value("time", calendar_snapshot["display_label"])
+        self.set_state_value(
+            "time",
+            build_calendar_snapshot(starting_minute, calendar_settings)["display_label"],
+        )
         self.set_state_value("weather", "Clear")
         self.set_state_value("condition", "Healthy")
 
@@ -654,7 +676,7 @@ class SaveRepository:
         with self._connect() as connection:
             rows = connection.execute(
                 """
-                SELECT id, category, quantity, description, value_base_units, metadata_json
+                SELECT id, category, quantity, storage_location, description, value_base_units, metadata_json
                 FROM inventory_items
                 WHERE name = ? COLLATE NOCASE
                 ORDER BY id ASC
@@ -681,6 +703,7 @@ class SaveRepository:
                     UPDATE inventory_items
                     SET category = ?,
                         quantity = ?,
+                        storage_location = ?,
                         description = ?,
                         value_base_units = ?,
                         metadata_json = ?
@@ -689,6 +712,7 @@ class SaveRepository:
                     (
                         updated_category,
                         updated_quantity,
+                        _inventory_storage_location(clean_metadata),
                         updated_description,
                         updated_value,
                         updated_metadata,
@@ -709,16 +733,18 @@ class SaveRepository:
                         name,
                         category,
                         quantity,
+                        storage_location,
                         description,
                         value_base_units,
                         metadata_json
                     )
-                    VALUES (?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         clean_name,
                         category.strip(),
                         quantity,
+                        _inventory_storage_location(clean_metadata),
                         description.strip(),
                         clean_value,
                         metadata_json,
@@ -753,6 +779,7 @@ class SaveRepository:
                     category,
                     quantity,
                     equipped,
+                    storage_location,
                     description,
                     value_base_units,
                     metadata_json
@@ -838,17 +865,19 @@ class SaveRepository:
                     name,
                     category,
                     quantity,
+                    storage_location,
                     description,
                     value_base_units,
                     metadata_json
                 )
-                VALUES (?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
                     (
                         item["name"],
                         item["category"],
                         item["quantity"],
+                        _inventory_storage_location(item["metadata"]),
                         item["description"],
                         item["value_base_units"],
                         _encode_json_dict(item["metadata"]),
@@ -1006,7 +1035,7 @@ class SaveRepository:
         with self._connect() as connection:
             row = connection.execute(
                 """
-                SELECT id, name, category, description, quantity, value_base_units, metadata_json
+                SELECT id, name, category, description, quantity, storage_location, value_base_units, metadata_json
                 FROM inventory_items
                 WHERE name = ?
                 ORDER BY id ASC
@@ -1032,6 +1061,7 @@ class SaveRepository:
             )
             updated_quantity = int(row["quantity"])
             updated_value = int(row["value_base_units"])
+            updated_storage_location = str(row["storage_location"] or "actively_carried")
             existing_metadata = _decode_json_dict(
                 row["metadata_json"], "inventory item metadata"
             )
@@ -1045,6 +1075,7 @@ class SaveRepository:
             merged_metadata = {**existing_metadata, **metadata_updates}
             updated_metadata["quantity_unit"] = _inventory_quantity_unit(merged_metadata)
             updated_metadata["storage_location"] = _inventory_storage_location(merged_metadata)
+            updated_storage_location = updated_metadata["storage_location"]
             updated_metadata["item_uuid"] = str(merged_metadata.get("item_uuid", "")).strip() or str(uuid.uuid4())
 
             if quantity is not None:
@@ -1074,6 +1105,7 @@ class SaveRepository:
                     category = ?,
                     description = ?,
                     quantity = ?,
+                    storage_location = ?,
                     value_base_units = ?,
                     metadata_json = ?
                 WHERE id = ?
@@ -1083,6 +1115,7 @@ class SaveRepository:
                     updated_category,
                     updated_description,
                     updated_quantity,
+                    updated_storage_location,
                     updated_value,
                     _encode_json_dict(updated_metadata),
                     row["id"],
@@ -1139,15 +1172,7 @@ class SaveRepository:
         clean_uses = uses or []
         clean_rarity = normalize_crafting_item_rarity(rarity)
         clean_value = max(0, _safe_int(value_base_units, default=0) or 0)
-        clean_notes = re.sub(
-            r"^\s*rarity\s*:\s*(?:common|uncommon|rare|very rare)\s*\.?\s*",
-            "",
-            notes.strip(),
-            flags=re.IGNORECASE,
-        )
-        clean_notes = f"Rarity: {clean_rarity}." + (
-            f" {clean_notes}" if clean_notes else ""
-        )
+        clean_notes = normalize_crafting_item_notes(notes, clean_rarity)
 
         with self._connect() as connection:
             connection.execute(
@@ -1238,8 +1263,8 @@ class SaveRepository:
                     "location": row["location"],
                     "uses": _decode_string_list(row["uses_json"], "uses"),
                     "rarity": normalize_crafting_item_rarity(row["rarity"]),
-                    "notes": row["notes"] or (
-                        f"Rarity: {normalize_crafting_item_rarity(row['rarity'])}."
+                    "notes": normalize_crafting_item_notes(
+                        row["notes"], row["rarity"]
                     ),
                     "value_base_units": max(0, int(row["value_base_units"] or 0)),
                     "discovered_at": row["discovered_at"],
@@ -2363,29 +2388,75 @@ class SaveRepository:
 
         return [_gm_secret_row_to_dict(row) for row in rows]
 
-    def append_history(self, kind: str, content: str) -> None:
+    @staticmethod
+    def create_message_id() -> str:
+        """Returns a globally unique identifier for one conversation message."""
+
+        return uuid.uuid4().hex
+
+    @contextmanager
+    def message_context(self, message_id: str | None) -> Iterator[None]:
+        """Associates repository writes in a scope with one conversation message."""
+
+        previous_message_id = self._active_message_id
+        self._active_message_id = (
+            str(message_id or "").strip() or previous_message_id
+        )
+        try:
+            yield
+        finally:
+            self._active_message_id = previous_message_id
+
+    def _resolve_message_id(self, message_id: str | None = None) -> str:
+        """Resolves an explicit, scoped, or newly generated message ID."""
+
+        return (
+            str(message_id or "").strip()
+            or self._active_message_id
+            or self.create_message_id()
+        )
+
+    def append_history(
+        self,
+        kind: str,
+        content: str,
+        *,
+        message_id: str | None = None,
+    ) -> str:
         """
         Appends an entry to the adventure history.
 
         Args:
             kind: Entry category, such as player, story, system, inventory, or alchemy.
             content: Entry text.
+            message_id: Optional conversation message ID.
+
+        Returns:
+            The associated conversation message ID.
         """
 
         clean_content = content.strip()
 
         if not clean_content:
             LOGGER.warning("Skipped blank history entry of kind '%s'.", kind)
-            return
+            return self._resolve_message_id(message_id)
+
+        resolved_message_id = self._resolve_message_id(message_id)
 
         with self._connect() as connection:
             connection.execute(
                 """
-                INSERT INTO history_entries (kind, content, created_at)
-                VALUES (?, ?, ?)
+                INSERT INTO history_entries (message_id, kind, content, created_at)
+                VALUES (?, ?, ?, ?)
                 """,
-                (kind.strip() or "misc", clean_content, datetime.now().isoformat(timespec="seconds")),
+                (
+                    resolved_message_id,
+                    kind.strip() or "misc",
+                    clean_content,
+                    datetime.now().isoformat(timespec="seconds"),
+                ),
             )
+        return resolved_message_id
 
     def append_mechanical_event(
         self,
@@ -2393,6 +2464,8 @@ class SaveRepository:
         payload: dict[str, Any],
         status: str,
         message: str,
+        *,
+        message_id: str | None = None,
     ) -> None:
         """
         Stores a mechanical event application result.
@@ -2402,21 +2475,26 @@ class SaveRepository:
             payload: Event payload.
             status: applied, skipped, or failed.
             message: Short status message.
+            message_id: Optional conversation message ID.
         """
+
+        resolved_message_id = self._resolve_message_id(message_id)
 
         with self._connect() as connection:
             connection.execute(
                 """
                 INSERT INTO mechanical_events (
+                    message_id,
                     event_type,
                     payload_json,
                     status,
                     message,
                     created_at
                 )
-                VALUES (?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?)
                 """,
                 (
+                    resolved_message_id,
                     event_type.strip() or "UnknownEvent",
                     json.dumps(payload),
                     status,
@@ -2436,7 +2514,7 @@ class SaveRepository:
         with self._connect() as connection:
             rows = connection.execute(
                 """
-                SELECT id, event_type, payload_json, status, message, created_at
+                SELECT id, message_id, event_type, payload_json, status, message, created_at
                 FROM mechanical_events
                 ORDER BY id ASC
                 """
@@ -2454,6 +2532,7 @@ class SaveRepository:
             events.append(
                 {
                     "id": row["id"],
+                    "message_id": row["message_id"],
                     "event_type": row["event_type"],
                     "payload": payload,
                     "status": row["status"],
@@ -2475,13 +2554,145 @@ class SaveRepository:
         with self._connect() as connection:
             rows = connection.execute(
                 """
-                SELECT id, kind, content, created_at
+                SELECT id, message_id, kind, content, created_at
                 FROM history_entries
                 ORDER BY id ASC
                 """
             ).fetchall()
 
         return [dict(row) for row in rows]
+
+    def capture_message_snapshot(self, message_id: str) -> None:
+        """Captures the complete database state immediately before one response."""
+
+        clean_message_id = str(message_id or "").strip()
+        if not clean_message_id:
+            raise ValueError("A message ID is required for a state snapshot.")
+
+        with self._connect() as connection:
+            snapshot: dict[str, dict[str, Any]] = {}
+            table_rows = connection.execute(
+                """
+                SELECT name
+                FROM sqlite_master
+                WHERE type = 'table'
+                  AND name NOT IN ('message_snapshots', 'sqlite_sequence')
+                ORDER BY name
+                """
+            ).fetchall()
+
+            for table_row in table_rows:
+                table_name = str(table_row["name"])
+                quoted_table = _quote_sql_identifier(table_name)
+                columns = [
+                    str(column["name"])
+                    for column in connection.execute(
+                        f"PRAGMA table_info({quoted_table})"
+                    ).fetchall()
+                ]
+                rows = connection.execute(
+                    f"SELECT * FROM {quoted_table}"
+                ).fetchall()
+                snapshot[table_name] = {
+                    "columns": columns,
+                    "rows": [list(row) for row in rows],
+                }
+
+            connection.execute(
+                """
+                INSERT INTO message_snapshots (message_id, snapshot_json, created_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(message_id) DO UPDATE SET
+                    snapshot_json = excluded.snapshot_json,
+                    created_at = excluded.created_at
+                """,
+                (
+                    clean_message_id,
+                    json.dumps(snapshot, ensure_ascii=False),
+                    datetime.now().isoformat(timespec="seconds"),
+                ),
+            )
+            connection.execute(
+                "DELETE FROM message_snapshots WHERE message_id <> ?",
+                (clean_message_id,),
+            )
+
+    def has_message_snapshot(self, message_id: str) -> bool:
+        """Returns whether a response can still be safely regenerated."""
+
+        clean_message_id = str(message_id or "").strip()
+        if not clean_message_id:
+            return False
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT 1 FROM message_snapshots WHERE message_id = ?",
+                (clean_message_id,),
+            ).fetchone()
+        return row is not None
+
+    def rollback_message(self, message_id: str) -> bool:
+        """Restores the latest saved pre-response state for one message."""
+
+        clean_message_id = str(message_id or "").strip()
+        if not clean_message_id:
+            return False
+
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT snapshot_json FROM message_snapshots WHERE message_id = ?",
+                (clean_message_id,),
+            ).fetchone()
+            if row is None:
+                return False
+
+            try:
+                snapshot = json.loads(str(row["snapshot_json"]))
+            except json.JSONDecodeError:
+                LOGGER.exception(
+                    "Cannot roll back message %s because its snapshot is invalid.",
+                    clean_message_id,
+                )
+                return False
+
+            if not isinstance(snapshot, dict):
+                return False
+
+            connection.execute("PRAGMA foreign_keys = OFF")
+            try:
+                for table_name in snapshot:
+                    connection.execute(
+                        f"DELETE FROM {_quote_sql_identifier(table_name)}"
+                    )
+
+                for table_name, table_snapshot in snapshot.items():
+                    if not isinstance(table_snapshot, dict):
+                        continue
+                    columns = [
+                        str(column)
+                        for column in table_snapshot.get("columns", [])
+                    ]
+                    rows = table_snapshot.get("rows", [])
+                    if not columns or not isinstance(rows, list):
+                        continue
+                    quoted_table = _quote_sql_identifier(table_name)
+                    quoted_columns = ", ".join(
+                        _quote_sql_identifier(column) for column in columns
+                    )
+                    placeholders = ", ".join("?" for _ in columns)
+                    connection.executemany(
+                        f"INSERT INTO {quoted_table} ({quoted_columns}) "
+                        f"VALUES ({placeholders})",
+                        [tuple(row) for row in rows if isinstance(row, list)],
+                    )
+            finally:
+                connection.execute("PRAGMA foreign_keys = ON")
+
+            connection.execute(
+                "DELETE FROM message_snapshots WHERE message_id = ?",
+                (clean_message_id,),
+            )
+
+        return True
 
     def upsert_active_task(
         self,
@@ -3302,18 +3513,19 @@ class SaveRepository:
                 );
 
                 CREATE TABLE IF NOT EXISTS inventory_items (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    id TEXT PRIMARY KEY NOT NULL DEFAULT ('rec_' || lower(hex(randomblob(16)))),
                     name TEXT NOT NULL,
                     category TEXT NOT NULL DEFAULT '',
                     quantity INTEGER NOT NULL DEFAULT 1,
                     equipped INTEGER NOT NULL DEFAULT 0,
+                    storage_location TEXT NOT NULL DEFAULT 'actively_carried',
                     description TEXT NOT NULL DEFAULT '',
                     value_base_units INTEGER NOT NULL DEFAULT 0,
                     metadata_json TEXT NOT NULL DEFAULT '{}'
                 );
 
                 CREATE TABLE IF NOT EXISTS item_catalog (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    id TEXT PRIMARY KEY NOT NULL DEFAULT ('rec_' || lower(hex(randomblob(16)))),
                     name TEXT NOT NULL UNIQUE COLLATE NOCASE,
                     category TEXT NOT NULL DEFAULT '',
                     description TEXT NOT NULL DEFAULT '',
@@ -3325,7 +3537,7 @@ class SaveRepository:
                 );
 
                 CREATE TABLE IF NOT EXISTS crafting_items (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    id TEXT PRIMARY KEY NOT NULL DEFAULT ('rec_' || lower(hex(randomblob(16)))),
                     name TEXT NOT NULL UNIQUE,
                     category TEXT NOT NULL DEFAULT 'Material',
                     description TEXT NOT NULL DEFAULT '',
@@ -3338,7 +3550,7 @@ class SaveRepository:
                 );
 
                 CREATE TABLE IF NOT EXISTS crafting_recipes (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    id TEXT PRIMARY KEY NOT NULL DEFAULT ('rec_' || lower(hex(randomblob(16)))),
                     name TEXT NOT NULL UNIQUE,
                     ingredients_json TEXT NOT NULL DEFAULT '[]',
                     result TEXT NOT NULL DEFAULT '',
@@ -3348,7 +3560,7 @@ class SaveRepository:
                 );
 
                 CREATE TABLE IF NOT EXISTS skills (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    id TEXT PRIMARY KEY NOT NULL DEFAULT ('rec_' || lower(hex(randomblob(16)))),
                     name TEXT NOT NULL UNIQUE,
                     description TEXT NOT NULL DEFAULT '',
                     level INTEGER NOT NULL DEFAULT 1,
@@ -3369,7 +3581,7 @@ class SaveRepository:
                 );
 
                 CREATE TABLE IF NOT EXISTS active_tasks (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    id TEXT PRIMARY KEY NOT NULL DEFAULT ('rec_' || lower(hex(randomblob(16)))),
                     name TEXT NOT NULL UNIQUE,
                     category TEXT NOT NULL DEFAULT 'Task',
                     status TEXT NOT NULL DEFAULT 'Active',
@@ -3386,7 +3598,7 @@ class SaveRepository:
                 );
 
                 CREATE TABLE IF NOT EXISTS npcs (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    id TEXT PRIMARY KEY NOT NULL DEFAULT ('rec_' || lower(hex(randomblob(16)))),
                     npc_id TEXT NOT NULL UNIQUE,
                     name TEXT NOT NULL,
                     display_name TEXT NOT NULL DEFAULT '',
@@ -3415,6 +3627,7 @@ class SaveRepository:
 
                 CREATE TABLE IF NOT EXISTS history_entries (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    message_id TEXT NOT NULL,
                     kind TEXT NOT NULL,
                     content TEXT NOT NULL,
                     created_at TEXT NOT NULL
@@ -3422,10 +3635,17 @@ class SaveRepository:
 
                 CREATE TABLE IF NOT EXISTS mechanical_events (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    message_id TEXT NOT NULL,
                     event_type TEXT NOT NULL,
                     payload_json TEXT NOT NULL,
                     status TEXT NOT NULL,
                     message TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS message_snapshots (
+                    message_id TEXT PRIMARY KEY,
+                    snapshot_json TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
 
@@ -3484,6 +3704,12 @@ class SaveRepository:
             _ensure_column(
                 connection,
                 "inventory_items",
+                "storage_location",
+                "TEXT NOT NULL DEFAULT 'actively_carried'",
+            )
+            _ensure_column(
+                connection,
+                "inventory_items",
                 "equipped",
                 "INTEGER NOT NULL DEFAULT 0",
             )
@@ -3497,6 +3723,18 @@ class SaveRepository:
                 connection,
                 "npcs",
                 "display_name",
+                "TEXT NOT NULL DEFAULT ''",
+            )
+            _ensure_column(
+                connection,
+                "history_entries",
+                "message_id",
+                "TEXT NOT NULL DEFAULT ''",
+            )
+            _ensure_column(
+                connection,
+                "mechanical_events",
+                "message_id",
                 "TEXT NOT NULL DEFAULT ''",
             )
             _ensure_column(
@@ -3682,6 +3920,12 @@ class SaveRepository:
                     "UPDATE inventory_items SET metadata_json = ? WHERE id = ?",
                     (_encode_json_dict(inventory_metadata), inventory_row["id"]),
                 )
+
+
+def _quote_sql_identifier(value: str) -> str:
+    """Quotes an identifier read from SQLite's own schema metadata."""
+
+    return '"' + str(value).replace('"', '""') + '"'
 
 
 def _slugify(value: str) -> str:
@@ -4035,6 +4279,8 @@ def _upsert_item_catalog_entry(
         category=clean_category,
         description=clean_description,
     )
+    # Storage belongs to the current inventory instance, never the durable catalog.
+    clean_metadata.pop("storage_location", None)
     # Keep a stable, AI-facing identity separate from the player-visible name.
     clean_metadata["item_uuid"] = str(raw_metadata.get("item_uuid", "")).strip() or str(uuid.uuid4())
     metadata_json = _encode_json_dict(clean_metadata)
@@ -4120,7 +4366,8 @@ def _inventory_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
 
     metadata = _decode_json_dict(row["metadata_json"], "inventory item metadata")
     metadata["quantity_unit"] = _inventory_quantity_unit(metadata)
-    metadata["storage_location"] = _inventory_storage_location(metadata)
+    storage_location = _clean_storage_location(row["storage_location"])
+    metadata["storage_location"] = storage_location
     normalized_metadata = normalize_item_metadata(
         metadata,
         name=str(row["name"]),
@@ -4128,7 +4375,7 @@ def _inventory_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
         description=str(row["description"]),
     )
     normalized_metadata["quantity_unit"] = metadata["quantity_unit"]
-    normalized_metadata["storage_location"] = metadata["storage_location"]
+    normalized_metadata["storage_location"] = storage_location
     normalized_metadata["item_uuid"] = str(metadata.get("item_uuid", "")).strip()
     return {
         "id": row["id"],
@@ -4136,7 +4383,7 @@ def _inventory_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
         "category": row["category"],
         "quantity": row["quantity"],
         "quantity_unit": metadata["quantity_unit"],
-        "storage_location": metadata["storage_location"],
+        "storage_location": storage_location,
         "equipped": bool(row["equipped"]),
         "description": row["description"],
         "value_base_units": row["value_base_units"],
@@ -4242,8 +4489,14 @@ def _normalize_calendar_event(raw_event: Any) -> dict[str, Any]:
 def _inventory_storage_location(metadata: dict[str, Any]) -> str:
     """Returns the persisted free-text inventory storage label."""
 
-    value = " ".join(str(metadata.get("storage_location", "actively_carried") or "actively_carried").strip().split())
-    return value[:120] or "actively_carried"
+    return _clean_storage_location(metadata.get("storage_location", "actively_carried"))
+
+
+def _clean_storage_location(value: Any) -> str:
+    """Normalizes one inventory table storage-location value."""
+
+    clean_value = " ".join(str(value or "actively_carried").strip().split())
+    return clean_value[:120] or "actively_carried"
 
 
 def _gm_secret_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:

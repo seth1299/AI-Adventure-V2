@@ -15,6 +15,7 @@ from ai_adventure.context.tags import PLANNABLE_CONTEXT_TAGS
 from ai_adventure.combat import normalize_combat_state
 from ai_adventure.currency import format_currency_amount
 from ai_adventure.core.models import AdventureState
+from ai_adventure.audio.pronunciation import normalize_pronunciation_map
 from ai_adventure.narration_preferences import normalize_narration_preferences
 
 
@@ -225,6 +226,8 @@ class AiContextBuilder:
         gm_secrets: list[dict[str, Any]] | None = None,
         valid_music_tracks: list[str] | None = None,
         current_music: str | None = None,
+        valid_sound_effect_tracks: list[str] | None = None,
+        current_sound_effect: str | None = None,
         resolved_skill_checks: list[dict[str, Any]] | None = None,
         planner_context_tags: list[str] | None = None,
     ) -> dict[str, Any]:
@@ -239,6 +242,8 @@ class AiContextBuilder:
             gm_secrets: Active private GM-memory records for every turn.
             valid_music_tracks: Playable background music filenames.
             current_music: Currently selected background music filename.
+            valid_sound_effect_tracks: Playable ambient sound-effect filenames.
+            current_sound_effect: Currently selected ambient sound-effect filename.
             resolved_skill_checks: Skill checks already resolved for this command.
             planner_context_tags: Validated tags selected by the pre-narration
                 planner. ``None`` falls back to keyword inference.
@@ -264,8 +269,13 @@ class AiContextBuilder:
             for track in (valid_music_tracks or [])
             if str(track).strip()
         ]
+        clean_sound_effect_tracks = [
+            str(track).strip()
+            for track in (valid_sound_effect_tracks or [])
+            if str(track).strip()
+        ]
 
-        if clean_music_tracks:
+        if clean_music_tracks or clean_sound_effect_tracks:
             selected_tags.add("music")
 
         reference_sections = self.library.select_sections(
@@ -314,6 +324,9 @@ class AiContextBuilder:
                 "adventure_title": state.metadata.title,
                 "player": {
                     "name": state.player.name,
+                    "name_pronunciation": _compact_text(
+                        state.player.name_pronunciation
+                    ),
                     "appearance": _compact_text(state.player.appearance),
                     "backstory": _compact_text(state.player.backstory),
                     "condition": _compact_text(
@@ -326,6 +339,9 @@ class AiContextBuilder:
                     "armor_rating": state.player.armor_rating,
                     "equipment": state.player.equipment,
                 },
+                "pronunciation_map": normalize_pronunciation_map(
+                    state.settings.values.get("tts.pronunciation_map", {})
+                ),
                 "player_ai_preferences": {
                     "additional_context": _compact_text(
                         state.settings.values.get("ai.additional_context", "")
@@ -448,6 +464,7 @@ class AiContextBuilder:
                 "inventory": {
                     "items": [
                         {
+                            "database_id": item.id,
                             "name": item.name,
                             "category": item.category,
                             "quantity": item.quantity,
@@ -482,6 +499,7 @@ class AiContextBuilder:
                 "item_catalog": {
                     "items": [
                         {
+                            "database_id": item.id,
                             "name": item.name,
                             "category": item.category,
                             "description": _compact_text(item.description),
@@ -506,7 +524,8 @@ class AiContextBuilder:
                         "Player Character is carrying it. "
                             "Use item_catalog to remember descriptions, categories, "
                             "values, and ASCII art for previously seen items. Each item also "
-                            "has metadata.item_uuid, a stable internal identity; "
+                            "has database_id, a globally unique database identity, and "
+                            "metadata.item_uuid, a stable item identity; "
                             "reuse it for the same item and do not split one item "
                             "into duplicate definitions because of name variations."
                         ),
@@ -595,7 +614,8 @@ class AiContextBuilder:
                               "location, uses, rarity, notes, and value_base_units as "
                               "player-known structured fields. location lists generalized "
                               "environments or source areas such as Forests or Caves, not "
-                              "a specific Travel-tab place. notes explicitly states rarity, "
+                              "a specific Travel-tab place. notes ends with exactly one "
+                              "rarity sentence, "
                               "and Rare or Very Rare items should be priced materially above "
                               "comparable Common items unless world context says otherwise. "
                             "The uses list describes generalized symptoms or effects, "
@@ -615,6 +635,10 @@ class AiContextBuilder:
                             "metadata.item_uuid, using the name only for display. Never use "
                             "vague units such as pinch or handful. Recipes also carry "
                             "value_base_units as the current or estimated result value. "
+                            "Recipe notes must be self-contained: state the intended "
+                            "purpose/effect, expected strength or outcome, onset, "
+                            "duration, and important use conditions; say unknown or "
+                            "not applicable when a detail is not established. "
                             "state.alchemy.known_reagents stores crafting knowledge, "
                             "but item_catalog categories decide whether an item can "
                             "be chosen as a recipe ingredient."
@@ -759,6 +783,12 @@ class AiContextBuilder:
                         or ""
                     ),
                     "valid_music_tracks": clean_music_tracks,
+                    "current_sound_effect": str(
+                        current_sound_effect
+                        or state.settings.values.get("audio.current_sound_effect", "")
+                        or ""
+                    ),
+                    "valid_sound_effect_tracks": clean_sound_effect_tracks,
                     "rules": {
                         "music_change_rule": (
                             "When scene mood, location, danger level, or environment "
@@ -769,6 +799,14 @@ class AiContextBuilder:
                             "MusicChangedEvent.filename must exactly match one entry "
                             "from valid_music_tracks. If valid_music_tracks is empty, "
                             "do not suggest MusicChangedEvent."
+                        ),
+                        "sound_effect_rule": (
+                            "SoundEffectChangedEvent controls one independent looping "
+                            "ambient/effect channel and may be used at the same time as "
+                            "MusicChangedEvent. Use it for persistent scene sounds such "
+                            "as rain, wind, crowds, machinery, or fire. Its filename "
+                            "must exactly match valid_sound_effect_tracks; use STOP to "
+                            "end the current effect when it no longer fits."
                         ),
                     },
                 },
@@ -866,7 +904,10 @@ class AiContextBuilder:
                     "end-of-turn prompt; the Python application displays that "
                     "separately based on narration tense and style. Resolve the player's "
                     "submitted action instead of ending by restating the action, "
-                    "intent, or search target. Do not invent player-character "
+                    "intent, or search target. When the player asks an NPC to answer, "
+                    "explain, reply, or tell their story, include the information that "
+                    "NPC can presently provide instead of stopping before the reply. "
+                    "Do not invent player-character "
                     "dialogue or decisions. Light Markdown is allowed for readable "
                     "player-facing prose: italics for inner thoughts, sensory "
                     "impressions, emphasis, or self-reflection; bold for important "
@@ -898,9 +939,12 @@ class AiContextBuilder:
                     "StatusUpdatedEvent. Its payload must always include all three "
                     "required fields: location, minutes_passed, and weather. Use "
                     "location='AUTO' when the player remains in the current "
-                    "location, weather='AUTO' when unchanged, and minutes_passed "
+                    "location, weather='AUTO' only when the narration preserves the "
+                    "current weather, and minutes_passed "
                     "='AUTO' or 0 when appropriate. Never send a partial status "
-                    "payload containing only minutes_passed."
+                    "payload containing only minutes_passed. If narration introduces "
+                    "rain, snow, fog, or any other different current weather, set "
+                    "weather to that actual condition instead of AUTO or the old value."
                 ),
                 "skill_checks": (
                     "Suggest SkillCheckRequestedEvent with skill_name and either dc "
@@ -925,9 +969,11 @@ class AiContextBuilder:
                     "new date labels."
                 ),
                 "character_profile": (
-                    "Use state.player.name, appearance, backstory, and notes as "
+                    "Use state.player.name, name_pronunciation, appearance, backstory, and notes as "
                     "player-authored character context. Treat it as true for the "
-                    "player character, but do not let NPCs know private profile "
+                    "player character. If name_pronunciation is non-empty, preserve it "
+                    "as the authoritative phonetic spelling for TTS and do not expose "
+                    "it in player-facing prose. Do not let NPCs know private profile "
                     "details unless they have observed them, been told, or have a "
                     "clear in-world reason to know."
                 ),
@@ -992,6 +1038,7 @@ class AiContextBuilder:
                 "background_music": (
                     "When StatusUpdatedEvent.location changes to a substantially different environment type, compare state.audio.current_music to state.audio.valid_music_tracks."
                     "If a listed track clearly better matches the new environment or mood, include MusicChangedEvent before the final StatusUpdatedEvent."
+                    " Independently compare state.audio.current_sound_effect to state.audio.valid_sound_effect_tracks. Use SoundEffectChangedEvent for fitting persistent ambience such as rain, wind, crowds, machinery, or fire, even while music continues; use filename STOP when the current ambience should end."
                 ),
                 "creative_ideas": (
                     "Treat creative_ideas as the preferred source of style seeds "
@@ -1095,6 +1142,7 @@ class AiContextBuilder:
                     "CurrencyChangedEvent",
                     "CurrencyDefinedEvent",
                     "MusicChangedEvent",
+                    "SoundEffectChangedEvent",
                     "FlagSetEvent",
                     "LocationUpsertedEvent",
                     "TravelModeChangedEvent",

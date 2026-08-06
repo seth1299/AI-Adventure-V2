@@ -1026,6 +1026,35 @@ class EventApplierTests(unittest.TestCase):
                 "Town Village City.mp3",
             )
 
+    def test_applies_and_stops_independent_sound_effect_event(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = SaveRepository.create_new_save(Path(temp_dir), "Effects Test")
+            applier = EventApplier(repository)
+
+            started = applier.apply_event(
+                {
+                    "type": "SoundEffectChangedEvent",
+                    "payload": {"filename": "Steady Rain.wav"},
+                }
+            )
+            self.assertEqual(started.status, "applied")
+            self.assertEqual(
+                repository.get_setting("audio.current_sound_effect"),
+                "Steady Rain.wav",
+            )
+
+            stopped = applier.apply_event(
+                {
+                    "type": "SoundEffectChangedEvent",
+                    "payload": {"filename": "STOP"},
+                }
+            )
+            self.assertEqual(stopped.status, "applied")
+            self.assertEqual(
+                repository.get_setting("audio.current_sound_effect"),
+                "",
+            )
+
     def test_normalizes_event_type_alias_from_new_game_events(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             repository = SaveRepository.create_new_save(Path(temp_dir), "Alias Test")

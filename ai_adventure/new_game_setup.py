@@ -10,6 +10,10 @@ from ai_adventure.calendar_system import (
     normalize_calendar_settings,
 )
 from ai_adventure.audio.tts_settings import normalize_tts_audio_fields
+from ai_adventure.audio.pronunciation import (
+    merge_pronunciation_maps,
+    normalize_pronunciation_map,
+)
 from ai_adventure.context.creative_ideas import CreativeIdeasLibrary
 from ai_adventure.context.naming import GENERIC_PROPER_NOUN_PLACEHOLDER_RULE
 from ai_adventure.currency import (
@@ -84,6 +88,10 @@ GREGORIAN_CALENDAR_SETTINGS: dict[str, Any] = {
     ],
     "time_display": "12_hour",
 }
+GREGORIAN_WEEKDAY_NAMES = frozenset(
+    str(name).strip().casefold()
+    for name in GREGORIAN_CALENDAR_SETTINGS["day_names"]
+)
 AI_GENERATED_CALENDAR_FALLBACK_SETTINGS: dict[str, Any] = {
     "days_per_week": 8,
     "weeks_per_month": 5,
@@ -206,6 +214,7 @@ def normalize_new_game_setup(raw_setup: Any) -> dict[str, Any]:
         character = {}
 
     start_location = _clean_text(raw_setup.get("start_location"))
+    opening_scene_request = _clean_text(raw_setup.get("opening_scene_request"))
     specified_genre = _clean_text(
         raw_setup.get("specified_genre", raw_setup.get("genre"))
     )
@@ -229,7 +238,23 @@ def normalize_new_game_setup(raw_setup: Any) -> dict[str, Any]:
         )
     )
     calendar_settings = _calendar_from_setup(raw_setup.get("calendar", {}))
+    starting_calendar = _starting_calendar_from_setup(
+        raw_setup.get("starting_calendar", {})
+    )
     audio_settings = _audio_from_setup(raw_setup.get("audio", {}))
+    raw_character_name_pronunciation = _clean_text(
+        character.get("name_pronunciation")
+    )
+    pronunciation_map = normalize_pronunciation_map(
+        raw_setup.get("pronunciation_map", {})
+    )
+    if raw_character_name_pronunciation and character.get("name"):
+        pronunciation_map = merge_pronunciation_maps(
+            {
+                str(character["name"]).strip(): raw_character_name_pronunciation
+            },
+            pronunciation_map,
+        )
     narration_preferences = normalize_narration_preferences(
         raw_setup.get("narration", {})
     )
@@ -262,6 +287,7 @@ def normalize_new_game_setup(raw_setup: Any) -> dict[str, Any]:
         "title": _clean_text(raw_setup.get("title")) or "New Adventure",
         "character": {
             "name": _clean_text(character.get("name")) or "Player Name",
+            "name_pronunciation": raw_character_name_pronunciation,
             "appearance": _clean_text(character.get("appearance")),
             "backstory": _clean_text(character.get("backstory")),
             "notes": _clean_text(character.get("notes")),
@@ -275,7 +301,9 @@ def normalize_new_game_setup(raw_setup: Any) -> dict[str, Any]:
         "starting_locations": starting_locations,
         "starting_task": starting_task,
         "calendar": calendar_settings,
+        "starting_calendar": starting_calendar,
         "audio": audio_settings,
+        "pronunciation_map": pronunciation_map,
         "narration": narration_preferences,
         "ai_settings": {
             "model_intelligence": ai_mode_preferences["model_intelligence"],
@@ -294,6 +322,7 @@ def normalize_new_game_setup(raw_setup: Any) -> dict[str, Any]:
         "game_style": game_style,
         "start_location": start_location,
         "start_location_mode": start_location_mode,
+        "opening_scene_request": opening_scene_request,
         "world_context": world_context,
         "ai_additional_context": _build_ai_additional_context(
             specified_genre=specified_genre,
@@ -313,6 +342,12 @@ def _audio_from_setup(raw_audio: Any) -> dict[str, Any]:
     return {
         "music_enabled": _safe_bool(raw_audio.get("music_enabled"), True),
         "music_volume": _clamped_int(raw_audio.get("music_volume"), 25, 0, 100),
+        "sound_effects_enabled": _safe_bool(
+            raw_audio.get("sound_effects_enabled"), True
+        ),
+        "sound_effects_volume": _clamped_int(
+            raw_audio.get("sound_effects_volume"), 35, 0, 100
+        ),
         **normalize_tts_audio_fields(raw_audio),
     }
 
@@ -385,6 +420,7 @@ def build_new_game_setup_packet(
     setup: dict[str, Any],
     *,
     valid_music_tracks: list[str] | None = None,
+    valid_sound_effect_tracks: list[str] | None = None,
 ) -> dict[str, Any]:
     """Builds a compact AI-facing setup packet for world synthesis."""
 
@@ -396,9 +432,17 @@ def build_new_game_setup_packet(
             "calendar_type": "ai_generated",
             "ai_generated": True,
         }
+        guidance = clean_setup["calendar"].get("generation_guidance", "")
+        if guidance:
+            packet_setup["calendar"]["generation_guidance"] = guidance
     clean_music_tracks = [
         str(track).strip()
         for track in (valid_music_tracks or [])
+        if str(track).strip()
+    ]
+    clean_sound_effect_tracks = [
+        str(track).strip()
+        for track in (valid_sound_effect_tracks or [])
         if str(track).strip()
     ]
     creative_ideas = CreativeIdeasLibrary.load_default().select_for_new_game()
@@ -426,7 +470,13 @@ def build_new_game_setup_packet(
                 "starting location. Use setup.narration.tense_label and "
                 "setup.narration.style_label for the prose. Light Markdown is "
                 "allowed for italics, bold important names, and readable lists. "
-                "End with the prompt in setup.turn_prompt."
+                "If setup.opening_scene_request is non-empty, use it as player-"
+                "authored creative direction for the situation, mood, event, or "
+                "hook at that starting location. Honor its intent when coherent, "
+                "but turn it into finalized in-world narration rather than copying "
+                "the request or exposing meta-instructions. Keep the result "
+                "consistent with the finalized start_location, character, world, "
+                "and player knowledge. End with the prompt in setup.turn_prompt."
             ),
             "start_location": (
                 "setup.start_location_mode controls how to treat the requested "
@@ -470,8 +520,17 @@ def build_new_game_setup_packet(
                 "for the new world using clear day names, month names, seasons, "
                 "season weather hints, and time_display. The calendar should fit "
                 "the selected genre, world culture, climate, and playstyle. Do "
-                "not copy the default Gregorian calendar, weekday names, January-"
-                "through-December month names, generic Month 1/Month 2 style "
+                "your best to honor setup.calendar.generation_guidance when it is "
+                "non-empty: treat requested month names, season names, starting "
+                "day/season, or other calendar details as player requirements, "
+                "while filling in unspecified details coherently. "
+                "When setup.starting_calendar is non-empty, honor its explicit "
+                "season_name and day_of_month in the returned starting_calendar "
+                "for every calendar type. "
+                "Do not copy the default Gregorian calendar. Never use Monday, "
+                "Tuesday, Wednesday, Thursday, Friday, Saturday, or Sunday as any "
+                "day name. Do not use January-through-December month names, generic "
+                "Month 1/Month 2 style "
                 "placeholder names, or generic fantasy/artisan defaults when AI "
                 "generation is requested. For futuristic, space, cyberpunk, or "
                 "science-fiction settings, use calendar names that fit that "
@@ -531,6 +590,13 @@ def build_new_game_setup_packet(
                 "If valid background music tracks are available, suggest one "
                 "MusicChangedEvent for the opening scene. The filename must exactly "
                 "match one entry from audio.valid_music_tracks."
+            ),
+            "starting_sound_effect": (
+                "If a looping ambient sound would strengthen the opening scene and "
+                "valid sound-effect tracks are available, suggest one "
+                "SoundEffectChangedEvent. Its filename must exactly match one entry "
+                "from audio.valid_sound_effect_tracks. This plays independently and "
+                "may be used alongside MusicChangedEvent."
             ),
             "ai_invention_policy": (
                 "Default, placeholder, or blank fields are not confirmed world facts. "
@@ -649,7 +715,8 @@ def build_new_game_setup_packet(
                 "list of generalized environments or source areas such as Forests, "
                 "Caves, Wetlands, Workshops, or Urban Scrap, never a specific named "
                 "Travel-tab location. Include rarity as Common, Uncommon, Rare, or "
-                "Very Rare; notes must explicitly state that rarity. Include "
+                "Very Rare; notes must end with exactly one sentence in the form "
+                "Rarity: <rarity>. after any other player-known notes. Include "
                 "value_base_units as a reasonable per-unit price in the baseline "
                 "currency. Rare and Very Rare items must be materially more expensive "
                 "than comparable Common items unless the setting explicitly provides "
@@ -662,6 +729,9 @@ def build_new_game_setup_packet(
                 "total amount consumed per crafted result. Do not use vague "
                 "units such as pinch or handful. Categorize vials, bottles, jars, "
                 "and similar vessels as Container. Each recipe must include "
+                "self-contained notes stating its intended purpose/effect, expected "
+                "strength or outcome, onset, duration, and important use conditions; "
+                "say unknown or not applicable when a detail is not established. "
                 "value_base_units as a reasonable estimated result value in the "
                 "world's baseline currency unit."
             ),
@@ -780,12 +850,11 @@ def build_new_game_setup_packet(
                 "generic training-data fantasy defaults. The banned_terms list is "
                 "a hard exclusion list, not optional style guidance: never use any "
                 "term listed in creative_ideas.banned_terms, nor obvious spelling, "
-                "hyphenation, or reskin variants, for newly generated player "
-                "characters, NPCs, locations, factions, religions, taverns, regions, "
-                "items, skills, calendar names, event payload names, or similar "
-                "proper nouns. Before returning JSON, scan every string key and "
-                "value and replace any newly invented banned term with a fresh "
-                "non-banned name. "
+                "hyphenation, or reskin variants, for newly generated NPC or location "
+                "names or references to those names in other returned fields. Calendar "
+                "settings are exempt and follow the separate calendar-generation rules. "
+                "Before returning JSON, replace any banned NPC or location name with a "
+                "fresh non-banned name. "
                 f"{GENERIC_PROPER_NOUN_PLACEHOLDER_RULE}"
             ),
         },
@@ -825,6 +894,8 @@ def build_new_game_setup_packet(
         "audio": {
             "valid_music_tracks": clean_music_tracks,
             "current_music": "",
+            "valid_sound_effect_tracks": clean_sound_effect_tracks,
+            "current_sound_effect": "",
         },
         "creative_ideas": creative_ideas,
     }
@@ -1570,7 +1641,31 @@ def _calendar_from_setup(raw_calendar: Any) -> dict[str, Any]:
     clean_settings = normalize_calendar_settings(settings)
     clean_settings["calendar_type"] = str(settings.get("calendar_type", "custom"))
     clean_settings["ai_generated"] = bool(settings.get("ai_generated", False))
+    if clean_settings["ai_generated"]:
+        generation_guidance = _clean_text(
+            raw_calendar.get("generation_guidance", "")
+        )[:2000]
+        if generation_guidance:
+            clean_settings["generation_guidance"] = generation_guidance
     return clean_settings
+
+
+def _starting_calendar_from_setup(raw_starting_calendar: Any) -> dict[str, Any]:
+    """Normalizes player-requested starting calendar hints."""
+
+    if not isinstance(raw_starting_calendar, dict):
+        return {}
+
+    starting_calendar: dict[str, Any] = {}
+    season_name = _clean_text(raw_starting_calendar.get("season_name"))[:120]
+    if season_name:
+        starting_calendar["season_name"] = season_name
+
+    day_of_month = _safe_int(raw_starting_calendar.get("day_of_month"), 0)
+    if day_of_month > 0:
+        starting_calendar["day_of_month"] = min(366, day_of_month)
+
+    return starting_calendar
 
 
 def calendar_looks_like_default_gregorian(raw_calendar: Any) -> bool:
@@ -1609,6 +1704,22 @@ def calendar_looks_like_default_gregorian(raw_calendar: Any) -> bool:
     )
 
 
+def calendar_uses_gregorian_weekday_names(raw_calendar: Any) -> bool:
+    """Returns True when any standard Gregorian weekday leaked into a calendar."""
+
+    if not isinstance(raw_calendar, dict):
+        return False
+
+    raw_day_names = raw_calendar.get("day_names", [])
+    if not isinstance(raw_day_names, list):
+        return False
+
+    return any(
+        str(day_name).strip().casefold() in GREGORIAN_WEEKDAY_NAMES
+        for day_name in raw_day_names
+    )
+
+
 def ai_generated_calendar_settings_or_fallback(
     raw_calendar: Any,
     *,
@@ -1618,12 +1729,16 @@ def ai_generated_calendar_settings_or_fallback(
 
     fallback = _ai_generated_calendar_fallback_for_genre(genre_hint)
 
-    if calendar_looks_like_default_gregorian(raw_calendar):
+    if calendar_looks_like_default_gregorian(
+        raw_calendar
+    ) or calendar_uses_gregorian_weekday_names(raw_calendar):
         return _copy_calendar_settings(fallback)
 
     clean_calendar = normalize_calendar_settings(raw_calendar)
 
-    if calendar_looks_like_default_gregorian(clean_calendar):
+    if calendar_looks_like_default_gregorian(
+        clean_calendar
+    ) or calendar_uses_gregorian_weekday_names(clean_calendar):
         return _copy_calendar_settings(fallback)
 
     if (

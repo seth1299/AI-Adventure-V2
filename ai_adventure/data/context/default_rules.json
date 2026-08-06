@@ -172,6 +172,7 @@
           "Follow state.player_ai_preferences.response_length_instruction and any output-token cap defined by that mode. Within the selected mode, scale response length to the importance, risk, and consequences of the action.",
           "Do not include \"What do you do now?\" or any tense/person-specific end-of-turn prompt in the response field; the application displays that separately based on the selected narration tense and style.",
           "Resolve the player's submitted action instead of ending by restating the action, intent, or search target.",
+          "When the player asks an NPC to answer, explain, reply, or tell their story, include the information that NPC can presently provide instead of stopping before the reply.",
           "For live_game turns, include 3-4 suggested_actions as separate strings. For out_of_game, use an empty array.",
           "Use events for state changes instead of embedding commands in narration."
         ],
@@ -263,12 +264,12 @@
         "rules": [
           "Every in-game response must include in structured event data exactly one StatusUpdatedEvent event.",
           "This must be the final structured event in an in-game response.",
-          "The StatusUpdatedEvent payload must always include all three required fields: location, minutes_passed, and weather. Never emit a partial payload with only one or two of these fields. Use `AUTO` for location when the player remains in the current location, `AUTO` for weather when it is unchanged, and `AUTO` or 0 for minutes_passed when appropriate.",
+          "The StatusUpdatedEvent payload must always include all three required fields: location, minutes_passed, and weather. Never emit a partial payload with only one or two of these fields. Use `AUTO` for location when the player remains in the current location, `AUTO` for weather only when the narration preserves the current weather, and `AUTO` or 0 for minutes_passed when appropriate.",
           "`Location` is the player's current or new location. Use `AUTO` for `Location` if the player remains in the same location.",
           "`Location` must be a short, broad place name such as a room, building, street, district, ship, campsite, or landmark. Do not include scenic clauses, exact position, floor, view, weather, or nearby landmark details in `Location`; put those details in visible narration instead. Example: use \"Y/N's Office\", not \"Y/N's Office, high up near the penthouse, overlooking the Hudson River\".",
           "Set `discover_location` to true only when the player has actually reached a newly discovered location that should be added to the Travel tab. Otherwise omit it or use false.",
           "`MinutesPassed` must be an integer number of minutes or `AUTO`. Use `0` if no meaningful time passed. Use `AUTO` if the engine should keep time unchanged.",
-          "`Weather` is the current weather at the player's location. Use `AUTO` for `Weather` if the weather does not change.",
+          "`Weather` is the current weather at the player's location. Use `AUTO` for `Weather` only if the narration keeps the current weather unchanged. If visible narration introduces rain, snow, fog, or any other different current weather, set `Weather` to that actual condition instead of `AUTO` or the prior value.",
           "Use the provided calendar settings and current calendar snapshot for date, day, month, season, and time labels.",
           "Do not invent new date labels in event payloads. Advance time only with `minutes_passed`; the Python application derives the displayed calendar date.",
           "Use each season's weather hint as the real-world analogue for weather, temperature, plants, and daylight tone.",
@@ -654,7 +655,7 @@
           "Ingredients must be structured objects with reagent_name, quantity, measure_amount, and measure_unit.",
           "Use reagent_name values that match state.item_catalog.items and preserve metadata.item_uuid. measure_unit must equal the matching inventory item's quantity_unit; quantity times measure_amount is the total amount consumed per crafted result. Only choose Material, Ingredient, Reagent, Crafting Item, or Container items. If the result needs a bottle, vial, jar, flask, pouch, or similar vessel, consume one suitable Container item per finished product. Liquids such as water require a concrete volume unit such as mL, L, tsp, tbsp, or cups and must not use each.",
           "Use finite measurement units such as each, mL, L, drops, tsp, tbsp, cups, grams, kg, oz, or lbs. Never use vague amounts such as pinch or handful.",
-          "value_base_units is the recipe result's current or reasonably estimated value in the world's baseline currency unit.",
+          "Recipe notes must be self-contained rather than relying on the recipe name or result text: state the intended purpose/effect, expected strength or outcome, onset, duration, and important use conditions. Say unknown or not applicable when a detail is not established. value_base_units is the recipe result's current or reasonably estimated value in the world's baseline currency unit.",
           "Do not use this to craft the item by itself. Crafting still requires InventoryItemRemovedEvent for ingredients and InventoryItemAddedEvent for the result."
         ]
       }
@@ -691,7 +692,7 @@
           "`Description` should briefly explain what the item or material is.",
           "`Location` means generalized environments or source areas, not an explicit existing map location. Use concise comma-separated categories such as Forests, Caves, Wetlands, Grasslands, Coastal Waters, Workshops, Farms, or Urban Scrap. Never put a specific Travel-tab location name here.",
           "`Uses` must be an array of short generalized symptoms or effects the item may address, such as sleep aid, pain relief, nausea relief, or wound care; do not use detailed recipes or procedures.",
-          "`rarity` must be Common, Uncommon, Rare, or Very Rare. `notes` must explicitly contain `Rarity: <rarity>.` followed by any other useful player-known notes.",
+          "`rarity` must be Common, Uncommon, Rare, or Very Rare. `notes` must place exactly one `Rarity: <rarity>.` sentence at the end, after any other useful player-known notes.",
           "`value_base_units` is the reasonable per-unit price in the world's baseline currency. Price against the supplied economy and comparable goods. Rare and Very Rare items must be materially more expensive than comparable Common items unless the setting explicitly establishes a reason otherwise.",
           "category must be Material, Ingredient, Reagent, Crafting Item, or Container. Use Container for vials, bottles, jars, and similar vessels.",
           "ReagentDiscoveredEvent records crafting knowledge and preserves that category for recipe ingredient selection. If the player physically collects, harvests, picks up, or stores the item/material, also suggest InventoryItemAddedEvent for the same item/material.",
@@ -938,6 +939,31 @@
           "Valid sound file names are listed in state.audio.valid_music_tracks.",
           "Do not invent filenames.",
           "Do not overuse this event for every minor action, however, do check and make sure that the currently playing music is appropriate for the location and the mood, even if the \"Location\" didn't actually change from one action to another. For example, if an ally suddenly turns traitor, you can start a fight song track, even if the Player is still in a \"Forest\" location."
+        ]
+      }
+    },
+    {
+      "id": "event.sound_effect",
+      "title": "SoundEffectChangedEvent Contract",
+      "category": "event_contract",
+      "tags": [
+        "events",
+        "music",
+        "scene"
+      ],
+      "priority": 70,
+      "content": {
+        "event_type": "SoundEffectChangedEvent",
+        "payload_fields": [
+          "filename"
+        ],
+        "purpose": "Changes one independent looping ambient sound-effect track without interrupting background music or narration.",
+        "rules": [
+          "Use SoundEffectChangedEvent for persistent scene ambience such as rain, wind, crowds, machinery, surf, or fire when a valid matching sound file exists.",
+          "The sound-effect channel is independent from MusicChangedEvent, so suitable music and ambience may play simultaneously.",
+          "The filename must exactly match one entry from state.audio.valid_sound_effect_tracks. Do not invent filenames.",
+          "Use filename STOP when the current ambient sound no longer fits and no replacement effect is needed.",
+          "Do not use this looping ambience event for every brief one-time noise mentioned in narration."
         ]
       }
     },

@@ -5,10 +5,79 @@ import unittest
 from pathlib import Path
 
 from ai_adventure.core.state_manager import StateManager
+from ai_adventure.events.event_applier import EventApplier
 from ai_adventure.persistence.save_repository import SaveRepository
 
 
 class StateManagerTests(unittest.TestCase):
+    def test_message_snapshot_rolls_back_state_and_associated_history(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = SaveRepository.create_new_save(Path(temp_dir), "Rollback Test")
+            player_message_id = repository.create_message_id()
+            response_message_id = repository.create_message_id()
+            repository.append_history(
+                "player",
+                "Search the workbench.",
+                message_id=player_message_id,
+            )
+            repository.capture_message_snapshot(response_message_id)
+
+            EventApplier(
+                repository,
+                message_id=response_message_id,
+            ).apply_events(
+                [
+                    {
+                        "type": "InventoryItemAddedEvent",
+                        "payload": {
+                            "item_name": "Recovered Key",
+                            "item_type": "Tool",
+                            "description": "A small brass key.",
+                            "amount": 1,
+                            "quantity_unit": "each",
+                        },
+                    }
+                ]
+            )
+            repository.append_history(
+                "story",
+                "You find a key.",
+                message_id=response_message_id,
+            )
+
+            self.assertTrue(repository.rollback_message(response_message_id))
+            self.assertNotIn(
+                "Recovered Key",
+                {item["name"] for item in repository.list_inventory_items()},
+            )
+            history = repository.list_history()
+            self.assertIn("Search the workbench.", [entry["content"] for entry in history])
+            self.assertNotIn("You find a key.", [entry["content"] for entry in history])
+            self.assertFalse(repository.has_message_snapshot(response_message_id))
+            self.assertTrue(
+                all(
+                    event["message_id"] != response_message_id
+                    for event in repository.list_mechanical_events()
+                )
+            )
+
+    def test_history_and_mechanical_events_have_message_ids(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = SaveRepository.create_new_save(Path(temp_dir), "Message ID Test")
+            message_id = repository.append_history("player", "Look around.")
+            repository.append_mechanical_event(
+                "TestEvent",
+                {},
+                "skipped",
+                "Test result.",
+                message_id=message_id,
+            )
+
+            history_entry = repository.list_history()[-1]
+            mechanical_event = repository.list_mechanical_events()[-1]
+            self.assertEqual(history_entry["message_id"], message_id)
+            self.assertEqual(mechanical_event["message_id"], message_id)
+
     def test_new_game_defaults_are_debug_friendly(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             repository = SaveRepository.create_new_save(Path(temp_dir), "Test Adventure")

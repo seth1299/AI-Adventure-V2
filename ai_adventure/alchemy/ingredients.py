@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from typing import Any
 
 
@@ -33,6 +34,11 @@ CRAFTING_ITEM_RARITIES: tuple[str, ...] = (
     "Very Rare",
 )
 
+_CRAFTING_ITEM_RARITY_NOTE_RE = re.compile(
+    r"\brarity\s*:\s*(?:very\s+rare|uncommon|common|rare)\s*\.?\s*",
+    flags=re.IGNORECASE,
+)
+
 
 def normalize_crafting_item_rarity(value: Any) -> str:
     """Returns the canonical crafting-item rarity label."""
@@ -42,6 +48,22 @@ def normalize_crafting_item_rarity(value: Any) -> str:
         if clean_value == rarity.casefold():
             return rarity
     return "Common"
+
+
+def normalize_crafting_item_notes(notes: Any, rarity: Any) -> str:
+    """Returns notes with exactly one rarity sentence at the end.
+
+    Rarity is stored separately, but older/model-generated notes can also include
+    it in the prose. Removing every labeled occurrence before appending the
+    canonical suffix keeps the Crafting table readable and prevents duplicates.
+    """
+
+    clean_rarity = normalize_crafting_item_rarity(rarity)
+    clean_notes = _CRAFTING_ITEM_RARITY_NOTE_RE.sub("", str(notes or "")).strip()
+    clean_notes = re.sub(r"\s+", " ", clean_notes)
+    clean_notes = re.sub(r"\s+([,.;:!?])", r"\1", clean_notes).strip()
+    rarity_note = f"Rarity: {clean_rarity}."
+    return f"{clean_notes} {rarity_note}" if clean_notes else rarity_note
 
 
 def is_crafting_ingredient_category(value: Any) -> bool:

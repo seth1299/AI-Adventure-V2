@@ -88,6 +88,7 @@ class EventApplier:
         self,
         repository: SaveRepository,
         rng: RandomNumberGenerator | None = None,
+        message_id: str | None = None,
     ) -> None:
         """
         Args:
@@ -97,6 +98,7 @@ class EventApplier:
 
         self.repository = repository
         self.rng = rng or random.Random()
+        self.message_id = str(message_id or "").strip() or None
 
     def apply_events(
         self,
@@ -115,6 +117,17 @@ class EventApplier:
         Returns:
             Application results for every attempted event.
         """
+
+        with self.repository.message_context(self.message_id):
+            return self._apply_events(raw_events, prior_results=prior_results)
+
+    def _apply_events(
+        self,
+        raw_events: list[dict[str, Any]],
+        *,
+        prior_results: list[AppliedEventResult] | None = None,
+    ) -> list[AppliedEventResult]:
+        """Applies events inside the message-associated repository scope."""
 
         results: list[AppliedEventResult] = []
         blocking_failure = _blocking_skill_check_failure(prior_results or [])
@@ -275,6 +288,9 @@ class EventApplier:
 
             if event_type == "MusicChangedEvent":
                 return self._apply_music_changed(event_type, payload)
+
+            if event_type == "SoundEffectChangedEvent":
+                return self._apply_sound_effect_changed(event_type, payload)
 
             message = f"Unsupported event type: {event_type}"
             LOGGER.warning(message)
@@ -1212,6 +1228,34 @@ class EventApplier:
             f"Changed background music to: {filename}.",
             payload,
         )
+
+    def _apply_sound_effect_changed(
+        self,
+        event_type: str,
+        payload: dict[str, Any],
+    ) -> AppliedEventResult:
+        """Applies SoundEffectChangedEvent to the independent ambient channel."""
+
+        filename = _first_text(
+            payload,
+            "filename",
+            "file_name",
+            "track",
+            "track_name",
+            "sound_effect",
+            "ambient_sound",
+        )
+        if not filename:
+            return _invalid(event_type, payload, "Sound-effect filename is required.")
+
+        if filename.upper() in {"STOP", "NONE", "OFF", "SILENCE"}:
+            self.repository.set_setting("audio.current_sound_effect", "")
+            message = "Stopped the ambient sound effect."
+        else:
+            self.repository.set_setting("audio.current_sound_effect", filename)
+            message = f"Changed ambient sound effect to: {filename}."
+
+        return AppliedEventResult(event_type, "applied", message, payload)
 
     def _apply_recipe_discovered(
         self,
@@ -2234,8 +2278,8 @@ def _active_task_due_fields(
     resolved_elapsed = _resolve_due_text_to_elapsed_minutes(
         repository,
         clean_due_date,
-        payload,
-    )
+            payload,
+        )
 
     if resolved_elapsed is None:
         return {"due_date": clean_due_date, "due_elapsed_minutes": None}

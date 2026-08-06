@@ -76,6 +76,10 @@ class ContextBuilderTests(unittest.TestCase):
             "Never infer or override the mode from wording",
             packet["response_contract"]["conversation_mode"],
         )
+        self.assertIn(
+            "If narration introduces rain, snow, fog",
+            packet["response_contract"]["status_event"],
+        )
 
     def test_default_library_loads(self) -> None:
         library = ContextReferenceLoader().load_default_library()
@@ -250,6 +254,8 @@ class ContextBuilderTests(unittest.TestCase):
             ],
             valid_music_tracks=["Town Village City.mp3", "Boss_Fight.mp3"],
             current_music="Town Village City.mp3",
+            valid_sound_effect_tracks=["Steady Rain.wav", "Crowd Ambience.ogg"],
+            current_sound_effect="Steady Rain.wav",
             resolved_skill_checks=[
                 {
                     "skill_name": "Foraging",
@@ -383,6 +389,18 @@ class ContextBuilderTests(unittest.TestCase):
             "Town Village City.mp3",
         )
         self.assertEqual(packet["state"]["audio"]["current_music"], "Town Village City.mp3")
+        self.assertEqual(
+            packet["state"]["audio"]["current_sound_effect"],
+            "Steady Rain.wav",
+        )
+        self.assertIn(
+            "SoundEffectChangedEvent",
+            packet["response_contract"]["known_event_types"],
+        )
+        self.assertIn(
+            "independent looping",
+            packet["state"]["audio"]["rules"]["sound_effect_rule"],
+        )
         self.assertEqual(packet["state"]["inventory"]["items"][0]["name"], "Lantern")
         self.assertTrue(packet["state"]["inventory"]["items"][0]["equipped"])
         self.assertEqual(packet["state"]["inventory"]["items"][0]["value_base_units"], 0)
@@ -544,6 +562,10 @@ class ContextBuilderTests(unittest.TestCase):
         )
         self.assertIn(
             "bold for important NPCs",
+            packet["response_contract"]["response"],
+        )
+        self.assertIn(
+            "instead of stopping before the reply",
             packet["response_contract"]["response"],
         )
         self.assertIn(

@@ -17,8 +17,10 @@ DEFAULT_APP_SETTINGS = {
     "theme": "Light",
     "audio": {
         "music_enabled": True,
+        "sound_effects_enabled": True,
         "narrator_enabled": True,
         "music_volume": 25,
+        "sound_effects_volume": 35,
         "tts_volume": 90,
         "tts_voice": DEFAULT_NARRATOR_VOICE,
         "tts_speed": 100,
@@ -109,6 +111,12 @@ def _normalize_audio(raw_audio: Any, *, tts_enabled: bool) -> dict[str, Any]:
     return {
         "music_enabled": _safe_bool(raw_audio.get("music_enabled"), True),
         "music_volume": _clamped_int(raw_audio.get("music_volume"), 25, 0, 100),
+        "sound_effects_enabled": _safe_bool(
+            raw_audio.get("sound_effects_enabled"), True
+        ),
+        "sound_effects_volume": _clamped_int(
+            raw_audio.get("sound_effects_volume"), 35, 0, 100
+        ),
         **normalize_tts_audio_fields(raw_audio, tts_enabled=tts_enabled),
     }
 
