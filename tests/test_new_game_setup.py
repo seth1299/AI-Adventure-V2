@@ -935,6 +935,11 @@ class NewGameSetupTests(unittest.TestCase):
         self.assertIn("preserve that field exactly", packet["requirements"]["character_generation"])
         self.assertIn("light Markdown", packet["requirements"]["world_summary"])
         self.assertIn("Light Markdown", packet["requirements"]["opening_scene"])
+        self.assertIn("pronunciation_map", packet["requirements"])
+        self.assertIn(
+            "Kokoro v1.0-compatible Unicode IPA",
+            packet["requirements"]["pronunciation_map"],
+        )
         self.assertIn("genre_generation", packet["requirements"])
         self.assertIn("Do not default to fantasy", packet["requirements"]["genre_generation"])
         self.assertIn("starting_location", packet["requirements"])
@@ -1011,6 +1016,15 @@ class NewGameSetupTests(unittest.TestCase):
             "cannot be a skill check or search",
             packet["requirements"]["gm_secrets"],
         )
+        self.assertIn("miscellaneous", packet["requirements"])
+        self.assertIn(
+            "original creatures or species",
+            packet["requirements"]["miscellaneous"],
+        )
+        self.assertIn(
+            "Do not duplicate records",
+            packet["requirements"]["miscellaneous"],
+        )
         self.assertIn("item_request", packet["requirements"]["starter_inventory"])
         self.assertIn("at least five", packet["requirements"]["starter_inventory"])
         self.assertIn("has no maximum count", packet["requirements"]["starter_inventory"])
@@ -1076,10 +1090,32 @@ class NewGameSetupTests(unittest.TestCase):
             packet["audio"]["valid_sound_effect_tracks"],
             ["Steady Rain.wav"],
         )
+        self.assertIn(
+            "must never come from audio.valid_music_tracks",
+            packet["requirements"]["starting_sound_effect"],
+        )
+        self.assertIn(
+            "no fixed cue-count target",
+            packet["requirements"]["starting_sound_effect"],
+        )
         self.assertEqual(packet["current_calendar"]["season_hint"], "spring")
         self.assertEqual(packet["current_weather"], "Clear")
         self.assertIn("calendar_weather_consistency", packet["requirements"])
         self.assertIn("calendar_generation", packet["requirements"])
+
+    def test_setup_packet_removes_music_tracks_from_sound_effect_catalog(self) -> None:
+        packet = build_new_game_setup_packet(
+            normalize_new_game_setup({}),
+            valid_music_tracks=["Homey_Cottage.mp3", "Town Village City.mp3"],
+            valid_sound_effect_tracks=["Town Village City.mp3"],
+        )
+
+        self.assertEqual(
+            packet["audio"]["valid_music_tracks"],
+            ["Homey_Cottage.mp3", "Town Village City.mp3"],
+        )
+        self.assertEqual(packet["audio"]["valid_sound_effect_tracks"], [])
+        self.assertNotIn("starting_sound_effect", packet["requirements"])
 
     def test_setup_packet_marks_ai_generated_calendar_for_gemini(self) -> None:
         setup = normalize_new_game_setup({"calendar": {"calendar_type": "ai_generated"}})

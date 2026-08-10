@@ -5,6 +5,8 @@ import zipfile
 from pathlib import Path
 from typing import Any
 
+from ai_adventure.audio.catalog import distinct_audio_track_catalogs
+
 
 LOGGER = logging.getLogger(__name__)
 
@@ -50,13 +52,36 @@ def prepare_sound_directory(app_paths: Any) -> Path:
     return managed_sounds_dir
 
 
-class SoundManager:
-    """Manages independent looping music and ambient sound-effect tracks."""
+def prepare_sound_effect_directory(app_paths: Any) -> Path:
+    """Finds or prepares the distinct one-shot sound-effect directory."""
 
-    def __init__(self, sounds_directory: str | Path) -> None:
+    managed_effects_dir = Path(app_paths.sound_effects_dir)
+    managed_effects_dir.mkdir(parents=True, exist_ok=True)
+    if _contains_audio_files(managed_effects_dir):
+        return managed_effects_dir
+
+    package_effects_dir = Path(app_paths.package_sound_effects_dir)
+    if _contains_audio_files(package_effects_dir):
+        return package_effects_dir
+
+    return managed_effects_dir
+
+
+class SoundManager:
+    """Manages looping music and independent one-shot sound effects."""
+
+    def __init__(
+        self,
+        sounds_directory: str | Path,
+        sound_effects_directory: str | Path | None = None,
+    ) -> None:
         self.sounds_directory = Path(sounds_directory).expanduser()
+        self.sound_effects_directory = (
+            Path(sound_effects_directory).expanduser()
+            if sound_effects_directory is not None
+            else self.sounds_directory / "sound_effects"
+        )
         self.current_music: str | None = None
-        self.current_sound_effect: str | None = None
         self.music_volume: float = 0.25
         self.sound_effects_volume: float = 0.35
         self.music_enabled = True
@@ -64,7 +89,8 @@ class SoundManager:
         self._initialized = False
         self._pygame: Any = None
         self._sound_effect: Any = None
-        self._track_cache: dict[str, Path] = {}
+        self._music_track_cache: dict[str, Path] = {}
+        self._sound_effect_track_cache: dict[str, Path] = {}
 
         self._initialize_audio()
         self.refresh_tracks()
@@ -94,32 +120,38 @@ class SoundManager:
     def refresh_tracks(self) -> None:
         """Refreshes the known playable track cache."""
 
-        self._track_cache.clear()
-
-        try:
-            if not self.sounds_directory.exists() or not self.sounds_directory.is_dir():
-                LOGGER.warning("Sound directory does not exist: %s", self.sounds_directory)
-                return
-
-            for file_path in self.sounds_directory.iterdir():
-                if (
-                    file_path.is_file()
-                    and file_path.suffix.lower() in SUPPORTED_AUDIO_EXTENSIONS
-                ):
-                    self._track_cache[file_path.name.lower()] = file_path
-        except Exception as error:
-            LOGGER.warning("Failed to refresh sound files: %s", error)
+        self._music_track_cache = _audio_file_cache(self.sounds_directory)
+        self._sound_effect_track_cache = _audio_file_cache(
+            self.sound_effects_directory,
+        )
+        music_names, effect_names = distinct_audio_track_catalogs(
+            (path.name for path in self._music_track_cache.values()),
+            (path.name for path in self._sound_effect_track_cache.values()),
+        )
+        music_keys = {name.casefold() for name in music_names}
+        effect_keys = {name.casefold() for name in effect_names}
+        self._music_track_cache = {
+            key: path
+            for key, path in self._music_track_cache.items()
+            if key in music_keys
+        }
+        self._sound_effect_track_cache = {
+            key: path
+            for key, path in self._sound_effect_track_cache.items()
+            if key in effect_keys
+        }
 
     def get_valid_track_names(self) -> list[str]:
         """Returns known playable audio filenames."""
 
         self.refresh_tracks()
-        return sorted(path.name for path in self._track_cache.values())
+        return sorted(path.name for path in self._music_track_cache.values())
 
     def get_valid_sound_effect_names(self) -> list[str]:
-        """Returns audio files that may play on the independent effect channel."""
+        """Returns audio files that may play as one-shot narration cues."""
 
-        return self.get_valid_track_names()
+        self.refresh_tracks()
+        return sorted(path.name for path in self._sound_effect_track_cache.values())
 
     def set_music_enabled(self, enabled: bool) -> None:
         """Enables or disables looping music playback."""
@@ -159,7 +191,10 @@ class SoundManager:
             LOGGER.warning("Cannot play music because the audio backend is unavailable.")
             return
 
-        track_path = self._resolve_track_path(track_name_or_path)
+        track_path = self._resolve_track_path(
+            track_name_or_path,
+            cache=self._music_track_cache,
+        )
         if track_path is None:
             return
 
@@ -186,7 +221,10 @@ class SoundManager:
             LOGGER.warning("Cannot play music preview because the audio backend is unavailable.")
             return
 
-        track_path = self._resolve_track_path(track_name_or_path)
+        track_path = self._resolve_track_path(
+            track_name_or_path,
+            cache=self._music_track_cache,
+        )
         if track_path is None:
             return
 
@@ -201,14 +239,14 @@ class SoundManager:
             LOGGER.warning("Failed to play music preview %s: %s", track_path, error)
 
     def set_sound_effects_enabled(self, enabled: bool) -> None:
-        """Enables or disables looping ambient sound effects."""
+        """Enables or disables one-shot narration sound effects."""
 
         self.sound_effects_enabled = bool(enabled)
         if not self.sound_effects_enabled:
             self.stop_sound_effect(clear_current=False)
 
     def set_sound_effects_volume(self, volume: float | int | None) -> None:
-        """Sets ambient sound-effect volume as either 0.0-1.0 or 0-100."""
+        """Sets one-shot sound-effect volume as either 0.0-1.0 or 0-100."""
 
         parsed_volume = _normalized_volume(volume, label="sound-effect")
         if parsed_volume is None:
@@ -238,7 +276,7 @@ class SoundManager:
             self.current_music = None
 
     def play_sound_effect(self, track_name_or_path: str | Path | None) -> None:
-        """Loops one ambient effect without interrupting background music."""
+        """Plays one short effect once without interrupting music or narration."""
 
         if not self.sound_effects_enabled:
             return
@@ -246,26 +284,26 @@ class SoundManager:
             LOGGER.warning("Cannot play a sound effect because audio is unavailable.")
             return
 
-        track_path = self._resolve_track_path(track_name_or_path, label="Sound effect")
+        track_path = self._resolve_track_path(
+            track_name_or_path,
+            cache=self._sound_effect_track_cache,
+            label="Sound effect",
+        )
         if track_path is None:
             return
 
         try:
             channel = self._pygame.mixer.Channel(SOUND_EFFECT_CHANNEL_INDEX)
-            if self.current_sound_effect == track_path.name and channel.get_busy():
-                return
-
             channel.stop()
             self._sound_effect = self._pygame.mixer.Sound(str(track_path))
             channel.set_volume(self.sound_effects_volume)
-            channel.play(self._sound_effect, loops=-1)
-            self.current_sound_effect = track_path.name
-            LOGGER.info("Playing ambient sound effect: %s", track_path.name)
+            channel.play(self._sound_effect, loops=0)
+            LOGGER.info("Playing one-shot narration sound effect: %s", track_path.name)
         except Exception as error:
             LOGGER.warning("Failed to play sound effect %s: %s", track_path, error)
 
     def stop_sound_effect(self, *, clear_current: bool = True) -> None:
-        """Stops the ambient effect channel without interrupting music."""
+        """Stops the one-shot effect channel without interrupting music."""
 
         if self._initialized and self._pygame is not None:
             try:
@@ -274,13 +312,12 @@ class SoundManager:
                 LOGGER.warning("Failed to stop sound effect: %s", error)
 
         self._sound_effect = None
-        if clear_current:
-            self.current_sound_effect = None
 
     def _resolve_track_path(
         self,
         track_name_or_path: str | Path | None,
         *,
+        cache: dict[str, Path],
         label: str = "Music track",
     ) -> Path | None:
         """Resolves either a filename or direct path to a playable audio file."""
@@ -299,7 +336,7 @@ class SoundManager:
             return raw_path
 
         self.refresh_tracks()
-        cached_path = self._track_cache.get(raw_path.name.lower())
+        cached_path = cache.get(raw_path.name.lower())
 
         if cached_path is None:
             LOGGER.warning("%s not found: %s", label, track_name_or_path)
@@ -332,6 +369,23 @@ def _contains_audio_files(directory: Path) -> bool:
         )
     except OSError:
         return False
+
+
+def _audio_file_cache(directory: Path) -> dict[str, Path]:
+    """Returns supported audio files in one catalog directory."""
+
+    try:
+        if not directory.exists() or not directory.is_dir():
+            return {}
+        return {
+            file_path.name.casefold(): file_path
+            for file_path in directory.iterdir()
+            if file_path.is_file()
+            and file_path.suffix.casefold() in SUPPORTED_AUDIO_EXTENSIONS
+        }
+    except OSError as error:
+        LOGGER.warning("Failed to refresh audio directory %s: %s", directory, error)
+        return {}
 
 
 def _extract_sounds_zip(zip_path: Path, target_directory: Path) -> None:

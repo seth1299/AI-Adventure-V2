@@ -341,6 +341,11 @@ class StateManager:
                     message_id=_read_string(row, "message_id", ""),
                     kind=_read_string(row, "kind", "misc"),
                     content=_read_string(row, "content", ""),
+                    sound_effect_cues=[
+                        cue
+                        for cue in row.get("sound_effect_cues", [])
+                        if isinstance(cue, dict)
+                    ],
                     created_at=_read_string(row, "created_at", ""),
                 )
             )

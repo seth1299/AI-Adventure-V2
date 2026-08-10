@@ -80,6 +80,10 @@ class ContextBuilderTests(unittest.TestCase):
             "If narration introduces rain, snow, fog",
             packet["response_contract"]["status_event"],
         )
+        self.assertIn(
+            "Kokoro v1.0-compatible Unicode IPA",
+            packet["response_contract"]["pronunciation_map"],
+        )
 
     def test_default_library_loads(self) -> None:
         library = ContextReferenceLoader().load_default_library()
@@ -114,6 +118,31 @@ class ContextBuilderTests(unittest.TestCase):
         )
 
         self.assertIn("crafting", packet["selection"]["tags"])
+
+    def test_music_files_are_not_advertised_as_sound_effects(self) -> None:
+        packet = AiContextBuilder(
+            ContextReferenceLoader().load_default_library()
+        ).build_story_context(
+            AdventureState(settings=SettingsState()),
+            player_command="I open the shop for the morning.",
+            valid_music_tracks=["Town Village City.mp3"],
+            valid_sound_effect_tracks=["Town Village City.mp3"],
+        )
+
+        self.assertEqual(packet["state"]["audio"]["valid_sound_effect_tracks"], [])
+        self.assertNotIn("current_sound_effect", packet["state"]["audio"])
+        self.assertNotIn(
+            "SoundEffectChangedEvent",
+            packet["response_contract"]["known_event_types"],
+        )
+        self.assertNotIn(
+            "event.sound_effect",
+            {section["id"] for section in packet["reference_sections"]},
+        )
+        self.assertNotIn(
+            "SoundEffectChangedEvent",
+            packet["response_contract"]["background_music"],
+        )
 
     def test_build_story_context_selects_relevant_sections(self) -> None:
         library = ContextReferenceLoader().load_default_library()
@@ -255,7 +284,6 @@ class ContextBuilderTests(unittest.TestCase):
             valid_music_tracks=["Town Village City.mp3", "Boss_Fight.mp3"],
             current_music="Town Village City.mp3",
             valid_sound_effect_tracks=["Steady Rain.wav", "Crowd Ambience.ogg"],
-            current_sound_effect="Steady Rain.wav",
             resolved_skill_checks=[
                 {
                     "skill_name": "Foraging",
@@ -389,16 +417,21 @@ class ContextBuilderTests(unittest.TestCase):
             "Town Village City.mp3",
         )
         self.assertEqual(packet["state"]["audio"]["current_music"], "Town Village City.mp3")
-        self.assertEqual(
-            packet["state"]["audio"]["current_sound_effect"],
-            "Steady Rain.wav",
-        )
+        self.assertNotIn("current_sound_effect", packet["state"]["audio"])
         self.assertIn(
             "SoundEffectChangedEvent",
             packet["response_contract"]["known_event_types"],
         )
         self.assertIn(
-            "independent looping",
+            "short one-shot narration cue",
+            packet["state"]["audio"]["rules"]["sound_effect_rule"],
+        )
+        self.assertIn(
+            "must never come from valid_music_tracks",
+            packet["state"]["audio"]["rules"]["sound_effect_rule"],
+        )
+        self.assertIn(
+            "no fixed cue-count target",
             packet["state"]["audio"]["rules"]["sound_effect_rule"],
         )
         self.assertEqual(packet["state"]["inventory"]["items"][0]["name"], "Lantern")
@@ -696,6 +729,37 @@ class ContextBuilderTests(unittest.TestCase):
         )
         self.assertLessEqual(len(packet["recent_history"][0]["content"]), 1200)
 
+    def test_miscellaneous_context_is_always_present_and_uncapped(self) -> None:
+        entries = [
+            {
+                "misc_id": f"concept_{index}",
+                "name": f"Concept {index}",
+                "category": "Creature" if index % 2 == 0 else "Custom",
+                "details": f"Complete general canon for concept {index}." + "x" * 1500,
+            }
+            for index in range(75)
+        ]
+        packet = AiContextBuilder.from_default_library().build_story_context(
+            AdventureState(metadata=AdventureMetadata(title="Misc Context")),
+            player_command="Wait quietly.",
+            planner_context_tags=[],
+            miscellaneous=entries,
+        )
+
+        sent_entries = packet["state"]["miscellaneous"]["entries"]
+        self.assertEqual(len(sent_entries), 75)
+        self.assertEqual(sent_entries[-1]["misc_id"], "concept_74")
+        self.assertEqual(sent_entries[0]["details"], entries[0]["details"])
+        self.assertIn("miscellaneous_memory", packet["response_contract"])
+        self.assertIn(
+            "MiscellaneousUpsertedEvent",
+            packet["response_contract"]["known_event_types"],
+        )
+        self.assertIn(
+            "event.miscellaneous_upsert",
+            {section["id"] for section in packet["reference_sections"]},
+        )
+
     def test_creative_ideas_are_omitted_when_not_relevant(self) -> None:
         packet = AiContextBuilder(
             ContextReferenceLoader().load_default_library(),
@@ -777,6 +841,15 @@ class ContextBuilderTests(unittest.TestCase):
         self.assertIn("event.active_task", section_ids)
         self.assertIn("event.upsert_location", section_ids)
         self.assertNotIn("event.upsert_world", section_ids)
+        pronunciation_rules = json.dumps(
+            [
+                section.content
+                for section in library.sections
+                if section.id in {"narration.core_contract", "response.structured_story_turn"}
+            ],
+            ensure_ascii=False,
+        )
+        self.assertIn("Kokoro v1.0-compatible Unicode IPA", pronunciation_rules)
 
 
 if __name__ == "__main__":

@@ -265,6 +265,7 @@ class HistoryEntry:
     message_id: str = ""
     kind: str = "misc"
     content: str = ""
+    sound_effect_cues: list[dict[str, str]] = field(default_factory=list)
     created_at: str = ""
 
     def to_dict(self) -> dict[str, Any]:

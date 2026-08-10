@@ -67,6 +67,8 @@ class NarrationChunk:
 
     display_text: str
     tts_text: str
+    sound_effects_before: tuple[str, ...] = ()
+    sound_effects_after: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -75,6 +77,8 @@ class GeneratedNarrationChunk:
 
     audio_path: Path
     display_text: str
+    sound_effects_before: tuple[str, ...] = ()
+    sound_effects_after: tuple[str, ...] = ()
 
 
 class NarrationPlayer:
@@ -216,7 +220,10 @@ class NarrationPlayer:
         text: str,
         *,
         voice: str | None = None,
+        sound_effect_cues: list[dict[str, str]] | None = None,
+        tts_text_transform: Callable[[str], str] | None = None,
         on_chunk_start: Callable[[str], None] | None = None,
+        on_sound_effect: Callable[[str], None] | None = None,
         on_complete: Callable[[], None] | None = None,
     ) -> bool:
         """Starts narrating text in generated chunks."""
@@ -224,7 +231,11 @@ class NarrationPlayer:
         if not self.enabled or not self.tts_manager.is_available:
             return False
 
-        chunks = build_narration_chunks(text)
+        chunks = build_narration_chunks(
+            text,
+            sound_effect_cues=sound_effect_cues,
+            tts_text_transform=tts_text_transform,
+        )
 
         if not chunks:
             return False
@@ -250,7 +261,13 @@ class NarrationPlayer:
         )
         consumer = threading.Thread(
             target=self._play_chunks,
-            args=(session_id, audio_queue, on_chunk_start, on_complete),
+            args=(
+                session_id,
+                audio_queue,
+                on_chunk_start,
+                on_sound_effect,
+                on_complete,
+            ),
             daemon=True,
         )
         producer.start()
@@ -301,6 +318,8 @@ class NarrationPlayer:
                 queue_item = GeneratedNarrationChunk(
                     audio_path=audio_path,
                     display_text=chunk.display_text,
+                    sound_effects_before=chunk.sound_effects_before,
+                    sound_effects_after=chunk.sound_effects_after,
                 )
 
                 if not self._put_queue_item(session_id, audio_queue, queue_item):
@@ -314,6 +333,7 @@ class NarrationPlayer:
         session_id: int,
         audio_queue: queue.Queue[GeneratedNarrationChunk | None],
         on_chunk_start: Callable[[str], None] | None,
+        on_sound_effect: Callable[[str], None] | None,
         on_complete: Callable[[], None] | None,
     ) -> None:
         """Plays generated chunks in order."""
@@ -330,9 +350,15 @@ class NarrationPlayer:
                 return
 
             try:
+                if on_sound_effect is not None:
+                    for filename in queue_item.sound_effects_before:
+                        on_sound_effect(filename)
                 if on_chunk_start is not None:
                     on_chunk_start(queue_item.display_text)
                 self._play_file_blocking(queue_item.audio_path, session_id)
+                if on_sound_effect is not None:
+                    for filename in queue_item.sound_effects_after:
+                        on_sound_effect(filename)
             finally:
                 _delete_file(queue_item.audio_path)
 
@@ -429,21 +455,131 @@ def build_narration_chunks(
     text: str,
     *,
     max_length: int = MAX_CHUNK_LENGTH,
+    sound_effect_cues: list[dict[str, str]] | None = None,
+    tts_text_transform: Callable[[str], str] | None = None,
 ) -> list[NarrationChunk]:
-    """Builds display/TTS chunk pairs from one story response."""
+    """Builds display/TTS chunks with exact one-shot cue boundaries."""
 
-    display_chunks = chunk_tts_text(
-        sanitize_narration_display_text(text),
+    clean_text = sanitize_narration_display_text(text)
+    if not clean_text:
+        return []
+
+    before_at: dict[int, list[str]] = {}
+    after_at: dict[int, list[str]] = {}
+    forced_offsets = {0, len(clean_text)}
+
+    for raw_cue in sound_effect_cues or []:
+        if not isinstance(raw_cue, dict):
+            continue
+        filename = str(raw_cue.get("filename", "") or "").strip()
+        anchor_text = sanitize_narration_display_text(
+            str(raw_cue.get("anchor_text", "") or "")
+        )
+        position = str(raw_cue.get("position", "after") or "after").casefold()
+        if not filename or not anchor_text or position not in {"before", "after"}:
+            continue
+        if clean_text.count(anchor_text) != 1:
+            LOGGER.warning(
+                "Skipped narration sound cue %r because its anchor is not unique.",
+                filename,
+            )
+            continue
+        anchor_start = clean_text.index(anchor_text)
+        boundary = (
+            anchor_start if position == "before" else anchor_start + len(anchor_text)
+        )
+        forced_offsets.add(boundary)
+        target = before_at if position == "before" else after_at
+        target.setdefault(boundary, []).append(filename)
+
+    ranges = _narration_chunk_ranges(
+        clean_text,
+        forced_offsets=forced_offsets,
         max_length=max_length,
     )
-
-    return [
-        NarrationChunk(
-            display_text=display_chunk,
-            tts_text=prepare_ssmd_tts_text(display_chunk),
+    chunks: list[NarrationChunk] = []
+    for start, end in ranges:
+        display_text = clean_text[start:end]
+        spoken_text = display_text.strip()
+        if not spoken_text:
+            if chunks:
+                previous = chunks[-1]
+                chunks[-1] = NarrationChunk(
+                    display_text=previous.display_text + display_text,
+                    tts_text=previous.tts_text,
+                    sound_effects_before=previous.sound_effects_before,
+                    sound_effects_after=previous.sound_effects_after,
+                )
+            continue
+        chunks.append(
+            NarrationChunk(
+                display_text=display_text,
+                tts_text=prepare_ssmd_tts_text(
+                    tts_text_transform(spoken_text)
+                    if tts_text_transform is not None
+                    else spoken_text
+                ),
+                sound_effects_before=tuple(before_at.get(start, ())),
+                sound_effects_after=tuple(after_at.get(end, ())),
+            )
         )
-        for display_chunk in display_chunks
-    ]
+
+    if chunks:
+        if before_at.get(len(clean_text)):
+            last = chunks[-1]
+            chunks[-1] = NarrationChunk(
+                display_text=last.display_text,
+                tts_text=last.tts_text,
+                sound_effects_before=last.sound_effects_before,
+                sound_effects_after=(
+                    last.sound_effects_after + tuple(before_at[len(clean_text)])
+                ),
+            )
+        if after_at.get(0):
+            first = chunks[0]
+            chunks[0] = NarrationChunk(
+                display_text=first.display_text,
+                tts_text=first.tts_text,
+                sound_effects_before=tuple(after_at[0]) + first.sound_effects_before,
+                sound_effects_after=first.sound_effects_after,
+            )
+    return chunks
+
+
+def _narration_chunk_ranges(
+    text: str,
+    *,
+    forced_offsets: set[int],
+    max_length: int,
+) -> list[tuple[int, int]]:
+    """Returns ordered chunk ranges while preserving every display character."""
+
+    boundaries = set(forced_offsets)
+    boundaries.update(match.end() for match in re.finditer(r"\n\s*\n+", text))
+    ordered_boundaries = sorted(
+        offset for offset in boundaries if 0 <= offset <= len(text)
+    )
+    ranges: list[tuple[int, int]] = []
+
+    for boundary_index in range(len(ordered_boundaries) - 1):
+        start = ordered_boundaries[boundary_index]
+        region_end = ordered_boundaries[boundary_index + 1]
+        while region_end - start > max_length:
+            search_end = start + max_length
+            comma_at = text.rfind(",", start, search_end)
+            space_at = text.rfind(" ", start, search_end)
+            if comma_at > start:
+                cut = comma_at + 1
+            elif space_at > start:
+                cut = space_at
+            else:
+                cut = search_end
+            ranges.append((start, cut))
+            start = cut
+        if start < region_end:
+            ranges.append((start, region_end))
+
+    return ranges
 
 
 def chunk_tts_text(text: str, *, max_length: int = MAX_CHUNK_LENGTH) -> list[str]:

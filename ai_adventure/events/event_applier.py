@@ -286,11 +286,11 @@ class EventApplier:
             if event_type == "SecretUpsertedEvent":
                 return self._apply_secret_upserted(event_type, payload)
 
+            if event_type == "MiscellaneousUpsertedEvent":
+                return self._apply_miscellaneous_upserted(event_type, payload)
+
             if event_type == "MusicChangedEvent":
                 return self._apply_music_changed(event_type, payload)
-
-            if event_type == "SoundEffectChangedEvent":
-                return self._apply_sound_effect_changed(event_type, payload)
 
             message = f"Unsupported event type: {event_type}"
             LOGGER.warning(message)
@@ -1229,34 +1229,6 @@ class EventApplier:
             payload,
         )
 
-    def _apply_sound_effect_changed(
-        self,
-        event_type: str,
-        payload: dict[str, Any],
-    ) -> AppliedEventResult:
-        """Applies SoundEffectChangedEvent to the independent ambient channel."""
-
-        filename = _first_text(
-            payload,
-            "filename",
-            "file_name",
-            "track",
-            "track_name",
-            "sound_effect",
-            "ambient_sound",
-        )
-        if not filename:
-            return _invalid(event_type, payload, "Sound-effect filename is required.")
-
-        if filename.upper() in {"STOP", "NONE", "OFF", "SILENCE"}:
-            self.repository.set_setting("audio.current_sound_effect", "")
-            message = "Stopped the ambient sound effect."
-        else:
-            self.repository.set_setting("audio.current_sound_effect", filename)
-            message = f"Changed ambient sound effect to: {filename}."
-
-        return AppliedEventResult(event_type, "applied", message, payload)
-
     def _apply_recipe_discovered(
         self,
         event_type: str,
@@ -1730,6 +1702,39 @@ class EventApplier:
             "applied",
             f"Stored private GM secret: {secret['title']}.",
             {**payload, "secret_id": secret["secret_id"], "status": secret["status"]},
+        )
+
+    def _apply_miscellaneous_upserted(
+        self,
+        event_type: str,
+        payload: dict[str, Any],
+    ) -> AppliedEventResult:
+        """Applies general canon that does not belong to another state table."""
+
+        name = _first_text(payload, "name", "title")
+        details = _first_text(payload, "details", "description")
+
+        if not name:
+            return _invalid(event_type, payload, "Miscellaneous entry name is required.")
+
+        if not details:
+            return _invalid(event_type, payload, "Miscellaneous entry details are required.")
+
+        entry = self.repository.upsert_miscellaneous(
+            misc_id=_first_text(payload, "misc_id", "id"),
+            name=name,
+            category=_first_text(payload, "category") or "Miscellaneous",
+            details=details,
+        )
+
+        if entry is None:
+            return _invalid(event_type, payload, "Miscellaneous entry could not be stored.")
+
+        return AppliedEventResult(
+            event_type,
+            "applied",
+            f"Stored miscellaneous world lore: {entry['name']}.",
+            {**payload, "misc_id": entry["misc_id"]},
         )
 
 

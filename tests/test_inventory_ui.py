@@ -4,7 +4,8 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
+from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -133,7 +134,7 @@ class InventoryUiTests(unittest.TestCase):
             self.assertNotIn("AI Game Master  |  Out-of-Game  |  Turn #2", headers)
             screen.close()
 
-    def test_saved_music_and_sound_effect_are_started_independently(self) -> None:
+    def test_saved_music_starts_without_replaying_a_sound_effect(self) -> None:
         class FakeSoundManager:
             def __init__(self) -> None:
                 self.music_played = ""
@@ -181,7 +182,6 @@ class InventoryUiTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             repository = SaveRepository.create_new_save(Path(temp_dir), "Audio Sync Test")
             repository.set_setting("audio.current_music", "Slow Jazz.mp3")
-            repository.set_setting("audio.current_sound_effect", "Steady Rain.wav")
             manager = FakeSoundManager()
 
             _apply_audio_settings_to_managers(
@@ -191,7 +191,81 @@ class InventoryUiTests(unittest.TestCase):
             )
 
             self.assertEqual(manager.music_played, "Slow Jazz.mp3")
-            self.assertEqual(manager.effect_played, "Steady Rain.wav")
+            self.assertEqual(manager.effect_played, "")
+
+    def test_latest_story_can_use_progressive_narration_with_pronunciations(self) -> None:
+        class FakeNarrationPlayer:
+            def __init__(self) -> None:
+                self.calls: list[tuple[str, dict[str, Any]]] = []
+
+            def set_volume(self, _volume: float | int | None) -> None:
+                pass
+
+            def set_speed(self, _speed: float | int | None) -> None:
+                pass
+
+            def set_voice(self, _voice: str | None) -> None:
+                pass
+
+            def set_enabled(self, _enabled: bool) -> None:
+                pass
+
+            def narrate(self, text: str, **kwargs: Any) -> bool:
+                self.calls.append((text, kwargs))
+                return True
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = SaveRepository.create_new_save(Path(temp_dir), "Opening Test")
+            repository.set_setting(
+                "tts.pronunciation_map",
+                {"Ironpeak City": {"ipa": "ˈaɪɚnˌpik ˈsɪti"}},
+            )
+            repository.append_history(
+                "story",
+                "Ironpeak City wakes.\n\nThe market opens.",
+                sound_effect_cues=[
+                    {
+                        "filename": "Market Bell.wav",
+                        "anchor_text": "market",
+                        "position": "before",
+                    }
+                ],
+            )
+            story_id = int(repository.list_history()[-1]["id"])
+            narrator = FakeNarrationPlayer()
+            screen = StoryScreen(narration_player=cast(Any, narrator))
+            screen.set_repository(repository)
+
+            with patch("ai_adventure.ui.main_window.QTimer.singleShot"):
+                started = screen.narrate_latest_story(reveal_progressively=True)
+
+            self.assertTrue(started)
+            self.assertEqual(screen._revealing_story_id, story_id)
+            self.assertEqual(screen._revealed_story_chunks, [])
+            self.assertEqual(len(narrator.calls), 1)
+            narration_text, kwargs = narrator.calls[0]
+            self.assertEqual(
+                narration_text,
+                "Ironpeak City wakes.\n\nThe market opens.",
+            )
+            self.assertIsNotNone(kwargs.get("on_chunk_start"))
+            self.assertIsNotNone(kwargs.get("on_complete"))
+            self.assertEqual(
+                kwargs.get("sound_effect_cues"),
+                [
+                    {
+                        "filename": "Market Bell.wav",
+                        "anchor_text": "market",
+                        "position": "before",
+                    }
+                ],
+            )
+            transform = cast(Any, kwargs["tts_text_transform"])
+            self.assertEqual(
+                transform("Ironpeak City wakes."),
+                '[Ironpeak City]{ph="ˈaɪɚnˌpik ˈsɪti"} wakes.',
+            )
+            screen.close()
 
     def test_conversation_refresh_preserves_reader_position_and_adds_bottom_buffer(self) -> None:
         screen = StoryScreen()
@@ -536,6 +610,78 @@ class InventoryUiTests(unittest.TestCase):
         self.assertIn("Food Rations\nx3 days  ·  Consumable", button_texts)
 
         panel.close()
+
+    def test_each_inventory_location_sorts_independently_and_retains_selection(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = SaveRepository.create_new_save(Path(temp_dir), "Sorted Inventory")
+            repository.add_inventory_item(
+                "Copper Buckle",
+                "Accessory",
+                5,
+                "A plain buckle.",
+                value_base_units=2,
+                metadata={"storage_location": "actively_carried"},
+            )
+            repository.add_inventory_item(
+                "Amber Lens",
+                "Tool",
+                1,
+                "A polished lens.",
+                value_base_units=12,
+                metadata={"storage_location": "actively_carried"},
+            )
+            repository.add_inventory_item(
+                "Zinc Plate",
+                "Material",
+                2,
+                "A thin metal plate.",
+                value_base_units=4,
+                metadata={"storage_location": "home"},
+            )
+            repository.add_inventory_item(
+                "Brass Tongs",
+                "Tool",
+                1,
+                "Small workshop tongs.",
+                value_base_units=9,
+                metadata={"storage_location": "home"},
+            )
+
+            screen = InventoryScreen()
+            screen.set_repository(repository)
+            self.app.processEvents()
+            carried_panel, home_panel = screen.location_panels
+
+            carried_panel.sort_field_combo.setCurrentIndex(
+                carried_panel.sort_field_combo.findData("price")
+            )
+            carried_panel.sort_direction_combo.setCurrentIndex(
+                carried_panel.sort_direction_combo.findData(True)
+            )
+            home_panel.sort_field_combo.setCurrentIndex(
+                home_panel.sort_field_combo.findData("category")
+            )
+            self.app.processEvents()
+
+            carried_names = [
+                button.text().splitlines()[0]
+                for button in carried_panel.item_buttons
+            ]
+            self.assertLess(
+                carried_names.index("Amber Lens"),
+                carried_names.index("Copper Buckles"),
+            )
+            self.assertTrue(home_panel.item_buttons[0].text().startswith("Zinc Plate"))
+            self.assertEqual(home_panel.sort_direction_combo.currentData(), False)
+
+            screen.refresh()
+            self.app.processEvents()
+            carried_panel, home_panel = screen.location_panels
+            self.assertEqual(carried_panel.sort_field_combo.currentData(), "price")
+            self.assertEqual(carried_panel.sort_direction_combo.currentData(), True)
+            self.assertEqual(home_panel.sort_field_combo.currentData(), "category")
+            self.assertEqual(home_panel.sort_direction_combo.currentData(), False)
+            screen.close()
 
     def test_single_location_panel_is_centered_at_half_width(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -42,9 +42,12 @@ from ai_adventure.currency import (
     normalize_visible_currency_text,
 )
 from ai_adventure.audio.pronunciation import (
+    KOKORO_IPA_PROMPT_RULE,
+    PronunciationMap,
     merge_pronunciation_maps,
     normalize_pronunciation_map,
 )
+from ai_adventure.audio.catalog import distinct_audio_track_catalogs
 from ai_adventure.locations import clean_player_location_name, normalize_known_locations
 from ai_adventure.new_game_setup import STARTER_INVENTORY_MIN_ITEMS
 from ai_adventure.skills.rules import MAX_SKILL_LEVEL
@@ -56,6 +59,7 @@ DEFAULT_GEMINI_MODEL = "gemini-3.5-flash-lite"
 CREATIVE_TERM_REPAIR_MODEL = DEFAULT_GEMINI_MODEL
 CREATIVE_TERM_REPAIR_ATTEMPTS = 4
 MODEL_REQUEST_ATTEMPTS = 2
+NEW_GAME_RESPONSE_ATTEMPTS = 3
 MODEL_RETRY_DELAY_SECONDS = 1.0
 FALLBACK_SUGGESTED_ACTIONS = [
     "Look around and take stock of the situation.",
@@ -124,6 +128,17 @@ KNOWN_TEXT_MODELS = {
     "gemini-2.5-pro",
 }
 
+
+def _is_embedding_model_name(model: str) -> bool:
+    """Returns True for Gemini API model ids that cannot generate text."""
+
+    normalized = str(model).strip().casefold()
+    if normalized.startswith("models/"):
+        normalized = normalized.removeprefix("models/")
+    return normalized.startswith(
+        ("gemini-embedding", "text-embedding", "embedding-")
+    )
+
 KNOWN_EVENT_TYPE_NAMES = [
     "StatusUpdatedEvent",
     "SkillCheckRequestedEvent",
@@ -152,6 +167,7 @@ KNOWN_EVENT_TYPE_NAMES = [
     "NpcUpsertedEvent",
     "NpcKnowledgeAddedEvent",
     "SecretUpsertedEvent",
+    "MiscellaneousUpsertedEvent",
 ]
 TEXT_SAFETY_HARM_CATEGORIES = list(ALL_CONTENT_HARM_CATEGORIES)
 STRING_LIST_SCHEMA: dict[str, Any] = {
@@ -223,6 +239,39 @@ NEW_GAME_GM_SECRET_RECORD_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": NEW_GAME_GM_SECRET_RECORD_PROPERTIES,
     "required": NEW_GAME_GM_SECRET_RECORD_REQUIRED_FIELDS,
+    "additionalProperties": False,
+}
+MISCELLANEOUS_RECORD_PROPERTIES: dict[str, Any] = {
+    "misc_id": {
+        "type": "string",
+        "description": "Stable lower_snake_case identifier reused for future updates.",
+    },
+    "name": {"type": "string"},
+    "category": {
+        "type": "string",
+        "description": (
+            "A concise free-form kind such as Creature, Species, Culture, Faction, "
+            "Religion, Law, Historical Event, Phenomenon, or Custom."
+        ),
+    },
+    "details": {
+        "type": "string",
+        "description": (
+            "Complete established non-secret canon needed for continuity. Do not "
+            "duplicate an NPC, location, item, task, or private GM secret record."
+        ),
+    },
+}
+MISCELLANEOUS_RECORD_REQUIRED_FIELDS = [
+    "misc_id",
+    "name",
+    "category",
+    "details",
+]
+MISCELLANEOUS_RECORD_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": MISCELLANEOUS_RECORD_PROPERTIES,
+    "required": MISCELLANEOUS_RECORD_REQUIRED_FIELDS,
     "additionalProperties": False,
 }
 RECIPE_INGREDIENT_SCHEMA: dict[str, Any] = {
@@ -880,12 +929,29 @@ EVENT_RESPONSE_SCHEMA: dict[str, Any] = {
                 "filename": {
                     "type": "string",
                     "description": (
-                        "Exact valid ambient sound filename, or STOP to end the "
-                        "current ambient effect."
+                        "Exact filename from valid_sound_effect_tracks for one short, "
+                        "non-looping narration cue."
                     ),
-                }
+                },
+                "anchor_text": {
+                    "type": "string",
+                    "description": (
+                        "A short exact excerpt that appears exactly once in the "
+                        "player-facing response."
+                    ),
+                },
+                "position": {
+                    "type": "string",
+                    "enum": ["before", "after"],
+                    "description": (
+                        "Play immediately before or after the spoken anchor_text."
+                    ),
+                },
             },
-            ["filename"],
+            ["filename", "anchor_text", "position"],
+            description=(
+                "Plays one short sound once at an exact boundary in this narration."
+            ),
         ),
         _event_response_schema(
             "FlagSetEvent",
@@ -1004,6 +1070,15 @@ EVENT_RESPONSE_SCHEMA: dict[str, Any] = {
             GM_SECRET_RECORD_REQUIRED_FIELDS,
             description="Creates or replaces private database-backed GM memory.",
         ),
+        _event_response_schema(
+            "MiscellaneousUpsertedEvent",
+            MISCELLANEOUS_RECORD_PROPERTIES,
+            MISCELLANEOUS_RECORD_REQUIRED_FIELDS,
+            description=(
+                "Creates or replaces established general canon that does not fit "
+                "an NPC, location, item, task, or private secret."
+            ),
+        ),
     ]
 }
 NEW_GAME_EVENT_TYPE_NAMES = (
@@ -1075,19 +1150,19 @@ STORY_RESPONSE_JSON_SCHEMA: dict[str, Any] = {
         "pronunciation_map": {
             "type": "array",
             "description": (
-                "Map exact visible names or recurring terms used in this response "
-                "to phonetic spellings for TTS only. Include places, NPCs, items, "
-                "factions, creatures, spells, and other names likely to recur. "
-                "Do not alter the response text to add pronunciation hints."
+                "TTS-only glossary for genuinely ambiguous visible terms. Omit "
+                "ordinary words already pronounced as written. "
+                f"{KOKORO_IPA_PROMPT_RULE} Do not alter the response text to add "
+                "pronunciation hints."
             ),
             "maxItems": 40,
             "items": {
                 "type": "object",
                 "properties": {
                     "term": {"type": "string"},
-                    "phonetic": {"type": "string"},
+                    "ipa": {"type": "string"},
                 },
-                "required": ["term", "phonetic"],
+                "required": ["term", "ipa"],
                 "additionalProperties": False,
             },
         },
@@ -1103,6 +1178,7 @@ STORY_RESPONSE_JSON_SCHEMA: dict[str, Any] = {
 STORY_BASE_EVENT_TYPE_NAMES: tuple[str, ...] = (
     "StatusUpdatedEvent",
     "SkillCheckRequestedEvent",
+    "MiscellaneousUpsertedEvent",
 )
 STORY_EVENT_TYPE_NAMES_BY_CONTEXT_TAG: dict[str, tuple[str, ...]] = {
     "alchemy": (
@@ -1292,6 +1368,16 @@ NEW_GAME_RESPONSE_JSON_SCHEMA: dict[str, Any] = {
                 "the setup explicitly establishes a credible knowledge barrier."
             ),
             "items": NEW_GAME_GM_SECRET_RECORD_SCHEMA,
+        },
+        "miscellaneous": {
+            "type": "array",
+            "description": (
+                "Established starting canon that does not fit locations, NPCs, items, "
+                "tasks, or private GM secrets. Include original creatures, species, "
+                "cultures, factions, religions, laws, history, and phenomena when "
+                "needed; otherwise return an empty array."
+            ),
+            "items": MISCELLANEOUS_RECORD_SCHEMA,
         },
         "start_location": {"type": "string"},
         "calendar_settings": {
@@ -1503,18 +1589,18 @@ NEW_GAME_RESPONSE_JSON_SCHEMA: dict[str, Any] = {
         "pronunciation_map": {
             "type": "array",
             "description": (
-                "Map exact visible names or recurring terms introduced in the initial "
-                "world to phonetic spellings for TTS only. Include locations, NPCs, "
-                "items, factions, creatures, spells, and other recurring names."
+                "TTS-only glossary for genuinely ambiguous visible terms introduced "
+                "in the initial world. Omit ordinary words already pronounced as "
+                f"written. {KOKORO_IPA_PROMPT_RULE}"
             ),
             "maxItems": 80,
             "items": {
                 "type": "object",
                 "properties": {
                     "term": {"type": "string"},
-                    "phonetic": {"type": "string"},
+                    "ipa": {"type": "string"},
                 },
-                "required": ["term", "phonetic"],
+                "required": ["term", "ipa"],
                 "additionalProperties": False,
             },
         },
@@ -1637,20 +1723,21 @@ def build_new_game_response_schema(setup_packet: dict[str, Any]) -> dict[str, An
     audio = setup_packet.get("audio", {})
     if not isinstance(audio, dict):
         audio = {}
-    valid_music_tracks = audio.get("valid_music_tracks", [])
-    valid_sound_effect_tracks = audio.get("valid_sound_effect_tracks", [])
+    valid_music_tracks, valid_sound_effect_tracks = distinct_audio_track_catalogs(
+        audio.get("valid_music_tracks", []),
+        audio.get("valid_sound_effect_tracks", []),
+    )
     setup_audio = setup.get("audio", {})
     music_enabled = not isinstance(setup_audio, dict) or bool(
         setup_audio.get("music_enabled", True)
     )
-    if music_enabled and isinstance(valid_music_tracks, list) and valid_music_tracks:
+    if music_enabled and valid_music_tracks:
         event_types.append("MusicChangedEvent")
     sound_effects_enabled = not isinstance(setup_audio, dict) or bool(
         setup_audio.get("sound_effects_enabled", True)
     )
     if (
         sound_effects_enabled
-        and isinstance(valid_sound_effect_tracks, list)
         and valid_sound_effect_tracks
     ):
         event_types.append("SoundEffectChangedEvent")
@@ -1718,6 +1805,15 @@ def _story_event_type_names(context_packet: dict[str, Any]) -> tuple[str, ...]:
     enabled_event_types = set(STORY_BASE_EVENT_TYPE_NAMES)
     for tag in selected_tags:
         enabled_event_types.update(STORY_EVENT_TYPE_NAMES_BY_CONTEXT_TAG.get(tag, ()))
+    audio = _state_subpacket(context_packet, "audio")
+    valid_music_tracks, valid_sound_effect_tracks = distinct_audio_track_catalogs(
+        audio.get("valid_music_tracks", []),
+        audio.get("valid_sound_effect_tracks", []),
+    )
+    if not valid_music_tracks:
+        enabled_event_types.discard("MusicChangedEvent")
+    if not valid_sound_effect_tracks:
+        enabled_event_types.discard("SoundEffectChangedEvent")
     return tuple(
         event_type
         for event_type in KNOWN_EVENT_TYPE_NAMES
@@ -1820,7 +1916,8 @@ class AiNarrationResult:
     narrative_text: str
     suggested_actions: list[str] = field(default_factory=list)
     suggested_events: list[dict[str, Any]] = field(default_factory=list)
-    pronunciation_map: dict[str, str] = field(default_factory=dict)
+    sound_effect_cues: list[dict[str, str]] = field(default_factory=list)
+    pronunciation_map: PronunciationMap = field(default_factory=dict)
     out_of_game: bool = False
     raw_text: str = ""
 
@@ -1847,6 +1944,7 @@ class AiWorldSetupResult:
     selected_genre: str = ""
     locations: list[dict[str, Any]] = field(default_factory=list)
     gm_secrets: list[dict[str, Any]] = field(default_factory=list)
+    miscellaneous: list[dict[str, Any]] = field(default_factory=list)
     finalized_character: dict[str, str] = field(default_factory=dict)
     finalized_skills: list[dict[str, Any]] = field(default_factory=list)
     finalized_starter_items: list[dict[str, Any]] = field(default_factory=list)
@@ -1855,9 +1953,10 @@ class AiWorldSetupResult:
     finalized_currency_denominations: list[dict[str, Any]] = field(default_factory=list)
     finalized_currency_description: str = ""
     finalized_starting_currency_balance_base_units: int | None = None
-    pronunciation_map: dict[str, str] = field(default_factory=dict)
+    pronunciation_map: PronunciationMap = field(default_factory=dict)
     suggested_actions: list[str] = field(default_factory=list)
     suggested_events: list[dict[str, Any]] = field(default_factory=list)
+    sound_effect_cues: list[dict[str, str]] = field(default_factory=list)
     raw_text: str = ""
 
 
@@ -2104,24 +2203,24 @@ class GeminiNarrationService:
             len(json.dumps(response_schema, separators=(",", ":"))),
         )
         LOGGER.info(f"NEW GAME PROMPT: \n\n{prompt}")
-        response = _generate_content_with_retry(
+        request_config = _structured_output_config(
+            response_schema,
+            model=self.settings.model,
+            ai_preferences=ai_preferences,
+            apply_response_length=True,
+            response_length_scope="new_game",
+        )
+        raw_text = _generate_new_game_response_with_quality_retry(
             client,
             model=self.settings.model,
-            contents=prompt,
-            config=_structured_output_config(
-                response_schema,
-                model=self.settings.model,
-                ai_preferences=ai_preferences,
-                apply_response_length=True,
-                response_length_scope="new_game",
-            ),
-            request_label="new-game request",
-            allow_schema_fallback=False,
+            prompt=prompt,
+            response_schema=response_schema,
+            config=request_config,
         )
         raw_text = _repair_gemini_creative_terms(
             client,
             self.settings.model,
-            str(getattr(response, "text", "") or "").strip(),
+            raw_text,
             "new-game response",
             response_schema,
             ai_preferences=ai_preferences,
@@ -2135,6 +2234,7 @@ class GeminiNarrationService:
             self.settings.model,
             raw_text,
             setup_packet,
+            response_schema=response_schema,
             ai_preferences=ai_preferences,
         )
         LOGGER.info("Gemini raw new-game response:\n%s", _pretty_json_for_log(raw_text))
@@ -2179,12 +2279,22 @@ def load_gemini_settings(
         or DEFAULT_GEMINI_MODEL
     ).strip() or DEFAULT_GEMINI_MODEL
 
-    if model not in KNOWN_TEXT_MODELS:
-        LOGGER.warning(
-            "Gemini model '%s' is not in the known supported text model list: %s.",
+    if _is_embedding_model_name(model):
+        LOGGER.error(
+            "Refusing embedding-only Gemini model '%s' for narration; using %s.",
             model,
+            DEFAULT_GEMINI_MODEL,
+        )
+        model = DEFAULT_GEMINI_MODEL
+    elif model not in KNOWN_TEXT_MODELS:
+        LOGGER.error(
+            "Refusing unapproved Gemini model '%s' for narration; using %s. "
+            "Approved text models: %s.",
+            model,
+            DEFAULT_GEMINI_MODEL,
             ", ".join(sorted(KNOWN_TEXT_MODELS)),
         )
+        model = DEFAULT_GEMINI_MODEL
 
     return GeminiSettings(
         api_key=read_api_key(key_path),
@@ -2324,13 +2434,17 @@ def _build_xml_story_prompt(context_packet: dict[str, Any]) -> str:
                 "when the player asks an NPC to answer, explain, reply, or tell their "
                 "story, narrate the information that NPC can presently provide instead "
                 "of stopping just before the reply. Suggest only warranted events and checks. Reuse "
-                "stable NPC, item, secret, task, and location identities. Never use "
+                "stable NPC, item, secret, task, location, and miscellaneous lore "
+                "identities. Never use "
                 "banned terms, close spellings, hyphenation variants, obvious reskins, "
                 "or bare category-label proper nouns for newly invented names. Return "
                 "a pronunciation_map for exact visible names and recurring terms whose "
                 "ordinary spelling may be mispronounced by TTS. Include locations, NPCs, "
                 "items, factions, creatures, spells, and other repeated names. The map "
                 "must never change the player-facing response; it is a TTS-only glossary. "
+                "Omit ordinary words already pronounced as written, such as Kit or "
+                f"Copper Square. {KOKORO_IPA_PROMPT_RULE} For example, Qh'thala may "
+                "map to kəˈθɑlə. "
                 "Honor the player's explicit character-name pronunciation.",
             ),
             _xml_text_section(
@@ -2345,6 +2459,19 @@ def _build_xml_story_prompt(context_packet: dict[str, Any]) -> str:
                 "Player Character rediscover their own knowing act. If the Player "
                 "Character knows a fact, keep it in player-visible narrative or "
                 "appropriate public state rather than SecretUpsertedEvent.",
+            ),
+            _xml_text_section(
+                "miscellaneous_world_memory",
+                "state.miscellaneous.entries is uncapped, authoritative world canon "
+                "and is included on every turn. Use every entry for continuity even "
+                "when it is not obviously related to the current command. Suggest "
+                "MiscellaneousUpsertedEvent when this response establishes or changes "
+                "a durable non-secret creature, species, culture, faction, religion, "
+                "law, historical event, phenomenon, custom, or other concept that does "
+                "not fit an NPC, Location, Item, active task, or GM secret. Reuse the "
+                "same misc_id for updates and send the complete current record. Never "
+                "duplicate information that belongs in a more specific table; use "
+                "SecretUpsertedEvent instead for hidden truth.",
             ),
             _xml_text_section(
                 "conversation_mode",
@@ -2387,9 +2514,9 @@ def _build_xml_story_prompt(context_packet: dict[str, Any]) -> str:
                 "the narration keeps the current value unchanged. If the narration "
                 "introduces rain, snow, fog, or any other current weather different "
                 "from state.scene.weather, set weather to that actual condition rather "
-                "than AUTO. pronunciation_map "
-                "must be an array of {term, phonetic} records with no explanatory "
-                "prose. No surrounding Markdown.",
+                "than AUTO. pronunciation_map must be an array of {term, ipa} records. "
+                f"{KOKORO_IPA_PROMPT_RULE} "
+                "No surrounding Markdown.",
             ),
             _xml_text_section(
                 "task",
@@ -2421,7 +2548,7 @@ def _story_prompt_packet(context_packet: dict[str, Any]) -> dict[str, Any]:
     always = {
         "response", "suggested_actions", "events", "status_event", "skill_checks",
         "player_ai_preferences", "creative_ideas", "conversation_mode", "out_of_game", "event_shape",
-        "known_event_types",
+        "known_event_types", "miscellaneous_memory",
     }
     tags_by_contract = {
         "calendar_time": {"time", "events"},
@@ -2483,8 +2610,10 @@ def _build_xml_new_game_prompt(setup_packet: dict[str, Any]) -> str:
                 "a pronunciation_map for exact visible names and recurring terms whose "
                 "ordinary spelling may be mispronounced by TTS, including locations, "
                 "NPCs, items, factions, creatures, and spells. This map is TTS-only and "
-                "must not insert phonetic spellings into player-facing prose. Honor the "
-                "player's explicit character-name pronunciation. If the setup includes "
+                "must not insert pronunciation data into player-facing prose. Honor the "
+                "player's explicit character-name pronunciation. Omit ordinary words "
+                "already pronounced as written, such as Kit or Copper Square. "
+                f"{KOKORO_IPA_PROMPT_RULE} If the setup includes "
                 "opening_scene_request, treat it as optional player-authored guidance "
                 "for the first scene at the selected start_location: honor its intent "
                 "when coherent, but write finalized in-world narration instead of "
@@ -2510,6 +2639,17 @@ def _build_xml_new_game_prompt(setup_packet: dict[str, Any]) -> str:
                 "test to remember or notice their own conscious action. If any check "
                 "fails, move the fact to an appropriate player-visible field when "
                 "established by setup, or omit it.",
+            ),
+            _xml_text_section(
+                "miscellaneous_world_memory",
+                "Return non-secret starting canon that does not fit locations, NPCs, "
+                "items, tasks, or GM secrets in the top-level miscellaneous array. "
+                "Use it for original creatures or species, cultures, factions, "
+                "religions, laws, historical events, phenomena, customs, and other "
+                "durable concepts introduced by the finalized world or opening scene. "
+                "Use stable misc_id values and complete records. Do not duplicate "
+                "information that belongs in another structured field; return an "
+                "empty array when no miscellaneous starting canon is established.",
             ),
             _xml_text_section(
                 "storage_rule",
@@ -2547,8 +2687,8 @@ def _build_xml_new_game_prompt(setup_packet: dict[str, Any]) -> str:
                 "output_format",
                 "Return exactly one JSON object matching the configured new-game "
                 "schema, with no surrounding Markdown. Complete every required field. "
-                "pronunciation_map must be an array of {term, phonetic} records mapping "
-                "exact visible terms to phonetic TTS spellings, with no explanatory prose.",
+                "pronunciation_map must be an array of {term, ipa} records mapping "
+                f"exact visible terms to native TTS phonemes. {KOKORO_IPA_PROMPT_RULE}",
             ),
             _xml_text_section(
                 "task",
@@ -3306,6 +3446,9 @@ def build_gemini_new_game_prompt(setup_packet: dict[str, Any]) -> str:
         "motives, mystery solutions, off-screen plans, and other GM-only starting "
         "truths in the top-level gm_secrets array, not in player-facing fields "
         "or the events array. The app stores those starting secrets as active. "
+        "Put established non-secret creatures, species, cultures, factions, laws, "
+        "history, phenomena, customs, and other concepts without a more specific "
+        "home in the top-level miscellaneous array. "
         "Use the direct setup fields for locations, crafting knowledge, inventory, "
         "currency, character, skills, calendar, and all other initial state that "
         "has a direct field. Use type and payload for each event; "
@@ -3338,10 +3481,14 @@ def build_gemini_new_game_prompt(setup_packet: dict[str, Any]) -> str:
         "setup_packet.audio.valid_music_tracks is non-empty, "
         "use one MusicChangedEvent to choose fitting opening background music; "
         "its filename must exactly match one listed track. When "
-        "setup_packet.audio.valid_sound_effect_tracks is non-empty and ambient "
-        "sound fits the scene, use one SoundEffectChangedEvent as well; it plays "
-        "independently from music and its filename must exactly match one listed "
-        "sound-effect track. The API response "
+        "setup_packet.audio.valid_sound_effect_tracks is non-empty, use a separate "
+        "SoundEffectChangedEvent for every specific narrated moment that genuinely "
+        "benefits from an appropriate listed sound; there is no fixed cue-count target, "
+        "and no cue should be forced when nothing fits. Each plays once, never loops, "
+        "and its filename must exactly match one listed sound-effect track, never "
+        "valid_music_tracks. For every event, copy anchor_text exactly from one unique "
+        "place in introductory_message and use position before or after to locate the "
+        "precise narration boundary. The API response "
         "schema defines the required JSON fields.\n\n"
         "Setup packet:\n"
         f"{packet_json}"
@@ -3503,6 +3650,18 @@ def _repair_gemini_creative_terms(
             )
             continue
 
+        if _new_game_response_quality_score(repaired_text, schema) > (
+            _new_game_response_quality_score(candidate_text, schema)
+        ):
+            LOGGER.warning(
+                "Gemini %s repair attempt %s/%s returned less complete JSON; "
+                "discarding that repair.",
+                response_label,
+                attempt,
+                CREATIVE_TERM_REPAIR_ATTEMPTS,
+            )
+            continue
+
         repaired_banned_terms = _unique_terms(
             _find_gemini_creative_terms(
                 repaired_text,
@@ -3552,6 +3711,7 @@ def _repair_gemini_suggested_setup_fields(
     raw_text: str,
     setup_packet: dict[str, Any],
     *,
+    response_schema: dict[str, Any],
     ai_preferences: dict[str, Any] | None = None,
 ) -> str:
     """Repairs reused wizard suggestions without treating them as global bans."""
@@ -3605,6 +3765,17 @@ def _repair_gemini_suggested_setup_fields(
 
         repaired_text = str(getattr(response, "text", "") or "").strip()
         if repaired_text:
+            if _new_game_response_quality_score(
+                repaired_text,
+                response_schema,
+            ) > _new_game_response_quality_score(candidate_text, response_schema):
+                LOGGER.warning(
+                    "Gemini new-game suggestion repair attempt %s/%s returned "
+                    "less complete JSON; discarding that repair.",
+                    attempt,
+                    CREATIVE_TERM_REPAIR_ATTEMPTS,
+                )
+                continue
             candidate_text = repaired_text
             paths = _unfinalized_suggested_setup_paths(candidate_text, setup_packet)
 
@@ -4018,6 +4189,154 @@ def _creative_term_repair_config(
     }
 
 
+def _generate_new_game_response_with_quality_retry(
+    client: Any,
+    *,
+    model: str,
+    prompt: str,
+    response_schema: dict[str, Any],
+    config: dict[str, Any],
+) -> str:
+    """Regenerates incomplete new-game JSON before any targeted repairs run."""
+
+    best_text = ""
+    best_score = _new_game_response_quality_score(best_text, response_schema)
+    previous_errors: list[str] = []
+
+    for attempt in range(1, NEW_GAME_RESPONSE_ATTEMPTS + 1):
+        request_config = dict(config)
+        request_contents = prompt
+        request_label = "new-game request"
+
+        if attempt > 1:
+            # A response-length preference must not prevent required setup state from
+            # being returned. Recovery attempts keep the prose guidance but remove the
+            # hard token cap and explicitly ask for a fresh, concise, complete object.
+            request_config.pop("max_output_tokens", None)
+            request_label = f"new-game quality retry {attempt - 1}"
+            request_contents = _new_game_quality_retry_prompt(
+                prompt,
+                previous_errors,
+                attempt=attempt,
+            )
+
+        response = _generate_content_with_retry(
+            client,
+            model=model,
+            contents=request_contents,
+            config=request_config,
+            request_label=request_label,
+            allow_schema_fallback=False,
+        )
+        candidate_text = str(getattr(response, "text", "") or "").strip()
+        candidate_errors = _new_game_response_quality_errors(
+            candidate_text,
+            response_schema,
+        )
+        candidate_score = _new_game_response_quality_score(
+            candidate_text,
+            response_schema,
+        )
+
+        if candidate_score < best_score:
+            best_text = candidate_text
+            best_score = candidate_score
+
+        if not candidate_errors:
+            if attempt > 1:
+                LOGGER.info(
+                    "Gemini new-game quality retry %s/%s returned complete JSON.",
+                    attempt - 1,
+                    NEW_GAME_RESPONSE_ATTEMPTS - 1,
+                )
+            return candidate_text
+
+        previous_errors = candidate_errors
+        if attempt < NEW_GAME_RESPONSE_ATTEMPTS:
+            LOGGER.warning(
+                "Gemini new-game response attempt %s/%s was incomplete: %s. "
+                "Requesting a full regeneration.",
+                attempt,
+                NEW_GAME_RESPONSE_ATTEMPTS,
+                "; ".join(candidate_errors[:8]),
+            )
+
+    LOGGER.warning(
+        "Gemini new-game response remained incomplete after %s attempts; using "
+        "the most complete candidate: %s",
+        NEW_GAME_RESPONSE_ATTEMPTS,
+        "; ".join(previous_errors[:8]),
+    )
+    return best_text
+
+
+def _new_game_quality_retry_prompt(
+    prompt: str,
+    errors: list[str],
+    *,
+    attempt: int,
+) -> str:
+    """Adds compact validation feedback to a full new-game regeneration prompt."""
+
+    return (
+        f"{prompt}\n\n"
+        "<retry_feedback>\n"
+        f"Full regeneration attempt {attempt} of {NEW_GAME_RESPONSE_ATTEMPTS}. "
+        "The previous response was incomplete or truncated. Generate the entire "
+        "JSON object again from scratch; do not continue the previous response. "
+        "Complete every configured field and every required nested field. Keep "
+        "descriptions concise when necessary so completeness takes priority over "
+        "embellishment.\n"
+        f"Validation issues: {'; '.join(errors[:8])}\n"
+        "</retry_feedback>"
+    )
+
+
+def _new_game_response_quality_errors(
+    raw_text: str,
+    response_schema: dict[str, Any],
+) -> list[str]:
+    """Returns actionable completeness errors for a new-game response candidate."""
+
+    if not raw_text.strip():
+        return ["response was empty"]
+
+    try:
+        data = json.loads(_strip_json_fence(raw_text.strip()))
+    except json.JSONDecodeError:
+        return ["response was not complete JSON"]
+
+    if not isinstance(data, dict):
+        return ["response JSON was not an object"]
+
+    # Extra fields are safe for the tolerant Python parser and can appear in older
+    # compatible responses. Missing, malformed, or out-of-contract required data is
+    # what makes a New Game materially incomplete.
+    return [
+        error
+        for error in _json_schema_shape_errors(data, response_schema)
+        if not error.endswith(" is not allowed")
+    ]
+
+
+def _new_game_response_quality_score(
+    raw_text: str,
+    response_schema: dict[str, Any],
+) -> int:
+    """Ranks candidates so a malformed repair cannot replace a better response."""
+
+    errors = _new_game_response_quality_errors(raw_text, response_schema)
+    if not errors:
+        return 0
+    if errors[0] == "response was empty":
+        return 1_000_002
+    if errors[0] == "response was not complete JSON":
+        return 1_000_001
+    if errors[0] == "response JSON was not an object":
+        return 1_000_000
+    return len(errors)
+
+
 def _generate_content_with_retry(
     client: Any,
     *,
@@ -4029,7 +4348,18 @@ def _generate_content_with_retry(
 ) -> Any:
     """Calls Gemini with one bounded retry for temporary service failures."""
 
-    active_config = dict(config)
+    if _is_embedding_model_name(model):
+        raise GeminiConfigurationError(
+            f"Gemini model '{model}' is embedding-only and cannot be used for "
+            f"AI Adventure narration. Use '{DEFAULT_GEMINI_MODEL}'."
+        )
+    if model not in KNOWN_TEXT_MODELS:
+        raise GeminiConfigurationError(
+            f"Gemini model '{model}' is not approved for AI Adventure narration. "
+            f"Use one of: {', '.join(sorted(KNOWN_TEXT_MODELS))}."
+        )
+
+    active_config = _tool_free_text_generation_config(config)
     LOGGER.info(
         "Gemini %s request diagnostics: %s",
         request_label,
@@ -4113,6 +4443,58 @@ def _generate_content_with_retry(
     raise GeminiRequestError("Gemini could not complete the request.")
 
 
+def _tool_free_text_generation_config(config: dict[str, Any]) -> dict[str, Any]:
+    """Returns an explicit text-only config and rejects every model tool surface."""
+
+    prohibited: list[str] = []
+    if config.get("tools"):
+        prohibited.append("tools")
+    if config.get("tool_config"):
+        prohibited.append("tool_config")
+
+    automatic = config.get("automatic_function_calling")
+    if automatic:
+        automatic_disabled = (
+            isinstance(automatic, dict) and automatic.get("disable") is True
+        )
+        if not automatic_disabled:
+            prohibited.append("automatic_function_calling")
+
+    modalities = config.get("response_modalities")
+    if modalities is not None:
+        raw_modalities = (
+            [modalities]
+            if isinstance(modalities, str)
+            else list(modalities)
+            if isinstance(modalities, (list, tuple, set))
+            else []
+        )
+        if not raw_modalities or any(
+            str(modality).strip().casefold() != "text"
+            for modality in raw_modalities
+        ):
+            prohibited.append("response_modalities")
+
+    for key in ("image_config", "speech_config"):
+        if key in config and config.get(key) is not None:
+            prohibited.append(key)
+
+    if prohibited:
+        raise GeminiConfigurationError(
+            "Gemini tools and non-text output are disabled for AI Adventure; "
+            f"refusing config field(s): {', '.join(sorted(set(prohibited)))}."
+        )
+
+    active_config = dict(config)
+    active_config["tools"] = []
+    active_config["tool_config"] = {
+        "function_calling_config": {"mode": "NONE"},
+    }
+    active_config["automatic_function_calling"] = {"disable": True}
+    active_config["response_modalities"] = ["TEXT"]
+    return active_config
+
+
 def _is_transient_model_error(error: Exception) -> bool:
     """Returns whether an SDK or network error is safe to retry briefly."""
 
@@ -4175,6 +4557,19 @@ def _model_request_diagnostics(
         "model": model,
         "contents_chars": len(contents),
         "config_keys": sorted(str(key) for key in config),
+        "tools_enabled": bool(config.get("tools")),
+        "function_calling_mode": _nested_value(
+            config,
+            "tool_config",
+            "function_calling_config",
+            "mode",
+        ),
+        "automatic_function_calling_disabled": _nested_value(
+            config,
+            "automatic_function_calling",
+            "disable",
+        ),
+        "response_modalities": config.get("response_modalities"),
         "response_mime_type": config.get("response_mime_type"),
         "thinking_config": config.get("thinking_config"),
         "max_output_tokens": config.get("max_output_tokens"),
@@ -4414,6 +4809,11 @@ def _skill_check_planning_packet(context_packet: dict[str, Any]) -> dict[str, An
             if isinstance(state.get("gm_secrets"), dict)
             else {}
         ),
+        "miscellaneous": (
+            state.get("miscellaneous", {})
+            if isinstance(state.get("miscellaneous"), dict)
+            else {}
+        ),
         "recent_checks": skills.get("recent_checks", []),
         "recent_history": recent_history[-2:],
     }
@@ -4445,6 +4845,9 @@ def _context_packet_stats(
         "active_tasks": _list_len(_nested_value(state, "active_tasks", "tasks")),
         "relevant_npcs": _list_len(_nested_value(state, "npcs", "relevant")),
         "active_gm_secrets": _list_len(_nested_value(state, "gm_secrets", "active")),
+        "miscellaneous_entries": _list_len(
+            _nested_value(state, "miscellaneous", "entries")
+        ),
         "valid_music_tracks": _list_len(_nested_value(state, "audio", "valid_music_tracks")),
     }
 
@@ -4480,6 +4883,131 @@ def _state_subpacket(context_packet: dict[str, Any], name: str) -> dict[str, Any
     subpacket = state.get(name, {})
 
     return subpacket if isinstance(subpacket, dict) else {}
+
+
+def _filter_audio_events_for_catalogs(
+    events: list[dict[str, Any]],
+    context_packet: dict[str, Any] | None,
+    *,
+    response_label: str,
+) -> list[dict[str, Any]]:
+    """Keeps audio events inside their distinct, request-visible catalogs."""
+
+    if not isinstance(context_packet, dict):
+        return events
+
+    raw_audio = context_packet.get("audio")
+    if not isinstance(raw_audio, dict) or not raw_audio:
+        raw_audio = _state_subpacket(context_packet, "audio")
+    valid_music, valid_effects = distinct_audio_track_catalogs(
+        raw_audio.get("valid_music_tracks", []),
+        raw_audio.get("valid_sound_effect_tracks", []),
+    )
+    music_by_key = {track.casefold(): track for track in valid_music}
+    effects_by_key = {track.casefold(): track for track in valid_effects}
+    filtered: list[dict[str, Any]] = []
+
+    for event in events:
+        event_type = str(event.get("type", "") or "").strip()
+        if event_type not in {"MusicChangedEvent", "SoundEffectChangedEvent"}:
+            filtered.append(event)
+            continue
+
+        payload = event.get("payload", {})
+        if not isinstance(payload, dict):
+            LOGGER.warning(
+                "Dropped %s from Gemini %s because its payload was not an object.",
+                event_type,
+                response_label,
+            )
+            continue
+        filename = str(
+            payload.get(
+                "filename",
+                payload.get("file_name", payload.get("track", payload.get("track_name", ""))),
+            )
+            or ""
+        ).strip()
+        filename_key = filename.casefold()
+
+        catalog = music_by_key if event_type == "MusicChangedEvent" else effects_by_key
+        canonical_filename = catalog.get(filename_key)
+        if canonical_filename is None:
+            catalog_label = "music" if event_type == "MusicChangedEvent" else "sound-effect"
+            LOGGER.warning(
+                "Dropped %s from Gemini %s because %r is not in the distinct %s catalog.",
+                event_type,
+                response_label,
+                filename,
+                catalog_label,
+            )
+            continue
+
+        if canonical_filename != filename:
+            event = dict(event)
+            payload = dict(payload)
+            payload["filename"] = canonical_filename
+            event["payload"] = payload
+        filtered.append(event)
+
+    return filtered
+
+
+def _extract_narration_sound_effect_cues(
+    events: list[dict[str, Any]],
+    narrative_text: str,
+    *,
+    response_label: str,
+) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
+    """Separates validated one-shot sound cues from state-changing events."""
+
+    remaining_events: list[dict[str, Any]] = []
+    cues: list[dict[str, str]] = []
+    clean_narrative = str(narrative_text or "")
+
+    for event in events:
+        if str(event.get("type", "") or "").strip() != "SoundEffectChangedEvent":
+            remaining_events.append(event)
+            continue
+
+        payload = event.get("payload", {})
+        if not isinstance(payload, dict):
+            LOGGER.warning(
+                "Dropped narration sound cue from Gemini %s because its payload "
+                "was not an object.",
+                response_label,
+            )
+            continue
+
+        filename = str(payload.get("filename", "") or "").strip()
+        anchor_text = str(payload.get("anchor_text", "") or "").strip()
+        position = str(payload.get("position", "") or "").strip().casefold()
+        if not filename or not anchor_text or position not in {"before", "after"}:
+            LOGGER.warning(
+                "Dropped narration sound cue %r from Gemini %s because filename, "
+                "anchor_text, and a before/after position are required.",
+                filename,
+                response_label,
+            )
+            continue
+        if clean_narrative.count(anchor_text) != 1:
+            LOGGER.warning(
+                "Dropped narration sound cue %r from Gemini %s because anchor %r "
+                "does not appear exactly once in the response.",
+                filename,
+                response_label,
+                anchor_text,
+            )
+            continue
+        cues.append(
+            {
+                "filename": filename,
+                "anchor_text": anchor_text,
+                "position": position,
+            }
+        )
+
+    return remaining_events, cues
 
 
 def parse_skill_check_plan_response(raw_text: str) -> SkillCheckPlanResult:
@@ -4638,6 +5166,7 @@ def _drop_unwarranted_skill_check_events(
         narrative_text=result.narrative_text,
         suggested_actions=result.suggested_actions,
         suggested_events=filtered_events,
+        sound_effect_cues=result.sound_effect_cues,
         out_of_game=result.out_of_game,
         raw_text=result.raw_text,
     )
@@ -4723,6 +5252,16 @@ def parse_gemini_story_response(
     suggested_events = [
         event for event in raw_events if isinstance(event, dict)
     ]
+    suggested_events = _filter_audio_events_for_catalogs(
+        suggested_events,
+        context_packet,
+        response_label="story response",
+    )
+    suggested_events, sound_effect_cues = _extract_narration_sound_effect_cues(
+        suggested_events,
+        response_text,
+        response_label="story response",
+    )
     pronunciation_map = normalize_pronunciation_map(data.get("pronunciation_map", {}))
     explicit_out_of_game = (
         isinstance(context_packet, dict)
@@ -4731,6 +5270,7 @@ def parse_gemini_story_response(
     if explicit_out_of_game:
         suggested_actions = []
         suggested_events = []
+        sound_effect_cues = []
     event_types = [
         str(event.get("type", "UnknownEvent")).strip() or "UnknownEvent"
         for event in suggested_events
@@ -4751,6 +5291,7 @@ def parse_gemini_story_response(
         narrative_text=narrative_text,
         suggested_actions=suggested_actions,
         suggested_events=suggested_events,
+        sound_effect_cues=sound_effect_cues,
         pronunciation_map=pronunciation_map,
         out_of_game=(
             explicit_out_of_game
@@ -4804,6 +5345,7 @@ def _normalize_visible_currency_phrasing(
         narrative_text=narrative_text,
         suggested_actions=suggested_actions,
         suggested_events=result.suggested_events,
+        sound_effect_cues=result.sound_effect_cues,
         out_of_game=result.out_of_game,
         raw_text=result.raw_text,
     )
@@ -4835,6 +5377,7 @@ def _ensure_in_game_suggested_actions(
         ),
         suggested_actions=fallback_actions,
         suggested_events=result.suggested_events,
+        sound_effect_cues=result.sound_effect_cues,
         out_of_game=result.out_of_game,
         raw_text=result.raw_text,
     )
@@ -4851,10 +5394,15 @@ def _enforce_explicit_conversation_mode(
         result.out_of_game == is_out_of_game
         and (not is_out_of_game or not result.suggested_actions)
         and (not is_out_of_game or not result.suggested_events)
+        and (not is_out_of_game or not result.sound_effect_cues)
     ):
         return result
 
-    if is_out_of_game and (result.suggested_actions or result.suggested_events):
+    if is_out_of_game and (
+        result.suggested_actions
+        or result.suggested_events
+        or result.sound_effect_cues
+    ):
         LOGGER.warning(
             "Discarded suggested actions/events from an explicit out-of-game response."
         )
@@ -4867,6 +5415,7 @@ def _enforce_explicit_conversation_mode(
         narrative_text=result.narrative_text,
         suggested_actions=[] if is_out_of_game else result.suggested_actions,
         suggested_events=[] if is_out_of_game else result.suggested_events,
+        sound_effect_cues=[] if is_out_of_game else result.sound_effect_cues,
         out_of_game=is_out_of_game,
         raw_text=result.raw_text,
     )
@@ -4961,17 +5510,19 @@ def _enforce_container_reward_flow(
     if result.out_of_game:
         return result
 
-    combined_text = " ".join(
+    current_turn_text = " ".join(
         [
             str(context_packet.get("player_command", "")),
             result.narrative_text,
-            *result.suggested_actions,
         ]
     )
     closed_container_names = _closed_container_names_from_context(context_packet)
-    references_closed_container = any(
-        name.casefold() in combined_text.casefold()
-        for name in closed_container_names
+    accesses_closed_container = (
+        _text_indicates_unopened_container(current_turn_text)
+        and any(
+            name.casefold() in current_turn_text.casefold()
+            for name in closed_container_names
+        )
     )
     adds_closed_container = any(
         _event_is_closed_container_addition(event)
@@ -4982,12 +5533,12 @@ def _enforce_container_reward_flow(
         for event in result.suggested_events
     )
     protects_closed_contents = (
-        references_closed_container
+        accesses_closed_container
         or adds_closed_container
-        or _text_indicates_unopened_container(combined_text)
+        or takes_contents
     )
 
-    if not protects_closed_contents and not takes_contents:
+    if not protects_closed_contents:
         return result
 
     filtered_events: list[dict[str, Any]] = []
@@ -5024,14 +5575,16 @@ def _enforce_container_reward_flow(
         return result
 
     LOGGER.warning(
-        "Dropped direct container reward event(s) %s; stored contents may only "
-        "transfer through ContainerContentsTakenEvent after the container opens.",
+        "Python container-flow guard dropped direct reward event(s) %s; stored "
+        "contents may only transfer through ContainerContentsTakenEvent after the "
+        "container opens.",
         removed_event_types,
     )
     return AiNarrationResult(
         narrative_text=result.narrative_text,
         suggested_actions=result.suggested_actions,
         suggested_events=filtered_events,
+        sound_effect_cues=result.sound_effect_cues,
         out_of_game=result.out_of_game,
         raw_text=result.raw_text,
     )
@@ -5150,6 +5703,7 @@ def _drop_duplicate_resolved_skill_check_events(
         narrative_text=result.narrative_text,
         suggested_actions=result.suggested_actions,
         suggested_events=filtered_events,
+        sound_effect_cues=result.sound_effect_cues,
         out_of_game=result.out_of_game,
         raw_text=result.raw_text,
     )
@@ -5284,6 +5838,7 @@ def _ensure_inventory_for_collected_reagents(
         narrative_text=result.narrative_text,
         suggested_actions=result.suggested_actions,
         suggested_events=updated_events,
+        sound_effect_cues=result.sound_effect_cues,
         out_of_game=result.out_of_game,
         raw_text=result.raw_text,
     )
@@ -5332,6 +5887,7 @@ def _ensure_inventory_for_narrated_collection(
         narrative_text=trimmed_narrative,
         suggested_actions=result.suggested_actions,
         suggested_events=result.suggested_events,
+        sound_effect_cues=result.sound_effect_cues,
         out_of_game=result.out_of_game,
         raw_text=result.raw_text,
     )
@@ -5578,6 +6134,7 @@ def parse_gemini_new_game_response(
     start_weather = str(data.get("weather", data.get("start_weather", ""))).strip()
     locations = _parse_new_game_locations(data.get("locations"), start_location)
     gm_secrets = _parse_new_game_gm_secrets(data.get("gm_secrets"))
+    miscellaneous = _parse_new_game_miscellaneous(data.get("miscellaneous"))
     introductory_message = str(
         data.get("introductory_message", data.get("response", ""))
     ).strip()
@@ -5631,6 +6188,16 @@ def parse_gemini_new_game_response(
     suggested_events = [
         event for event in raw_events if isinstance(event, dict)
     ]
+    suggested_events = _filter_audio_events_for_catalogs(
+        suggested_events,
+        setup_packet,
+        response_label="new-game response",
+    )
+    suggested_events, sound_effect_cues = _extract_narration_sound_effect_cues(
+        suggested_events,
+        str(data.get("introductory_message", data.get("response", ""))).strip(),
+        response_label="new-game response",
+    )
     LOGGER.info(
         "Gemini parsed %s new-game event(s): payload=%s",
         len(suggested_events),
@@ -5647,6 +6214,7 @@ def parse_gemini_new_game_response(
         selected_genre=selected_genre,
         locations=locations,
         gm_secrets=gm_secrets,
+        miscellaneous=miscellaneous,
         finalized_character=finalized_character,
         finalized_skills=finalized_skills,
         finalized_starter_items=finalized_starter_items,
@@ -5660,6 +6228,7 @@ def parse_gemini_new_game_response(
         pronunciation_map=pronunciation_map,
         suggested_actions=suggested_actions,
         suggested_events=suggested_events,
+        sound_effect_cues=sound_effect_cues,
         raw_text=guarded_raw_text,
     )
 
@@ -5736,6 +6305,41 @@ def _parse_new_game_gm_secrets(raw_secrets: Any) -> list[dict[str, Any]]:
         )
 
     return secrets
+
+
+def _parse_new_game_miscellaneous(raw_entries: Any) -> list[dict[str, Any]]:
+    """Parses general world canon from new-game synthesis."""
+
+    if not isinstance(raw_entries, list):
+        return []
+
+    entries: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+
+    for raw_entry in raw_entries:
+        if not isinstance(raw_entry, dict):
+            continue
+
+        misc_id = str(raw_entry.get("misc_id", "")).strip()
+        name = str(raw_entry.get("name", "")).strip()
+        category = str(raw_entry.get("category", "")).strip() or "Miscellaneous"
+        details = str(raw_entry.get("details", "")).strip()
+        normalized_id = misc_id.casefold()
+
+        if not misc_id or not name or not details or normalized_id in seen_ids:
+            continue
+
+        seen_ids.add(normalized_id)
+        entries.append(
+            {
+                "misc_id": misc_id,
+                "name": name,
+                "category": category,
+                "details": details,
+            }
+        )
+
+    return entries
 
 
 def _parse_new_game_locations(

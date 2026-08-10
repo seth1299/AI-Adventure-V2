@@ -164,7 +164,6 @@ class SaveRepository:
         repository.set_setting("audio.tts_custom_voices", [])
         repository.set_setting("tts.pronunciation_map", {})
         repository.set_setting("audio.current_music", "")
-        repository.set_setting("audio.current_sound_effect", "")
         repository.set_journal_notes("")
         repository.set_journal_share_with_ai(False)
         repository.set_currency_denominations(DEFAULT_CURRENCY_DENOMINATIONS)
@@ -283,7 +282,6 @@ class SaveRepository:
         self.set_setting("audio.tts_custom_voices", audio_settings["tts_custom_voices"])
         self.set_setting("tts.pronunciation_map", clean_setup["pronunciation_map"])
         self.set_setting("audio.current_music", "")
-        self.set_setting("audio.current_sound_effect", "")
         self.set_setting("new_game.setup", clean_setup)
         self.set_setting("world.setup_context", clean_setup["world_context"])
         self.set_setting("world.genre", clean_setup["specified_genre"])
@@ -2388,6 +2386,92 @@ class SaveRepository:
 
         return [_gm_secret_row_to_dict(row) for row in rows]
 
+    def upsert_miscellaneous(
+        self,
+        *,
+        name: str,
+        category: str,
+        details: str,
+        misc_id: str = "",
+    ) -> dict[str, Any] | None:
+        """Creates or replaces one general world-lore record."""
+
+        clean_name = " ".join(name.strip().split())
+        clean_category = " ".join(category.strip().split()) or "Miscellaneous"
+        clean_details = details.strip()
+
+        if not clean_name or not clean_details:
+            LOGGER.warning("Skipped miscellaneous upsert without name and details.")
+            return None
+
+        clean_misc_id = _miscellaneous_id(misc_id or clean_name)
+        timestamp = datetime.now().isoformat(timespec="seconds")
+
+        with self._connect() as connection:
+            existing = connection.execute(
+                "SELECT created_at FROM miscellaneous WHERE misc_id = ?",
+                (clean_misc_id,),
+            ).fetchone()
+            created_at = timestamp if existing is None else str(existing["created_at"])
+            connection.execute(
+                """
+                INSERT INTO miscellaneous (
+                    misc_id,
+                    name,
+                    category,
+                    details,
+                    created_at,
+                    updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(misc_id) DO UPDATE SET
+                    name = excluded.name,
+                    category = excluded.category,
+                    details = excluded.details,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    clean_misc_id,
+                    clean_name,
+                    clean_category,
+                    clean_details,
+                    created_at,
+                    timestamp,
+                ),
+            )
+
+        return self.get_miscellaneous(clean_misc_id)
+
+    def get_miscellaneous(self, misc_id: str) -> dict[str, Any] | None:
+        """Reads one miscellaneous world-lore record by stable id."""
+
+        clean_misc_id = _miscellaneous_id(misc_id)
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT misc_id, name, category, details, created_at, updated_at
+                FROM miscellaneous
+                WHERE misc_id = ?
+                """,
+                (clean_misc_id,),
+            ).fetchone()
+
+        return None if row is None else _miscellaneous_row_to_dict(row)
+
+    def list_miscellaneous(self) -> list[dict[str, Any]]:
+        """Lists every general world-lore record for always-on AI context."""
+
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT misc_id, name, category, details, created_at, updated_at
+                FROM miscellaneous
+                ORDER BY created_at ASC, name COLLATE NOCASE, misc_id
+                """
+            ).fetchall()
+
+        return [_miscellaneous_row_to_dict(row) for row in rows]
+
     @staticmethod
     def create_message_id() -> str:
         """Returns a globally unique identifier for one conversation message."""
@@ -2422,6 +2506,7 @@ class SaveRepository:
         content: str,
         *,
         message_id: str | None = None,
+        sound_effect_cues: list[dict[str, str]] | None = None,
     ) -> str:
         """
         Appends an entry to the adventure history.
@@ -2430,6 +2515,7 @@ class SaveRepository:
             kind: Entry category, such as player, story, system, inventory, or alchemy.
             content: Entry text.
             message_id: Optional conversation message ID.
+            sound_effect_cues: Exact one-shot narration cue anchors for replay.
 
         Returns:
             The associated conversation message ID.
@@ -2442,17 +2528,37 @@ class SaveRepository:
             return self._resolve_message_id(message_id)
 
         resolved_message_id = self._resolve_message_id(message_id)
+        clean_sound_effect_cues = [
+            {
+                "filename": str(cue.get("filename", "") or "").strip(),
+                "anchor_text": str(cue.get("anchor_text", "") or "").strip(),
+                "position": str(cue.get("position", "") or "").strip().casefold(),
+            }
+            for cue in (sound_effect_cues or [])
+            if isinstance(cue, dict)
+            and str(cue.get("filename", "") or "").strip()
+            and str(cue.get("anchor_text", "") or "").strip()
+            and str(cue.get("position", "") or "").strip().casefold()
+            in {"before", "after"}
+        ]
 
         with self._connect() as connection:
             connection.execute(
                 """
-                INSERT INTO history_entries (message_id, kind, content, created_at)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO history_entries (
+                    message_id,
+                    kind,
+                    content,
+                    sound_effect_cues_json,
+                    created_at
+                )
+                VALUES (?, ?, ?, ?, ?)
                 """,
                 (
                     resolved_message_id,
                     kind.strip() or "misc",
                     clean_content,
+                    json.dumps(clean_sound_effect_cues, ensure_ascii=False),
                     datetime.now().isoformat(timespec="seconds"),
                 ),
             )
@@ -2554,13 +2660,27 @@ class SaveRepository:
         with self._connect() as connection:
             rows = connection.execute(
                 """
-                SELECT id, message_id, kind, content, created_at
+                SELECT id, message_id, kind, content, sound_effect_cues_json, created_at
                 FROM history_entries
                 ORDER BY id ASC
                 """
             ).fetchall()
 
-        return [dict(row) for row in rows]
+        history: list[dict[str, Any]] = []
+        for row in rows:
+            entry = dict(row)
+            try:
+                raw_cues = json.loads(str(entry.pop("sound_effect_cues_json", "[]")))
+            except json.JSONDecodeError:
+                LOGGER.warning("History entry %s has invalid sound cue JSON.", entry["id"])
+                raw_cues = []
+            entry["sound_effect_cues"] = (
+                [cue for cue in raw_cues if isinstance(cue, dict)]
+                if isinstance(raw_cues, list)
+                else []
+            )
+            history.append(entry)
+        return history
 
     def capture_message_snapshot(self, message_id: str) -> None:
         """Captures the complete database state immediately before one response."""
@@ -3625,11 +3745,21 @@ class SaveRepository:
                     updated_at TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS miscellaneous (
+                    misc_id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    category TEXT NOT NULL DEFAULT 'Miscellaneous',
+                    details TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
                 CREATE TABLE IF NOT EXISTS history_entries (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     message_id TEXT NOT NULL,
                     kind TEXT NOT NULL,
                     content TEXT NOT NULL,
+                    sound_effect_cues_json TEXT NOT NULL DEFAULT '[]',
                     created_at TEXT NOT NULL
                 );
 
@@ -3730,6 +3860,12 @@ class SaveRepository:
                 "history_entries",
                 "message_id",
                 "TEXT NOT NULL DEFAULT ''",
+            )
+            _ensure_column(
+                connection,
+                "history_entries",
+                "sound_effect_cues_json",
+                "TEXT NOT NULL DEFAULT '[]'",
             )
             _ensure_column(
                 connection,
@@ -3992,6 +4128,13 @@ def _gm_secret_id(value: str) -> str:
 
     cleaned = re.sub(r"[^a-zA-Z0-9]+", "_", value.strip().casefold()).strip("_")
     return (cleaned or "unnamed_secret")[:100]
+
+
+def _miscellaneous_id(value: str) -> str:
+    """Builds a stable id for one miscellaneous world-lore record."""
+
+    cleaned = re.sub(r"[^a-zA-Z0-9]+", "_", value.strip().casefold()).strip("_")
+    return (cleaned or "unnamed_miscellaneous_entry")[:100]
 
 
 def _fallback_npc_display_name(name: str, role: str) -> str:
@@ -4516,6 +4659,19 @@ def _gm_secret_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
             "GM secret related locations",
         ),
         "status": row["status"],
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
+def _miscellaneous_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    """Converts a miscellaneous world-lore row to a plain dictionary."""
+
+    return {
+        "misc_id": row["misc_id"],
+        "name": row["name"],
+        "category": row["category"],
+        "details": row["details"],
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
     }

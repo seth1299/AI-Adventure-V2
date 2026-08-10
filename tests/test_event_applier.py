@@ -1026,34 +1026,23 @@ class EventApplierTests(unittest.TestCase):
                 "Town Village City.mp3",
             )
 
-    def test_applies_and_stops_independent_sound_effect_event(self) -> None:
+    def test_sound_effect_event_is_not_persistent_game_state(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             repository = SaveRepository.create_new_save(Path(temp_dir), "Effects Test")
             applier = EventApplier(repository)
 
-            started = applier.apply_event(
+            result = applier.apply_event(
                 {
                     "type": "SoundEffectChangedEvent",
-                    "payload": {"filename": "Steady Rain.wav"},
+                    "payload": {
+                        "filename": "Hammer.wav",
+                        "anchor_text": "hammer",
+                        "position": "after",
+                    },
                 }
             )
-            self.assertEqual(started.status, "applied")
-            self.assertEqual(
-                repository.get_setting("audio.current_sound_effect"),
-                "Steady Rain.wav",
-            )
-
-            stopped = applier.apply_event(
-                {
-                    "type": "SoundEffectChangedEvent",
-                    "payload": {"filename": "STOP"},
-                }
-            )
-            self.assertEqual(stopped.status, "applied")
-            self.assertEqual(
-                repository.get_setting("audio.current_sound_effect"),
-                "",
-            )
+            self.assertEqual(result.status, "skipped")
+            self.assertIsNone(repository.get_setting("audio.current_sound_effect"))
 
     def test_normalizes_event_type_alias_from_new_game_events(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1098,6 +1087,44 @@ class EventApplierTests(unittest.TestCase):
 
             self.assertEqual([result.status for result in results], ["skipped"])
             self.assertIn("Unsupported event type", results[0].message)
+
+    def test_miscellaneous_upsert_event_stores_and_updates_general_canon(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = SaveRepository.create_new_save(Path(temp_dir), "Misc Test")
+            applier = EventApplier(repository)
+
+            first = applier.apply_event(
+                {
+                    "type": "MiscellaneousUpsertedEvent",
+                    "payload": {
+                        "misc_id": "glassback_grazer",
+                        "name": "Glassback Grazer",
+                        "category": "Creature",
+                        "details": "A six-legged herbivore with a translucent shell.",
+                    },
+                }
+            )
+            second = applier.apply_event(
+                {
+                    "type": "MiscellaneousUpsertedEvent",
+                    "payload": {
+                        "misc_id": "glassback_grazer",
+                        "name": "Glassback Grazer",
+                        "category": "Creature",
+                        "details": (
+                            "A six-legged herbivore whose translucent shell darkens "
+                            "before storms."
+                        ),
+                    },
+                }
+            )
+
+            entries = repository.list_miscellaneous()
+            self.assertEqual(first.status, "applied")
+            self.assertEqual(second.status, "applied")
+            self.assertEqual(len(entries), 1)
+            self.assertEqual(entries[0]["misc_id"], "glassback_grazer")
+            self.assertIn("darkens before storms", entries[0]["details"])
 
     def test_event_payloads_sanitize_banned_creative_terms_before_storage(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

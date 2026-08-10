@@ -10,9 +10,11 @@ from ai_adventure.calendar_system import (
     normalize_calendar_settings,
 )
 from ai_adventure.audio.tts_settings import normalize_tts_audio_fields
+from ai_adventure.audio.catalog import distinct_audio_track_catalogs
 from ai_adventure.audio.pronunciation import (
-    merge_pronunciation_maps,
+    KOKORO_IPA_PROMPT_RULE,
     normalize_pronunciation_map,
+    set_authoritative_pronunciation,
 )
 from ai_adventure.context.creative_ideas import CreativeIdeasLibrary
 from ai_adventure.context.naming import GENERIC_PROPER_NOUN_PLACEHOLDER_RULE
@@ -249,11 +251,10 @@ def normalize_new_game_setup(raw_setup: Any) -> dict[str, Any]:
         raw_setup.get("pronunciation_map", {})
     )
     if raw_character_name_pronunciation and character.get("name"):
-        pronunciation_map = merge_pronunciation_maps(
-            {
-                str(character["name"]).strip(): raw_character_name_pronunciation
-            },
+        pronunciation_map = set_authoritative_pronunciation(
             pronunciation_map,
+            character["name"],
+            raw_character_name_pronunciation,
         )
     narration_preferences = normalize_narration_preferences(
         raw_setup.get("narration", {})
@@ -435,16 +436,10 @@ def build_new_game_setup_packet(
         guidance = clean_setup["calendar"].get("generation_guidance", "")
         if guidance:
             packet_setup["calendar"]["generation_guidance"] = guidance
-    clean_music_tracks = [
-        str(track).strip()
-        for track in (valid_music_tracks or [])
-        if str(track).strip()
-    ]
-    clean_sound_effect_tracks = [
-        str(track).strip()
-        for track in (valid_sound_effect_tracks or [])
-        if str(track).strip()
-    ]
+    clean_music_tracks, clean_sound_effect_tracks = distinct_audio_track_catalogs(
+        valid_music_tracks,
+        valid_sound_effect_tracks,
+    )
     creative_ideas = CreativeIdeasLibrary.load_default().select_for_new_game()
     starter_item_count = len(clean_setup["starter_items"])
     ai_mode_preferences = normalize_ai_mode_preferences(clean_setup["ai_settings"])
@@ -506,6 +501,12 @@ def build_new_game_setup_packet(
                 "profile text, and all other "
                 "player-facing prose. These preferences do not relax schema "
                 "completeness or hidden-information rules."
+            ),
+            "pronunciation_map": (
+                "Return exact visible ambiguous names and recurring terms as {term, ipa} "
+                "records for TTS only. Omit ordinary words and keep pronunciation hints "
+                f"out of visible prose. {KOKORO_IPA_PROMPT_RULE} Honor the player's "
+                "character.name_pronunciation guide when producing the character name's IPA."
             ),
             "calendar_weather_consistency": (
                 "When current_calendar is present, opening prose must match it unless "
@@ -575,6 +576,16 @@ def build_new_game_setup_packet(
                 "inventory, or other public state; if setup did not establish such a "
                 "fact, omit it rather than secretly inventing it."
             ),
+            "miscellaneous": (
+                "Return established non-secret world canon that does not fit a "
+                "Location, NPC, Item, active task, or GM secret in the top-level "
+                "miscellaneous array. Use stable misc_id values and complete name, "
+                "category, and details fields. This includes original creatures or "
+                "species, cultures, factions, religions, laws, historical events, "
+                "and supernatural or scientific phenomena. Do not duplicate records "
+                "that belong in another structured field. Return an empty array when "
+                "no such starting canon is needed."
+            ),
             "starting_task": (
                 "setup.starting_task.mode controls the initial active quest. If "
                 "mode is none, do not create an initial ActiveTaskUpsertedEvent "
@@ -592,11 +603,15 @@ def build_new_game_setup_packet(
                 "match one entry from audio.valid_music_tracks."
             ),
             "starting_sound_effect": (
-                "If a looping ambient sound would strengthen the opening scene and "
-                "valid sound-effect tracks are available, suggest one "
-                "SoundEffectChangedEvent. Its filename must exactly match one entry "
-                "from audio.valid_sound_effect_tracks. This plays independently and "
-                "may be used alongside MusicChangedEvent."
+                "For every specific moment in the opening narration that would "
+                "genuinely benefit from a short sound, suggest a separate "
+                "SoundEffectChangedEvent when an appropriate listed effect exists. "
+                "There is no fixed cue-count target. Each filename must exactly match one entry "
+                "from audio.valid_sound_effect_tracks and must never come from "
+                "audio.valid_music_tracks. "
+                "For every event, copy a unique exact excerpt from introductory_message "
+                "into anchor_text and set position to before or after. Each plays once and "
+                "must never be used for looping ambience."
             ),
             "ai_invention_policy": (
                 "Default, placeholder, or blank fields are not confirmed world facts. "
@@ -895,10 +910,13 @@ def build_new_game_setup_packet(
             "valid_music_tracks": clean_music_tracks,
             "current_music": "",
             "valid_sound_effect_tracks": clean_sound_effect_tracks,
-            "current_sound_effect": "",
         },
         "creative_ideas": creative_ideas,
     }
+    if not clean_music_tracks:
+        packet["requirements"].pop("starting_music", None)
+    if not clean_sound_effect_tracks:
+        packet["requirements"].pop("starting_sound_effect", None)
     if not calendar_is_ai_generated:
         packet["current_calendar"] = build_calendar_snapshot(
             DEFAULT_START_ELAPSED_MINUTES,

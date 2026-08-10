@@ -14,6 +14,10 @@ SSMD_INLINE_VOICE_RE = re.compile(
     r"\[([^\]]+)\]\{\s*voice\s*=\s*['\"][^'\"]+['\"]\s*\}",
     re.IGNORECASE,
 )
+SSMD_PHONEME_RE = re.compile(
+    r'\[([^\]]+)\]\{\s*(?:ph|phonemes)\s*=\s*[\'"][^\'"]+[\'"]\s*\}',
+    re.IGNORECASE,
+)
 SSMD_DIV_TAG_RE = re.compile(r"</?div\b[^>]*>", re.IGNORECASE)
 
 
@@ -56,6 +60,7 @@ def strip_ssmd_markup_for_plain_tts(text: str) -> str:
     """Converts SSMD text into plain text for engines without SSMD support."""
 
     plain_text = str(text or "")
+    plain_text = SSMD_PHONEME_RE.sub(lambda match: match.group(1), plain_text)
     plain_text = SSMD_INLINE_VOICE_RE.sub(lambda match: match.group(1), plain_text)
     plain_text = SSMD_DIV_TAG_RE.sub(" ", plain_text)
     plain_text = SSMD_SAY_AS_RE.sub(_replace_say_as_for_plain_tts, plain_text)

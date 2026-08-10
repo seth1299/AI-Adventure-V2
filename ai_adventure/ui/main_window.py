@@ -166,7 +166,10 @@ class NarrationPlayerProtocol(Protocol):
         text: str,
         *,
         voice: str | None = None,
+        sound_effect_cues: list[dict[str, str]] | None = None,
+        tts_text_transform: Callable[[str], str] | None = None,
         on_chunk_start: Callable[[str], None] | None = None,
+        on_sound_effect: Callable[[str], None] | None = None,
         on_complete: Callable[[], None] | None = None,
     ) -> bool: ...
 
@@ -198,6 +201,7 @@ if not is_playtesting_build():
     from ai_adventure.audio.sound_manager import (
         SoundManager as _SoundManagerClass,
         prepare_sound_directory,
+        prepare_sound_effect_directory,
     )
 else:
     _NarrationPlayerClass = None
@@ -207,6 +211,11 @@ else:
         """Returns a harmless placeholder path in the audio-free build."""
 
         return Path(app_paths.sounds_dir)
+
+    def prepare_sound_effect_directory(app_paths: Any) -> Path:
+        """Returns a harmless placeholder effect path in the audio-free build."""
+
+        return Path(app_paths.sound_effects_dir)
 from ai_adventure.audio.tts_settings import (
     DEFAULT_TTS_SPEED_PERCENT,
     active_voice_spec_from_audio,
@@ -220,9 +229,11 @@ from ai_adventure.audio.tts_settings import (
     voice_display_name,
 )
 from ai_adventure.audio.pronunciation import (
+    PronunciationMap,
     apply_pronunciation_map,
     merge_pronunciation_maps,
     normalize_pronunciation_map,
+    set_authoritative_pronunciation,
 )
 from ai_adventure.audio.voices import (
     DEFAULT_NARRATOR_VOICE,
@@ -789,7 +800,10 @@ class MainWindow(QMainWindow):
         self.sound_manager = (
             None
             if self.playtesting_build or _SoundManagerClass is None
-            else _SoundManagerClass(prepare_sound_directory(self.app_paths))
+            else _SoundManagerClass(
+                prepare_sound_directory(self.app_paths),
+                prepare_sound_effect_directory(self.app_paths),
+            )
         )
         self.narration_player = _create_narration_player(self.app_paths)
 
@@ -1159,12 +1173,16 @@ class MainWindow(QMainWindow):
         if self.active_repository is not repository:
             return
 
+        narration_started = False
         try:
             self._synthesize_new_game_world(repository, setup)
+            narration_started = self.game_shell.story_screen.narrate_latest_story(
+                reveal_progressively=True,
+            )
             self.game_shell.refresh_screens()
-            self.game_shell.story_screen.narrate_latest_story()
         finally:
-            self.game_shell.story_screen.set_initial_generation_pending(False)
+            if not narration_started:
+                self.game_shell.story_screen.set_initial_generation_pending(False)
 
     def _synthesize_new_game_world(
         self,
@@ -1238,6 +1256,7 @@ class MainWindow(QMainWindow):
                 setup,
                 result.finalized_character,
             ),
+            sound_effect_cues=result.sound_effect_cues,
         )
 
         if result.suggested_events:
@@ -1318,6 +1337,14 @@ class MainWindow(QMainWindow):
                 related_npc_ids=list(secret.get("related_npc_ids", [])),
                 related_locations=list(secret.get("related_locations", [])),
                 status=str(secret.get("status", "active")),
+            )
+
+        for entry in getattr(result, "miscellaneous", []):
+            repository.upsert_miscellaneous(
+                misc_id=str(entry.get("misc_id", "")),
+                name=str(entry.get("name", "")),
+                category=str(entry.get("category", "")),
+                details=str(entry.get("details", "")),
             )
 
         setup_calendar = setup.get("calendar", {})
@@ -1408,18 +1435,20 @@ class MainWindow(QMainWindow):
             if character.get("notes"):
                 repository.set_setting("player.notes", character["notes"])
 
-        repository.set_setting(
-            "tts.pronunciation_map",
-            merge_pronunciation_maps(
-                setup.get("pronunciation_map", {}),
-                getattr(result, "pronunciation_map", {}),
-                {
-                    setup.get("character", {}).get("name", ""): setup.get(
-                        "character", {}
-                    ).get("name_pronunciation", "")
-                },
-            ),
+        pronunciation_map = merge_pronunciation_maps(
+            setup.get("pronunciation_map", {}),
+            getattr(result, "pronunciation_map", {}),
         )
+        setup_character = setup.get("character", {})
+        if isinstance(setup_character, dict) and setup_character.get(
+            "name_pronunciation"
+        ):
+            pronunciation_map = set_authoritative_pronunciation(
+                pronunciation_map,
+                setup_character.get("name", ""),
+                setup_character.get("name_pronunciation", ""),
+            )
+        repository.set_setting("tts.pronunciation_map", pronunciation_map)
 
         finalized_skills = (
             []
@@ -2858,7 +2887,7 @@ class MainMenuSettingsDialog(QDialog):
                 "Music Volume:",
                 _slider_row(self.music_volume_slider, self.music_volume_label),
             )
-            form.addRow("Ambient Sound Effects:", self.sound_effects_enabled_checkbox)
+            form.addRow("Narration Sound Effects:", self.sound_effects_enabled_checkbox)
             form.addRow(
                 "Sound Effects Volume:",
                 _slider_row(
@@ -3305,7 +3334,7 @@ class NewGameTemplateManagerDialog(QDialog):
         self.character_name_input.setPlaceholderText("Player character name")
         self.character_name_pronunciation_input = QLineEdit()
         self.character_name_pronunciation_input.setPlaceholderText(
-            "Optional phonetic spelling for the narrator, e.g. KAH-tha-lah"
+            "Optional: kah-tha-lah, or /kəˈθɑlə/ for exact IPA"
         )
         self.appearance_input = QTextEdit()
         self.appearance_input.setPlaceholderText("Appearance, clothing, visible traits...")
@@ -4857,7 +4886,7 @@ class NewGameWizard(QWizard):
         self.tts_speed_slider: QSlider | None = None
         self.tts_settings_widget: TTSSettingsWidget | None = None
         self._legacy_currency_description = ""
-        self._pronunciation_map: dict[str, str] = {}
+        self._pronunciation_map: PronunciationMap = {}
         self._starting_location_row_id_counter = 0
         default_modes = normalize_ai_mode_preferences({})
         self._new_game_ai_settings: dict[str, Any] = {
@@ -6003,7 +6032,7 @@ class NewGameWizard(QWizard):
         self.character_name_input.setText("Player Name")
         self.character_name_pronunciation_input = QLineEdit()
         self.character_name_pronunciation_input.setPlaceholderText(
-            "Optional phonetic spelling for the narrator, e.g. KAH-tha-lah"
+            "Optional: kah-tha-lah, or /kəˈθɑlə/ for exact IPA"
         )
 
         self.appearance_input = QTextEdit()
@@ -7361,7 +7390,7 @@ class StoryScreen(RepositoryBackedWidget):
                             (
                                 "ai",
                                 "live_game",
-                                "\n\n".join(self._revealed_story_chunks),
+                                "".join(self._revealed_story_chunks),
                                 entry_id,
                                 str(entry.get("message_id", "") or ""),
                                 turn_number,
@@ -7910,6 +7939,7 @@ class StoryScreen(RepositoryBackedWidget):
             query_text=player_text,
         )
         gm_secrets = repository.list_gm_secrets(active_only=True)
+        miscellaneous = repository.list_miscellaneous()
         valid_music_tracks = (
             self.sound_manager.get_valid_track_names()
             if self.sound_manager is not None
@@ -7926,12 +7956,10 @@ class StoryScreen(RepositoryBackedWidget):
             conversation_mode=conversation_mode,
             relevant_npcs=relevant_npcs,
             gm_secrets=gm_secrets,
+            miscellaneous=miscellaneous,
             valid_music_tracks=valid_music_tracks,
             current_music=str(repository.get_setting("audio.current_music", "")),
             valid_sound_effect_tracks=valid_sound_effect_tracks,
-            current_sound_effect=str(
-                repository.get_setting("audio.current_sound_effect", "")
-            ),
             resolved_skill_checks=resolved_skill_checks,
             planner_context_tags=planner_context_tags,
         )
@@ -8056,18 +8084,21 @@ class StoryScreen(RepositoryBackedWidget):
             return
 
         is_out_of_game = self._pending_conversation_mode == "out_of_game"
-        repository.set_setting(
-            "tts.pronunciation_map",
-            merge_pronunciation_maps(
-                repository.get_setting("tts.pronunciation_map", {}),
-                getattr(result, "pronunciation_map", {}),
-                {
-                    repository.get_setting("player_name", ""): repository.get_setting(
-                        "player.name_pronunciation", ""
-                    )
-                },
-            ),
+        pronunciation_map = merge_pronunciation_maps(
+            repository.get_setting("tts.pronunciation_map", {}),
+            getattr(result, "pronunciation_map", {}),
         )
+        player_name_pronunciation = repository.get_setting(
+            "player.name_pronunciation",
+            "",
+        )
+        if player_name_pronunciation:
+            pronunciation_map = set_authoritative_pronunciation(
+                pronunciation_map,
+                repository.get_setting("player_name", ""),
+                player_name_pronunciation,
+            )
+        repository.set_setting("tts.pronunciation_map", pronunciation_map)
         message_id = self._pending_message_id or (
             repository.create_message_id() if repository is not None else ""
         )
@@ -8075,6 +8106,7 @@ class StoryScreen(RepositoryBackedWidget):
             "story_oog" if is_out_of_game else "story",
             result.narrative_text,
             message_id=message_id,
+            sound_effect_cues=result.sound_effect_cues,
         )
 
         if result.suggested_events and not is_out_of_game:
@@ -8111,6 +8143,7 @@ class StoryScreen(RepositoryBackedWidget):
         if not is_out_of_game and latest_story is not None and self._reveal_story_with_narration(
             int(latest_story["id"]),
             result.narrative_text,
+            result.sound_effect_cues,
         ):
             return
 
@@ -8274,13 +8307,13 @@ class StoryScreen(RepositoryBackedWidget):
 
         self._set_waiting_for_gm(pending)
 
-    def narrate_latest_story(self) -> None:
-        """Narrates the latest story history entry when narrator is enabled."""
+    def narrate_latest_story(self, *, reveal_progressively: bool = False) -> bool:
+        """Narrates the latest story, optionally revealing its chunks on screen."""
 
         repository = self.repository()
 
         if repository is None:
-            return
+            return False
 
         entries = repository.list_history()
 
@@ -8291,15 +8324,29 @@ class StoryScreen(RepositoryBackedWidget):
                     sound_manager=self.sound_manager,
                     narration_player=self.narration_player,
                 )
+                content = str(entry.get("content", ""))
+                sound_effect_cues = entry.get("sound_effect_cues", [])
+                if reveal_progressively:
+                    story_id = _safe_int(entry.get("id"), -1)
+                    if story_id >= 0 and self._reveal_story_with_narration(
+                        story_id,
+                        content,
+                        sound_effect_cues,
+                    ):
+                        return True
                 self.refresh()
-                self._narrate_text(str(entry.get("content", "")))
-                return
+                return self._narrate_text(
+                    content,
+                    sound_effect_cues=sound_effect_cues,
+                )
+        return False
 
     def _narrate_text(
         self,
         text: str,
         *,
         story_id: int | None = None,
+        sound_effect_cues: list[dict[str, str]] | None = None,
     ) -> bool:
         """Sends text to the narration player if available."""
 
@@ -8307,39 +8354,48 @@ class StoryScreen(RepositoryBackedWidget):
             return False
 
         repository = self.repository()
-        tts_text = apply_pronunciation_map(
-            text,
+        pronunciation_map = (
             repository.get_setting("tts.pronunciation_map", {})
             if repository is not None
-            else {},
+            else {}
+        )
+        tts_text_transform = lambda chunk: apply_pronunciation_map(
+            chunk,
+            pronunciation_map,
+        )
+        on_sound_effect = (
+            self.sound_manager.play_sound_effect
+            if self.sound_manager is not None
+            else None
         )
 
         if story_id is None:
-            return self.narration_player.narrate(tts_text)
+            return self.narration_player.narrate(
+                text,
+                sound_effect_cues=sound_effect_cues,
+                tts_text_transform=tts_text_transform,
+                on_sound_effect=on_sound_effect,
+            )
 
         return self.narration_player.narrate(
-            tts_text,
+            text,
+            sound_effect_cues=sound_effect_cues,
+            tts_text_transform=tts_text_transform,
             on_chunk_start=lambda chunk: self._narration_chunk_ready.emit(
                 story_id,
                 chunk,
             ),
+            on_sound_effect=on_sound_effect,
             on_complete=lambda: self._narration_complete.emit(story_id),
         )
 
-    def _reveal_story_with_narration(self, story_id: int, text: str) -> bool:
+    def _reveal_story_with_narration(
+        self,
+        story_id: int,
+        text: str,
+        sound_effect_cues: list[dict[str, str]] | None = None,
+    ) -> bool:
         """Displays the latest story progressively as TTS starts each chunk."""
-
-        repository = self.repository()
-        if repository is not None and normalize_pronunciation_map(
-            repository.get_setting("tts.pronunciation_map", {})
-        ):
-            self._clear_story_reveal_state()
-            started = self._narrate_text(text)
-            if started:
-                self._set_waiting_for_gm(False)
-                self.refresh()
-                return True
-            return False
 
         self._revealing_story_id = story_id
         self._revealed_story_chunks = []
@@ -8347,7 +8403,11 @@ class StoryScreen(RepositoryBackedWidget):
         reveal_generation = self._story_reveal_generation
         self.refresh()
 
-        if self._narrate_text(text, story_id=story_id):
+        if self._narrate_text(
+            text,
+            story_id=story_id,
+            sound_effect_cues=sound_effect_cues,
+        ):
             QTimer.singleShot(
                 STORY_REVEAL_STALL_TIMEOUT_MS,
                 lambda: self._recover_stalled_story_reveal(
@@ -8366,9 +8426,9 @@ class StoryScreen(RepositoryBackedWidget):
         if story_id != self._revealing_story_id:
             return
 
-        clean_chunk = str(chunk or "").strip()
+        clean_chunk = str(chunk or "")
 
-        if not clean_chunk:
+        if not clean_chunk.strip():
             return
 
         self._revealed_story_chunks.append(clean_chunk)
@@ -8485,6 +8545,9 @@ class CharacterScreen(RepositoryBackedWidget):
         self.name_input = QLineEdit()
         self.name_input.editingFinished.connect(self._save_character)
         self.name_pronunciation_input = QLineEdit()
+        self.name_pronunciation_input.setPlaceholderText(
+            "Optional: kah-tha-lah, or /kəˈθɑlə/ for exact IPA"
+        )
         self.name_pronunciation_input.editingFinished.connect(self._save_character)
         self.health_current_input = QSpinBox()
         self.health_current_input.setRange(0, 9999)
@@ -8728,11 +8791,25 @@ class CharacterScreen(RepositoryBackedWidget):
 
         self._saving_character = True
         try:
+            previous_name = repository.get_setting("player_name", "")
+            pronunciation_map = repository.get_setting("tts.pronunciation_map", {})
+            if str(previous_name).strip().casefold() != payload["name"].casefold():
+                pronunciation_map = set_authoritative_pronunciation(
+                    pronunciation_map,
+                    previous_name,
+                    "",
+                )
+            pronunciation_map = set_authoritative_pronunciation(
+                pronunciation_map,
+                payload["name"],
+                payload["name_pronunciation"],
+            )
             repository.set_setting("player_name", payload["name"])
             repository.set_setting(
                 "player.name_pronunciation",
                 payload["name_pronunciation"],
             )
+            repository.set_setting("tts.pronunciation_map", pronunciation_map)
             repository.set_setting("player.appearance", payload["appearance"])
             repository.set_setting("player.backstory", payload["backstory"])
             repository.set_setting("player.notes", payload["notes"])
@@ -10482,14 +10559,20 @@ class CalendarScreen(RepositoryBackedWidget):
             navigation_left,
             0,
             0,
+            alignment=Qt.AlignmentFlag.AlignVCenter,
         )
         navigation_row.addWidget(
             self.month_label,
             0,
             1,
-            alignment=Qt.AlignmentFlag.AlignCenter,
+            alignment=Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter,
         )
-        navigation_row.addWidget(navigation_right, 0, 2)
+        navigation_row.addWidget(
+            navigation_right,
+            0,
+            2,
+            alignment=Qt.AlignmentFlag.AlignVCenter,
+        )
         navigation_row.setColumnStretch(0, 1)
         navigation_row.setColumnStretch(2, 1)
 
@@ -11510,20 +11593,85 @@ def _inventory_item_display_name(name: Any, quantity: Any, quantity_unit: Any) -
 class InventoryLocationPanel(QGroupBox):
     """Compact list of inventory items stored at one free-text location."""
 
+    SORT_OPTIONS = (
+        ("Name", "name"),
+        ("Category", "category"),
+        ("Price", "price"),
+        ("Quantity", "quantity"),
+    )
+
     def __init__(
         self,
         location: str,
         items: list[dict[str, Any]],
         on_item_clicked: Callable[[dict[str, Any]], None],
+        *,
+        sort_field: str = "name",
+        sort_descending: bool = False,
+        on_sort_changed: Callable[[str, bool], None] | None = None,
     ) -> None:
         super().__init__(f"{_inventory_location_label(location)} ({len(items)})")
         self.location = location
+        self._items = [dict(item) for item in items]
+        self._on_item_clicked = on_item_clicked
+        self._on_sort_changed = on_sort_changed
         self.item_buttons: list[QPushButton] = []
         layout = QVBoxLayout()
 
+        controls = QHBoxLayout()
+        controls.addWidget(QLabel("Sort by:"))
+        self.sort_field_combo = QComboBox()
+        self.sort_field_combo.setObjectName("inventoryLocationSortField")
+        for label, value in self.SORT_OPTIONS:
+            self.sort_field_combo.addItem(label, value)
+        _set_combo_to_data(self.sort_field_combo, sort_field)
+        controls.addWidget(self.sort_field_combo, 1)
+
+        self.sort_direction_combo = QComboBox()
+        self.sort_direction_combo.setObjectName("inventoryLocationSortDirection")
+        self.sort_direction_combo.addItem("Ascending", False)
+        self.sort_direction_combo.addItem("Descending", True)
+        direction_index = self.sort_direction_combo.findData(bool(sort_descending))
+        self.sort_direction_combo.setCurrentIndex(max(0, direction_index))
+        controls.addWidget(self.sort_direction_combo)
+        layout.addLayout(controls)
+
+        self.item_list_layout = QVBoxLayout()
+        layout.addLayout(self.item_list_layout)
+        layout.addStretch(1)
+        self.setLayout(layout)
+
+        self.sort_field_combo.currentIndexChanged.connect(self._sorting_changed)
+        self.sort_direction_combo.currentIndexChanged.connect(self._sorting_changed)
+        self._render_items()
+
+    def _sorting_changed(self, _index: int) -> None:
+        """Applies this location's independent sort selection immediately."""
+
+        sort_field = str(self.sort_field_combo.currentData() or "name")
+        sort_descending = bool(self.sort_direction_combo.currentData())
+        if self._on_sort_changed is not None:
+            self._on_sort_changed(sort_field, sort_descending)
+        self._render_items()
+
+    def _render_items(self) -> None:
+        """Rebuilds the item buttons in the selected order."""
+
+        while self.item_list_layout.count():
+            layout_item = self.item_list_layout.takeAt(0)
+            if layout_item is None:
+                continue
+            widget = layout_item.widget()
+            if widget is not None:
+                widget.deleteLater()
+
+        self.item_buttons.clear()
+        sort_field = str(self.sort_field_combo.currentData() or "name")
+        sort_descending = bool(self.sort_direction_combo.currentData())
         for item in sorted(
-            items,
-            key=lambda candidate: str(candidate.get("name", "")).casefold(),
+            self._items,
+            key=lambda candidate: self._item_sort_key(candidate, sort_field),
+            reverse=sort_descending,
         ):
             quantity = max(0, _safe_int(item.get("quantity", 0), 0))
             unit = str(item.get("quantity_unit", "each") or "each")
@@ -11541,13 +11689,23 @@ class InventoryLocationPanel(QGroupBox):
             button.setMinimumHeight(52)
             button.setToolTip("Open all item details")
             button.clicked.connect(
-                lambda _checked=False, selected=dict(item): on_item_clicked(selected)
+                lambda _checked=False, selected=dict(item): self._on_item_clicked(selected)
             )
-            layout.addWidget(button)
+            self.item_list_layout.addWidget(button)
             self.item_buttons.append(button)
 
-        layout.addStretch(1)
-        self.setLayout(layout)
+    @staticmethod
+    def _item_sort_key(item: dict[str, Any], sort_field: str) -> tuple[Any, str]:
+        """Returns a stable player-facing sort key for one inventory item."""
+
+        name = str(item.get("name", "")).casefold()
+        if sort_field == "category":
+            return str(item.get("category", "Item") or "Item").casefold(), name
+        if sort_field == "price":
+            return max(0, _safe_int(item.get("value_base_units", 0), 0)), name
+        if sort_field == "quantity":
+            return max(0, _safe_int(item.get("quantity", 0), 0)), name
+        return name, name
 
 
 def _selectable_label(value: Any) -> QLabel:
@@ -11619,6 +11777,7 @@ class InventoryScreen(RepositoryBackedWidget):
         self._inventory_items: dict[str, dict[str, Any]] = {}
         self._catalog_by_name: dict[str, dict[str, Any]] = {}
         self._denominations: list[dict[str, Any]] = []
+        self._location_sort_settings: dict[str, tuple[str, bool]] = {}
         self.location_panels: list[InventoryLocationPanel] = []
         self.currency_label = QLabel("Currency: 0")
 
@@ -11845,10 +12004,25 @@ class InventoryScreen(RepositoryBackedWidget):
         ordered_locations = sorted(grouped_items, key=location_key)
         location_count = len(ordered_locations)
         for index, location in enumerate(ordered_locations):
+            sort_field, sort_descending = self._location_sort_settings.get(
+                location,
+                ("name", False),
+            )
+
+            def remember_sort(
+                field: str,
+                descending: bool,
+                panel_location: str = location,
+            ) -> None:
+                self._remember_location_sort(panel_location, field, descending)
+
             panel = InventoryLocationPanel(
                 location,
                 grouped_items[location],
                 self._open_item_details,
+                sort_field=sort_field,
+                sort_descending=sort_descending,
+                on_sort_changed=remember_sort,
             )
             is_unpaired_final_panel = location_count % 2 == 1 and index == location_count - 1
             column = 1 if is_unpaired_final_panel else (0 if index % 2 == 0 else 2)
@@ -11857,6 +12031,16 @@ class InventoryScreen(RepositoryBackedWidget):
 
         for column in range(4):
             self.inventory_panel_layout.setColumnStretch(column, 1)
+
+    def _remember_location_sort(
+        self,
+        location: str,
+        sort_field: str,
+        sort_descending: bool,
+    ) -> None:
+        """Keeps each location's sort choice across inventory refreshes."""
+
+        self._location_sort_settings[location] = (sort_field, sort_descending)
 
     def _open_item_details(self, item: dict[str, Any]) -> None:
         """Opens one blocking item-detail dialog and primes playtesting edits."""
@@ -13951,7 +14135,7 @@ def _apply_audio_settings_to_managers(
     sound_manager: SoundManagerProtocol | None,
     narration_player: NarrationPlayerProtocol | None,
 ) -> None:
-    """Applies saved music, ambience, and narrator settings to audio managers."""
+    """Applies saved music, one-shot effect, and narrator settings to managers."""
 
     music_enabled = _bool_setting(repository.get_setting("audio.music_enabled", True), True)
     sound_effects_enabled = _bool_setting(
@@ -13997,15 +14181,8 @@ def _apply_audio_settings_to_managers(
         elif not music_enabled:
             sound_manager.stop_music(clear_current=False)
 
-        current_sound_effect = str(
-            repository.get_setting("audio.current_sound_effect", "") or ""
-        ).strip()
-        if sound_effects_enabled and current_sound_effect:
-            sound_manager.play_sound_effect(current_sound_effect)
-        else:
-            sound_manager.stop_sound_effect(
-                clear_current=not bool(current_sound_effect)
-            )
+        if not sound_effects_enabled:
+            sound_manager.stop_sound_effect(clear_current=False)
 
     if narration_player is not None and hasattr(narration_player, "set_volume"):
         narration_player.set_volume(tts_volume)

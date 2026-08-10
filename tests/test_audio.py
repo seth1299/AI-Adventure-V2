@@ -1,14 +1,19 @@
 from __future__ import annotations
 
 import os
+import queue
 import sys
+import threading
 import types
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 from ai_adventure.app.app_paths import AppPaths
 from ai_adventure.audio.narration import (
+    GeneratedNarrationChunk,
+    NarrationPlayer,
     build_narration_chunks,
     chunk_tts_text,
     normalize_tts_time_text,
@@ -26,13 +31,18 @@ from ai_adventure.audio.sound_manager import (
     SOUND_EFFECT_CHANNEL_INDEX,
     SoundManager,
     prepare_sound_directory,
+    prepare_sound_effect_directory,
 )
 from ai_adventure.audio.tts import tts_manager
-from ai_adventure.audio.tts.tts_manager import PyKokoroTTSEngine
+from ai_adventure.audio.tts.tts_manager import (
+    KokoroOnnxTTSEngine,
+    PyKokoroTTSEngine,
+    TTSRequest,
+)
 
 
 class AudioTests(unittest.TestCase):
-    def test_music_and_looping_sound_effect_play_on_independent_channels(self) -> None:
+    def test_music_loops_while_sound_effect_plays_once(self) -> None:
         class FakeMusic:
             def __init__(self) -> None:
                 self.stop_calls = 0
@@ -96,22 +106,31 @@ class AudioTests(unittest.TestCase):
         try:
             sys.modules["pygame"] = fake_pygame
             with TemporaryDirectory() as temp_dir:
-                music_path = Path(temp_dir) / "Slow Jazz.mp3"
-                effect_path = Path(temp_dir) / "Steady Rain.wav"
+                music_dir = Path(temp_dir) / "music"
+                effect_dir = Path(temp_dir) / "effects"
+                music_dir.mkdir()
+                effect_dir.mkdir()
+                music_path = music_dir / "Slow Jazz.mp3"
+                effect_path = effect_dir / "Steady Rain.wav"
                 music_path.write_bytes(b"music")
                 effect_path.write_bytes(b"rain")
-                manager = SoundManager(temp_dir)
+                (effect_dir / music_path.name).write_bytes(b"misfiled music")
+                manager = SoundManager(music_dir, effect_dir)
+                self.assertEqual(manager.get_valid_track_names(), [music_path.name])
+                self.assertEqual(
+                    manager.get_valid_sound_effect_names(),
+                    [effect_path.name],
+                )
                 manager.play_music(music_path.name)
                 music_stop_calls = fake_music.stop_calls
                 manager.play_sound_effect(effect_path.name)
 
                 self.assertEqual(manager.current_music, music_path.name)
-                self.assertEqual(manager.current_sound_effect, effect_path.name)
                 self.assertEqual(fake_music.stop_calls, music_stop_calls)
                 self.assertEqual(fake_music.play_loops, [-1])
                 self.assertEqual(
                     fake_channels[SOUND_EFFECT_CHANNEL_INDEX].played[0][1],
-                    -1,
+                    0,
                 )
         finally:
             if original_pygame is None:
@@ -163,6 +182,14 @@ class AudioTests(unittest.TestCase):
         self.assertIn("noon", text)
         self.assertIn("eight thirty in the evening", text)
 
+    def test_plain_tts_strips_native_phoneme_annotations_to_visible_text(self) -> None:
+        self.assertEqual(
+            strip_ssmd_markup_for_plain_tts(
+                'The [Qh’thala]{ph="kəˈθɑlə"} waits.'
+            ),
+            "The Qh’thala waits.",
+        )
+
     def test_narration_chunks_keep_display_text_separate_from_tts_text(self) -> None:
         chunks = build_narration_chunks("The bell rings at 7:00 A.M. What do you do now?")
 
@@ -173,6 +200,146 @@ class AudioTests(unittest.TestCase):
         self.assertEqual(
             chunks[0].tts_text,
             "The bell rings at [7:00 A.M.](as: time) What do you do now?",
+        )
+
+    def test_narration_chunks_apply_pronunciation_only_to_spoken_text(self) -> None:
+        text = "Ironpeak City wakes.\n\nThe market opens."
+        chunks = build_narration_chunks(
+            text,
+            tts_text_transform=lambda chunk: chunk.replace(
+                "Ironpeak City",
+                '[Ironpeak City]{ph="ˈaɪɚnˌpik ˈsɪti"}',
+            ),
+        )
+
+        self.assertEqual("".join(chunk.display_text for chunk in chunks), text)
+        self.assertEqual(chunks[0].display_text, "Ironpeak City wakes.\n\n")
+        self.assertIn('[Ironpeak City]{ph="ˈaɪɚnˌpik ˈsɪti"}', chunks[0].tts_text)
+        self.assertNotIn("ˈaɪɚnˌpik", chunks[1].tts_text)
+
+    def test_kokoro_onnx_uses_native_phoneme_mode_for_ipa_overrides(self) -> None:
+        create_calls: list[tuple[str, dict[str, object]]] = []
+
+        class FakeTokenizer:
+            @staticmethod
+            def phonemize(text: str, _language: str) -> str:
+                return f"<{text}>"
+
+        class FakeKokoro:
+            def __init__(self, _model_path: str, _voices_path: str) -> None:
+                self.tokenizer = FakeTokenizer()
+
+            def create(self, text: str, **kwargs: object):
+                create_calls.append((text, kwargs))
+                return [0.0], 24000
+
+        writes: list[tuple[str, object, int]] = []
+        fake_kokoro_module = types.ModuleType("kokoro_onnx")
+        setattr(fake_kokoro_module, "Kokoro", FakeKokoro)
+        fake_soundfile = types.ModuleType("soundfile")
+        setattr(
+            fake_soundfile,
+            "write",
+            lambda path, samples, rate: writes.append((path, samples, rate)),
+        )
+        original_kokoro = sys.modules.get("kokoro_onnx")
+        original_soundfile = sys.modules.get("soundfile")
+
+        with TemporaryDirectory() as temp_dir:
+            model_path = Path(temp_dir) / "model.onnx"
+            voices_path = Path(temp_dir) / "voices.bin"
+            model_path.touch()
+            voices_path.touch()
+            try:
+                sys.modules["kokoro_onnx"] = fake_kokoro_module
+                sys.modules["soundfile"] = fake_soundfile
+                engine = KokoroOnnxTTSEngine(
+                    model_path=model_path,
+                    voices_path=voices_path,
+                    output_directory=temp_dir,
+                )
+                engine.synthesize_to_file(
+                    TTSRequest(
+                        text='The [Qh’thala]{ph="kəˈθɑlə"} waits.',
+                        voice="af_sarah",
+                    )
+                )
+            finally:
+                if original_kokoro is None:
+                    sys.modules.pop("kokoro_onnx", None)
+                else:
+                    sys.modules["kokoro_onnx"] = original_kokoro
+                if original_soundfile is None:
+                    sys.modules.pop("soundfile", None)
+                else:
+                    sys.modules["soundfile"] = original_soundfile
+
+        self.assertEqual(create_calls[0][0], "<The> kəˈθɑlə <waits.>")
+        self.assertTrue(create_calls[0][1]["is_phonemes"])
+        self.assertEqual(len(writes), 1)
+
+    def test_narration_sound_cue_forces_exact_word_boundary(self) -> None:
+        text = "The hammer falls. Sparks leap from the anvil."
+        chunks = build_narration_chunks(
+            text,
+            sound_effect_cues=[
+                {
+                    "filename": "Hammer Strike.wav",
+                    "anchor_text": "hammer",
+                    "position": "after",
+                }
+            ],
+        )
+
+        self.assertEqual("".join(chunk.display_text for chunk in chunks), text)
+        self.assertEqual(chunks[0].display_text, "The hammer")
+        self.assertEqual(chunks[0].sound_effects_after, ("Hammer Strike.wav",))
+        self.assertEqual(chunks[1].display_text, " falls. Sparks leap from the anvil.")
+
+    def test_narration_player_fires_cue_after_anchored_audio_chunk(self) -> None:
+        player = NarrationPlayer.__new__(NarrationPlayer)
+        player.enabled = True
+        player._session_id = 7
+        player._state_lock = threading.Lock()
+        audio_queue: queue.Queue[GeneratedNarrationChunk | None] = queue.Queue()
+        audio_queue.put(
+            GeneratedNarrationChunk(
+                audio_path=Path("first.wav"),
+                display_text="The hammer",
+                sound_effects_after=("Hammer Strike.wav",),
+            )
+        )
+        audio_queue.put(
+            GeneratedNarrationChunk(
+                audio_path=Path("second.wav"),
+                display_text=" falls.",
+            )
+        )
+        audio_queue.put(None)
+        order: list[str] = []
+
+        with patch.object(
+            player,
+            "_play_file_blocking",
+            side_effect=lambda path, _session_id: order.append(f"speak:{path.name}"),
+        ):
+            player._play_chunks(
+                7,
+                audio_queue,
+                lambda chunk: order.append(f"chunk:{chunk}"),
+                lambda filename: order.append(f"effect:{filename}"),
+                None,
+            )
+
+        self.assertEqual(
+            order,
+            [
+                "chunk:The hammer",
+                "speak:first.wav",
+                "effect:Hammer Strike.wav",
+                "chunk: falls.",
+                "speak:second.wav",
+            ],
         )
 
     def test_voice_blend_specs_round_trip_for_tts_engines(self) -> None:
@@ -481,9 +648,18 @@ class AudioTests(unittest.TestCase):
                 log_file=root / "logs" / "ai_adventure.log",
             )
             sound_directory = prepare_sound_directory(paths)
+            sound_effect_directory = prepare_sound_effect_directory(paths)
 
             self.assertEqual(sound_directory, paths.package_music_tracks_dir)
             self.assertTrue((sound_directory / "Boss_Fight.mp3").exists())
+            self.assertEqual(
+                sound_effect_directory,
+                paths.package_sound_effects_dir,
+            )
+            self.assertEqual(paths.package_sound_effects_dir.name, "sound_effects")
+            self.assertTrue(
+                any(path.suffix.casefold() == ".mp3" for path in sound_effect_directory.iterdir())
+            )
             self.assertEqual(paths.app_icon_path, paths.package_data_dir / "app_icon.ico")
             self.assertTrue(paths.app_icon_path.exists())
             self.assertEqual(paths.kokoro_model_path, paths.package_tts_dir / "kokoro-v1.0.onnx")

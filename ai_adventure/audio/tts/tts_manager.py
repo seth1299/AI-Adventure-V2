@@ -12,6 +12,7 @@ from collections.abc import Callable
 from typing import Any, ClassVar, Literal, cast
 
 from ai_adventure.audio.ssmd import strip_ssmd_markup_for_plain_tts
+from ai_adventure.audio.pronunciation import compile_kokoro_phoneme_overrides
 from ai_adventure.audio.tts_settings import (
     normalize_narrator_voice_spec,
     parse_voice_blend_spec,
@@ -223,7 +224,8 @@ class KokoroOnnxTTSEngine(TTSEngine):
 
         import soundfile as sf
 
-        clean_text = strip_ssmd_markup_for_plain_tts(str(request.text or "").strip())
+        annotated_text = str(request.text or "").strip()
+        clean_text = strip_ssmd_markup_for_plain_tts(annotated_text)
         if not clean_text:
             raise ValueError("Cannot synthesize empty text.")
 
@@ -237,11 +239,24 @@ class KokoroOnnxTTSEngine(TTSEngine):
             str(request.language or "en-us").strip() or "en-us",
         )
 
+        phonemes = compile_kokoro_phoneme_overrides(
+            annotated_text,
+            lambda segment: self._kokoro.tokenizer.phonemize(segment, language_code),
+        )
+        create_kwargs: dict[str, Any] = {
+            "voice": voice,
+            "speed": max(0.5, min(2.0, float(request.speed))),
+            "lang": language_code,
+        }
+        if phonemes:
+            create_kwargs["is_phonemes"] = True
+            synthesis_text = phonemes
+        else:
+            synthesis_text = clean_text
+
         samples, sample_rate = self._kokoro.create(
-            clean_text,
-            voice=voice,
-            speed=max(0.5, min(2.0, float(request.speed))),
-            lang=language_code,
+            synthesis_text,
+            **create_kwargs,
         )
         sf.write(str(output_path), samples, sample_rate)
         return output_path

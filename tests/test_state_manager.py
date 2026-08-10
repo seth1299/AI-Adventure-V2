@@ -78,6 +78,26 @@ class StateManagerTests(unittest.TestCase):
             self.assertEqual(history_entry["message_id"], message_id)
             self.assertEqual(mechanical_event["message_id"], message_id)
 
+    def test_history_preserves_narration_sound_cues_for_replay(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = SaveRepository.create_new_save(Path(temp_dir), "Cue Replay Test")
+            cue = {
+                "filename": "Hammer.wav",
+                "anchor_text": "hammer",
+                "position": "after",
+            }
+            repository.append_history(
+                "story",
+                "The hammer falls against the anvil.",
+                sound_effect_cues=[cue],
+            )
+
+            self.assertEqual(repository.list_history()[-1]["sound_effect_cues"], [cue])
+            self.assertEqual(
+                StateManager(repository).load_state().history.entries[-1].sound_effect_cues,
+                [cue],
+            )
+
     def test_new_game_defaults_are_debug_friendly(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             repository = SaveRepository.create_new_save(Path(temp_dir), "Test Adventure")

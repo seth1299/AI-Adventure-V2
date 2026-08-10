@@ -45,6 +45,12 @@ class AppPaths:
         return self.app_data_dir / "sounds"
 
     @property
+    def sound_effects_dir(self) -> Path:
+        """Returns the app-managed one-shot sound-effect directory."""
+
+        return self.app_data_dir / "sound_effects"
+
+    @property
     def package_audio_dir(self) -> Path:
         """Returns the packaged source-tree audio asset directory."""
 
@@ -67,6 +73,12 @@ class AppPaths:
         """Returns the packaged music-track directory."""
 
         return self.package_audio_dir / "music_tracks"
+
+    @property
+    def package_sound_effects_dir(self) -> Path:
+        """Returns the packaged one-shot sound-effect directory."""
+
+        return self.package_audio_dir / "sound_effects"
 
     @property
     def package_tts_dir(self) -> Path:

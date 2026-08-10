@@ -7,6 +7,7 @@ from ai_adventure.alchemy.ingredients import (
     CRAFTING_INGREDIENT_CATEGORY_NAMES,
 )
 from ai_adventure.ai.modes import ai_mode_preferences_from_settings
+from ai_adventure.audio.catalog import distinct_audio_track_catalogs
 from ai_adventure.context.creative_ideas import CreativeIdeasLibrary
 from ai_adventure.context.models import ContextLibrary
 from ai_adventure.context.naming import GENERIC_PROPER_NOUN_PLACEHOLDER_RULE
@@ -15,7 +16,10 @@ from ai_adventure.context.tags import PLANNABLE_CONTEXT_TAGS
 from ai_adventure.combat import normalize_combat_state
 from ai_adventure.currency import format_currency_amount
 from ai_adventure.core.models import AdventureState
-from ai_adventure.audio.pronunciation import normalize_pronunciation_map
+from ai_adventure.audio.pronunciation import (
+    KOKORO_IPA_PROMPT_RULE,
+    normalize_pronunciation_map,
+)
 from ai_adventure.narration_preferences import normalize_narration_preferences
 
 
@@ -224,10 +228,10 @@ class AiContextBuilder:
         conversation_mode: str = "live_game",
         relevant_npcs: list[dict[str, Any]] | None = None,
         gm_secrets: list[dict[str, Any]] | None = None,
+        miscellaneous: list[dict[str, Any]] | None = None,
         valid_music_tracks: list[str] | None = None,
         current_music: str | None = None,
         valid_sound_effect_tracks: list[str] | None = None,
-        current_sound_effect: str | None = None,
         resolved_skill_checks: list[dict[str, Any]] | None = None,
         planner_context_tags: list[str] | None = None,
     ) -> dict[str, Any]:
@@ -240,10 +244,10 @@ class AiContextBuilder:
             conversation_mode: Explicit UI-selected mode: live_game or out_of_game.
             relevant_npcs: NPC memory profiles likely relevant this turn.
             gm_secrets: Active private GM-memory records for every turn.
+            miscellaneous: Every general world-lore record, always sent uncapped.
             valid_music_tracks: Playable background music filenames.
             current_music: Currently selected background music filename.
-            valid_sound_effect_tracks: Playable ambient sound-effect filenames.
-            current_sound_effect: Currently selected ambient sound-effect filename.
+            valid_sound_effect_tracks: Playable one-shot sound-effect filenames.
             resolved_skill_checks: Skill checks already resolved for this command.
             planner_context_tags: Validated tags selected by the pre-narration
                 planner. ``None`` falls back to keyword inference.
@@ -264,17 +268,19 @@ class AiContextBuilder:
         selected_tags.add("story")
         if clean_conversation_mode == "out_of_game":
             selected_tags.add("out_of_game")
-        clean_music_tracks = [
-            str(track).strip()
-            for track in (valid_music_tracks or [])
-            if str(track).strip()
-        ]
-        clean_sound_effect_tracks = [
-            str(track).strip()
-            for track in (valid_sound_effect_tracks or [])
-            if str(track).strip()
-        ]
-
+        clean_music_tracks, clean_sound_effect_tracks = distinct_audio_track_catalogs(
+            valid_music_tracks,
+            valid_sound_effect_tracks,
+        )
+        clean_current_music = str(
+            current_music
+            or state.settings.values.get("audio.current_music", "")
+            or ""
+        ).strip()
+        if clean_current_music.casefold() not in {
+            track.casefold() for track in clean_music_tracks
+        }:
+            clean_current_music = ""
         if clean_music_tracks or clean_sound_effect_tracks:
             selected_tags.add("music")
 
@@ -282,6 +288,38 @@ class AiContextBuilder:
             selected_tags,
             max_sections=self.max_reference_sections,
         )
+        disabled_audio_event_types: set[str] = set()
+        if not clean_music_tracks:
+            disabled_audio_event_types.add("MusicChangedEvent")
+        if not clean_sound_effect_tracks:
+            disabled_audio_event_types.add("SoundEffectChangedEvent")
+        reference_sections = [
+            section
+            for section in reference_sections
+            if str(section.content.get("event_type", ""))
+            not in disabled_audio_event_types
+        ]
+        audio_transition_rules: list[str] = []
+        if clean_music_tracks:
+            audio_transition_rules.append(
+                "When StatusUpdatedEvent.location changes to a substantially different "
+                "environment type, compare state.audio.current_music to "
+                "state.audio.valid_music_tracks. If a listed track clearly better "
+                "matches the new environment or mood, include MusicChangedEvent "
+                "before the final StatusUpdatedEvent."
+            )
+        if clean_sound_effect_tracks:
+            audio_transition_rules.append(
+                "Use SoundEffectChangedEvent only for a brief, meaningful sound "
+                "described by this response. Its filename must come from "
+                "state.audio.valid_sound_effect_tracks, never valid_music_tracks. "
+                "Provide anchor_text copied exactly from one unique place in the "
+                "response and position before or after so Python can play the sound "
+                "once at that exact narration boundary. Add as many separate cues as "
+                "the response genuinely benefits from, provided an appropriate listed "
+                "sound exists for every cue; do not add a cue merely to use a file. "
+                "Never use it for ambience."
+            )
         clean_relevant_npcs = [
             _npc_context_profile(npc)
             for npc in (relevant_npcs or [])
@@ -290,6 +328,11 @@ class AiContextBuilder:
             _gm_secret_context_record(secret)
             for secret in (gm_secrets or [])
             if str(secret.get("status", "active")).strip().casefold() == "active"
+        ]
+        clean_miscellaneous = [
+            _miscellaneous_context_record(entry)
+            for entry in (miscellaneous or [])
+            if isinstance(entry, dict)
         ]
         journal_share_with_ai = _coerce_bool(
             state.settings.values.get("journal.share_with_ai", False),
@@ -310,7 +353,7 @@ class AiContextBuilder:
         ai_mode_preferences = ai_mode_preferences_from_settings(state.settings.values)
         combat_state = normalize_combat_state(state.settings.values.get("combat.state", {}))
 
-        return {
+        packet = {
             "schema_version": 1,
             "packet_type": "story_turn",
             "player_command": clean_command,
@@ -777,17 +820,8 @@ class AiContextBuilder:
                     ],
                 },
                 "audio": {
-                    "current_music": str(
-                        current_music
-                        or state.settings.values.get("audio.current_music", "")
-                        or ""
-                    ),
+                    "current_music": clean_current_music,
                     "valid_music_tracks": clean_music_tracks,
-                    "current_sound_effect": str(
-                        current_sound_effect
-                        or state.settings.values.get("audio.current_sound_effect", "")
-                        or ""
-                    ),
                     "valid_sound_effect_tracks": clean_sound_effect_tracks,
                     "rules": {
                         "music_change_rule": (
@@ -801,12 +835,15 @@ class AiContextBuilder:
                             "do not suggest MusicChangedEvent."
                         ),
                         "sound_effect_rule": (
-                            "SoundEffectChangedEvent controls one independent looping "
-                            "ambient/effect channel and may be used at the same time as "
-                            "MusicChangedEvent. Use it for persistent scene sounds such "
-                            "as rain, wind, crowds, machinery, or fire. Its filename "
-                            "must exactly match valid_sound_effect_tracks; use STOP to "
-                            "end the current effect when it no longer fits."
+                            "SoundEffectChangedEvent is a short one-shot narration cue, "
+                            "never looping ambience. filename must exactly match "
+                            "valid_sound_effect_tracks and must never come from "
+                            "valid_music_tracks. anchor_text must be copied exactly from "
+                            "one unique place in response; position must be before or "
+                            "after. Use as many separately anchored events as are "
+                            "meaningfully appropriate for the response, with no fixed "
+                            "cue-count target; omit cues when no listed sound fits. The "
+                            "app replays each saved cue at that same boundary."
                         ),
                     },
                 },
@@ -887,6 +924,31 @@ class AiContextBuilder:
                     },
                     "active": clean_gm_secrets,
                 },
+                "miscellaneous": {
+                    "visibility": (
+                        "Established non-secret world canon. This entire section is "
+                        "included on every turn without relevance filtering or a cap."
+                    ),
+                    "rules": {
+                        "continuity": (
+                            "Treat every entry as authoritative established canon, even "
+                            "when it is not obviously related to the current command."
+                        ),
+                        "updates": (
+                            "Use MiscellaneousUpsertedEvent with the same misc_id and a "
+                            "complete current record when general canon is created or "
+                            "changes."
+                        ),
+                        "scope": (
+                            "Use this only for durable concepts without a more specific "
+                            "home, such as original creatures or species, cultures, "
+                            "factions, religions, laws, historical events, phenomena, "
+                            "or customs. Do not duplicate NPCs, locations, items, tasks, "
+                            "or hidden GM secrets."
+                        ),
+                    },
+                    "entries": clean_miscellaneous,
+                },
             },
             "rulebooks": {},
             "creative_ideas": self._build_creative_ideas_context(selected_tags),
@@ -925,12 +987,19 @@ class AiContextBuilder:
                     "applies events. Include multiple entries of the same event type "
                     "when multiple distinct state changes happen in one turn."
                 ),
+                "pronunciation_map": (
+                    "TTS-only array of {term, ipa} records for exact visible names or "
+                    "recurring terms whose spelling is genuinely ambiguous. Omit ordinary "
+                    "words and never place pronunciation hints in response. "
+                    f"{KOKORO_IPA_PROMPT_RULE}"
+                ),
                 "conversation_mode": (
                     "conversation_mode is selected explicitly by the player in the UI "
                     "and is authoritative. For out_of_game, answer the player's question "
                     "or request directly, return out_of_game=true, suggested_actions=[], "
                     "and events=[]; do not advance time, turns, status, combat, skills, "
-                    "inventory, tasks, NPC memory, secrets, music, or any durable state. "
+                    "inventory, tasks, NPC memory, secrets, miscellaneous canon, "
+                    "music, or any durable state. "
                     "For live_game, return out_of_game=false and resolve the message as "
                     "an in-world action. Never infer or override the mode from wording."
                 ),
@@ -972,7 +1041,8 @@ class AiContextBuilder:
                     "Use state.player.name, name_pronunciation, appearance, backstory, and notes as "
                     "player-authored character context. Treat it as true for the "
                     "player character. If name_pronunciation is non-empty, preserve it "
-                    "as the authoritative phonetic spelling for TTS and do not expose "
+                    "as the authoritative player guide for TTS and use it when choosing "
+                    "the character name's IPA. Do not expose pronunciation data "
                     "it in player-facing prose. Do not let NPCs know private profile "
                     "details unless they have observed them, been told, or have a "
                     "clear in-world reason to know."
@@ -1036,9 +1106,7 @@ class AiContextBuilder:
                     f"{CRAFTING_INGREDIENT_CATEGORY_NAMES}."
                 ),
                 "background_music": (
-                    "When StatusUpdatedEvent.location changes to a substantially different environment type, compare state.audio.current_music to state.audio.valid_music_tracks."
-                    "If a listed track clearly better matches the new environment or mood, include MusicChangedEvent before the final StatusUpdatedEvent."
-                    " Independently compare state.audio.current_sound_effect to state.audio.valid_sound_effect_tracks. Use SoundEffectChangedEvent for fitting persistent ambience such as rain, wind, crowds, machinery, or fire, even while music continues; use filename STOP when the current ambience should end."
+                    " ".join(audio_transition_rules)
                 ),
                 "creative_ideas": (
                     "Treat creative_ideas as the preferred source of style seeds "
@@ -1090,6 +1158,17 @@ class AiContextBuilder:
                     "public NPC, Location, task, flag, item/material, or other "
                     "supported event. "
                     "Set status to retired when the record is no longer true or useful."
+                ),
+                "miscellaneous_memory": (
+                    "state.miscellaneous.entries contains every miscellaneous canon "
+                    "record and is always present without relevance filtering or a "
+                    "count cap. Treat every entry as authoritative. Suggest "
+                    "MiscellaneousUpsertedEvent with a stable misc_id, name, category, "
+                    "and complete details when a durable non-secret creature, species, "
+                    "culture, faction, religion, law, historical event, phenomenon, "
+                    "custom, or other concept is established or changed and no more "
+                    "specific state table fits. Reuse the same misc_id for updates. "
+                    "Never duplicate NPC, Location, Item, task, or GM-secret records."
                 ),
                 "currency_transactions": (
                     "The player's money is state.currency.balance, also shown as "
@@ -1152,9 +1231,17 @@ class AiContextBuilder:
                     "NpcUpsertedEvent",
                     "NpcKnowledgeAddedEvent",
                     "SecretUpsertedEvent",
+                    "MiscellaneousUpsertedEvent",
                 ],
             },
         }
+        known_event_types = packet["response_contract"]["known_event_types"]
+        packet["response_contract"]["known_event_types"] = [
+            event_type
+            for event_type in known_event_types
+            if event_type not in disabled_audio_event_types
+        ]
+        return packet
 
     def _build_creative_ideas_context(self, selected_tags: set[str]) -> dict[str, Any]:
         """Builds creative idea context for relevant story turns."""
@@ -1261,6 +1348,17 @@ def _gm_secret_context_record(secret: dict[str, Any]) -> dict[str, Any]:
         key: _compact_context_value(value)
         for key, value in secret.items()
         if key in allowed_fields
+    }
+
+
+def _miscellaneous_context_record(entry: dict[str, Any]) -> dict[str, Any]:
+    """Returns the complete core fields for always-on miscellaneous context."""
+
+    return {
+        "misc_id": str(entry.get("misc_id", "")).strip(),
+        "name": str(entry.get("name", "")).strip(),
+        "category": str(entry.get("category", "")).strip(),
+        "details": str(entry.get("details", "")).strip(),
     }
 
 

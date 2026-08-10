@@ -18,7 +18,8 @@
           "response": "String. Visible narration only.",
           "suggested_actions": "Array of 3-4 strings for live_game turns. Empty when conversation_mode is out_of_game.",
           "events": "Array of structured event objects. Empty when no state change is proposed.",
-          "out_of_game": "Boolean. Must exactly match the player's explicit conversation_mode UI selection."
+          "out_of_game": "Boolean. Must exactly match the player's explicit conversation_mode UI selection.",
+          "pronunciation_map": "Array of {term, ipa} records for TTS only. ipa must be a Kokoro v1.0-compatible Unicode IPA phoneme string."
         },
         "event_shape": {
           "type": "String event type name.",
@@ -26,10 +27,41 @@
         },
         "rules": [
           "Return valid JSON only, with no Markdown fence.",
-          "Treat conversation_mode as authoritative. For out_of_game, answer directly with out_of_game=true, suggested_actions=[], and events=[]; do not advance the turn counter or change status, time, combat, skills, inventory, tasks, NPC memory, secrets, music, or any durable state. For live_game, return out_of_game=false and resolve the message in-world. Never infer or override the mode from wording.",
+          "Treat conversation_mode as authoritative. For out_of_game, answer directly with out_of_game=true, suggested_actions=[], and events=[]; do not advance the turn counter or change status, time, combat, skills, inventory, tasks, NPC memory, secrets, miscellaneous canon, music, or any durable state. For live_game, return out_of_game=false and resolve the message in-world. Never infer or override the mode from wording.",
           "Only put player-facing text in response.",
-          "Use supported events for inventory, active tasks, skills, currency, combat, recipes, reagents, NPCs, music, spells, flags, travel, locations, and status changes.",
+          "For genuinely ambiguous exact visible names or recurring terms, return pronunciation_map entries as {term, ipa}. Use Kokoro v1.0-compatible Unicode IPA without slash or bracket delimiters, hyphens, syllable respellings, ordinary English spelling, uppercase emphasis, or explanatory prose. Never insert pronunciation hints into response.",
+          "Use supported events for inventory, active tasks, skills, currency, combat, recipes, reagents, NPCs, miscellaneous world canon, music, spells, flags, travel, locations, and status changes.",
+          "Treat every state.miscellaneous.entries record as authoritative established canon on every turn. This section is intentionally uncapped and always included, without relevance filtering. Use MiscellaneousUpsertedEvent with a stable misc_id, name, category, and complete details for durable non-secret creatures, species, cultures, factions, religions, laws, historical events, phenomena, customs, or other concepts that do not fit a more specific table. Never duplicate NPC, Location, Item, task, or GM-secret records there.",
           "The Python application validates events before committing state."
+        ]
+      }
+    },
+    {
+      "id": "event.miscellaneous_upsert",
+      "title": "MiscellaneousUpsertedEvent Contract",
+      "category": "event_contract",
+      "tags": [
+        "always",
+        "events",
+        "lore",
+        "world"
+      ],
+      "priority": 109,
+      "content": {
+        "event_type": "MiscellaneousUpsertedEvent",
+        "payload_fields": [
+          "misc_id",
+          "name",
+          "category",
+          "details"
+        ],
+        "purpose": "Creates or replaces durable established non-secret canon that has no more specific state table.",
+        "rules": [
+          "Use a stable lower_snake_case misc_id and reuse it when the same concept changes.",
+          "Use a concise free-form category such as Creature, Species, Culture, Faction, Religion, Law, Historical Event, Phenomenon, or Custom.",
+          "Send the complete current details on every update rather than a partial patch.",
+          "Use this for original creatures or monsters and other durable concepts that do not fit NPCs, Locations, Items, active tasks, or private GM secrets.",
+          "Do not duplicate information that belongs in another structured table. Hidden truth belongs in SecretUpsertedEvent instead."
         ]
       }
     },
@@ -936,7 +968,7 @@
         "rules": [
           "Suggest MusicChangedEvent when the scene mood, location, danger level, or environment changes enough to justify new background music.",
           "The filename must exactly match one of the valid sound files.",
-          "Valid sound file names are listed in state.audio.valid_music_tracks.",
+          "Valid background-music filenames are listed only in state.audio.valid_music_tracks. Never use a filename from state.audio.valid_sound_effect_tracks for MusicChangedEvent.",
           "Do not invent filenames.",
           "Do not overuse this event for every minor action, however, do check and make sure that the currently playing music is appropriate for the location and the mood, even if the \"Location\" didn't actually change from one action to another. For example, if an ally suddenly turns traitor, you can start a fight song track, even if the Player is still in a \"Forest\" location."
         ]
@@ -955,15 +987,16 @@
       "content": {
         "event_type": "SoundEffectChangedEvent",
         "payload_fields": [
-          "filename"
+          "filename",
+          "anchor_text",
+          "position"
         ],
-        "purpose": "Changes one independent looping ambient sound-effect track without interrupting background music or narration.",
+        "purpose": "Plays one short sound effect once at an exact boundary in the current narration.",
         "rules": [
-          "Use SoundEffectChangedEvent for persistent scene ambience such as rain, wind, crowds, machinery, surf, or fire when a valid matching sound file exists.",
-          "The sound-effect channel is independent from MusicChangedEvent, so suitable music and ambience may play simultaneously.",
-          "The filename must exactly match one entry from state.audio.valid_sound_effect_tracks. Do not invent filenames.",
-          "Use filename STOP when the current ambient sound no longer fits and no replacement effect is needed.",
-          "Do not use this looping ambience event for every brief one-time noise mentioned in narration."
+          "Use SoundEffectChangedEvent only for a brief, meaningful sound directly tied to a moment described in the current response. Never use it for looping or persistent ambience.",
+          "Copy anchor_text exactly from one unique place in the player-facing response. Set position to before or after to choose the precise spoken boundary where the one-shot sound begins.",
+          "The filename must exactly match one entry from state.audio.valid_sound_effect_tracks. Never use a filename from state.audio.valid_music_tracks for SoundEffectChangedEvent, even when it appears to match the scene. Do not invent filenames.",
+          "Use as many separately anchored cues as the response genuinely benefits from, with no fixed cue-count target. Every cue must have an appropriate filename from the available effect list; do not force a cue merely to use a file. Each saved anchor makes the same sound replay at the same moment when the message is read aloud again."
         ]
       }
     },
