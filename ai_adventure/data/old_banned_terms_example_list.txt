@@ -1,0 +1,18 @@
+BANNED_CREATIVE_TERMS: ClassVar[tuple[str, ...]] = (
+        "Aethelgard",
+        "Whisperwood",
+        "Whisper-Wood",
+        "Vaelan",
+        "Vaelen",
+        "Caelan",
+        "Kaelan",
+        "Bram",
+        "Elara",
+        "Oakhaven",
+        "Ravenswood",
+        "Silverbrook",
+        "Silas",
+        "Sylas",
+        "Verdant Green",
+        "Verdant"
+    )
