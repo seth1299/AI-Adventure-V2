@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from ai_adventure.alchemy.ingredients import (
@@ -271,6 +272,13 @@ class AiContextBuilder:
             if planner_context_tags is None
             else _normalize_planner_context_tags(planner_context_tags)
         )
+        selected_tags.update(
+            _hybrid_magic_relevance_tags(
+                state,
+                player_command=clean_command,
+                relevant_npcs=relevant_npcs or [],
+            )
+        )
         selected_tags.add("story")
         if clean_conversation_mode == "out_of_game":
             selected_tags.add("out_of_game")
@@ -384,6 +392,10 @@ class AiContextBuilder:
             )
         )
         strict_combat = combat_preferences["resolution_mode"] == "strict"
+        magic_context = _magic_context_packet(
+            state.magic,
+            include_progression="magic" in selected_tags or "spell" in selected_tags,
+        )
 
         packet = {
             "schema_version": 1,
@@ -796,7 +808,7 @@ class AiContextBuilder:
                     ],
                 },
                 "magic": {
-                    **state.magic.to_dict(),
+                    **magic_context,
                     "rules": {
                         "authority": (
                             "If configuration.world_contains_magic is false, the world "
@@ -815,6 +827,19 @@ class AiContextBuilder:
                         "tiered": (
                             "Tiered casting consumes one slot at the selected tier. Tier 0 "
                             "spells consume no slot."
+                        ),
+                        **(
+                            {
+                                "advancement": (
+                                    "progression is authoritative durable evidence. Use "
+                                    "MagicAdvancementRecordedEvent only for meaningful magical "
+                                    "development established by this response, never routine "
+                                    "repetition. The event records evidence only and does not "
+                                    "change Mana, slots, tiers, or known spells."
+                                )
+                            }
+                            if "progression" in magic_context
+                            else {}
                         ),
                     },
                 },
@@ -1331,6 +1356,7 @@ class AiContextBuilder:
                     "SpellCatalogUpsertedEvent",
                     "CharacterSpellLearnedEvent",
                     "PlayerSpellCastEvent",
+                    "MagicAdvancementRecordedEvent",
                     "MagicEffectUpsertedEvent",
                     "NpcUpsertedEvent",
                     "NpcKnowledgeAddedEvent",
@@ -1433,6 +1459,134 @@ def _npc_context_profile(npc: dict[str, Any]) -> dict[str, Any]:
         for key, value in npc.items()
         if key in allowed_fields
     }
+
+
+def _hybrid_magic_relevance_tags(
+    state: AdventureState,
+    *,
+    player_command: str,
+    relevant_npcs: list[dict[str, Any]],
+) -> set[str]:
+    """Combines deterministic state signals with planner/keyword magic relevance."""
+
+    command = player_command.casefold()
+    command_words = {
+        word.strip(".,!?;:()[]{}\"'") for word in command.split() if word.strip()
+    }
+    magic_words = {
+        "arcane", "cantrip", "cast", "casting", "enchant", "magic", "magical",
+        "mana", "ritual", "sorcery", "spell", "spellbook", "wizardry",
+    }
+    spell_words = {"cantrip", "cast", "casting", "spell", "spellbook"}
+    tags: set[str] = set()
+    if command_words.intersection(magic_words):
+        tags.add("magic")
+    if command_words.intersection(spell_words):
+        tags.add("spell")
+
+    known_spell_names = {
+        spell.name.strip().casefold()
+        for spell in state.magic.known_spells
+        if spell.name.strip()
+    }
+    if _contains_known_spell_name(command, known_spell_names):
+        tags.update({"magic", "spell"})
+
+    if state.magic.active_effects:
+        tags.add("magic")
+
+    refers_back = bool(
+        command_words.intersection(
+            {
+                "again", "continue", "exercise", "lesson", "practice", "resume",
+                "same", "study", "train", "training", "try",
+            }
+        )
+    )
+
+    task_text = " ".join(
+        " ".join(
+            (
+                task.name,
+                task.category,
+                task.description,
+                task.requester,
+                task.notes,
+            )
+        )
+        for task in state.active_tasks.tasks
+        if task.status.strip().casefold() not in {"completed", "cancelled", "failed"}
+    ).casefold()
+    npc_text = " ".join(str(npc) for npc in relevant_npcs).casefold()
+    if refers_back and _contains_magic_relevance_signal(task_text, known_spell_names):
+        tags.add("magic")
+    if _contains_magic_relevance_signal(npc_text, known_spell_names):
+        tags.add("magic")
+
+    if refers_back:
+        recent_text = " ".join(
+            entry.content for entry in state.history.entries[-4:]
+        ).casefold()
+        if _contains_magic_relevance_signal(recent_text, known_spell_names):
+            tags.add("magic")
+
+    if "spell" in tags:
+        tags.add("magic")
+    return tags
+
+
+def _contains_magic_relevance_signal(text: str, known_spell_names: set[str]) -> bool:
+    """Returns whether text contains a strong magic-domain routing signal."""
+
+    if not text:
+        return False
+    words = {
+        word.strip(".,!?;:()[]{}\"'") for word in text.split() if word.strip()
+    }
+    if words.intersection(
+        {
+            "arcane", "cantrip", "cast", "casting", "enchant", "mage", "magic",
+            "magical", "mana", "ritual", "sorcery", "spell", "spellbook", "wizard",
+        }
+    ):
+        return True
+    return _contains_known_spell_name(text, known_spell_names)
+
+
+def _contains_known_spell_name(text: str, known_spell_names: set[str]) -> bool:
+    """Matches exact known spell names without substring false positives."""
+
+    return any(
+        re.search(rf"(?<!\w){re.escape(name)}(?!\w)", text) is not None
+        for name in known_spell_names
+    )
+
+
+def _magic_context_packet(magic_state, *, include_progression: bool) -> dict[str, Any]:
+    """Projects full magic state while conditionally attaching advancement evidence."""
+
+    data = magic_state.to_dict()
+    history = data.pop("advancement_history", [])
+    summary = data.pop("advancement_summary", {})
+    if not include_progression:
+        return data
+    recent = history[:8] if isinstance(history, list) else []
+    milestones = (
+        summary.get("important_milestones", []) if isinstance(summary, dict) else []
+    )
+    data["progression"] = {
+        "summary": {
+            "total_meaningful_advancements": summary.get(
+                "total_meaningful_advancements", 0
+            ) if isinstance(summary, dict) else 0,
+            "counts_by_category": summary.get("counts_by_category", {})
+            if isinstance(summary, dict) else {},
+        },
+        "recent_meaningful_advancements": recent,
+        "important_milestones": milestones[:10]
+        if isinstance(milestones, list) else [],
+    }
+    return data
 
 
 def _party_context_profile(member: dict[str, Any]) -> dict[str, Any]:

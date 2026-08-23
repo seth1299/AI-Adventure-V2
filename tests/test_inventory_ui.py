@@ -13,6 +13,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
+    QDialog,
     QGridLayout,
     QHeaderView,
     QLabel,
@@ -35,6 +36,7 @@ from ai_adventure.ui.main_window import (
     AlchemyNotebookScreen,
     CalendarPlayerEventDialog,
     CalendarScreen,
+    CharacterScreen,
     CombatScreen,
     GameShell,
     InventoryItemDetailsDialog,
@@ -461,6 +463,37 @@ class InventoryUiTests(unittest.TestCase):
             self.assertFalse(screen.add_combatant_button.isEnabled())
             screen.close()
 
+    def test_character_identity_pronouns_and_contextual_controls(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = SaveRepository.create_new_save(
+                Path(temp_dir), "Character Smart Controls"
+            )
+            repository.set_setting("player.pronouns", "Xe/Xem")
+            repository.set_setting("audio.narrator_enabled", False)
+            repository.set_setting(
+                "combat.preferences",
+                {"resolution_mode": "narrative", "focus": "balanced"},
+            )
+            repository.set_state_value("condition", "Wounded")
+            screen = CharacterScreen(tts_enabled=True)
+            screen.set_repository(repository)
+            self.app.processEvents()
+
+            self.assertEqual(screen.pronouns_combo.currentData(), "other")
+            self.assertEqual(screen.custom_pronouns_input.text(), "Xe/Xem")
+            self.assertFalse(screen.custom_pronouns_input.isHidden())
+            self.assertTrue(screen.name_pronunciation_input.isHidden())
+            self.assertTrue(screen.stats_group.isHidden())
+            self.assertTrue(screen.equipment_group.isHidden())
+            self.assertFalse(screen.condition_group.isHidden())
+            self.assertEqual(screen.condition_label.text(), "Wounded")
+
+            she_index = screen.pronouns_combo.findData("She/Her")
+            screen.pronouns_combo.setCurrentIndex(she_index)
+            self.app.processEvents()
+            self.assertEqual(repository.get_setting("player.pronouns"), "She/Her")
+            screen.close()
+
     def test_magic_screen_displays_known_spells_and_resources(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             repository = SaveRepository.create_new_save(Path(temp_dir), "Magic UI")
@@ -509,6 +542,41 @@ class InventoryUiTests(unittest.TestCase):
         self.assertEqual(wizard.starter_inventory_mode_stack.currentIndex(), 1)
         self.assertEqual(len(advanced_items), 1)
         self.assertEqual(advanced_items[0]["name"], "Exact Lantern")
+        wizard.close()
+
+    def test_new_game_wizard_starting_wealth_supports_guidance_and_exact_amounts(self) -> None:
+        wizard = NewGameWizard(tts_enabled=False)
+        self.assertEqual(wizard._starting_wealth_mode(), "basic")
+        self.assertIn("few meals", wizard.starting_wealth_guidance_input.toPlainText())
+
+        wizard._append_currency_row(
+            {"name": "Bit", "plural_name": "Bits", "value": 1}
+        )
+        wizard._append_currency_row(
+            {"name": "Crown", "plural_name": "Crowns", "value": 12}
+        )
+        wizard._set_starting_wealth_mode("advanced")
+        wizard._append_starting_wealth_amount_row(
+            {"denomination_value": 12, "quantity": 3}
+        )
+        wizard._append_starting_wealth_amount_row(
+            {"denomination_value": 1, "quantity": 4}
+        )
+
+        first_combo = wizard.starting_wealth_amounts_table.cellWidget(0, 0)
+        first_amount = wizard.starting_wealth_amounts_table.cellWidget(0, 1)
+        self.assertIsInstance(first_combo, QComboBox)
+        self.assertIsInstance(first_amount, _NoWheelSpinBox)
+        assert isinstance(first_combo, QComboBox)
+        self.assertEqual(
+            [first_combo.itemText(index) for index in range(first_combo.count())],
+            ["Bit", "Crown"],
+        )
+
+        setup = wizard.build_setup()
+        self.assertEqual(setup["starting_wealth"]["mode"], "advanced")
+        self.assertEqual(setup["starting_wealth"]["balance_base_units"], 40)
+        self.assertIn("40 base units", wizard.starting_wealth_summary_label.text())
         wizard.close()
 
     def test_new_game_wizard_controls_resize_with_available_space(self) -> None:
@@ -894,6 +962,69 @@ class InventoryUiTests(unittest.TestCase):
 
             dialog.close()
             screen.close()
+
+    def test_calendar_day_double_click_prefills_event_date(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = SaveRepository.create_new_save(
+                Path(temp_dir), "Calendar Double Click"
+            )
+            screen = CalendarScreen()
+            screen.set_repository(repository)
+            self.app.processEvents()
+            item = screen.table.item(0, 2)
+            self.assertIsNotNone(item)
+            assert item is not None
+            date = item.data(int(Qt.ItemDataRole.UserRole) + 1)
+            self.assertIsInstance(date, dict)
+
+            with patch(
+                "ai_adventure.ui.main_window.CalendarPlayerEventDialog"
+            ) as dialog_type:
+                dialog_type.return_value.exec.return_value = QDialog.DialogCode.Rejected
+                screen._schedule_open_day_events(0, 2)
+                screen._add_player_event_for_day(0, 2)
+
+            self.assertFalse(screen._day_click_timer.isActive())
+            self.assertEqual(dialog_type.call_args.kwargs["default_year"], date["year"])
+            self.assertEqual(dialog_type.call_args.kwargs["default_month"], date["month"])
+            self.assertEqual(dialog_type.call_args.kwargs["default_day"], date["day"])
+            screen.close()
+
+    def test_new_game_empty_tabs_reveal_with_unread_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = SaveRepository.create_new_save(
+                Path(temp_dir),
+                "Smart Starting Tabs",
+                setup={"title": "Smart Starting Tabs"},
+            )
+            shell = GameShell(lambda: None, tts_enabled=False, ai_enabled=False)
+            shell.set_repository(repository, initially_hide_empty_tabs=True)
+            self.app.processEvents()
+
+            self.assertEqual(shell._tab_index_for_key("npcs"), -1)
+            self.assertEqual(shell._tab_index_for_key("party"), -1)
+            self.assertEqual(shell._tab_index_for_key("magic"), -1)
+
+            repository.upsert_npc(
+                npc_id="mira_coppercup",
+                name="Mira Coppercup",
+                display_name="Mira",
+                role="Guide",
+                player_facing_information="A guide the player has just met.",
+            )
+            shell.story_screen.notify_repository_changed()
+            self.app.processEvents()
+
+            npc_index = shell._tab_index_for_key("npcs")
+            self.assertGreaterEqual(npc_index, 0)
+            self.assertEqual(shell.tabs.tabText(npc_index), "NPCs •")
+            self.assertEqual(shell._tab_index_for_key("party"), -1)
+            self.assertEqual(shell._tab_index_for_key("magic"), -1)
+
+            shell.tabs.setCurrentIndex(npc_index)
+            self.app.processEvents()
+            self.assertEqual(shell.tabs.tabText(npc_index), "NPCs")
+            shell.close()
 
     def test_npcs_auto_refresh_after_repository_change_without_refresh_button(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

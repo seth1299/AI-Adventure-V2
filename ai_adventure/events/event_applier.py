@@ -56,6 +56,7 @@ _SKILL_CHECK_GATED_EVENT_TYPES = {
     "RecipeDiscoveredEvent",
     "SkillXpAddedEvent",
     "CharacterSpellLearnedEvent",
+    "MagicAdvancementRecordedEvent",
 }
 _BAD_LUCK_HISTORY_LIMIT = 8
 _BAD_LUCK_MIN_HISTORY = 5
@@ -283,6 +284,9 @@ class EventApplier:
 
             if event_type == "PlayerSpellCastEvent":
                 return self._apply_player_spell_cast(event_type, payload)
+
+            if event_type == "MagicAdvancementRecordedEvent":
+                return self._apply_magic_advancement_recorded(event_type, payload)
 
             if event_type == "MagicEffectUpsertedEvent":
                 return self._apply_magic_effect_upserted(event_type, payload)
@@ -1663,6 +1667,39 @@ class EventApplier:
             )
         payload.update(result)
         return AppliedEventResult(event_type, "applied", str(result["message"]), payload)
+
+    def _apply_magic_advancement_recorded(
+        self,
+        event_type: str,
+        payload: dict[str, Any],
+    ) -> AppliedEventResult:
+        """Records validated evidence of meaningful magical development."""
+
+        result = self.repository.record_magic_advancement(
+            category=_first_text(payload, "category"),
+            reason=_first_text(payload, "reason"),
+            significance=_first_text(payload, "significance") or "meaningful",
+            spell_id=_first_text(payload, "spell_id"),
+            source=_first_text(payload, "source"),
+            message_id=self.message_id,
+        )
+        status = str(result.get("status", "rejected"))
+        if status == "recorded":
+            entry = result.get("entry", {})
+            if isinstance(entry, dict):
+                payload["advancement_id"] = str(entry.get("advancement_id", ""))
+            return AppliedEventResult(
+                event_type,
+                "applied",
+                str(result.get("message", "Recorded meaningful magic advancement.")),
+                payload,
+            )
+        return AppliedEventResult(
+            event_type,
+            "skipped",
+            str(result.get("message", "Magic advancement was not recorded.")),
+            payload,
+        )
 
     def _apply_magic_effect_upserted(
         self,

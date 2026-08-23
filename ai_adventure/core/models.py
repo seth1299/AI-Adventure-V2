@@ -395,6 +395,24 @@ class ActiveMagicEffect:
 
 
 @dataclass
+class MagicAdvancement:
+    """One durable, narratively meaningful magic-development record."""
+
+    advancement_id: str = ""
+    category: str = ""
+    significance: str = "meaningful"
+    reason: str = ""
+    spell_id: str = ""
+    source: str = ""
+    message_id: str = ""
+    elapsed_minutes: int = -1
+    created_at: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
 class MagicState:
     """The composed player-magic configuration and current tracked state."""
 
@@ -402,6 +420,8 @@ class MagicState:
     known_spells: list[CharacterSpell] = field(default_factory=list)
     resource_pools: list[MagicResourcePool] = field(default_factory=list)
     active_effects: list[ActiveMagicEffect] = field(default_factory=list)
+    advancement_summary: dict[str, Any] = field(default_factory=dict)
+    advancement_history: list[MagicAdvancement] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -409,6 +429,10 @@ class MagicState:
             "known_spells": [spell.to_dict() for spell in self.known_spells],
             "resource_pools": [pool.to_dict() for pool in self.resource_pools],
             "active_effects": [effect.to_dict() for effect in self.active_effects],
+            "advancement_summary": dict(self.advancement_summary),
+            "advancement_history": [
+                advancement.to_dict() for advancement in self.advancement_history
+            ],
         }
 
 

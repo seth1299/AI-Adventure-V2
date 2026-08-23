@@ -4,6 +4,14 @@ from typing import Any
 
 
 MAGIC_CASTING_MODES = ("narrative", "mana", "tiered")
+MAGIC_ADVANCEMENT_CATEGORIES = (
+    "meaningful_cast",
+    "training",
+    "study",
+    "discovery",
+    "story_milestone",
+)
+MAGIC_ADVANCEMENT_SIGNIFICANCE = ("meaningful", "major", "milestone")
 MAGIC_CASTING_MODE_LABELS = {
     "narrative": "Narrative",
     "mana": "Mana",
@@ -118,6 +126,20 @@ def magic_resource_specs(raw_magic: Any) -> list[dict[str, Any]]:
         for tier, maximum in magic["tier_slots"].items()
         if maximum > 0
     ]
+
+
+def normalize_magic_advancement_category(value: Any) -> str:
+    """Returns a supported magic-advancement category or an empty string."""
+
+    normalized = str(value or "").strip().casefold().replace("-", "_").replace(" ", "_")
+    return normalized if normalized in MAGIC_ADVANCEMENT_CATEGORIES else ""
+
+
+def normalize_magic_advancement_significance(value: Any) -> str:
+    """Returns a supported advancement significance, defaulting to meaningful."""
+
+    normalized = str(value or "").strip().casefold()
+    return normalized if normalized in MAGIC_ADVANCEMENT_SIGNIFICANCE else "meaningful"
 
 
 def _normalize_starting_spell(spell: dict[str, Any]) -> dict[str, Any]:

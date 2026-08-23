@@ -53,6 +53,21 @@
       }
     },
     {
+      "id": "magic.meaningful_advancement",
+      "title": "Meaningful Magic Advancement",
+      "category": "magic",
+      "tags": ["magic", "spell", "events"],
+      "priority": 82,
+      "content": {
+        "rules": [
+          "When state.magic.progression is present, its summary, recent meaningful advancements, and important milestones are authoritative durable evidence.",
+          "Use MagicAdvancementRecordedEvent only when the current response establishes meaningful magical development through a consequential cast, substantive training or study, a discovery, or a story milestone. Never use it for routine repetition or an event from an earlier turn.",
+          "For category meaningful_cast, include the exact authorized PlayerSpellCastEvent earlier in the same response and copy its spell_id.",
+          "MagicAdvancementRecordedEvent records evidence only. It does not change maximum Mana, tier slots, tier access, or known spells."
+        ]
+      }
+    },
+    {
       "id": "exploration.default_guidance",
       "title": "Exploration Guidance",
       "category": "world",

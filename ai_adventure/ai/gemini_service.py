@@ -166,6 +166,7 @@ KNOWN_EVENT_TYPE_NAMES = [
     "SpellCatalogUpsertedEvent",
     "CharacterSpellLearnedEvent",
     "PlayerSpellCastEvent",
+    "MagicAdvancementRecordedEvent",
     "MagicEffectUpsertedEvent",
     "NpcUpsertedEvent",
     "NpcKnowledgeAddedEvent",
@@ -1068,6 +1069,33 @@ EVENT_RESPONSE_SCHEMA: dict[str, Any] = {
             ["spell_id", "cast_tier", "player_authorized"],
         ),
         _event_response_schema(
+            "MagicAdvancementRecordedEvent",
+            {
+                "category": {
+                    "type": "string",
+                    "enum": [
+                        "meaningful_cast",
+                        "training",
+                        "study",
+                        "discovery",
+                        "story_milestone",
+                    ],
+                },
+                "significance": {
+                    "type": "string",
+                    "enum": ["meaningful", "major", "milestone"],
+                },
+                "reason": {"type": "string"},
+                "spell_id": {"type": "string"},
+                "source": {"type": "string"},
+            },
+            ["category", "significance", "reason"],
+            description=(
+                "Records one current-turn instance of meaningful magical development; "
+                "it does not itself change Mana, slots, tiers, or known spells."
+            ),
+        ),
+        _event_response_schema(
             "MagicEffectUpsertedEvent",
             {
                 "effect_id": {"type": "string"},
@@ -1309,6 +1337,7 @@ STORY_EVENT_TYPE_NAMES_BY_CONTEXT_TAG: dict[str, tuple[str, ...]] = {
         "SpellCatalogUpsertedEvent",
         "CharacterSpellLearnedEvent",
         "PlayerSpellCastEvent",
+        "MagicAdvancementRecordedEvent",
         "MagicEffectUpsertedEvent",
     ),
     "merchant": (
@@ -1350,6 +1379,7 @@ STORY_EVENT_TYPE_NAMES_BY_CONTEXT_TAG: dict[str, tuple[str, ...]] = {
         "SpellCatalogUpsertedEvent",
         "CharacterSpellLearnedEvent",
         "PlayerSpellCastEvent",
+        "MagicAdvancementRecordedEvent",
         "MagicEffectUpsertedEvent",
     ),
     "state": ("FlagSetEvent",),
@@ -1854,6 +1884,14 @@ def build_new_game_response_schema(setup_packet: dict[str, Any]) -> dict[str, An
     if isinstance(denominations, list) and denominations:
         omit("currency_denominations")
         omit("currency_description")
+
+    starting_wealth = setup.get("starting_wealth", {})
+    if (
+        isinstance(starting_wealth, dict)
+        and str(starting_wealth.get("mode", "basic")).strip().casefold()
+        == "advanced"
+    ):
+        omit("starting_currency_balance_base_units")
 
     event_types: list[str] = []
     starting_npcs = setup.get("starting_npcs", [])
@@ -3104,7 +3142,15 @@ def build_gemini_story_prompt(context_packet: dict[str, Any]) -> str:
         "for tier 0. Use CharacterSpellLearnedEvent only when the player actually gains a "
         "usable spell, and include its complete definition. Use SpellCatalogUpsertedEvent "
         "for established spells the player does not learn. Use MagicEffectUpsertedEvent "
-        "only for an ongoing effect actually established by the current narration.\n"
+        "only for an ongoing effect actually established by the current narration. When "
+        "state.magic.progression is present, treat its summary, recent meaningful "
+        "advancements, and milestones as authoritative. Suggest "
+        "MagicAdvancementRecordedEvent only when this response establishes meaningful "
+        "magical development through a consequential cast, substantive training or study, "
+        "a discovery, or a story milestone. Never award it for routine repetition or an "
+        "event from an earlier turn. For category=meaningful_cast, first include the exact "
+        "authorized PlayerSpellCastEvent in this response and copy its spell_id. This "
+        "advancement record does not itself change Mana, slots, tiers, or known spells.\n"
         "- state.travel is the authoritative player-known travel map. Its x_miles "
         "and y_miles coordinates use a shared map measured in miles; do not invent "
         "a conflicting distance for known locations. When the player learns a new "
@@ -3602,12 +3648,14 @@ def build_gemini_new_game_prompt(setup_packet: dict[str, Any]) -> str:
         "may use credits. Use setup.economy_examples as common-price calibration "
         "for ordinary goods when it is present. If setup.currency_denominations "
         "already contains player-provided values, preserve them.\n"
-        "- starting_currency_balance_base_units must be a reasonable starting money "
-        "amount for the finalized character, genre, and economy. This is the "
-        "player's actual starting money stored in game_state/currency.balance as "
-        "one integer in the baseline currency unit. Account for any "
-        "setup.economy_examples common-price rows when choosing it. Do not create "
-        "coin or purse items in starting_items to represent spendable money.\n"
+        "- setup.starting_wealth is authoritative. In basic mode, "
+        "starting_currency_balance_base_units must be a nonnegative starting-money "
+        "amount that follows setup.starting_wealth.guidance and fits the finalized "
+        "character, genre, economy, and setup.economy_examples. In advanced mode, "
+        "Python already calculated the exact balance from the player's denomination "
+        "and count rows; do not return or replace it. Starting wealth is stored as "
+        "one integer in game_state/currency.balance. Never create coin, purse, cash, "
+        "wallet, credit, or other spendable-money items in starting_items.\n"
         "- The API response schema defines the required output fields and event "
         "envelope. New-game events may only be NpcUpsertedEvent, "
         "ActiveTaskUpsertedEvent, MusicChangedEvent, or "
@@ -5058,7 +5106,30 @@ def _skill_check_planning_packet(context_packet: dict[str, Any]) -> dict[str, An
     if not isinstance(recent_history, list):
         recent_history = []
 
-    return {
+    selection = context_packet.get("selection", {})
+    selected_tags = {
+        str(tag).strip().casefold()
+        for tag in selection.get("tags", [])
+        if isinstance(tag, str) and str(tag).strip()
+    } if isinstance(selection, dict) else set()
+    magic = state.get("magic", {}) if isinstance(state.get("magic"), dict) else {}
+    magic_planning_context: dict[str, Any] = {}
+    if selected_tags.intersection({"magic", "spell"}):
+        magic_planning_context = {
+            "configuration": magic.get("configuration", {}),
+            "known_spells": [
+                {
+                    key: spell.get(key)
+                    for key in ("spell_id", "name", "tier", "school", "mana_cost")
+                }
+                for spell in magic.get("known_spells", [])
+                if isinstance(spell, dict)
+            ],
+            "active_effects": magic.get("active_effects", []),
+            "progression": magic.get("progression", {}),
+        }
+
+    packet = {
         "packet_type": "skill_check_planning",
         "player_command": str(context_packet.get("player_command", "")).strip(),
         "scene": state.get("scene", {}) if isinstance(state.get("scene"), dict) else {},
@@ -5085,6 +5156,9 @@ def _skill_check_planning_packet(context_packet: dict[str, Any]) -> dict[str, An
         "recent_checks": skills.get("recent_checks", []),
         "recent_history": recent_history[-2:],
     }
+    if magic_planning_context:
+        packet["magic"] = magic_planning_context
+    return packet
 
 
 def _context_packet_stats(
@@ -5110,6 +5184,9 @@ def _context_packet_stats(
         "crafting_recipes": _list_len(_nested_value(state, "alchemy", "known_recipes")),
         "known_skills": _list_len(_nested_value(state, "skills", "known_skills")),
         "recent_checks": _list_len(_nested_value(state, "skills", "recent_checks")),
+        "magic_advancements": _list_len(
+            _nested_value(state, "magic", "progression", "recent_meaningful_advancements")
+        ),
         "active_tasks": _list_len(_nested_value(state, "active_tasks", "tasks")),
         "relevant_npcs": _list_len(_nested_value(state, "npcs", "relevant")),
         "active_gm_secrets": _list_len(_nested_value(state, "gm_secrets", "active")),

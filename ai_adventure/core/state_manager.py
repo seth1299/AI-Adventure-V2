@@ -27,6 +27,7 @@ from ai_adventure.core.models import (
     InventoryItem,
     InventoryState,
     MagicResourcePool,
+    MagicAdvancement,
     MagicState,
     ActiveMagicEffect,
     PlayerState,
@@ -383,6 +384,21 @@ class StateManager:
                     requires_concentration=bool(row.get("requires_concentration", False)),
                 )
                 for row in self.repository.list_active_magic_effects()
+            ],
+            advancement_summary=self.repository.get_magic_advancement_summary(),
+            advancement_history=[
+                MagicAdvancement(
+                    advancement_id=_read_string(row, "advancement_id", ""),
+                    category=_read_string(row, "category", ""),
+                    significance=_read_string(row, "significance", "meaningful"),
+                    reason=_read_string(row, "reason", ""),
+                    spell_id=_read_string(row, "spell_id", ""),
+                    source=_read_string(row, "source", ""),
+                    message_id=_read_string(row, "message_id", ""),
+                    elapsed_minutes=_read_int(row, "elapsed_minutes", -1),
+                    created_at=_read_string(row, "created_at", ""),
+                )
+                for row in self.repository.list_magic_advancement_history(limit=50)
             ],
         )
 

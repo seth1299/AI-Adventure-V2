@@ -36,6 +36,9 @@ SKILL_PRESET_LEVEL_PLANS: dict[str, list[int]] = {
 }
 SKILL_LEVEL_PLAN = SKILL_PRESET_LEVEL_PLANS["professional"]
 STARTER_INVENTORY_MIN_ITEMS = 5
+DEFAULT_STARTING_WEALTH_GUIDANCE = (
+    "They should have enough money to cover a few meals."
+)
 
 CHARACTER_GENDER_PRESENTATION_HINTS = [
     "female-coded",
@@ -231,6 +234,10 @@ def normalize_new_game_setup(raw_setup: Any) -> dict[str, Any]:
         raw_setup.get("currency_denominations", []),
         fallback_denominations=[],
     )
+    starting_wealth = normalize_starting_wealth(
+        raw_setup.get("starting_wealth", {}),
+        currency_denominations,
+    )
     economy_examples = normalize_economy_examples(
         raw_setup.get("economy_examples", raw_setup.get("economy_notes", []))
     )
@@ -335,6 +342,7 @@ def normalize_new_game_setup(raw_setup: Any) -> dict[str, Any]:
         },
         "time_display": calendar_settings["time_display"],
         "currency_denominations": currency_denominations,
+        "starting_wealth": starting_wealth,
         "currency_description": currency_description,
         "economy_examples": economy_examples,
         "specified_genre": specified_genre,
@@ -888,14 +896,16 @@ def build_new_game_setup_packet(
                 "player-provided setup.currency_denominations instead of replacing them."
             ),
             "starting_currency_balance": (
-                "Return starting_currency_balance_base_units as the player "
-                "character's actual starting money. It will be written to "
-                "game_state/currency.balance as one integer in the baseline "
-                "currency unit. Choose an amount that fits the finalized "
-                "character, genre, starting situation, economy, and any "
-                "setup.economy_examples common-price rows. Do not create coin, "
-                "purse, cash, wallet, or credit inventory items to represent "
-                "spendable money."
+                "setup.starting_wealth is authoritative. In basic mode, return "
+                "starting_currency_balance_base_units as the player character's "
+                "actual starting money, choosing one nonnegative integer amount "
+                "that follows setup.starting_wealth.guidance and fits the finalized "
+                "economy and setup.economy_examples. In advanced mode, Python "
+                "already calculated setup.starting_wealth.balance_base_units from "
+                "the exact denomination/count rows; preserve that amount and do not "
+                "return or replace it. Starting wealth is stored only in "
+                "game_state/currency.balance. Never create coin, purse, cash, wallet, "
+                "or credit inventory items to represent spendable money."
             ),
             "magic": (
                 "setup.magic is authoritative. If world_contains_magic is false, "
@@ -973,6 +983,21 @@ def build_new_game_setup_packet(
                 "its origin or packaging. A ready-to-use poison or toxin is Poison "
                 "even in a vial; Ingredient or Reagent is for a recipe input that "
                 "still needs processing."
+            ),
+        },
+        "starting_wealth_contract": {
+            "mode": clean_setup["starting_wealth"]["mode"],
+            "guidance": clean_setup["starting_wealth"]["guidance"],
+            "amounts": clean_setup["starting_wealth"]["amounts"],
+            "balance_base_units": clean_setup["starting_wealth"][
+                "balance_base_units"
+            ],
+            "requires_ai_invention": clean_setup["starting_wealth"][
+                "requires_ai_invention"
+            ],
+            "storage_rule": (
+                "The finalized amount is one integer in game_state/currency.balance, "
+                "never an inventory item."
             ),
         },
         "magic_contract": {
@@ -1145,6 +1170,9 @@ def _fields_requiring_ai_invention(clean_setup: dict[str, Any]) -> list[str]:
     if not clean_setup["currency_denominations"]:
         invention_fields.append("economy and currency denominations")
 
+    if clean_setup["starting_wealth"]["mode"] == "basic":
+        invention_fields.append("starting wealth from player guidance")
+
     return invention_fields
 
 
@@ -1231,6 +1259,77 @@ def _character_generation_guidance(clean_setup: dict[str, Any]) -> dict[str, str
             "description. Vary names, appearance, and backstory without conflicting "
             "with canonical_pronouns."
         ),
+    }
+
+
+def normalize_starting_wealth(
+    raw_wealth: Any,
+    denominations: Any,
+) -> dict[str, Any]:
+    """Returns the canonical Basic/Advanced new-game wealth contract."""
+
+    source = raw_wealth if isinstance(raw_wealth, dict) else {}
+    mode = (
+        "advanced"
+        if str(source.get("mode", "basic")).strip().casefold() == "advanced"
+        else "basic"
+    )
+    guidance = _clean_text(source.get("guidance")) or DEFAULT_STARTING_WEALTH_GUIDANCE
+    clean_denominations = normalize_currency_denominations(
+        denominations,
+        fallback_denominations=[],
+    )
+    denominations_by_value = {
+        int(denomination["value"]): denomination
+        for denomination in clean_denominations
+    }
+    denominations_by_name = {
+        str(denomination["name"]).strip().casefold(): denomination
+        for denomination in clean_denominations
+    }
+    raw_amounts = source.get("amounts", [])
+    if not isinstance(raw_amounts, list):
+        raw_amounts = []
+    quantities_by_value: dict[int, int] = {}
+    for raw_amount in raw_amounts:
+        if not isinstance(raw_amount, dict):
+            continue
+        value = _safe_int(raw_amount.get("denomination_value"), 0)
+        denomination = denominations_by_value.get(value)
+        if denomination is None:
+            name = _clean_text(raw_amount.get("denomination_name")).casefold()
+            denomination = denominations_by_name.get(name)
+        if denomination is None:
+            continue
+        denomination_value = int(denomination["value"])
+        quantity = _clamped_int(raw_amount.get("quantity"), 0, 0, 1_000_000_000)
+        quantities_by_value[denomination_value] = min(
+            1_000_000_000,
+            quantities_by_value.get(denomination_value, 0) + quantity,
+        )
+
+    amounts = [
+        {
+            "denomination_name": str(denominations_by_value[value]["name"]),
+            "denomination_value": value,
+            "quantity": quantity,
+        }
+        for value, quantity in sorted(quantities_by_value.items())
+        if quantity > 0
+    ]
+    balance_base_units = min(
+        9_223_372_036_854_775_807,
+        sum(
+            int(amount["denomination_value"]) * int(amount["quantity"])
+            for amount in amounts
+        ),
+    )
+    return {
+        "mode": mode,
+        "guidance": guidance if mode == "basic" else "",
+        "amounts": amounts if mode == "advanced" else [],
+        "balance_base_units": balance_base_units if mode == "advanced" else None,
+        "requires_ai_invention": mode == "basic",
     }
 
 

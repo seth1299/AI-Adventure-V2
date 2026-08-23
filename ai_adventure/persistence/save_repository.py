@@ -52,7 +52,12 @@ from ai_adventure.locations import (
     normalize_known_location,
     normalize_known_locations,
 )
-from ai_adventure.magic import magic_resource_specs, normalize_magic_setup
+from ai_adventure.magic import (
+    magic_resource_specs,
+    normalize_magic_advancement_category,
+    normalize_magic_advancement_significance,
+    normalize_magic_setup,
+)
 from ai_adventure.skills.rules import bonus_for_level, clamp_skill_level, level_for_xp
 
 
@@ -298,6 +303,15 @@ class SaveRepository:
         self.set_journal_notes("")
         self.set_journal_share_with_ai(False)
         self.set_currency_denominations(clean_setup["currency_denominations"])
+        starting_wealth = clean_setup["starting_wealth"]
+        self.set_state_value(
+            "currency.balance",
+            str(
+                int(starting_wealth["balance_base_units"])
+                if starting_wealth["mode"] == "advanced"
+                else 0
+            ),
+        )
         self.set_calendar_settings(calendar_settings)
         starting_minute = resolve_starting_calendar_minute(
             clean_setup.get("starting_calendar", {}),
@@ -1709,6 +1723,164 @@ class SaveRepository:
                 (max(1, limit),),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def record_magic_advancement(
+        self,
+        *,
+        category: str,
+        reason: str,
+        significance: str = "meaningful",
+        spell_id: str = "",
+        source: str = "",
+        message_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Records one validated, narratively meaningful magic-development entry."""
+
+        magic = self.get_magic_configuration()
+        if not magic["world_contains_magic"]:
+            return {
+                "status": "rejected",
+                "message": "Magic advancement cannot occur in a world without magic.",
+            }
+        clean_category = normalize_magic_advancement_category(category)
+        if not clean_category:
+            return {"status": "rejected", "message": "Unsupported magic advancement category."}
+        clean_reason = str(reason or "").strip()[:500]
+        if not clean_reason:
+            return {"status": "rejected", "message": "Magic advancement requires a reason."}
+        clean_significance = normalize_magic_advancement_significance(significance)
+        clean_spell_id = str(spell_id or "").strip()
+        clean_source = str(source or "").strip()[:160]
+        resolved_message_id = self._resolve_message_id(message_id)
+
+        if clean_spell_id and self.get_spell(clean_spell_id) is None:
+            return {"status": "rejected", "message": "Referenced magic-advancement spell does not exist."}
+
+        with self._connect() as connection:
+            if clean_category == "meaningful_cast":
+                if not clean_spell_id:
+                    return {
+                        "status": "rejected",
+                        "message": "Meaningful casting advancement requires an exact spell_id.",
+                    }
+                cast = connection.execute(
+                    """
+                    SELECT 1 FROM spell_cast_history
+                    WHERE message_id = ? AND spell_id = ? AND status = 'cast'
+                    LIMIT 1
+                    """,
+                    (resolved_message_id, clean_spell_id),
+                ).fetchone()
+                if cast is None:
+                    return {
+                        "status": "rejected",
+                        "message": (
+                            "Meaningful casting advancement requires that exact spell "
+                            "to have been cast in the current response."
+                        ),
+                    }
+
+            dedupe_material = "\x1f".join(
+                (
+                    resolved_message_id,
+                    clean_category,
+                    clean_spell_id,
+                    clean_reason.casefold(),
+                )
+            )
+            dedupe_key = uuid.uuid5(uuid.NAMESPACE_URL, dedupe_material).hex
+            existing = connection.execute(
+                "SELECT * FROM magic_advancement_history WHERE dedupe_key = ?",
+                (dedupe_key,),
+            ).fetchone()
+            if existing is not None:
+                return {
+                    "status": "duplicate",
+                    "message": "That magic advancement is already recorded for this response.",
+                    "entry": dict(existing),
+                }
+
+            advancement_id = f"magic_adv_{uuid.uuid4().hex}"
+            timestamp = datetime.now().isoformat(timespec="seconds")
+            elapsed_minutes = self.get_current_calendar_minute()
+            connection.execute(
+                """
+                INSERT INTO magic_advancement_history (
+                    advancement_id, category, significance, reason, spell_id,
+                    source, message_id, elapsed_minutes, dedupe_key, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    advancement_id,
+                    clean_category,
+                    clean_significance,
+                    clean_reason,
+                    clean_spell_id,
+                    clean_source,
+                    resolved_message_id,
+                    elapsed_minutes,
+                    dedupe_key,
+                    timestamp,
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM magic_advancement_history WHERE advancement_id = ?",
+                (advancement_id,),
+            ).fetchone()
+
+        return {
+            "status": "recorded",
+            "message": "Recorded meaningful magic advancement.",
+            "entry": dict(row) if row is not None else {},
+        }
+
+    def list_magic_advancement_history(self, limit: int = 50) -> list[dict[str, Any]]:
+        """Lists the newest durable magic-development records first."""
+
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT advancement_id, category, significance, reason, spell_id,
+                       source, message_id, elapsed_minutes, created_at
+                FROM magic_advancement_history
+                ORDER BY created_at DESC, rowid DESC
+                LIMIT ?
+                """,
+                (max(1, int(limit)),),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_magic_advancement_summary(self) -> dict[str, Any]:
+        """Builds compact authoritative counts and lasting milestone evidence."""
+
+        with self._connect() as connection:
+            total_row = connection.execute(
+                "SELECT COUNT(*) AS total FROM magic_advancement_history"
+            ).fetchone()
+            category_rows = connection.execute(
+                """
+                SELECT category, COUNT(*) AS count
+                FROM magic_advancement_history
+                GROUP BY category ORDER BY category
+                """
+            ).fetchall()
+            milestone_rows = connection.execute(
+                """
+                SELECT advancement_id, category, significance, reason, spell_id,
+                       source, message_id, elapsed_minutes, created_at
+                FROM magic_advancement_history
+                WHERE significance = 'milestone'
+                ORDER BY created_at DESC, rowid DESC
+                LIMIT 10
+                """
+            ).fetchall()
+        return {
+            "total_meaningful_advancements": int(total_row["total"] if total_row else 0),
+            "counts_by_category": {
+                str(row["category"]): int(row["count"]) for row in category_rows
+            },
+            "important_milestones": [dict(row) for row in milestone_rows],
+        }
 
     def upsert_active_magic_effect(
         self,
@@ -4271,6 +4443,19 @@ class SaveRepository:
                     status TEXT NOT NULL DEFAULT 'cast',
                     message_id TEXT NOT NULL DEFAULT '',
                     cast_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS magic_advancement_history (
+                    advancement_id TEXT PRIMARY KEY,
+                    category TEXT NOT NULL,
+                    significance TEXT NOT NULL DEFAULT 'meaningful',
+                    reason TEXT NOT NULL,
+                    spell_id TEXT NOT NULL DEFAULT '',
+                    source TEXT NOT NULL DEFAULT '',
+                    message_id TEXT NOT NULL DEFAULT '',
+                    elapsed_minutes INTEGER NOT NULL DEFAULT -1,
+                    dedupe_key TEXT NOT NULL UNIQUE,
+                    created_at TEXT NOT NULL
                 );
 
                 CREATE TABLE IF NOT EXISTS active_magic_effects (

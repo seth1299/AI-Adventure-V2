@@ -84,6 +84,42 @@ def _container_metadata() -> dict[str, object]:
 
 
 class GeminiServiceTests(unittest.TestCase):
+    def test_new_game_schema_lets_gemini_set_only_basic_starting_wealth(self) -> None:
+        basic_schema = build_new_game_response_schema(
+            {
+                "setup": {
+                    "starting_wealth": {"mode": "basic"},
+                }
+            }
+        )
+        advanced_schema = build_new_game_response_schema(
+            {
+                "setup": {
+                    "starting_wealth": {
+                        "mode": "advanced",
+                        "balance_base_units": 40,
+                    },
+                }
+            }
+        )
+
+        self.assertIn(
+            "starting_currency_balance_base_units",
+            basic_schema["properties"],
+        )
+        self.assertIn(
+            "starting_currency_balance_base_units",
+            basic_schema["required"],
+        )
+        self.assertNotIn(
+            "starting_currency_balance_base_units",
+            advanced_schema["properties"],
+        )
+        self.assertNotIn(
+            "starting_currency_balance_base_units",
+            advanced_schema["required"],
+        )
+
     def test_new_game_parser_enforces_starting_party_npc_identity(self) -> None:
         setup = {
             "starting_npcs": [

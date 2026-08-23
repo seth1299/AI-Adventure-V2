@@ -302,6 +302,7 @@ from ai_adventure.events.event_applier import EventApplier
 from ai_adventure.new_game_setup import (
     CHARACTER_PRONOUN_OPTIONS,
     DEFAULT_CHARACTER_PRONOUNS,
+    DEFAULT_STARTING_WEALTH_GUIDANCE,
     GREGORIAN_CALENDAR_SETTINGS,
     SKILL_LEVEL_PLAN,
     SKILL_PRESET_LEVEL_PLANS,
@@ -377,6 +378,7 @@ STARTING_NPC_COLUMN_WIDTHS = (150, 160, 260, 132, 100)
 STARTING_LOCATION_COLUMN_WIDTHS = (180, 320, 132, 110, 180, 120)
 CURRENCY_COLUMN_WIDTHS = (150, 160, 132, 100)
 ECONOMY_EXAMPLE_COLUMN_WIDTHS = (220, 132, 100)
+STARTING_WEALTH_COLUMN_WIDTHS = (220, 132, 100)
 THEME_NAMES = {"Light", "Dark"}
 SampleVoiceCallback = Callable[[str, int, int], bool]
 SKILL_LEVEL_DESCRIPTIONS = {
@@ -668,6 +670,90 @@ class RepositoryBackedWidget(QWidget):
 
         if self.on_repository_changed is not None:
             self.on_repository_changed(self)
+
+
+def _screen_content_signature(screen: QWidget) -> str:
+    """Returns a stable signature of player-visible values on one game screen."""
+
+    values: list[Any] = []
+    for widget in [screen, *screen.findChildren(QWidget)]:
+        identity = (widget.metaObject().className(), widget.objectName())
+
+        if isinstance(widget, QTableWidget):
+            cells: list[Any] = []
+            for row in range(widget.rowCount()):
+                for column in range(widget.columnCount()):
+                    item = widget.item(row, column)
+                    cells.append(
+                        None
+                        if item is None
+                        else (
+                            item.text(),
+                            item.checkState().value,
+                        )
+                    )
+            values.append((identity, widget.rowCount(), widget.columnCount(), cells))
+        elif isinstance(widget, QListWidget):
+            values.append(
+                (
+                    identity,
+                    [
+                        widget.item(index).text()
+                        for index in range(widget.count())
+                    ],
+                )
+            )
+        elif isinstance(widget, QComboBox):
+            values.append(
+                (
+                    identity,
+                    widget.currentIndex(),
+                    [widget.itemText(index) for index in range(widget.count())],
+                    widget.isEnabled(),
+                    widget.isHidden(),
+                )
+            )
+        elif isinstance(widget, QSpinBox):
+            values.append(
+                (identity, widget.value(), widget.isEnabled(), widget.isHidden())
+            )
+        elif isinstance(widget, QSlider):
+            values.append(
+                (identity, widget.value(), widget.isEnabled(), widget.isHidden())
+            )
+        elif isinstance(widget, QCheckBox):
+            values.append(
+                (
+                    identity,
+                    widget.text(),
+                    widget.isChecked(),
+                    widget.isEnabled(),
+                    widget.isHidden(),
+                )
+            )
+        elif isinstance(widget, QLineEdit):
+            values.append(
+                (identity, widget.text(), widget.isEnabled(), widget.isHidden())
+            )
+        elif isinstance(widget, (QTextEdit, QPlainTextEdit)):
+            values.append(
+                (identity, widget.toPlainText(), widget.isEnabled(), widget.isHidden())
+            )
+        elif isinstance(widget, QLabel):
+            values.append((identity, widget.text(), widget.isHidden()))
+        elif isinstance(widget, QGroupBox):
+            values.append((identity, widget.title(), widget.isHidden()))
+        elif isinstance(widget, QPushButton):
+            values.append(
+                (
+                    identity,
+                    widget.text(),
+                    widget.isEnabled(),
+                    widget.isHidden(),
+                )
+            )
+
+    return json.dumps(values, sort_keys=True, default=str, separators=(",", ":"))
 
 
 class _GeminiStoryWorker(QObject):
@@ -1162,7 +1248,7 @@ class MainWindow(QMainWindow):
         repository.set_setting("theme", self.menu_theme)
 
         save_new_game_template(self.app_paths.new_game_templates_path, clean_setup)
-        self.open_repository(repository)
+        self.open_repository(repository, new_game=True)
 
         if not self.ai_enabled:
             return
@@ -1395,7 +1481,16 @@ class MainWindow(QMainWindow):
         if result.start_weather:
             repository.set_state_value("weather", result.start_weather)
 
-        if result.finalized_starting_currency_balance_base_units is not None:
+        starting_wealth = setup.get("starting_wealth", {})
+        starting_wealth_mode = (
+            str(starting_wealth.get("mode", "basic")).strip().casefold()
+            if isinstance(starting_wealth, dict)
+            else "basic"
+        )
+        if (
+            starting_wealth_mode == "basic"
+            and result.finalized_starting_currency_balance_base_units is not None
+        ):
             repository.set_state_value(
                 "currency.balance",
                 str(result.finalized_starting_currency_balance_base_units),
@@ -1566,7 +1661,12 @@ class MainWindow(QMainWindow):
 
         self.open_repository(repository)
 
-    def open_repository(self, repository: SaveRepository) -> None:
+    def open_repository(
+        self,
+        repository: SaveRepository,
+        *,
+        new_game: bool = False,
+    ) -> None:
         """
         Opens a repository in the game shell.
 
@@ -1575,7 +1675,10 @@ class MainWindow(QMainWindow):
         """
 
         self.active_repository = repository
-        self.game_shell.set_repository(repository)
+        self.game_shell.set_repository(
+            repository,
+            initially_hide_empty_tabs=new_game,
+        )
         self._apply_active_theme()
         self.stack.setCurrentWidget(self.game_shell)
 
@@ -5446,6 +5549,7 @@ class NewGameWizard(QWizard):
                 "style": self.narration_style_combo.currentData(),
             },
             "currency_denominations": self._currency_denominations_from_table(),
+            "starting_wealth": self._starting_wealth_from_controls(),
             "currency_description": (
                 describe_economy_examples(economy_examples)
                 or self._legacy_currency_description
@@ -5591,6 +5695,8 @@ class NewGameWizard(QWizard):
 
         for denomination in clean_setup["currency_denominations"]:
             self._append_currency_row(denomination)
+
+        self._load_starting_wealth(clean_setup["starting_wealth"])
 
         self.economy_examples_table.setRowCount(0)
 
@@ -7183,7 +7289,10 @@ class NewGameWizard(QWizard):
 
         page = QWizardPage()
         page.setTitle("Inventory and Currency")
-        page.setSubTitle("Add requested starter items and describe the world's money.")
+        page.setSubTitle(
+            "Add requested starter items, define the world's money, and choose "
+            "the Player's starting wealth."
+        )
 
         self.starter_items_table = _AppTableWidget(0, 7)
         self.starter_items_table.setHorizontalHeaderLabels(
@@ -7313,6 +7422,86 @@ class NewGameWizard(QWizard):
             lambda: self._append_economy_example_row({})
         )
 
+        self.starting_wealth_basic_button = QPushButton("Basic")
+        self.starting_wealth_advanced_button = QPushButton("Advanced")
+        self.starting_wealth_mode_buttons = QButtonGroup(self)
+        self.starting_wealth_mode_buttons.setExclusive(True)
+        self.starting_wealth_mode_buttons.addButton(
+            self.starting_wealth_basic_button, 0
+        )
+        self.starting_wealth_mode_buttons.addButton(
+            self.starting_wealth_advanced_button, 1
+        )
+        for mode_button in (
+            self.starting_wealth_basic_button,
+            self.starting_wealth_advanced_button,
+        ):
+            mode_button.setObjectName("startingWealthModeButton")
+            mode_button.setCheckable(True)
+        self.starting_wealth_basic_button.setChecked(True)
+
+        self.starting_wealth_guidance_input = QPlainTextEdit()
+        self.starting_wealth_guidance_input.setPlaceholderText(
+            DEFAULT_STARTING_WEALTH_GUIDANCE
+        )
+        self.starting_wealth_guidance_input.setPlainText(
+            DEFAULT_STARTING_WEALTH_GUIDANCE
+        )
+        self.starting_wealth_guidance_input.setMinimumHeight(85)
+
+        basic_wealth_layout = QFormLayout()
+        _configure_responsive_form(basic_wealth_layout)
+        basic_wealth_layout.addRow(
+            "Starting Wealth Guidance:",
+            self.starting_wealth_guidance_input,
+        )
+        basic_wealth_widget = QWidget()
+        basic_wealth_widget.setLayout(basic_wealth_layout)
+
+        self.starting_wealth_amounts_table = _AppTableWidget(0, 3)
+        self.starting_wealth_amounts_table.setHorizontalHeaderLabels(
+            ["Currency", "Amount", "Remove"]
+        )
+        _configure_inline_table(
+            self.starting_wealth_amounts_table,
+            STARTING_WEALTH_COLUMN_WIDTHS,
+            minimum_height=140,
+        )
+        _configure_responsive_table(
+            self.starting_wealth_amounts_table,
+            stretch_columns={0},
+            compact_columns={1, 2},
+        )
+        self.add_starting_wealth_amount_button = QPushButton(
+            "Add Starting Currency Amount"
+        )
+        self.add_starting_wealth_amount_button.clicked.connect(
+            lambda: self._append_starting_wealth_amount_row({})
+        )
+        self.starting_wealth_summary_label = QLabel("Total: 0 base units")
+        self.starting_wealth_summary_label.setWordWrap(True)
+
+        advanced_wealth_layout = QFormLayout()
+        _configure_responsive_form(advanced_wealth_layout)
+        advanced_wealth_layout.addRow(
+            "Starting Currency:", self.starting_wealth_amounts_table
+        )
+        advanced_wealth_layout.addRow(
+            "", _button_row(self.add_starting_wealth_amount_button)
+        )
+        advanced_wealth_layout.addRow("", self.starting_wealth_summary_label)
+        advanced_wealth_widget = QWidget()
+        advanced_wealth_widget.setLayout(advanced_wealth_layout)
+
+        self.starting_wealth_mode_stack = QStackedWidget()
+        self.starting_wealth_mode_stack.addWidget(basic_wealth_widget)
+        self.starting_wealth_mode_stack.addWidget(advanced_wealth_widget)
+        self.starting_wealth_mode_buttons.idClicked.connect(
+            lambda index: self._set_starting_wealth_mode(
+                "advanced" if index == 1 else "basic"
+            )
+        )
+
         self.starter_inventory_basic_button = QPushButton("Basic")
         self.starter_inventory_advanced_button = QPushButton("Advanced")
         self.starter_inventory_mode_buttons = QButtonGroup(self)
@@ -7378,6 +7567,19 @@ class NewGameWizard(QWizard):
         layout.addRow("", _button_row(add_currency_button))
         layout.addRow("Economy Notes:", self.economy_examples_table)
         layout.addRow("", _button_row(add_economy_example_button))
+        wealth_mode_label = QLabel(
+            "Starting wealth: Basic lets the A.I. interpret plain-language "
+            "guidance; Advanced stores the exact denomination counts below."
+        )
+        wealth_mode_label.setWordWrap(True)
+        layout.addRow(wealth_mode_label)
+        layout.addRow(
+            _button_row(
+                self.starting_wealth_basic_button,
+                self.starting_wealth_advanced_button,
+            )
+        )
+        layout.addRow(self.starting_wealth_mode_stack)
 
         content = QWidget()
         content.setLayout(layout)
@@ -7403,6 +7605,7 @@ class NewGameWizard(QWizard):
         page_layout.addWidget(scroll_area)
         page.setLayout(page_layout)
 
+        self._sync_starting_wealth_currency_options()
         self.addPage(page)
 
     def _build_audio_page(self) -> None:
@@ -7678,6 +7881,14 @@ class NewGameWizard(QWizard):
             denomination,
             self._remove_currency_row,
         )
+        row = self.currency_table.rowCount() - 1
+        name_input = self.currency_table.cellWidget(row, 0)
+        value_input = self.currency_table.cellWidget(row, 2)
+        if isinstance(name_input, QLineEdit):
+            name_input.textChanged.connect(self._sync_starting_wealth_currency_options)
+        if isinstance(value_input, QSpinBox):
+            value_input.valueChanged.connect(self._sync_starting_wealth_currency_options)
+        self._sync_starting_wealth_currency_options()
 
     def _remove_currency_row(self, button: QPushButton) -> None:
         """Removes the currency row containing button."""
@@ -7687,6 +7898,7 @@ class NewGameWizard(QWizard):
 
         if _remove_table_row_by_button(self.currency_table, button) >= 0:
             self._sync_currency_base_value_row()
+            self._sync_starting_wealth_currency_options()
 
     def _sync_currency_base_value_row(self) -> None:
         """Keeps the first visible currency row as the baseline denomination."""
@@ -7697,6 +7909,166 @@ class NewGameWizard(QWizard):
         """Reads currency denomination rows from the wizard table."""
 
         return _currency_denominations_from_table(self.currency_table)
+
+    def _starting_wealth_mode(self) -> str:
+        """Returns the selected Basic/Advanced starting-wealth mode."""
+
+        return (
+            "advanced"
+            if self.starting_wealth_advanced_button.isChecked()
+            else "basic"
+        )
+
+    def _set_starting_wealth_mode(self, mode: str) -> None:
+        """Selects the starting-wealth mode and matching editor page."""
+
+        is_advanced = str(mode).casefold() == "advanced"
+        self.starting_wealth_advanced_button.setChecked(is_advanced)
+        self.starting_wealth_basic_button.setChecked(not is_advanced)
+        self.starting_wealth_mode_stack.setCurrentIndex(1 if is_advanced else 0)
+
+    def _append_starting_wealth_amount_row(
+        self,
+        amount: dict[str, Any],
+    ) -> None:
+        """Adds one exact denomination/count row to starting wealth."""
+
+        row = self.starting_wealth_amounts_table.rowCount()
+        self.starting_wealth_amounts_table.insertRow(row)
+        self.starting_wealth_amounts_table.setRowHeight(row, 36)
+        denomination_combo = _NoWheelComboBox()
+        denomination_combo.setMinimumWidth(TABLE_INLINE_EDITOR_MIN_WIDTH)
+        denomination_combo.setMinimumHeight(TABLE_INLINE_EDITOR_HEIGHT)
+        quantity_input = _table_spin_box(0, 1_000_000_000)
+        quantity_input.setValue(_safe_int(amount.get("quantity"), 0))
+        self.starting_wealth_amounts_table.setCellWidget(
+            row, 0, denomination_combo
+        )
+        self.starting_wealth_amounts_table.setCellWidget(row, 1, quantity_input)
+        _set_remove_row_button(
+            self.starting_wealth_amounts_table,
+            row,
+            2,
+            "starting currency amount",
+            self._remove_starting_wealth_amount_row,
+        )
+        denomination_combo.setProperty(
+            "requestedDenominationValue",
+            _safe_int(amount.get("denomination_value"), 0),
+        )
+        denomination_combo.setProperty(
+            "requestedDenominationName",
+            str(amount.get("denomination_name", "")),
+        )
+        denomination_combo.currentIndexChanged.connect(
+            self._sync_starting_wealth_summary
+        )
+        quantity_input.valueChanged.connect(self._sync_starting_wealth_summary)
+        self._sync_starting_wealth_currency_options()
+
+    def _remove_starting_wealth_amount_row(self, button: QPushButton) -> None:
+        """Removes one exact starting-currency amount row."""
+
+        _remove_table_row_by_button(self.starting_wealth_amounts_table, button)
+        self._sync_starting_wealth_summary()
+
+    def _sync_starting_wealth_currency_options(self, _value: Any = None) -> None:
+        """Keeps exact-wealth dropdowns aligned with valid currency rows."""
+
+        if not hasattr(self, "starting_wealth_amounts_table"):
+            return
+        denominations = self._currency_denominations_from_table()
+        for row in range(self.starting_wealth_amounts_table.rowCount()):
+            combo = self.starting_wealth_amounts_table.cellWidget(row, 0)
+            if not isinstance(combo, QComboBox):
+                continue
+            selected_value = _safe_int(combo.currentData(), 0)
+            if selected_value <= 0:
+                selected_value = _safe_int(
+                    combo.property("requestedDenominationValue"), 0
+                )
+            requested_name = str(
+                combo.property("requestedDenominationName") or ""
+            ).strip().casefold()
+            combo.blockSignals(True)
+            combo.clear()
+            for denomination in denominations:
+                combo.addItem(
+                    str(denomination["name"]),
+                    int(denomination["value"]),
+                )
+            selected_index = combo.findData(selected_value)
+            if selected_index < 0 and requested_name:
+                for index in range(combo.count()):
+                    if combo.itemText(index).strip().casefold() == requested_name:
+                        selected_index = index
+                        break
+            combo.setCurrentIndex(selected_index if selected_index >= 0 else 0)
+            combo.setEnabled(bool(denominations))
+            combo.setProperty("requestedDenominationValue", 0)
+            combo.setProperty("requestedDenominationName", "")
+            combo.blockSignals(False)
+        self.add_starting_wealth_amount_button.setEnabled(bool(denominations))
+        self._sync_starting_wealth_summary()
+
+    def _starting_wealth_from_controls(self) -> dict[str, Any]:
+        """Reads the player-facing starting-wealth controls."""
+
+        amounts: list[dict[str, Any]] = []
+        for row in range(self.starting_wealth_amounts_table.rowCount()):
+            combo = self.starting_wealth_amounts_table.cellWidget(row, 0)
+            quantity_input = self.starting_wealth_amounts_table.cellWidget(row, 1)
+            if not isinstance(combo, QComboBox) or not isinstance(
+                quantity_input, QSpinBox
+            ):
+                continue
+            denomination_value = _safe_int(combo.currentData(), 0)
+            if denomination_value <= 0:
+                continue
+            amounts.append(
+                {
+                    "denomination_name": combo.currentText().strip(),
+                    "denomination_value": denomination_value,
+                    "quantity": quantity_input.value(),
+                }
+            )
+        return {
+            "mode": self._starting_wealth_mode(),
+            "guidance": self.starting_wealth_guidance_input.toPlainText(),
+            "amounts": amounts,
+        }
+
+    def _load_starting_wealth(self, wealth: dict[str, Any]) -> None:
+        """Loads a normalized starting-wealth contract into the Wizard."""
+
+        self.starting_wealth_guidance_input.setPlainText(
+            str(wealth.get("guidance") or DEFAULT_STARTING_WEALTH_GUIDANCE)
+        )
+        self.starting_wealth_amounts_table.setRowCount(0)
+        for amount in wealth.get("amounts", []):
+            if isinstance(amount, dict):
+                self._append_starting_wealth_amount_row(amount)
+        self._set_starting_wealth_mode(str(wealth.get("mode", "basic")))
+        self._sync_starting_wealth_currency_options()
+
+    def _sync_starting_wealth_summary(self, _value: Any = None) -> None:
+        """Displays the exact base-unit total represented by Advanced rows."""
+
+        if not hasattr(self, "starting_wealth_summary_label"):
+            return
+        total = sum(
+            int(amount["denomination_value"]) * int(amount["quantity"])
+            for amount in self._starting_wealth_from_controls()["amounts"]
+        )
+        denominations = self._currency_denominations_from_table()
+        formatted = (
+            format_currency_amount(total, denominations)
+            if denominations
+            else "0 base units"
+        )
+        self.starting_wealth_summary_label.setText(
+            f"Total: {formatted} ({total} base units)"
+        )
 
     def _append_economy_example_row(self, example: dict[str, Any]) -> None:
         """Adds a common-price example row to the wizard table."""
@@ -7947,6 +8319,9 @@ class GameShell(QWidget):
         self._tab_specs: dict[str, tuple[RepositoryBackedWidget, str, bool]] = {}
         self._tab_order: list[str] = []
         self._detached_windows: dict[str, _DetachedTabWindow] = {}
+        self._tab_notifications: set[str] = set()
+        self._tab_content_signatures: dict[str, str] = {}
+        self._smart_hidden_tabs: set[str] = set()
 
         self.story_screen = StoryScreen(
             sound_manager=self.sound_manager,
@@ -7955,6 +8330,7 @@ class GameShell(QWidget):
         )
         self.character_screen = CharacterScreen(
             playtesting_tools=self.playtesting_tools,
+            tts_enabled=self.tts_enabled,
         )
         self.travel_screen = TravelScreen(
             on_travel_requested=self._submit_travel_request,
@@ -8077,6 +8453,61 @@ class GameShell(QWidget):
         index = self.tabs.addTab(screen, label)
         self.tab_bar.setTabData(index, tab_key)
 
+    def _tab_key_for_screen(self, screen: RepositoryBackedWidget) -> str:
+        """Returns the stable tab key registered for a screen."""
+
+        for tab_key, (registered, _label, _closable) in self._tab_specs.items():
+            if registered is screen:
+                return tab_key
+        return ""
+
+    def _display_tab_label(self, tab_key: str) -> str:
+        """Returns a tab label with its unread-change marker, when present."""
+
+        spec = self._tab_specs.get(tab_key)
+        if spec is None:
+            return tab_key
+        label = spec[1]
+        return f"{label} •" if tab_key in self._tab_notifications else label
+
+    def _sync_tab_notification_display(self, tab_key: str) -> None:
+        """Updates the docked tab or detached title for one notification state."""
+
+        index = self._tab_index_for_key(tab_key)
+        if index >= 0:
+            self.tabs.setTabText(index, self._display_tab_label(tab_key))
+            self.tabs.setTabToolTip(
+                index,
+                "Updated since you last viewed this tab."
+                if tab_key in self._tab_notifications
+                else "",
+            )
+        window = self._detached_windows.get(tab_key)
+        if window is not None:
+            window.setWindowTitle(
+                self._detached_window_title(self._display_tab_label(tab_key))
+            )
+
+    def _mark_tab_changed(self, tab_key: str) -> None:
+        """Marks a non-focused tab as having newly changed visible content."""
+
+        if not tab_key:
+            return
+        current_index = self.tabs.currentIndex()
+        if current_index >= 0 and self._tab_index_for_key(tab_key) == current_index:
+            return
+        self._tab_notifications.add(tab_key)
+        self._sync_tab_notification_display(tab_key)
+
+    def _clear_tab_changed(self, tab_key: str) -> None:
+        """Clears one tab's unread-change marker after it receives focus."""
+
+        if tab_key not in self._tab_notifications:
+            return
+        self._tab_notifications.discard(tab_key)
+        self._sync_tab_notification_display(tab_key)
+        self._rebuild_add_tab_menu()
+
     def _tab_index_for_key(self, tab_key: str) -> int:
         """Returns the current docked index for a stable tab key."""
 
@@ -8129,8 +8560,8 @@ class GameShell(QWidget):
             return
 
         for tab_key in missing_keys:
-            _screen, label, _closable = self._tab_specs[tab_key]
-            action = self.add_tab_menu.addAction(label)
+            _screen, _label, _closable = self._tab_specs[tab_key]
+            action = self.add_tab_menu.addAction(self._display_tab_label(tab_key))
             action.triggered.connect(
                 lambda _checked=False, key=tab_key: self._restore_tab(key)
             )
@@ -8147,12 +8578,14 @@ class GameShell(QWidget):
             self.tabs.setCurrentIndex(existing_index)
             return
 
-        screen, label, _closable = spec
+        screen, _label, _closable = spec
         screen.setParent(self.tabs)
-        index = self.tabs.addTab(screen, label)
+        index = self.tabs.addTab(screen, self._display_tab_label(tab_key))
         self.tab_bar.setTabData(index, tab_key)
         screen.show()
         self.tabs.setCurrentIndex(index)
+        self._smart_hidden_tabs.discard(tab_key)
+        self._clear_tab_changed(tab_key)
         self._sync_protected_tab_button()
 
     @Slot(str, QPoint)
@@ -8164,6 +8597,7 @@ class GameShell(QWidget):
         if index < 0 or spec is None or tab_key in self._detached_windows:
             return
 
+        self._clear_tab_changed(tab_key)
         screen, label, _closable = spec
         self.tabs.removeTab(index)
         window = _DetachedTabWindow(
@@ -8214,7 +8648,12 @@ class GameShell(QWidget):
         for window in self._detached_windows.values():
             window.show()
 
-    def set_repository(self, repository: SaveRepository | None) -> None:
+    def set_repository(
+        self,
+        repository: SaveRepository | None,
+        *,
+        initially_hide_empty_tabs: bool = False,
+    ) -> None:
         """
         Sets the active save repository for every screen.
 
@@ -8222,7 +8661,9 @@ class GameShell(QWidget):
             repository: Active save repository, or None when returning to menu.
         """
 
+        self._restore_all_smart_hidden_tabs()
         self.repository = repository
+        self._tab_notifications.clear()
 
         if repository is None:
             self.title_label.setText("No Save Loaded")
@@ -8235,7 +8676,92 @@ class GameShell(QWidget):
         for screen in self.screens:
             screen.set_repository(repository)
 
+        for tab_key in self._tab_specs:
+            self._sync_tab_notification_display(tab_key)
+
+        if repository is not None and initially_hide_empty_tabs:
+            self._hide_empty_starting_tabs(repository)
+
+        self._tab_content_signatures = {
+            tab_key: _screen_content_signature(screen)
+            for tab_key, (screen, _label, _closable) in self._tab_specs.items()
+        }
         self._apply_audio_settings()
+
+    def _hide_empty_starting_tabs(self, repository: SaveRepository) -> None:
+        """Hides empty NPC, Party, and Magic tabs for a newly created game."""
+
+        setup = repository.get_setting("new_game.setup", {})
+        if not isinstance(setup, dict):
+            setup = {}
+        starting_npcs = setup.get("starting_npcs", [])
+        starting_party = setup.get("starting_party_npc_ids", [])
+        magic = setup.get("magic", {})
+        if not isinstance(magic, dict):
+            magic = {}
+        requested_spells = magic.get("starting_spell_requests", [])
+        starting_spells = magic.get("starting_spells", [])
+        should_hide = {
+            "npcs": not repository.list_player_visible_npcs()
+            and not (isinstance(starting_npcs, list) and starting_npcs),
+            "party": not repository.list_party_members()
+            and not (isinstance(starting_party, list) and starting_party),
+            "magic": not repository.list_character_spells()
+            and not (isinstance(requested_spells, list) and requested_spells)
+            and not (isinstance(starting_spells, list) and starting_spells),
+        }
+        for tab_key, hidden in should_hide.items():
+            if not hidden:
+                continue
+            index = self._tab_index_for_key(tab_key)
+            if index < 0 or tab_key in self._detached_windows:
+                continue
+            screen = self.tabs.widget(index)
+            self.tabs.removeTab(index)
+            if screen is not None:
+                screen.hide()
+            self._smart_hidden_tabs.add(tab_key)
+        self._sync_protected_tab_button()
+        self._rebuild_add_tab_menu()
+
+    def _restore_all_smart_hidden_tabs(self) -> None:
+        """Restores tabs hidden only by the previous new-game empty-state rule."""
+
+        for tab_key in list(self._smart_hidden_tabs):
+            self._dock_smart_hidden_tab(tab_key)
+        self._smart_hidden_tabs.clear()
+
+    def _dock_smart_hidden_tab(self, tab_key: str) -> None:
+        """Docks a smart-hidden tab without stealing focus from the player."""
+
+        spec = self._tab_specs.get(tab_key)
+        if spec is None or self._tab_index_for_key(tab_key) >= 0:
+            self._smart_hidden_tabs.discard(tab_key)
+            return
+        screen, _label, _closable = spec
+        screen.setParent(self.tabs)
+        index = self.tabs.addTab(screen, self._display_tab_label(tab_key))
+        self.tab_bar.setTabData(index, tab_key)
+        screen.show()
+        self._smart_hidden_tabs.discard(tab_key)
+        self._tab_content_signatures[tab_key] = _screen_content_signature(screen)
+        self._sync_protected_tab_button()
+
+    def _reveal_populated_smart_hidden_tabs(self) -> None:
+        """Reveals startup-hidden tabs once their underlying content appears."""
+
+        repository = self.repository
+        if repository is None:
+            return
+        has_content = {
+            "npcs": bool(repository.list_player_visible_npcs()),
+            "party": bool(repository.list_party_members()),
+            "magic": bool(repository.list_character_spells()),
+        }
+        for tab_key in list(self._smart_hidden_tabs):
+            if has_content.get(tab_key, False):
+                self._dock_smart_hidden_tab(tab_key)
+        self._rebuild_add_tab_menu()
 
     def refresh_screens(
         self,
@@ -8245,12 +8771,28 @@ class GameShell(QWidget):
         """Refreshes tabs from saved data while preserving each screen's local state."""
 
         excluded_screens = exclude or set()
+        previous_signatures = dict(self._tab_content_signatures)
 
         for screen in self.screens:
             if screen in excluded_screens:
                 continue
 
             screen.refresh()
+
+        changed_source_keys = {
+            self._tab_key_for_screen(screen) for screen in excluded_screens
+        }
+        for tab_key, (screen, _label, _closable) in self._tab_specs.items():
+            signature = _screen_content_signature(screen)
+            previous = previous_signatures.get(tab_key)
+            self._tab_content_signatures[tab_key] = signature
+            if (
+                previous is not None
+                and previous != signature
+                and tab_key not in changed_source_keys
+            ):
+                self._mark_tab_changed(tab_key)
+        self._reveal_populated_smart_hidden_tabs()
 
     def _handle_screen_repository_changed(self, source: RepositoryBackedWidget) -> None:
         """Refreshes tabs after a screen or event changes repository data."""
@@ -8259,13 +8801,23 @@ class GameShell(QWidget):
         self.refresh_screens(exclude={source})
 
     def _handle_tab_changed(self, index: int) -> None:
-        """Resets the calendar view to the current month when opened."""
+        """Handles tab-focus refreshes and clears unread-change markers."""
+
+        if index < 0:
+            return
+
+        tab_key = str(self.tab_bar.tabData(index) or "")
+        self._clear_tab_changed(tab_key)
 
         if self.tabs.widget(index) == self.calendar_screen:
             self.calendar_screen.return_to_current_month()
 
         if self.tabs.widget(index) == self.travel_screen:
             self.travel_screen.refresh()
+
+        screen = self.tabs.widget(index)
+        if isinstance(screen, RepositoryBackedWidget) and tab_key:
+            self._tab_content_signatures[tab_key] = _screen_content_signature(screen)
 
     def _submit_travel_request(
         self,
@@ -9651,10 +10203,16 @@ class StoryScreen(RepositoryBackedWidget):
 class CharacterScreen(RepositoryBackedWidget):
     """Dungeons-and-Dragons-style character sheet."""
 
-    def __init__(self, *, playtesting_tools: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        playtesting_tools: bool = False,
+        tts_enabled: bool = True,
+    ) -> None:
         super().__init__()
 
         self.playtesting_tools = bool(playtesting_tools)
+        self.tts_enabled = bool(tts_enabled)
         self._loading_character = False
         self._saving_character = False
         self._last_saved_character_payload: dict[str, Any] | None = None
@@ -9665,6 +10223,18 @@ class CharacterScreen(RepositoryBackedWidget):
             "Optional: kah-tha-lah, or /kəˈθɑlə/ for exact IPA"
         )
         self.name_pronunciation_input.editingFinished.connect(self._save_character)
+        self.pronouns_combo = _NoWheelComboBox()
+        for pronouns in CHARACTER_PRONOUN_OPTIONS:
+            self.pronouns_combo.addItem(pronouns, pronouns)
+        self.pronouns_combo.addItem("Other", "other")
+        self.custom_pronouns_input = QLineEdit()
+        self.custom_pronouns_input.setPlaceholderText(
+            "Enter custom pronouns, such as Xe/Xem"
+        )
+        self.pronouns_combo.currentIndexChanged.connect(
+            self._handle_pronouns_changed
+        )
+        self.custom_pronouns_input.editingFinished.connect(self._save_character)
         self.health_current_input = QSpinBox()
         self.health_current_input.setRange(0, 9999)
         self.health_current_input.valueChanged.connect(
@@ -9733,29 +10303,47 @@ class CharacterScreen(RepositoryBackedWidget):
         identity_group = QGroupBox("Identity")
         identity_layout = QFormLayout()
         identity_layout.addRow("Name:", self.name_input)
-        identity_layout.addRow("Name Pronunciation:", self.name_pronunciation_input)
+        identity_layout.addRow("Pronouns:", self.pronouns_combo)
+        self.custom_pronouns_label = QLabel("Custom Pronouns:")
+        identity_layout.addRow(
+            self.custom_pronouns_label,
+            self.custom_pronouns_input,
+        )
+        self.name_pronunciation_label = QLabel("Name Pronunciation:")
+        identity_layout.addRow(
+            self.name_pronunciation_label,
+            self.name_pronunciation_input,
+        )
         identity_layout.addRow("Appearance:", self.appearance_input)
         identity_layout.addRow("Backstory:", self.backstory_input)
         identity_layout.addRow("Notes:", self.notes_input)
         identity_group.setLayout(identity_layout)
 
-        stats_group = QGroupBox("Vitals")
+        self.stats_group = QGroupBox("Vitals")
         stats_layout = QFormLayout()
         stats_layout.addRow("Health:", _spin_pair_row(self.health_current_input, self.health_max_input))
         stats_layout.addRow("Initiative Bonus:", self.initiative_bonus_input)
         stats_layout.addRow("Armor Rating:", self.armor_rating_label)
         stats_layout.addRow("Weapon Damage:", self.weapon_damage_label)
-        stats_group.setLayout(stats_layout)
+        self.stats_group.setLayout(stats_layout)
 
-        equipment_group = QGroupBox("Equipment")
+        self.equipment_group = QGroupBox("Equipment")
         equipment_layout = QFormLayout()
         for slot in EQUIPMENT_SLOTS:
             equipment_layout.addRow(f"{slot}:", self.equipment_combos[slot])
-        equipment_group.setLayout(equipment_layout)
+        self.equipment_group.setLayout(equipment_layout)
+
+        self.condition_group = QGroupBox("Status")
+        condition_layout = QFormLayout()
+        self.condition_label = QLabel("Healthy")
+        self.condition_label.setStyleSheet("font-size: 16px; font-weight: 600;")
+        condition_layout.addRow("Condition:", self.condition_label)
+        self.condition_group.setLayout(condition_layout)
 
         left_layout = QVBoxLayout()
-        left_layout.addWidget(stats_group)
-        left_layout.addWidget(equipment_group)
+        left_layout.addWidget(self.condition_group)
+        left_layout.addWidget(self.stats_group)
+        left_layout.addWidget(self.equipment_group)
         left_layout.addStretch()
 
         right_layout = QVBoxLayout()
@@ -9766,6 +10354,70 @@ class CharacterScreen(RepositoryBackedWidget):
         sheet_layout.addLayout(right_layout, stretch=1)
 
         self.setLayout(sheet_layout)
+        self._set_pronouns(DEFAULT_CHARACTER_PRONOUNS)
+        self._sync_contextual_controls(None)
+
+    def _handle_pronouns_changed(self, _index: int = -1) -> None:
+        """Shows custom pronoun entry when needed and saves the selection."""
+
+        self._sync_pronoun_controls()
+        if (
+            self.pronouns_combo.currentData() == "other"
+            and not self.custom_pronouns_input.text().strip()
+        ):
+            return
+        self._save_character()
+
+    def _sync_pronoun_controls(self) -> None:
+        """Shows custom pronoun entry only when Other is selected."""
+
+        is_custom = self.pronouns_combo.currentData() == "other"
+        self.custom_pronouns_label.setVisible(is_custom)
+        self.custom_pronouns_input.setVisible(is_custom)
+
+    def _pronouns_from_controls(self) -> str:
+        """Returns canonical standard or custom pronouns from the sheet."""
+
+        if self.pronouns_combo.currentData() == "other":
+            return normalize_character_pronouns(self.custom_pronouns_input.text())
+        return normalize_character_pronouns(self.pronouns_combo.currentData())
+
+    def _set_pronouns(self, pronouns: Any) -> None:
+        """Loads canonical standard or custom pronouns into the sheet."""
+
+        canonical = normalize_character_pronouns(pronouns)
+        index = self.pronouns_combo.findData(canonical)
+        is_custom = index < 0
+        if is_custom:
+            index = self.pronouns_combo.findData("other")
+        self.pronouns_combo.setCurrentIndex(max(0, index))
+        self.custom_pronouns_input.setText(canonical if is_custom else "")
+        self._sync_pronoun_controls()
+
+    def _sync_contextual_controls(
+        self,
+        repository: SaveRepository | None,
+    ) -> None:
+        """Shows only character controls relevant to the save's active systems."""
+
+        narrative_combat = bool(
+            repository is not None and CombatScreen._uses_narrative_combat(repository)
+        )
+        narrator_enabled = bool(
+            self.tts_enabled
+            and (
+                repository is None
+                or _bool_setting(
+                    repository.get_setting("audio.narrator_enabled", True),
+                    True,
+                )
+            )
+        )
+        self.condition_group.setVisible(narrative_combat)
+        self.stats_group.setVisible(not narrative_combat)
+        self.equipment_group.setVisible(not narrative_combat)
+        self.name_pronunciation_label.setVisible(narrator_enabled)
+        self.name_pronunciation_input.setVisible(narrator_enabled)
 
     def refresh(self) -> None:
         """Reloads the character sheet."""
@@ -9777,6 +10429,7 @@ class CharacterScreen(RepositoryBackedWidget):
             if repository is None:
                 self.name_input.clear()
                 self.name_pronunciation_input.clear()
+                self._set_pronouns(DEFAULT_CHARACTER_PRONOUNS)
                 self.appearance_input.clear()
                 self.backstory_input.clear()
                 self.notes_input.clear()
@@ -9785,6 +10438,8 @@ class CharacterScreen(RepositoryBackedWidget):
                 self.initiative_bonus_input.setValue(0)
                 self._populate_equipment_combos([], empty_equipment())
                 self._sync_equipment_summary()
+                self.condition_label.setText("Healthy")
+                self._sync_contextual_controls(None)
                 return
 
             state = StateManager(repository).load_state()
@@ -9795,6 +10450,7 @@ class CharacterScreen(RepositoryBackedWidget):
 
             self.name_input.setText(state.player.name)
             self.name_pronunciation_input.setText(state.player.name_pronunciation)
+            self._set_pronouns(state.player.pronouns)
             self.appearance_input.setPlainText(state.player.appearance)
             self.backstory_input.setPlainText(state.player.backstory)
             self.notes_input.setPlainText(state.player.notes)
@@ -9810,6 +10466,8 @@ class CharacterScreen(RepositoryBackedWidget):
             )
             self._populate_equipment_combos(inventory_items, equipment)
             self._sync_equipment_summary()
+            self.condition_label.setText(state.player.condition or "Healthy")
+            self._sync_contextual_controls(repository)
         finally:
             self._loading_character = False
             self._last_saved_character_payload = (
@@ -9883,6 +10541,7 @@ class CharacterScreen(RepositoryBackedWidget):
         return {
             "name": self.name_input.text().strip(),
             "name_pronunciation": self.name_pronunciation_input.text().strip(),
+            "pronouns": self._pronouns_from_controls(),
             "appearance": self.appearance_input.toPlainText().strip(),
             "backstory": self.backstory_input.toPlainText().strip(),
             "notes": self.notes_input.toPlainText().strip(),
@@ -9925,6 +10584,7 @@ class CharacterScreen(RepositoryBackedWidget):
                 "player.name_pronunciation",
                 payload["name_pronunciation"],
             )
+            repository.set_setting("player.pronouns", payload["pronouns"])
             repository.set_setting("tts.pronunciation_map", pronunciation_map)
             repository.set_setting("player.appearance", payload["appearance"])
             repository.set_setting("player.backstory", payload["backstory"])
@@ -11756,7 +12416,12 @@ class CalendarScreen(RepositoryBackedWidget):
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self.table.verticalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
         self.table.verticalHeader().setVisible(False)
-        self.table.cellClicked.connect(self._open_day_events)
+        self._pending_day_cell: tuple[int, int] | None = None
+        self._day_click_timer = QTimer(self)
+        self._day_click_timer.setSingleShot(True)
+        self._day_click_timer.timeout.connect(self._open_pending_day_events)
+        self.table.cellClicked.connect(self._schedule_open_day_events)
+        self.table.cellDoubleClicked.connect(self._add_player_event_for_day)
 
         self.year_table = _AppTableWidget(0, 0)
         self.year_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
@@ -11857,6 +12522,14 @@ class CalendarScreen(RepositoryBackedWidget):
                 item = QTableWidgetItem(label)
                 item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                 item.setData(Qt.ItemDataRole.UserRole, events)
+                item.setData(
+                    int(Qt.ItemDataRole.UserRole) + 1,
+                    {
+                        "year": int(grid["year"]),
+                        "month": int(grid["month_index"]) + 1,
+                        "day": int(day["day_of_month"]),
+                    },
+                )
                 self.table.setItem(row_index, column_index, item)
 
                 if day["is_current_day"]:
@@ -11930,6 +12603,20 @@ class CalendarScreen(RepositoryBackedWidget):
                 matches.append(event)
         return matches
 
+    def _schedule_open_day_events(self, row: int, column: int) -> None:
+        """Delays single-click details so a double-click can create an event."""
+
+        self._pending_day_cell = (row, column)
+        self._day_click_timer.start(max(1, QApplication.doubleClickInterval()))
+
+    def _open_pending_day_events(self) -> None:
+        """Opens the day selected by a completed single click."""
+
+        pending = self._pending_day_cell
+        self._pending_day_cell = None
+        if pending is not None:
+            self._open_day_events(*pending)
+
     def _open_day_events(self, row: int, column: int) -> None:
         """Shows details for calendar events listed in a day cell."""
 
@@ -11972,11 +12659,48 @@ class CalendarScreen(RepositoryBackedWidget):
             return
         state = StateManager(repository).load_state()
         grid = build_month_grid(state.calendar.to_dict(), self.month_offset)
-        dialog = CalendarPlayerEventDialog(
-            calendar_settings=repository.get_calendar_settings(),
+        self._open_player_event_dialog(
             default_year=int(grid["year"]),
             default_month=int(grid["month_index"]) + 1,
             default_day=1,
+        )
+
+    def _add_player_event_for_day(self, row: int, column: int) -> None:
+        """Creates an event with a double-clicked calendar date preselected."""
+
+        self._day_click_timer.stop()
+        self._pending_day_cell = None
+        item = self.table.item(row, column)
+        date = (
+            item.data(int(Qt.ItemDataRole.UserRole) + 1)
+            if item is not None
+            else None
+        )
+        if not isinstance(date, dict):
+            return
+        self._open_player_event_dialog(
+            default_year=_safe_int(date.get("year"), 1),
+            default_month=_safe_int(date.get("month"), 1),
+            default_day=_safe_int(date.get("day"), 1),
+        )
+
+    def _open_player_event_dialog(
+        self,
+        *,
+        default_year: int,
+        default_month: int,
+        default_day: int,
+    ) -> None:
+        """Opens and persists the shared player-created calendar event dialog."""
+
+        repository = self.repository()
+        if repository is None:
+            return
+        dialog = CalendarPlayerEventDialog(
+            calendar_settings=repository.get_calendar_settings(),
+            default_year=default_year,
+            default_month=default_month,
+            default_day=default_day,
             parent=self,
         )
         if dialog.exec() != QDialog.DialogCode.Accepted:

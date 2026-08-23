@@ -11,6 +11,8 @@ from ai_adventure.ai.gemini_service import (
     KNOWN_EVENT_TYPE_NAMES,
     AiNarrationResult,
     _drop_unauthorized_player_spell_cast_events,
+    _skill_check_planning_packet,
+    _story_event_type_names,
 )
 from ai_adventure.context.context_builder import AiContextBuilder
 from ai_adventure.core.state_manager import StateManager
@@ -177,6 +179,7 @@ class MagicSystemTests(unittest.TestCase):
                     "character_spells",
                     "magic_resource_pools",
                     "spell_cast_history",
+                    "magic_advancement_history",
                     "active_magic_effects",
                 }.issubset(tables)
             )
@@ -279,6 +282,159 @@ class MagicSystemTests(unittest.TestCase):
             self.assertEqual(effect.status, "applied")
             self.assertEqual(repository.list_active_magic_effects()[0]["name"], "Quiet Step")
 
+    def test_meaningful_magic_advancement_requires_same_response_cast_and_rolls_back(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = SaveRepository.create_new_save(Path(temp_dir), "Magic Growth")
+            repository.set_magic_configuration(
+                {"enabled": True, "casting_mode": "mana", "mana_maximum": 8}
+            )
+            spell = repository.upsert_spell_catalog(
+                name="Quiet Step",
+                tier=1,
+                school="Veil",
+                description="Muffles the caster's movement.",
+                mana_cost=2,
+            )
+            assert spell is not None
+            repository.learn_character_spell(spell["spell_id"], source="Test")
+            message_id = "magic-growth-message"
+            repository.capture_message_snapshot(message_id)
+            applier = EventApplier(repository, message_id=message_id)
+
+            rejected = applier.apply_event(
+                {
+                    "type": "MagicAdvancementRecordedEvent",
+                    "payload": {
+                        "category": "meaningful_cast",
+                        "significance": "meaningful",
+                        "reason": "Used Quiet Step to pass the sentries.",
+                        "spell_id": spell["spell_id"],
+                    },
+                }
+            )
+            results = applier.apply_events(
+                [
+                    {
+                        "type": "PlayerSpellCastEvent",
+                        "payload": {
+                            "spell_id": spell["spell_id"],
+                            "cast_tier": 1,
+                            "player_authorized": True,
+                        },
+                    },
+                    {
+                        "type": "MagicAdvancementRecordedEvent",
+                        "payload": {
+                            "category": "meaningful_cast",
+                            "significance": "major",
+                            "reason": "Used Quiet Step to pass the sentries.",
+                            "spell_id": spell["spell_id"],
+                            "source": "Sentry infiltration",
+                        },
+                    },
+                ]
+            )
+
+            self.assertEqual(rejected.status, "skipped")
+            self.assertEqual([result.status for result in results], ["applied", "applied"])
+            history = repository.list_magic_advancement_history()
+            self.assertEqual(len(history), 1)
+            self.assertEqual(history[0]["message_id"], message_id)
+            self.assertEqual(history[0]["significance"], "major")
+            self.assertEqual(
+                repository.get_magic_advancement_summary()["counts_by_category"],
+                {"meaningful_cast": 1},
+            )
+            self.assertEqual(repository.list_magic_resource_pools()[0]["current_amount"], 6)
+
+            self.assertTrue(repository.rollback_message(message_id))
+            self.assertEqual(repository.list_magic_advancement_history(), [])
+            self.assertEqual(repository.list_spell_cast_history(), [])
+            self.assertEqual(repository.list_magic_resource_pools()[0]["current_amount"], 8)
+
+    def test_magic_advancement_context_uses_hybrid_relevance_and_stays_conditional(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = SaveRepository.create_new_save(Path(temp_dir), "Magic Context Routing")
+            repository.set_magic_configuration(
+                {"enabled": True, "casting_mode": "mana", "mana_maximum": 10}
+            )
+            spell = repository.upsert_spell_catalog(
+                name="Ember Lance",
+                tier=1,
+                school="Flame",
+                description="A focused flame.",
+                mana_cost=2,
+            )
+            assert spell is not None
+            repository.learn_character_spell(spell["spell_id"], source="Test")
+            repository.record_magic_advancement(
+                category="training",
+                significance="meaningful",
+                reason="Completed a controlled channeling exercise.",
+                spell_id=spell["spell_id"],
+                source="Tutor Ilyra",
+                message_id="training-message",
+            )
+            repository.upsert_active_task(
+                name="Complete the arcane channeling exercise",
+                category="Training",
+                description="Continue the magical lesson with Tutor Ilyra.",
+            )
+            state = StateManager(repository).load_state()
+            builder = AiContextBuilder.from_default_library()
+
+            mundane = builder.build_story_context(
+                state,
+                player_command="I eat breakfast.",
+                planner_context_tags=[],
+            )
+            exact_spell = builder.build_story_context(
+                state,
+                player_command="I use Ember Lance against the barrier.",
+                planner_context_tags=[],
+            )
+            indirect_training = builder.build_story_context(
+                state,
+                player_command="I continue the exercise.",
+                planner_context_tags=[],
+            )
+            npc_routed = builder.build_story_context(
+                state,
+                player_command="I ask whether I am ready.",
+                planner_context_tags=[],
+                relevant_npcs=[{"name": "Ilyra", "role": "Arcane mage tutor"}],
+            )
+
+            self.assertNotIn("progression", mundane["state"]["magic"])
+            self.assertNotIn("advancement", mundane["state"]["magic"]["rules"])
+            self.assertNotIn(
+                "magic.meaningful_advancement",
+                {section["id"] for section in mundane["reference_sections"]},
+            )
+            self.assertNotIn(
+                "MagicAdvancementRecordedEvent", _story_event_type_names(mundane)
+            )
+            for packet in (exact_spell, indirect_training, npc_routed):
+                self.assertIn("magic", packet["selection"]["tags"])
+                self.assertEqual(
+                    packet["state"]["magic"]["progression"]["summary"][
+                        "total_meaningful_advancements"
+                    ],
+                    1,
+                )
+                self.assertIn(
+                    "MagicAdvancementRecordedEvent", _story_event_type_names(packet)
+                )
+                self.assertIn(
+                    "magic.meaningful_advancement",
+                    {section["id"] for section in packet["reference_sections"]},
+                )
+
+            planning_packet = _skill_check_planning_packet(indirect_training)
+            self.assertIn("magic", planning_packet)
+            self.assertEqual(planning_packet["magic"]["known_spells"][0]["name"], "Ember Lance")
+            self.assertNotIn("magic", _skill_check_planning_packet(mundane))
+
     def test_state_context_and_contract_expose_new_magic_model_only(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             repository = SaveRepository.create_new_save(Path(temp_dir), "Magic Context")
@@ -311,6 +467,7 @@ class MagicSystemTests(unittest.TestCase):
             self.assertEqual(packet["state"]["magic"]["resource_pools"][0]["current_amount"], 12)
             self.assertNotIn("SpellLearnedEvent", KNOWN_EVENT_TYPE_NAMES)
             self.assertIn("CharacterSpellLearnedEvent", KNOWN_EVENT_TYPE_NAMES)
+            self.assertIn("MagicAdvancementRecordedEvent", KNOWN_EVENT_TYPE_NAMES)
             branches = EVENT_RESPONSE_SCHEMA["anyOf"]
             event_names = {
                 branch["properties"]["type"]["enum"][0]
@@ -321,6 +478,7 @@ class MagicSystemTests(unittest.TestCase):
             rules_text = json.dumps(json.loads(rules_path.read_text(encoding="utf-8")))
             self.assertNotIn('"event_type": "SpellLearnedEvent"', rules_text)
             self.assertIn("MagicEffectUpsertedEvent", rules_text)
+            self.assertIn("MagicAdvancementRecordedEvent", rules_text)
             self.assertIn("world_contains_magic is false", rules_text)
             self.assertIn("enabled is false", rules_text)
             context_path = Path("ai_adventure/data/context/default_context.json")

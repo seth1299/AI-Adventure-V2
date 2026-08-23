@@ -6,6 +6,7 @@ from pathlib import Path
 
 from ai_adventure.new_game_setup import (
     DEFAULT_CHARACTER_PRONOUNS,
+    DEFAULT_STARTING_WEALTH_GUIDANCE,
     SKILL_LEVEL_PLAN,
     SKILL_PRESET_LEVEL_PLANS,
     ai_generated_calendar_settings_or_fallback,
@@ -670,6 +671,72 @@ class NewGameSetupTests(unittest.TestCase):
             "setup.economy_examples",
             packet["requirements"]["starting_currency_balance"],
         )
+
+    def test_starting_wealth_basic_guidance_requires_ai_interpretation(self) -> None:
+        setup = normalize_new_game_setup(
+            {
+                "starting_wealth": {
+                    "mode": "basic",
+                    "guidance": "Enough money for a room and three meals.",
+                }
+            }
+        )
+        packet = build_new_game_setup_packet(setup)
+
+        self.assertEqual(setup["starting_wealth"]["mode"], "basic")
+        self.assertEqual(
+            setup["starting_wealth"]["guidance"],
+            "Enough money for a room and three meals.",
+        )
+        self.assertIsNone(setup["starting_wealth"]["balance_base_units"])
+        self.assertTrue(setup["starting_wealth"]["requires_ai_invention"])
+        self.assertIn(
+            "starting wealth from player guidance",
+            packet["fields_requiring_ai_invention"],
+        )
+        self.assertEqual(packet["starting_wealth_contract"]["mode"], "basic")
+
+        default_setup = normalize_new_game_setup({})
+        self.assertEqual(
+            default_setup["starting_wealth"]["guidance"],
+            DEFAULT_STARTING_WEALTH_GUIDANCE,
+        )
+
+    def test_starting_wealth_advanced_calculates_and_persists_exact_balance(self) -> None:
+        raw_setup = {
+            "title": "Exact Wealth Test",
+            "currency_denominations": [
+                {"name": "Bit", "plural_name": "Bits", "value": 1},
+                {"name": "Crown", "plural_name": "Crowns", "value": 12},
+            ],
+            "starting_wealth": {
+                "mode": "advanced",
+                "amounts": [
+                    {"denomination_name": "Crown", "quantity": 3},
+                    {"denomination_value": 1, "quantity": 4},
+                ],
+            },
+        }
+        setup = normalize_new_game_setup(raw_setup)
+        packet = build_new_game_setup_packet(setup)
+
+        self.assertEqual(setup["starting_wealth"]["mode"], "advanced")
+        self.assertEqual(setup["starting_wealth"]["balance_base_units"], 40)
+        self.assertFalse(setup["starting_wealth"]["requires_ai_invention"])
+        self.assertNotIn(
+            "starting wealth from player guidance",
+            packet["fields_requiring_ai_invention"],
+        )
+        self.assertEqual(packet["starting_wealth_contract"]["balance_base_units"], 40)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = SaveRepository.create_new_save(
+                Path(temp_dir),
+                setup["title"],
+                setup=setup,
+            )
+            self.assertEqual(repository.get_state_value("currency.balance"), "40")
+            self.assertEqual(repository.list_inventory_items(), [])
 
     def test_starting_task_setup_supports_ai_and_custom_opening_quests(self) -> None:
         ai_setup = normalize_new_game_setup(
