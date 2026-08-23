@@ -68,6 +68,109 @@ def _test_container_metadata(
 
 
 class EventApplierTests(unittest.TestCase):
+    def test_party_member_uses_same_npc_id_and_can_leave_without_deleting_npc(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = SaveRepository.create_new_save(Path(temp_dir), "Party NPC Test")
+            applier = EventApplier(repository)
+            added = applier.apply_event(
+                {
+                    "type": "NpcUpsertedEvent",
+                    "payload": {
+                        "npc_id": "mira_coppercup",
+                        "name": "Mira Coppercup",
+                        "display_name": "Mira",
+                        "role": "Scout",
+                        "location": "Old Road",
+                        "public_description": "A keen-eyed traveler in a green cloak.",
+                        "player_facing_information": "A trusted traveling companion.",
+                        "knowledge_scope": ["Roads"],
+                        "known_facts": ["The player hired her at Rainmarket."],
+                        "party_member": True,
+                        "party_status": "Active",
+                        "party_health_current": 14,
+                        "party_health_max": 18,
+                        "party_armor_class": 13,
+                        "party_combat_style": "Mobile archer",
+                        "party_skills": ["Archery", "Tracking"],
+                    },
+                }
+            )
+
+            party = repository.list_party_members()
+            npc = repository.get_npc("mira_coppercup")
+            self.assertEqual(added.status, "applied")
+            self.assertIsNotNone(npc)
+            self.assertEqual(len(party), 1)
+            self.assertEqual(party[0]["npc_id"], npc["npc_id"] if npc else "")
+            self.assertEqual(party[0]["health_current"], 14)
+            self.assertEqual(party[0]["armor_class"], 13)
+            self.assertEqual(party[0]["skills"], ["Archery", "Tracking"])
+
+            removed = applier.apply_event(
+                {
+                    "type": "NpcUpsertedEvent",
+                    "payload": {
+                        "npc_id": "mira_coppercup",
+                        "name": "Mira Coppercup",
+                        "display_name": "Mira",
+                        "role": "Scout",
+                        "location": "Old Road",
+                        "public_description": "A keen-eyed traveler in a green cloak.",
+                        "player_facing_information": "A former traveling companion.",
+                        "knowledge_scope": ["Roads"],
+                        "known_facts": ["She left the party at Old Road."],
+                        "party_member": False,
+                    },
+                }
+            )
+            self.assertEqual(removed.status, "applied")
+            self.assertEqual(repository.list_party_members(), [])
+            self.assertIsNotNone(repository.get_npc("mira_coppercup"))
+
+    def test_combat_ally_preserves_party_npc_id_and_initial_vitals(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = SaveRepository.create_new_save(Path(temp_dir), "Party Combat Test")
+            repository.upsert_npc(
+                npc_id="mira_coppercup",
+                name="Mira Coppercup",
+                display_name="Mira",
+                role="Scout",
+                location="Old Road",
+            )
+            repository.upsert_party_member(
+                "mira_coppercup", health_current=18, health_max=18, armor_class=11
+            )
+
+            result = EventApplier(repository).apply_event(
+                {
+                    "type": "CombatStartedEvent",
+                    "payload": {
+                        "enemies": [{"name": "Bandit", "health": 8}],
+                        "allies": [
+                            {
+                                "npc_id": "mira_coppercup",
+                                "name": "Mira",
+                                "health": 14,
+                                "armor_rating": 13,
+                            }
+                        ],
+                    },
+                }
+            )
+
+            ally = next(
+                combatant
+                for combatant in repository.get_combat_state()["combatants"]
+                if combatant.get("npc_id") == "mira_coppercup"
+            )
+            party_member = repository.list_party_members()[0]
+            self.assertEqual(result.status, "applied")
+            self.assertEqual(ally["npc_id"], "mira_coppercup")
+            self.assertEqual(party_member["npc_id"], "mira_coppercup")
+            self.assertEqual(party_member["status"], "Active")
+            self.assertEqual(party_member["health_current"], 14)
+            self.assertEqual(party_member["armor_class"], 13)
+
     def test_calendar_game_events_store_exact_time_and_cannot_change_player_events(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             repository = SaveRepository.create_new_save(Path(temp_dir), "Calendar Boundary")
@@ -584,6 +687,27 @@ class EventApplierTests(unittest.TestCase):
             )
 
             self.assertEqual(skipped.status, "skipped")
+
+    def test_combat_started_event_is_rejected_for_narrative_combat(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = SaveRepository.create_new_save(
+                Path(temp_dir), "Narrative Combat Event Test"
+            )
+            repository.set_setting(
+                "combat.preferences",
+                {"resolution_mode": "narrative", "focus": "balanced"},
+            )
+
+            result = EventApplier(repository).apply_event(
+                {
+                    "type": "CombatStartedEvent",
+                    "payload": {"enemy_name": "Bandit"},
+                }
+            )
+
+            self.assertEqual(result.status, "skipped")
+            self.assertIn("narrative combat", result.message)
+            self.assertFalse(repository.is_combat_active())
 
     def test_player_equipment_updates_inventory_equipped_flag(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

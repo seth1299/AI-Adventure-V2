@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 
 from ai_adventure.new_game_setup import (
-    CHARACTER_GENDER_PRESENTATION_HINTS,
+    DEFAULT_CHARACTER_PRONOUNS,
     SKILL_LEVEL_PLAN,
     SKILL_PRESET_LEVEL_PLANS,
     ai_generated_calendar_settings_or_fallback,
@@ -15,6 +15,7 @@ from ai_adventure.new_game_setup import (
     fallback_introductory_message,
     fallback_world_summary,
     normalize_new_game_setup,
+    normalize_character_pronouns,
     parse_starter_items_text,
 )
 from ai_adventure.new_game_templates import (
@@ -31,6 +32,41 @@ from ai_adventure.persistence.save_repository import (
 
 
 class NewGameSetupTests(unittest.TestCase):
+    def test_character_pronouns_are_normalized_as_canonical_setup_data(self) -> None:
+        self.assertEqual(
+            normalize_new_game_setup({})["character"]["pronouns"],
+            DEFAULT_CHARACTER_PRONOUNS,
+        )
+        self.assertEqual(normalize_character_pronouns("she/her"), "She/Her")
+        self.assertEqual(normalize_character_pronouns("Xe/Xem"), "Xe/Xem")
+
+    def test_starting_party_keeps_only_ids_from_the_starting_npc_list(self) -> None:
+        setup = normalize_new_game_setup(
+            {
+                "starting_npcs": [
+                    {"npc_id": "npc_mira", "name": "Mira"},
+                    {"npc_id": "npc_orin", "name": "Orin"},
+                ],
+                "starting_party_npc_ids": [
+                    "npc_mira",
+                    "deleted_npc",
+                    "npc_mira",
+                ],
+            }
+        )
+
+        self.assertEqual(
+            [npc["npc_id"] for npc in setup["starting_npcs"]],
+            ["npc_mira", "npc_orin"],
+        )
+        self.assertEqual(setup["starting_party_npc_ids"], ["npc_mira"])
+        packet = build_new_game_setup_packet(setup)
+        self.assertIn(
+            "setup.starting_party_npc_ids",
+            packet["requirements"]["events"],
+        )
+        self.assertIn("copy its npc_id exactly", packet["requirements"]["events"])
+
     def test_normalize_new_game_setup_preserves_starter_storage_location(self) -> None:
         setup = normalize_new_game_setup(
             {
@@ -379,6 +415,7 @@ class NewGameSetupTests(unittest.TestCase):
                     "title": "Detective Test",
                     "character": {
                         "name": "Iris Vale",
+                        "pronouns": "She/Her",
                         "appearance": "A careful detective in a rain-dark coat.",
                     },
                     "skills": [{"name": f"Skill {index}"} for index in range(15)],
@@ -424,6 +461,7 @@ class NewGameSetupTests(unittest.TestCase):
 
             self.assertEqual(state.metadata.title, "Detective Test")
             self.assertEqual(state.player.name, "Iris Vale")
+            self.assertEqual(state.player.pronouns, "She/Her")
             self.assertEqual(state.player.appearance, "A careful detective in a rain-dark coat.")
             self.assertEqual(state.world.location, "Rainmarket Station")
             self.assertEqual(state.calendar.time_display, "12_hour")
@@ -634,13 +672,29 @@ class NewGameSetupTests(unittest.TestCase):
         )
 
     def test_starting_task_setup_supports_ai_and_custom_opening_quests(self) -> None:
-        ai_setup = normalize_new_game_setup({"starting_task": {"mode": "ai"}})
+        ai_setup = normalize_new_game_setup(
+            {
+                "starting_task": {
+                    "mode": "ai",
+                    "guidance": "A missing courier tied to the opening location",
+                }
+            }
+        )
         ai_packet = build_new_game_setup_packet(ai_setup)
 
         self.assertEqual(ai_setup["starting_task"]["mode"], "ai")
+        self.assertEqual(
+            ai_setup["starting_task"]["guidance"],
+            "A missing courier tied to the opening location",
+        )
         self.assertTrue(ai_setup["starting_task"]["task"]["requires_ai_invention"])
         self.assertIn("opening quest/task", ai_packet["fields_requiring_ai_invention"])
         self.assertEqual(ai_packet["starting_task_contract"]["mode"], "ai")
+        self.assertEqual(
+            ai_packet["starting_task_contract"]["guidance"],
+            "A missing courier tied to the opening location",
+        )
+        self.assertIn("optional player inspiration", ai_packet["requirements"]["starting_task"])
         self.assertIn("ActiveTaskUpsertedEvent", ai_packet["requirements"]["starting_task"])
 
         custom_setup = normalize_new_game_setup(
@@ -672,6 +726,58 @@ class NewGameSetupTests(unittest.TestCase):
             custom_packet["starting_task_contract"]["task"]["requester"],
             "Archivist Pell",
         )
+
+    def test_starter_inventory_mode_defaults_to_basic_and_supports_advanced(self) -> None:
+        basic_setup = normalize_new_game_setup({})
+        advanced_setup = normalize_new_game_setup(
+            {"starter_inventory_mode": "advanced"}
+        )
+        advanced_packet = build_new_game_setup_packet(advanced_setup)
+
+        self.assertEqual(basic_setup["starter_inventory_mode"], "basic")
+        self.assertEqual(advanced_setup["starter_inventory_mode"], "advanced")
+        self.assertEqual(
+            advanced_packet["starter_inventory_contract"]["mode"], "advanced"
+        )
+        self.assertIn(
+            "preserve the player's exact structured values",
+            advanced_packet["requirements"]["starter_inventory"],
+        )
+
+    def test_combat_preferences_default_to_current_rules_and_support_narrative_mode(self) -> None:
+        default_setup = normalize_new_game_setup({})
+        narrative_setup = normalize_new_game_setup(
+            {"combat": {"resolution_mode": "narrative", "focus": "high"}}
+        )
+        packet = build_new_game_setup_packet(narrative_setup)
+
+        self.assertEqual(
+            default_setup["combat"],
+            {"resolution_mode": "strict", "focus": "balanced"},
+        )
+        self.assertEqual(narrative_setup["combat"]["resolution_mode"], "narrative")
+        self.assertEqual(narrative_setup["combat"]["focus"], "high")
+        self.assertEqual(packet["combat_contract"]["resolution_mode"], "narrative")
+        self.assertIn("major recurring part", packet["combat_contract"]["focus_instruction"])
+        self.assertIn("forbids CombatStartedEvent", packet["combat_contract"]["rules"])
+
+    def test_new_game_setup_persists_combat_preferences(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = SaveRepository.create_new_save(
+                Path(temp_dir), "Combat Preferences Test"
+            )
+            repository.apply_new_game_setup(
+                {"combat": {"resolution_mode": "narrative", "focus": "high"}}
+            )
+
+            self.assertEqual(
+                repository.get_setting("combat.preferences"),
+                {"resolution_mode": "narrative", "focus": "high"},
+            )
+            self.assertEqual(
+                repository.get_setting("combat.resolution_mode"), "narrative"
+            )
+            self.assertEqual(repository.get_setting("combat.focus"), "high")
 
     def test_blank_currency_setup_is_reserved_for_ai_generation(self) -> None:
         setup = normalize_new_game_setup({})
@@ -1049,9 +1155,13 @@ class NewGameSetupTests(unittest.TestCase):
         self.assertEqual(packet["starter_inventory_contract"]["output_field"], "starting_items")
         self.assertIn("creative_ideas", packet)
         self.assertIn("character_generation_guidance", packet)
+        self.assertEqual(
+            packet["character_generation_guidance"]["canonical_pronouns"],
+            "They/Them",
+        )
         self.assertIn(
-            packet["character_generation_guidance"]["gender_presentation_hint"],
-            CHARACTER_GENDER_PRESENTATION_HINTS,
+            "canonical",
+            packet["requirements"]["character_generation"],
         )
         self.assertIn("genre_generation_guidance", packet)
         self.assertTrue(packet["genre_generation_guidance"]["genre_hint"])

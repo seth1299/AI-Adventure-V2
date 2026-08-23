@@ -23,6 +23,8 @@ from ai_adventure.currency import (
     normalize_currency_denominations,
 )
 from ai_adventure.narration_preferences import normalize_narration_preferences
+from ai_adventure.magic import normalize_magic_setup
+from ai_adventure.combat import COMBAT_FOCUS_INSTRUCTIONS, normalize_combat_preferences
 
 
 SKILL_PRESET_LEVEL_PLANS: dict[str, list[int]] = {
@@ -40,6 +42,8 @@ CHARACTER_GENDER_PRESENTATION_HINTS = [
     "male-coded",
     "androgynous or nonbinary-coded",
 ]
+CHARACTER_PRONOUN_OPTIONS = ("He/Him", "She/Her", "They/Them")
+DEFAULT_CHARACTER_PRONOUNS = "They/Them"
 
 GENRE_VARIETY_HINTS = [
     "gritty survival",
@@ -270,6 +274,9 @@ def normalize_new_game_setup(raw_setup: Any) -> dict[str, Any]:
     skill_preset = _normalize_skill_preset(raw_setup.get("skill_preset"))
     skill_level_plan = _skill_level_plan_for_setup(raw_setup, skill_preset)
     skills = _normalize_skills(raw_setup.get("skills", []), skill_level_plan)
+    starter_inventory_mode = _normalize_starter_inventory_mode(
+        raw_setup.get("starter_inventory_mode", "basic")
+    )
     starter_items = _normalize_starter_items(raw_setup.get("starter_items", []))
     no_starting_npcs = bool(raw_setup.get("no_starting_npcs", False))
     starting_npcs = (
@@ -277,18 +284,25 @@ def normalize_new_game_setup(raw_setup: Any) -> dict[str, Any]:
         if no_starting_npcs
         else _normalize_starting_npcs(raw_setup.get("starting_npcs", []))
     )
+    starting_party_npc_ids = _normalize_starting_party_npc_ids(
+        raw_setup.get("starting_party_npc_ids", raw_setup.get("starting_party", [])),
+        starting_npcs,
+    )
     starting_locations = _normalize_starting_locations(
         raw_setup.get("starting_locations", [])
     )
     starting_task = _normalize_starting_task(
         raw_setup.get("starting_task", raw_setup.get("starting_quest", {}))
     )
+    magic = normalize_magic_setup(raw_setup.get("magic", {}))
+    combat = normalize_combat_preferences(raw_setup.get("combat", {}))
 
     return {
         "title": _clean_text(raw_setup.get("title")) or "New Adventure",
         "character": {
             "name": _clean_text(character.get("name")) or "Player Name",
             "name_pronunciation": raw_character_name_pronunciation,
+            "pronouns": normalize_character_pronouns(character.get("pronouns")),
             "appearance": _clean_text(character.get("appearance")),
             "backstory": _clean_text(character.get("backstory")),
             "notes": _clean_text(character.get("notes")),
@@ -296,11 +310,15 @@ def normalize_new_game_setup(raw_setup: Any) -> dict[str, Any]:
         "skills": skills,
         "skill_preset": skill_preset,
         "skill_level_plan": skill_level_plan,
+        "starter_inventory_mode": starter_inventory_mode,
         "starter_items": starter_items,
         "starting_npcs": starting_npcs,
         "no_starting_npcs": no_starting_npcs,
+        "starting_party_npc_ids": starting_party_npc_ids,
         "starting_locations": starting_locations,
         "starting_task": starting_task,
+        "magic": magic,
+        "combat": combat,
         "calendar": calendar_settings,
         "starting_calendar": starting_calendar,
         "audio": audio_settings,
@@ -442,6 +460,9 @@ def build_new_game_setup_packet(
     )
     creative_ideas = CreativeIdeasLibrary.load_default().select_for_new_game()
     starter_item_count = len(clean_setup["starter_items"])
+    starting_spell_request_count = len(
+        clean_setup["magic"]["starting_spell_requests"]
+    )
     ai_mode_preferences = normalize_ai_mode_preferences(clean_setup["ai_settings"])
 
     packet = {
@@ -488,7 +509,10 @@ def build_new_game_setup_packet(
                 "fall back to second-person wording unless the selected style is "
                 "Second-Person. First-person styles should use I/me/my; "
                 "third-person styles should use the player character's name or "
-                "pronouns instead of you/your. Limited styles should stay within "
+                "setup.character.pronouns instead of you/your. The pronouns field "
+                "is canonical: use it exactly and never infer replacements from "
+                "the character's name, appearance, voice, or backstory. Limited "
+                "styles should stay within "
                 "the player character's observed or reasonably inferred experience. "
                 "Omniscient styles may use a broader narrative camera, but must "
                 "not reveal secrets, hidden state, mystery solutions, or "
@@ -548,7 +572,13 @@ def build_new_game_setup_packet(
                 "count from setup.starting_npcs and what the player character "
                 "would actually know at setup. Do not parse NPCs out of "
                 "ordinary setup prose or plaintext fields. For each "
-                "setup.starting_npcs row, create one NpcUpsertedEvent. Fill blank "
+                "setup.starting_npcs row, create one NpcUpsertedEvent and copy its "
+                "npc_id exactly into payload.npc_id. Set payload.party_member true "
+                "exactly when that npc_id appears in setup.starting_party_npc_ids, "
+                "and false otherwise. When location_source_index is nonnegative, "
+                "payload.location must use the finalized name of the corresponding "
+                "setup.starting_locations row, including when its suggestion-mode "
+                "name changes. Fill blank "
                 "name, location, or description fields with fitting specifics. "
                 "If description_mode is exact, copy description into "
                 "payload.public_description unchanged; if description_mode is "
@@ -591,7 +621,9 @@ def build_new_game_setup_packet(
                 "mode is none, do not create an initial ActiveTaskUpsertedEvent "
                 "unless another explicit setup field independently asks for one. "
                 "If mode is ai, create one fitting starting quest with "
-                "ActiveTaskUpsertedEvent. If mode is custom, create exactly one "
+                "ActiveTaskUpsertedEvent. Treat setup.starting_task.guidance as "
+                "optional player inspiration: honor its idea while inventing all "
+                "unspecified quest details. If mode is custom, create exactly one "
                 "ActiveTaskUpsertedEvent using the player's provided fields as "
                 "authoritative anchors, filling any blank/default fields from the "
                 "rest of the setup. Use category Quest unless the player provided "
@@ -623,9 +655,13 @@ def build_new_game_setup_packet(
             "character_generation": (
                 "If character name, appearance, backstory, or notes are blank/default "
                 "placeholders, invent them. Blank/default character fields do not "
-                "mean the player character should default to male. Follow "
-                "character_generation_guidance.gender_presentation_hint for invented "
-                "character details, and use creative_ideas.player_character_name_examples "
+                "mean the player character should default to male. "
+                "setup.character.pronouns is always player-selected and canonical; "
+                "copy and use it exactly without inferring different pronouns from "
+                "the name, appearance, voice, genre, or invented details. Follow "
+                "character_generation_guidance.gender_presentation_hint only for "
+                "details that do not conflict with those pronouns, and use "
+                "creative_ideas.player_character_name_examples "
                 "as a balanced name pool when useful. If the player supplied a custom "
                 "character name, appearance, backstory, or notes value, preserve that "
                 "field exactly instead of rewriting, renaming, embellishing, or "
@@ -798,6 +834,10 @@ def build_new_game_setup_packet(
                 "stores information. "
                 "Preserve any player-provided starter items with "
                 "requires_ai_invention=false. "
+                "setup.starter_inventory_mode is basic or advanced. In basic "
+                "mode, each setup starter-item row is a narrative suggestion "
+                "that the AI must turn into fitting concrete item details. In "
+                "advanced mode, preserve the player's exact structured values. "
                 "When a setup.starter_items entry has requires_ai_invention=true or "
                 "item_request text, treat it as a player-authored item concept and "
                 "convert it into the number of concrete, setting-appropriate tracked "
@@ -857,6 +897,35 @@ def build_new_game_setup_packet(
                 "purse, cash, wallet, or credit inventory items to represent "
                 "spendable money."
             ),
+            "magic": (
+                "setup.magic is authoritative. If world_contains_magic is false, "
+                "the setting contains no magic: do not introduce spells, magical "
+                "creatures, supernatural powers, enchanted items, magical traditions, "
+                "or other magic anywhere in the world or opening scene. If the world "
+                "contains magic, use casting_mode and tradition to define how magic "
+                "works in the world even when enabled is false; enabled=false means "
+                "only that the Player Character cannot cast spells at the start. "
+                "Keep the opening world consistent with casting_mode and tradition. "
+                "When enabled is true, also keep the Player Character consistent with "
+                "mana_maximum and tier_slots. Narrative casting has "
+                "no consumable resource; Mana casting uses each spell's mana_cost; "
+                "Tiered casting uses one slot of the selected tier except for tier 0. "
+                "starting_spells_mode is basic or advanced. In basic mode, convert "
+                "each setup.magic.starting_spell_requests entry into exactly one "
+                "complete, setting-appropriate spell in the top-level starting_spells "
+                "output, with matching source_index; invent its name and mechanics "
+                "instead of copying spell_request as its name. In advanced mode, the "
+                "application stores the exact setup.magic.starting_spells directly. "
+                "Never use new-game events to add, remove, rename, or alter starting "
+                "spells."
+            ),
+            "combat": (
+                "setup.combat is authoritative. Follow its focus instruction when "
+                "deciding how prominent fights should be. strict resolution means "
+                "the Python Combat tab resolves actual fights; narrative resolution "
+                "means Gemini describes and resolves fights in story prose without "
+                "CombatStartedEvent or the deterministic Combat tab."
+            ),
             "creative_ideas": (
                 "Treat creative_ideas as high-priority style seeds when inventing "
                 "names, locations, cultures, religions, foods, drinks, species, "
@@ -875,6 +944,7 @@ def build_new_game_setup_packet(
         },
         "fields_requiring_ai_invention": _fields_requiring_ai_invention(clean_setup),
         "starter_inventory_contract": {
+            "mode": clean_setup["starter_inventory_mode"],
             "requested_item_count": starter_item_count,
             "minimum_finalized_item_count": STARTER_INVENTORY_MIN_ITEMS,
             "count_rule": (
@@ -890,17 +960,44 @@ def build_new_game_setup_packet(
         },
         "starting_task_contract": {
             "mode": clean_setup["starting_task"]["mode"],
+            "guidance": clean_setup["starting_task"]["guidance"],
             "task": clean_setup["starting_task"]["task"],
             "rules": (
                 "none means no requested opening quest; ai means invent a fitting "
-                "opening quest; custom means use provided fields and have the AI "
-                "fill blanks from the rest of the setup."
+                "opening quest, using guidance as optional inspiration when it is "
+                "present; custom means use provided fields and have the AI fill "
+                "blanks from the rest of the setup."
             ),
             "category_rule": (
                 "Classify each finalized item by its present primary function, not "
                 "its origin or packaging. A ready-to-use poison or toxin is Poison "
                 "even in a vial; Ingredient or Reagent is for a recipe input that "
                 "still needs processing."
+            ),
+        },
+        "magic_contract": {
+            "enabled": clean_setup["magic"]["enabled"],
+            "casting_mode": clean_setup["magic"]["casting_mode"],
+            "tradition": clean_setup["magic"]["tradition"],
+            "starting_spells_mode": clean_setup["magic"]["starting_spells_mode"],
+            "starting_spell_request_count": starting_spell_request_count,
+            "starting_spell_count": len(clean_setup["magic"]["starting_spells"]),
+            "rules": (
+                "Basic spell requests require one finalized top-level starting_spells "
+                "record per request. Advanced spells are confirmed player input. "
+                "Reflect either mode in prose, but never synthesize replacement spell "
+                "events during new-game generation."
+            ),
+        },
+        "combat_contract": {
+            "resolution_mode": clean_setup["combat"]["resolution_mode"],
+            "focus": clean_setup["combat"]["focus"],
+            "focus_instruction": COMBAT_FOCUS_INSTRUCTIONS[clean_setup["combat"]["focus"]],
+            "rules": (
+                "Strict mode hands actual fights to Python with CombatStartedEvent. "
+                "Narrative mode lets Gemini resolve fights in prose and forbids "
+                "CombatStartedEvent. The selected focus guides frequency, not a "
+                "requirement to force implausible encounters."
             ),
         },
         "turn_prompt": _turn_prompt_for_setup(clean_setup),
@@ -1023,6 +1120,9 @@ def _fields_requiring_ai_invention(clean_setup: dict[str, Any]) -> list[str]:
     if any(bool(item.get("requires_ai_invention")) for item in clean_setup["starter_items"]):
         invention_fields.append("starter inventory based on character and skills")
 
+    if clean_setup["magic"]["starting_spell_requests"]:
+        invention_fields.append("starting spells from player descriptions")
+
     if any(
         bool(location.get("requires_ai_invention"))
         for location in clean_setup["starting_locations"]
@@ -1099,6 +1199,12 @@ def _character_generation_guidance(clean_setup: dict[str, Any]) -> dict[str, str
     """Builds a small randomized guidance hint for blank/default player characters."""
 
     character = clean_setup["character"]
+    canonical_pronouns = normalize_character_pronouns(character.get("pronouns"))
+    gender_presentation_hint = {
+        "He/Him": "male-coded",
+        "She/Her": "female-coded",
+        "They/Them": "androgynous or nonbinary-coded",
+    }.get(canonical_pronouns, "player-defined; do not infer a gender")
     needs_character_invention = (
         character["name"] == "Player Name"
         or not character["appearance"]
@@ -1109,22 +1215,36 @@ def _character_generation_guidance(clean_setup: dict[str, Any]) -> dict[str, str
     if not needs_character_invention:
         return {
             "rule": "Preserve the player-provided character identity and details.",
-            "gender_presentation_hint": "player-provided",
+            "canonical_pronouns": canonical_pronouns,
+            "gender_presentation_hint": gender_presentation_hint,
         }
 
     return {
         "rule": (
             "Use this only for blank/default character fields. It is a creative "
-            "variety hint, not a claim about player identity."
+            "variety hint, not permission to replace the canonical pronouns."
         ),
-        "gender_presentation_hint": random.SystemRandom().choice(
-            CHARACTER_GENDER_PRESENTATION_HINTS
-        ),
+        "canonical_pronouns": canonical_pronouns,
+        "gender_presentation_hint": gender_presentation_hint,
         "anti_default_rule": (
-            "Do not assume a blank/default player character is male. Vary names, "
-            "pronouns, appearance, and backstory across new games."
+            "Do not infer different pronouns from a blank/default name or character "
+            "description. Vary names, appearance, and backstory without conflicting "
+            "with canonical_pronouns."
         ),
     }
+
+
+def normalize_character_pronouns(value: Any) -> str:
+    """Returns standard or player-authored canonical character pronouns."""
+
+    clean_value = _clean_text(value)
+    if not clean_value:
+        return DEFAULT_CHARACTER_PRONOUNS
+
+    standard_values = {
+        option.casefold(): option for option in CHARACTER_PRONOUN_OPTIONS
+    }
+    return standard_values.get(clean_value.casefold(), clean_value)
 
 
 def _genre_generation_guidance(clean_setup: dict[str, Any]) -> dict[str, str]:
@@ -1286,11 +1406,19 @@ def _normalize_starting_npcs(raw_npcs: Any) -> list[dict[str, Any]]:
 
     npcs: list[dict[str, Any]] = []
 
-    for raw_npc in raw_npcs:
+    used_npc_ids: set[str] = set()
+    for source_index, raw_npc in enumerate(raw_npcs):
         if not isinstance(raw_npc, dict):
             continue
 
         name = _clean_text(raw_npc.get("name", raw_npc.get("display_name")))
+        npc_id = _clean_text(raw_npc.get("npc_id")) or f"starting_npc_{source_index + 1}"
+        base_npc_id = npc_id
+        suffix = 2
+        while npc_id in used_npc_ids:
+            npc_id = f"{base_npc_id}_{suffix}"
+            suffix += 1
+        used_npc_ids.add(npc_id)
         location = _clean_text(raw_npc.get("location"))
         description = _clean_text(
             raw_npc.get("description", raw_npc.get("public_description"))
@@ -1298,14 +1426,20 @@ def _normalize_starting_npcs(raw_npcs: Any) -> list[dict[str, Any]]:
         description_mode = _clean_text(
             raw_npc.get("description_mode", raw_npc.get("mode"))
         ).casefold()
+        location_source_index = max(
+            -1,
+            _safe_int(raw_npc.get("location_source_index"), -1),
+        )
 
         if description_mode not in {"suggestion", "exact"}:
             description_mode = "suggestion"
 
         npcs.append(
             {
+                "npc_id": npc_id,
                 "name": name,
                 "location": location,
+                "location_source_index": location_source_index,
                 "description": description,
                 "description_mode": description_mode,
                 "requires_ai_invention": (
@@ -1318,6 +1452,32 @@ def _normalize_starting_npcs(raw_npcs: Any) -> list[dict[str, Any]]:
         )
 
     return npcs
+
+
+def _normalize_starting_party_npc_ids(
+    raw_party: Any,
+    starting_npcs: list[dict[str, Any]],
+) -> list[str]:
+    """Keeps unique starting-party selections that still exist in the NPC list."""
+
+    available_ids = {
+        str(npc.get("npc_id", "")).strip()
+        for npc in starting_npcs
+        if str(npc.get("npc_id", "")).strip()
+    }
+    if not isinstance(raw_party, list):
+        return []
+
+    selected_ids: list[str] = []
+    for raw_member in raw_party:
+        npc_id = (
+            _clean_text(raw_member.get("npc_id"))
+            if isinstance(raw_member, dict)
+            else _clean_text(raw_member)
+        )
+        if npc_id in available_ids and npc_id not in selected_ids:
+            selected_ids.append(npc_id)
+    return selected_ids
 
 
 def _normalize_starting_locations(raw_locations: Any) -> list[dict[str, Any]]:
@@ -1501,6 +1661,10 @@ def _normalize_starting_task(raw_task_setup: Any) -> dict[str, Any]:
     if mode not in {"none", "ai", "custom"}:
         mode = "none"
 
+    guidance = _clean_text(
+        raw_task_setup.get("guidance", raw_task_setup.get("ai_guidance"))
+    )
+
     raw_task = raw_task_setup.get("task", raw_task_setup)
     if not isinstance(raw_task, dict):
         raw_task = {}
@@ -1519,6 +1683,7 @@ def _normalize_starting_task(raw_task_setup: Any) -> dict[str, Any]:
     if mode != "custom":
         return {
             "mode": mode,
+            "guidance": guidance if mode == "ai" else "",
             "task": {
                 "name": "",
                 "category": "Quest",
@@ -1543,7 +1708,13 @@ def _normalize_starting_task(raw_task_setup: Any) -> dict[str, Any]:
             "due_date",
         ]
     )
-    return {"mode": mode, "task": task}
+    return {"mode": mode, "guidance": "", "task": task}
+
+
+def _normalize_starter_inventory_mode(raw_mode: Any) -> str:
+    """Returns the requested starter-inventory editing depth."""
+
+    return "advanced" if _clean_text(raw_mode).casefold() == "advanced" else "basic"
 
 
 def normalize_economy_examples(raw_examples: Any) -> list[dict[str, Any]]:

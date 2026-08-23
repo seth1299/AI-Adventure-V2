@@ -32,10 +32,12 @@ from PySide6.QtGui import (
     QStandardItemModel,
     QTextBlockFormat,
     QTextCursor,
+    QWheelEvent,
 )
 from PySide6.QtWidgets import (
     QAbstractSpinBox,
     QApplication,
+    QButtonGroup,
     QCheckBox,
     QComboBox,
     QCompleter,
@@ -249,6 +251,10 @@ from ai_adventure.calendar_system import (
     resolve_starting_calendar_minute,
 )
 from ai_adventure.combat import (
+    COMBAT_FOCUS_LABELS,
+    COMBAT_FOCUS_LEVELS,
+    COMBAT_RESOLUTION_MODE_LABELS,
+    COMBAT_RESOLUTION_MODES,
     BODY_PARTS,
     COMBAT_PERSONALITIES,
     DEFAULT_ATTACK_RANGE_FEET,
@@ -270,6 +276,7 @@ from ai_adventure.combat import (
     item_is_valid_for_slot,
     item_metadata,
     next_living_index,
+    normalize_combat_preferences,
     normalize_combat_state,
     normalize_damage_expression,
     normalize_equipment,
@@ -289,9 +296,12 @@ from ai_adventure.locations import (
     normalize_known_location,
     normalize_known_locations,
 )
+from ai_adventure.magic import MAGIC_CASTING_MODE_LABELS, MAGIC_CASTING_MODES
 from ai_adventure.core.state_manager import StateManager
 from ai_adventure.events.event_applier import EventApplier
 from ai_adventure.new_game_setup import (
+    CHARACTER_PRONOUN_OPTIONS,
+    DEFAULT_CHARACTER_PRONOUNS,
     GREGORIAN_CALENDAR_SETTINGS,
     SKILL_LEVEL_PLAN,
     SKILL_PRESET_LEVEL_PLANS,
@@ -302,6 +312,7 @@ from ai_adventure.new_game_setup import (
     fallback_introductory_message,
     fallback_world_summary,
     normalize_economy_examples,
+    normalize_character_pronouns,
     normalize_new_game_setup,
     parse_starter_items_text,
 )
@@ -1428,6 +1439,8 @@ class MainWindow(QMainWindow):
                     "player.name_pronunciation",
                     character["name_pronunciation"],
                 )
+            if character.get("pronouns"):
+                repository.set_setting("player.pronouns", character["pronouns"])
             if character.get("appearance"):
                 repository.set_setting("player.appearance", character["appearance"])
             if character.get("backstory"):
@@ -1465,6 +1478,37 @@ class MainWindow(QMainWindow):
             LOGGER.warning(
                 "Skipped AI-finalized skills because they did not match the starting skill plan."
             )
+
+        magic_setup = setup.get("magic", {})
+        if not isinstance(magic_setup, dict):
+            magic_setup = {}
+        starting_spell_requests = magic_setup.get("starting_spell_requests", [])
+        if not isinstance(starting_spell_requests, list):
+            starting_spell_requests = []
+        if (
+            bool(magic_setup.get("enabled", False))
+            and str(magic_setup.get("starting_spells_mode", "basic")).casefold()
+            == "basic"
+            and starting_spell_requests
+        ):
+            finalized_starting_spells = [
+                spell
+                for spell in getattr(result, "finalized_starting_spells", [])
+                if isinstance(spell, dict)
+                and 0
+                <= _safe_int(spell.get("source_index"), -1)
+                < len(starting_spell_requests)
+            ]
+            learned_spells = repository.learn_starting_spells(
+                finalized_starting_spells,
+                source="Gemini New Game",
+            )
+            if len(learned_spells) != len(starting_spell_requests):
+                LOGGER.warning(
+                    "Gemini finalized %s of %s requested starting spell(s).",
+                    len(learned_spells),
+                    len(starting_spell_requests),
+                )
 
         finalized_starter_items = _starter_items_for_save(
             result.finalized_starter_items,
@@ -3616,9 +3660,7 @@ class NewGameTemplateManagerDialog(QDialog):
             self.skill_tables[level] = table
             add_button = QPushButton("Add Skill")
             add_button.clicked.connect(lambda _checked=False, skill_level=level: self._add_template_skill_row(skill_level))
-            remove_button = QPushButton("Remove Selected Skills")
-            remove_button.clicked.connect(lambda _checked=False, skill_level=level: self._remove_template_skill_rows(skill_level))
-            controls = _button_row(add_button, remove_button)
+            controls = _button_row(add_button)
             self.skill_table_controls[level] = controls
             group_layout.addWidget(table)
             group_layout.addWidget(controls)
@@ -3688,16 +3730,7 @@ class NewGameTemplateManagerDialog(QDialog):
         form.addRow("Start Location:", self.start_location_combo)
         layout.addLayout(form)
         layout.addWidget(self.starting_locations_table)
-        layout.addWidget(
-            _button_row(
-                self.add_location_button,
-                _bulk_remove_button(
-                    self.starting_locations_table,
-                    label="Remove Selected Locations",
-                    after_remove=self._refresh_starting_location_dropdowns,
-                ),
-            )
-        )
+        layout.addWidget(_button_row(self.add_location_button))
         opening_scene_group = QGroupBox("Opening Scene Request")
         opening_scene_group_layout = QVBoxLayout(opening_scene_group)
         opening_scene_group_layout.addWidget(
@@ -3719,12 +3752,7 @@ class NewGameTemplateManagerDialog(QDialog):
         layout = QVBoxLayout()
         layout.addWidget(self.no_starting_npcs_checkbox)
         layout.addWidget(self.starting_npcs_table)
-        layout.addWidget(
-            _button_row(
-                self.add_npc_button,
-                _bulk_remove_button(self.starting_npcs_table, label="Remove Selected NPCs"),
-            )
-        )
+        layout.addWidget(_button_row(self.add_npc_button))
         layout.addStretch()
 
         tab = QWidget()
@@ -3751,30 +3779,21 @@ class NewGameTemplateManagerDialog(QDialog):
         form = QFormLayout()
         form.addRow("World Details:", self.world_context_input)
         form.addRow("Starter Items:", self.starter_items_table)
-        form.addRow("", _button_row(self.add_starter_item_button, _bulk_remove_button(self.starter_items_table, label="Remove Selected Items")))
+        form.addRow("", _button_row(self.add_starter_item_button))
         form.addRow("Item Suggestions:", self.starter_item_suggestions_table)
-        form.addRow("", _button_row(
-            self.add_item_suggestion_button,
-            _bulk_remove_button(self.starter_item_suggestions_table, label="Remove Selected Suggestions"),
-        ))
+        form.addRow("", _button_row(self.add_item_suggestion_button))
         form.addRow("Starter Weapons:", self.starter_weapons_table)
-        form.addRow("", _button_row(self.add_starter_weapon_button, _bulk_remove_button(self.starter_weapons_table, label="Remove Selected Weapons")))
+        form.addRow("", _button_row(self.add_starter_weapon_button))
         form.addRow("Weapon Suggestions:", self.starter_weapon_suggestions_table)
-        form.addRow("", _button_row(
-            self.add_weapon_suggestion_button,
-            _bulk_remove_button(self.starter_weapon_suggestions_table, label="Remove Selected Suggestions"),
-        ))
+        form.addRow("", _button_row(self.add_weapon_suggestion_button))
         form.addRow("Starter Armor:", self.starter_armor_table)
-        form.addRow("", _button_row(self.add_starter_armor_button, _bulk_remove_button(self.starter_armor_table, label="Remove Selected Armor")))
+        form.addRow("", _button_row(self.add_starter_armor_button))
         form.addRow("Armor Suggestions:", self.starter_armor_suggestions_table)
-        form.addRow("", _button_row(
-            self.add_armor_suggestion_button,
-            _bulk_remove_button(self.starter_armor_suggestions_table, label="Remove Selected Suggestions"),
-        ))
+        form.addRow("", _button_row(self.add_armor_suggestion_button))
         form.addRow("Currencies:", self.currency_table)
-        form.addRow("", _button_row(self.add_currency_button, _bulk_remove_button(self.currency_table, label="Remove Selected Currencies", preserve_first_row=True, after_remove=lambda: _sync_currency_base_value_row(self.currency_table))))
+        form.addRow("", _button_row(self.add_currency_button))
         form.addRow("Economy Notes:", self.economy_examples_table)
-        form.addRow("", _button_row(self.add_economy_example_button, _bulk_remove_button(self.economy_examples_table, label="Remove Selected Economy Items")))
+        form.addRow("", _button_row(self.add_economy_example_button))
         form.addRow("Calendar:", self.calendar_type_combo)
 
         tab = QWidget()
@@ -4178,16 +4197,31 @@ class NewGameTemplateManagerDialog(QDialog):
         table = self.skill_tables[level]
         row = table.rowCount()
         table.insertRow(row)
-        _set_checked_row_checkbox(table, row, 0, "Check this skill, then click Remove Selected Skills.")
+        _set_remove_row_button(
+            table,
+            row,
+            0,
+            "skill",
+            lambda button, skill_level=level: self._remove_template_skill_row(
+                skill_level,
+                button,
+            ),
+            name_column=1,
+        )
         table.setCellWidget(row, 1, QLineEdit(name))
         table.setCellWidget(row, 2, QLineEdit(description))
         self._sync_template_skill_inputs()
 
-    def _remove_template_skill_rows(self, level: int) -> None:
+    def _remove_template_skill_row(
+        self,
+        level: int,
+        button: QPushButton,
+    ) -> None:
+        """Removes one confirmed custom skill row from the template."""
+
         table = self.skill_tables[level]
-        for row in reversed(table.checked_rows(0)):
-            table.removeRow(row)
-        self._sync_template_skill_inputs()
+        if _remove_table_row_by_button(table, button) >= 0:
+            self._sync_template_skill_inputs()
 
     def _sync_template_skill_inputs(self) -> None:
         self.skill_inputs = []
@@ -4406,6 +4440,10 @@ class NewGameTemplateManagerDialog(QDialog):
             self.starting_locations_table,
             locations,
         )
+        _sync_starting_npc_location_dropdowns(
+            self.starting_npcs_table,
+            locations,
+        )
         valid_ids = {row_id for row_id, _name in locations}
 
         if str(selected_start or "") not in valid_ids:
@@ -4436,6 +4474,9 @@ class NewGameTemplateManagerDialog(QDialog):
             self.starting_npcs_table,
             npc,
             self._remove_starting_npc_row,
+            location_options=_starting_location_options_from_table(
+                self.starting_locations_table
+            ),
         )
 
     def _remove_starting_npc_row(self, button: QPushButton) -> None:
@@ -4888,6 +4929,7 @@ class NewGameWizard(QWizard):
         self._legacy_currency_description = ""
         self._pronunciation_map: PronunciationMap = {}
         self._starting_location_row_id_counter = 0
+        self._custom_calendar_settings = dict(GREGORIAN_CALENDAR_SETTINGS)
         default_modes = normalize_ai_mode_preferences({})
         self._new_game_ai_settings: dict[str, Any] = {
             "model_intelligence": default_modes["model_intelligence"],
@@ -4900,7 +4942,24 @@ class NewGameWizard(QWizard):
         }
 
         self.setWindowTitle("New Game Wizard")
-        self.resize(780, 620)
+        self.setWindowFlags(
+            Qt.WindowType.Window
+            | Qt.WindowType.WindowTitleHint
+            | Qt.WindowType.WindowSystemMenuHint
+            | Qt.WindowType.WindowMinMaxButtonsHint
+            | Qt.WindowType.WindowCloseButtonHint
+        )
+        self.setMaximumSize(16777215, 16777215)
+        self.setSizeGripEnabled(True)
+        screen = QApplication.primaryScreen()
+        if screen is None:
+            self.resize(960, 700)
+        else:
+            available = screen.availableGeometry()
+            self.resize(
+                min(1100, max(780, int(available.width() * 0.82))),
+                min(800, max(620, int(available.height() * 0.82))),
+            )
         self._apply_theme()
 
         self._build_adventure_page()
@@ -4908,18 +4967,36 @@ class NewGameWizard(QWizard):
         self._build_starting_locations_page()
         self._build_starting_task_page()
         self._build_starting_npcs_page()
+        self._build_starting_party_page()
         self._build_character_page()
         self._build_skills_page()
+        self._build_magic_page()
+        self._build_combat_page()
         self._build_inventory_currency_page()
         self._build_audio_page()
         if self.tts_enabled:
             self._build_tts_page()
         self._build_calendar_page()
 
+        self.currentIdChanged.connect(self._schedule_page_heading_style)
+        self._style_current_page_headings()
         self._bind_music_preview_stop_buttons()
 
         if template_setup is not None:
             self.load_setup(template_setup)
+
+    def nextId(self) -> int:
+        """Skips Party dynamically when the setup explicitly has no NPCs."""
+
+        if (
+            self.currentId() == getattr(self, "starting_npcs_page_id", -1)
+            and hasattr(self, "no_starting_npcs_checkbox")
+            and self.no_starting_npcs_checkbox.isChecked()
+        ):
+            character_page_id = getattr(self, "character_page_id", -1)
+            if character_page_id >= 0:
+                return character_page_id
+        return super().nextId()
 
     def _apply_theme(self) -> None:
         """Applies a cohesive local theme to the new-game wizard."""
@@ -4997,6 +5074,7 @@ class NewGameWizard(QWizard):
             QWizard#newGameWizard QWidget {
                 background-color: {colors["window"]};
                 color: {colors["window_text"]};
+                font-size: 15px;
             }
 
             QWizard#newGameWizard QWizardPage,
@@ -5008,7 +5086,19 @@ class NewGameWizard(QWizard):
             QWizard#newGameWizard QLabel {
                 background-color: transparent;
                 color: {colors["window_text"]};
-                font-size: 13px;
+                font-size: 15px;
+            }
+
+            QWizard#newGameWizard QLabel#newGameWizardPageTitle {
+                font-size: 26px;
+                font-weight: 700;
+                padding: 8px 0 2px 0;
+            }
+
+            QWizard#newGameWizard QLabel#newGameWizardPageSubtitle {
+                color: {colors["placeholder"]};
+                font-size: 17px;
+                padding: 0 0 10px 0;
             }
 
             QWizard#newGameWizard QLineEdit,
@@ -5019,6 +5109,7 @@ class NewGameWizard(QWizard):
                 border: 1px solid {colors["border"]};
                 border-radius: 5px;
                 color: {colors["window_text"]};
+                font-size: 15px;
                 padding: 6px;
                 selection-background-color: {colors["selection"]};
                 selection-color: {colors["selection_text"]};
@@ -5044,6 +5135,7 @@ class NewGameWizard(QWizard):
             QWizard#newGameWizard QCheckBox {
                 background-color: transparent;
                 color: {colors["window_text"]};
+                font-size: 15px;
                 spacing: 8px;
             }
 
@@ -5178,8 +5270,9 @@ class NewGameWizard(QWizard):
                 border: 0;
                 border-right: 1px solid {colors["grid"]};
                 color: {colors["window_text"]};
+                font-size: 14px;
                 font-weight: 600;
-                padding: 7px;
+                padding: 9px 7px;
             }
 
             QWizard#newGameWizard QPushButton {
@@ -5187,8 +5280,14 @@ class NewGameWizard(QWizard):
                 border: 1px solid {colors["border"]};
                 border-radius: 5px;
                 color: {colors["window_text"]};
+                font-size: 14px;
                 min-width: 76px;
-                padding: 6px 14px;
+                padding: 7px 14px;
+            }
+
+            QWizard#newGameWizard QPushButton#rowRemoveButton {
+                min-width: 66px;
+                padding: 5px 10px;
             }
 
             QWizard#newGameWizard QPushButton:hover {
@@ -5198,6 +5297,12 @@ class NewGameWizard(QWizard):
 
             QWizard#newGameWizard QPushButton:pressed {
                 background-color: {colors["button_pressed"]};
+            }
+
+            QWizard#newGameWizard QPushButton#starterInventoryModeButton:checked {
+                background-color: {colors["accent"]};
+                border-color: {colors["accent_dark"]};
+                color: {colors["selection_text"]};
             }
 
             QWizard#newGameWizard QPushButton:default {
@@ -5217,6 +5322,61 @@ class NewGameWizard(QWizard):
             stylesheet = stylesheet.replace(f'{{colors["{color_name}"]}}', color_value)
 
         self.setStyleSheet(stylesheet)
+        self._wizard_subtitle_color = colors["placeholder"]
+
+    def _schedule_page_heading_style(self, _page_id: int) -> None:
+        """Restyles Qt's shared title labels after the page text changes."""
+
+        QTimer.singleShot(0, self._style_current_page_headings)
+
+    def _style_current_page_headings(self) -> None:
+        """Makes the current page title and subtitle visibly distinct."""
+
+        page = self.currentPage()
+        if page is None:
+            return
+
+        title = page.title()
+        subtitle = page.subTitle()
+        title_styled = False
+        subtitle_styled = False
+        for label in self.findChildren(QLabel):
+            if not title_styled and label.text() == title:
+                label.setObjectName("newGameWizardPageTitle")
+                label.setStyleSheet(
+                    "font-size: 26px; font-weight: 700; padding: 8px 0 2px 0;"
+                )
+                label.ensurePolished()
+                heading_width = max(320, self.width() - 100)
+                title_height = label.heightForWidth(heading_width)
+                if title_height <= 0:
+                    title_height = label.fontMetrics().lineSpacing() + 10
+                label.setSizePolicy(
+                    QSizePolicy.Policy.Preferred,
+                    QSizePolicy.Policy.Fixed,
+                )
+                label.setFixedHeight(title_height)
+                label.updateGeometry()
+                title_styled = True
+                continue
+            if not subtitle_styled and label.text() == subtitle:
+                label.setObjectName("newGameWizardPageSubtitle")
+                label.setStyleSheet(
+                    f"color: {self._wizard_subtitle_color}; font-size: 17px; "
+                    "padding: 0 0 10px 0;"
+                )
+                label.ensurePolished()
+                heading_width = max(320, self.width() - 100)
+                subtitle_height = label.heightForWidth(heading_width)
+                if subtitle_height <= 0:
+                    subtitle_height = label.fontMetrics().lineSpacing() + 10
+                label.setSizePolicy(
+                    QSizePolicy.Policy.Preferred,
+                    QSizePolicy.Policy.Fixed,
+                )
+                label.setFixedHeight(subtitle_height)
+                label.updateGeometry()
+                subtitle_styled = True
 
     def build_setup(self) -> dict[str, Any]:
         """Builds a normalized setup dictionary from wizard fields."""
@@ -5249,6 +5409,7 @@ class NewGameWizard(QWizard):
             "character": {
                 "name": self.character_name_input.text(),
                 "name_pronunciation": self.character_name_pronunciation_input.text(),
+                "pronouns": self._character_pronouns_from_controls(),
                 "appearance": self.appearance_input.toPlainText(),
                 "backstory": self.backstory_input.toPlainText(),
                 "notes": self.character_notes_input.toPlainText(),
@@ -5256,11 +5417,15 @@ class NewGameWizard(QWizard):
             "skills": skills,
             "skill_preset": str(self.skill_preset_combo.currentData() or "professional"),
             "skill_level_plan": [level for level, _name, _description in self.skill_inputs],
+            "magic": self._magic_setup_from_controls(),
+            "combat": self._combat_setup_from_controls(),
+            "starter_inventory_mode": self._starter_inventory_mode(),
             "starter_items": self._starter_items_from_table(),
             "starting_npcs": self._starting_npcs_from_table(),
             "no_starting_npcs": self.no_starting_npcs_checkbox.isChecked()
             if hasattr(self, "no_starting_npcs_checkbox")
             else False,
+            "starting_party_npc_ids": self._starting_party_npc_ids_from_table(),
             "starting_locations": self._starting_locations_from_table(),
             "starting_task": self._starting_task_from_controls(),
             "calendar": calendar_settings,
@@ -5347,6 +5512,10 @@ class NewGameWizard(QWizard):
         for npc in clean_setup["starting_npcs"]:
             self._append_starting_npc_row(npc)
 
+        self._set_starting_party_npc_ids(
+            clean_setup.get("starting_party_npc_ids", [])
+        )
+
         if hasattr(self, "no_starting_npcs_checkbox"):
             self.no_starting_npcs_checkbox.blockSignals(True)
             self.no_starting_npcs_checkbox.setChecked(
@@ -5367,9 +5536,12 @@ class NewGameWizard(QWizard):
         self.character_name_pronunciation_input.setText(
             character["name_pronunciation"]
         )
+        self._set_character_pronouns(character["pronouns"])
         self.appearance_input.setPlainText(character["appearance"])
         self.backstory_input.setPlainText(character["backstory"])
         self.character_notes_input.setPlainText(character["notes"])
+        self._load_magic_setup(clean_setup["magic"])
+        self._load_combat_setup(clean_setup["combat"])
 
         preset_index = self.skill_preset_combo.findData(clean_setup.get("skill_preset", "professional"))
         self.skill_preset_combo.setCurrentIndex(max(0, preset_index))
@@ -5394,6 +5566,8 @@ class NewGameWizard(QWizard):
         self.starter_item_suggestions_table.setRowCount(0)
         self.starter_weapon_suggestions_table.setRowCount(0)
         self.starter_armor_suggestions_table.setRowCount(0)
+
+        self._set_starter_inventory_mode(clean_setup["starter_inventory_mode"])
 
         for item in clean_setup["starter_items"]:
             kind = _starter_item_kind(item)
@@ -5588,6 +5762,7 @@ class NewGameWizard(QWizard):
         )
 
         layout = QFormLayout()
+        _configure_responsive_form(layout)
         layout.addRow("Game Name:", self.title_input)
         layout.addRow("Genre:", self.genre_input)
         layout.addRow("Game Style:", self.game_style_input)
@@ -5635,18 +5810,19 @@ class NewGameWizard(QWizard):
         add_location_button.clicked.connect(
             lambda: self._append_starting_location_row({})
         )
-        remove_locations_button = _bulk_remove_button(
-            self.starting_locations_table,
-            label="Remove Selected Locations",
-            after_remove=self._refresh_starting_location_dropdowns,
-        )
 
         layout = QVBoxLayout()
         form = QFormLayout()
+        _configure_responsive_form(form)
         form.addRow("Start Location:", self.start_location_combo)
         layout.addLayout(form)
+        _configure_responsive_table(
+            self.starting_locations_table,
+            stretch_columns={0, 1, 4},
+            compact_columns={2, 3, 5},
+        )
+        layout.addWidget(_button_row(add_location_button))
         layout.addWidget(self.starting_locations_table)
-        layout.addWidget(_button_row(add_location_button, remove_locations_button))
         opening_scene_group = QGroupBox("Opening Scene Request")
         opening_scene_group_layout = QVBoxLayout(opening_scene_group)
         opening_scene_group_layout.addWidget(
@@ -5655,8 +5831,8 @@ class NewGameWizard(QWizard):
             )
         )
         opening_scene_group_layout.addWidget(self.opening_scene_request_input)
-        layout.addWidget(opening_scene_group)
-        layout.addStretch()
+        layout.addWidget(opening_scene_group, 1)
+        layout.setAlignment(Qt.AlignmentFlag.AlignTop)
         page.setLayout(layout)
 
         self.addPage(page)
@@ -5795,6 +5971,13 @@ class NewGameWizard(QWizard):
             self.starting_locations_table,
             locations,
         )
+        if hasattr(self, "starting_npcs_table"):
+            _sync_starting_npc_location_dropdowns(
+                self.starting_npcs_table,
+                locations,
+            )
+        if hasattr(self, "starting_party_table"):
+            self._sync_starting_party_choices()
 
         if str(selected_start or "") not in valid_ids and hasattr(
             self,
@@ -5838,6 +6021,21 @@ class NewGameWizard(QWizard):
             lambda _index: self._sync_starting_task_controls()
         )
 
+        self.starting_task_guidance_input = QTextEdit()
+        self.starting_task_guidance_input.setPlaceholderText(
+            "Optional: describe the kind of starting quest you have in mind. "
+            "The A.I. will use this as inspiration and fill in the details."
+        )
+        self.starting_task_guidance_input.setMinimumHeight(120)
+        self.starting_task_guidance_input.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Expanding,
+        )
+        self.starting_task_guidance_group = QGroupBox("Optional A.I. Quest Nudge")
+        guidance_layout = QVBoxLayout()
+        guidance_layout.addWidget(self.starting_task_guidance_input)
+        self.starting_task_guidance_group.setLayout(guidance_layout)
+
         self.starting_task_name_input = QLineEdit()
         self.starting_task_name_input.setPlaceholderText("Optional quest name")
         self.starting_task_description_input = QTextEdit()
@@ -5859,6 +6057,7 @@ class NewGameWizard(QWizard):
 
         self.starting_task_custom_group = QGroupBox("Custom Quest Draft")
         custom_form = QFormLayout()
+        _configure_responsive_form(custom_form)
         custom_form.addRow("Name:", self.starting_task_name_input)
         custom_form.addRow("Description:", self.starting_task_description_input)
         custom_form.addRow("Requester:", self.starting_task_requester_input)
@@ -5870,6 +6069,7 @@ class NewGameWizard(QWizard):
         layout = QVBoxLayout()
         layout.addWidget(QLabel("Opening quest mode"))
         layout.addWidget(self.starting_task_mode_combo)
+        layout.addWidget(self.starting_task_guidance_group)
         layout.addWidget(self.starting_task_custom_group)
         layout.addStretch()
         page.setLayout(layout)
@@ -5883,7 +6083,9 @@ class NewGameWizard(QWizard):
         if not hasattr(self, "starting_task_custom_group"):
             return
 
-        is_custom = self.starting_task_mode_combo.currentData() == "custom"
+        mode = self.starting_task_mode_combo.currentData()
+        self.starting_task_guidance_group.setVisible(mode == "ai")
+        is_custom = mode == "custom"
         self.starting_task_custom_group.setVisible(is_custom)
 
     def _starting_task_from_controls(self) -> dict[str, Any]:
@@ -5892,6 +6094,7 @@ class NewGameWizard(QWizard):
         mode = str(self.starting_task_mode_combo.currentData() or "none")
         return {
             "mode": mode,
+            "guidance": self.starting_task_guidance_input.toPlainText(),
             "task": {
                 "name": self.starting_task_name_input.text(),
                 "category": "Quest",
@@ -5915,6 +6118,9 @@ class NewGameWizard(QWizard):
         _set_combo_to_data(
             self.starting_task_mode_combo,
             str(task_setup.get("mode", "none")),
+        )
+        self.starting_task_guidance_input.setPlainText(
+            str(task_setup.get("guidance", ""))
         )
         self.starting_task_name_input.setText(str(task.get("name", "")))
         self.starting_task_description_input.setPlainText(
@@ -5942,6 +6148,11 @@ class NewGameWizard(QWizard):
             STARTING_NPC_COLUMN_WIDTHS,
             minimum_height=240,
         )
+        _configure_responsive_table(
+            self.starting_npcs_table,
+            stretch_columns={0, 1, 2},
+            compact_columns={3, 4},
+        )
 
         self.no_starting_npcs_checkbox = QCheckBox("No starting NPCs")
         self.no_starting_npcs_checkbox.toggled.connect(
@@ -5949,19 +6160,27 @@ class NewGameWizard(QWizard):
         )
         self.add_npc_button = QPushButton("Add NPC")
         self.add_npc_button.clicked.connect(lambda: self._append_starting_npc_row({}))
-        self.remove_npcs_button = _bulk_remove_button(
-            self.starting_npcs_table,
-            label="Remove Selected NPCs",
+
+        npc_editor_layout = QVBoxLayout()
+        npc_editor_layout.setContentsMargins(0, 0, 0, 0)
+        npc_editor_layout.setSpacing(8)
+        npc_editor_layout.addWidget(_button_row(self.add_npc_button))
+        npc_editor_layout.addWidget(self.starting_npcs_table)
+        self.starting_npcs_editor_container = QWidget()
+        self.starting_npcs_editor_container.setLayout(npc_editor_layout)
+        self.starting_npcs_editor_container.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Maximum,
         )
 
         layout = QVBoxLayout()
         layout.addWidget(self.no_starting_npcs_checkbox)
-        layout.addWidget(self.starting_npcs_table)
-        layout.addWidget(_button_row(self.add_npc_button, self.remove_npcs_button))
+        layout.addWidget(self.starting_npcs_editor_container)
         layout.addStretch()
+        layout.setAlignment(Qt.AlignmentFlag.AlignTop)
         page.setLayout(layout)
 
-        self.addPage(page)
+        self.starting_npcs_page_id = self.addPage(page)
         self._sync_starting_npcs_controls()
 
     def _append_starting_npc_row(self, npc: dict[str, Any]) -> None:
@@ -5971,12 +6190,18 @@ class NewGameWizard(QWizard):
             self.starting_npcs_table,
             npc,
             self._remove_starting_npc_row,
+            location_options=_starting_location_options_from_table(
+                self.starting_locations_table
+            ),
+            change_callback=self._sync_starting_party_choices,
         )
+        self._sync_starting_party_choices()
 
     def _remove_starting_npc_row(self, button: QPushButton) -> None:
         """Removes the starting NPC row containing button."""
 
         _remove_table_row_by_button(self.starting_npcs_table, button)
+        self._sync_starting_party_choices()
 
     def _starting_npcs_from_table(self) -> list[dict[str, Any]]:
         """Reads requested starting NPC rows from the wizard table."""
@@ -6007,19 +6232,218 @@ class NewGameWizard(QWizard):
                 return
 
             self.starting_npcs_table.setRowCount(0)
+            self._sync_starting_party_choices()
 
         self._sync_starting_npcs_controls()
 
     def _sync_starting_npcs_controls(self) -> None:
-        """Disables starting NPC editing while the no-NPCs option is active."""
+        """Hides starting NPC editing while the no-NPCs option is active."""
 
         if not hasattr(self, "no_starting_npcs_checkbox"):
             return
 
         allow_npcs = not self.no_starting_npcs_checkbox.isChecked()
-        self.starting_npcs_table.setEnabled(allow_npcs)
-        self.add_npc_button.setEnabled(allow_npcs)
-        self.remove_npcs_button.setEnabled(allow_npcs)
+        self.starting_npcs_editor_container.setVisible(allow_npcs)
+
+    def _build_starting_party_page(self) -> None:
+        """Builds the starting-party selector from the Wizard NPC list."""
+
+        page = QWizardPage()
+        page.setTitle("Party")
+        page.setSubTitle(
+            "Choose which starting NPCs are already traveling with the player."
+        )
+
+        self.starting_party_npc_combo = QComboBox()
+        self.add_starting_party_member_button = QPushButton("Add to Party")
+        self.add_starting_party_member_button.clicked.connect(
+            self._add_selected_starting_party_member
+        )
+        selection_controls = _button_row(
+            self.starting_party_npc_combo,
+            self.add_starting_party_member_button,
+        )
+        selection_form = QFormLayout()
+        _configure_responsive_form(selection_form)
+        selection_form.addRow("NPC to Add:", selection_controls)
+        self.starting_party_selection_container = QWidget()
+        self.starting_party_selection_container.setLayout(selection_form)
+
+        self.starting_party_table = _AppTableWidget(0, 3)
+        self.starting_party_table.setHorizontalHeaderLabels(
+            ["NPC", "Starting Location", "Remove"]
+        )
+        _configure_inline_table(
+            self.starting_party_table,
+            (360, 320, 90),
+            minimum_height=240,
+        )
+        _configure_responsive_table(
+            self.starting_party_table,
+            stretch_columns={0, 1},
+            compact_columns={2},
+        )
+        explanation = QLabel(
+            "Party members remain the same NPCs shown on the NPC page and retain "
+            "the same hidden NPC ID. Removing an NPC there also removes them here."
+        )
+        explanation.setWordWrap(True)
+        self.starting_party_empty_label = QLabel()
+        self.starting_party_empty_label.setWordWrap(True)
+
+        layout = QVBoxLayout()
+        layout.addWidget(explanation)
+        layout.addWidget(self.starting_party_selection_container)
+        layout.addWidget(self.starting_party_empty_label)
+        layout.addWidget(self.starting_party_table)
+        layout.addStretch()
+        layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+        page.setLayout(layout)
+        self.starting_party_page_id = self.addPage(page)
+        self._sync_starting_party_choices()
+
+    def _starting_npc_choices(self) -> list[dict[str, str]]:
+        """Reads current NPC names and locations with their stable hidden IDs."""
+
+        choices: list[dict[str, str]] = []
+        for row in range(self.starting_npcs_table.rowCount()):
+            name_widget = self.starting_npcs_table.cellWidget(row, 0)
+            location_widget = self.starting_npcs_table.cellWidget(row, 1)
+            if not isinstance(name_widget, QLineEdit):
+                continue
+            npc_id = str(name_widget.property("npc_id") or "").strip()
+            if not npc_id:
+                continue
+            name = name_widget.text().strip() or f"Unnamed NPC {row + 1}"
+            location = (
+                location_widget.currentText().strip()
+                if isinstance(location_widget, QComboBox)
+                and location_widget.currentData() not in (None, "")
+                else ""
+            )
+            choices.append({"npc_id": npc_id, "name": name, "location": location})
+        return choices
+
+    def _starting_party_npc_ids_from_table(self) -> list[str]:
+        """Reads selected party identities from the Party page."""
+
+        npc_ids: list[str] = []
+        for row in range(self.starting_party_table.rowCount()):
+            item = self.starting_party_table.item(row, 0)
+            npc_id = (
+                str(item.data(Qt.ItemDataRole.UserRole) or "").strip()
+                if item is not None
+                else ""
+            )
+            if npc_id and npc_id not in npc_ids:
+                npc_ids.append(npc_id)
+        return npc_ids
+
+    def _set_starting_party_npc_ids(self, npc_ids: Any) -> None:
+        """Loads selected IDs, dropping any that are absent from the NPC page."""
+
+        requested = (
+            [str(value).strip() for value in npc_ids]
+            if isinstance(npc_ids, list)
+            else []
+        )
+        available = {choice["npc_id"] for choice in self._starting_npc_choices()}
+        self.starting_party_table.setRowCount(0)
+        for npc_id in requested:
+            if npc_id in available:
+                self._append_starting_party_member_row(npc_id)
+        self._sync_starting_party_choices()
+
+    def _append_starting_party_member_row(self, npc_id: str) -> None:
+        """Adds one selected NPC identity to the Party table."""
+
+        choice = next(
+            (
+                entry
+                for entry in self._starting_npc_choices()
+                if entry["npc_id"] == npc_id
+            ),
+            None,
+        )
+        if choice is None or npc_id in self._starting_party_npc_ids_from_table():
+            return
+        row = self.starting_party_table.rowCount()
+        self.starting_party_table.insertRow(row)
+        name_item = QTableWidgetItem(choice["name"])
+        name_item.setData(Qt.ItemDataRole.UserRole, npc_id)
+        location_item = QTableWidgetItem(choice["location"] or "Not specified")
+        location_item.setData(Qt.ItemDataRole.UserRole, npc_id)
+        self.starting_party_table.setItem(row, 0, name_item)
+        self.starting_party_table.setItem(row, 1, location_item)
+        _set_remove_row_button(
+            self.starting_party_table,
+            row,
+            2,
+            "party member",
+            self._remove_starting_party_member_row,
+        )
+
+    def _remove_starting_party_member_row(self, button: QPushButton) -> None:
+        """Removes one confirmed member from the starting party."""
+
+        if _remove_table_row_by_button(self.starting_party_table, button) >= 0:
+            self._sync_starting_party_choices()
+
+    def _add_selected_starting_party_member(self) -> None:
+        """Adds the NPC currently selected in the dropdown."""
+
+        npc_id = str(self.starting_party_npc_combo.currentData() or "").strip()
+        if npc_id:
+            self._append_starting_party_member_row(npc_id)
+            self._sync_starting_party_choices()
+
+    def _sync_starting_party_choices(self) -> None:
+        """Refreshes Party selections and options from the live Wizard NPC rows."""
+
+        if not hasattr(self, "starting_party_table"):
+            return
+        choices = self._starting_npc_choices()
+        choices_by_id = {choice["npc_id"]: choice for choice in choices}
+        selected_ids = [
+            npc_id
+            for npc_id in self._starting_party_npc_ids_from_table()
+            if npc_id in choices_by_id
+        ]
+
+        self.starting_party_table.setRowCount(0)
+        for npc_id in selected_ids:
+            self._append_starting_party_member_row(npc_id)
+
+        previous_id = str(self.starting_party_npc_combo.currentData() or "").strip()
+        self.starting_party_npc_combo.blockSignals(True)
+        self.starting_party_npc_combo.clear()
+        for choice in choices:
+            if choice["npc_id"] in selected_ids:
+                continue
+            label = choice["name"]
+            if choice["location"]:
+                label = f"{label} — {choice['location']}"
+            self.starting_party_npc_combo.addItem(label, choice["npc_id"])
+        restored_index = self.starting_party_npc_combo.findData(previous_id)
+        if restored_index >= 0:
+            self.starting_party_npc_combo.setCurrentIndex(restored_index)
+        self.starting_party_npc_combo.blockSignals(False)
+        self.add_starting_party_member_button.setEnabled(
+            self.starting_party_npc_combo.count() > 0
+        )
+        has_choices = self.starting_party_npc_combo.count() > 0
+        has_party_members = self.starting_party_table.rowCount() > 0
+        has_any_npcs = bool(choices)
+        self.starting_party_selection_container.setVisible(has_choices)
+        self.starting_party_table.setVisible(has_party_members)
+        if not has_any_npcs:
+            empty_text = "Add NPCs on the previous page before choosing a starting party."
+        elif not has_party_members:
+            empty_text = "No NPCs are in the starting party yet."
+        else:
+            empty_text = ""
+        self.starting_party_empty_label.setText(empty_text)
+        self.starting_party_empty_label.setVisible(bool(empty_text))
 
     def _build_character_page(self) -> None:
         """Builds the character page."""
@@ -6034,6 +6458,18 @@ class NewGameWizard(QWizard):
         self.character_name_pronunciation_input.setPlaceholderText(
             "Optional: kah-tha-lah, or /kəˈθɑlə/ for exact IPA"
         )
+        self.character_pronouns_combo = _NoWheelComboBox()
+        for pronouns in CHARACTER_PRONOUN_OPTIONS:
+            self.character_pronouns_combo.addItem(pronouns, pronouns)
+        self.character_pronouns_combo.addItem("Other", "other")
+        self.character_custom_pronouns_input = QLineEdit()
+        self.character_custom_pronouns_input.setPlaceholderText(
+            "Enter custom pronouns, such as Xe/Xem"
+        )
+        self.character_pronouns_combo.currentIndexChanged.connect(
+            self._sync_character_pronoun_controls
+        )
+        self._set_character_pronouns(DEFAULT_CHARACTER_PRONOUNS)
 
         self.appearance_input = QTextEdit()
         self.backstory_input = QTextEdit()
@@ -6044,14 +6480,54 @@ class NewGameWizard(QWizard):
         self.character_notes_input.setPlaceholderText("Other character notes the AI should know...")
 
         layout = QFormLayout()
+        self.character_form_layout = layout
+        _configure_responsive_form(layout)
         layout.addRow("Name:", self.character_name_input)
         layout.addRow("Name Pronunciation:", self.character_name_pronunciation_input)
+        layout.addRow("Pronouns:", self.character_pronouns_combo)
+        layout.addRow("Custom Pronouns:", self.character_custom_pronouns_input)
         layout.addRow("Appearance:", self.appearance_input)
         layout.addRow("Backstory:", self.backstory_input)
         layout.addRow("Notes:", self.character_notes_input)
+        self._sync_character_pronoun_controls()
         page.setLayout(layout)
 
-        self.addPage(page)
+        self.character_page_id = self.addPage(page)
+
+    def _sync_character_pronoun_controls(self, _index: int = -1) -> None:
+        """Shows custom pronoun entry only when Other is selected."""
+
+        is_custom = self.character_pronouns_combo.currentData() == "other"
+        if hasattr(self, "character_form_layout"):
+            self.character_form_layout.setRowVisible(
+                self.character_custom_pronouns_input,
+                is_custom,
+            )
+        else:
+            self.character_custom_pronouns_input.setVisible(is_custom)
+
+    def _character_pronouns_from_controls(self) -> str:
+        """Returns the Wizard's canonical player-character pronouns."""
+
+        if self.character_pronouns_combo.currentData() == "other":
+            return normalize_character_pronouns(
+                self.character_custom_pronouns_input.text()
+            )
+        return normalize_character_pronouns(
+            self.character_pronouns_combo.currentData()
+        )
+
+    def _set_character_pronouns(self, pronouns: Any) -> None:
+        """Loads standard or custom canonical pronouns into the Wizard."""
+
+        canonical = normalize_character_pronouns(pronouns)
+        index = self.character_pronouns_combo.findData(canonical)
+        is_custom = index < 0
+        if is_custom:
+            index = self.character_pronouns_combo.findData("other")
+        self.character_pronouns_combo.setCurrentIndex(max(0, index))
+        self.character_custom_pronouns_input.setText(canonical if is_custom else "")
+        self._sync_character_pronoun_controls()
 
     def _build_skills_page(self) -> None:
         """Builds the starting skills page."""
@@ -6094,17 +6570,20 @@ class NewGameWizard(QWizard):
             table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
             table.verticalHeader().setVisible(False)
             table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
+            table.setSizePolicy(
+                QSizePolicy.Policy.Expanding,
+                QSizePolicy.Policy.Expanding,
+            )
+            _configure_auto_height_table(table)
+            _configure_table_wheel_passthrough(table)
             self.skill_tables[level] = table
 
             add_button = QPushButton("Add Skill")
-            remove_button = QPushButton("Remove Selected Skills")
             add_button.clicked.connect(lambda _checked=False, skill_level=level: self._add_starting_skill_row(skill_level))
-            remove_button.clicked.connect(lambda _checked=False, skill_level=level: self._remove_selected_starting_skill_rows(skill_level))
             controls = QWidget()
             controls_layout = QHBoxLayout()
             controls_layout.setContentsMargins(0, 0, 0, 0)
             controls_layout.addWidget(add_button)
-            controls_layout.addWidget(remove_button)
             controls_layout.addStretch()
             controls.setLayout(controls_layout)
             group_layout.addWidget(controls)
@@ -6139,11 +6618,16 @@ class NewGameWizard(QWizard):
         table = self.skill_tables[level]
         row = table.rowCount()
         table.insertRow(row)
-        _set_checked_row_checkbox(
+        _set_remove_row_button(
             table,
             row,
             0,
-            "Check this skill, then click Remove Selected Skills.",
+            "skill",
+            lambda button, skill_level=level: self._remove_starting_skill_row(
+                skill_level,
+                button,
+            ),
+            name_column=1,
         )
         skill_input = QLineEdit(name)
         skill_input.setPlaceholderText("Skill name")
@@ -6153,12 +6637,16 @@ class NewGameWizard(QWizard):
         table.setCellWidget(row, 2, description_input)
         self._sync_starting_skill_inputs()
 
-    def _remove_selected_starting_skill_rows(self, level: int) -> None:
+    def _remove_starting_skill_row(
+        self,
+        level: int,
+        button: QPushButton,
+    ) -> None:
+        """Removes one confirmed custom skill row."""
+
         table = self.skill_tables[level]
-        checked_rows = table.checked_rows(0)
-        for row in reversed(checked_rows):
-            table.removeRow(row)
-        self._sync_starting_skill_inputs()
+        if _remove_table_row_by_button(table, button) >= 0:
+            self._sync_starting_skill_inputs()
 
     def _sync_starting_skill_inputs(self) -> None:
         self.skill_inputs = []
@@ -6186,6 +6674,510 @@ class NewGameWizard(QWizard):
             self.skill_table_controls[level].setVisible(is_custom)
         self._sync_starting_skill_inputs()
 
+    def _build_magic_page(self) -> None:
+        """Builds world magic and optional starting player-spell controls."""
+
+        page = QWizardPage()
+        page.setTitle("Magic")
+        page.setSubTitle(
+            "Choose whether magic exists and how player spellcasting works at the start."
+        )
+
+        self.no_world_magic_checkbox = QCheckBox("This world does not contain magic.")
+        self.magic_enabled_checkbox = QCheckBox(
+            "The player character can cast spells at the start"
+        )
+        self.magic_casting_mode_combo = QComboBox()
+        for mode in MAGIC_CASTING_MODES:
+            self.magic_casting_mode_combo.addItem(MAGIC_CASTING_MODE_LABELS[mode], mode)
+        self.magic_tradition_input = QLineEdit()
+        self.magic_tradition_input.setPlaceholderText(
+            "Arcane, Divine, Psychic, Elemental, or another setting-appropriate tradition"
+        )
+        self.magic_mana_maximum_input = _NoWheelSpinBox()
+        self.magic_mana_maximum_input.setRange(1, 9999)
+        self.magic_mana_maximum_input.setValue(10)
+
+        self.magic_tier_slot_inputs: dict[int, QSpinBox] = {}
+        tier_form = QFormLayout()
+        for tier in range(1, 10):
+            slot_input = _NoWheelSpinBox()
+            slot_input.setRange(0, 99)
+            slot_input.setValue(2 if tier == 1 else 0)
+            self.magic_tier_slot_inputs[tier] = slot_input
+            tier_form.addRow(f"Tier {tier} slots:", slot_input)
+        self.magic_tier_slots_group = QGroupBox("Starting Tiered Slots")
+        self.magic_tier_slots_group.setLayout(tier_form)
+
+        mana_form = QFormLayout()
+        mana_form.addRow("Maximum Mana:", self.magic_mana_maximum_input)
+        self.magic_mana_group = QGroupBox("Starting Mana")
+        self.magic_mana_group.setLayout(mana_form)
+
+        self.starting_spell_requests_table = _AppTableWidget(0, 2)
+        self.starting_spell_requests_table.setHorizontalHeaderLabels(
+            ["Spell Description", "Remove"]
+        )
+        self.starting_spell_requests_table.verticalHeader().setVisible(False)
+        self.starting_spell_requests_table.verticalHeader().setDefaultSectionSize(40)
+        self.starting_spell_requests_table.setSelectionMode(
+            QTableWidget.SelectionMode.NoSelection
+        )
+        _configure_responsive_table(
+            self.starting_spell_requests_table,
+            stretch_columns={0},
+            compact_columns={1},
+        )
+        self.magic_add_spell_request_button = QPushButton("Add Starting Spell")
+        self.magic_add_spell_request_button.clicked.connect(
+            lambda: self._append_starting_spell_request_row({})
+        )
+
+        self.starting_spells_table = _AppTableWidget(0, 7)
+        self.starting_spells_table.setHorizontalHeaderLabels(
+            ["Name", "Tier", "School", "Mana Cost", "Prepared", "Description", "Remove"]
+        )
+        self.starting_spells_table.verticalHeader().setVisible(False)
+        self.starting_spells_table.verticalHeader().setDefaultSectionSize(40)
+        self.starting_spells_table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
+        _configure_responsive_table(
+            self.starting_spells_table,
+            stretch_columns={0, 2, 5},
+            compact_columns={1, 3, 4, 6},
+        )
+        self.magic_add_spell_button = QPushButton("Add Starting Spell")
+        self.magic_add_spell_button.clicked.connect(
+            lambda: self._append_starting_spell_row({})
+        )
+
+        self.starting_spells_basic_button = QPushButton("Basic")
+        self.starting_spells_advanced_button = QPushButton("Advanced")
+        self.starting_spells_mode_buttons = QButtonGroup(self)
+        self.starting_spells_mode_buttons.setExclusive(True)
+        self.starting_spells_mode_buttons.addButton(
+            self.starting_spells_basic_button,
+            0,
+        )
+        self.starting_spells_mode_buttons.addButton(
+            self.starting_spells_advanced_button,
+            1,
+        )
+        for mode_button in (
+            self.starting_spells_basic_button,
+            self.starting_spells_advanced_button,
+        ):
+            mode_button.setObjectName("starterInventoryModeButton")
+            mode_button.setCheckable(True)
+        self.starting_spells_basic_button.setChecked(True)
+
+        form = QFormLayout()
+        _configure_responsive_form(form)
+        form.addRow("Casting Model:", self.magic_casting_mode_combo)
+        form.addRow("Tradition / Style:", self.magic_tradition_input)
+
+        basic_spells_layout = QVBoxLayout()
+        basic_spells_explanation = QLabel(
+            "Describe each spell plainly. Gemini will create its name, tier, school, "
+            "cost, and complete gameplay details during game creation."
+        )
+        basic_spells_explanation.setWordWrap(True)
+        basic_spells_layout.addWidget(basic_spells_explanation)
+        basic_spells_layout.addWidget(
+            _button_row(self.magic_add_spell_request_button)
+        )
+        basic_spells_layout.addWidget(self.starting_spell_requests_table)
+        basic_spells_widget = QWidget()
+        basic_spells_widget.setLayout(basic_spells_layout)
+
+        advanced_spells_layout = QVBoxLayout()
+        advanced_spells_layout.addWidget(_button_row(self.magic_add_spell_button))
+        advanced_spells_layout.addWidget(self.starting_spells_table)
+        advanced_spells_widget = QWidget()
+        advanced_spells_widget.setLayout(advanced_spells_layout)
+
+        self.starting_spells_mode_stack = QStackedWidget()
+        self.starting_spells_mode_stack.addWidget(basic_spells_widget)
+        self.starting_spells_mode_stack.addWidget(advanced_spells_widget)
+        self.starting_spells_mode_buttons.idClicked.connect(
+            self.starting_spells_mode_stack.setCurrentIndex
+        )
+
+        spells_layout = QVBoxLayout()
+        spells_mode_explanation = QLabel(
+            "Basic lets Gemini develop plain-language spell ideas; Advanced lets "
+            "you enter exact spell values."
+        )
+        spells_mode_explanation.setWordWrap(True)
+        spells_layout.addWidget(spells_mode_explanation)
+        spells_layout.addWidget(
+            _button_row(
+                self.starting_spells_basic_button,
+                self.starting_spells_advanced_button,
+            )
+        )
+        spells_layout.addWidget(self.starting_spells_mode_stack)
+        self.starting_spells_group = QGroupBox("Starting Spells")
+        self.starting_spells_group.setLayout(spells_layout)
+
+        player_casting_controls_layout = QVBoxLayout()
+        player_casting_controls_layout.setContentsMargins(0, 0, 0, 0)
+        player_casting_controls_layout.addWidget(self.magic_mana_group)
+        player_casting_controls_layout.addWidget(self.magic_tier_slots_group)
+        player_casting_controls_layout.addWidget(self.starting_spells_group)
+        self.magic_player_casting_controls_container = QWidget()
+        self.magic_player_casting_controls_container.setLayout(
+            player_casting_controls_layout
+        )
+
+        explanation = QLabel(
+            "Narrative casting tracks known spells without a consumable resource. "
+            "Mana spends each spell's Mana Cost. Tiered casting spends one slot at "
+            "the selected tier; Tier 0 spells are at-will."
+        )
+        explanation.setWordWrap(True)
+        player_options_layout = QVBoxLayout()
+        player_options_layout.setContentsMargins(0, 0, 0, 0)
+        player_options_layout.addWidget(explanation)
+        player_options_layout.addLayout(form)
+        player_options_layout.addWidget(self.magic_player_casting_controls_container)
+        player_options_layout.addStretch()
+        self.magic_player_options_container = QWidget()
+        self.magic_player_options_container.setLayout(player_options_layout)
+
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setFrameShape(QScrollArea.Shape.NoFrame)
+        scroll_area.setWidget(self.magic_player_options_container)
+        self.magic_player_options_scroll = scroll_area
+        layout = QVBoxLayout()
+        player_magic_explanation = QLabel(
+            "Leave player casting unchecked when magic exists in the world but "
+            "the player character cannot use it at the start."
+        )
+        player_magic_explanation.setWordWrap(True)
+        options_layout = QVBoxLayout()
+        options_layout.setContentsMargins(0, 0, 0, 0)
+        options_layout.addWidget(player_magic_explanation)
+        options_layout.addWidget(self.magic_enabled_checkbox)
+        options_layout.addWidget(scroll_area)
+        self.magic_options_container = QWidget()
+        self.magic_options_container.setLayout(options_layout)
+
+        layout.addWidget(self.no_world_magic_checkbox)
+        layout.addWidget(self.magic_options_container)
+        page.setLayout(layout)
+
+        self.no_world_magic_checkbox.toggled.connect(self._sync_magic_controls)
+        self.magic_enabled_checkbox.toggled.connect(self._sync_magic_controls)
+        self.magic_casting_mode_combo.currentIndexChanged.connect(self._sync_magic_controls)
+        self._sync_magic_controls()
+        self.addPage(page)
+
+    def _append_starting_spell_request_row(self, request: dict[str, Any]) -> None:
+        """Adds one Basic-mode plain-language spell request."""
+
+        row = self.starting_spell_requests_table.rowCount()
+        self.starting_spell_requests_table.insertRow(row)
+        self.starting_spell_requests_table.setRowHeight(row, 40)
+        request_input = QLineEdit(str(request.get("spell_request", "")))
+        request_input.setPlaceholderText(
+            "For example: a protective ward that briefly turns aside an attack"
+        )
+        self.starting_spell_requests_table.setCellWidget(row, 0, request_input)
+        _set_remove_row_button(
+            self.starting_spell_requests_table,
+            row,
+            1,
+            "spell request",
+            self._remove_starting_spell_request_row,
+        )
+
+    def _remove_starting_spell_request_row(self, button: QPushButton) -> None:
+        """Removes one Basic-mode spell request."""
+
+        _remove_table_row_by_button(self.starting_spell_requests_table, button)
+
+    def _append_starting_spell_row(self, spell: dict[str, Any]) -> None:
+        """Adds one editable starting-spell row to the Wizard."""
+
+        row = self.starting_spells_table.rowCount()
+        self.starting_spells_table.insertRow(row)
+        self.starting_spells_table.setRowHeight(row, 40)
+        name_input = QLineEdit(str(spell.get("name", "")))
+        name_input.setPlaceholderText("Spell name")
+        tier_input = QSpinBox()
+        tier_input.setRange(0, 9)
+        tier_input.setValue(_safe_int(spell.get("tier", 0), 0))
+        school_input = QLineEdit(str(spell.get("school", "")))
+        school_input.setPlaceholderText("School or tradition")
+        cost_input = QSpinBox()
+        cost_input.setRange(0, 9999)
+        cost_input.setValue(_safe_int(spell.get("mana_cost", 0), 0))
+        prepared_input = QCheckBox()
+        prepared_input.setChecked(bool(spell.get("prepared", True)))
+        description_input = QLineEdit(str(spell.get("description", "")))
+        description_input.setPlaceholderText("Practical gameplay effect")
+        for column, widget in enumerate(
+            (name_input, tier_input, school_input, cost_input, prepared_input, description_input)
+        ):
+            self.starting_spells_table.setCellWidget(row, column, widget)
+        _set_remove_row_button(
+            self.starting_spells_table,
+            row,
+            6,
+            "spell",
+            self._remove_starting_spell_row,
+        )
+
+    def _remove_starting_spell_row(self, button: QPushButton) -> None:
+        """Removes one confirmed spell from the starting-spell table."""
+
+        _remove_table_row_by_button(self.starting_spells_table, button)
+
+    def _magic_setup_from_controls(self) -> dict[str, Any]:
+        """Serializes the Wizard's authoritative magic configuration."""
+
+        world_contains_magic = not self.no_world_magic_checkbox.isChecked()
+        player_magic_enabled = (
+            world_contains_magic and self.magic_enabled_checkbox.isChecked()
+        )
+        starting_spells_mode = self._starting_spells_mode()
+        starting_spell_requests: list[dict[str, Any]] = []
+        starting_spells: list[dict[str, Any]] = []
+        if player_magic_enabled and starting_spells_mode == "basic":
+            for row in range(self.starting_spell_requests_table.rowCount()):
+                request_input = self.starting_spell_requests_table.cellWidget(row, 0)
+                if not isinstance(request_input, QLineEdit):
+                    continue
+                request = request_input.text().strip()
+                if request:
+                    starting_spell_requests.append(
+                        {
+                            "spell_request": request,
+                            "requires_ai_invention": True,
+                        }
+                    )
+        elif player_magic_enabled:
+            for row in range(self.starting_spells_table.rowCount()):
+                name_input = self.starting_spells_table.cellWidget(row, 0)
+                tier_input = self.starting_spells_table.cellWidget(row, 1)
+                school_input = self.starting_spells_table.cellWidget(row, 2)
+                cost_input = self.starting_spells_table.cellWidget(row, 3)
+                prepared_input = self.starting_spells_table.cellWidget(row, 4)
+                description_input = self.starting_spells_table.cellWidget(row, 5)
+                if not isinstance(name_input, QLineEdit):
+                    continue
+                name = name_input.text().strip()
+                if not name:
+                    continue
+                starting_spells.append(
+                    {
+                        "name": name,
+                        "tier": (
+                            tier_input.value()
+                            if isinstance(tier_input, QSpinBox)
+                            else 0
+                        ),
+                        "school": (
+                            school_input.text()
+                            if isinstance(school_input, QLineEdit)
+                            else ""
+                        ),
+                        "mana_cost": (
+                            cost_input.value()
+                            if isinstance(cost_input, QSpinBox)
+                            else 0
+                        ),
+                        "prepared": (
+                            prepared_input.isChecked()
+                            if isinstance(prepared_input, QCheckBox)
+                            else True
+                        ),
+                        "description": (
+                            description_input.text()
+                            if isinstance(description_input, QLineEdit)
+                            else ""
+                        ),
+                    }
+                )
+        return {
+            "world_contains_magic": world_contains_magic,
+            "player_magic_enabled": player_magic_enabled,
+            "enabled": player_magic_enabled,
+            "casting_mode": str(
+                self.magic_casting_mode_combo.currentData() or "narrative"
+            ),
+            "tradition": self.magic_tradition_input.text(),
+            "mana_maximum": self.magic_mana_maximum_input.value(),
+            "tier_slots": {
+                tier: slot_input.value()
+                for tier, slot_input in self.magic_tier_slot_inputs.items()
+            },
+            "starting_spells_mode": starting_spells_mode,
+            "starting_spell_requests": starting_spell_requests,
+            "starting_spells": starting_spells,
+        }
+
+    def _starting_spells_mode(self) -> str:
+        """Returns the selected Basic/Advanced starting-spell mode."""
+
+        return (
+            "advanced"
+            if self.starting_spells_advanced_button.isChecked()
+            else "basic"
+        )
+
+    def _set_starting_spells_mode(self, mode: str) -> None:
+        """Selects the starting-spell editing depth and matching editor."""
+
+        is_advanced = str(mode).casefold() == "advanced"
+        self.starting_spells_advanced_button.setChecked(is_advanced)
+        self.starting_spells_basic_button.setChecked(not is_advanced)
+        self.starting_spells_mode_stack.setCurrentIndex(1 if is_advanced else 0)
+
+    def _load_magic_setup(self, magic: dict[str, Any]) -> None:
+        """Loads normalized magic setup into Wizard controls."""
+
+        self.no_world_magic_checkbox.setChecked(
+            not bool(magic.get("world_contains_magic", True))
+        )
+        self.magic_enabled_checkbox.setChecked(
+            bool(magic.get("player_magic_enabled", magic.get("enabled", False)))
+        )
+        _set_combo_to_data(
+            self.magic_casting_mode_combo,
+            str(magic.get("casting_mode", "narrative")),
+        )
+        self.magic_tradition_input.setText(str(magic.get("tradition", "")))
+        self.magic_mana_maximum_input.setValue(
+            max(1, _safe_int(magic.get("mana_maximum", 10), 10))
+        )
+        slots = magic.get("tier_slots", {})
+        if not isinstance(slots, dict):
+            slots = {}
+        for tier, slot_input in self.magic_tier_slot_inputs.items():
+            slot_input.setValue(_safe_int(slots.get(tier, slots.get(str(tier), 0)), 0))
+        self.starting_spell_requests_table.setRowCount(0)
+        self.starting_spells_table.setRowCount(0)
+        self._set_starting_spells_mode(
+            str(magic.get("starting_spells_mode", "basic"))
+        )
+        for request in magic.get("starting_spell_requests", []):
+            if isinstance(request, dict):
+                self._append_starting_spell_request_row(request)
+        for spell in magic.get("starting_spells", []):
+            if isinstance(spell, dict):
+                self._append_starting_spell_row(spell)
+        self._sync_magic_controls()
+
+    def _sync_magic_controls(self, _value: Any = None) -> None:
+        """Shows only controls relevant to the selected casting model."""
+
+        world_contains_magic = not self.no_world_magic_checkbox.isChecked()
+        player_magic_enabled = self.magic_enabled_checkbox.isChecked()
+        mode = str(self.magic_casting_mode_combo.currentData() or "narrative")
+        self.magic_options_container.setVisible(world_contains_magic)
+        self.magic_player_options_scroll.setVisible(world_contains_magic)
+        self.magic_player_options_container.setVisible(world_contains_magic)
+        show_player_casting_controls = world_contains_magic and player_magic_enabled
+        self.magic_player_casting_controls_container.setVisible(
+            show_player_casting_controls
+        )
+        self.magic_mana_group.setVisible(
+            show_player_casting_controls and mode == "mana"
+        )
+        self.magic_tier_slots_group.setVisible(
+            show_player_casting_controls and mode == "tiered"
+        )
+        self.starting_spells_group.setVisible(show_player_casting_controls)
+
+    def _build_combat_page(self) -> None:
+        """Builds the player-facing combat focus and resolution page."""
+
+        page = QWizardPage()
+        page.setTitle("Combat")
+        page.setSubTitle(
+            "Choose how prominent combat should be and who resolves actual fights."
+        )
+
+        self.combat_focus_combo = QComboBox()
+        for focus in COMBAT_FOCUS_LEVELS:
+            self.combat_focus_combo.addItem(COMBAT_FOCUS_LABELS[focus], focus)
+
+        self.combat_resolution_mode_combo = QComboBox()
+        for mode in COMBAT_RESOLUTION_MODES:
+            self.combat_resolution_mode_combo.addItem(
+                COMBAT_RESOLUTION_MODE_LABELS[mode], mode
+            )
+
+        self.combat_resolution_explanation = QLabel()
+        self.combat_resolution_explanation.setWordWrap(True)
+
+        form = QFormLayout()
+        _configure_responsive_form(form)
+        form.addRow("Combat Focus:", self.combat_focus_combo)
+        form.addRow("Combat Resolution:", self.combat_resolution_mode_combo)
+        form.addRow(self.combat_resolution_explanation)
+
+        content = QWidget()
+        content.setLayout(form)
+        layout = QVBoxLayout()
+        introduction = QLabel(
+            "Combat Focus influences how often the adventure presents fights. "
+            "Combat Resolution determines whether fights use the deterministic "
+            "Combat tab or remain part of Gemini's narration."
+        )
+        introduction.setWordWrap(True)
+        layout.addWidget(introduction)
+        layout.addWidget(content)
+        layout.addStretch()
+        page.setLayout(layout)
+
+        self.combat_resolution_mode_combo.currentIndexChanged.connect(
+            self._sync_combat_explanation
+        )
+        self._sync_combat_explanation()
+        self.addPage(page)
+
+    def _combat_setup_from_controls(self) -> dict[str, str]:
+        """Serializes the Wizard's combat preferences."""
+
+        return {
+            "focus": str(self.combat_focus_combo.currentData() or "balanced"),
+            "resolution_mode": str(
+                self.combat_resolution_mode_combo.currentData() or "strict"
+            ),
+        }
+
+    def _load_combat_setup(self, combat: dict[str, Any]) -> None:
+        """Loads normalized combat preferences into Wizard controls."""
+
+        _set_combo_to_data(
+            self.combat_focus_combo,
+            str(combat.get("focus", "balanced")),
+        )
+        _set_combo_to_data(
+            self.combat_resolution_mode_combo,
+            str(combat.get("resolution_mode", "strict")),
+        )
+        self._sync_combat_explanation()
+
+    def _sync_combat_explanation(self, _value: Any = None) -> None:
+        """Explains the behavior controlled by the selected resolution mode."""
+
+        mode = str(self.combat_resolution_mode_combo.currentData() or "strict")
+        if mode == "narrative":
+            explanation = (
+                "Gemini narrates and resolves fights as part of the story. It will "
+                "not start the deterministic Combat tab or use CombatStartedEvent."
+            )
+        else:
+            explanation = (
+                "When a fight begins, Gemini hands it to the deterministic Combat "
+                "tab. Python controls initiative, attacks, damage, victory, and loot."
+            )
+        self.combat_resolution_explanation.setText(explanation)
+
     def _build_inventory_currency_page(self) -> None:
         """Builds the starter inventory and currency page."""
 
@@ -6205,20 +7197,21 @@ class NewGameWizard(QWizard):
         self.starter_items_table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
         self.starter_items_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         _set_table_column_widths(self.starter_items_table, STARTER_ITEM_COLUMN_WIDTHS)
+        _configure_responsive_table(
+            self.starter_items_table,
+            stretch_columns={0, 2, 3, 5},
+            compact_columns={1, 4, 6},
+        )
 
         add_item_button = QPushButton("Add Item")
         add_item_button.clicked.connect(lambda: self._append_starter_item_row({}))
-        remove_item_button = _bulk_remove_button(self.starter_items_table, label="Remove Selected Items")
 
         self.starter_item_suggestions_table = _build_starter_suggestion_table("Item")
-        add_item_suggestion_button = QPushButton("Add Item Suggestion")
+        add_item_suggestion_button = QPushButton("Add Item Idea")
         add_item_suggestion_button.clicked.connect(
             lambda: _append_starter_suggestion_table_row(
                 self.starter_item_suggestions_table, "Item"
             )
-        )
-        remove_item_suggestion_button = _bulk_remove_button(
-            self.starter_item_suggestions_table, label="Remove Selected Suggestions"
         )
 
         self.starter_weapons_table = _AppTableWidget(0, 9)
@@ -6240,20 +7233,21 @@ class NewGameWizard(QWizard):
             STARTER_WEAPON_COLUMN_WIDTHS,
             minimum_height=150,
         )
+        _configure_responsive_table(
+            self.starter_weapons_table,
+            stretch_columns={0, 3, 4, 5, 6},
+            compact_columns={1, 2, 7, 8},
+        )
 
         add_weapon_button = QPushButton("Add Weapon")
         add_weapon_button.clicked.connect(lambda: self._append_starter_weapon_row({}))
-        remove_weapon_button = _bulk_remove_button(self.starter_weapons_table, label="Remove Selected Weapons")
 
         self.starter_weapon_suggestions_table = _build_starter_suggestion_table("Weapon")
-        add_weapon_suggestion_button = QPushButton("Add Weapon Suggestion")
+        add_weapon_suggestion_button = QPushButton("Add Weapon Idea")
         add_weapon_suggestion_button.clicked.connect(
             lambda: _append_starter_suggestion_table_row(
                 self.starter_weapon_suggestions_table, "Weapon"
             )
-        )
-        remove_weapon_suggestion_button = _bulk_remove_button(
-            self.starter_weapon_suggestions_table, label="Remove Selected Suggestions"
         )
 
         self.starter_armor_table = _AppTableWidget(0, 6)
@@ -6265,20 +7259,21 @@ class NewGameWizard(QWizard):
             STARTER_ARMOR_COLUMN_WIDTHS,
             minimum_height=130,
         )
+        _configure_responsive_table(
+            self.starter_armor_table,
+            stretch_columns={0, 2},
+            compact_columns={1, 3, 4, 5},
+        )
 
         add_armor_button = QPushButton("Add Armor")
         add_armor_button.clicked.connect(lambda: self._append_starter_armor_row({}))
-        remove_armor_button = _bulk_remove_button(self.starter_armor_table, label="Remove Selected Armor")
 
         self.starter_armor_suggestions_table = _build_starter_suggestion_table("Armor")
-        add_armor_suggestion_button = QPushButton("Add Armor Suggestion")
+        add_armor_suggestion_button = QPushButton("Add Armor Idea")
         add_armor_suggestion_button.clicked.connect(
             lambda: _append_starter_suggestion_table_row(
                 self.starter_armor_suggestions_table, "Armor"
             )
-        )
-        remove_armor_suggestion_button = _bulk_remove_button(
-            self.starter_armor_suggestions_table, label="Remove Selected Suggestions"
         )
 
         self.currency_table = _AppTableWidget(0, 4)
@@ -6291,15 +7286,14 @@ class NewGameWizard(QWizard):
         self.currency_table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
         self.currency_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         _set_table_column_widths(self.currency_table, CURRENCY_COLUMN_WIDTHS)
+        _configure_responsive_table(
+            self.currency_table,
+            stretch_columns={0, 1},
+            compact_columns={2, 3},
+        )
 
         add_currency_button = QPushButton("Add Currency")
         add_currency_button.clicked.connect(lambda: self._append_currency_row({}))
-        remove_currency_button = _bulk_remove_button(
-            self.currency_table,
-            label="Remove Selected Currencies",
-            preserve_first_row=True,
-            after_remove=lambda: _sync_currency_base_value_row(self.currency_table),
-        )
 
         self.economy_examples_table = _AppTableWidget(0, 3)
         self.economy_examples_table.setHorizontalHeaderLabels(["Item", "Base Units", "Remove"])
@@ -6308,33 +7302,82 @@ class NewGameWizard(QWizard):
             ECONOMY_EXAMPLE_COLUMN_WIDTHS,
             minimum_height=140,
         )
+        _configure_responsive_table(
+            self.economy_examples_table,
+            stretch_columns={0},
+            compact_columns={1, 2},
+        )
 
         add_economy_example_button = QPushButton("Add Economy Item")
         add_economy_example_button.clicked.connect(
             lambda: self._append_economy_example_row({})
         )
-        remove_economy_example_button = _bulk_remove_button(
-            self.economy_examples_table,
-            label="Remove Selected Economy Items",
+
+        self.starter_inventory_basic_button = QPushButton("Basic")
+        self.starter_inventory_advanced_button = QPushButton("Advanced")
+        self.starter_inventory_mode_buttons = QButtonGroup(self)
+        self.starter_inventory_mode_buttons.setExclusive(True)
+        self.starter_inventory_mode_buttons.addButton(
+            self.starter_inventory_basic_button, 0
+        )
+        self.starter_inventory_mode_buttons.addButton(
+            self.starter_inventory_advanced_button, 1
+        )
+        for mode_button in (
+            self.starter_inventory_basic_button,
+            self.starter_inventory_advanced_button,
+        ):
+            mode_button.setObjectName("starterInventoryModeButton")
+            mode_button.setCheckable(True)
+        self.starter_inventory_basic_button.setChecked(True)
+
+        basic_inventory_layout = QFormLayout()
+        _configure_responsive_form(basic_inventory_layout)
+        for suggestion_table in (
+            self.starter_item_suggestions_table,
+            self.starter_weapon_suggestions_table,
+            self.starter_armor_suggestions_table,
+        ):
+            suggestion_table.setMaximumHeight(16777215)
+            _configure_responsive_table(
+                suggestion_table,
+                stretch_columns={0},
+                compact_columns={1},
+            )
+        basic_inventory_layout.addRow("Items:", self.starter_item_suggestions_table)
+        basic_inventory_layout.addRow("", _button_row(add_item_suggestion_button))
+        basic_inventory_layout.addRow("Weapons:", self.starter_weapon_suggestions_table)
+        basic_inventory_layout.addRow("", _button_row(add_weapon_suggestion_button))
+        basic_inventory_layout.addRow("Armor:", self.starter_armor_suggestions_table)
+        basic_inventory_layout.addRow("", _button_row(add_armor_suggestion_button))
+        basic_inventory_widget = QWidget()
+        basic_inventory_widget.setLayout(basic_inventory_layout)
+
+        advanced_inventory_layout = QFormLayout()
+        _configure_responsive_form(advanced_inventory_layout)
+        advanced_inventory_layout.addRow("Items:", self.starter_items_table)
+        advanced_inventory_layout.addRow("", _button_row(add_item_button))
+        advanced_inventory_layout.addRow("Weapons:", self.starter_weapons_table)
+        advanced_inventory_layout.addRow("", _button_row(add_weapon_button))
+        advanced_inventory_layout.addRow("Armor:", self.starter_armor_table)
+        advanced_inventory_layout.addRow("", _button_row(add_armor_button))
+        advanced_inventory_widget = QWidget()
+        advanced_inventory_widget.setLayout(advanced_inventory_layout)
+
+        self.starter_inventory_mode_stack = QStackedWidget()
+        self.starter_inventory_mode_stack.addWidget(basic_inventory_widget)
+        self.starter_inventory_mode_stack.addWidget(advanced_inventory_widget)
+        self.starter_inventory_mode_buttons.idClicked.connect(
+            self.starter_inventory_mode_stack.setCurrentIndex
         )
 
         layout = QFormLayout()
-        layout.addRow("Starter Items:", self.starter_items_table)
-        layout.addRow("", _button_row(add_item_button, remove_item_button))
-        layout.addRow("Item Suggestions:", self.starter_item_suggestions_table)
-        layout.addRow("", _button_row(add_item_suggestion_button, remove_item_suggestion_button))
-        layout.addRow("Starter Weapons:", self.starter_weapons_table)
-        layout.addRow("", _button_row(add_weapon_button, remove_weapon_button))
-        layout.addRow("Weapon Suggestions:", self.starter_weapon_suggestions_table)
-        layout.addRow("", _button_row(add_weapon_suggestion_button, remove_weapon_suggestion_button))
-        layout.addRow("Starter Armor:", self.starter_armor_table)
-        layout.addRow("", _button_row(add_armor_button, remove_armor_button))
-        layout.addRow("Armor Suggestions:", self.starter_armor_suggestions_table)
-        layout.addRow("", _button_row(add_armor_suggestion_button, remove_armor_suggestion_button))
+        _configure_responsive_form(layout)
+        layout.addRow(self.starter_inventory_mode_stack)
         layout.addRow("Currencies:", self.currency_table)
-        layout.addRow("", _button_row(add_currency_button, remove_currency_button))
+        layout.addRow("", _button_row(add_currency_button))
         layout.addRow("Economy Notes:", self.economy_examples_table)
-        layout.addRow("", _button_row(add_economy_example_button, remove_economy_example_button))
+        layout.addRow("", _button_row(add_economy_example_button))
 
         content = QWidget()
         content.setLayout(layout)
@@ -6345,6 +7388,18 @@ class NewGameWizard(QWizard):
         scroll_area.setWidget(content)
 
         page_layout = QVBoxLayout()
+        mode_label = QLabel(
+            "Starter equipment detail: Basic lets the A.I. develop your ideas; "
+            "Advanced lets you enter exact values."
+        )
+        mode_label.setWordWrap(True)
+        page_layout.addWidget(mode_label)
+        page_layout.addWidget(
+            _button_row(
+                self.starter_inventory_basic_button,
+                self.starter_inventory_advanced_button,
+            )
+        )
         page_layout.addWidget(scroll_area)
         page.setLayout(page_layout)
 
@@ -6355,7 +7410,9 @@ class NewGameWizard(QWizard):
 
         page = QWizardPage()
         page.setTitle("Audio")
-        page.setSubTitle("Choose music preferences before the save starts.")
+        page.setSubTitle(
+            "Choose music and sound-effect preferences before the save starts."
+        )
 
         self.music_enabled_checkbox = QCheckBox("Music enabled")
         self.music_enabled_checkbox.setChecked(bool(self.audio_defaults["music_enabled"]))
@@ -6384,8 +7441,13 @@ class NewGameWizard(QWizard):
         )
         self.music_test_button = QPushButton("Test")
         self.music_test_button.clicked.connect(self._test_music_preview)
+        self.sound_effects_test_button = QPushButton("Test")
+        self.sound_effects_test_button.clicked.connect(
+            self._test_sound_effects_preview
+        )
 
         layout = QFormLayout()
+        _configure_responsive_form(layout)
         layout.addRow("Background Music:", self.music_enabled_checkbox)
         layout.addRow("Music Volume:", _slider_row(self.music_volume_slider, self.music_volume_label))
         layout.addRow("Music Preview:", self.music_test_button)
@@ -6397,6 +7459,7 @@ class NewGameWizard(QWizard):
                 self.sound_effects_volume_label,
             ),
         )
+        layout.addRow("Sound Effects Preview:", self.sound_effects_test_button)
 
         page.setLayout(layout)
 
@@ -6412,6 +7475,19 @@ class NewGameWizard(QWizard):
 
         self.sound_manager.set_music_volume(self.music_volume_slider.value())
         self.sound_manager.play_music_preview(random.choice(tracks))
+
+    def _test_sound_effects_preview(self) -> None:
+        if self.sound_manager is None:
+            return
+
+        sound_effects = self.sound_manager.get_valid_sound_effect_names()
+        if not sound_effects:
+            return
+
+        self.sound_manager.set_sound_effects_volume(
+            self.sound_effects_volume_slider.value()
+        )
+        self.sound_manager.play_sound_effect(random.choice(sound_effects))
 
     def _bind_music_preview_stop_buttons(self) -> None:
         for button in self.findChildren(QPushButton):
@@ -6530,14 +7606,41 @@ class NewGameWizard(QWizard):
     def _starter_items_from_table(self) -> list[dict[str, Any]]:
         """Reads starter item rows from the wizard table."""
 
+        if self._starter_inventory_mode() == "advanced":
+            return [
+                *_starter_items_from_table(self.starter_items_table),
+                *_starter_weapons_from_table(self.starter_weapons_table),
+                *_starter_armor_from_table(self.starter_armor_table),
+            ]
+
         return [
-            *_starter_items_from_table(self.starter_items_table),
-            *_starter_weapons_from_table(self.starter_weapons_table),
-            *_starter_armor_from_table(self.starter_armor_table),
-            *_starter_suggestions_from_table(self.starter_item_suggestions_table, "Item"),
-            *_starter_suggestions_from_table(self.starter_weapon_suggestions_table, "Weapon"),
-            *_starter_suggestions_from_table(self.starter_armor_suggestions_table, "Armor"),
+            *_starter_suggestions_from_table(
+                self.starter_item_suggestions_table, "Item"
+            ),
+            *_starter_suggestions_from_table(
+                self.starter_weapon_suggestions_table, "Weapon"
+            ),
+            *_starter_suggestions_from_table(
+                self.starter_armor_suggestions_table, "Armor"
+            ),
         ]
+
+    def _starter_inventory_mode(self) -> str:
+        """Returns the selected Basic/Advanced starter-equipment mode."""
+
+        return (
+            "advanced"
+            if self.starter_inventory_advanced_button.isChecked()
+            else "basic"
+        )
+
+    def _set_starter_inventory_mode(self, mode: str) -> None:
+        """Selects the starter-equipment mode and matching editor page."""
+
+        is_advanced = str(mode).casefold() == "advanced"
+        self.starter_inventory_advanced_button.setChecked(is_advanced)
+        self.starter_inventory_basic_button.setChecked(not is_advanced)
+        self.starter_inventory_mode_stack.setCurrentIndex(1 if is_advanced else 0)
 
     def _append_starter_weapon_row(self, item: dict[str, Any]) -> None:
         """Adds a starter weapon row to the wizard table."""
@@ -6648,12 +7751,14 @@ class NewGameWizard(QWizard):
 
         self.calendar_settings_button = QPushButton("Calendar Settings...")
         self.calendar_settings_button.clicked.connect(self._open_wizard_calendar_settings)
+        self.calendar_settings_label = QLabel("Custom Settings:")
 
         layout = QFormLayout()
+        _configure_responsive_form(layout)
         layout.addRow("Calendar:", self.calendar_type_combo)
         layout.addRow("Starting Season:", self.calendar_start_season_input)
         layout.addRow("Starting Day:", self.calendar_start_day_input)
-        layout.addRow("Custom Settings:", self.calendar_settings_button)
+        layout.addRow(self.calendar_settings_label, self.calendar_settings_button)
         layout.addRow(
             self.calendar_generation_guidance_label,
             self.calendar_generation_guidance_input,
@@ -6688,13 +7793,14 @@ class NewGameWizard(QWizard):
         }
 
     def _sync_calendar_settings_button(self) -> None:
-        """Enables custom calendar editing only for custom new-game calendars."""
+        """Shows custom calendar editing only for custom new-game calendars."""
 
         if not hasattr(self, "calendar_settings_button"):
             return
 
         is_custom = self.calendar_type_combo.currentData() == "custom"
-        self.calendar_settings_button.setEnabled(is_custom)
+        self.calendar_settings_label.setVisible(is_custom)
+        self.calendar_settings_button.setVisible(is_custom)
         is_ai_generated = self.calendar_type_combo.currentData() == "ai_generated"
         self.calendar_generation_guidance_label.setVisible(is_ai_generated)
         self.calendar_generation_guidance_input.setVisible(is_ai_generated)
@@ -6861,8 +7967,10 @@ class GameShell(QWidget):
             playtesting_tools=self.playtesting_tools,
         )
         self.npcs_screen = NpcsScreen()
+        self.party_screen = PartyScreen()
         self.active_tasks_screen = ActiveTasksScreen()
         self.skills_screen = SkillsScreen()
+        self.magic_screen = MagicScreen()
         self.alchemy_screen = AlchemyNotebookScreen(
             playtesting_tools=self.playtesting_tools,
         )
@@ -6889,8 +7997,10 @@ class GameShell(QWidget):
             self.inventory_screen,
             self.combat_screen,
             self.npcs_screen,
+            self.party_screen,
             self.active_tasks_screen,
             self.skills_screen,
+            self.magic_screen,
             self.alchemy_screen,
             self.history_screen,
             self.settings_screen,
@@ -6904,7 +8014,9 @@ class GameShell(QWidget):
                 ("character", self.character_screen, "Character", True),
                 ("calendar", self.calendar_screen, "Calendar", True),
                 ("inventory", self.inventory_screen, "Inventory", True),
+                ("magic", self.magic_screen, "Magic", True),
                 ("combat", self.combat_screen, "Combat", True),
+                ("party", self.party_screen, "Party", True),
                 ("settings", self.settings_screen, "Settings", True),
             ]
             if self.playtesting_tools
@@ -6915,8 +8027,10 @@ class GameShell(QWidget):
                 ("calendar", self.calendar_screen, "Calendar", True),
                 ("inventory", self.inventory_screen, "Inventory", True),
                 ("combat", self.combat_screen, "Combat", True),
+                ("party", self.party_screen, "Party", True),
                 ("npcs", self.npcs_screen, "NPCs", True),
                 ("skills", self.skills_screen, "Skills", True),
+                ("magic", self.magic_screen, "Magic", True),
                 ("crafting", self.alchemy_screen, "Crafting", True),
                 ("journal", self.history_screen, "Journal", True),
                 ("settings", self.settings_screen, "Settings", True),
@@ -7938,6 +9052,7 @@ class StoryScreen(RepositoryBackedWidget):
             location=state.world.location,
             query_text=player_text,
         )
+        party_members = repository.list_party_members()
         gm_secrets = repository.list_gm_secrets(active_only=True)
         miscellaneous = repository.list_miscellaneous()
         valid_music_tracks = (
@@ -7955,6 +9070,7 @@ class StoryScreen(RepositoryBackedWidget):
             player_command=player_text,
             conversation_mode=conversation_mode,
             relevant_npcs=relevant_npcs,
+            party_members=party_members,
             gm_secrets=gm_secrets,
             miscellaneous=miscellaneous,
             valid_music_tracks=valid_music_tracks,
@@ -9283,6 +10399,10 @@ class CombatScreen(RepositoryBackedWidget):
 
         combat_state = repository.get_combat_state()
         self._render_combat_state(combat_state)
+        if not combat_state.get("active") and self._uses_narrative_combat(repository):
+            self.status_label.setText(
+                "Narrative combat is enabled. Gemini resolves fights in Story."
+            )
 
     def _schedule_npc_turn(self, combat_state: dict[str, Any]) -> None:
         """Schedules the current NPC to act after the reading delay."""
@@ -9362,6 +10482,12 @@ class CombatScreen(RepositoryBackedWidget):
         repository = self.repository()
 
         if repository is None:
+            return
+
+        if self._uses_narrative_combat(repository):
+            self.status_label.setText(
+                "Narrative combat is enabled. Gemini resolves fights in Story."
+            )
             return
 
         state = StateManager(repository).load_state()
@@ -10109,18 +11235,34 @@ class CombatScreen(RepositoryBackedWidget):
         """Persists player health from the player combatant."""
 
         for combatant in combat_state.get("combatants", []):
-            if combatant.get("id") != "player":
+            if combatant.get("id") == "player":
+                repository.set_setting("player.health_current", int(combatant["current_health"]))
+                repository.set_setting("player.health_max", int(combatant["max_health"]))
+                repository.set_setting("player.armor_rating", int(combatant["armor_rating"]))
+                repository.set_state_value(
+                    "condition",
+                    "Incapacitated" if int(combatant["current_health"]) <= 0 else "Healthy",
+                )
+                self._persist_player_clip_ammo(repository, combatant)
                 continue
 
-            repository.set_setting("player.health_current", int(combatant["current_health"]))
-            repository.set_setting("player.health_max", int(combatant["max_health"]))
-            repository.set_setting("player.armor_rating", int(combatant["armor_rating"]))
-            repository.set_state_value(
-                "condition",
-                "Incapacitated" if int(combatant["current_health"]) <= 0 else "Healthy",
-            )
-            self._persist_player_clip_ammo(repository, combatant)
-            break
+            npc_id = str(combatant.get("npc_id", "") or "").strip()
+            if npc_id and combatant.get("team") == "party":
+                current_health = int(combatant.get("current_health", -1))
+                max_health = int(combatant.get("max_health", -1))
+                repository.upsert_party_member(
+                    npc_id,
+                    status=(
+                        "Incapacitated"
+                        if current_health <= 0
+                        else "Wounded"
+                        if max_health >= 0 and current_health < max_health
+                        else "Active"
+                    ),
+                    health_current=current_health,
+                    health_max=max_health,
+                    armor_class=int(combatant.get("armor_rating", -1)),
+                )
 
     @staticmethod
     def _clear_resolved_battlefield(combat_state: dict[str, Any]) -> None:
@@ -10263,6 +11405,11 @@ class CombatScreen(RepositoryBackedWidget):
         """Enables combat controls for the active state."""
 
         repository = self.repository()
+        narrative_combat = bool(
+            repository
+            and not combat_active
+            and self._uses_narrative_combat(repository)
+        )
         combat_state = (
             repository.get_combat_state()
             if repository is not None and combat_active
@@ -10289,10 +11436,31 @@ class CombatScreen(RepositoryBackedWidget):
         self.end_turn_button.setVisible(manual_action_visible)
         self.reload_button.setVisible(manual_action_visible)
         self.resolve_button.setEnabled(combat_active)
-        self.add_combatant_button.setEnabled(self.repository() is not None)
-        self.start_button.setEnabled(self.repository() is not None and not combat_active)
+        self.add_combatant_button.setEnabled(
+            repository is not None and not narrative_combat
+        )
+        self.start_button.setEnabled(
+            repository is not None and not combat_active and not narrative_combat
+        )
         self.damage_button.setEnabled(bool(self.adjust_target_combo.count()))
         self.heal_button.setEnabled(bool(self.adjust_target_combo.count()))
+
+    @staticmethod
+    def _uses_narrative_combat(repository: SaveRepository) -> bool:
+        """Returns whether this save delegates combat resolution to Gemini."""
+
+        preferences = normalize_combat_preferences(
+            repository.get_setting(
+                "combat.preferences",
+                {
+                    "resolution_mode": repository.get_setting(
+                        "combat.resolution_mode", "strict"
+                    ),
+                    "focus": repository.get_setting("combat.focus", "balanced"),
+                },
+            )
+        )
+        return preferences["resolution_mode"] == "narrative"
 
 
 class TravelScreen(RepositoryBackedWidget):
@@ -11616,6 +12784,7 @@ class InventoryLocationPanel(QGroupBox):
         self._on_item_clicked = on_item_clicked
         self._on_sort_changed = on_sort_changed
         self.item_buttons: list[QPushButton] = []
+        self.group_separators: list[QFrame] = []
         layout = QVBoxLayout()
 
         controls = QHBoxLayout()
@@ -11666,13 +12835,27 @@ class InventoryLocationPanel(QGroupBox):
                 widget.deleteLater()
 
         self.item_buttons.clear()
+        self.group_separators.clear()
         sort_field = str(self.sort_field_combo.currentData() or "name")
         sort_descending = bool(self.sort_direction_combo.currentData())
-        for item in sorted(
+        sorted_items = sorted(
             self._items,
             key=lambda candidate: self._item_sort_key(candidate, sort_field),
             reverse=sort_descending,
-        ):
+        )
+        previous_group: Any = None
+        for index, item in enumerate(sorted_items):
+            group = self._item_group_key(item, sort_field)
+            if index > 0 and group != previous_group:
+                separator = QFrame()
+                separator.setObjectName("inventorySortGroupSeparator")
+                separator.setFrameShape(QFrame.Shape.HLine)
+                separator.setFrameShadow(QFrame.Shadow.Sunken)
+                separator.setToolTip("New sort group")
+                self.item_list_layout.addWidget(separator)
+                self.group_separators.append(separator)
+            previous_group = group
+
             quantity = max(0, _safe_int(item.get("quantity", 0), 0))
             unit = str(item.get("quantity_unit", "each") or "each")
             category = str(item.get("category", "Item") or "Item")
@@ -11693,6 +12876,19 @@ class InventoryLocationPanel(QGroupBox):
             )
             self.item_list_layout.addWidget(button)
             self.item_buttons.append(button)
+
+    @staticmethod
+    def _item_group_key(item: dict[str, Any], sort_field: str) -> Any:
+        """Returns the dynamic group represented by the active sort option."""
+
+        if sort_field == "category":
+            return str(item.get("category", "Item") or "Item").casefold()
+        if sort_field == "price":
+            return max(0, _safe_int(item.get("value_base_units", 0), 0))
+        if sort_field == "quantity":
+            return max(0, _safe_int(item.get("quantity", 0), 0))
+        name = str(item.get("name", "")).strip().casefold()
+        return name[:1] or "#"
 
     @staticmethod
     def _item_sort_key(item: dict[str, Any], sort_field: str) -> tuple[Any, str]:
@@ -12275,6 +13471,75 @@ class InventoryScreen(RepositoryBackedWidget):
         finally:
             self._loading_item_editor = False
 
+class PartyScreen(RepositoryBackedWidget):
+    """Player-facing party roster backed by canonical NPC identities."""
+
+    def __init__(self) -> None:
+        super().__init__()
+
+        self.table = _AppTableWidget(0, 7)
+        self.table.setHorizontalHeaderLabels(
+            [
+                "Name",
+                "Status",
+                "Health",
+                "Armor Class",
+                "Combat Style",
+                "Skills",
+                "Description",
+            ]
+        )
+        self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        _configure_wrapping_table(self.table, {4, 5, 6})
+
+        explanation = QLabel(
+            "Party members are shared NPC identities. Names and descriptions come "
+            "from the NPC profile; this tab shows their current party-specific state."
+        )
+        explanation.setWordWrap(True)
+
+        layout = QVBoxLayout()
+        layout.addWidget(explanation)
+        layout.addWidget(self.table)
+        self.setLayout(layout)
+
+    def refresh(self) -> None:
+        """Reloads current party records joined to their NPC profiles."""
+
+        repository = self.repository()
+        if repository is None:
+            self.table.setRowCount(0)
+            return
+
+        members = repository.list_party_members()
+        self.table.setRowCount(len(members))
+        for row_index, member in enumerate(members):
+            health_current = _safe_int(member.get("health_current"), -1)
+            health_max = _safe_int(member.get("health_max"), -1)
+            health = (
+                f"{health_current}/{health_max}"
+                if health_current >= 0 and health_max >= 0
+                else "N/A"
+            )
+            armor_class = _safe_int(member.get("armor_class"), -1)
+            values = (
+                member.get("display_name") or member.get("name") or "Unknown NPC",
+                member.get("status", "Active"),
+                health,
+                armor_class if armor_class >= 0 else "N/A",
+                member.get("combat_style", ""),
+                ", ".join(str(skill) for skill in member.get("skills", [])),
+                member.get("description") or member.get("notes") or "",
+            )
+            for column, value in enumerate(values):
+                item = _table_item(str(value))
+                item.setData(Qt.ItemDataRole.UserRole, str(member.get("npc_id", "")))
+                self.table.setItem(row_index, column, item)
+
+        _resize_wrapping_table_rows(self.table)
+
+
 class NpcsScreen(RepositoryBackedWidget):
     """Player-facing NPC journal."""
 
@@ -12554,6 +13819,239 @@ class SkillsScreen(RepositoryBackedWidget):
             return str(skill.get("description", "")).casefold(), name
 
         return name, name
+
+
+class MagicScreen(RepositoryBackedWidget):
+    """Player magic journal with deterministic resource consumption."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._spell_rows: list[dict[str, Any]] = []
+
+        self.summary_label = QLabel("Magic is not configured for this save.")
+        self.summary_label.setWordWrap(True)
+        self.resources_label = QLabel("")
+        self.resources_label.setWordWrap(True)
+
+        self.spells_table = _AppTableWidget(0, 5)
+        self.spells_table.setHorizontalHeaderLabels(
+            ["Spell", "Tier", "School", "Cost", "Prepared"]
+        )
+        self.spells_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.spells_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.spells_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        _configure_wrapping_table(self.spells_table, {0, 2})
+        self.spells_table.itemSelectionChanged.connect(self._load_selected_spell)
+
+        self.spell_details_label = QLabel("Select a spell to view its details.")
+        self.spell_details_label.setWordWrap(True)
+        self.cast_spell_button = QPushButton("Cast / Record Use")
+        self.cast_spell_button.setEnabled(False)
+        self.cast_spell_button.clicked.connect(self._cast_selected_spell)
+        self.prepare_spell_button = QPushButton("Prepare / Unprepare")
+        self.prepare_spell_button.setEnabled(False)
+        self.prepare_spell_button.clicked.connect(self._toggle_selected_spell_prepared)
+
+        details_group = QGroupBox("Selected Spell")
+        details_layout = QVBoxLayout()
+        details_layout.addWidget(self.spell_details_label)
+        details_layout.addStretch()
+        details_layout.addWidget(self.cast_spell_button)
+        details_layout.addWidget(self.prepare_spell_button)
+        details_group.setLayout(details_layout)
+
+        spells_layout = QHBoxLayout()
+        spells_layout.addWidget(self.spells_table, 3)
+        spells_layout.addWidget(details_group, 2)
+        spells_widget = QWidget()
+        spells_widget.setLayout(spells_layout)
+
+        self.effects_table = _AppTableWidget(0, 4)
+        self.effects_table.setHorizontalHeaderLabels(
+            ["Effect", "Target", "Duration", "Concentration"]
+        )
+        self.effects_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        _configure_wrapping_table(self.effects_table, {0, 1, 2})
+
+        self.cast_history_table = _AppTableWidget(0, 4)
+        self.cast_history_table.setHorizontalHeaderLabels(
+            ["Spell", "Tier", "Resource Spent", "Cast At"]
+        )
+        self.cast_history_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        _configure_wrapping_table(self.cast_history_table, {0, 2})
+
+        tabs = QTabWidget()
+        tabs.addTab(spells_widget, "Known Spells")
+        tabs.addTab(self.effects_table, "Active Effects")
+        tabs.addTab(self.cast_history_table, "Cast History")
+
+        layout = QVBoxLayout()
+        layout.addWidget(self.summary_label)
+        layout.addWidget(self.resources_label)
+        layout.addWidget(tabs)
+        self.setLayout(layout)
+
+    def refresh(self) -> None:
+        """Reloads configuration, spells, resources, effects, and cast history."""
+
+        repository = self.repository()
+        if repository is None:
+            self._spell_rows = []
+            self.spells_table.setRowCount(0)
+            self.effects_table.setRowCount(0)
+            self.cast_history_table.setRowCount(0)
+            self.summary_label.setText("Magic is not configured for this save.")
+            self.resources_label.clear()
+            return
+
+        magic = repository.get_magic_configuration()
+        mode = str(magic["casting_mode"])
+        mode_label = MAGIC_CASTING_MODE_LABELS.get(mode, mode.title())
+        tradition = str(magic.get("tradition", "")).strip() or "Unspecified tradition"
+        self.summary_label.setText(
+            "This world does not contain magic."
+            if not magic.get("world_contains_magic", True)
+            else (
+                f"{mode_label} Casting · {tradition}"
+                if magic["enabled"]
+                else "Player magic is disabled for this save."
+            )
+        )
+        pools = repository.list_magic_resource_pools()
+        self.resources_label.setText(
+            "Resources: "
+            + (
+                " · ".join(
+                    f"{pool['name']} {pool['current_amount']}/{pool['maximum_amount']}"
+                    for pool in pools
+                )
+                if pools
+                else "No consumable casting resource"
+            )
+        )
+
+        self._spell_rows = repository.list_character_spells()
+        self.spells_table.setRowCount(len(self._spell_rows))
+        for row_index, spell in enumerate(self._spell_rows):
+            cost = (
+                f"{spell['mana_cost']} Mana"
+                if mode == "mana"
+                else ("At-will" if int(spell["tier"]) == 0 else f"Tier {spell['tier']} slot")
+                if mode == "tiered"
+                else "Narrative"
+            )
+            values = (
+                spell["name"], spell["tier"], spell["school"], cost,
+                "Yes" if spell["prepared"] else "No",
+            )
+            for column, value in enumerate(values):
+                item = _table_item(str(value))
+                item.setData(Qt.ItemDataRole.UserRole, spell["spell_id"])
+                self.spells_table.setItem(row_index, column, item)
+        _resize_wrapping_table_rows(self.spells_table)
+
+        effects = repository.list_active_magic_effects()
+        self.effects_table.setRowCount(len(effects))
+        for row_index, effect in enumerate(effects):
+            duration = (
+                "Ongoing"
+                if int(effect["end_elapsed_minutes"]) < 0
+                else f"Until minute {effect['end_elapsed_minutes']}"
+            )
+            values = (
+                effect["name"], effect["target"], duration,
+                "Yes" if effect["requires_concentration"] else "No",
+            )
+            for column, value in enumerate(values):
+                self.effects_table.setItem(row_index, column, _table_item(str(value)))
+
+        history = repository.list_spell_cast_history()
+        self.cast_history_table.setRowCount(len(history))
+        for row_index, cast in enumerate(history):
+            spent = (
+                "None"
+                if int(cast["amount_spent"]) == 0
+                else f"{cast['amount_spent']} from {cast['pool_id']}"
+            )
+            values = (cast.get("spell_name") or "Unknown Spell", cast["cast_tier"], spent, cast["cast_at"])
+            for column, value in enumerate(values):
+                self.cast_history_table.setItem(row_index, column, _table_item(str(value)))
+
+        self._load_selected_spell()
+
+    def _selected_spell(self) -> dict[str, Any] | None:
+        row = self.spells_table.currentRow()
+        if row < 0 or row >= len(self._spell_rows):
+            return None
+        return self._spell_rows[row]
+
+    def _load_selected_spell(self) -> None:
+        spell = self._selected_spell()
+        if spell is None:
+            self.spell_details_label.setText("Select a spell to view its details.")
+            self.cast_spell_button.setEnabled(False)
+            self.prepare_spell_button.setEnabled(False)
+            return
+        details = [
+            f"{spell['name']} · Tier {spell['tier']} · {spell['school'] or 'Unclassified'}",
+            spell["description"] or "No description recorded.",
+            f"Casting Time: {spell['casting_time']}",
+            f"Range: {spell['range'] or 'Unspecified'}",
+            f"Duration: {spell['duration'] or 'Unspecified'}",
+            f"Requirements: {spell['requirements'] or 'None recorded'}",
+            f"Mana Cost: {spell['mana_cost']}",
+        ]
+        self.spell_details_label.setText("\n\n".join(details))
+        repository = self.repository()
+        enabled = bool(repository and repository.get_magic_configuration()["enabled"])
+        self.cast_spell_button.setEnabled(enabled)
+        self.prepare_spell_button.setEnabled(enabled)
+
+    def _cast_selected_spell(self) -> None:
+        repository = self.repository()
+        spell = self._selected_spell()
+        if repository is None or spell is None:
+            return
+        magic = repository.get_magic_configuration()
+        cast_tier = int(spell["tier"])
+        if magic["casting_mode"] == "tiered" and cast_tier > 0:
+            cast_tier, accepted = QInputDialog.getInt(
+                self,
+                "Cast Spell",
+                "Slot tier to consume:",
+                cast_tier,
+                cast_tier,
+                9,
+            )
+            if not accepted:
+                return
+        confirmation = QMessageBox.question(
+            self,
+            "Record Spell Cast",
+            f"Cast {spell['name']} and consume its required resource?",
+        )
+        if confirmation != QMessageBox.StandardButton.Yes:
+            return
+        result = repository.cast_character_spell(
+            str(spell["spell_id"]),
+            cast_tier=cast_tier,
+        )
+        if result.get("status") != "cast":
+            QMessageBox.warning(self, "Spell Not Cast", str(result.get("message", "Cast rejected.")))
+            return
+        self.notify_repository_changed()
+        self.refresh()
+
+    def _toggle_selected_spell_prepared(self) -> None:
+        repository = self.repository()
+        spell = self._selected_spell()
+        if repository is None or spell is None:
+            return
+        repository.set_character_spell_prepared(
+            str(spell["spell_id"]), not bool(spell["prepared"])
+        )
+        self.notify_repository_changed()
+        self.refresh()
 
 
 class AlchemyNotebookScreen(RepositoryBackedWidget):
@@ -14205,7 +15703,14 @@ def _preserved_player_character_fields(
     ai_character = ai_character if isinstance(ai_character, dict) else {}
     preserved: dict[str, str] = {}
 
-    for key in ("name", "name_pronunciation", "appearance", "backstory", "notes"):
+    for key in (
+        "name",
+        "name_pronunciation",
+        "pronouns",
+        "appearance",
+        "backstory",
+        "notes",
+    ):
         setup_value = str(setup_character.get(key, "")).strip()
         ai_value = str(ai_character.get(key, "")).strip()
 
@@ -14869,7 +16374,13 @@ def _append_starting_location_table_row(
     table.setCellWidget(row, 2, mode_input)
     table.setCellWidget(row, 3, sublocation_input)
     table.setCellWidget(row, 4, parent_input)
-    _set_checked_row_checkbox(table, row, 5, "Select this location for removal.")
+    _set_remove_row_button(
+        table,
+        row,
+        5,
+        "location",
+        remove_callback,
+    )
     parent_input.setVisible(sublocation_input.isChecked())
     _set_table_column_widths(table, STARTING_LOCATION_COLUMN_WIDTHS)
 
@@ -14967,6 +16478,30 @@ def _starting_location_options_from_table(
     return options
 
 
+def _sync_starting_npc_location_dropdowns(
+    npc_table: QTableWidget,
+    locations: list[tuple[str, str]],
+) -> None:
+    """Keeps NPC location choices tied to the live starting-location rows."""
+
+    valid_ids = {row_id for row_id, _name in locations}
+    for row in range(npc_table.rowCount()):
+        location_widget = npc_table.cellWidget(row, 1)
+        if not isinstance(location_widget, QComboBox):
+            continue
+        selected_id = str(location_widget.currentData() or "")
+        location_widget.blockSignals(True)
+        location_widget.clear()
+        location_widget.addItem("Select a location", "")
+        for row_id, name in locations:
+            location_widget.addItem(name, row_id)
+        if selected_id in valid_ids:
+            _set_combo_to_data(location_widget, selected_id)
+        else:
+            location_widget.setCurrentIndex(0)
+        location_widget.blockSignals(False)
+
+
 def _sync_starting_location_parent_dropdowns(
     table: QTableWidget,
     locations: list[tuple[str, str]],
@@ -15024,6 +16559,9 @@ def _append_starting_npc_table_row(
     table: QTableWidget,
     npc: dict[str, Any],
     remove_callback: Callable[[QPushButton], None],
+    *,
+    location_options: list[tuple[str, str]] | None = None,
+    change_callback: Callable[[], None] | None = None,
 ) -> None:
     """Adds one editable starting NPC row to table."""
 
@@ -15032,7 +16570,20 @@ def _append_starting_npc_table_row(
     table.setRowHeight(row, 36)
 
     name_input = _table_line_edit(str(npc.get("name", npc.get("display_name", ""))))
-    location_input = _table_line_edit(str(npc.get("location", "")))
+    name_input.setProperty(
+        "npc_id",
+        str(npc.get("npc_id", "")).strip() or f"starting_npc_{uuid.uuid4().hex}",
+    )
+    location_input = _NoWheelComboBox()
+    location_input.addItem("Select a location", "")
+    for row_id, location_name in location_options or []:
+        location_input.addItem(location_name, row_id)
+    requested_location = str(npc.get("location", "")).strip().casefold()
+    if requested_location:
+        for index in range(1, location_input.count()):
+            if location_input.itemText(index).strip().casefold() == requested_location:
+                location_input.setCurrentIndex(index)
+                break
     description_input = _table_line_edit(
         str(npc.get("description", npc.get("public_description", "")))
     )
@@ -15040,12 +16591,21 @@ def _append_starting_npc_table_row(
         {"suggestion": "Suggestion", "exact": "Exact"},
         str(npc.get("description_mode", "suggestion") or "suggestion"),
     )
+    if change_callback is not None:
+        name_input.textChanged.connect(change_callback)
+        location_input.currentIndexChanged.connect(change_callback)
 
     table.setCellWidget(row, 0, name_input)
     table.setCellWidget(row, 1, location_input)
     table.setCellWidget(row, 2, description_input)
     table.setCellWidget(row, 3, mode_input)
-    _set_checked_row_checkbox(table, row, 4, "Select this NPC for removal.")
+    _set_remove_row_button(
+        table,
+        row,
+        4,
+        "NPC",
+        remove_callback,
+    )
     _set_table_column_widths(table, STARTING_NPC_COLUMN_WIDTHS)
 
 
@@ -15060,9 +16620,15 @@ def _starting_npcs_from_table(table: QTableWidget) -> list[dict[str, Any]]:
         description_widget = table.cellWidget(row, 2)
         mode_widget = table.cellWidget(row, 3)
         name = name_widget.text().strip() if isinstance(name_widget, QLineEdit) else ""
+        npc_id = (
+            str(name_widget.property("npc_id") or "").strip()
+            if isinstance(name_widget, QLineEdit)
+            else ""
+        )
         location = (
-            location_widget.text().strip()
-            if isinstance(location_widget, QLineEdit)
+            location_widget.currentText().strip()
+            if isinstance(location_widget, QComboBox)
+            and location_widget.currentData() not in (None, "")
             else ""
         )
         description = (
@@ -15081,8 +16647,15 @@ def _starting_npcs_from_table(table: QTableWidget) -> list[dict[str, Any]]:
 
         npcs.append(
             {
+                "npc_id": npc_id,
                 "name": name,
                 "location": location,
+                "location_source_index": (
+                    location_widget.currentIndex() - 1
+                    if isinstance(location_widget, QComboBox)
+                    and location_widget.currentData() not in (None, "")
+                    else -1
+                ),
                 "description": description,
                 "description_mode": description_mode,
                 "requires_ai_invention": (
@@ -15116,70 +16689,186 @@ def _configure_inline_table(
     _set_table_column_widths(table, widths)
 
 
-def _set_checked_row_checkbox(
+def _configure_responsive_form(layout: QFormLayout) -> None:
+    """Lets wizard form fields grow and wrap cleanly at narrow widths."""
+
+    layout.setFieldGrowthPolicy(
+        QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow
+    )
+    layout.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
+
+
+def _configure_responsive_table(
+    table: QTableWidget,
+    *,
+    stretch_columns: set[int],
+    compact_columns: set[int],
+) -> None:
+    """Makes an inline editor table consume available width responsively."""
+
+    table.setSizePolicy(
+        QSizePolicy.Policy.Expanding,
+        QSizePolicy.Policy.Expanding,
+    )
+    header = table.horizontalHeader()
+    header.setStretchLastSection(False)
+    header.setMinimumSectionSize(72)
+    for column in range(table.columnCount()):
+        if column in compact_columns:
+            resize_mode = QHeaderView.ResizeMode.ResizeToContents
+        elif column in stretch_columns:
+            resize_mode = QHeaderView.ResizeMode.Stretch
+        else:
+            resize_mode = QHeaderView.ResizeMode.Interactive
+        header.setSectionResizeMode(column, resize_mode)
+    _configure_auto_height_table(table)
+    _configure_table_wheel_passthrough(table)
+
+
+def _configure_auto_height_table(
+    table: QTableWidget,
+    *,
+    maximum_visible_rows: int = 5,
+) -> None:
+    """Fits a wizard table to its rows until its scrollbar is actually needed."""
+
+    if hasattr(table, "_auto_height_refresh"):
+        return
+
+    def refresh_height() -> None:
+        visible_row_count = min(
+            max(1, table.rowCount()),
+            max(1, maximum_visible_rows),
+        )
+        row_heights = [
+            max(table.rowHeight(row), table.verticalHeader().defaultSectionSize())
+            for row in range(min(table.rowCount(), visible_row_count))
+        ]
+        while len(row_heights) < visible_row_count:
+            row_heights.append(table.verticalHeader().defaultSectionSize())
+        target_height = (
+            table.horizontalHeader().sizeHint().height()
+            + sum(row_heights)
+            + (table.frameWidth() * 2)
+            + 6
+        )
+        table.setMinimumHeight(target_height)
+        table.setMaximumHeight(target_height)
+
+    def schedule_refresh(*_args: Any) -> None:
+        QTimer.singleShot(0, refresh_height)
+
+    model = table.model()
+    model.rowsInserted.connect(schedule_refresh)
+    model.rowsRemoved.connect(schedule_refresh)
+    model.modelReset.connect(schedule_refresh)
+    table._auto_height_refresh = refresh_height  # type: ignore[attr-defined]
+    refresh_height()
+    schedule_refresh()
+
+
+class _TableWheelPassthroughFilter(QObject):
+    """Routes table wheel input to the enclosing page instead of the table."""
+
+    def __init__(self, table: QTableWidget) -> None:
+        super().__init__(table)
+        self.table = table
+
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:
+        if event.type() != QEvent.Type.Wheel or not isinstance(event, QWheelEvent):
+            return super().eventFilter(watched, event)
+
+        parent = self.table.parentWidget()
+        while parent is not None and not isinstance(parent, QScrollArea):
+            parent = parent.parentWidget()
+
+        if isinstance(parent, QScrollArea):
+            page_scrollbar = parent.verticalScrollBar()
+            pixel_delta = event.pixelDelta().y()
+            if pixel_delta:
+                scroll_amount = -pixel_delta
+            else:
+                wheel_steps = event.angleDelta().y() / 120.0
+                scroll_amount = int(
+                    -wheel_steps * max(1, page_scrollbar.singleStep()) * 3
+                )
+            page_scrollbar.setValue(page_scrollbar.value() + scroll_amount)
+
+        event.accept()
+        return True
+
+
+def _configure_table_wheel_passthrough(table: QTableWidget) -> None:
+    """Disables wheel scrolling for a table while preserving scrollbar dragging."""
+
+    if hasattr(table, "_wheel_passthrough_filter"):
+        return
+    wheel_filter = _TableWheelPassthroughFilter(table)
+    for watched in (
+        table,
+        table.viewport(),
+        table.verticalScrollBar(),
+        table.horizontalScrollBar(),
+    ):
+        watched.installEventFilter(wheel_filter)
+    table._wheel_passthrough_filter = wheel_filter  # type: ignore[attr-defined]
+
+
+def _table_row_display_name(
     table: QTableWidget,
     row: int,
     column: int,
-    tooltip: str,
-) -> QCheckBox:
-    """Adds a real, centered checkbox widget used for bulk row removal."""
+) -> str:
+    """Returns the current user-facing name for a table row."""
 
-    checkbox = QCheckBox()
-    checkbox.setToolTip(tooltip)
-    checkbox.setCursor(Qt.CursorShape.PointingHandCursor)
-    container = QWidget()
-    layout = QHBoxLayout()
-    layout.setContentsMargins(0, 0, 0, 0)
-    layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
-    layout.addWidget(checkbox)
-    container.setLayout(layout)
-    table.setCellWidget(row, column, container)
-    return checkbox
+    widget = table.cellWidget(row, column)
+    if isinstance(widget, QLineEdit):
+        return widget.text().strip()
+    if isinstance(widget, QComboBox):
+        return widget.currentText().strip()
+
+    item = table.item(row, column)
+    return item.text().strip() if item is not None else ""
 
 
-def _remove_checked_table_rows(
+def _set_remove_row_button(
     table: QTableWidget,
+    row: int,
+    column: int,
+    item_label: str,
+    remove_callback: Callable[[QPushButton], None],
     *,
-    preserve_first_row: bool = False,
-) -> list[int]:
-    """Removes every checked row and returns their original indexes."""
-
-    if isinstance(table, _AppTableWidget):
-        return table.remove_checked_rows(preserve_first_row=preserve_first_row)
-
-    checkbox_column = table.columnCount() - 1
-    rows: list[int] = []
-    for row in range(table.rowCount()):
-        if preserve_first_row and row == 0:
-            continue
-        item = table.item(row, checkbox_column)
-        if item is not None and item.checkState() == Qt.CheckState.Checked:
-            rows.append(row)
-    for row in reversed(rows):
-        table.removeRow(row)
-    return rows
-
-
-def _bulk_remove_button(
-    table: QTableWidget,
-    *,
-    label: str = "Remove Selected",
-    preserve_first_row: bool = False,
-    after_remove: Callable[[], None] | None = None,
+    name_column: int = 0,
+    protected: bool = False,
 ) -> QPushButton:
-    """Builds a button that removes all checkbox-selected rows from a table."""
+    """Adds one confirmed, row-local Remove action to an editor table."""
 
-    button = QPushButton(label)
+    button = QPushButton("Remove")
+    button.setObjectName("rowRemoveButton")
+    button.setCursor(Qt.CursorShape.PointingHandCursor)
+    button.setToolTip(f"Remove this {item_label}.")
+    button.setEnabled(not protected)
+    button.setVisible(not protected)
 
-    def remove_selected() -> None:
-        removed_rows = _remove_checked_table_rows(
+    def confirm_remove() -> None:
+        current_row = _row_for_cell_widget(table, button)
+        if current_row < 0:
+            return
+
+        display_name = _table_row_display_name(table, current_row, name_column)
+        target = f'"{display_name}"' if display_name else f"this {item_label}"
+        result = QMessageBox.question(
             table,
-            preserve_first_row=preserve_first_row,
+            f"Remove {item_label.title()}",
+            f"Are you sure you want to remove {target}?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
         )
-        if removed_rows and after_remove is not None:
-            after_remove()
+        if result == QMessageBox.StandardButton.Yes:
+            remove_callback(button)
 
-    button.clicked.connect(remove_selected)
+    button.clicked.connect(confirm_remove)
+    table.setCellWidget(row, column, button)
     return button
 
 
@@ -15205,6 +16894,7 @@ def _append_starter_suggestion_table_row(
     table: QTableWidget,
     kind: str,
     suggestion: str = "",
+    remove_callback: Callable[[QPushButton], None] | None = None,
 ) -> None:
     """Adds one natural-language starter-item suggestion row."""
 
@@ -15214,7 +16904,20 @@ def _append_starter_suggestion_table_row(
     suggestion_input = _table_line_edit(suggestion)
     suggestion_input.setPlaceholderText(f"e.g. {'Iron Sword' if kind == 'Weapon' else 'Leather Satchel'}")
     table.setCellWidget(row, 0, suggestion_input)
-    _set_checked_row_checkbox(table, row, 1, f"Select this {kind.lower()} suggestion for removal.")
+    callback: Callable[[QPushButton], None]
+    if remove_callback is None:
+        def remove_default(button: QPushButton) -> None:
+            _remove_table_row_by_button(table, button)
+        callback = remove_default
+    else:
+        callback = remove_callback
+    _set_remove_row_button(
+        table,
+        row,
+        1,
+        f"{kind.lower()} idea",
+        callback,
+    )
 
 
 def _starter_suggestions_from_table(
@@ -15280,7 +16983,7 @@ def _append_starter_item_table_row(
     table.setCellWidget(row, 3, description_input)
     table.setCellWidget(row, 4, value_input)
     table.setCellWidget(row, 5, storage_input)
-    _set_checked_row_checkbox(table, row, 6, "Select this item for removal.")
+    _set_remove_row_button(table, row, 6, "item", remove_callback)
     _set_table_column_widths(table, STARTER_ITEM_COLUMN_WIDTHS)
 
 
@@ -15404,7 +17107,7 @@ def _append_starter_weapon_table_row(
     table.setCellWidget(row, 5, range_input)
     table.setCellWidget(row, 6, ammo_input)
     table.setCellWidget(row, 7, clip_size_input)
-    _set_checked_row_checkbox(table, row, 8, "Select this weapon for removal.")
+    _set_remove_row_button(table, row, 8, "weapon", remove_callback)
     _set_table_column_widths(table, STARTER_WEAPON_COLUMN_WIDTHS)
 
 
@@ -15508,7 +17211,7 @@ def _append_starter_armor_table_row(
     table.setCellWidget(row, 2, covers_input)
     table.setCellWidget(row, 3, armor_rating_input)
     table.setCellWidget(row, 4, value_input)
-    _set_checked_row_checkbox(table, row, 5, "Select this armor for removal.")
+    _set_remove_row_button(table, row, 5, "armor", remove_callback)
     _set_table_column_widths(table, STARTER_ARMOR_COLUMN_WIDTHS)
 
 
@@ -15587,7 +17290,14 @@ def _append_currency_table_row(
     table.setCellWidget(row, 0, name_input)
     table.setCellWidget(row, 1, plural_name_input)
     table.setCellWidget(row, 2, value_input)
-    _set_checked_row_checkbox(table, row, 3, "Select this denomination for removal.")
+    _set_remove_row_button(
+        table,
+        row,
+        3,
+        "currency",
+        remove_callback,
+        protected=row == 0,
+    )
     _sync_currency_base_value_row(table)
     _set_table_column_widths(table, CURRENCY_COLUMN_WIDTHS)
 
@@ -15609,16 +17319,10 @@ def _sync_currency_base_value_row(table: QTableWidget) -> None:
             value_widget.setEnabled(True)
             value_widget.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.UpDownArrows)
 
-        remove_container = table.cellWidget(row, 3)
-        remove_checkbox = (
-            remove_container.findChild(QCheckBox)
-            if remove_container is not None
-            else None
-        )
-        if isinstance(remove_checkbox, QCheckBox):
-            remove_checkbox.setChecked(False)
-            remove_checkbox.setEnabled(row != 0)
-            remove_checkbox.setVisible(row != 0)
+        remove_button = table.cellWidget(row, 3)
+        if isinstance(remove_button, QPushButton):
+            remove_button.setEnabled(row != 0)
+            remove_button.setVisible(row != 0)
 
 
 def _currency_denominations_from_table(table: QTableWidget) -> list[dict[str, Any]]:
@@ -15668,7 +17372,13 @@ def _append_economy_example_table_row(
 
     table.setCellWidget(row, 0, name_input)
     table.setCellWidget(row, 1, value_input)
-    _set_checked_row_checkbox(table, row, 2, "Select this economy example for removal.")
+    _set_remove_row_button(
+        table,
+        row,
+        2,
+        "economy item",
+        remove_callback,
+    )
     _set_table_column_widths(table, ECONOMY_EXAMPLE_COLUMN_WIDTHS)
 
 

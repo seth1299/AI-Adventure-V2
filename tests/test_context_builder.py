@@ -25,6 +25,66 @@ from ai_adventure.core.models import (
 
 
 class ContextBuilderTests(unittest.TestCase):
+    def test_party_context_reuses_npc_identity_and_exposes_party_specific_data(self) -> None:
+        state = AdventureState()
+        party_member = {
+            "npc_id": "mira_coppercup",
+            "name": "Mira Coppercup",
+            "display_name": "Mira",
+            "role": "Scout",
+            "location": "Old Road",
+            "description": "A keen-eyed traveler.",
+            "notes": "A trusted companion.",
+            "status": "Wounded",
+            "health_current": 8,
+            "health_max": 18,
+            "armor_class": 13,
+            "combat_style": "Mobile archer",
+            "skills": ["Archery", "Tracking"],
+        }
+
+        packet = AiContextBuilder(
+            ContextReferenceLoader().load_default_library()
+        ).build_story_context(
+            state,
+            player_command="Mira tends her wounds.",
+            party_members=[party_member],
+        )
+
+        self.assertEqual(packet["state"]["party"]["members"][0]["npc_id"], "mira_coppercup")
+        self.assertEqual(packet["state"]["party"]["members"][0]["health_current"], 8)
+        self.assertEqual(packet["state"]["party"]["members"][0]["skills"], ["Archery", "Tracking"])
+        self.assertIn(
+            "mira_coppercup",
+            [npc["npc_id"] for npc in packet["state"]["npcs"]["relevant"]],
+        )
+        self.assertIn("same stable identity", packet["state"]["party"]["rules"])
+
+    def test_narrative_combat_preferences_replace_strict_handoff_contract(self) -> None:
+        state = AdventureState(
+            settings=SettingsState(
+                values={
+                    "combat.preferences": {
+                        "resolution_mode": "narrative",
+                        "focus": "low",
+                    }
+                }
+            )
+        )
+
+        packet = AiContextBuilder(
+            ContextReferenceLoader().load_default_library()
+        ).build_story_context(state, player_command="I fight the bandit.")
+
+        self.assertEqual(packet["state"]["combat"]["resolution_mode"], "narrative")
+        self.assertEqual(packet["state"]["combat"]["focus"], "low")
+        self.assertIn("Keep combat uncommon", packet["state"]["combat"]["focus_instruction"])
+        self.assertIn("narrative_combat", packet["response_contract"])
+        self.assertNotIn("combat_handoff", packet["response_contract"])
+        self.assertNotIn(
+            "CombatStartedEvent", packet["response_contract"]["known_event_types"]
+        )
+
     def test_player_created_calendar_events_are_omitted_from_ai_context(self) -> None:
         state = AdventureState(
             settings=SettingsState(
@@ -156,6 +216,7 @@ class ContextBuilderTests(unittest.TestCase):
             metadata=AdventureMetadata(title="Context Test"),
             player=PlayerState(
                 name="Mira",
+                pronouns="She/Her",
                 appearance="A road-worn apothecary in a green cloak.",
                 backstory="Raised by caravan healers.",
                 condition="Curious",
@@ -301,6 +362,7 @@ class ContextBuilderTests(unittest.TestCase):
 
         self.assertEqual(packet["state"]["adventure_title"], "Context Test")
         self.assertEqual(packet["state"]["player"]["appearance"], "A road-worn apothecary in a green cloak.")
+        self.assertEqual(packet["state"]["player"]["pronouns"], "She/Her")
         self.assertEqual(packet["state"]["player"]["backstory"], "Raised by caravan healers.")
         self.assertEqual(packet["state"]["player"]["notes"], "Distrusts locked doors.")
         self.assertEqual(packet["state"]["player"]["health_current"], 17)
@@ -376,6 +438,10 @@ class ContextBuilderTests(unittest.TestCase):
         self.assertEqual(packet["state"]["calendar"]["current"]["season_hint"], "spring")
         self.assertIn("calendar_time", packet["response_contract"])
         self.assertIn("character_profile", packet["response_contract"])
+        self.assertIn(
+            "canonical source",
+            packet["response_contract"]["character_profile"],
+        )
         self.assertIn("character_scope", packet["response_contract"])
         self.assertIn(
             "not proof that the whole world shares that theme",

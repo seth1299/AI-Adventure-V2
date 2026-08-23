@@ -13,7 +13,11 @@ from ai_adventure.context.models import ContextLibrary
 from ai_adventure.context.naming import GENERIC_PROPER_NOUN_PLACEHOLDER_RULE
 from ai_adventure.context.reference_loader import ContextReferenceLoader
 from ai_adventure.context.tags import PLANNABLE_CONTEXT_TAGS
-from ai_adventure.combat import normalize_combat_state
+from ai_adventure.combat import (
+    COMBAT_FOCUS_INSTRUCTIONS,
+    normalize_combat_preferences,
+    normalize_combat_state,
+)
 from ai_adventure.currency import format_currency_amount
 from ai_adventure.core.models import AdventureState
 from ai_adventure.audio.pronunciation import (
@@ -227,6 +231,7 @@ class AiContextBuilder:
         player_command: str,
         conversation_mode: str = "live_game",
         relevant_npcs: list[dict[str, Any]] | None = None,
+        party_members: list[dict[str, Any]] | None = None,
         gm_secrets: list[dict[str, Any]] | None = None,
         miscellaneous: list[dict[str, Any]] | None = None,
         valid_music_tracks: list[str] | None = None,
@@ -243,6 +248,7 @@ class AiContextBuilder:
             player_command: The player's pending command.
             conversation_mode: Explicit UI-selected mode: live_game or out_of_game.
             relevant_npcs: NPC memory profiles likely relevant this turn.
+            party_members: Current party records joined to canonical NPC profiles.
             gm_secrets: Active private GM-memory records for every turn.
             miscellaneous: Every general world-lore record, always sent uncapped.
             valid_music_tracks: Playable background music filenames.
@@ -324,6 +330,20 @@ class AiContextBuilder:
             _npc_context_profile(npc)
             for npc in (relevant_npcs or [])
         ]
+        clean_party_members = [
+            _party_context_profile(member)
+            for member in (party_members or [])
+            if isinstance(member, dict)
+        ]
+        relevant_npc_ids = {
+            str(npc.get("npc_id", "")) for npc in clean_relevant_npcs
+        }
+        for member in party_members or []:
+            clean_member_npc = _npc_context_profile(member)
+            member_npc_id = str(clean_member_npc.get("npc_id", ""))
+            if member_npc_id and member_npc_id not in relevant_npc_ids:
+                clean_relevant_npcs.append(clean_member_npc)
+                relevant_npc_ids.add(member_npc_id)
         clean_gm_secrets = [
             _gm_secret_context_record(secret)
             for secret in (gm_secrets or [])
@@ -352,6 +372,18 @@ class AiContextBuilder:
         )
         ai_mode_preferences = ai_mode_preferences_from_settings(state.settings.values)
         combat_state = normalize_combat_state(state.settings.values.get("combat.state", {}))
+        combat_preferences = normalize_combat_preferences(
+            state.settings.values.get(
+                "combat.preferences",
+                {
+                    "resolution_mode": state.settings.values.get(
+                        "combat.resolution_mode", "strict"
+                    ),
+                    "focus": state.settings.values.get("combat.focus", "balanced"),
+                },
+            )
+        )
+        strict_combat = combat_preferences["resolution_mode"] == "strict"
 
         packet = {
             "schema_version": 1,
@@ -370,6 +402,7 @@ class AiContextBuilder:
                     "name_pronunciation": _compact_text(
                         state.player.name_pronunciation
                     ),
+                    "pronouns": _compact_text(state.player.pronouns),
                     "appearance": _compact_text(state.player.appearance),
                     "backstory": _compact_text(state.player.backstory),
                     "condition": _compact_text(
@@ -618,6 +651,11 @@ class AiContextBuilder:
                     ),
                 },
                 "combat": {
+                    "resolution_mode": combat_preferences["resolution_mode"],
+                    "focus": combat_preferences["focus"],
+                    "focus_instruction": COMBAT_FOCUS_INSTRUCTIONS[
+                        combat_preferences["focus"]
+                    ],
                     "active": bool(combat_state.get("active", False)),
                     "round": combat_state.get("round", 1),
                     "turn_index": combat_state.get("turn_index", 0),
@@ -626,16 +664,25 @@ class AiContextBuilder:
                         for combatant in combat_state.get("combatants", [])
                     ],
                     "rules": (
-                        "When a fight starts, suggest CombatStartedEvent with "
-                        "enemy/allied combatants, health, armor_rating, "
-                        "to_hit_bonus, initiative_bonus, personality, ammunition/clip "
-                        "fields, damage dice, and loot. The Python combat system "
-                        "rolls initiative, calculates each team's Threat Levels "
-                        "from health, armor, and average damage, and uses those "
-                        "percentages for non-intelligent NPC targeting. Intelligent "
-                        "NPCs target tactically. Do not resolve attacks, turns, damage, "
-                        "victory, defeat, or loot in story prose after combat "
-                        "starts; the Python Combat tab handles those mechanics."
+                        (
+                            "When a fight starts, suggest CombatStartedEvent with "
+                            "enemy/allied combatants, health, armor_rating, "
+                            "to_hit_bonus, initiative_bonus, personality, ammunition/clip "
+                            "fields, damage dice, and loot. The Python combat system "
+                            "rolls initiative, calculates team Threat Levels, and resolves "
+                            "attacks, damage, victory, defeat, and loot. Do not resolve "
+                            "those mechanics in story prose after combat starts."
+                        )
+                        if strict_combat
+                        else (
+                            "Resolve and describe combat narratively in story prose. "
+                            "Do not suggest CombatStartedEvent and do not hand the fight "
+                            "to the Combat tab. Respect the player's declared actions, "
+                            "use warranted skill checks before uncertain outcomes, give "
+                            "all participants meaningful agency, and persist any actual "
+                            "injuries, items, currency, status, or other durable changes "
+                            "with the supported non-combat events."
+                        )
                     ),
                 },
                 "alchemy": {
@@ -747,6 +794,29 @@ class AiContextBuilder:
                         for check in (resolved_skill_checks or [])
                         if isinstance(check, dict)
                     ],
+                },
+                "magic": {
+                    **state.magic.to_dict(),
+                    "rules": {
+                        "authority": (
+                            "If configuration.world_contains_magic is false, the world "
+                            "contains no magic: never introduce spells, magical powers, "
+                            "enchanted items, magical creatures, or supernatural effects. "
+                            "If world_contains_magic is true but enabled is false, "
+                            "magic still exists in the world according to casting_mode "
+                            "and tradition, but the Player Character cannot cast at the "
+                            "start. Otherwise, the player chooses whether to cast. Python "
+                            "validates known spells and deterministically consumes mana "
+                            "or tiered slots. Never invent a player cast or calculate "
+                            "remaining resources."
+                        ),
+                        "narrative": "Narrative casting consumes no tracked resource.",
+                        "mana": "Mana casting consumes the authoritative mana_cost from the spell catalog.",
+                        "tiered": (
+                            "Tiered casting consumes one slot at the selected tier. Tier 0 "
+                            "spells consume no slot."
+                        ),
+                    },
                 },
                 "active_tasks": {
                     "rules": {
@@ -896,6 +966,19 @@ class AiContextBuilder:
                     },
                     "relevant": clean_relevant_npcs,
                 },
+                "party": {
+                    "members": clean_party_members,
+                    "rules": (
+                        "Every party member is also a canonical NPC. party.members.npc_id "
+                        "is the same stable identity used in state.npcs.relevant and the "
+                        "NPCs tab. Never create a duplicate NPC when party membership or "
+                        "party stats change. Use NpcUpsertedEvent with that same npc_id, "
+                        "party_member=true, and the changed party fields. Use "
+                        "party_member=false to remove someone from the party without "
+                        "deleting their NPC profile. Keep health, armor class, status, "
+                        "combat style, and skills consistent with narrated outcomes."
+                    ),
+                },
                 "gm_secrets": {
                     "visibility": "AI-only; never display this section to the player.",
                     "rules": {
@@ -1038,9 +1121,13 @@ class AiContextBuilder:
                     "new date labels."
                 ),
                 "character_profile": (
-                    "Use state.player.name, name_pronunciation, appearance, backstory, and notes as "
+                    "Use state.player.name, name_pronunciation, pronouns, appearance, "
+                    "backstory, and notes as "
                     "player-authored character context. Treat it as true for the "
-                    "player character. If name_pronunciation is non-empty, preserve it "
+                    "player character. state.player.pronouns is the canonical source "
+                    "for referring to the player character: use it exactly and never "
+                    "infer different pronouns from the name, appearance, voice, "
+                    "backstory, or genre. If name_pronunciation is non-empty, preserve it "
                     "as the authoritative player guide for TTS and use it when choosing "
                     "the character name's IPA. Do not expose pronunciation data "
                     "it in player-facing prose. Do not let NPCs know private profile "
@@ -1136,7 +1223,12 @@ class AiContextBuilder:
                     "person is already listed, reuse that existing npc_id/internal "
                     "identifier and update the one profile; do not create a second "
                     "internal name for the same role/person at the same location. Use "
-                    "one NpcUpsertedEvent per distinct meaningful NPC introduced."
+                    "one NpcUpsertedEvent per distinct meaningful NPC introduced. "
+                    "Every party member remains that same canonical NPC: reuse npc_id "
+                    "with party_member=true and party_status, party_health_current, "
+                    "party_health_max, party_armor_class, party_combat_style, and "
+                    "party_skills when those visible details change. Use "
+                    "party_member=false to remove membership without deleting the NPC."
                 ),
                 "secret_memory": (
                     "Use state.gm_secrets.active as authoritative AI-only hidden "
@@ -1186,16 +1278,25 @@ class AiContextBuilder:
                     "must not use CurrencyChangedEvent; Python adds it only when an "
                     "open container receives ContainerContentsTakenEvent."
                 ),
-                "combat_handoff": (
-                    "When a fight begins, suggest CombatStartedEvent with concrete "
-                    "enemy/allied combatants, health, armor_rating, to_hit_bonus, "
-                    "initiative_bonus, personality, complete ammunition/clip fields, "
-                    "damage dice, and loot. Python rolls initiative, calculates "
-                    "team Threat Levels from maximum health, armor rating, and average "
-                    "damage, uses them for non-intelligent NPC targets, and preserves "
-                    "tactical targeting for intelligent NPCs. After that, do not resolve "
-                    "attacks, turns, reloading, damage, victory, "
-                    "defeat, or loot in story prose; the Combat tab owns those mechanics."
+                (
+                    "combat_handoff" if strict_combat else "narrative_combat"
+                ): (
+                    (
+                        "When a fight begins, suggest CombatStartedEvent with concrete "
+                        "enemy/allied combatants, health, armor_rating, to_hit_bonus, "
+                        "initiative_bonus, personality, complete ammunition/clip fields, "
+                        "damage dice, and loot. Python rolls initiative, calculates team "
+                        "Threat Levels from maximum health, armor rating, and average "
+                        "damage, uses them for non-intelligent NPC targets, preserves "
+                        "tactical targeting for intelligent NPCs, and owns attacks, "
+                        "reloading, damage, victory, defeat, and loot in the Combat tab."
+                    )
+                    if strict_combat
+                    else (
+                        "Narrate and resolve the complete fight in the story without "
+                        "CombatStartedEvent. Use warranted skill checks for uncertain "
+                        "actions and supported non-combat events for durable consequences."
+                    )
                 ),
                 "out_of_game": (
                     "Boolean. Must be true exactly when conversation_mode is out_of_game; "
@@ -1227,7 +1328,10 @@ class AiContextBuilder:
                     "TravelModeChangedEvent",
                     "ActiveTaskUpsertedEvent",
                     "ActiveTaskCompletedEvent",
-                    "SpellLearnedEvent",
+                    "SpellCatalogUpsertedEvent",
+                    "CharacterSpellLearnedEvent",
+                    "PlayerSpellCastEvent",
+                    "MagicEffectUpsertedEvent",
                     "NpcUpsertedEvent",
                     "NpcKnowledgeAddedEvent",
                     "SecretUpsertedEvent",
@@ -1240,6 +1344,7 @@ class AiContextBuilder:
             event_type
             for event_type in known_event_types
             if event_type not in disabled_audio_event_types
+            and (strict_combat or event_type != "CombatStartedEvent")
         ]
         return packet
 
@@ -1326,6 +1431,31 @@ def _npc_context_profile(npc: dict[str, Any]) -> dict[str, Any]:
     return {
         key: _compact_context_value(value)
         for key, value in npc.items()
+        if key in allowed_fields
+    }
+
+
+def _party_context_profile(member: dict[str, Any]) -> dict[str, Any]:
+    """Returns party fields plus the shared NPC identity sent to Gemini."""
+
+    allowed_fields = {
+        "npc_id",
+        "name",
+        "display_name",
+        "role",
+        "location",
+        "description",
+        "notes",
+        "status",
+        "health_current",
+        "health_max",
+        "armor_class",
+        "combat_style",
+        "skills",
+    }
+    return {
+        key: _compact_context_value(value)
+        for key, value in member.items()
         if key in allowed_fields
     }
 

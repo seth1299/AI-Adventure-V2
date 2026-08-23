@@ -127,6 +127,7 @@ class StateManagerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             repository = SaveRepository.create_new_save(Path(temp_dir), "Test Adventure")
             repository.set_setting("player_name", "Mira")
+            repository.set_setting("player.pronouns", "She/Her")
             repository.set_setting("player.appearance", "A road-worn apothecary.")
             repository.set_setting("player.backstory", "Raised by caravan healers.")
             repository.set_setting("player.notes", "Prefers quiet solutions.")
@@ -149,6 +150,7 @@ class StateManagerTests(unittest.TestCase):
 
             self.assertEqual(state.metadata.title, "Test Adventure")
             self.assertEqual(state.player.name, "Mira")
+            self.assertEqual(state.player.pronouns, "She/Her")
             self.assertEqual(state.player.appearance, "A road-worn apothecary.")
             self.assertEqual(state.player.backstory, "Raised by caravan healers.")
             self.assertEqual(state.player.notes, "Prefers quiet solutions.")

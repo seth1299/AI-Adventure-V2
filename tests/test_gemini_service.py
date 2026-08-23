@@ -44,6 +44,7 @@ from ai_adventure.ai.gemini_service import (
     _find_gemini_creative_terms,
     _normalize_visible_currency_phrasing,
     _parse_new_game_calendar_settings,
+    _parse_new_game_starting_spells,
     _parse_new_game_starter_items,
     _pretty_json_for_log,
     _sanitize_gemini_creative_terms,
@@ -83,6 +84,72 @@ def _container_metadata() -> dict[str, object]:
 
 
 class GeminiServiceTests(unittest.TestCase):
+    def test_new_game_parser_enforces_starting_party_npc_identity(self) -> None:
+        setup = {
+            "starting_npcs": [
+                {
+                    "npc_id": "npc_mira",
+                    "name": "Mira",
+                    "location": "Old Road",
+                    "location_source_index": 0,
+                },
+                {"npc_id": "npc_orin", "name": "Orin"},
+            ],
+            "starting_locations": [{"name": "Old Road"}],
+            "starting_party_npc_ids": ["npc_mira"],
+        }
+        result = parse_gemini_new_game_response(
+            json.dumps(
+                {
+                    "world_summary": "A road-bound company gathers.",
+                    "introductory_message": "The journey begins.",
+                    "locations": [
+                        {
+                            "source_index": 0,
+                            "name": "North Road",
+                            "description": "A rain-cut road through the hills.",
+                        }
+                    ],
+                    "events": [
+                        {
+                            "type": "NpcUpsertedEvent",
+                            "payload": {"npc_id": "wrong_one", "display_name": "Mira"},
+                        },
+                        {
+                            "type": "NpcUpsertedEvent",
+                            "payload": {"npc_id": "wrong_two", "display_name": "Orin"},
+                        },
+                    ],
+                }
+            ),
+            setup_packet={"setup": setup},
+        )
+
+        first_payload = result.suggested_events[0]["payload"]
+        second_payload = result.suggested_events[1]["payload"]
+        self.assertEqual(first_payload["npc_id"], "npc_mira")
+        self.assertEqual(first_payload["location"], "North Road")
+        self.assertTrue(first_payload["party_member"])
+        self.assertEqual(first_payload["party_status"], "Active")
+        self.assertEqual(second_payload["npc_id"], "npc_orin")
+        self.assertFalse(second_payload["party_member"])
+
+    def test_npc_event_schema_supports_shared_party_fields(self) -> None:
+        branch = next(
+            event_branch
+            for event_branch in EVENT_RESPONSE_SCHEMA["anyOf"]
+            if event_branch["properties"]["type"]["enum"] == ["NpcUpsertedEvent"]
+        )
+        payload_properties = branch["properties"]["payload"]["properties"]
+
+        self.assertIn("party_member", payload_properties)
+        self.assertIn("party_status", payload_properties)
+        self.assertIn("party_health_current", payload_properties)
+        self.assertIn("party_health_max", payload_properties)
+        self.assertIn("party_armor_class", payload_properties)
+        self.assertIn("party_combat_style", payload_properties)
+        self.assertIn("party_skills", payload_properties)
+
     def test_new_game_creative_guardrails_exempt_calendar_settings(self) -> None:
         response = {
             "calendar_settings": {
@@ -383,6 +450,91 @@ class GeminiServiceTests(unittest.TestCase):
         self.assertIn("calendar_settings", schema["required"])
         self.assertIn("starting_calendar", schema["required"])
 
+    def test_new_game_dynamic_schema_requests_basic_starting_spells_only(self) -> None:
+        basic_schema = build_new_game_response_schema(
+            {
+                "setup": {
+                    "magic": {
+                        "enabled": True,
+                        "starting_spells_mode": "basic",
+                        "starting_spell_requests": [
+                            {"spell_request": "A brief protective ward"}
+                        ],
+                    }
+                }
+            }
+        )
+        advanced_schema = build_new_game_response_schema(
+            {
+                "setup": {
+                    "magic": {
+                        "enabled": True,
+                        "starting_spells_mode": "advanced",
+                        "starting_spell_requests": [],
+                    }
+                }
+            }
+        )
+
+        self.assertIn("starting_spells", basic_schema["required"])
+        spell_schema = basic_schema["properties"]["starting_spells"]
+        self.assertEqual(spell_schema["minItems"], 1)
+        self.assertEqual(
+            spell_schema["items"]["properties"]["source_index"]["enum"],
+            [0],
+        )
+        self.assertNotIn("starting_spells", advanced_schema["properties"])
+
+    def test_new_game_basic_starting_spells_are_structured_and_guarded(self) -> None:
+        packet = {
+            "setup": {
+                "magic": {
+                    "starting_spell_requests": [
+                        {"spell_request": "A brief protective ward"}
+                    ]
+                }
+            }
+        }
+        unchanged = json.dumps(
+            {
+                "locations": [],
+                "starting_spells": [
+                    {
+                        "name": "A brief protective ward",
+                        "source_index": 0,
+                    }
+                ],
+            }
+        )
+        parsed = _parse_new_game_starting_spells(
+            [
+                {
+                    "name": "Momentary Aegis",
+                    "tier": 1,
+                    "school": "Warding",
+                    "description": "Turns aside one incoming strike.",
+                    "casting_time": "Reaction",
+                    "range": "Self",
+                    "duration": "Instant",
+                    "requirements": "A free hand",
+                    "mana_cost": 2,
+                    "prepared": True,
+                    "source_index": 0,
+                }
+            ]
+        )
+
+        self.assertEqual(parsed[0]["name"], "Momentary Aegis")
+        self.assertEqual(parsed[0]["source_index"], 0)
+        self.assertIn(
+            "A brief protective ward",
+            _unfinalized_suggested_setup_terms(unchanged, packet),
+        )
+        self.assertIn(
+            "starting_spells[source_index=0].name",
+            _unfinalized_suggested_setup_paths(unchanged, packet),
+        )
+
     def test_new_game_starter_item_parser_preserves_firearm_metadata(self) -> None:
         items = _parse_new_game_starter_items(
             [
@@ -611,6 +763,24 @@ class GeminiServiceTests(unittest.TestCase):
 
         self.assertIn("MusicChangedEvent", event_types)
         self.assertNotIn("SoundEffectChangedEvent", event_types)
+
+    def test_narrative_combat_schema_omits_combat_started_event(self) -> None:
+        schema = build_story_response_schema(
+            {
+                "selection": {"tags": ["combat", "story"]},
+                "state": {
+                    "combat": {"resolution_mode": "narrative"},
+                    "audio": {"valid_music_tracks": [], "valid_sound_effect_tracks": []},
+                },
+            }
+        )
+        event_types = {
+            branch["properties"]["type"]["enum"][0]
+            for branch in schema["properties"]["events"]["items"]["anyOf"]
+        }
+
+        self.assertNotIn("CombatStartedEvent", event_types)
+        self.assertIn("SkillCheckRequestedEvent", event_types)
 
     def test_story_parser_extracts_exact_one_shot_sound_cue(self) -> None:
         result = parse_gemini_story_response(
@@ -2913,6 +3083,7 @@ class GeminiServiceTests(unittest.TestCase):
 
         sent_config = models.calls[0]["config"]
         self.assertIsInstance(sent_config, dict)
+        assert isinstance(sent_config, dict)
         self.assertEqual(sent_config["tools"], [])  # type: ignore[index]
         self.assertEqual(  # type: ignore[index]
             sent_config["tool_config"],
@@ -3586,6 +3757,7 @@ class GeminiServiceTests(unittest.TestCase):
                 "packet_type": "new_game_setup",
                 "setup": {
                     "title": "Rainmarket",
+                    "character": {"pronouns": "She/Her"},
                     "starting_task": {
                         "mode": "custom",
                         "task": {
@@ -3613,6 +3785,10 @@ class GeminiServiceTests(unittest.TestCase):
         self.assertIn("Replace every blank, placeholder, or suggestion", prompt)
         self.assertIn("Every nonblank field governed by a suggestion mode", prompt)
         self.assertIn("do not copy or cosmetically edit it", prompt)
+        self.assertIn("starting_task.guidance is non-empty", prompt)
+        self.assertIn("inventing every unspecified quest detail", prompt)
+        self.assertIn("Use canonical setup.character.pronouns exactly", prompt)
+        self.assertIn('"pronouns":"She/Her"', prompt)
         self.assertIn("<examples>", prompt)
         self.assertIn("<output_format>", prompt)
         self.assertIn("Omit ordinary words already pronounced as written", prompt)
