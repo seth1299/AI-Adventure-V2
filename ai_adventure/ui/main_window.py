@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 import json
 import re
 import logging
@@ -72,6 +73,8 @@ from PySide6.QtWidgets import (
     QTableWidget,
     QTableWidgetItem,
     QTextEdit,
+    QTreeWidget,
+    QTreeWidgetItem,
     QVBoxLayout,
     QWidget,
     QWizard,
@@ -88,7 +91,7 @@ from ai_adventure.alchemy.ingredients import (
     normalize_recipe_ingredient,
     normalize_recipe_ingredients,
 )
-from ai_adventure.ascii_art import normalize_ascii_art
+from ai_adventure.ascii_art import ensure_substantive_ascii_art, normalize_ascii_art
 from ai_adventure.app.api_key_store import (
     read_api_key,
     record_terms_acceptance,
@@ -161,6 +164,10 @@ class NarrationPlayerProtocol(Protocol):
         volume: float | int | None = None,
         speed: float | int | None = None,
         text: str = ...,
+        sound_effect_cues: list[dict[str, str]] | None = None,
+        speaker_cues: list[dict[str, str]] | None = None,
+        tts_text_transform: Callable[[str], str] | None = None,
+        on_sound_effect: Callable[[str], None] | None = None,
     ) -> bool: ...
 
     def narrate(
@@ -169,6 +176,7 @@ class NarrationPlayerProtocol(Protocol):
         *,
         voice: str | None = None,
         sound_effect_cues: list[dict[str, str]] | None = None,
+        speaker_cues: list[dict[str, str]] | None = None,
         tts_text_transform: Callable[[str], str] | None = None,
         on_chunk_start: Callable[[str], None] | None = None,
         on_sound_effect: Callable[[str], None] | None = None,
@@ -239,6 +247,7 @@ from ai_adventure.audio.pronunciation import (
 )
 from ai_adventure.audio.voices import (
     DEFAULT_NARRATOR_VOICE,
+    assign_speaker_voices,
     available_narrator_voices,
     normalize_narrator_voice,
 )
@@ -324,11 +333,13 @@ from ai_adventure.narration_preferences import (
     NARRATION_TENSE_OPTIONS,
     normalize_narration_preferences,
 )
+from ai_adventure.notes import parse_note_tags, prefix_markdown_lines, wrap_markdown_text
 from ai_adventure.new_game_templates import (
     NewGameTemplate,
     delete_new_game_template,
     load_new_game_templates,
     save_new_game_template,
+    template_setup_has_changes,
 )
 from ai_adventure.persistence.save_repository import (
     DuplicateSaveTitleError,
@@ -970,7 +981,9 @@ class MainWindow(QMainWindow):
             self._start_new_playtest()
             return
 
-        should_continue, template_setup = self._choose_new_game_template_setup()
+        should_continue, template_setup, loaded_template_name = (
+            self._choose_new_game_template_setup()
+        )
 
         if not should_continue:
             return
@@ -988,16 +1001,42 @@ class MainWindow(QMainWindow):
             terms_acceptance_path=self.app_paths.gemini_terms_acceptance_path,
             sound_manager=self.sound_manager,
         )
+        loaded_template_baseline = (
+            wizard.build_setup() if loaded_template_name else None
+        )
 
         while True:
             if wizard.exec() != QDialog.DialogCode.Accepted:
                 return
 
+            clean_setup = wizard.build_setup()
+            template_save_name: str | None = None
+            if (
+                loaded_template_name
+                and loaded_template_baseline is not None
+                and template_setup_has_changes(loaded_template_baseline, clean_setup)
+            ):
+                template_action = self._prompt_for_modified_template_action(
+                    loaded_template_name
+                )
+                if template_action is None:
+                    continue
+                if template_action == "overwrite":
+                    template_save_name = loaded_template_name
+                elif template_action == "save_as_new":
+                    template_save_name = self._prompt_for_new_template_name(
+                        loaded_template_name
+                    )
+                    if template_save_name is None:
+                        continue
+
             while True:
                 clean_setup = wizard.build_setup()
-
                 try:
-                    self._create_new_game_from_setup(clean_setup)
+                    self._create_new_game_from_setup(
+                        clean_setup,
+                        template_save_name=template_save_name,
+                    )
                     return
                 except DuplicateSaveTitleError as error:
                     new_title = self._prompt_for_duplicate_save_title(
@@ -1100,7 +1139,9 @@ class MainWindow(QMainWindow):
         )
         dialog.exec()
 
-    def _choose_new_game_template_setup(self) -> tuple[bool, dict[str, Any] | None]:
+    def _choose_new_game_template_setup(
+        self,
+    ) -> tuple[bool, dict[str, Any] | None, str | None]:
         """Asks whether a new game should start blank or from a saved template."""
 
         choice = QMessageBox(self)
@@ -1120,10 +1161,10 @@ class MainWindow(QMainWindow):
         clicked_button = choice.clickedButton()
 
         if clicked_button == cancel_button:
-            return False, None
+            return False, None, None
 
         if clicked_button != template_button:
-            return True, None
+            return True, None, None
 
         templates = load_new_game_templates(
             self.app_paths.new_game_templates_path,
@@ -1136,7 +1177,7 @@ class MainWindow(QMainWindow):
                 "No Templates Found",
                 "No saved new-game templates were found. Starting from scratch instead.",
             )
-            return True, None
+            return True, None, None
 
         template_names = [template.name for template in templates]
         selected_name, accepted = QInputDialog.getItem(
@@ -1149,16 +1190,98 @@ class MainWindow(QMainWindow):
         )
 
         if not accepted:
-            return False, None
+            return False, None, None
 
         for template in templates:
             if template.name == selected_name:
-                return True, self._template_setup_with_available_title(
-                    template.setup,
-                    template_name=template.name,
+                return (
+                    True,
+                    self._template_setup_with_available_title(
+                        template.setup,
+                        template_name=template.name,
+                    ),
+                    template.name,
                 )
 
-        return True, None
+        return True, None, None
+
+    def _prompt_for_modified_template_action(self, template_name: str) -> str | None:
+        """Asks how changed wizard values should affect the loaded template."""
+
+        choice = QMessageBox(self)
+        choice.setWindowTitle("Template Changed")
+        choice.setText(
+            f'It looks like you made changes to the template "{template_name}".'
+        )
+        choice.setInformativeText("What would you like to do?")
+        overwrite_button = choice.addButton(
+            "Overwrite Existing Template",
+            QMessageBox.ButtonRole.AcceptRole,
+        )
+        save_new_button = choice.addButton(
+            "Save as New Template",
+            QMessageBox.ButtonRole.ActionRole,
+        )
+        game_only_button = choice.addButton(
+            "Create Game Only",
+            QMessageBox.ButtonRole.DestructiveRole,
+        )
+        cancel_button = choice.addButton(QMessageBox.StandardButton.Cancel)
+        choice.exec()
+        clicked = choice.clickedButton()
+        if clicked == overwrite_button:
+            return "overwrite"
+        if clicked == save_new_button:
+            return "save_as_new"
+        if clicked == game_only_button:
+            return "game_only"
+        if clicked == cancel_button:
+            return None
+        return None
+
+    def _prompt_for_new_template_name(self, source_name: str) -> str | None:
+        """Prompts until a non-empty, unused template name is supplied."""
+
+        existing_names = {
+            template.name.casefold()
+            for template in load_new_game_templates(
+                self.app_paths.new_game_templates_path,
+                legacy_template_path=self.app_paths.legacy_new_game_template_path,
+                normalize_setups=False,
+            )
+        }
+        suggested_name = f"{source_name} Copy"
+        suffix = 2
+        while suggested_name.casefold() in existing_names:
+            suggested_name = f"{source_name} Copy {suffix}"
+            suffix += 1
+
+        while True:
+            template_name, accepted = QInputDialog.getText(
+                self,
+                "Save as New Template",
+                "New template name:",
+                QLineEdit.EchoMode.Normal,
+                suggested_name,
+            )
+            if not accepted:
+                return None
+            clean_name = template_name.strip()
+            if not clean_name:
+                QMessageBox.warning(
+                    self,
+                    "Missing Template Name",
+                    "Enter a template name.",
+                )
+                continue
+            if clean_name.casefold() in existing_names:
+                QMessageBox.warning(
+                    self,
+                    "Template Already Exists",
+                    f'A template named "{clean_name}" already exists.',
+                )
+                continue
+            return clean_name
 
     def _template_setup_with_available_title(
         self,
@@ -1235,7 +1358,12 @@ class MainWindow(QMainWindow):
 
         return True
 
-    def _create_new_game_from_setup(self, clean_setup: dict[str, Any]) -> None:
+    def _create_new_game_from_setup(
+        self,
+        clean_setup: dict[str, Any],
+        *,
+        template_save_name: str | None = None,
+    ) -> None:
         """Creates a new save from normalized setup and opens the shell."""
 
         clean_setup = self._normalize_new_game_setup_for_runtime(clean_setup)
@@ -1247,7 +1375,16 @@ class MainWindow(QMainWindow):
         )
         repository.set_setting("theme", self.menu_theme)
 
-        save_new_game_template(self.app_paths.new_game_templates_path, clean_setup)
+        if template_save_name and not save_new_game_template(
+            self.app_paths.new_game_templates_path,
+            {**clean_setup, "title": template_save_name},
+            template_name=template_save_name,
+        ):
+            QMessageBox.warning(
+                self,
+                "Template Not Saved",
+                "The game was created, but the template could not be saved.",
+            )
         self.open_repository(repository, new_game=True)
 
         if not self.ai_enabled:
@@ -1346,14 +1483,21 @@ class MainWindow(QMainWindow):
                 result.finalized_character,
             )
         )
+        introductory_message = _preserve_player_character_text(
+            _introductory_message_for_save(setup, result),
+            setup,
+            result.finalized_character,
+        )
+        speaker_cues = _resolve_speaker_cues_for_repository(
+            repository,
+            self.narration_player,
+            getattr(result, "speaker_cues", []),
+        )
         repository.append_history(
             "story",
-            _preserve_player_character_text(
-                _introductory_message_for_save(setup, result),
-                setup,
-                result.finalized_character,
-            ),
+            introductory_message,
             sound_effect_cues=result.sound_effect_cues,
+            speaker_cues=speaker_cues,
         )
 
         if result.suggested_events:
@@ -3423,6 +3567,7 @@ class NewGameTemplateManagerDialog(QDialog):
         self.templates: list[NewGameTemplate] = []
         self.active_template_name: str | None = None
         self.active_setup: dict[str, Any] = {}
+        self._loading_template_setup = False
 
         self.setWindowTitle("New Game Templates")
         self.setWindowFlags(
@@ -3705,6 +3850,7 @@ class NewGameTemplateManagerDialog(QDialog):
         self.setLayout(main_layout)
 
         self._refresh_templates()
+        self._prime_template_table_capacity()
 
         if self.template_list.count() == 0:
             self._new_template()
@@ -3866,7 +4012,11 @@ class NewGameTemplateManagerDialog(QDialog):
         """Clears and disables template NPC rows when none are requested."""
 
         if checked:
-            self.starting_npcs_table.setRowCount(0)
+            self._resize_template_table(
+                self.starting_npcs_table,
+                0,
+                lambda: self._append_starting_npc_row({}),
+            )
         self._sync_template_no_starting_npcs_controls()
 
     def _sync_template_no_starting_npcs_controls(self) -> None:
@@ -3991,151 +4141,336 @@ class NewGameTemplateManagerDialog(QDialog):
 
         template = self.templates[row]
         self.active_template_name = template.name
-        self.active_setup = dict(template.setup)
-        self._load_setup_into_editor(template.name, template.setup)
+        self.active_setup = deepcopy(template.setup)
+        self._load_setup_into_editor(template.name, deepcopy(template.setup))
+
+    @staticmethod
+    def _resize_template_table(
+        table: QTableWidget,
+        desired_rows: int,
+        append_row: Callable[[], None],
+    ) -> None:
+        """Reuses existing inline editors and changes only the row-count difference."""
+
+        desired_rows = max(0, desired_rows)
+        while table.rowCount() < desired_rows:
+            append_row()
+        for row in range(table.rowCount()):
+            table.setRowHidden(row, row >= desired_rows)
+
+    def _prime_template_table_capacity(self) -> None:
+        """Allocates the largest required row pools once before selection begins."""
+
+        maximums = {
+            "locations": 0,
+            "npcs": 0,
+            "items": 0,
+            "weapons": 0,
+            "armor": 0,
+            "item_suggestions": 0,
+            "weapon_suggestions": 0,
+            "armor_suggestions": 0,
+            "currencies": 0,
+            "economy": 0,
+        }
+        skill_maximums = {level: 0 for level in range(1, 6)}
+        for template in self.templates:
+            setup = template.setup
+            maximums["locations"] = max(
+                maximums["locations"],
+                len(self._starting_locations_for_editor(setup.get("starting_locations", []))),
+            )
+            maximums["npcs"] = max(
+                maximums["npcs"],
+                len(self._starting_npcs_for_editor(setup.get("starting_npcs", []))),
+            )
+            item_counts = {key: 0 for key in (
+                "items", "weapons", "armor", "item_suggestions",
+                "weapon_suggestions", "armor_suggestions",
+            )}
+            for item in self._starter_items_for_editor(setup.get("starter_items", [])):
+                kind = _starter_item_kind(item)
+                if item.get("requires_ai_invention") and item.get("item_request"):
+                    key = {
+                        "Weapon": "weapon_suggestions",
+                        "Armor": "armor_suggestions",
+                    }.get(kind, "item_suggestions")
+                else:
+                    key = {"Weapon": "weapons", "Armor": "armor"}.get(
+                        kind, "items"
+                    )
+                item_counts[key] += 1
+            for key, count in item_counts.items():
+                maximums[key] = max(maximums[key], count)
+            maximums["currencies"] = max(
+                maximums["currencies"],
+                len(self._currency_denominations_for_editor(
+                    setup.get("currency_denominations", [])
+                )),
+            )
+            maximums["economy"] = max(
+                maximums["economy"],
+                len(normalize_economy_examples(setup.get("economy_examples", []))),
+            )
+            preset = str(setup.get("skill_preset", "professional") or "professional")
+            plan = list(SKILL_PRESET_LEVEL_PLANS.get(preset, []))
+            if preset == "custom" and isinstance(setup.get("skill_level_plan"), list):
+                plan = [
+                    min(5, max(1, _safe_int(raw_level, 1)))
+                    for raw_level in setup["skill_level_plan"]
+                ]
+            skill_counts = {level: plan.count(level) for level in range(1, 6)}
+            raw_skills = setup.get("skills", [])
+            if isinstance(raw_skills, list):
+                explicit_counts = {level: 0 for level in range(1, 6)}
+                for skill in raw_skills:
+                    if isinstance(skill, dict):
+                        level = min(5, max(1, _safe_int(skill.get("level"), 1)))
+                        explicit_counts[level] += 1
+                for level in range(1, 6):
+                    skill_counts[level] = max(
+                        skill_counts[level], explicit_counts[level]
+                    )
+            for level, count in skill_counts.items():
+                skill_maximums[level] = max(skill_maximums[level], count)
+
+        self._loading_template_setup = True
+        try:
+            self._resize_template_table(
+                self.starting_locations_table,
+                maximums["locations"],
+                lambda: self._append_starting_location_row({}),
+            )
+            self._resize_template_table(
+                self.starting_npcs_table,
+                maximums["npcs"],
+                lambda: self._append_starting_npc_row({}),
+            )
+            for level, maximum in skill_maximums.items():
+                self._resize_template_table(
+                    self.skill_tables[level],
+                    maximum,
+                    lambda skill_level=level: self._add_template_skill_row(skill_level),
+                )
+            for table, maximum, append_row in (
+                (self.starter_items_table, maximums["items"], lambda: self._append_starter_item_row({})),
+                (self.starter_weapons_table, maximums["weapons"], lambda: self._append_starter_weapon_row({})),
+                (self.starter_armor_table, maximums["armor"], lambda: self._append_starter_armor_row({})),
+                (self.starter_item_suggestions_table, maximums["item_suggestions"], lambda: _append_starter_suggestion_table_row(self.starter_item_suggestions_table, "Item")),
+                (self.starter_weapon_suggestions_table, maximums["weapon_suggestions"], lambda: _append_starter_suggestion_table_row(self.starter_weapon_suggestions_table, "Weapon")),
+                (self.starter_armor_suggestions_table, maximums["armor_suggestions"], lambda: _append_starter_suggestion_table_row(self.starter_armor_suggestions_table, "Armor")),
+                (self.currency_table, maximums["currencies"], lambda: self._append_currency_row({})),
+                (self.economy_examples_table, maximums["economy"], lambda: self._append_economy_example_row({})),
+            ):
+                self._resize_template_table(table, maximum, append_row)
+        finally:
+            self._loading_template_setup = False
 
     def _load_setup_into_editor(self, template_name: str, setup: dict[str, Any]) -> None:
         """Populates editor controls from a possibly partial template setup."""
 
-        character = setup.get("character", {}) if isinstance(setup.get("character"), dict) else {}
-        self.template_name_input.setText(template_name)
-        self.genre_input.setText(str(setup.get("specified_genre", setup.get("genre", "")) or ""))
-        self.start_location_input.setText(str(setup.get("start_location", "") or ""))
-        self.opening_scene_request_input.setPlainText(
-            str(setup.get("opening_scene_request", "") or "")
-        )
-        _set_combo_to_data(
-            self.start_location_mode_combo,
-            str(setup.get("start_location_mode", "suggestion") or "suggestion"),
-        )
-        narration = normalize_narration_preferences(
-            setup.get("narration", {}) if isinstance(setup.get("narration"), dict) else {}
-        )
-        _set_combo_to_data(self.narration_tense_combo, narration["tense"])
-        _set_combo_to_data(self.narration_style_combo, narration["style"])
-        self.game_style_input.setPlainText(str(setup.get("game_style", "") or ""))
-        self.world_context_input.setPlainText(str(setup.get("world_context", "") or ""))
-        self.starting_locations_table.setRowCount(0)
-        self._starting_location_row_id_counter = 0
+        self._loading_template_setup = True
+        self.setUpdatesEnabled(False)
+        try:
+            character = (
+                setup.get("character", {})
+                if isinstance(setup.get("character"), dict)
+                else {}
+            )
+            self.template_name_input.setText(template_name)
+            self.genre_input.setText(
+                str(setup.get("specified_genre", setup.get("genre", "")) or "")
+            )
+            self.start_location_input.setText(str(setup.get("start_location", "") or ""))
+            self.opening_scene_request_input.setPlainText(
+                str(setup.get("opening_scene_request", "") or "")
+            )
+            _set_combo_to_data(
+                self.start_location_mode_combo,
+                str(setup.get("start_location_mode", "suggestion") or "suggestion"),
+            )
+            narration = normalize_narration_preferences(
+                setup.get("narration", {}) if isinstance(setup.get("narration"), dict) else {}
+            )
+            _set_combo_to_data(self.narration_tense_combo, narration["tense"])
+            _set_combo_to_data(self.narration_style_combo, narration["style"])
+            self.game_style_input.setPlainText(str(setup.get("game_style", "") or ""))
+            self.world_context_input.setPlainText(str(setup.get("world_context", "") or ""))
 
-        for location in self._starting_locations_for_editor(
-            setup.get("starting_locations", [])
-        ):
-            self._append_starting_location_row(location)
+            locations = self._starting_locations_for_editor(
+                setup.get("starting_locations", [])
+            )
+            self._resize_template_table(
+                self.starting_locations_table,
+                len(locations),
+                lambda: self._append_starting_location_row({}),
+            )
+            for location_row, location in enumerate(locations):
+                self._update_starting_location_row(location_row, location)
 
-        self._refresh_starting_location_dropdowns()
-        self._select_starting_location_combo_by_name(
-            str(setup.get("start_location", "") or "")
-        )
-        self.starting_npcs_table.setRowCount(0)
+            self._refresh_starting_location_dropdowns(force=True)
+            self._select_starting_location_combo_by_name(
+                str(setup.get("start_location", "") or "")
+            )
 
-        for npc in self._starting_npcs_for_editor(setup.get("starting_npcs", [])):
-            self._append_starting_npc_row(npc)
+            npcs = self._starting_npcs_for_editor(setup.get("starting_npcs", []))
+            self._resize_template_table(
+                self.starting_npcs_table,
+                len(npcs),
+                lambda: self._append_starting_npc_row({}),
+            )
+            for npc_row, npc in enumerate(npcs):
+                self._update_starting_npc_row(npc_row, npc)
 
-        self.no_starting_npcs_checkbox.blockSignals(True)
-        self.no_starting_npcs_checkbox.setChecked(
-            bool(setup.get("no_starting_npcs", False))
-            and self.starting_npcs_table.rowCount() == 0
-        )
-        self.no_starting_npcs_checkbox.blockSignals(False)
-        self._sync_template_no_starting_npcs_controls()
+            self.no_starting_npcs_checkbox.blockSignals(True)
+            self.no_starting_npcs_checkbox.setChecked(
+                bool(setup.get("no_starting_npcs", False))
+                and not npcs
+            )
+            self.no_starting_npcs_checkbox.blockSignals(False)
+            self._sync_template_no_starting_npcs_controls()
 
-        self.character_name_input.setText(str(character.get("name", "") or ""))
-        self.character_name_pronunciation_input.setText(
-            str(character.get("name_pronunciation", "") or "")
-        )
-        self.appearance_input.setPlainText(str(character.get("appearance", "") or ""))
-        self.backstory_input.setPlainText(str(character.get("backstory", "") or ""))
-        self.character_notes_input.setPlainText(str(character.get("notes", "") or ""))
+            self.character_name_input.setText(str(character.get("name", "") or ""))
+            self.character_name_pronunciation_input.setText(
+                str(character.get("name_pronunciation", "") or "")
+            )
+            self.appearance_input.setPlainText(
+                str(character.get("appearance", "") or "")
+            )
+            self.backstory_input.setPlainText(str(character.get("backstory", "") or ""))
+            self.character_notes_input.setPlainText(
+                str(character.get("notes", "") or "")
+            )
 
-        preset_index = self.skill_preset_combo.findData(setup.get("skill_preset", "professional"))
-        self.skill_preset_combo.setCurrentIndex(max(0, preset_index))
+            preset_index = self.skill_preset_combo.findData(
+                setup.get("skill_preset", "professional")
+            )
+            self.skill_preset_combo.blockSignals(True)
+            self.skill_preset_combo.setCurrentIndex(max(0, preset_index))
+            self.skill_preset_combo.blockSignals(False)
+            self._apply_template_skill_preset()
 
-        selected_preset = str(self.skill_preset_combo.currentData() or "professional")
-        if selected_preset == "custom":
-            for table in self.skill_tables.values():
-                table.setRowCount(0)
-            custom_plan = setup.get("skill_level_plan", [])
-            if isinstance(custom_plan, list):
-                for raw_level in custom_plan:
-                    level = min(5, max(1, _safe_int(raw_level, 1)))
-                    self._add_template_skill_row(level)
+            selected_preset = str(
+                self.skill_preset_combo.currentData() or "professional"
+            )
+            if selected_preset == "custom":
+                custom_plan = setup.get("skill_level_plan", [])
+                level_counts = {level: 0 for level in range(1, 6)}
+                if isinstance(custom_plan, list):
+                    for raw_level in custom_plan:
+                        level = min(5, max(1, _safe_int(raw_level, 1)))
+                        level_counts[level] += 1
+                for level, table in self.skill_tables.items():
+                    self._resize_template_table(
+                        table,
+                        level_counts[level],
+                        lambda skill_level=level: self._add_template_skill_row(
+                            skill_level
+                        ),
+                    )
+                self._sync_template_skill_inputs()
 
-        skills = self._skills_for_editor(setup.get("skills", []))
-        self._load_template_skills(skills)
+            skills = self._skills_for_editor(setup.get("skills", []))
+            self._load_template_skills(skills)
 
-        self.starter_items_table.setRowCount(0)
-        self.starter_weapons_table.setRowCount(0)
-        self.starter_armor_table.setRowCount(0)
-        self.starter_item_suggestions_table.setRowCount(0)
-        self.starter_weapon_suggestions_table.setRowCount(0)
-        self.starter_armor_suggestions_table.setRowCount(0)
-        for item in self._starter_items_for_editor(setup.get("starter_items", [])):
-            kind = _starter_item_kind(item)
+            exact_items: list[dict[str, Any]] = []
+            exact_weapons: list[dict[str, Any]] = []
+            exact_armor: list[dict[str, Any]] = []
+            item_suggestions: list[str] = []
+            weapon_suggestions: list[str] = []
+            armor_suggestions: list[str] = []
+            for item in self._starter_items_for_editor(setup.get("starter_items", [])):
+                kind = _starter_item_kind(item)
+                if item.get("requires_ai_invention") and item.get("item_request"):
+                    suggestion = str(item.get("item_request", ""))
+                    if kind == "Weapon":
+                        weapon_suggestions.append(suggestion)
+                    elif kind == "Armor":
+                        armor_suggestions.append(suggestion)
+                    else:
+                        item_suggestions.append(suggestion)
+                elif kind == "Weapon":
+                    exact_weapons.append(item)
+                elif kind == "Armor":
+                    exact_armor.append(item)
+                else:
+                    exact_items.append(item)
 
-            if item.get("requires_ai_invention") and item.get("item_request"):
-                suggestion_table = {
-                    "Weapon": self.starter_weapon_suggestions_table,
-                    "Armor": self.starter_armor_suggestions_table,
-                }.get(kind, self.starter_item_suggestions_table)
-                _append_starter_suggestion_table_row(
-                    suggestion_table, kind, str(item.get("item_request", ""))
-                )
-            elif kind == "Weapon":
-                self._append_starter_weapon_row(item)
-            elif kind == "Armor":
-                self._append_starter_armor_row(item)
-            else:
-                self._append_starter_item_row(item)
+            self._load_starter_item_rows(exact_items)
+            self._load_starter_weapon_rows(exact_weapons)
+            self._load_starter_armor_rows(exact_armor)
+            self._load_starter_suggestion_rows(
+                self.starter_item_suggestions_table, "Item", item_suggestions
+            )
+            self._load_starter_suggestion_rows(
+                self.starter_weapon_suggestions_table, "Weapon", weapon_suggestions
+            )
+            self._load_starter_suggestion_rows(
+                self.starter_armor_suggestions_table, "Armor", armor_suggestions
+            )
 
-        self.currency_table.setRowCount(0)
+            denominations = self._currency_denominations_for_editor(
+                setup.get("currency_denominations", [])
+            )
+            self._load_currency_rows(denominations)
 
-        for denomination in self._currency_denominations_for_editor(
-            setup.get("currency_denominations", [])
-        ):
-            self._append_currency_row(denomination)
+            economy_examples = normalize_economy_examples(
+                setup.get("economy_examples", [])
+            )
+            self._load_economy_example_rows(economy_examples)
 
-        self.economy_examples_table.setRowCount(0)
-
-        economy_examples = normalize_economy_examples(setup.get("economy_examples", []))
-
-        for example in economy_examples:
-            self._append_economy_example_row(example)
-
-        self._legacy_currency_description = (
-            "" if economy_examples else str(setup.get("currency_description", "") or "")
-        )
-        _set_combo_to_data(
-            self.calendar_type_combo,
-            self._template_calendar_type(setup.get("calendar", {})),
-        )
-        self._load_template_starting_task(setup.get("starting_task", setup.get("starting_quest", {})))
-        template_audio = setup.get("audio", {}) if isinstance(setup.get("audio"), dict) else {}
-        audio = {
-            **self.audio_defaults,
-            **template_audio,
-            "tts_custom_voices": merge_custom_voices(
-                template_audio.get("tts_custom_voices", []),
-                self.audio_defaults.get("tts_custom_voices", []),
-            ),
-        }
-        self.music_enabled_checkbox.setChecked(bool(audio.get("music_enabled", True)))
-        self.music_volume_slider.setValue(_safe_int(audio.get("music_volume"), 25))
-        self.music_volume_label.setText(f"{self.music_volume_slider.value()}%")
-        self.sound_effects_enabled_checkbox.setChecked(
-            bool(audio.get("sound_effects_enabled", True))
-        )
-        self.sound_effects_volume_slider.setValue(
-            _safe_int(audio.get("sound_effects_volume"), 35)
-        )
-        self.sound_effects_volume_label.setText(
-            f"{self.sound_effects_volume_slider.value()}%"
-        )
-        self.template_tts_settings_widget.load_audio_settings(audio)
-        ai_settings = setup.get("ai_settings", {}) if isinstance(setup.get("ai_settings"), dict) else {}
-        self._new_game_ai_settings = normalize_ai_mode_preferences(ai_settings)
-        self._new_game_ai_settings["additional_context"] = str(ai_settings.get("additional_context", "") or "")
-        self._refresh_template_ai_settings_summary()
+            self._legacy_currency_description = (
+                "" if economy_examples else str(setup.get("currency_description", "") or "")
+            )
+            _set_combo_to_data(
+                self.calendar_type_combo,
+                self._template_calendar_type(setup.get("calendar", {})),
+            )
+            self._load_template_starting_task(
+                setup.get("starting_task", setup.get("starting_quest", {}))
+            )
+            template_audio = (
+                setup.get("audio", {})
+                if isinstance(setup.get("audio"), dict)
+                else {}
+            )
+            audio = {
+                **self.audio_defaults,
+                **template_audio,
+                "tts_custom_voices": merge_custom_voices(
+                    template_audio.get("tts_custom_voices", []),
+                    self.audio_defaults.get("tts_custom_voices", []),
+                ),
+            }
+            self.music_enabled_checkbox.setChecked(
+                bool(audio.get("music_enabled", True))
+            )
+            self.music_volume_slider.setValue(_safe_int(audio.get("music_volume"), 25))
+            self.music_volume_label.setText(f"{self.music_volume_slider.value()}%")
+            self.sound_effects_enabled_checkbox.setChecked(
+                bool(audio.get("sound_effects_enabled", True))
+            )
+            self.sound_effects_volume_slider.setValue(
+                _safe_int(audio.get("sound_effects_volume"), 35)
+            )
+            self.sound_effects_volume_label.setText(
+                f"{self.sound_effects_volume_slider.value()}%"
+            )
+            self.template_tts_settings_widget.load_audio_settings(audio)
+            ai_settings = (
+                setup.get("ai_settings", {})
+                if isinstance(setup.get("ai_settings"), dict)
+                else {}
+            )
+            self._new_game_ai_settings = normalize_ai_mode_preferences(ai_settings)
+            self._new_game_ai_settings["additional_context"] = str(
+                ai_settings.get("additional_context", "") or ""
+            )
+            self._refresh_template_ai_settings_summary()
+        finally:
+            self._loading_template_setup = False
+            self.setUpdatesEnabled(True)
+            self.update()
 
     def _handle_template_custom_voice_saved(self, audio_settings: dict[str, Any]) -> None:
         """Keeps template-editor custom voices in the shared app-level library."""
@@ -4215,7 +4550,7 @@ class NewGameTemplateManagerDialog(QDialog):
     def _build_setup_from_editor(self) -> dict[str, Any]:
         """Builds a partial setup dictionary from the editor controls."""
 
-        setup = dict(self.active_setup)
+        setup = deepcopy(self.active_setup)
         setup["title"] = self.template_name_input.text().strip()
         setup["specified_genre"] = self.genre_input.text().strip()
         setup["game_style"] = self.game_style_input.toPlainText().strip()
@@ -4331,6 +4666,8 @@ class NewGameTemplateManagerDialog(QDialog):
         for level in range(5, 0, -1):
             table = self.skill_tables[level]
             for row in range(table.rowCount()):
+                if table.isRowHidden(row):
+                    continue
                 name = table.cellWidget(row, 1)
                 description = table.cellWidget(row, 2)
                 if isinstance(name, QLineEdit) and isinstance(description, QLineEdit):
@@ -4341,10 +4678,19 @@ class NewGameTemplateManagerDialog(QDialog):
         plan = SKILL_PRESET_LEVEL_PLANS.get(preset, [])
         custom = preset == "custom"
         for level, table in self.skill_tables.items():
-            table.setRowCount(0)
             count = plan.count(level)
-            for _unused in range(count):
-                self._add_template_skill_row(level)
+            self._resize_template_table(
+                table,
+                count,
+                lambda skill_level=level: self._add_template_skill_row(skill_level),
+            )
+            for row in range(table.rowCount()):
+                name = table.cellWidget(row, 1)
+                description = table.cellWidget(row, 2)
+                if isinstance(name, QLineEdit):
+                    name.clear()
+                if isinstance(description, QLineEdit):
+                    description.clear()
             parent_widget = table.parentWidget()
             if parent_widget is not None:
                 parent_widget.setVisible(custom or count > 0)
@@ -4373,6 +4719,8 @@ class NewGameTemplateManagerDialog(QDialog):
             table = self.skill_tables[level]
             target_row = None
             for row in range(table.rowCount()):
+                if table.isRowHidden(row):
+                    continue
                 name = table.cellWidget(row, 1)
                 description = table.cellWidget(row, 2)
                 if (
@@ -4400,6 +4748,8 @@ class NewGameTemplateManagerDialog(QDialog):
         table = self.skill_tables[level]
         skills = []
         for row in range(table.rowCount()):
+            if table.isRowHidden(row):
+                continue
             name = table.cellWidget(row, 1)
             description = table.cellWidget(row, 2)
             if isinstance(name, QLineEdit) and isinstance(description, QLineEdit):
@@ -4469,7 +4819,39 @@ class NewGameTemplateManagerDialog(QDialog):
                 lambda _index: self._refresh_starting_location_dropdowns()
             )
 
-        self._refresh_starting_location_dropdowns()
+        if not self._loading_template_setup:
+            self._refresh_starting_location_dropdowns()
+
+    def _update_starting_location_row(
+        self,
+        row: int,
+        location: dict[str, Any],
+    ) -> None:
+        """Updates one existing location row without replacing its widgets."""
+
+        name_widget = self.starting_locations_table.cellWidget(row, 0)
+        description_widget = self.starting_locations_table.cellWidget(row, 1)
+        mode_widget = self.starting_locations_table.cellWidget(row, 2)
+        sublocation_widget = self.starting_locations_table.cellWidget(row, 3)
+        parent_widget = self.starting_locations_table.cellWidget(row, 4)
+        if isinstance(name_widget, QLineEdit):
+            name_widget.setText(str(location.get("name", "")))
+        if isinstance(description_widget, QLineEdit):
+            description_widget.setText(str(location.get("description", "")))
+        if isinstance(mode_widget, QComboBox):
+            _set_combo_to_data(
+                mode_widget,
+                str(location.get("location_mode", "suggestion") or "suggestion"),
+            )
+        is_sublocation = bool(location.get("is_sublocation", False))
+        if isinstance(sublocation_widget, QCheckBox):
+            sublocation_widget.setChecked(is_sublocation)
+        if isinstance(parent_widget, QComboBox):
+            parent_widget.setProperty(
+                "pending_parent_location",
+                str(location.get("parent_location", "") or ""),
+            )
+            parent_widget.setVisible(is_sublocation)
 
     def _remove_starting_location_row(self, button: QPushButton) -> None:
         """Removes the starting location row containing button."""
@@ -4525,8 +4907,11 @@ class NewGameTemplateManagerDialog(QDialog):
             selected_start_location["location_mode"],
         )
 
-    def _refresh_starting_location_dropdowns(self) -> None:
+    def _refresh_starting_location_dropdowns(self, *, force: bool = False) -> None:
         """Keeps template start and parent-location dropdowns aligned."""
+
+        if self._loading_template_setup and not force:
+            return
 
         locations = _starting_location_options_from_table(self.starting_locations_table)
         selected_start = self.start_location_combo.currentData()
@@ -4581,6 +4966,35 @@ class NewGameTemplateManagerDialog(QDialog):
                 self.starting_locations_table
             ),
         )
+
+    def _update_starting_npc_row(self, row: int, npc: dict[str, Any]) -> None:
+        """Updates one existing NPC row without replacing its widgets."""
+
+        name_widget = self.starting_npcs_table.cellWidget(row, 0)
+        location_widget = self.starting_npcs_table.cellWidget(row, 1)
+        description_widget = self.starting_npcs_table.cellWidget(row, 2)
+        mode_widget = self.starting_npcs_table.cellWidget(row, 3)
+        if isinstance(name_widget, QLineEdit):
+            name_widget.setText(str(npc.get("name", npc.get("display_name", ""))))
+            name_widget.setProperty(
+                "npc_id",
+                str(npc.get("npc_id", "")).strip()
+                or f"starting_npc_{uuid.uuid4().hex}",
+            )
+        if isinstance(location_widget, QComboBox):
+            requested_location = str(npc.get("location", "") or "").strip()
+            _set_combo_to_text(location_widget, requested_location)
+            if not requested_location:
+                location_widget.setCurrentIndex(0)
+        if isinstance(description_widget, QLineEdit):
+            description_widget.setText(
+                str(npc.get("description", npc.get("public_description", "")))
+            )
+        if isinstance(mode_widget, QComboBox):
+            _set_combo_to_data(
+                mode_widget,
+                str(npc.get("description_mode", "suggestion") or "suggestion"),
+            )
 
     def _remove_starting_npc_row(self, button: QPushButton) -> None:
         """Removes the starting NPC row containing button."""
@@ -4659,6 +5073,41 @@ class NewGameTemplateManagerDialog(QDialog):
             self._remove_starter_item_row,
         )
 
+    def _load_starter_item_rows(self, items: list[dict[str, Any]]) -> None:
+        """Loads exact starter items while reusing existing row editors."""
+
+        self._resize_template_table(
+            self.starter_items_table,
+            len(items),
+            lambda: self._append_starter_item_row({}),
+        )
+        for row, item in enumerate(items):
+            name = self.starter_items_table.cellWidget(row, 0)
+            quantity = self.starter_items_table.cellWidget(row, 1)
+            category = self.starter_items_table.cellWidget(row, 2)
+            description = self.starter_items_table.cellWidget(row, 3)
+            value = self.starter_items_table.cellWidget(row, 4)
+            storage = self.starter_items_table.cellWidget(row, 5)
+            if isinstance(name, QLineEdit):
+                name.setText(str(item.get("name", "")))
+            if isinstance(quantity, QSpinBox):
+                quantity.setValue(_safe_int(item.get("quantity", 1), 1))
+            if isinstance(category, QLineEdit):
+                category.setText(str(item.get("category", "Item") or "Item"))
+            if isinstance(description, QLineEdit):
+                description.setText(str(item.get("description", "")))
+            if isinstance(value, QSpinBox):
+                value.setValue(_safe_int(item.get("value_base_units", 0), 0))
+            if isinstance(storage, QComboBox):
+                storage_value = str(
+                    item.get("storage_location", "actively_carried")
+                    or "actively_carried"
+                ).strip()
+                if storage.findData(storage_value) >= 0:
+                    _set_combo_to_data(storage, storage_value)
+                else:
+                    storage.setEditText(storage_value)
+
     def _remove_starter_item_row(self, button: QPushButton) -> None:
         """Removes the starter item row containing button."""
 
@@ -4682,6 +5131,50 @@ class NewGameTemplateManagerDialog(QDialog):
             self._remove_starter_weapon_row,
         )
 
+    def _load_starter_weapon_rows(self, items: list[dict[str, Any]]) -> None:
+        """Loads exact starter weapons while reusing existing row editors."""
+
+        self._resize_template_table(
+            self.starter_weapons_table,
+            len(items),
+            lambda: self._append_starter_weapon_row({}),
+        )
+        for row, item in enumerate(items):
+            name = self.starter_weapons_table.cellWidget(row, 0)
+            quantity = self.starter_weapons_table.cellWidget(row, 1)
+            hands = self.starter_weapons_table.cellWidget(row, 2)
+            damage = self.starter_weapons_table.cellWidget(row, 3)
+            attack_skill = self.starter_weapons_table.cellWidget(row, 4)
+            attack_range = self.starter_weapons_table.cellWidget(row, 5)
+            ammunition = self.starter_weapons_table.cellWidget(row, 6)
+            clip_size = self.starter_weapons_table.cellWidget(row, 7)
+            if isinstance(name, QLineEdit):
+                name.setText(str(item.get("name", "")))
+            if isinstance(quantity, QSpinBox):
+                quantity.setValue(_safe_int(item.get("quantity", 1), 1))
+            if isinstance(hands, QComboBox):
+                _set_combo_to_data(
+                    hands,
+                    _metadata_text(item, "weapon_hands", "one-handed")
+                    or "one-handed",
+                )
+            if isinstance(damage, QLineEdit):
+                damage.setText(_metadata_text(item, "damage", "1d6") or "1d6")
+            if isinstance(attack_skill, QLineEdit):
+                attack_skill.setText(
+                    _metadata_text(item, "attack_skill", "Melee") or "Melee"
+                )
+            if isinstance(attack_range, QSpinBox):
+                attack_range.setValue(
+                    max(0, _metadata_int(item, "attack_range_feet", 5))
+                )
+            if isinstance(ammunition, QLineEdit):
+                ammunition.setText(
+                    _metadata_text(item, "ammunition_type_required")
+                )
+            if isinstance(clip_size, QSpinBox):
+                clip_size.setValue(max(0, _metadata_int(item, "clip_size", 0)))
+
     def _remove_starter_weapon_row(self, button: QPushButton) -> None:
         """Removes the starter weapon row containing button."""
 
@@ -4695,6 +5188,59 @@ class NewGameTemplateManagerDialog(QDialog):
             item,
             self._remove_starter_armor_row,
         )
+
+    def _load_starter_armor_rows(self, items: list[dict[str, Any]]) -> None:
+        """Loads exact starter armor while reusing existing row editors."""
+
+        self._resize_template_table(
+            self.starter_armor_table,
+            len(items),
+            lambda: self._append_starter_armor_row({}),
+        )
+        for row, item in enumerate(items):
+            name = self.starter_armor_table.cellWidget(row, 0)
+            quantity = self.starter_armor_table.cellWidget(row, 1)
+            covers = self.starter_armor_table.cellWidget(row, 2)
+            armor_rating = self.starter_armor_table.cellWidget(row, 3)
+            value = self.starter_armor_table.cellWidget(row, 4)
+            raw_covers = item.get("covers_body_parts")
+            if not isinstance(raw_covers, list) and isinstance(
+                item.get("metadata"), dict
+            ):
+                raw_covers = item["metadata"].get("covers_body_parts")
+            covers_parts = raw_covers if isinstance(raw_covers, list) else []
+            if isinstance(name, QLineEdit):
+                name.setText(str(item.get("name", "")))
+            if isinstance(quantity, QSpinBox):
+                quantity.setValue(_safe_int(item.get("quantity", 1), 1))
+            if isinstance(covers, QLineEdit):
+                covers.setText(
+                    ", ".join(str(part) for part in covers_parts if part is not None)
+                )
+            if isinstance(armor_rating, QSpinBox):
+                armor_rating.setValue(
+                    max(0, _metadata_int(item, "armor_rating", 1))
+                )
+            if isinstance(value, QSpinBox):
+                value.setValue(_safe_int(item.get("value_base_units", 0), 0))
+
+    def _load_starter_suggestion_rows(
+        self,
+        table: QTableWidget,
+        kind: str,
+        suggestions: list[str],
+    ) -> None:
+        """Loads starter suggestions while reusing existing row editors."""
+
+        self._resize_template_table(
+            table,
+            len(suggestions),
+            lambda: _append_starter_suggestion_table_row(table, kind),
+        )
+        for row, suggestion in enumerate(suggestions):
+            editor = table.cellWidget(row, 0)
+            if isinstance(editor, QLineEdit):
+                editor.setText(suggestion)
 
     def _remove_starter_armor_row(self, button: QPushButton) -> None:
         """Removes the starter armor row containing button."""
@@ -4727,6 +5273,26 @@ class NewGameTemplateManagerDialog(QDialog):
             denomination,
             self._remove_currency_row,
         )
+
+    def _load_currency_rows(self, denominations: list[dict[str, Any]]) -> None:
+        """Loads currency rows while reusing existing row editors."""
+
+        self._resize_template_table(
+            self.currency_table,
+            len(denominations),
+            lambda: self._append_currency_row({}),
+        )
+        for row, denomination in enumerate(denominations):
+            name = self.currency_table.cellWidget(row, 0)
+            plural_name = self.currency_table.cellWidget(row, 1)
+            value = self.currency_table.cellWidget(row, 2)
+            if isinstance(name, QLineEdit):
+                name.setText(str(denomination.get("name", "")))
+            if isinstance(plural_name, QLineEdit):
+                plural_name.setText(str(denomination.get("plural_name", "")))
+            if isinstance(value, QSpinBox):
+                value.setValue(_safe_int(denomination.get("value", 1), 1))
+        _sync_currency_base_value_row(self.currency_table)
 
     def _remove_currency_row(self, button: QPushButton) -> None:
         """Removes the currency denomination row containing button."""
@@ -4763,6 +5329,25 @@ class NewGameTemplateManagerDialog(QDialog):
             example,
             self._remove_economy_example_row,
         )
+
+    def _load_economy_example_rows(
+        self,
+        examples: list[dict[str, Any]],
+    ) -> None:
+        """Loads economy examples while reusing existing row editors."""
+
+        self._resize_template_table(
+            self.economy_examples_table,
+            len(examples),
+            lambda: self._append_economy_example_row({}),
+        )
+        for row, example in enumerate(examples):
+            name = self.economy_examples_table.cellWidget(row, 0)
+            value = self.economy_examples_table.cellWidget(row, 1)
+            if isinstance(name, QLineEdit):
+                name.setText(str(example.get("name", "")))
+            if isinstance(value, QSpinBox):
+                value.setValue(_safe_int(example.get("value_base_units", 1), 1))
 
     def _remove_economy_example_row(self, button: QPushButton) -> None:
         """Removes the common-price example row containing button."""
@@ -7881,6 +8466,7 @@ class NewGameWizard(QWizard):
             denomination,
             self._remove_currency_row,
         )
+
         row = self.currency_table.rowCount() - 1
         name_input = self.currency_table.cellWidget(row, 0)
         value_input = self.currency_table.cellWidget(row, 2)
@@ -8335,6 +8921,7 @@ class GameShell(QWidget):
         self.travel_screen = TravelScreen(
             on_travel_requested=self._submit_travel_request,
         )
+        self.bestiary_screen = BestiaryScreen()
         self.calendar_screen = CalendarScreen(playtesting_tools=self.playtesting_tools)
         self.inventory_screen = InventoryScreen(
             playtesting_tools=self.playtesting_tools,
@@ -8350,7 +8937,7 @@ class GameShell(QWidget):
         self.alchemy_screen = AlchemyNotebookScreen(
             playtesting_tools=self.playtesting_tools,
         )
-        self.history_screen = HistoryScreen()
+        self.notes_screen = NotesScreen()
         self.settings_screen = SettingsScreen(
             on_audio_settings_changed=self._apply_audio_settings,
             on_theme_changed=self._apply_theme,
@@ -8369,6 +8956,7 @@ class GameShell(QWidget):
             self.story_screen,
             self.character_screen,
             self.travel_screen,
+            self.bestiary_screen,
             self.calendar_screen,
             self.inventory_screen,
             self.combat_screen,
@@ -8378,7 +8966,7 @@ class GameShell(QWidget):
             self.skills_screen,
             self.magic_screen,
             self.alchemy_screen,
-            self.history_screen,
+            self.notes_screen,
             self.settings_screen,
         ]
 
@@ -8400,6 +8988,7 @@ class GameShell(QWidget):
                 ("conversation", self.story_screen, "Conversation", False),
                 ("character", self.character_screen, "Character", True),
                 ("travel", self.travel_screen, "Travel", True),
+                ("bestiary", self.bestiary_screen, "Bestiary", True),
                 ("calendar", self.calendar_screen, "Calendar", True),
                 ("inventory", self.inventory_screen, "Inventory", True),
                 ("combat", self.combat_screen, "Combat", True),
@@ -8408,7 +8997,7 @@ class GameShell(QWidget):
                 ("skills", self.skills_screen, "Skills", True),
                 ("magic", self.magic_screen, "Magic", True),
                 ("crafting", self.alchemy_screen, "Crafting", True),
-                ("journal", self.history_screen, "Journal", True),
+                ("notes", self.notes_screen, "Notes", True),
                 ("settings", self.settings_screen, "Settings", True),
             ]
         )
@@ -9039,7 +9628,7 @@ class StoryScreen(RepositoryBackedWidget):
                         "player",
                         "out_of_game" if kind == "player_oog" else "live_game",
                         content,
-                        -1,
+                        _safe_int(entry.get("id"), -1),
                         str(entry.get("message_id", "") or ""),
                     )
                 )
@@ -9130,6 +9719,7 @@ class StoryScreen(RepositoryBackedWidget):
                     role,
                     mode,
                     content,
+                    history_entry_id=_safe_int(entry_id, -1),
                     message_id=message_id,
                     can_regenerate=can_regenerate,
                     turn_number=turn_number,
@@ -9191,6 +9781,7 @@ class StoryScreen(RepositoryBackedWidget):
         mode: str,
         content: str,
         *,
+        history_entry_id: int = -1,
         message_id: str = "",
         can_regenerate: bool = False,
         turn_number: int | None = None,
@@ -9233,8 +9824,11 @@ class StoryScreen(RepositoryBackedWidget):
             "QPushButton:hover { background-color: rgba(255, 255, 255, 48); }"
         )
         read_aloud_button.clicked.connect(
-            lambda _checked=False, message_text=content: (
-                self._read_conversation_message_aloud(message_text)
+            lambda _checked=False, message_text=content, entry_id=history_entry_id: (
+                self._read_conversation_message_aloud(
+                    message_text,
+                    history_entry_id=entry_id,
+                )
             )
         )
 
@@ -9300,8 +9894,13 @@ class StoryScreen(RepositoryBackedWidget):
             row_layout.addWidget(bubble, 1)
         return row
 
-    def _read_conversation_message_aloud(self, text: str) -> bool:
-        """Regenerates one bubble's speech locally without contacting Gemini."""
+    def _read_conversation_message_aloud(
+        self,
+        text: str,
+        *,
+        history_entry_id: int = -1,
+    ) -> bool:
+        """Replays one saved passage and its sound cues without contacting Gemini."""
 
         if self.narration_player is None:
             return False
@@ -9319,9 +9918,45 @@ class StoryScreen(RepositoryBackedWidget):
             if repository is not None
             else {}
         )
+        narration_text = text
+        sound_effect_cues: list[dict[str, str]] = []
+        speaker_cues: list[dict[str, str]] = []
+        if repository is not None and history_entry_id >= 0:
+            history_entry = next(
+                (
+                    entry
+                    for entry in repository.list_history()
+                    if _safe_int(entry.get("id"), -1) == history_entry_id
+                ),
+                None,
+            )
+            if history_entry is not None:
+                narration_text = str(history_entry.get("content", text))
+                raw_cues = history_entry.get("sound_effect_cues", [])
+                if isinstance(raw_cues, list):
+                    sound_effect_cues = [
+                        cue for cue in raw_cues if isinstance(cue, dict)
+                    ]
+                raw_speaker_cues = history_entry.get("speaker_cues", [])
+                if isinstance(raw_speaker_cues, list):
+                    speaker_cues = [
+                        cue for cue in raw_speaker_cues if isinstance(cue, dict)
+                    ]
+
         return bool(
             self.narration_player.play_sample(
-                text=apply_pronunciation_map(text, pronunciation_map)
+                text=narration_text,
+                sound_effect_cues=sound_effect_cues,
+                speaker_cues=speaker_cues,
+                tts_text_transform=lambda chunk: apply_pronunciation_map(
+                    chunk,
+                    pronunciation_map,
+                ),
+                on_sound_effect=(
+                    self.sound_manager.play_sound_effect
+                    if self.sound_manager is not None
+                    else None
+                ),
             )
         )
 
@@ -9770,11 +10405,21 @@ class StoryScreen(RepositoryBackedWidget):
         message_id = self._pending_message_id or (
             repository.create_message_id() if repository is not None else ""
         )
+        speaker_cues = (
+            []
+            if is_out_of_game
+            else _resolve_speaker_cues_for_repository(
+                repository,
+                self.narration_player,
+                getattr(result, "speaker_cues", []),
+            )
+        )
         repository.append_history(
             "story_oog" if is_out_of_game else "story",
             result.narrative_text,
             message_id=message_id,
             sound_effect_cues=result.sound_effect_cues,
+            speaker_cues=speaker_cues,
         )
 
         if result.suggested_events and not is_out_of_game:
@@ -9812,6 +10457,7 @@ class StoryScreen(RepositoryBackedWidget):
             int(latest_story["id"]),
             result.narrative_text,
             result.sound_effect_cues,
+            speaker_cues,
         ):
             return
 
@@ -9994,18 +10640,21 @@ class StoryScreen(RepositoryBackedWidget):
                 )
                 content = str(entry.get("content", ""))
                 sound_effect_cues = entry.get("sound_effect_cues", [])
+                speaker_cues = entry.get("speaker_cues", [])
                 if reveal_progressively:
                     story_id = _safe_int(entry.get("id"), -1)
                     if story_id >= 0 and self._reveal_story_with_narration(
                         story_id,
                         content,
                         sound_effect_cues,
+                        speaker_cues,
                     ):
                         return True
                 self.refresh()
                 return self._narrate_text(
                     content,
                     sound_effect_cues=sound_effect_cues,
+                    speaker_cues=speaker_cues,
                 )
         return False
 
@@ -10015,6 +10664,7 @@ class StoryScreen(RepositoryBackedWidget):
         *,
         story_id: int | None = None,
         sound_effect_cues: list[dict[str, str]] | None = None,
+        speaker_cues: list[dict[str, str]] | None = None,
     ) -> bool:
         """Sends text to the narration player if available."""
 
@@ -10041,6 +10691,7 @@ class StoryScreen(RepositoryBackedWidget):
             return self.narration_player.narrate(
                 text,
                 sound_effect_cues=sound_effect_cues,
+                speaker_cues=speaker_cues,
                 tts_text_transform=tts_text_transform,
                 on_sound_effect=on_sound_effect,
             )
@@ -10048,6 +10699,7 @@ class StoryScreen(RepositoryBackedWidget):
         return self.narration_player.narrate(
             text,
             sound_effect_cues=sound_effect_cues,
+            speaker_cues=speaker_cues,
             tts_text_transform=tts_text_transform,
             on_chunk_start=lambda chunk: self._narration_chunk_ready.emit(
                 story_id,
@@ -10062,6 +10714,7 @@ class StoryScreen(RepositoryBackedWidget):
         story_id: int,
         text: str,
         sound_effect_cues: list[dict[str, str]] | None = None,
+        speaker_cues: list[dict[str, str]] | None = None,
     ) -> bool:
         """Displays the latest story progressively as TTS starts each chunk."""
 
@@ -10075,6 +10728,7 @@ class StoryScreen(RepositoryBackedWidget):
             text,
             story_id=story_id,
             sound_effect_cues=sound_effect_cues,
+            speaker_cues=speaker_cues,
         ):
             QTimer.singleShot(
                 STORY_REVEAL_STALL_TIMEOUT_MS,
@@ -12123,6 +12777,109 @@ class CombatScreen(RepositoryBackedWidget):
         return preferences["resolution_mode"] == "narrative"
 
 
+class BestiaryScreen(RepositoryBackedWidget):
+    """Player-facing collection of learned, non-secret creature lore."""
+
+    def __init__(self) -> None:
+        super().__init__()
+
+        self.creature_list = QListWidget()
+        self.creature_list.currentItemChanged.connect(
+            self._display_selected_creature
+        )
+
+        self.details_output = QTextEdit()
+        self.details_output.setReadOnly(True)
+
+        list_layout = QVBoxLayout()
+        list_layout.addWidget(QLabel("Known Creatures"))
+        list_layout.addWidget(self.creature_list)
+
+        details_layout = QVBoxLayout()
+        details_layout.addWidget(self.details_output)
+
+        layout = QHBoxLayout()
+        layout.addLayout(list_layout, 1)
+        layout.addLayout(details_layout, 2)
+        self.setLayout(layout)
+
+    def refresh(self) -> None:
+        """Reloads learned creatures while preserving the visible selection."""
+
+        repository = self.repository()
+        selected_id = self._selected_creature_id()
+        self.creature_list.blockSignals(True)
+        self.creature_list.clear()
+
+        if repository is None:
+            self.creature_list.blockSignals(False)
+            self.details_output.clear()
+            return
+
+        for creature in repository.list_bestiary_entries():
+            name = str(creature.get("name", "")).strip()
+            if not name:
+                continue
+
+            item = QListWidgetItem(name)
+            item.setData(Qt.ItemDataRole.UserRole, creature)
+            item.setData(
+                Qt.ItemDataRole.UserRole + 1,
+                str(creature.get("misc_id", "")).strip(),
+            )
+            self.creature_list.addItem(item)
+
+        self.creature_list.blockSignals(False)
+
+        if self.creature_list.count() == 0:
+            self.details_output.setPlainText(
+                "No creatures have been learned about yet."
+            )
+            return
+
+        target_row = 0
+        for row in range(self.creature_list.count()):
+            item = self.creature_list.item(row)
+            if item is not None and str(
+                item.data(Qt.ItemDataRole.UserRole + 1) or ""
+            ) == selected_id:
+                target_row = row
+                break
+
+        self.creature_list.setCurrentRow(target_row)
+        self._display_selected_creature()
+
+    def _selected_creature_id(self) -> str:
+        """Returns the selected creature's durable public-lore ID."""
+
+        current_item = self.creature_list.currentItem()
+        if current_item is None:
+            return ""
+        return str(
+            current_item.data(Qt.ItemDataRole.UserRole + 1) or ""
+        ).strip()
+
+    def _display_selected_creature(self, *_args: Any) -> None:
+        """Displays only the selected public miscellaneous record."""
+
+        current_item = self.creature_list.currentItem()
+        if current_item is None:
+            self.details_output.clear()
+            return
+
+        raw_creature = current_item.data(Qt.ItemDataRole.UserRole)
+        if not isinstance(raw_creature, dict):
+            self.details_output.clear()
+            return
+
+        name = str(raw_creature.get("name", "")).strip()
+        details = str(raw_creature.get("details", "")).strip()
+        sections = [f"# {name}"] if name else []
+        if details:
+            sections.append(details)
+        _set_markdown_text(self.details_output, "\n\n".join(sections))
+
+
 class TravelScreen(RepositoryBackedWidget):
     """Player-facing map knowledge, route estimates, and travel requests."""
 
@@ -12430,13 +13187,13 @@ class CalendarScreen(RepositoryBackedWidget):
         self.year_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self.year_table.verticalHeader().setVisible(False)
 
-        self.tasks_table = _AppTableWidget(0, 5)
+        self.tasks_table = _AppTableWidget(0, 6)
         self.tasks_table.setHorizontalHeaderLabels(
-            ["Task", "Category", "Due", "Location", "Reward"]
+            ["Task", "Description", "Category", "Due", "Location", "Reward"]
         )
         self.tasks_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         _use_soft_table_selection(self.tasks_table)
-        self.tasks_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        _configure_wrapping_table(self.tasks_table, {1})
 
         self.views = QTabWidget()
         month_page = QWidget()
@@ -12752,6 +13509,7 @@ class CalendarScreen(RepositoryBackedWidget):
         for row, task in enumerate(tasks):
             values = [
                 task.get("name", ""),
+                task.get("description", "") or "No description recorded yet.",
                 task.get("category", ""),
                 task.get("due_date", "N/A"),
                 task.get("location", ""),
@@ -12759,6 +13517,7 @@ class CalendarScreen(RepositoryBackedWidget):
             ]
             for column, value in enumerate(values):
                 self.tasks_table.setItem(row, column, _table_item(str(value)))
+        _resize_wrapping_table_rows(self.tasks_table)
 
     def return_to_current_month(self) -> None:
         """Returns the grid to the current month and refreshes."""
@@ -13268,10 +14027,12 @@ class InventoryItemDetailsDialog(QDialog):
         title.setObjectName("inventoryItemDetailTitle")
         title.setStyleSheet("font-size: 20px; font-weight: 700;")
 
-        ascii_art = normalize_ascii_art(
+        ascii_art = ensure_substantive_ascii_art(
             (catalog_entry or {}).get("ascii_art", "")
             or item.get("ascii_art", "")
-            or ""
+            or "",
+            item_name=str(item.get("name", "Unnamed Item")),
+            category=str(item.get("category", "Item")),
         )
         art_view = QPlainTextEdit()
         art_view.setObjectName("inventoryAsciiArt")
@@ -15555,84 +16316,356 @@ class AlchemyNotebookScreen(RepositoryBackedWidget):
 
         return name, name
 
-class HistoryScreen(RepositoryBackedWidget):
-    """Player journal with explicit AI sharing control."""
+class NotesScreen(RepositoryBackedWidget):
+    """Structured player notes with tag organization and AI sharing control."""
 
     def __init__(self) -> None:
         super().__init__()
 
-        self._loading_journal = False
-        self._saving_journal = False
+        self._loading_notes = False
+        self._saving_notes = False
         self._autosave_timer = QTimer(self)
         self._autosave_timer.setSingleShot(True)
         self._autosave_timer.setInterval(900)
-        self._autosave_timer.timeout.connect(self._autosave_journal)
+        self._autosave_timer.timeout.connect(self._autosave_notes)
 
-        self.journal_input = QTextEdit()
-        self.journal_input.setPlaceholderText(
-            "Write player notes here. They stay private unless sharing is enabled."
+        self._note_entries: list[dict[str, Any]] = []
+
+        self.add_entry_button = QPushButton("Add new entry")
+        self.add_entry_button.clicked.connect(self._add_note_entry)
+        self.delete_entry_button = QPushButton("Delete entry")
+        self.delete_entry_button.clicked.connect(self._delete_selected_entry)
+
+        self.entry_tree = QTreeWidget()
+        self.entry_tree.setHeaderHidden(True)
+        self.entry_tree.setMinimumWidth(240)
+        self.entry_tree.currentItemChanged.connect(self._show_selected_entry)
+
+        self.entry_heading_input = QLineEdit()
+        self.entry_heading_input.setPlaceholderText("Entry heading")
+        self.entry_heading_input.textChanged.connect(self._entry_editor_changed)
+        self.entry_body_input = QTextEdit()
+        self.entry_body_input.setAcceptRichText(False)
+        self.entry_body_input.setPlaceholderText(
+            "Write the note in Markdown. Select text and use the formatting buttons."
         )
-        self.journal_input.textChanged.connect(self._schedule_journal_autosave)
+        self.entry_body_input.textChanged.connect(self._entry_editor_changed)
+        self.entry_tags_input = QLineEdit()
+        self.entry_tags_input.setPlaceholderText("e.g. quests, suspects, places")
+        self.entry_tags_input.textChanged.connect(self._tags_text_changed)
+        self.entry_tags_input.editingFinished.connect(self._tags_editing_finished)
 
-        self.share_with_ai_checkbox = QCheckBox("Send these journal notes to the AI")
+        editor_layout = QVBoxLayout()
+        editor_layout.addWidget(
+            QLabel("Heading (starts with the current in-game date and time):")
+        )
+        editor_layout.addWidget(self.entry_heading_input)
+        editor_layout.addWidget(QLabel("Note (Markdown):"))
+        markdown_toolbar = QHBoxLayout()
+        self._markdown_buttons: list[QPushButton] = []
+        self._add_markdown_button(markdown_toolbar, "B", "Bold (Ctrl+B)", "bold")
+        self._add_markdown_button(markdown_toolbar, "I", "Italic (Ctrl+I)", "italic")
+        self._add_markdown_button(markdown_toolbar, "U", "Underline (Ctrl+U)", "underline")
+        self._add_markdown_button(markdown_toolbar, "• List", "Bulleted list", "bullet")
+        self._add_markdown_button(markdown_toolbar, "1. List", "Numbered list", "numbered")
+        self._add_markdown_button(markdown_toolbar, "H", "Heading", "heading")
+        self._add_markdown_button(markdown_toolbar, "Quote", "Block quote", "quote")
+        self._add_markdown_button(markdown_toolbar, "Code", "Inline code", "code")
+        self._add_markdown_button(markdown_toolbar, "Link", "Link", "link")
+        markdown_toolbar.addStretch()
+        editor_layout.addLayout(markdown_toolbar)
+        editor_layout.addWidget(self.entry_body_input)
+        editor_layout.addWidget(QLabel("Tags (comma-separated or #tag):"))
+        editor_layout.addWidget(self.entry_tags_input)
+        editor = QWidget()
+        editor.setLayout(editor_layout)
+
+        entries_layout = QHBoxLayout()
+        entries_layout.addWidget(self.entry_tree, 1)
+        entries_layout.addWidget(editor, 3)
+
+        self.share_with_ai_checkbox = QCheckBox("Send these notes to the AI")
         self.share_with_ai_checkbox.toggled.connect(
-            lambda _checked: self._schedule_journal_autosave()
+            lambda _checked: self._schedule_notes_autosave()
         )
 
         layout = QVBoxLayout()
         layout.addWidget(self.share_with_ai_checkbox)
-        layout.addWidget(self.journal_input)
+        button_layout = QHBoxLayout()
+        button_layout.addWidget(self.add_entry_button)
+        button_layout.addWidget(self.delete_entry_button)
+        button_layout.addStretch()
+        layout.addLayout(button_layout)
+        layout.addLayout(entries_layout)
 
         self.setLayout(layout)
+        self._set_editor_entry(None)
+
+    def _add_markdown_button(
+        self,
+        layout: QHBoxLayout,
+        label: str,
+        tooltip: str,
+        action: str,
+    ) -> None:
+        button = QPushButton(label)
+        button.setToolTip(tooltip)
+        button.setMaximumWidth(78)
+        button.clicked.connect(lambda _checked=False, name=action: self._apply_markdown(name))
+        if action == "bold":
+            button.setShortcut("Ctrl+B")
+        elif action == "italic":
+            button.setShortcut("Ctrl+I")
+        elif action == "underline":
+            button.setShortcut("Ctrl+U")
+        layout.addWidget(button)
+        self._markdown_buttons.append(button)
+
+    def _apply_markdown(self, action: str) -> None:
+        """Applies portable Markdown syntax to the current body selection."""
+
+        if self._selected_entry() is None:
+            return
+        cursor = self.entry_body_input.textCursor()
+        start = cursor.selectionStart()
+        end = cursor.selectionEnd()
+        text = self.entry_body_input.toPlainText()
+
+        wrappers = {
+            "bold": ("**", "**", "bold text"),
+            "italic": ("*", "*", "italic text"),
+            "underline": ("<u>", "</u>", "underlined text"),
+            "code": ("`", "`", "code"),
+            "link": ("[", "](https://example.com)", "link text"),
+        }
+        if action in wrappers:
+            prefix, suffix, placeholder = wrappers[action]
+            updated, selection_start, selection_end = wrap_markdown_text(
+                text, start, end, prefix, suffix, placeholder=placeholder
+            )
+        else:
+            cursor.setPosition(start)
+            cursor.movePosition(QTextCursor.MoveOperation.StartOfBlock)
+            block_start = cursor.position()
+            cursor.setPosition(end)
+            cursor.movePosition(QTextCursor.MoveOperation.EndOfBlock)
+            block_end = cursor.position()
+            selected_lines = text[block_start:block_end]
+            if action == "numbered":
+                replacement = prefix_markdown_lines(selected_lines, "", numbered=True)
+            else:
+                prefixes = {"bullet": "- ", "heading": "## ", "quote": "> "}
+                replacement = prefix_markdown_lines(selected_lines, prefixes[action])
+            updated = text[:block_start] + replacement + text[block_end:]
+            selection_start = block_start
+            selection_end = block_start + len(replacement)
+
+        self.entry_body_input.setPlainText(updated)
+        cursor = self.entry_body_input.textCursor()
+        cursor.setPosition(selection_start)
+        cursor.setPosition(selection_end, QTextCursor.MoveMode.KeepAnchor)
+        self.entry_body_input.setTextCursor(cursor)
+        self.entry_body_input.setFocus()
 
     def refresh(self) -> None:
-        """Reloads journal notes and sharing preference."""
+        """Reloads notes, tag groups, and sharing preference."""
 
         repository = self.repository()
         self._autosave_timer.stop()
-        self._loading_journal = True
-
+        self._loading_notes = True
         try:
             if repository is None:
-                self.journal_input.clear()
+                self._note_entries = []
+                self.entry_tree.clear()
+                self._set_editor_entry(None)
                 self.share_with_ai_checkbox.setChecked(False)
                 return
-
-            self.journal_input.setPlainText(repository.get_journal_notes())
-            self.share_with_ai_checkbox.setChecked(repository.get_journal_share_with_ai())
+            self._note_entries = repository.get_note_entries()
+            self._refresh_entry_list()
+            self.share_with_ai_checkbox.setChecked(repository.get_notes_share_with_ai())
         finally:
-            self._loading_journal = False
+            self._loading_notes = False
 
-    def _schedule_journal_autosave(self) -> None:
-        """Debounces journal autosaves while the player is typing."""
+    def _schedule_notes_autosave(self) -> None:
+        if not self._loading_notes and not self._saving_notes:
+            self._autosave_timer.start()
 
-        if self._loading_journal or self._saving_journal:
-            return
-
-        self._autosave_timer.start()
-
-    def _autosave_journal(self) -> None:
-        """Persists journal changes without interrupting the player."""
-
+    def _autosave_notes(self) -> None:
         self._autosave_timer.stop()
-        self._persist_journal()
+        self._persist_notes()
 
-    def _persist_journal(self) -> None:
-        """Persists journal notes and AI sharing preference."""
-
+    def _persist_notes(self) -> None:
         repository = self.repository()
-
-        if repository is None or self._loading_journal or self._saving_journal:
+        if repository is None or self._loading_notes or self._saving_notes:
             return
-
-        self._saving_journal = True
-
+        self._saving_notes = True
         try:
-            repository.set_journal_notes(self.journal_input.toPlainText())
-            repository.set_journal_share_with_ai(self.share_with_ai_checkbox.isChecked())
+            repository.set_note_entries(self._note_entries)
+            repository.set_notes_share_with_ai(self.share_with_ai_checkbox.isChecked())
             self.notify_repository_changed()
         finally:
-            self._saving_journal = False
+            self._saving_notes = False
+
+    def _add_note_entry(self) -> None:
+        """Adds and selects an entry headed with the current in-game time."""
+
+        repository = self.repository()
+        if repository is None:
+            return
+        heading = build_calendar_snapshot(
+            repository.get_current_calendar_minute(),
+            repository.get_calendar_settings(),
+        )["display_label"]
+        entry = {"entry_id": str(uuid.uuid4()), "heading": heading, "body": "", "tags": []}
+        self._note_entries.insert(0, entry)
+        self._refresh_entry_list(selected_entry_id=entry["entry_id"])
+        self.entry_body_input.setFocus()
+        self._schedule_notes_autosave()
+
+    def _delete_selected_entry(self) -> None:
+        """Deletes the selected note after confirmation."""
+
+        entry = self._selected_entry()
+        if entry is None:
+            return
+        answer = QMessageBox.question(
+            self,
+            "Delete Note",
+            "Delete this note? This cannot be undone.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        self._note_entries = [
+            candidate for candidate in self._note_entries
+            if candidate["entry_id"] != entry["entry_id"]
+        ]
+        self._refresh_entry_list()
+        self._schedule_notes_autosave()
+
+    def _refresh_entry_list(self, *, selected_entry_id: str = "") -> None:
+        """Groups notes under All Notes and every assigned tag."""
+
+        previous_loading = self._loading_notes
+        self._loading_notes = True
+        try:
+            self.entry_tree.clear()
+            selected_item = None
+            groups: list[tuple[str, list[dict[str, Any]]]] = [("All Notes", self._note_entries)]
+            tag_groups: dict[str, tuple[str, list[dict[str, Any]]]] = {}
+            for entry in self._note_entries:
+                for tag in entry["tags"]:
+                    identity = tag.casefold()
+                    if identity not in tag_groups:
+                        tag_groups[identity] = (tag, [])
+                    tag_groups[identity][1].append(entry)
+            groups.extend(
+                (f"#{label}", entries)
+                for label, entries in sorted(
+                    tag_groups.values(), key=lambda group: group[0].casefold()
+                )
+            )
+            for group_label, entries in groups:
+                group_item = QTreeWidgetItem([f"{group_label} ({len(entries)})"])
+                group_item.setFlags(group_item.flags() & ~Qt.ItemFlag.ItemIsSelectable)
+                self.entry_tree.addTopLevelItem(group_item)
+                group_item.setExpanded(True)
+                for entry in entries:
+                    item = QTreeWidgetItem([entry["heading"].strip() or "Untitled note"])
+                    item.setData(0, Qt.ItemDataRole.UserRole, entry["entry_id"])
+                    group_item.addChild(item)
+                    if entry["entry_id"] == selected_entry_id and selected_item is None:
+                        selected_item = item
+            if selected_item is not None:
+                self.entry_tree.setCurrentItem(selected_item)
+            elif self._note_entries:
+                all_notes_group = self.entry_tree.topLevelItem(0)
+                if all_notes_group is not None:
+                    self.entry_tree.setCurrentItem(all_notes_group.child(0))
+            else:
+                self._set_editor_entry(None)
+        finally:
+            self._loading_notes = previous_loading
+        self._show_selected_entry(self.entry_tree.currentItem(), None)
+
+    def _selected_entry(self) -> dict[str, Any] | None:
+        item = self.entry_tree.currentItem()
+        entry_id = str(item.data(0, Qt.ItemDataRole.UserRole) or "") if item else ""
+        return next(
+            (entry for entry in self._note_entries if entry["entry_id"] == entry_id),
+            None,
+        )
+
+    def _show_selected_entry(self, current: Any, _previous: Any) -> None:
+        """Loads the selected entry into the editable fields."""
+
+        self._set_editor_entry(self._selected_entry() if current is not None else None)
+
+    def _set_editor_entry(self, entry: dict[str, Any] | None) -> None:
+        previous_loading = self._loading_notes
+        self._loading_notes = True
+        try:
+            enabled = entry is not None
+            self.entry_heading_input.setEnabled(enabled)
+            self.entry_body_input.setEnabled(enabled)
+            self.entry_tags_input.setEnabled(enabled)
+            for button in self._markdown_buttons:
+                button.setEnabled(enabled)
+            self.delete_entry_button.setEnabled(enabled)
+            self.entry_heading_input.setText(entry["heading"] if entry else "")
+            self.entry_body_input.setPlainText(entry["body"] if entry else "")
+            self.entry_tags_input.setText(", ".join(entry["tags"]) if entry else "")
+        finally:
+            self._loading_notes = previous_loading
+
+    def _entry_editor_changed(self) -> None:
+        """Copies editor changes into the selected structured entry."""
+
+        if self._loading_notes:
+            return
+        entry = self._selected_entry()
+        if entry is None:
+            return
+        entry["heading"] = self.entry_heading_input.text()
+        entry["body"] = self.entry_body_input.toPlainText()
+        new_tags = parse_note_tags(self.entry_tags_input.text())
+        tags_changed = new_tags != entry["tags"]
+        entry["tags"] = new_tags
+        selected_id = entry["entry_id"]
+        if tags_changed:
+            self._refresh_entry_list(selected_entry_id=selected_id)
+        else:
+            label = entry["heading"].strip() or "Untitled note"
+            for group_index in range(self.entry_tree.topLevelItemCount()):
+                group_item = self.entry_tree.topLevelItem(group_index)
+                if group_item is None:
+                    continue
+                for child_index in range(group_item.childCount()):
+                    item = group_item.child(child_index)
+                    if item is None:
+                        continue
+                    if str(item.data(0, Qt.ItemDataRole.UserRole) or "") == selected_id:
+                        item.setText(0, label)
+        self._schedule_notes_autosave()
+
+    def _tags_text_changed(self) -> None:
+        """Keeps tag edits durable without rebuilding groups on every keystroke."""
+
+        if self._loading_notes:
+            return
+        entry = self._selected_entry()
+        if entry is None:
+            return
+        entry["tags"] = parse_note_tags(self.entry_tags_input.text())
+        self._schedule_notes_autosave()
+
+    def _tags_editing_finished(self) -> None:
+        """Rebuilds automatic tag groups after the user finishes editing tags."""
+
+        entry = self._selected_entry()
+        if entry is not None:
+            self._refresh_entry_list(selected_entry_id=entry["entry_id"])
 
 
 class SettingsScreen(RepositoryBackedWidget):
@@ -16416,6 +17449,42 @@ def _apply_audio_settings_to_managers(
         narration_player.set_enabled(narrator_enabled)
 
 
+def _resolve_speaker_cues_for_repository(
+    repository: SaveRepository,
+    narration_player: NarrationPlayerProtocol | None,
+    speaker_cues: Any,
+) -> list[dict[str, str]]:
+    """Assigns installed voices and persists stable speaker-to-voice IDs."""
+
+    tts_audio = normalize_tts_audio_fields(
+        {
+            "tts_voice": repository.get_setting(
+                "audio.tts_voice", DEFAULT_NARRATOR_VOICE
+            ),
+            "tts_voice_mode": repository.get_setting(
+                "audio.tts_voice_mode", "preset"
+            ),
+            "tts_voice_blend": repository.get_setting(
+                "audio.tts_voice_blend", {}
+            ),
+        }
+    )
+    voice_options = _narrator_voice_options(narration_player)
+    existing_assignments = repository.get_setting(
+        "audio.speaker_voice_assignments",
+        {},
+    )
+    resolved, assignments = assign_speaker_voices(
+        speaker_cues,
+        narrator_voice=active_voice_spec_from_audio(tts_audio),
+        available_voice_ids=list(voice_options.values()),
+        existing_assignments=existing_assignments,
+    )
+    if assignments != existing_assignments:
+        repository.set_setting("audio.speaker_voice_assignments", assignments)
+    return resolved
+
+
 def _preserved_player_character_fields(
     setup: dict[str, Any],
     ai_character: Any,
@@ -17115,6 +18184,8 @@ def _starting_locations_from_table(table: QTableWidget) -> list[dict[str, Any]]:
     locations: list[dict[str, Any]] = []
 
     for row in range(table.rowCount()):
+        if table.isRowHidden(row):
+            continue
         name_widget = table.cellWidget(row, 0)
         description_widget = table.cellWidget(row, 1)
         mode_widget = table.cellWidget(row, 2)
@@ -17192,6 +18263,8 @@ def _starting_location_options_from_table(
     options: list[tuple[str, str]] = []
 
     for row in range(table.rowCount()):
+        if table.isRowHidden(row):
+            continue
         row_id = _starting_location_row_id_for_row(table, row)
         name_widget = table.cellWidget(row, 0)
         name = name_widget.text().strip() if isinstance(name_widget, QLineEdit) else ""
@@ -17210,6 +18283,8 @@ def _sync_starting_npc_location_dropdowns(
 
     valid_ids = {row_id for row_id, _name in locations}
     for row in range(npc_table.rowCount()):
+        if npc_table.isRowHidden(row):
+            continue
         location_widget = npc_table.cellWidget(row, 1)
         if not isinstance(location_widget, QComboBox):
             continue
@@ -17235,6 +18310,8 @@ def _sync_starting_location_parent_dropdowns(
     valid_ids = {row_id for row_id, _name in locations}
 
     for row in range(table.rowCount()):
+        if table.isRowHidden(row):
+            continue
         row_id = _starting_location_row_id_for_row(table, row)
         sublocation_widget = table.cellWidget(row, 3)
         parent_widget = table.cellWidget(row, 4)
@@ -17339,6 +18416,8 @@ def _starting_npcs_from_table(table: QTableWidget) -> list[dict[str, Any]]:
     npcs: list[dict[str, Any]] = []
 
     for row in range(table.rowCount()):
+        if table.isRowHidden(row):
+            continue
         name_widget = table.cellWidget(row, 0)
         location_widget = table.cellWidget(row, 1)
         description_widget = table.cellWidget(row, 2)
@@ -17652,6 +18731,8 @@ def _starter_suggestions_from_table(
 
     suggestions: list[dict[str, Any]] = []
     for row in range(table.rowCount()):
+        if table.isRowHidden(row):
+            continue
         widget = table.cellWidget(row, 0)
         suggestion = widget.text().strip() if isinstance(widget, QLineEdit) else ""
         if not suggestion:
@@ -17717,6 +18798,8 @@ def _starter_items_from_table(table: QTableWidget) -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
 
     for row in range(table.rowCount()):
+        if table.isRowHidden(row):
+            continue
         name_widget = table.cellWidget(row, 0)
         quantity_widget = table.cellWidget(row, 1)
         category_widget = table.cellWidget(row, 2)
@@ -17841,6 +18924,8 @@ def _starter_weapons_from_table(table: QTableWidget) -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
 
     for row in range(table.rowCount()):
+        if table.isRowHidden(row):
+            continue
         name_widget = table.cellWidget(row, 0)
         quantity_widget = table.cellWidget(row, 1)
         hands_widget = table.cellWidget(row, 2)
@@ -17945,6 +19030,8 @@ def _starter_armor_from_table(table: QTableWidget) -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
 
     for row in range(table.rowCount()):
+        if table.isRowHidden(row):
+            continue
         name_widget = table.cellWidget(row, 0)
         quantity_widget = table.cellWidget(row, 1)
         covers_widget = table.cellWidget(row, 2)
@@ -18055,6 +19142,8 @@ def _currency_denominations_from_table(table: QTableWidget) -> list[dict[str, An
     denominations: list[dict[str, Any]] = []
 
     for row in range(table.rowCount()):
+        if table.isRowHidden(row):
+            continue
         name_widget = table.cellWidget(row, 0)
         plural_widget = table.cellWidget(row, 1)
         value_widget = table.cellWidget(row, 2)
@@ -18112,6 +19201,8 @@ def _economy_examples_from_table(table: QTableWidget) -> list[dict[str, Any]]:
     examples: list[dict[str, Any]] = []
 
     for row in range(table.rowCount()):
+        if table.isRowHidden(row):
+            continue
         name_widget = table.cellWidget(row, 0)
         value_widget = table.cellWidget(row, 1)
         name = name_widget.text().strip() if isinstance(name_widget, QLineEdit) else ""

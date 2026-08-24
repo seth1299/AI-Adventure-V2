@@ -21,10 +21,7 @@ from ai_adventure.combat import (
 )
 from ai_adventure.currency import format_currency_amount
 from ai_adventure.core.models import AdventureState
-from ai_adventure.audio.pronunciation import (
-    KOKORO_IPA_PROMPT_RULE,
-    normalize_pronunciation_map,
-)
+from ai_adventure.notes import note_entries_for_ai, normalize_note_entries
 from ai_adventure.narration_preferences import normalize_narration_preferences
 
 
@@ -362,16 +359,24 @@ class AiContextBuilder:
             for entry in (miscellaneous or [])
             if isinstance(entry, dict)
         ]
-        journal_share_with_ai = _coerce_bool(
-            state.settings.values.get("journal.share_with_ai", False),
+        notes_share_with_ai = _coerce_bool(
+            state.settings.values.get("notes.share_with_ai", False),
             default=False,
         )
-        journal_notes = ""
+        note_entries: list[dict[str, Any]] = []
 
-        if journal_share_with_ai:
-            journal_notes = _compact_text(
-                state.settings.values.get("journal.private_notes", "")
+        if notes_share_with_ai:
+            note_entries = note_entries_for_ai(
+                normalize_note_entries(state.settings.values.get("notes.entries", []))
             )
+            note_entries = [
+                {
+                    "heading": _compact_text(entry["heading"], max_chars=300),
+                    "body": _compact_text(entry["body"]),
+                    "tags": entry["tags"],
+                }
+                for entry in note_entries[:MAX_CONTEXT_LIST_ITEMS]
+            ]
         narration_preferences = normalize_narration_preferences(
             {
                 "tense": state.settings.values.get("ai.narration_tense", ""),
@@ -411,9 +416,6 @@ class AiContextBuilder:
                 "adventure_title": state.metadata.title,
                 "player": {
                     "name": state.player.name,
-                    "name_pronunciation": _compact_text(
-                        state.player.name_pronunciation
-                    ),
                     "pronouns": _compact_text(state.player.pronouns),
                     "appearance": _compact_text(state.player.appearance),
                     "backstory": _compact_text(state.player.backstory),
@@ -427,9 +429,6 @@ class AiContextBuilder:
                     "armor_rating": state.player.armor_rating,
                     "equipment": state.player.equipment,
                 },
-                "pronunciation_map": normalize_pronunciation_map(
-                    state.settings.values.get("tts.pronunciation_map", {})
-                ),
                 "player_ai_preferences": {
                     "additional_context": _compact_text(
                         state.settings.values.get("ai.additional_context", "")
@@ -481,12 +480,14 @@ class AiContextBuilder:
                         "structured response rules."
                     ),
                 },
-                "journal": {
-                    "share_with_ai": journal_share_with_ai,
-                    "player_notes": journal_notes,
+                "notes": {
+                    "share_with_ai": notes_share_with_ai,
+                    "entries": note_entries,
                     "rules": (
-                        "Use player_notes only when share_with_ai is true. "
-                        "These are player-authored journal notes, not verified "
+                        "Use entries only when share_with_ai is true. Each heading, "
+                        "body, and tag is player-authored, not verified. Bodies may "
+                        "contain Markdown formatting; interpret the content without "
+                        "treating Markdown syntax as world facts. These are not verified "
                         "world facts unless supported by established state or "
                         "story history."
                     ),
@@ -616,6 +617,13 @@ class AiContextBuilder:
                             "metadata.item_uuid, a stable item identity; "
                             "reuse it for the same item and do not split one item "
                             "into duplicate definitions because of name variations."
+                        ),
+                        "ascii_art_rule": (
+                            "New item definitions require an original 3-12 line "
+                            "fixed-width drawing of the recognizable item shape. A "
+                            "bracketed item name such as [Camera], a caption, or any "
+                            "other single-line label is invalid and is not ASCII art. "
+                            "Reuse valid existing catalog art exactly."
                         ),
                     },
                 },
@@ -867,6 +875,16 @@ class AiContextBuilder:
                             "the app will display it with the current calendar and "
                             "time settings."
                         ),
+                        "description_rule": (
+                            "Every new task requires a complete player-visible "
+                            "description explaining what must be done, all currently "
+                            "known relevant people and places, and how the Player can "
+                            "recognize completion. Include only player-known facts. "
+                            "Preserve an existing description when an update does not "
+                            "change it. When an existing task has a blank or incomplete "
+                            "description, repair it with ActiveTaskUpsertedEvent as "
+                            "soon as the task is relevant."
+                        ),
                         "completion_rule": (
                             "Suggest ActiveTaskCompletedEvent when a task is fulfilled, "
                             "cancelled, resolved, delivered, or otherwise no longer active."
@@ -939,6 +957,26 @@ class AiContextBuilder:
                             "meaningfully appropriate for the response, with no fixed "
                             "cue-count target; omit cues when no listed sound fits. The "
                             "app replays each saved cue at that same boundary."
+                        ),
+                        "english_text_rule": (
+                            "Every generated string value must use printable ASCII "
+                            "English characters only. Transliterate accented Latin "
+                            "letters to unaccented English and never emit foreign "
+                            "scripts, IPA, phoneme strings, pronunciation annotations, "
+                            "or pronunciation_map. Python enforces this before any "
+                            "generated text reaches state, UI, persistence, or TTS."
+                        ),
+                        "speaker_voice_rule": (
+                            "Return speaker_cues for every exact contiguous span of "
+                            "non-narrator dialogue in response. Copy the complete span, "
+                            "including outer double quotation marks, into a unique "
+                            "anchor_text. Use an actual NPC's exact npc_id as speaker_id "
+                            "and reuse it on later turns; use distinct stable "
+                            "lower_snake_case IDs for other speakers. Choose only a "
+                            "broad established voice_profile and use neutral when "
+                            "unspecified. Python selects and durably remembers the "
+                            "installed voice ID. Do not cue narrator prose or the "
+                            "Player Character."
                         ),
                     },
                 },
@@ -1052,7 +1090,11 @@ class AiContextBuilder:
                             "home, such as original creatures or species, cultures, "
                             "factions, religions, laws, historical events, phenomena, "
                             "or customs. Do not duplicate NPCs, locations, items, tasks, "
-                            "or hidden GM secrets."
+                            "or hidden GM secrets. Use category Creature for every "
+                            "non-NPC creature or monster the Player learns about; its "
+                            "details must contain only facts known to the Player or "
+                            "Player Character because Creature records populate the "
+                            "player-visible Bestiary."
                         ),
                     },
                     "entries": clean_miscellaneous,
@@ -1095,11 +1137,21 @@ class AiContextBuilder:
                     "applies events. Include multiple entries of the same event type "
                     "when multiple distinct state changes happen in one turn."
                 ),
-                "pronunciation_map": (
-                    "TTS-only array of {term, ipa} records for exact visible names or "
-                    "recurring terms whose spelling is genuinely ambiguous. Omit ordinary "
-                    "words and never place pronunciation hints in response. "
-                    f"{KOKORO_IPA_PROMPT_RULE}"
+                "english_text": (
+                    "Every string in the response object must use printable ASCII "
+                    "English characters only. Use unaccented English transliterations "
+                    "and never return pronunciation_map, IPA, phoneme strings, foreign "
+                    "scripts, or inline pronunciation markup."
+                ),
+                "speaker_cues": (
+                    "TTS-only array covering every contiguous non-narrator spoken "
+                    "span in response. Each record must contain anchor_text copied "
+                    "exactly with outer double quotes, speaker_id, speaker_name, and "
+                    "voice_profile. Use the exact canonical npc_id for an NPC, reuse "
+                    "one ID for the same speaker, and use different IDs for different "
+                    "speakers. Return [] when only the narrator speaks or for "
+                    "out_of_game. Python owns final installed voice assignment and "
+                    "persistence."
                 ),
                 "conversation_mode": (
                     "conversation_mode is selected explicitly by the player in the UI "
@@ -1146,16 +1198,12 @@ class AiContextBuilder:
                     "new date labels."
                 ),
                 "character_profile": (
-                    "Use state.player.name, name_pronunciation, pronouns, appearance, "
-                    "backstory, and notes as "
+                    "Use state.player.name, pronouns, appearance, backstory, and notes as "
                     "player-authored character context. Treat it as true for the "
                     "player character. state.player.pronouns is the canonical source "
                     "for referring to the player character: use it exactly and never "
                     "infer different pronouns from the name, appearance, voice, "
-                    "backstory, or genre. If name_pronunciation is non-empty, preserve it "
-                    "as the authoritative player guide for TTS and use it when choosing "
-                    "the character name's IPA. Do not expose pronunciation data "
-                    "it in player-facing prose. Do not let NPCs know private profile "
+                    "backstory, or genre. Do not let NPCs know private profile "
                     "details unless they have observed them, been told, or have a "
                     "clear in-world reason to know."
                 ),
@@ -1177,15 +1225,18 @@ class AiContextBuilder:
                     "player-facing prose. Also use "
                     "state.player_ai_preferences.additional_context as persistent "
                     "player-provided guidance for boundaries and miscellaneous "
-                    "preferences. This is always AI-facing; Journal notes are only "
-                    "AI-facing when state.journal.share_with_ai is true."
+                    "preferences. This is always AI-facing; Notes are only AI-facing "
+                    "when state.notes.share_with_ai is true."
                 ),
-                "journal": (
-                    "When state.journal.share_with_ai is true, use "
-                    "state.journal.player_notes as player-authored notes, theories, "
-                    "reminders, and priorities. Treat them as the player's perspective, "
-                    "not automatically true world facts. When share_with_ai is false, "
-                    "ignore Journal notes because they are private."
+                "notes": (
+                    "When state.notes.share_with_ai is true, use state.notes.entries "
+                    "headings, bodies, and tags as player-authored notes, "
+                    "theories, reminders, and priorities. Treat them as the player's "
+                    "perspective, not automatically true world facts. Interpret Markdown "
+                    "formatting in note bodies as presentation syntax. Entry headings may "
+                    "contain player-edited in-game date and time labels. When "
+                    "share_with_ai is false, "
+                    "ignore Notes because they are private."
                 ),
                 "mature_content": ai_mode_preferences["model_content_rules"],
                 "active_tasks": (
@@ -1193,7 +1244,10 @@ class AiContextBuilder:
                     "commissions, custom orders, pending purchases, and other "
                     "ongoing obligations. Suggest ActiveTaskUpsertedEvent for new "
                     "or changed tasks and ActiveTaskCompletedEvent when one is no "
-                    "longer active. Use due_elapsed_minutes for exact deadlines "
+                    "longer active. Every new task needs a complete player-visible "
+                    "description covering the objective, currently known relevant "
+                    "people and places, and how to recognize completion. Use "
+                    "due_elapsed_minutes for exact deadlines "
                     "instead of vague due-date prose."
                 ),
                 "item_catalog": (
@@ -1285,6 +1339,9 @@ class AiContextBuilder:
                     "culture, faction, religion, law, historical event, phenomenon, "
                     "custom, or other concept is established or changed and no more "
                     "specific state table fits. Reuse the same misc_id for updates. "
+                    "Use category Creature for every non-NPC creature or monster the "
+                    "Player learns about and include only player-known facts in its "
+                    "details; these records populate the player-visible Bestiary. "
                     "Never duplicate NPC, Location, Item, task, or GM-secret records."
                 ),
                 "currency_transactions": (

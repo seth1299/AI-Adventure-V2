@@ -19,6 +19,7 @@ from ai_adventure.alchemy.ingredients import (
     normalize_crafting_item_rarity,
     normalize_recipe_ingredients,
 )
+from ai_adventure.ascii_art import ensure_substantive_ascii_art
 from ai_adventure.context.creative_guardrails import (
     contains_banned_creative_term,
     find_banned_creative_terms,
@@ -372,6 +373,11 @@ class EventApplier:
             merged_metadata["ascii_art"] = str(
                 catalog_entry.get("ascii_art", payload.get("ascii_art", "")) or ""
             ).strip("\r\n")
+        merged_metadata["ascii_art"] = ensure_substantive_ascii_art(
+            merged_metadata.get("ascii_art", ""),
+            item_name=name,
+            category=category,
+        )
 
         self.repository.add_inventory_item(
             name=name,
@@ -1351,7 +1357,11 @@ class EventApplier:
         description = _first_text(payload, "description", "notes")
         location = _first_text(payload, "location", "found_at", "source")
         uses = _as_string_list(payload.get("uses", []))
-        ascii_art = str(payload.get("ascii_art", "") or "").strip("\r\n")
+        ascii_art = ensure_substantive_ascii_art(
+            payload.get("ascii_art", ""),
+            item_name=name,
+            category=_first_text(payload, "category") or "Material",
+        )
         rarity = normalize_crafting_item_rarity(payload.get("rarity"))
         notes = _first_text(payload, "notes")
         value_base_units = max(
@@ -1507,6 +1517,12 @@ class EventApplier:
             _first_text(payload, "description", "objective", "summary")
             or str((existing_task or {}).get("description", "")).strip()
         )
+        if not description:
+            return _invalid(
+                event_type,
+                payload,
+                "An active task requires a player-visible description.",
+            )
         status = (
             _first_text(payload, "status")
             or str((existing_task or {}).get("status", "")).strip()

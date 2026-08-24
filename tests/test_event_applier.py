@@ -278,6 +278,36 @@ class EventApplierTests(unittest.TestCase):
             self.assertNotIn("Old Brass Light", {item["name"] for item in catalog})
             self.assertEqual(catalog_lantern["ascii_art"], "  ___\n /___\\\n | * |")
 
+    def test_inventory_item_added_replaces_bracket_label_ascii_art(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = SaveRepository.create_new_save(
+                Path(temp_dir),
+                "ASCII Art Guard",
+            )
+
+            result = EventApplier(repository).apply_event(
+                {
+                    "type": "InventoryItemAddedEvent",
+                    "payload": {
+                        "item_type": "Item",
+                        "item_name": "Camera",
+                        "description": "A sturdy analog camera.",
+                        "ascii_art": "[Camera]",
+                        "amount": 1,
+                        "value_base_units": 50,
+                    },
+                }
+            )
+
+            camera = next(
+                item
+                for item in repository.list_item_catalog()
+                if item["name"] == "Camera"
+            )
+            self.assertEqual(result.status, "applied")
+            self.assertGreaterEqual(len(camera["ascii_art"].splitlines()), 3)
+            self.assertNotIn("Camera", camera["ascii_art"])
+
     def test_inventory_item_added_normalizes_finished_toxin_to_poison(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             repository = SaveRepository.create_new_save(
@@ -1250,6 +1280,33 @@ class EventApplierTests(unittest.TestCase):
             self.assertEqual(entries[0]["misc_id"], "glassback_grazer")
             self.assertIn("darkens before storms", entries[0]["details"])
 
+    def test_bestiary_lists_only_public_creature_lore_and_normalizes_aliases(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = SaveRepository.create_new_save(Path(temp_dir), "Bestiary Test")
+            repository.upsert_miscellaneous(
+                misc_id="ash_wolf",
+                name="Ash Wolf",
+                category="Monster",
+                details="Its tracks glow faintly at dusk.",
+            )
+            repository.upsert_miscellaneous(
+                misc_id="ember_court",
+                name="Ember Court",
+                category="Faction",
+                details="A coalition of fire priests.",
+            )
+            repository.upsert_gm_secret(
+                secret_id="ash_wolf_weakness",
+                title="Ash Wolf Weakness",
+                details="It is secretly vulnerable to rainwater.",
+            )
+
+            entries = repository.list_bestiary_entries()
+
+            self.assertEqual([entry["misc_id"] for entry in entries], ["ash_wolf"])
+            self.assertEqual(entries[0]["category"], "Creature")
+            self.assertNotIn("rainwater", entries[0]["details"])
+
     def test_event_payloads_sanitize_banned_creative_terms_before_storage(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             repository = SaveRepository.create_new_save(Path(temp_dir), "Guardrail Test")
@@ -1699,6 +1756,30 @@ class EventApplierTests(unittest.TestCase):
             self.assertEqual(task["location"], "Player's Workshop")
             self.assertEqual(task["reward"], "N/A")
             self.assertEqual(task["due_date"], "N/A")
+
+    def test_new_active_task_requires_player_visible_description(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = SaveRepository.create_new_save(
+                Path(temp_dir),
+                "Task Description Guard",
+            )
+
+            result = EventApplier(repository).apply_event(
+                {
+                    "type": "ActiveTaskUpsertedEvent",
+                    "payload": {
+                        "name": "The Kestrel Street Homicide",
+                        "category": "Quest",
+                        "location": "Kestrel Street Alleyway",
+                    },
+                }
+            )
+
+            self.assertEqual(result.status, "skipped")
+            self.assertIn("requires a player-visible description", result.message)
+            self.assertIsNone(
+                repository.get_active_task("The Kestrel Street Homicide")
+            )
 
     def test_active_task_defaults_do_not_overwrite_existing_values(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

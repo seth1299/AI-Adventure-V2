@@ -450,15 +450,7 @@ class GeminiServiceTests(unittest.TestCase):
             "description",
             schema["properties"]["starting_items"]["items"]["properties"],
         )
-        self.assertNotIn(
-            "maxItems",
-            schema["properties"]["pronunciation_map"],
-        )
-        pronunciation_properties = schema["properties"]["pronunciation_map"]["items"][
-            "properties"
-        ]
-        self.assertIn("ipa", pronunciation_properties)
-        self.assertNotIn("phonetic", pronunciation_properties)
+        self.assertNotIn("pronunciation_map", schema["properties"])
 
     def test_new_game_dynamic_schema_keeps_only_missing_character_fields(self) -> None:
         schema = build_new_game_response_schema(
@@ -773,12 +765,7 @@ class GeminiServiceTests(unittest.TestCase):
         )
         self.assertNotIn("InventoryItemAddedEvent", event_types)
         self.assertNotIn("description", schema["properties"]["events"])
-        self.assertNotIn("maxItems", schema["properties"]["pronunciation_map"])
-        pronunciation_properties = schema["properties"]["pronunciation_map"]["items"][
-            "properties"
-        ]
-        self.assertIn("ipa", pronunciation_properties)
-        self.assertNotIn("phonetic", pronunciation_properties)
+        self.assertNotIn("pronunciation_map", schema["properties"])
 
     def test_story_schema_omits_sound_effect_event_without_distinct_effects(self) -> None:
         schema = build_story_response_schema(
@@ -907,6 +894,50 @@ class GeminiServiceTests(unittest.TestCase):
             ["Hammer.wav", "Shop Bell.wav"],
         )
 
+    def test_story_parser_extracts_exact_npc_speaker_cues(self) -> None:
+        result = parse_gemini_story_response(
+            json.dumps(
+                {
+                    "response": 'Mira leans close. "Keep moving." Orin nods.',
+                    "suggested_actions": [],
+                    "events": [],
+                    "out_of_game": False,
+                    "speaker_cues": [
+                        {
+                            "anchor_text": '"Keep moving."',
+                            "speaker_id": "mira_coppercup",
+                            "speaker_name": "Mira",
+                            "voice_profile": "feminine",
+                        }
+                    ],
+                }
+            )
+        )
+
+        self.assertEqual(
+            result.speaker_cues,
+            [
+                {
+                    "anchor_text": '"Keep moving."',
+                    "speaker_id": "mira_coppercup",
+                    "speaker_name": "Mira",
+                    "voice_profile": "feminine",
+                }
+            ],
+        )
+
+    def test_story_speaker_cue_schema_uses_stable_identity_and_voice_profile(self) -> None:
+        cue_schema = STORY_RESPONSE_JSON_SCHEMA["properties"]["speaker_cues"]["items"]
+
+        self.assertEqual(
+            cue_schema["required"],
+            ["anchor_text", "speaker_id", "speaker_name", "voice_profile"],
+        )
+        self.assertIn(
+            "deep_masculine",
+            cue_schema["properties"]["voice_profile"]["enum"],
+        )
+
     def test_sound_effect_schema_requires_exact_anchor_and_position(self) -> None:
         branch = next(
             candidate
@@ -991,6 +1022,28 @@ class GeminiServiceTests(unittest.TestCase):
         self.assertEqual(result.suggested_events, [])
         self.assertEqual(result.sound_effect_cues[0]["filename"], "Hammer.wav")
         self.assertEqual(result.sound_effect_cues[0]["position"], "before")
+
+    def test_new_game_parser_extracts_opening_npc_speaker_cue(self) -> None:
+        result = parse_gemini_new_game_response(
+            json.dumps(
+                {
+                    "world_summary": "A guarded mountain settlement.",
+                    "introductory_message": 'Orin warns, "Stay behind me."',
+                    "events": [],
+                    "speaker_cues": [
+                        {
+                            "anchor_text": '"Stay behind me."',
+                            "speaker_id": "captain_orin",
+                            "speaker_name": "Captain Orin",
+                            "voice_profile": "deep_masculine",
+                        }
+                    ],
+                }
+            )
+        )
+
+        self.assertEqual(result.speaker_cues[0]["speaker_id"], "captain_orin")
+        self.assertEqual(result.speaker_cues[0]["voice_profile"], "deep_masculine")
 
     def test_new_game_starter_items_preserve_free_text_storage_location(self) -> None:
         item_schema = NEW_GAME_RESPONSE_JSON_SCHEMA["properties"]["starting_items"]["items"]
@@ -2812,6 +2865,47 @@ class GeminiServiceTests(unittest.TestCase):
         self.assertIn("Requesting a full regeneration", "\n".join(logs.output))
         self.assertIn("Morning light reaches the loft.", result.introductory_message)
 
+    def test_new_game_retries_bracket_label_ascii_art(self) -> None:
+        packet = self._completed_new_game_packet(start_location_mode="exact")
+        complete_response = self._complete_new_game_response()
+        invalid_response = json.loads(json.dumps(complete_response))
+        invalid_response["starting_items"][0]["ascii_art"] = "[Camera]"
+        fake_client_class = self._install_fake_genai_client(
+            [json.dumps(invalid_response), json.dumps(complete_response)]
+        )
+
+        try:
+            result = GeminiNarrationService(
+                GeminiSettings(api_key="test-key", model="gemini-3.5-flash-lite")
+            ).generate_new_game_world(packet)
+        finally:
+            self._remove_fake_genai_client()
+
+        calls = fake_client_class.last_client.models.calls
+        self.assertEqual(len(calls), 2)
+        self.assertIn("a bracketed name or single-line label is invalid", calls[1]["contents"])
+        self.assertGreaterEqual(
+            len(result.finalized_starter_items[0]["ascii_art"].splitlines()),
+            3,
+        )
+
+    def test_new_game_parser_replaces_bracket_label_art_with_pictogram(self) -> None:
+        parsed = _parse_new_game_starter_items(
+            [
+                {
+                    "name": "Camera",
+                    "category": "Item",
+                    "quantity": 1,
+                    "description": "A sturdy analog camera.",
+                    "ascii_art": "[Camera]",
+                    "value_base_units": 50,
+                }
+            ]
+        )
+
+        self.assertGreaterEqual(len(parsed[0]["ascii_art"].splitlines()), 3)
+        self.assertNotIn("Camera", parsed[0]["ascii_art"])
+
     def test_new_game_discards_incomplete_suggestion_repairs(self) -> None:
         packet = self._completed_new_game_packet(start_location_mode="suggestion")
         complete_response = self._complete_new_game_response()
@@ -2884,7 +2978,7 @@ class GeminiServiceTests(unittest.TestCase):
             "BLOCK_LOW_AND_ABOVE",
         )
         self.assertIn("playful, occasionally zany voice", call["contents"])
-        self.assertIn("Response length — Super Brief", call["contents"])
+        self.assertIn("Response length - Super Brief", call["contents"])
 
     def test_new_game_repairs_banned_terms_until_response_is_clean(self) -> None:
         def response_for(
@@ -2936,7 +3030,7 @@ class GeminiServiceTests(unittest.TestCase):
                             "quantity_unit": "each",
                             "storage_location": "actively_carried",
                             "description": "Useful enough to keep.",
-                            "ascii_art": "[===]",
+                            "ascii_art": " ___\n|___|\n | |",
                             "value_base_units": index + 1,
                             "source_index": -1,
                         }
@@ -3077,6 +3171,30 @@ class GeminiServiceTests(unittest.TestCase):
         self.assertIsNotNone(result)
         self.assertEqual(models.calls, 2)
         sleep.assert_called_once()
+
+    def test_model_request_sends_only_ascii_english_characters(self) -> None:
+        class Models:
+            def __init__(self) -> None:
+                self.calls: list[dict[str, object]] = []
+
+            def generate_content(self, **kwargs: object) -> object:
+                self.calls.append(dict(kwargs))
+                return object()
+
+        models = Models()
+        _generate_content_with_retry(
+            types.SimpleNamespace(models=models),
+            model=DEFAULT_GEMINI_MODEL,
+            contents="Describe the café العربية — briefly.",
+            config={},
+            request_label="test request",
+        )
+
+        self.assertEqual(
+            models.calls[0]["contents"],
+            "Describe the cafe - briefly.",
+        )
+        self.assertTrue(str(models.calls[0]["contents"]).isascii())
 
     def test_model_request_refuses_embedding_model_without_api_call(self) -> None:
         class Models:
@@ -3346,10 +3464,12 @@ class GeminiServiceTests(unittest.TestCase):
         self.assertNotIn("CombatStartedEvent", prompt)
         self.assertIn("<examples>", prompt)
         self.assertIn("<output_format>", prompt)
-        self.assertIn("Omit ordinary words already pronounced as written", prompt)
-        self.assertIn("Kokoro v1.0-compatible Unicode IPA", prompt)
-        self.assertIn("Do not use slash or bracket delimiters", prompt)
-        self.assertIn("syllable respellings", prompt)
+        self.assertIn("printable ASCII English characters only", prompt)
+        self.assertIn("never emit foreign scripts, IPA", prompt)
+        self.assertIn("Do not return pronunciation_map", prompt)
+        self.assertIn("speaker_cues", prompt)
+        self.assertIn("exact canonical npc_id as speaker_id", prompt)
+        self.assertIn("different IDs for different speakers", prompt)
         self.assertIn("status_event", prompt)
         self.assertIn("payload contains location, minutes_passed, and weather", prompt)
         self.assertIn("events must end with exactly one StatusUpdatedEvent", prompt)
@@ -3357,9 +3477,13 @@ class GeminiServiceTests(unittest.TestCase):
         self.assertIn("including any immediate NPC response", prompt)
         self.assertIn("state.miscellaneous.entries is uncapped", prompt)
         self.assertIn("MiscellaneousUpsertedEvent", prompt)
+        self.assertIn("player-visible Bestiary", prompt)
+        self.assertIn("category Creature", prompt)
+        self.assertIn("[Camera]", prompt)
+        self.assertIn("single-line label is invalid", prompt)
         self.assertIn("look around", prompt)
         self.assertNotIn("Context packet:", prompt)
-        self.assertLess(len(prompt), 8_000)
+        self.assertLess(len(prompt), 9_000)
         """Legacy prose assertions retained here only as migration documentation.
         self.assertIn("response", prompt)
         self.assertIn("suggested_actions", prompt)
@@ -3392,10 +3516,15 @@ class GeminiServiceTests(unittest.TestCase):
         self.assertIn("location must be a meaningful", prompt)
         self.assertNotIn("disposition", prompt)
         self.assertIn("ActiveTaskUpsertedEvent is shown directly", prompt)
+        self.assertIn("Every new task must have a complete description", prompt)
+        self.assertIn("how the Player can tell the task is complete", prompt)
+        self.assertIn("Include only player-known facts", prompt)
         self.assertIn("requester='Self'", prompt)
         self.assertIn("due_date='N/A'", prompt)
         self.assertIn("due_elapsed_minutes=-1", prompt)
         self.assertIn("Do not add notes", prompt)
+        self.assertIn("[Camera]", prompt)
+        self.assertIn("single-line label is invalid", prompt)
         self.assertIn("exact player-facing date and time", prompt)
         self.assertIn("Mature fictional content is allowed", prompt)
         self.assertIn("adults of legal drinking age", prompt)
@@ -3533,6 +3662,52 @@ class GeminiServiceTests(unittest.TestCase):
             result.suggested_events[0]["payload"]["location"],
             "the city",
         )
+
+    def test_parse_json_response_removes_foreign_scripts_and_discards_ipa(self) -> None:
+        raw_text = json.dumps(
+            {
+                "response": (
+                    "Kestrel's Reach is the primary sanctuary ofوینت the citadel. "
+                    "Gérlinde says, “Stay here.”"
+                ),
+                "suggested_actions": ["Ask العربية about the archives."],
+                "events": [
+                    {
+                        "type": "NpcUpsertedEvent",
+                        "payload": {
+                            "npc_id": "npc_gerlinde",
+                            "name": "Gérlinde",
+                        },
+                    }
+                ],
+                "out_of_game": False,
+                "pronunciation_map": [
+                    {"term": "Gérlinde", "ipa": "ɡɛrlɪndə"},
+                ],
+                "speaker_cues": [
+                    {
+                        "anchor_text": "“Stay here.”",
+                        "speaker_id": "npc_gerlinde",
+                        "speaker_name": "Gérlinde",
+                        "voice_profile": "feminine",
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        )
+
+        result = parse_gemini_story_response(raw_text)
+
+        self.assertIn(
+            "Kestrel's Reach is the primary sanctuary of the citadel.",
+            result.narrative_text,
+        )
+        self.assertIn('Gerlinde says, "Stay here."', result.narrative_text)
+        self.assertEqual(result.suggested_actions, ["Ask about the archives."])
+        self.assertEqual(result.suggested_events[0]["payload"]["name"], "Gerlinde")
+        self.assertEqual(result.pronunciation_map, {})
+        self.assertEqual(result.speaker_cues[0]["anchor_text"], '"Stay here."')
+        self.assertTrue(result.raw_text.isascii())
 
     def test_parse_json_response_strips_model_supplied_turn_prompt(self) -> None:
         raw_text = json.dumps(
@@ -3823,16 +3998,16 @@ class GeminiServiceTests(unittest.TestCase):
         self.assertIn("do not copy or cosmetically edit it", prompt)
         self.assertIn("starting_task.guidance is non-empty", prompt)
         self.assertIn("inventing every unspecified quest detail", prompt)
+        self.assertIn("must not retain Clear or another contradictory default", prompt)
         self.assertIn("Use canonical setup.character.pronouns exactly", prompt)
         self.assertIn('"pronouns":"She/Her"', prompt)
         self.assertIn("<examples>", prompt)
         self.assertIn("<output_format>", prompt)
-        self.assertIn("Omit ordinary words already pronounced as written", prompt)
-        self.assertIn("Kokoro v1.0-compatible Unicode IPA", prompt)
-        self.assertIn("Do not use slash or bracket delimiters", prompt)
-        self.assertIn("syllable respellings", prompt)
+        self.assertIn("printable ASCII English characters only", prompt)
+        self.assertIn("never emit foreign scripts, IPA", prompt)
+        self.assertIn("pronunciation_map", prompt)
         self.assertNotIn("Setup packet:", prompt)
-        self.assertLess(len(prompt), 8_000)
+        self.assertLess(len(prompt), 9_000)
         raw_text = json.dumps(
             {
                 "selected_genre": "Realistic detective mystery",
@@ -4201,7 +4376,7 @@ class GeminiServiceTests(unittest.TestCase):
         self.assertEqual(result.calendar_settings["days_per_week"], 8)
         self.assertEqual(result.calendar_settings["time_display"], "24_hour")
         self.assertEqual(result.starting_calendar["season_hint"], "autumn")
-        self.assertEqual(result.start_weather, "Clear, cold autumn wind.")
+        self.assertEqual(result.start_weather, "Rain")
         self.assertEqual(result.finalized_character["name"], "Iris Vale")
         self.assertEqual(result.finalized_skills[0]["name"], "Canal Investigation")
         self.assertEqual(len(result.finalized_starter_items), 5)
@@ -4269,6 +4444,60 @@ class GeminiServiceTests(unittest.TestCase):
 
         self.assertIn("What does Kit do now?", result.introductory_message)
         self.assertNotIn("What do you do now?", result.introductory_message)
+
+    def test_parse_new_game_response_synchronizes_explicit_opening_rain(self) -> None:
+        raw_text = json.dumps(
+            {
+                "world_summary": "A rain-soaked noir city.",
+                "gm_secrets": [],
+                "start_location": "Tithe Street Alleyway",
+                "weather": "Clear",
+                "skills": [],
+                "starting_items": [],
+                "known_crafting_items": [],
+                "known_crafting_recipes": [],
+                "starting_currency_balance_base_units": 0,
+                "introductory_message": (
+                    "I pull my collar tight and scan the wet pavement for clues."
+                ),
+                "suggested_actions": ["Examine the body."],
+                "locations": [{
+                    "name": "Tithe Street Alleyway",
+                    "description": "A cramped alley slick with midnight rain.",
+                }],
+                "events": [],
+            }
+        )
+
+        result = parse_gemini_new_game_response(raw_text)
+
+        self.assertEqual(result.start_weather, "Rain")
+
+    def test_parse_new_game_response_keeps_clear_for_incidental_rain_reference(self) -> None:
+        raw_text = json.dumps(
+            {
+                "world_summary": "A city where rain is common in autumn.",
+                "gm_secrets": [],
+                "start_location": "Detective Office",
+                "weather": "Clear",
+                "skills": [],
+                "starting_items": [],
+                "known_crafting_items": [],
+                "known_crafting_recipes": [],
+                "starting_currency_balance_base_units": 0,
+                "introductory_message": "Sunlight crosses the office floor.",
+                "suggested_actions": ["Check the desk."],
+                "locations": [{
+                    "name": "Detective Office",
+                    "description": "An office with an old rain gauge on a shelf.",
+                }],
+                "events": [],
+            }
+        )
+
+        result = parse_gemini_new_game_response(raw_text)
+
+        self.assertEqual(result.start_weather, "Clear")
 
     def test_parse_new_game_starter_items_generalizes_setup_amount_names(self) -> None:
         raw_text = json.dumps(
@@ -4608,7 +4837,7 @@ class GeminiServiceTests(unittest.TestCase):
                     "quantity_unit": "each",
                     "storage_location": "actively_carried",
                     "description": "A useful personal item.",
-                    "ascii_art": "[===]",
+                    "ascii_art": " ___\n|___|\n | |",
                     "value_base_units": index + 1,
                     "source_index": -1,
                 }

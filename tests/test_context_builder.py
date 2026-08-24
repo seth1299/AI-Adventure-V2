@@ -141,8 +141,18 @@ class ContextBuilderTests(unittest.TestCase):
             packet["response_contract"]["status_event"],
         )
         self.assertIn(
-            "Kokoro v1.0-compatible Unicode IPA",
-            packet["response_contract"]["pronunciation_map"],
+            "printable ASCII English characters only",
+            packet["response_contract"]["english_text"],
+        )
+        self.assertNotIn("pronunciation_map", packet["response_contract"])
+        self.assertIn("speaker_cues", packet["response_contract"])
+        self.assertIn(
+            "exact canonical npc_id",
+            packet["response_contract"]["speaker_cues"],
+        )
+        self.assertIn(
+            "durably remembers",
+            packet["state"]["audio"]["rules"]["speaker_voice_rule"],
         )
 
     def test_default_library_loads(self) -> None:
@@ -725,8 +735,28 @@ class ContextBuilderTests(unittest.TestCase):
             packet["state"]["active_tasks"]["rules"]["field_completion_rule"],
         )
         self.assertIn(
+            "what must be done",
+            packet["state"]["active_tasks"]["rules"]["description_rule"],
+        )
+        self.assertIn(
+            "how the Player can recognize completion",
+            packet["state"]["active_tasks"]["rules"]["description_rule"],
+        )
+        self.assertIn(
+            "complete player-visible description",
+            packet["response_contract"]["active_tasks"],
+        )
+        self.assertIn(
             "instead of vague due-date prose",
             packet["response_contract"]["active_tasks"],
+        )
+        self.assertIn(
+            "[Camera]",
+            packet["state"]["item_catalog"]["rules"]["ascii_art_rule"],
+        )
+        self.assertIn(
+            "single-line label is invalid",
+            packet["state"]["item_catalog"]["rules"]["ascii_art_rule"],
         )
         self.assertIn(
             "should not be blank",
@@ -825,6 +855,14 @@ class ContextBuilderTests(unittest.TestCase):
             "event.miscellaneous_upsert",
             {section["id"] for section in packet["reference_sections"]},
         )
+        self.assertIn(
+            "player-visible Bestiary",
+            packet["response_contract"]["miscellaneous_memory"],
+        )
+        self.assertIn(
+            "category Creature",
+            packet["state"]["miscellaneous"]["rules"]["scope"],
+        )
 
     def test_creative_ideas_are_omitted_when_not_relevant(self) -> None:
         packet = AiContextBuilder(
@@ -907,7 +945,7 @@ class ContextBuilderTests(unittest.TestCase):
         self.assertIn("event.active_task", section_ids)
         self.assertIn("event.upsert_location", section_ids)
         self.assertNotIn("event.upsert_world", section_ids)
-        pronunciation_rules = json.dumps(
+        english_text_rules = json.dumps(
             [
                 section.content
                 for section in library.sections
@@ -915,7 +953,16 @@ class ContextBuilderTests(unittest.TestCase):
             ],
             ensure_ascii=False,
         )
-        self.assertIn("Kokoro v1.0-compatible Unicode IPA", pronunciation_rules)
+        self.assertIn("printable ASCII English characters", english_text_rules)
+        self.assertIn("never return foreign scripts, IPA", english_text_rules)
+        active_task_rules = json.dumps(
+            next(
+                section.content
+                for section in library.sections
+                if section.id == "event.active_task"
+            )
+        )
+        self.assertIn("how the Player can recognize completion", active_task_rules)
 
 
 if __name__ == "__main__":

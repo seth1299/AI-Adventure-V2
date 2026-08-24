@@ -24,6 +24,7 @@ from ai_adventure.new_game_templates import (
     load_new_game_template,
     load_new_game_templates,
     save_new_game_template,
+    template_setup_has_changes,
 )
 from ai_adventure.core.state_manager import StateManager
 from ai_adventure.persistence.save_repository import (
@@ -763,6 +764,14 @@ class NewGameSetupTests(unittest.TestCase):
         )
         self.assertIn("optional player inspiration", ai_packet["requirements"]["starting_task"])
         self.assertIn("ActiveTaskUpsertedEvent", ai_packet["requirements"]["starting_task"])
+        self.assertIn(
+            "how to recognize completion",
+            ai_packet["requirements"]["starting_task"],
+        )
+        self.assertIn(
+            "complete player-visible description",
+            ai_packet["starting_task_contract"]["rules"],
+        )
 
         custom_setup = normalize_new_game_setup(
             {
@@ -911,6 +920,23 @@ class NewGameSetupTests(unittest.TestCase):
         )
         self.assertIn("setup.opening_scene_request", packet["requirements"]["opening_scene"])
         self.assertIn("finalized in-world narration", packet["requirements"]["opening_scene"])
+
+    def test_template_change_detection_uses_canonical_setup_values(self) -> None:
+        original = {
+            "title": "Mystery",
+            "character": {"name": "Iris"},
+            "starting_locations": [{"name": "Market"}],
+        }
+
+        self.assertFalse(template_setup_has_changes(original, dict(original)))
+        self.assertFalse(template_setup_has_changes(
+            original,
+            {**original, "title": "Mystery Save 2"},
+        ))
+        self.assertTrue(template_setup_has_changes(
+            original,
+            {**original, "character": {"name": "Mira"}},
+        ))
 
     def test_new_game_templates_round_trip_multiple_normalized_setups(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1108,10 +1134,16 @@ class NewGameSetupTests(unittest.TestCase):
         self.assertIn("preserve that field exactly", packet["requirements"]["character_generation"])
         self.assertIn("light Markdown", packet["requirements"]["world_summary"])
         self.assertIn("Light Markdown", packet["requirements"]["opening_scene"])
-        self.assertIn("pronunciation_map", packet["requirements"])
+        self.assertIn("english_text", packet["requirements"])
         self.assertIn(
-            "Kokoro v1.0-compatible Unicode IPA",
-            packet["requirements"]["pronunciation_map"],
+            "printable ASCII English characters",
+            packet["requirements"]["english_text"],
+        )
+        self.assertNotIn("pronunciation_map", packet["requirements"])
+        self.assertIn("speaker_cues", packet["requirements"])
+        self.assertIn(
+            "exact npc_id as speaker_id",
+            packet["requirements"]["speaker_cues"],
         )
         self.assertIn("genre_generation", packet["requirements"])
         self.assertIn("Do not default to fantasy", packet["requirements"]["genre_generation"])
@@ -1198,6 +1230,14 @@ class NewGameSetupTests(unittest.TestCase):
             "Do not duplicate records",
             packet["requirements"]["miscellaneous"],
         )
+        self.assertIn(
+            "category Creature",
+            packet["requirements"]["miscellaneous"],
+        )
+        self.assertIn(
+            "populate the Bestiary",
+            packet["requirements"]["miscellaneous"],
+        )
         self.assertIn("item_request", packet["requirements"]["starter_inventory"])
         self.assertIn("at least five", packet["requirements"]["starter_inventory"])
         self.assertIn("has no maximum count", packet["requirements"]["starter_inventory"])
@@ -1213,6 +1253,14 @@ class NewGameSetupTests(unittest.TestCase):
         self.assertIn("source_index", packet["requirements"]["starter_inventory"])
         self.assertIn("Fuel instead of Starting Fuel Amount", packet["requirements"]["starter_inventory"])
         self.assertIn("Put quantities in quantity, not name", packet["requirements"]["starter_inventory"])
+        self.assertIn(
+            "[Camera]",
+            packet["requirements"]["starter_inventory"],
+        )
+        self.assertIn(
+            "single-line label is invalid",
+            packet["requirements"]["starter_inventory"],
+        )
         self.assertEqual(packet["starter_inventory_contract"]["requested_item_count"], 0)
         self.assertEqual(packet["starter_inventory_contract"]["minimum_finalized_item_count"], 5)
         self.assertEqual(
@@ -1278,6 +1326,10 @@ class NewGameSetupTests(unittest.TestCase):
         self.assertEqual(packet["current_calendar"]["season_hint"], "spring")
         self.assertEqual(packet["current_weather"], "Clear")
         self.assertIn("calendar_weather_consistency", packet["requirements"])
+        self.assertIn(
+            "instead of Clear or another contradictory default",
+            packet["requirements"]["calendar_weather_consistency"],
+        )
         self.assertIn("calendar_generation", packet["requirements"])
 
     def test_setup_packet_removes_music_tracks_from_sound_effect_catalog(self) -> None:

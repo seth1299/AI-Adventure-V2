@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 import os
 import tempfile
 import unittest
@@ -31,9 +32,14 @@ from PySide6.QtWidgets import (
 )
 
 from ai_adventure.persistence.save_repository import SaveRepository
+from ai_adventure.new_game_templates import (
+    load_new_game_templates,
+    save_new_game_template,
+)
 from ai_adventure.ui.main_window import (
     _DetachedTabWindow,
     AlchemyNotebookScreen,
+    BestiaryScreen,
     CalendarPlayerEventDialog,
     CalendarScreen,
     CharacterScreen,
@@ -43,6 +49,7 @@ from ai_adventure.ui.main_window import (
     InventoryLocationPanel,
     InventoryScreen,
     MagicScreen,
+    NewGameTemplateManagerDialog,
     NewGameWizard,
     NpcsScreen,
     PartyScreen,
@@ -111,6 +118,129 @@ class InventoryUiTests(unittest.TestCase):
             "Begin with a mystery involving a missing courier.",
         )
         wizard.close()
+
+    def test_template_selection_reuses_widgets_without_mutating_templates(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            template_path = Path(temp_dir) / "new_game_templates.json"
+            first_setup = {
+                "specified_genre": "Mystery",
+                "starting_locations": [
+                    {"name": "Office", "description": "A cramped office."},
+                    {"name": "Street", "description": "A rain-soaked street."},
+                ],
+                "starting_npcs": [
+                    {"name": "Client", "location": "Office", "description": "Nervous."}
+                ],
+                "starter_items": [
+                    {"name": "Notebook", "category": "Item", "quantity": 1},
+                    {
+                        "name": "Revolver",
+                        "category": "Weapon",
+                        "item_type": "Weapon",
+                        "quantity": 1,
+                    },
+                ],
+                "currency_denominations": [
+                    {"name": "dollar", "plural_name": "dollars", "value": 1}
+                ],
+                "economy_examples": [
+                    {"name": "Coffee", "value_base_units": 1}
+                ],
+            }
+            second_setup = {
+                "specified_genre": "Fantasy",
+                "starting_locations": [
+                    {"name": "Keep", "description": "A stone keep."}
+                ],
+                "starting_npcs": [],
+                "no_starting_npcs": True,
+                "starter_items": [],
+                "currency_denominations": [],
+                "economy_examples": [],
+            }
+            self.assertTrue(
+                save_new_game_template(
+                    template_path,
+                    first_setup,
+                    template_name="A Mystery",
+                    normalize_setup=False,
+                )
+            )
+            self.assertTrue(
+                save_new_game_template(
+                    template_path,
+                    second_setup,
+                    template_name="B Fantasy",
+                    normalize_setup=False,
+                )
+            )
+            original_file = template_path.read_bytes()
+            dialog = NewGameTemplateManagerDialog(template_path=template_path)
+            original_setups = [deepcopy(template.setup) for template in dialog.templates]
+            pooled_widget_ids = {
+                id(widget)
+                for table in (
+                    dialog.starting_locations_table,
+                    dialog.starting_npcs_table,
+                    dialog.starter_items_table,
+                    dialog.starter_weapons_table,
+                    dialog.starter_armor_table,
+                    dialog.currency_table,
+                    dialog.economy_examples_table,
+                    *dialog.skill_tables.values(),
+                )
+                for row in range(table.rowCount())
+                for column in range(table.columnCount())
+                if (widget := table.cellWidget(row, column)) is not None
+            }
+
+            with patch("ai_adventure.ui.main_window.NewGameWizard") as wizard_type:
+                for row in (1, 0, 1, 0):
+                    dialog.template_list.setCurrentRow(row)
+                    self.app.processEvents()
+
+            current_widget_ids = {
+                id(widget)
+                for table in (
+                    dialog.starting_locations_table,
+                    dialog.starting_npcs_table,
+                    dialog.starter_items_table,
+                    dialog.starter_weapons_table,
+                    dialog.starter_armor_table,
+                    dialog.currency_table,
+                    dialog.economy_examples_table,
+                    *dialog.skill_tables.values(),
+                )
+                for row in range(table.rowCount())
+                for column in range(table.columnCount())
+                if (widget := table.cellWidget(row, column)) is not None
+            }
+            self.assertEqual(current_widget_ids, pooled_widget_ids)
+            self.assertEqual(
+                [template.setup for template in dialog.templates],
+                original_setups,
+            )
+            self.assertEqual(template_path.read_bytes(), original_file)
+            wizard_type.assert_not_called()
+            self.assertEqual(dialog.genre_input.text(), "Mystery")
+            self.assertEqual(
+                len(dialog._starting_locations_from_table()),
+                2,
+            )
+            self.assertEqual(len(dialog._starting_npcs_from_table()), 1)
+            dialog.genre_input.setText("Thriller")
+            dialog._save_template()
+            saved_templates = load_new_game_templates(
+                template_path,
+                normalize_setups=False,
+            )
+            saved_mystery = next(
+                template
+                for template in saved_templates
+                if template.name == "A Mystery"
+            )
+            self.assertEqual(saved_mystery.setup["specified_genre"], "Thriller")
+            dialog.close()
 
     def test_new_game_wizard_calendar_settings_button_opens_dialog(self) -> None:
         wizard = NewGameWizard(tts_enabled=False)
@@ -812,6 +942,15 @@ class InventoryUiTests(unittest.TestCase):
                         "position": "before",
                     }
                 ],
+                speaker_cues=[
+                    {
+                        "anchor_text": "The market opens.",
+                        "speaker_id": "market_crier",
+                        "speaker_name": "Market Crier",
+                        "voice_profile": "deep_masculine",
+                        "voice_id": "am_onyx",
+                    }
+                ],
             )
             story_id = int(repository.list_history()[-1]["id"])
             narrator = FakeNarrationPlayer()
@@ -842,11 +981,123 @@ class InventoryUiTests(unittest.TestCase):
                     }
                 ],
             )
-            transform = cast(Any, kwargs["tts_text_transform"])
             self.assertEqual(
-                transform("Ironpeak City wakes."),
-                '[Ironpeak City]{ph="ˈaɪɚnˌpik ˈsɪti"} wakes.',
+                kwargs.get("speaker_cues"),
+                [
+                    {
+                        "anchor_text": "The market opens.",
+                        "speaker_id": "market_crier",
+                        "speaker_name": "Market Crier",
+                        "voice_profile": "deep_masculine",
+                        "voice_id": "am_onyx",
+                    }
+                ],
             )
+            transform = cast(Any, kwargs["tts_text_transform"])
+            self.assertEqual(transform("Ironpeak City wakes."), "Ironpeak City wakes.")
+            screen.close()
+
+    def test_read_aloud_replays_saved_passage_sound_effect_cues(self) -> None:
+        class FakeNarrationPlayer:
+            def __init__(self) -> None:
+                self.calls: list[dict[str, Any]] = []
+
+            def set_volume(self, _volume: float | int | None) -> None:
+                pass
+
+            def set_speed(self, _speed: float | int | None) -> None:
+                pass
+
+            def set_voice(self, _voice: str | None) -> None:
+                pass
+
+            def set_enabled(self, _enabled: bool) -> None:
+                pass
+
+            def play_sample(self, **kwargs: Any) -> bool:
+                self.calls.append(kwargs)
+                return True
+
+        class FakeSoundManager:
+            def __init__(self) -> None:
+                self.effects: list[str] = []
+
+            def set_music_volume(self, _volume: float | int | None) -> None:
+                pass
+
+            def set_music_enabled(self, _enabled: bool) -> None:
+                pass
+
+            def set_sound_effects_volume(self, _volume: float | int | None) -> None:
+                pass
+
+            def set_sound_effects_enabled(self, _enabled: bool) -> None:
+                pass
+
+            def play_music(self, _track: str | Path | None) -> None:
+                pass
+
+            def stop_music(self, *, clear_current: bool = True) -> None:
+                pass
+
+            def stop_sound_effect(self, *, clear_current: bool = True) -> None:
+                pass
+
+            def play_sound_effect(self, track: str | Path | None) -> None:
+                self.effects.append(str(track or ""))
+
+        cue = {
+            "filename": "Market Bell.wav",
+            "anchor_text": "market",
+            "position": "before",
+        }
+        speaker_cue = {
+            "anchor_text": '"The market opens."',
+            "speaker_id": "town_crier",
+            "speaker_name": "Town Crier",
+            "voice_profile": "deep_masculine",
+            "voice_id": "am_onyx",
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = SaveRepository.create_new_save(Path(temp_dir), "Replay Test")
+            repository.set_setting(
+                "tts.pronunciation_map",
+                {"Ironpeak City": {"ipa": "ˈaɪɚnˌpik ˈsɪti"}},
+            )
+            repository.append_history(
+                "story",
+                'Ironpeak City wakes. "The market opens."',
+                sound_effect_cues=[cue],
+                speaker_cues=[speaker_cue],
+            )
+            history_entry_id = int(repository.list_history()[-1]["id"])
+            narrator = FakeNarrationPlayer()
+            sound_manager = FakeSoundManager()
+            screen = StoryScreen(
+                narration_player=cast(Any, narrator),
+                sound_manager=cast(Any, sound_manager),
+            )
+            screen.set_repository(repository)
+
+            started = screen._read_conversation_message_aloud(
+                "Formatted display text",
+                history_entry_id=history_entry_id,
+            )
+
+            self.assertTrue(started)
+            self.assertEqual(len(narrator.calls), 1)
+            call = narrator.calls[0]
+            self.assertEqual(
+                call["text"],
+                'Ironpeak City wakes. "The market opens."',
+            )
+            self.assertEqual(call["sound_effect_cues"], [cue])
+            self.assertEqual(call["speaker_cues"], [speaker_cue])
+            transform = cast(Any, call["tts_text_transform"])
+            self.assertEqual(transform("Ironpeak City wakes."), "Ironpeak City wakes.")
+            on_sound_effect = cast(Any, call["on_sound_effect"])
+            on_sound_effect("Market Bell.wav")
+            self.assertEqual(sound_manager.effects, ["Market Bell.wav"])
             screen.close()
 
     def test_conversation_refresh_preserves_reader_position_and_adds_bottom_buffer(self) -> None:
@@ -961,6 +1212,46 @@ class InventoryUiTests(unittest.TestCase):
             self.assertTrue(str(event["event_id"]).startswith("player_"))
 
             dialog.close()
+
+    def test_calendar_tasks_table_displays_wrapped_quest_description(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = SaveRepository.create_new_save(
+                Path(temp_dir),
+                "Task Description UI",
+            )
+            repository.upsert_active_task(
+                name="The Kestrel Street Homicide",
+                category="Quest",
+                description=(
+                    "Question witnesses in Kestrel Street Alleyway, identify the "
+                    "victim, and bring enough evidence to Inspector Vale to name "
+                    "the killer."
+                ),
+                requester="Inspector Vale",
+                location="Kestrel Street Alleyway",
+                reward="$200",
+                due_date="N/A",
+            )
+            screen = CalendarScreen()
+            screen.set_repository(repository)
+            self.app.processEvents()
+
+            headers = [
+                cast(QTableWidgetItem, screen.tasks_table.horizontalHeaderItem(column)).text()
+                for column in range(screen.tasks_table.columnCount())
+            ]
+            self.assertEqual(
+                headers,
+                ["Task", "Description", "Category", "Due", "Location", "Reward"],
+            )
+            self.assertEqual(screen.tasks_table.rowCount(), 1)
+            description_item = screen.tasks_table.item(0, 1)
+            self.assertIsNotNone(description_item)
+            assert description_item is not None
+            self.assertIn("Question witnesses", description_item.text())
+            self.assertIn("Inspector Vale", description_item.text())
+            self.assertTrue(screen.tasks_table.wordWrap())
+            screen.close()
             screen.close()
 
     def test_calendar_day_double_click_prefills_event_date(self) -> None:
@@ -1025,6 +1316,48 @@ class InventoryUiTests(unittest.TestCase):
             self.app.processEvents()
             self.assertEqual(shell.tabs.tabText(npc_index), "NPCs")
             shell.close()
+
+    def test_bestiary_screen_matches_travel_layout_without_action_button(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = SaveRepository.create_new_save(Path(temp_dir), "Bestiary UI")
+            repository.upsert_miscellaneous(
+                misc_id="mist_strider",
+                name="Mist-Strider",
+                category="Creature",
+                details="A towering animal seen moving between the fog banks.",
+            )
+            repository.upsert_miscellaneous(
+                misc_id="reed_covenant",
+                name="Reed Covenant",
+                category="Faction",
+                details="A marshland alliance.",
+            )
+            repository.upsert_gm_secret(
+                secret_id="mist_strider_origin",
+                title="Mist-Strider Origin",
+                details="It was secretly built beneath the old archive.",
+            )
+
+            screen = BestiaryScreen()
+            screen.set_repository(repository)
+            self.app.processEvents()
+
+            self.assertEqual(screen.creature_list.count(), 1)
+            self.assertEqual(screen.creature_list.item(0).text(), "Mist-Strider")
+            visible_details = screen.details_output.toPlainText()
+            self.assertIn("towering animal", visible_details)
+            self.assertNotIn("built beneath", visible_details)
+            self.assertEqual(screen.findChildren(QPushButton), [])
+            screen.close()
+
+    def test_game_shell_registers_bestiary_tab(self) -> None:
+        shell = GameShell(lambda: None, tts_enabled=False, ai_enabled=False)
+
+        index = shell._tab_index_for_key("bestiary")
+        self.assertGreaterEqual(index, 0)
+        self.assertEqual(shell.tabs.tabText(index), "Bestiary")
+        self.assertIs(shell.tabs.widget(index), shell.bestiary_screen)
+        shell.close()
 
     def test_npcs_auto_refresh_after_repository_change_without_refresh_button(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

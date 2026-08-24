@@ -12,7 +12,6 @@ from ai_adventure.calendar_system import (
 from ai_adventure.audio.tts_settings import normalize_tts_audio_fields
 from ai_adventure.audio.catalog import distinct_audio_track_catalogs
 from ai_adventure.audio.pronunciation import (
-    KOKORO_IPA_PROMPT_RULE,
     normalize_pronunciation_map,
     set_authoritative_pronunciation,
 )
@@ -534,11 +533,21 @@ def build_new_game_setup_packet(
                 "player-facing prose. These preferences do not relax schema "
                 "completeness or hidden-information rules."
             ),
-            "pronunciation_map": (
-                "Return exact visible ambiguous names and recurring terms as {term, ipa} "
-                "records for TTS only. Omit ordinary words and keep pronunciation hints "
-                f"out of visible prose. {KOKORO_IPA_PROMPT_RULE} Honor the player's "
-                "character.name_pronunciation guide when producing the character name's IPA."
+            "english_text": (
+                "Return printable ASCII English characters in every generated string. "
+                "Transliterate accented Latin letters to unaccented English and never "
+                "return foreign scripts, IPA, phoneme strings, pronunciation markup, "
+                "or pronunciation_map."
+            ),
+            "speaker_cues": (
+                "Return one TTS-only record for every exact contiguous non-narrator "
+                "spoken span in introductory_message. anchor_text must copy the "
+                "complete span including outer double quotation marks from one unique "
+                "place. Use an actual NPC's exact npc_id as speaker_id, reuse IDs for "
+                "the same speaker, and use distinct stable lower_snake_case IDs for "
+                "incidental speakers. Choose voice_profile from established audible "
+                "traits or neutral when unspecified. Return [] when only the narrator "
+                "speaks. Python chooses and durably stores the installed voice ID."
             ),
             "calendar_weather_consistency": (
                 "When current_calendar is present, opening prose must match it unless "
@@ -546,7 +555,10 @@ def build_new_game_setup_packet(
                 "setup.calendar.ai_generated is true, current_calendar is deliberately "
                 "omitted: invent calendar_settings and starting_calendar first, then "
                 "make opening prose match those generated values. Opening prose must "
-                "also match current_weather unless the returned weather changes it."
+                "also match current_weather unless the returned weather changes it. "
+                "If the opening scene or actual starting-location description establishes "
+                "rain, drizzle, snow, fog, or another current condition, return that "
+                "condition in weather instead of Clear or another contradictory default."
             ),
             "calendar_generation": (
                 "If setup.calendar.ai_generated is true, invent calendar_settings "
@@ -620,7 +632,10 @@ def build_new_game_setup_packet(
                 "miscellaneous array. Use stable misc_id values and complete name, "
                 "category, and details fields. This includes original creatures or "
                 "species, cultures, factions, religions, laws, historical events, "
-                "and supernatural or scientific phenomena. Do not duplicate records "
+                "and supernatural or scientific phenomena. Use category Creature for "
+                "each non-NPC creature or monster known to the Player, with only "
+                "player-known facts in details; these records populate the Bestiary. "
+                "Do not duplicate records "
                 "that belong in another structured field. Return an empty array when "
                 "no such starting canon is needed."
             ),
@@ -629,7 +644,10 @@ def build_new_game_setup_packet(
                 "mode is none, do not create an initial ActiveTaskUpsertedEvent "
                 "unless another explicit setup field independently asks for one. "
                 "If mode is ai, create one fitting starting quest with "
-                "ActiveTaskUpsertedEvent. Treat setup.starting_task.guidance as "
+                "ActiveTaskUpsertedEvent, including a complete player-visible "
+                "description of what must be done, currently known relevant people "
+                "and places, and how to recognize completion. Treat "
+                "setup.starting_task.guidance as "
                 "optional player inspiration: honor its idea while inventing all "
                 "unspecified quest details. If mode is custom, create exactly one "
                 "ActiveTaskUpsertedEvent using the player's provided fields as "
@@ -769,7 +787,8 @@ def build_new_game_setup_packet(
                 "items/materials and recipes as fit the backstory. Recipe "
                 "Every known_crafting_items entry must include original ascii_art "
                 "using 3-12 fixed-width lines, no Markdown fence, and no line over "
-                "40 characters. "
+                "40 characters. A bracketed name, caption, or other single-line "
+                "label is invalid and is not ASCII art. "
                 "For each known crafting item, location must be a comma-separated "
                 "list of generalized environments or source areas such as Forests, "
                 "Caves, Wetlands, Workshops, or Urban Scrap, never a specific named "
@@ -875,6 +894,9 @@ def build_new_game_setup_packet(
                 "Every finalized starting item must include original ascii_art that "
                 "visually depicts that concrete item using 3-12 fixed-width lines, "
                 "without a Markdown code fence and with no line over 40 characters. "
+                "A bracketed item name such as [Camera], a caption, or any other "
+                "single-line label is invalid and is not ASCII art. Draw the item's "
+                "recognizable shape instead of writing its name. "
                 "Do not double-escape line breaks or put visible backslash-n text "
                 "inside the drawing. "
                 "Use home for items kept in the player's house, workshop, base, room, "
@@ -976,7 +998,10 @@ def build_new_game_setup_packet(
                 "none means no requested opening quest; ai means invent a fitting "
                 "opening quest, using guidance as optional inspiration when it is "
                 "present; custom means use provided fields and have the AI fill "
-                "blanks from the rest of the setup."
+                "blanks from the rest of the setup. Every finalized starting quest "
+                "must include a complete player-visible description explaining the "
+                "objective, currently known relevant people and places, and how to "
+                "recognize completion."
             ),
             "category_rule": (
                 "Classify each finalized item by its present primary function, not "

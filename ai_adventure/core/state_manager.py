@@ -419,6 +419,11 @@ class StateManager:
                         for cue in row.get("sound_effect_cues", [])
                         if isinstance(cue, dict)
                     ],
+                    speaker_cues=[
+                        cue
+                        for cue in row.get("speaker_cues", [])
+                        if isinstance(cue, dict)
+                    ],
                     created_at=_read_string(row, "created_at", ""),
                 )
             )

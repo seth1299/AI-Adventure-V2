@@ -18,7 +18,10 @@ from ai_adventure.alchemy.ingredients import (
     normalize_crafting_item_notes,
     normalize_recipe_ingredients,
 )
-from ai_adventure.ascii_art import normalize_ascii_art
+from ai_adventure.ascii_art import (
+    ensure_substantive_ascii_art,
+    is_substantive_ascii_art,
+)
 from ai_adventure.ai.modes import (
     default_ai_mode_settings,
     normalize_ai_mode_preferences,
@@ -52,6 +55,7 @@ from ai_adventure.locations import (
     normalize_known_location,
     normalize_known_locations,
 )
+from ai_adventure.notes import normalize_note_entries
 from ai_adventure.magic import (
     magic_resource_specs,
     normalize_magic_advancement_category,
@@ -59,6 +63,7 @@ from ai_adventure.magic import (
     normalize_magic_setup,
 )
 from ai_adventure.skills.rules import bonus_for_level, clamp_skill_level, level_for_xp
+from ai_adventure.text_sanitization import sanitize_english_text
 
 
 LOGGER = logging.getLogger(__name__)
@@ -171,8 +176,8 @@ class SaveRepository:
         repository.set_setting("audio.tts_custom_voices", [])
         repository.set_setting("tts.pronunciation_map", {})
         repository.set_setting("audio.current_music", "")
-        repository.set_journal_notes("")
-        repository.set_journal_share_with_ai(False)
+        repository.set_note_entries([])
+        repository.set_notes_share_with_ai(False)
         repository.set_currency_denominations(DEFAULT_CURRENCY_DENOMINATIONS)
         repository.set_calendar_settings(DEFAULT_CALENDAR_SETTINGS)
         repository.set_current_calendar_minute(DEFAULT_START_ELAPSED_MINUTES)
@@ -300,8 +305,8 @@ class SaveRepository:
         )
         self.set_setting("combat.focus", clean_setup["combat"]["focus"])
         self.set_setting("currency.description", clean_setup["currency_description"])
-        self.set_journal_notes("")
-        self.set_journal_share_with_ai(False)
+        self.set_note_entries([])
+        self.set_notes_share_with_ai(False)
         self.set_currency_denominations(clean_setup["currency_denominations"])
         starting_wealth = clean_setup["starting_wealth"]
         self.set_state_value(
@@ -694,8 +699,10 @@ class SaveRepository:
         clean_metadata["quantity_unit"] = _inventory_quantity_unit(raw_metadata)
         clean_metadata["storage_location"] = _inventory_storage_location(raw_metadata)
         clean_metadata["item_uuid"] = str(raw_metadata.get("item_uuid", "")).strip() or str(uuid.uuid4())
-        clean_metadata["ascii_art"] = normalize_ascii_art(
-            raw_metadata.get("ascii_art", "")
+        clean_metadata["ascii_art"] = ensure_substantive_ascii_art(
+            raw_metadata.get("ascii_art", ""),
+            item_name=clean_name,
+            category=category,
         )
         metadata_json = _encode_json_dict(clean_metadata)
 
@@ -864,8 +871,10 @@ class SaveRepository:
             clean_metadata["item_uuid"] = (
                 str(raw_metadata.get("item_uuid", "")).strip() or str(uuid.uuid4())
             )
-            clean_metadata["ascii_art"] = normalize_ascii_art(
-                raw_metadata.get("ascii_art", "")
+            clean_metadata["ascii_art"] = ensure_substantive_ascii_art(
+                raw_metadata.get("ascii_art", ""),
+                item_name=name,
+                category=str(raw_item.get("category", "Item")),
             )
             clean_items.append(
                 {
@@ -3095,7 +3104,7 @@ class SaveRepository:
         """Creates or replaces one general world-lore record."""
 
         clean_name = " ".join(name.strip().split())
-        clean_category = " ".join(category.strip().split()) or "Miscellaneous"
+        clean_category = _normalize_miscellaneous_category(category)
         clean_details = details.strip()
 
         if not clean_name or not clean_details:
@@ -3170,6 +3179,23 @@ class SaveRepository:
 
         return [_miscellaneous_row_to_dict(row) for row in rows]
 
+    def list_bestiary_entries(self) -> list[dict[str, Any]]:
+        """Lists player-known creature lore without consulting GM-secret state."""
+
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT misc_id, name, category, details, created_at, updated_at
+                FROM miscellaneous
+                WHERE LOWER(TRIM(category)) IN (
+                    'creature', 'creatures', 'monster', 'monsters', 'beast', 'beasts'
+                )
+                ORDER BY name COLLATE NOCASE, misc_id
+                """
+            ).fetchall()
+
+        return [_miscellaneous_row_to_dict(row) for row in rows]
+
     @staticmethod
     def create_message_id() -> str:
         """Returns a globally unique identifier for one conversation message."""
@@ -3205,6 +3231,7 @@ class SaveRepository:
         *,
         message_id: str | None = None,
         sound_effect_cues: list[dict[str, str]] | None = None,
+        speaker_cues: list[dict[str, str]] | None = None,
     ) -> str:
         """
         Appends an entry to the adventure history.
@@ -3214,12 +3241,13 @@ class SaveRepository:
             content: Entry text.
             message_id: Optional conversation message ID.
             sound_effect_cues: Exact one-shot narration cue anchors for replay.
+            speaker_cues: Exact anchored speaker/voice assignments for replay.
 
         Returns:
             The associated conversation message ID.
         """
 
-        clean_content = content.strip()
+        clean_content = sanitize_english_text(content)
 
         if not clean_content:
             LOGGER.warning("Skipped blank history entry of kind '%s'.", kind)
@@ -3229,7 +3257,7 @@ class SaveRepository:
         clean_sound_effect_cues = [
             {
                 "filename": str(cue.get("filename", "") or "").strip(),
-                "anchor_text": str(cue.get("anchor_text", "") or "").strip(),
+                "anchor_text": sanitize_english_text(cue.get("anchor_text", "")),
                 "position": str(cue.get("position", "") or "").strip().casefold(),
             }
             for cue in (sound_effect_cues or [])
@@ -3238,6 +3266,24 @@ class SaveRepository:
             and str(cue.get("anchor_text", "") or "").strip()
             and str(cue.get("position", "") or "").strip().casefold()
             in {"before", "after"}
+        ]
+        clean_speaker_cues = [
+            {
+                "anchor_text": sanitize_english_text(cue.get("anchor_text", "")),
+                "speaker_id": sanitize_english_text(
+                    cue.get("speaker_id", "")
+                ).casefold(),
+                "speaker_name": sanitize_english_text(cue.get("speaker_name", "")),
+                "voice_profile": str(
+                    cue.get("voice_profile", "neutral") or "neutral"
+                ).strip().casefold(),
+                "voice_id": str(cue.get("voice_id", "") or "").strip(),
+            }
+            for cue in (speaker_cues or [])
+            if isinstance(cue, dict)
+            and str(cue.get("anchor_text", "") or "").strip()
+            and str(cue.get("speaker_id", "") or "").strip()
+            and str(cue.get("voice_id", "") or "").strip()
         ]
 
         with self._connect() as connection:
@@ -3248,15 +3294,17 @@ class SaveRepository:
                     kind,
                     content,
                     sound_effect_cues_json,
+                    speaker_cues_json,
                     created_at
                 )
-                VALUES (?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?)
                 """,
                 (
                     resolved_message_id,
                     kind.strip() or "misc",
                     clean_content,
                     json.dumps(clean_sound_effect_cues, ensure_ascii=False),
+                    json.dumps(clean_speaker_cues, ensure_ascii=False),
                     datetime.now().isoformat(timespec="seconds"),
                 ),
             )
@@ -3358,7 +3406,8 @@ class SaveRepository:
         with self._connect() as connection:
             rows = connection.execute(
                 """
-                SELECT id, message_id, kind, content, sound_effect_cues_json, created_at
+                SELECT id, message_id, kind, content, sound_effect_cues_json,
+                       speaker_cues_json, created_at
                 FROM history_entries
                 ORDER BY id ASC
                 """
@@ -3367,14 +3416,53 @@ class SaveRepository:
         history: list[dict[str, Any]] = []
         for row in rows:
             entry = dict(row)
+            entry["content"] = sanitize_english_text(entry.get("content", ""))
             try:
                 raw_cues = json.loads(str(entry.pop("sound_effect_cues_json", "[]")))
             except json.JSONDecodeError:
                 LOGGER.warning("History entry %s has invalid sound cue JSON.", entry["id"])
                 raw_cues = []
             entry["sound_effect_cues"] = (
-                [cue for cue in raw_cues if isinstance(cue, dict)]
+                [
+                    {
+                        **cue,
+                        "anchor_text": sanitize_english_text(
+                            cue.get("anchor_text", "")
+                        ),
+                    }
+                    for cue in raw_cues
+                    if isinstance(cue, dict)
+                ]
                 if isinstance(raw_cues, list)
+                else []
+            )
+            try:
+                raw_speaker_cues = json.loads(
+                    str(entry.pop("speaker_cues_json", "[]"))
+                )
+            except json.JSONDecodeError:
+                LOGGER.warning(
+                    "History entry %s has invalid speaker cue JSON.", entry["id"]
+                )
+                raw_speaker_cues = []
+            entry["speaker_cues"] = (
+                [
+                    {
+                        **cue,
+                        "anchor_text": sanitize_english_text(
+                            cue.get("anchor_text", "")
+                        ),
+                        "speaker_id": sanitize_english_text(
+                            cue.get("speaker_id", "")
+                        ).casefold(),
+                        "speaker_name": sanitize_english_text(
+                            cue.get("speaker_name", "")
+                        ),
+                    }
+                    for cue in raw_speaker_cues
+                    if isinstance(cue, dict)
+                ]
+                if isinstance(raw_speaker_cues, list)
                 else []
             )
             history.append(entry)
@@ -3799,25 +3887,25 @@ class SaveRepository:
 
         return row
 
-    def set_journal_notes(self, notes: str) -> None:
-        """Stores the player's journal notes."""
+    def set_note_entries(self, entries: Any) -> None:
+        """Stores the player's structured, tagged notes."""
 
-        self.set_setting("journal.private_notes", str(notes))
+        self.set_setting("notes.entries", normalize_note_entries(entries))
 
-    def get_journal_notes(self) -> str:
-        """Reads the player's journal notes."""
+    def get_note_entries(self) -> list[dict[str, Any]]:
+        """Reads the player's structured, tagged notes."""
 
-        return str(self.get_setting("journal.private_notes", ""))
+        return normalize_note_entries(self.get_setting("notes.entries", []))
 
-    def set_journal_share_with_ai(self, share_with_ai: bool) -> None:
-        """Stores whether journal notes should be included in AI context."""
+    def set_notes_share_with_ai(self, share_with_ai: bool) -> None:
+        """Stores whether player notes should be included in AI context."""
 
-        self.set_setting("journal.share_with_ai", bool(share_with_ai))
+        self.set_setting("notes.share_with_ai", bool(share_with_ai))
 
-    def get_journal_share_with_ai(self) -> bool:
-        """Reads whether journal notes should be included in AI context."""
+    def get_notes_share_with_ai(self) -> bool:
+        """Reads whether player notes should be included in AI context."""
 
-        return _safe_bool(self.get_setting("journal.share_with_ai", False), default=False)
+        return _safe_bool(self.get_setting("notes.share_with_ai", False), default=False)
 
     def set_world_summary(self, summary: str) -> None:
         """
@@ -4545,6 +4633,7 @@ class SaveRepository:
                     kind TEXT NOT NULL,
                     content TEXT NOT NULL,
                     sound_effect_cues_json TEXT NOT NULL DEFAULT '[]',
+                    speaker_cues_json TEXT NOT NULL DEFAULT '[]',
                     created_at TEXT NOT NULL
                 );
 
@@ -4650,6 +4739,12 @@ class SaveRepository:
                 connection,
                 "history_entries",
                 "sound_effect_cues_json",
+                "TEXT NOT NULL DEFAULT '[]'",
+            )
+            _ensure_column(
+                connection,
+                "history_entries",
+                "speaker_cues_json",
                 "TEXT NOT NULL DEFAULT '[]'",
             )
             _ensure_column(
@@ -4982,6 +5077,22 @@ def _miscellaneous_id(value: str) -> str:
     return (cleaned or "unnamed_miscellaneous_entry")[:100]
 
 
+def _normalize_miscellaneous_category(value: str) -> str:
+    """Normalizes public creature-lore aliases into the Bestiary category."""
+
+    cleaned = " ".join(str(value or "").strip().split()) or "Miscellaneous"
+    if cleaned.casefold() in {
+        "creature",
+        "creatures",
+        "monster",
+        "monsters",
+        "beast",
+        "beasts",
+    }:
+        return "Creature"
+    return cleaned
+
+
 def _fallback_npc_display_name(name: str, role: str) -> str:
     """Chooses a player-visible fallback when the model did not provide one."""
 
@@ -5260,7 +5371,11 @@ def _upsert_item_catalog_entry(
     clean_description = description.strip()
     clean_value = max(0, _safe_int(value_base_units, default=0) or 0)
     raw_metadata = metadata if isinstance(metadata, dict) else {}
-    clean_ascii_art = normalize_ascii_art(raw_metadata.get("ascii_art", ""))
+    clean_ascii_art = ensure_substantive_ascii_art(
+        raw_metadata.get("ascii_art", ""),
+        item_name=clean_name,
+        category=clean_category,
+    )
     clean_metadata = normalize_item_metadata(
         metadata,
         name=clean_name,
@@ -5312,6 +5427,15 @@ def _upsert_item_catalog_entry(
         )
         return
 
+    resolved_ascii_art = (
+        clean_ascii_art
+        if is_substantive_ascii_art(raw_metadata.get("ascii_art", ""))
+        else ensure_substantive_ascii_art(
+            row["ascii_art"],
+            item_name=clean_name,
+            category=clean_category or str(row["category"]),
+        )
+    )
     existing_metadata = _decode_json_dict(
         row["metadata_json"],
         "item catalog metadata",
@@ -5339,7 +5463,7 @@ def _upsert_item_catalog_entry(
             clean_category or str(row["category"]),
             clean_description or str(row["description"]),
             clean_value if clean_value > 0 else int(row["value_base_units"]),
-            clean_ascii_art or str(row["ascii_art"]),
+            resolved_ascii_art,
             metadata_json
             if clean_metadata.get("item_type") != "Item"
             else str(row["metadata_json"]),
@@ -5365,6 +5489,11 @@ def _inventory_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
     normalized_metadata["quantity_unit"] = metadata["quantity_unit"]
     normalized_metadata["storage_location"] = storage_location
     normalized_metadata["item_uuid"] = str(metadata.get("item_uuid", "")).strip()
+    normalized_metadata["ascii_art"] = ensure_substantive_ascii_art(
+        metadata.get("ascii_art", ""),
+        item_name=str(row["name"]),
+        category=str(row["category"]),
+    )
     return {
         "id": row["id"],
         "name": row["name"],
@@ -5397,7 +5526,11 @@ def _item_catalog_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
         "category": row["category"],
         "description": row["description"],
         "value_base_units": row["value_base_units"],
-        "ascii_art": normalize_ascii_art(row["ascii_art"]),
+        "ascii_art": ensure_substantive_ascii_art(
+            row["ascii_art"],
+            item_name=str(row["name"]),
+            category=str(row["category"]),
+        ),
         "metadata": normalized_metadata,
         "first_seen_at": row["first_seen_at"],
         "updated_at": row["updated_at"],

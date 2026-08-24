@@ -22,6 +22,7 @@ from ai_adventure.audio.voices import (
     DEFAULT_NARRATOR_VOICE,
     NARRATOR_SAMPLE_TEXT,
 )
+from ai_adventure.text_sanitization import sanitize_english_text
 
 
 LOGGER = logging.getLogger(__name__)
@@ -67,6 +68,7 @@ class NarrationChunk:
 
     display_text: str
     tts_text: str
+    voice_id: str = ""
     sound_effects_before: tuple[str, ...] = ()
     sound_effects_after: tuple[str, ...] = ()
 
@@ -188,8 +190,12 @@ class NarrationPlayer:
         volume: float | int | None = None,
         speed: float | int | None = None,
         text: str = NARRATOR_SAMPLE_TEXT,
+        sound_effect_cues: list[dict[str, str]] | None = None,
+        speaker_cues: list[dict[str, str]] | None = None,
+        tts_text_transform: Callable[[str], str] | None = None,
+        on_sound_effect: Callable[[str], None] | None = None,
     ) -> bool:
-        """Plays a local narrator sample without contacting the AI."""
+        """Plays local narration without contacting the AI."""
 
         previous_enabled = self.enabled
 
@@ -207,6 +213,10 @@ class NarrationPlayer:
         started = self.narrate(
             text,
             voice=voice,
+            sound_effect_cues=sound_effect_cues,
+            speaker_cues=speaker_cues,
+            tts_text_transform=tts_text_transform,
+            on_sound_effect=on_sound_effect,
             on_complete=restore_enabled,
         )
 
@@ -221,6 +231,7 @@ class NarrationPlayer:
         *,
         voice: str | None = None,
         sound_effect_cues: list[dict[str, str]] | None = None,
+        speaker_cues: list[dict[str, str]] | None = None,
         tts_text_transform: Callable[[str], str] | None = None,
         on_chunk_start: Callable[[str], None] | None = None,
         on_sound_effect: Callable[[str], None] | None = None,
@@ -234,6 +245,7 @@ class NarrationPlayer:
         chunks = build_narration_chunks(
             text,
             sound_effect_cues=sound_effect_cues,
+            speaker_cues=speaker_cues,
             tts_text_transform=tts_text_transform,
         )
 
@@ -307,7 +319,9 @@ class NarrationPlayer:
                     audio_path = self.tts_manager.synthesize_to_file(
                         TTSRequest(
                             text=chunk.tts_text,
-                            voice=voice,
+                            voice=normalize_narrator_voice_spec(
+                                chunk.voice_id or voice
+                            ),
                             speed=self.speed,
                         )
                     )
@@ -425,7 +439,7 @@ def sanitize_narration_display_text(text: str) -> str:
     """Returns visible prose that should be revealed while narration plays."""
 
     marker_pattern = r"\[" r"\[[^\]]+\]" r"\]"
-    clean_text = re.sub(marker_pattern, " ", str(text or ""))
+    clean_text = re.sub(marker_pattern, " ", sanitize_english_text(text))
     clean_text = re.sub(r"`([^`]+)`", r"\1", clean_text)
     clean_text = clean_text.replace("*", "")
     clean_text = clean_text.replace("_", "")
@@ -456,9 +470,10 @@ def build_narration_chunks(
     *,
     max_length: int = MAX_CHUNK_LENGTH,
     sound_effect_cues: list[dict[str, str]] | None = None,
+    speaker_cues: list[dict[str, str]] | None = None,
     tts_text_transform: Callable[[str], str] | None = None,
 ) -> list[NarrationChunk]:
-    """Builds display/TTS chunks with exact one-shot cue boundaries."""
+    """Builds display/TTS chunks with exact effect and speaker boundaries."""
 
     clean_text = sanitize_narration_display_text(text)
     if not clean_text:
@@ -466,6 +481,7 @@ def build_narration_chunks(
 
     before_at: dict[int, list[str]] = {}
     after_at: dict[int, list[str]] = {}
+    speaker_ranges: list[tuple[int, int, str]] = []
     forced_offsets = {0, len(clean_text)}
 
     for raw_cue in sound_effect_cues or []:
@@ -492,6 +508,27 @@ def build_narration_chunks(
         target = before_at if position == "before" else after_at
         target.setdefault(boundary, []).append(filename)
 
+    for raw_cue in speaker_cues or []:
+        if not isinstance(raw_cue, dict):
+            continue
+        anchor_text = sanitize_narration_display_text(
+            str(raw_cue.get("anchor_text", "") or "")
+        )
+        voice_id = str(raw_cue.get("voice_id", "") or "").strip()
+        if not anchor_text or not voice_id or clean_text.count(anchor_text) != 1:
+            LOGGER.warning(
+                "Skipped narration speaker cue because its anchor is not unique "
+                "or its voice ID is missing."
+            )
+            continue
+        start = clean_text.index(anchor_text)
+        end = start + len(anchor_text)
+        if any(start < existing_end and end > existing_start for existing_start, existing_end, _ in speaker_ranges):
+            LOGGER.warning("Skipped overlapping narration speaker cue %r.", anchor_text)
+            continue
+        speaker_ranges.append((start, end, voice_id))
+        forced_offsets.update({start, end})
+
     ranges = _narration_chunk_ranges(
         clean_text,
         forced_offsets=forced_offsets,
@@ -507,6 +544,7 @@ def build_narration_chunks(
                 chunks[-1] = NarrationChunk(
                     display_text=previous.display_text + display_text,
                     tts_text=previous.tts_text,
+                    voice_id=previous.voice_id,
                     sound_effects_before=previous.sound_effects_before,
                     sound_effects_after=previous.sound_effects_after,
                 )
@@ -519,6 +557,14 @@ def build_narration_chunks(
                     if tts_text_transform is not None
                     else spoken_text
                 ),
+                voice_id=next(
+                    (
+                        voice_id
+                        for speaker_start, speaker_end, voice_id in speaker_ranges
+                        if start >= speaker_start and end <= speaker_end
+                    ),
+                    "",
+                ),
                 sound_effects_before=tuple(before_at.get(start, ())),
                 sound_effects_after=tuple(after_at.get(end, ())),
             )
@@ -530,6 +576,7 @@ def build_narration_chunks(
             chunks[-1] = NarrationChunk(
                 display_text=last.display_text,
                 tts_text=last.tts_text,
+                voice_id=last.voice_id,
                 sound_effects_before=last.sound_effects_before,
                 sound_effects_after=(
                     last.sound_effects_after + tuple(before_at[len(clean_text)])
@@ -540,6 +587,7 @@ def build_narration_chunks(
             chunks[0] = NarrationChunk(
                 display_text=first.display_text,
                 tts_text=first.tts_text,
+                voice_id=first.voice_id,
                 sound_effects_before=tuple(after_at[0]) + first.sound_effects_before,
                 sound_effects_after=first.sound_effects_after,
             )
