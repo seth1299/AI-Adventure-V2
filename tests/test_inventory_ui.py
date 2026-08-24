@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 import os
 import tempfile
 import unittest
@@ -12,11 +13,17 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QApplication,
+    QComboBox,
+    QDialog,
     QGridLayout,
+    QHeaderView,
     QLabel,
     QLayoutItem,
+    QLineEdit,
+    QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QSizePolicy,
     QTabWidget,
     QTableWidgetItem,
     QTextEdit,
@@ -25,17 +32,30 @@ from PySide6.QtWidgets import (
 )
 
 from ai_adventure.persistence.save_repository import SaveRepository
+from ai_adventure.new_game_templates import (
+    load_new_game_templates,
+    save_new_game_template,
+)
 from ai_adventure.ui.main_window import (
     _DetachedTabWindow,
     AlchemyNotebookScreen,
+    BestiaryScreen,
     CalendarPlayerEventDialog,
     CalendarScreen,
+    CharacterScreen,
+    CombatScreen,
     GameShell,
     InventoryItemDetailsDialog,
     InventoryLocationPanel,
     InventoryScreen,
+    MagicScreen,
+    NewGameTemplateManagerDialog,
+    NewGameWizard,
     NpcsScreen,
+    PartyScreen,
     StoryScreen,
+    _NoWheelSpinBox,
+    _append_starter_suggestion_table_row,
     _apply_audio_settings_to_managers,
     _inventory_item_display_name,
     _inventory_quantity_display,
@@ -46,6 +66,698 @@ class InventoryUiTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.app = QApplication.instance() or QApplication([])
+
+    def test_new_game_wizard_supports_maximize_and_quest_guidance(self) -> None:
+        wizard = NewGameWizard(tts_enabled=False)
+
+        self.assertTrue(
+            wizard.windowFlags() & Qt.WindowType.WindowMaximizeButtonHint
+        )
+        self.assertTrue(
+            wizard.windowFlags() & Qt.WindowType.WindowMinMaxButtonsHint
+        )
+        self.assertEqual(
+            wizard.windowFlags() & Qt.WindowType.WindowType_Mask,
+            Qt.WindowType.Window,
+        )
+        self.assertGreater(wizard.maximumWidth(), wizard.width())
+        stylesheet = wizard.styleSheet()
+        self.assertIn("QLabel#newGameWizardPageTitle", stylesheet)
+        self.assertIn("font-size: 26px", stylesheet)
+        self.assertIn("QLabel#newGameWizardPageSubtitle", stylesheet)
+        self.assertIn("font-size: 17px", stylesheet)
+        title_label = wizard.findChild(QLabel, "newGameWizardPageTitle")
+        subtitle_label = wizard.findChild(QLabel, "newGameWizardPageSubtitle")
+        self.assertIsNotNone(title_label)
+        self.assertIsNotNone(subtitle_label)
+        assert title_label is not None
+        assert subtitle_label is not None
+        self.assertEqual(
+            title_label.sizePolicy().verticalPolicy(),
+            QSizePolicy.Policy.Fixed,
+        )
+        self.assertEqual(
+            subtitle_label.sizePolicy().verticalPolicy(),
+            QSizePolicy.Policy.Fixed,
+        )
+        self.assertEqual(title_label.minimumHeight(), title_label.maximumHeight())
+        self.assertEqual(subtitle_label.minimumHeight(), subtitle_label.maximumHeight())
+        self.assertLess(title_label.maximumHeight(), 100)
+        self.assertLess(subtitle_label.maximumHeight(), 100)
+        ai_index = wizard.starting_task_mode_combo.findData("ai")
+        wizard.starting_task_mode_combo.setCurrentIndex(ai_index)
+        wizard.starting_task_guidance_input.setPlainText(
+            "Begin with a mystery involving a missing courier."
+        )
+        self.app.processEvents()
+
+        self.assertFalse(wizard.starting_task_guidance_group.isHidden())
+        self.assertTrue(wizard.starting_task_custom_group.isHidden())
+        self.assertEqual(
+            wizard._starting_task_from_controls()["guidance"],
+            "Begin with a mystery involving a missing courier.",
+        )
+        wizard.close()
+
+    def test_template_selection_reuses_widgets_without_mutating_templates(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            template_path = Path(temp_dir) / "new_game_templates.json"
+            first_setup = {
+                "specified_genre": "Mystery",
+                "starting_locations": [
+                    {"name": "Office", "description": "A cramped office."},
+                    {"name": "Street", "description": "A rain-soaked street."},
+                ],
+                "starting_npcs": [
+                    {"name": "Client", "location": "Office", "description": "Nervous."}
+                ],
+                "starter_items": [
+                    {"name": "Notebook", "category": "Item", "quantity": 1},
+                    {
+                        "name": "Revolver",
+                        "category": "Weapon",
+                        "item_type": "Weapon",
+                        "quantity": 1,
+                    },
+                ],
+                "currency_denominations": [
+                    {"name": "dollar", "plural_name": "dollars", "value": 1}
+                ],
+                "economy_examples": [
+                    {"name": "Coffee", "value_base_units": 1}
+                ],
+            }
+            second_setup = {
+                "specified_genre": "Fantasy",
+                "starting_locations": [
+                    {"name": "Keep", "description": "A stone keep."}
+                ],
+                "starting_npcs": [],
+                "no_starting_npcs": True,
+                "starter_items": [],
+                "currency_denominations": [],
+                "economy_examples": [],
+            }
+            self.assertTrue(
+                save_new_game_template(
+                    template_path,
+                    first_setup,
+                    template_name="A Mystery",
+                    normalize_setup=False,
+                )
+            )
+            self.assertTrue(
+                save_new_game_template(
+                    template_path,
+                    second_setup,
+                    template_name="B Fantasy",
+                    normalize_setup=False,
+                )
+            )
+            original_file = template_path.read_bytes()
+            dialog = NewGameTemplateManagerDialog(template_path=template_path)
+            original_setups = [deepcopy(template.setup) for template in dialog.templates]
+            pooled_widget_ids = {
+                id(widget)
+                for table in (
+                    dialog.starting_locations_table,
+                    dialog.starting_npcs_table,
+                    dialog.starter_items_table,
+                    dialog.starter_weapons_table,
+                    dialog.starter_armor_table,
+                    dialog.currency_table,
+                    dialog.economy_examples_table,
+                    *dialog.skill_tables.values(),
+                )
+                for row in range(table.rowCount())
+                for column in range(table.columnCount())
+                if (widget := table.cellWidget(row, column)) is not None
+            }
+
+            with patch("ai_adventure.ui.main_window.NewGameWizard") as wizard_type:
+                for row in (1, 0, 1, 0):
+                    dialog.template_list.setCurrentRow(row)
+                    self.app.processEvents()
+
+            current_widget_ids = {
+                id(widget)
+                for table in (
+                    dialog.starting_locations_table,
+                    dialog.starting_npcs_table,
+                    dialog.starter_items_table,
+                    dialog.starter_weapons_table,
+                    dialog.starter_armor_table,
+                    dialog.currency_table,
+                    dialog.economy_examples_table,
+                    *dialog.skill_tables.values(),
+                )
+                for row in range(table.rowCount())
+                for column in range(table.columnCount())
+                if (widget := table.cellWidget(row, column)) is not None
+            }
+            self.assertEqual(current_widget_ids, pooled_widget_ids)
+            self.assertEqual(
+                [template.setup for template in dialog.templates],
+                original_setups,
+            )
+            self.assertEqual(template_path.read_bytes(), original_file)
+            wizard_type.assert_not_called()
+            self.assertEqual(dialog.genre_input.text(), "Mystery")
+            self.assertEqual(
+                len(dialog._starting_locations_from_table()),
+                2,
+            )
+            self.assertEqual(len(dialog._starting_npcs_from_table()), 1)
+            dialog.genre_input.setText("Thriller")
+            dialog._save_template()
+            saved_templates = load_new_game_templates(
+                template_path,
+                normalize_setups=False,
+            )
+            saved_mystery = next(
+                template
+                for template in saved_templates
+                if template.name == "A Mystery"
+            )
+            self.assertEqual(saved_mystery.setup["specified_genre"], "Thriller")
+            dialog.close()
+
+    def test_new_game_wizard_calendar_settings_button_opens_dialog(self) -> None:
+        wizard = NewGameWizard(tts_enabled=False)
+        custom_index = wizard.calendar_type_combo.findData("custom")
+        wizard.calendar_type_combo.setCurrentIndex(custom_index)
+        self.app.processEvents()
+
+        with patch("ai_adventure.ui.main_window.CalendarSettingsDialog") as dialog_type:
+            dialog_type.return_value.exec.return_value = 0
+            wizard.calendar_settings_button.click()
+
+        dialog_type.assert_called_once_with(
+            wizard._custom_calendar_settings,
+            wizard,
+        )
+        wizard.close()
+
+    def test_new_game_wizard_can_preview_a_sound_effect(self) -> None:
+        class FakeSoundManager:
+            def __init__(self) -> None:
+                self.effect_volume: float | int | None = None
+                self.effect_played = ""
+
+            def get_valid_sound_effect_names(self) -> list[str]:
+                return ["Rain.wav"]
+
+            def set_sound_effects_volume(self, volume: float | int | None) -> None:
+                self.effect_volume = volume
+
+            def play_sound_effect(
+                self,
+                track_name_or_path: str | Path | None,
+            ) -> None:
+                self.effect_played = str(track_name_or_path or "")
+
+            def stop_music(self, *, clear_current: bool = True) -> None:
+                pass
+
+        manager = FakeSoundManager()
+        wizard = NewGameWizard(
+            tts_enabled=False,
+            sound_manager=cast(Any, manager),
+        )
+        wizard.sound_effects_volume_slider.setValue(42)
+        wizard.sound_effects_test_button.click()
+
+        self.assertEqual(manager.effect_volume, 42)
+        self.assertEqual(manager.effect_played, "Rain.wav")
+        wizard.close()
+
+    def test_new_game_wizard_round_trips_magic_configuration(self) -> None:
+        wizard = NewGameWizard(tts_enabled=False)
+        wizard.load_setup(
+            {
+                "magic": {
+                    "enabled": True,
+                    "casting_mode": "tiered",
+                    "tradition": "Starlight",
+                    "tier_slots": {1: 3, 2: 1},
+                    "starting_spells_mode": "advanced",
+                    "starting_spells": [
+                        {
+                            "name": "Star Spark",
+                            "tier": 0,
+                            "school": "Astral",
+                            "description": "Creates a bright stellar spark.",
+                            "mana_cost": 0,
+                            "prepared": True,
+                        }
+                    ],
+                }
+            }
+        )
+
+        magic = wizard.build_setup()["magic"]
+
+        self.assertTrue(magic["enabled"])
+        self.assertEqual(magic["casting_mode"], "tiered")
+        self.assertEqual(magic["tradition"], "Starlight")
+        self.assertEqual(magic["tier_slots"][1], 3)
+        self.assertEqual(magic["starting_spells"][0]["name"], "Star Spark")
+        wizard.close()
+
+    def test_new_game_wizard_no_magic_checkbox_hides_and_restores_options(self) -> None:
+        wizard = NewGameWizard(tts_enabled=False)
+        self.assertEqual(
+            wizard.no_world_magic_checkbox.text(),
+            "This world does not contain magic.",
+        )
+        wizard.magic_enabled_checkbox.setChecked(True)
+        wizard.magic_tradition_input.setText("Starlight")
+        wizard._set_starting_spells_mode("advanced")
+        wizard._append_starting_spell_row(
+            {"name": "Star Spark", "description": "Creates a stellar spark."}
+        )
+
+        wizard.no_world_magic_checkbox.setChecked(True)
+        self.app.processEvents()
+        disabled_magic = wizard.build_setup()["magic"]
+
+        self.assertTrue(wizard.magic_options_container.isHidden())
+        self.assertFalse(disabled_magic["world_contains_magic"])
+        self.assertFalse(disabled_magic["player_magic_enabled"])
+        self.assertFalse(disabled_magic["enabled"])
+        self.assertEqual(disabled_magic["starting_spells"], [])
+
+        wizard.no_world_magic_checkbox.setChecked(False)
+        self.app.processEvents()
+        restored_magic = wizard.build_setup()["magic"]
+
+        self.assertFalse(wizard.magic_options_container.isHidden())
+        self.assertTrue(wizard.magic_options_container.isEnabled())
+        self.assertTrue(wizard.magic_enabled_checkbox.isChecked())
+        self.assertEqual(wizard.magic_tradition_input.text(), "Starlight")
+        self.assertEqual(wizard.starting_spells_table.rowCount(), 1)
+        self.assertTrue(restored_magic["world_contains_magic"])
+        self.assertTrue(restored_magic["enabled"])
+        wizard.close()
+
+    def test_new_game_wizard_keeps_world_magic_details_when_player_casting_is_off(self) -> None:
+        wizard = NewGameWizard(tts_enabled=False)
+        wizard.magic_enabled_checkbox.setChecked(True)
+        wizard.magic_casting_mode_combo.setCurrentIndex(
+            wizard.magic_casting_mode_combo.findData("mana")
+        )
+        wizard.magic_tradition_input.setText("Starlight")
+        self.app.processEvents()
+
+        self.assertFalse(wizard.magic_player_options_scroll.isHidden())
+        wizard.magic_enabled_checkbox.setChecked(False)
+        self.app.processEvents()
+        magic = wizard.build_setup()["magic"]
+
+        self.assertFalse(wizard.magic_options_container.isHidden())
+        self.assertFalse(wizard.magic_player_options_scroll.isHidden())
+        self.assertTrue(wizard.magic_player_casting_controls_container.isHidden())
+        self.assertTrue(wizard.magic_mana_group.isHidden())
+        self.assertTrue(wizard.starting_spells_group.isHidden())
+        self.assertFalse(magic["player_magic_enabled"])
+        self.assertEqual(magic["casting_mode"], "mana")
+        self.assertEqual(magic["tradition"], "Starlight")
+        self.assertEqual(magic["starting_spells"], [])
+        wizard.close()
+
+    def test_new_game_wizard_casting_resources_do_not_capture_wheel_scroll(self) -> None:
+        wizard = NewGameWizard(tts_enabled=False)
+
+        self.assertIsInstance(wizard.magic_mana_maximum_input, _NoWheelSpinBox)
+        self.assertTrue(
+            all(
+                isinstance(slot_input, _NoWheelSpinBox)
+                for slot_input in wizard.magic_tier_slot_inputs.values()
+            )
+        )
+        wizard.close()
+
+    def test_new_game_wizard_round_trips_standard_and_custom_pronouns(self) -> None:
+        wizard = NewGameWizard(tts_enabled=False)
+
+        self.assertEqual(wizard.build_setup()["character"]["pronouns"], "They/Them")
+        self.assertTrue(wizard.character_custom_pronouns_input.isHidden())
+
+        wizard.load_setup({"character": {"pronouns": "She/Her"}})
+        self.assertEqual(wizard.character_pronouns_combo.currentData(), "She/Her")
+        self.assertEqual(wizard.build_setup()["character"]["pronouns"], "She/Her")
+
+        wizard.load_setup({"character": {"pronouns": "Xe/Xem"}})
+        self.app.processEvents()
+        self.assertEqual(wizard.character_pronouns_combo.currentData(), "other")
+        self.assertFalse(wizard.character_custom_pronouns_input.isHidden())
+        self.assertEqual(wizard.character_custom_pronouns_input.text(), "Xe/Xem")
+        self.assertEqual(wizard.build_setup()["character"]["pronouns"], "Xe/Xem")
+        wizard.close()
+
+    def test_new_game_wizard_basic_starting_spells_are_gemini_requests(self) -> None:
+        wizard = NewGameWizard(tts_enabled=False)
+        wizard.magic_enabled_checkbox.setChecked(True)
+        wizard._append_starting_spell_request_row(
+            {"spell_request": "A spell that reveals fresh footprints"}
+        )
+
+        magic = wizard.build_setup()["magic"]
+
+        self.assertEqual(magic["starting_spells_mode"], "basic")
+        self.assertEqual(magic["starting_spells"], [])
+        self.assertEqual(
+            magic["starting_spell_requests"][0]["spell_request"],
+            "A spell that reveals fresh footprints",
+        )
+        wizard.close()
+
+    def test_new_game_wizard_round_trips_combat_preferences(self) -> None:
+        wizard = NewGameWizard(tts_enabled=False)
+        wizard.load_setup(
+            {"combat": {"resolution_mode": "narrative", "focus": "low"}}
+        )
+
+        combat = wizard.build_setup()["combat"]
+
+        self.assertEqual(combat["resolution_mode"], "narrative")
+        self.assertEqual(combat["focus"], "low")
+        self.assertIn("Gemini narrates", wizard.combat_resolution_explanation.text())
+        wizard.close()
+
+    def test_new_game_wizard_party_tracks_the_live_starting_npc_list(self) -> None:
+        wizard = NewGameWizard(tts_enabled=False)
+        wizard._append_starting_npc_row(
+            {"npc_id": "npc_mira", "name": "Mira", "location": "Old Road"}
+        )
+        wizard._append_starting_npc_row(
+            {"npc_id": "npc_orin", "name": "Orin", "location": "West Gate"}
+        )
+        self.app.processEvents()
+
+        self.assertEqual(wizard.starting_party_npc_combo.count(), 2)
+        mira_index = wizard.starting_party_npc_combo.findData("npc_mira")
+        wizard.starting_party_npc_combo.setCurrentIndex(mira_index)
+        wizard._add_selected_starting_party_member()
+        self.assertEqual(
+            wizard.build_setup()["starting_party_npc_ids"],
+            ["npc_mira"],
+        )
+
+        remove_button = wizard.starting_npcs_table.cellWidget(0, 4)
+        self.assertIsInstance(remove_button, QPushButton)
+        assert isinstance(remove_button, QPushButton)
+        self.assertEqual(remove_button.text(), "Remove")
+
+        with patch(
+            "ai_adventure.ui.main_window.QMessageBox.question",
+            return_value=QMessageBox.StandardButton.No,
+        ):
+            remove_button.click()
+        self.assertEqual(wizard.starting_npcs_table.rowCount(), 2)
+
+        with patch(
+            "ai_adventure.ui.main_window.QMessageBox.question",
+            return_value=QMessageBox.StandardButton.Yes,
+        ):
+            remove_button.click()
+        self.app.processEvents()
+
+        self.assertEqual(wizard.starting_party_table.rowCount(), 0)
+        self.assertEqual(wizard.starting_party_npc_combo.findData("npc_mira"), -1)
+        self.assertEqual(
+            wizard.build_setup()["starting_party_npc_ids"],
+            [],
+        )
+        wizard.close()
+
+    def test_new_game_wizard_hides_inactive_npc_and_party_controls(self) -> None:
+        wizard = NewGameWizard(tts_enabled=False)
+
+        self.assertTrue(wizard.starting_party_selection_container.isHidden())
+        self.assertTrue(wizard.starting_party_table.isHidden())
+        self.assertFalse(wizard.starting_party_empty_label.isHidden())
+
+        wizard.no_starting_npcs_checkbox.setChecked(True)
+        self.app.processEvents()
+        self.assertTrue(wizard.starting_npcs_editor_container.isHidden())
+
+        wizard.no_starting_npcs_checkbox.setChecked(False)
+        wizard._append_starting_npc_row({"name": "Mira"})
+        self.app.processEvents()
+        self.assertFalse(wizard.starting_npcs_editor_container.isHidden())
+        self.assertFalse(wizard.starting_party_selection_container.isHidden())
+        self.assertFalse(wizard.add_starting_party_member_button.isHidden())
+        wizard.close()
+
+    def test_new_game_wizard_party_page_skip_reacts_to_npc_checkbox(self) -> None:
+        wizard = NewGameWizard(tts_enabled=False)
+        wizard.setCurrentId(wizard.starting_npcs_page_id)
+
+        wizard.no_starting_npcs_checkbox.setChecked(True)
+        self.assertEqual(wizard.nextId(), wizard.character_page_id)
+
+        wizard.no_starting_npcs_checkbox.setChecked(False)
+        self.assertEqual(wizard.nextId(), wizard.starting_party_page_id)
+        wizard.close()
+
+    def test_new_game_wizard_npc_location_dropdown_tracks_locations_page(self) -> None:
+        wizard = NewGameWizard(tts_enabled=False)
+        wizard._append_starting_location_row(
+            {"name": "Old Road", "description": "A muddy trade road."}
+        )
+        wizard._append_starting_location_row(
+            {"name": "West Gate", "description": "The city gate."}
+        )
+        wizard._append_starting_npc_row(
+            {"npc_id": "npc_mira", "name": "Mira", "location": "Old Road"}
+        )
+        self.app.processEvents()
+
+        location_combo = wizard.starting_npcs_table.cellWidget(0, 1)
+        self.assertIsInstance(location_combo, QComboBox)
+        assert isinstance(location_combo, QComboBox)
+        self.assertEqual(
+            [location_combo.itemText(index) for index in range(location_combo.count())],
+            ["Select a location", "Old Road", "West Gate"],
+        )
+        self.assertEqual(location_combo.currentText(), "Old Road")
+
+        old_road_name = wizard.starting_locations_table.cellWidget(0, 0)
+        self.assertIsInstance(old_road_name, QLineEdit)
+        assert isinstance(old_road_name, QLineEdit)
+        old_road_name.setText("North Road")
+        self.app.processEvents()
+
+        self.assertEqual(location_combo.currentText(), "North Road")
+        self.assertEqual(
+            wizard.build_setup()["starting_npcs"][0]["location"],
+            "North Road",
+        )
+        self.assertEqual(
+            wizard.build_setup()["starting_npcs"][0]["location_source_index"],
+            0,
+        )
+
+        wizard.starting_locations_table.removeRow(0)
+        wizard._refresh_starting_location_dropdowns()
+        self.app.processEvents()
+
+        self.assertEqual(location_combo.currentData(), "")
+        self.assertNotIn(
+            "North Road",
+            [location_combo.itemText(index) for index in range(location_combo.count())],
+        )
+        self.assertEqual(wizard.build_setup()["starting_npcs"][0]["location"], "")
+        self.assertEqual(
+            wizard.build_setup()["starting_npcs"][0]["location_source_index"],
+            -1,
+        )
+        wizard.close()
+
+    def test_combat_screen_disables_manual_start_for_narrative_combat(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = SaveRepository.create_new_save(
+                Path(temp_dir), "Narrative Combat UI"
+            )
+            repository.set_setting(
+                "combat.preferences",
+                {"resolution_mode": "narrative", "focus": "balanced"},
+            )
+            screen = CombatScreen(playtesting_tools=True)
+            screen.set_repository(repository)
+            self.app.processEvents()
+
+            self.assertIn("Gemini resolves fights", screen.status_label.text())
+            self.assertFalse(screen.start_button.isEnabled())
+            self.assertFalse(screen.add_combatant_button.isEnabled())
+            screen.close()
+
+    def test_character_identity_pronouns_and_contextual_controls(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = SaveRepository.create_new_save(
+                Path(temp_dir), "Character Smart Controls"
+            )
+            repository.set_setting("player.pronouns", "Xe/Xem")
+            repository.set_setting("audio.narrator_enabled", False)
+            repository.set_setting(
+                "combat.preferences",
+                {"resolution_mode": "narrative", "focus": "balanced"},
+            )
+            repository.set_state_value("condition", "Wounded")
+            screen = CharacterScreen(tts_enabled=True)
+            screen.set_repository(repository)
+            self.app.processEvents()
+
+            self.assertEqual(screen.pronouns_combo.currentData(), "other")
+            self.assertEqual(screen.custom_pronouns_input.text(), "Xe/Xem")
+            self.assertFalse(screen.custom_pronouns_input.isHidden())
+            self.assertTrue(screen.name_pronunciation_input.isHidden())
+            self.assertTrue(screen.stats_group.isHidden())
+            self.assertTrue(screen.equipment_group.isHidden())
+            self.assertFalse(screen.condition_group.isHidden())
+            self.assertEqual(screen.condition_label.text(), "Wounded")
+
+            she_index = screen.pronouns_combo.findData("She/Her")
+            screen.pronouns_combo.setCurrentIndex(she_index)
+            self.app.processEvents()
+            self.assertEqual(repository.get_setting("player.pronouns"), "She/Her")
+            screen.close()
+
+    def test_magic_screen_displays_known_spells_and_resources(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = SaveRepository.create_new_save(Path(temp_dir), "Magic UI")
+            repository.set_magic_configuration(
+                {"enabled": True, "casting_mode": "mana", "mana_maximum": 14}
+            )
+            spell = repository.upsert_spell_catalog(
+                name="River Shield",
+                tier=1,
+                school="Water",
+                description="Raises a flowing defensive veil.",
+                mana_cost=3,
+            )
+            assert spell is not None
+            repository.learn_character_spell(spell["spell_id"])
+            screen = MagicScreen()
+            screen.set_repository(repository)
+            self.app.processEvents()
+
+            self.assertIn("Mana Casting", screen.summary_label.text())
+            self.assertIn("14/14", screen.resources_label.text())
+            self.assertEqual(screen.spells_table.rowCount(), 1)
+            spell_item = screen.spells_table.item(0, 0)
+            self.assertIsNotNone(spell_item)
+            assert spell_item is not None
+            self.assertEqual(spell_item.text(), "River Shield")
+            screen.close()
+
+    def test_new_game_wizard_starter_inventory_uses_one_basic_advanced_mode(self) -> None:
+        wizard = NewGameWizard(tts_enabled=False)
+        self.assertEqual(wizard._starter_inventory_mode(), "basic")
+        self.assertEqual(wizard.starter_inventory_mode_stack.currentIndex(), 0)
+
+        _append_starter_suggestion_table_row(
+            wizard.starter_item_suggestions_table,
+            "Item",
+            "A compact field medicine kit",
+        )
+        wizard._append_starter_item_row({"name": "Exact Lantern"})
+        basic_items = wizard._starter_items_from_table()
+        self.assertEqual(len(basic_items), 1)
+        self.assertEqual(basic_items[0]["item_request"], "A compact field medicine kit")
+
+        wizard._set_starter_inventory_mode("advanced")
+        advanced_items = wizard._starter_items_from_table()
+        self.assertEqual(wizard.starter_inventory_mode_stack.currentIndex(), 1)
+        self.assertEqual(len(advanced_items), 1)
+        self.assertEqual(advanced_items[0]["name"], "Exact Lantern")
+        wizard.close()
+
+    def test_new_game_wizard_starting_wealth_supports_guidance_and_exact_amounts(self) -> None:
+        wizard = NewGameWizard(tts_enabled=False)
+        self.assertEqual(wizard._starting_wealth_mode(), "basic")
+        self.assertIn("few meals", wizard.starting_wealth_guidance_input.toPlainText())
+
+        wizard._append_currency_row(
+            {"name": "Bit", "plural_name": "Bits", "value": 1}
+        )
+        wizard._append_currency_row(
+            {"name": "Crown", "plural_name": "Crowns", "value": 12}
+        )
+        wizard._set_starting_wealth_mode("advanced")
+        wizard._append_starting_wealth_amount_row(
+            {"denomination_value": 12, "quantity": 3}
+        )
+        wizard._append_starting_wealth_amount_row(
+            {"denomination_value": 1, "quantity": 4}
+        )
+
+        first_combo = wizard.starting_wealth_amounts_table.cellWidget(0, 0)
+        first_amount = wizard.starting_wealth_amounts_table.cellWidget(0, 1)
+        self.assertIsInstance(first_combo, QComboBox)
+        self.assertIsInstance(first_amount, _NoWheelSpinBox)
+        assert isinstance(first_combo, QComboBox)
+        self.assertEqual(
+            [first_combo.itemText(index) for index in range(first_combo.count())],
+            ["Bit", "Crown"],
+        )
+
+        setup = wizard.build_setup()
+        self.assertEqual(setup["starting_wealth"]["mode"], "advanced")
+        self.assertEqual(setup["starting_wealth"]["balance_base_units"], 40)
+        self.assertIn("40 base units", wizard.starting_wealth_summary_label.text())
+        wizard.close()
+
+    def test_new_game_wizard_controls_resize_with_available_space(self) -> None:
+        wizard = NewGameWizard(tts_enabled=False)
+
+        self.assertGreaterEqual(wizard.width(), 780)
+        self.assertGreaterEqual(wizard.height(), 620)
+        self.assertEqual(
+            wizard.starting_locations_table.horizontalHeader().sectionResizeMode(0),
+            QHeaderView.ResizeMode.Stretch,
+        )
+        self.assertEqual(
+            wizard.starting_locations_table.horizontalHeader().sectionResizeMode(5),
+            QHeaderView.ResizeMode.ResizeToContents,
+        )
+        self.assertEqual(
+            wizard.starter_item_suggestions_table.horizontalHeader().sectionResizeMode(0),
+            QHeaderView.ResizeMode.Stretch,
+        )
+        self.app.processEvents()
+        empty_height = wizard.starter_item_suggestions_table.maximumHeight()
+        self.assertLess(empty_height, 190)
+        _append_starter_suggestion_table_row(
+            wizard.starter_item_suggestions_table,
+            "Item",
+            "Field kit",
+        )
+        _append_starter_suggestion_table_row(
+            wizard.starter_item_suggestions_table,
+            "Item",
+            "Weatherproof cloak",
+        )
+        self.app.processEvents()
+        self.assertGreater(
+            wizard.starter_item_suggestions_table.maximumHeight(),
+            empty_height,
+        )
+        wizard.starter_item_suggestions_table.setRowCount(0)
+        self.app.processEvents()
+        self.assertEqual(
+            wizard.starter_item_suggestions_table.maximumHeight(),
+            empty_height,
+        )
+        self.assertTrue(
+            hasattr(
+                wizard.starter_item_suggestions_table,
+                "_wheel_passthrough_filter",
+            )
+        )
+        self.assertGreater(wizard.starting_task_guidance_input.maximumHeight(), 120)
+        wizard.close()
 
     def test_detached_tab_window_reshows_page_hidden_by_tab_removal(self) -> None:
         host = QWidget()
@@ -230,6 +942,15 @@ class InventoryUiTests(unittest.TestCase):
                         "position": "before",
                     }
                 ],
+                speaker_cues=[
+                    {
+                        "anchor_text": "The market opens.",
+                        "speaker_id": "market_crier",
+                        "speaker_name": "Market Crier",
+                        "voice_profile": "deep_masculine",
+                        "voice_id": "am_onyx",
+                    }
+                ],
             )
             story_id = int(repository.list_history()[-1]["id"])
             narrator = FakeNarrationPlayer()
@@ -260,11 +981,123 @@ class InventoryUiTests(unittest.TestCase):
                     }
                 ],
             )
-            transform = cast(Any, kwargs["tts_text_transform"])
             self.assertEqual(
-                transform("Ironpeak City wakes."),
-                '[Ironpeak City]{ph="ˈaɪɚnˌpik ˈsɪti"} wakes.',
+                kwargs.get("speaker_cues"),
+                [
+                    {
+                        "anchor_text": "The market opens.",
+                        "speaker_id": "market_crier",
+                        "speaker_name": "Market Crier",
+                        "voice_profile": "deep_masculine",
+                        "voice_id": "am_onyx",
+                    }
+                ],
             )
+            transform = cast(Any, kwargs["tts_text_transform"])
+            self.assertEqual(transform("Ironpeak City wakes."), "Ironpeak City wakes.")
+            screen.close()
+
+    def test_read_aloud_replays_saved_passage_sound_effect_cues(self) -> None:
+        class FakeNarrationPlayer:
+            def __init__(self) -> None:
+                self.calls: list[dict[str, Any]] = []
+
+            def set_volume(self, _volume: float | int | None) -> None:
+                pass
+
+            def set_speed(self, _speed: float | int | None) -> None:
+                pass
+
+            def set_voice(self, _voice: str | None) -> None:
+                pass
+
+            def set_enabled(self, _enabled: bool) -> None:
+                pass
+
+            def play_sample(self, **kwargs: Any) -> bool:
+                self.calls.append(kwargs)
+                return True
+
+        class FakeSoundManager:
+            def __init__(self) -> None:
+                self.effects: list[str] = []
+
+            def set_music_volume(self, _volume: float | int | None) -> None:
+                pass
+
+            def set_music_enabled(self, _enabled: bool) -> None:
+                pass
+
+            def set_sound_effects_volume(self, _volume: float | int | None) -> None:
+                pass
+
+            def set_sound_effects_enabled(self, _enabled: bool) -> None:
+                pass
+
+            def play_music(self, _track: str | Path | None) -> None:
+                pass
+
+            def stop_music(self, *, clear_current: bool = True) -> None:
+                pass
+
+            def stop_sound_effect(self, *, clear_current: bool = True) -> None:
+                pass
+
+            def play_sound_effect(self, track: str | Path | None) -> None:
+                self.effects.append(str(track or ""))
+
+        cue = {
+            "filename": "Market Bell.wav",
+            "anchor_text": "market",
+            "position": "before",
+        }
+        speaker_cue = {
+            "anchor_text": '"The market opens."',
+            "speaker_id": "town_crier",
+            "speaker_name": "Town Crier",
+            "voice_profile": "deep_masculine",
+            "voice_id": "am_onyx",
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = SaveRepository.create_new_save(Path(temp_dir), "Replay Test")
+            repository.set_setting(
+                "tts.pronunciation_map",
+                {"Ironpeak City": {"ipa": "ˈaɪɚnˌpik ˈsɪti"}},
+            )
+            repository.append_history(
+                "story",
+                'Ironpeak City wakes. "The market opens."',
+                sound_effect_cues=[cue],
+                speaker_cues=[speaker_cue],
+            )
+            history_entry_id = int(repository.list_history()[-1]["id"])
+            narrator = FakeNarrationPlayer()
+            sound_manager = FakeSoundManager()
+            screen = StoryScreen(
+                narration_player=cast(Any, narrator),
+                sound_manager=cast(Any, sound_manager),
+            )
+            screen.set_repository(repository)
+
+            started = screen._read_conversation_message_aloud(
+                "Formatted display text",
+                history_entry_id=history_entry_id,
+            )
+
+            self.assertTrue(started)
+            self.assertEqual(len(narrator.calls), 1)
+            call = narrator.calls[0]
+            self.assertEqual(
+                call["text"],
+                'Ironpeak City wakes. "The market opens."',
+            )
+            self.assertEqual(call["sound_effect_cues"], [cue])
+            self.assertEqual(call["speaker_cues"], [speaker_cue])
+            transform = cast(Any, call["tts_text_transform"])
+            self.assertEqual(transform("Ironpeak City wakes."), "Ironpeak City wakes.")
+            on_sound_effect = cast(Any, call["on_sound_effect"])
+            on_sound_effect("Market Bell.wav")
+            self.assertEqual(sound_manager.effects, ["Market Bell.wav"])
             screen.close()
 
     def test_conversation_refresh_preserves_reader_position_and_adds_bottom_buffer(self) -> None:
@@ -379,7 +1212,152 @@ class InventoryUiTests(unittest.TestCase):
             self.assertTrue(str(event["event_id"]).startswith("player_"))
 
             dialog.close()
+
+    def test_calendar_tasks_table_displays_wrapped_quest_description(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = SaveRepository.create_new_save(
+                Path(temp_dir),
+                "Task Description UI",
+            )
+            repository.upsert_active_task(
+                name="The Kestrel Street Homicide",
+                category="Quest",
+                description=(
+                    "Question witnesses in Kestrel Street Alleyway, identify the "
+                    "victim, and bring enough evidence to Inspector Vale to name "
+                    "the killer."
+                ),
+                requester="Inspector Vale",
+                location="Kestrel Street Alleyway",
+                reward="$200",
+                due_date="N/A",
+            )
+            screen = CalendarScreen()
+            screen.set_repository(repository)
+            self.app.processEvents()
+
+            headers = [
+                cast(QTableWidgetItem, screen.tasks_table.horizontalHeaderItem(column)).text()
+                for column in range(screen.tasks_table.columnCount())
+            ]
+            self.assertEqual(
+                headers,
+                ["Task", "Description", "Category", "Due", "Location", "Reward"],
+            )
+            self.assertEqual(screen.tasks_table.rowCount(), 1)
+            description_item = screen.tasks_table.item(0, 1)
+            self.assertIsNotNone(description_item)
+            assert description_item is not None
+            self.assertIn("Question witnesses", description_item.text())
+            self.assertIn("Inspector Vale", description_item.text())
+            self.assertTrue(screen.tasks_table.wordWrap())
             screen.close()
+            screen.close()
+
+    def test_calendar_day_double_click_prefills_event_date(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = SaveRepository.create_new_save(
+                Path(temp_dir), "Calendar Double Click"
+            )
+            screen = CalendarScreen()
+            screen.set_repository(repository)
+            self.app.processEvents()
+            item = screen.table.item(0, 2)
+            self.assertIsNotNone(item)
+            assert item is not None
+            date = item.data(int(Qt.ItemDataRole.UserRole) + 1)
+            self.assertIsInstance(date, dict)
+
+            with patch(
+                "ai_adventure.ui.main_window.CalendarPlayerEventDialog"
+            ) as dialog_type:
+                dialog_type.return_value.exec.return_value = QDialog.DialogCode.Rejected
+                screen._schedule_open_day_events(0, 2)
+                screen._add_player_event_for_day(0, 2)
+
+            self.assertFalse(screen._day_click_timer.isActive())
+            self.assertEqual(dialog_type.call_args.kwargs["default_year"], date["year"])
+            self.assertEqual(dialog_type.call_args.kwargs["default_month"], date["month"])
+            self.assertEqual(dialog_type.call_args.kwargs["default_day"], date["day"])
+            screen.close()
+
+    def test_new_game_empty_tabs_reveal_with_unread_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = SaveRepository.create_new_save(
+                Path(temp_dir),
+                "Smart Starting Tabs",
+                setup={"title": "Smart Starting Tabs"},
+            )
+            shell = GameShell(lambda: None, tts_enabled=False, ai_enabled=False)
+            shell.set_repository(repository, initially_hide_empty_tabs=True)
+            self.app.processEvents()
+
+            self.assertEqual(shell._tab_index_for_key("npcs"), -1)
+            self.assertEqual(shell._tab_index_for_key("party"), -1)
+            self.assertEqual(shell._tab_index_for_key("magic"), -1)
+
+            repository.upsert_npc(
+                npc_id="mira_coppercup",
+                name="Mira Coppercup",
+                display_name="Mira",
+                role="Guide",
+                player_facing_information="A guide the player has just met.",
+            )
+            shell.story_screen.notify_repository_changed()
+            self.app.processEvents()
+
+            npc_index = shell._tab_index_for_key("npcs")
+            self.assertGreaterEqual(npc_index, 0)
+            self.assertEqual(shell.tabs.tabText(npc_index), "NPCs •")
+            self.assertEqual(shell._tab_index_for_key("party"), -1)
+            self.assertEqual(shell._tab_index_for_key("magic"), -1)
+
+            shell.tabs.setCurrentIndex(npc_index)
+            self.app.processEvents()
+            self.assertEqual(shell.tabs.tabText(npc_index), "NPCs")
+            shell.close()
+
+    def test_bestiary_screen_matches_travel_layout_without_action_button(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = SaveRepository.create_new_save(Path(temp_dir), "Bestiary UI")
+            repository.upsert_miscellaneous(
+                misc_id="mist_strider",
+                name="Mist-Strider",
+                category="Creature",
+                details="A towering animal seen moving between the fog banks.",
+            )
+            repository.upsert_miscellaneous(
+                misc_id="reed_covenant",
+                name="Reed Covenant",
+                category="Faction",
+                details="A marshland alliance.",
+            )
+            repository.upsert_gm_secret(
+                secret_id="mist_strider_origin",
+                title="Mist-Strider Origin",
+                details="It was secretly built beneath the old archive.",
+            )
+
+            screen = BestiaryScreen()
+            screen.set_repository(repository)
+            self.app.processEvents()
+
+            self.assertEqual(screen.creature_list.count(), 1)
+            self.assertEqual(screen.creature_list.item(0).text(), "Mist-Strider")
+            visible_details = screen.details_output.toPlainText()
+            self.assertIn("towering animal", visible_details)
+            self.assertNotIn("built beneath", visible_details)
+            self.assertEqual(screen.findChildren(QPushButton), [])
+            screen.close()
+
+    def test_game_shell_registers_bestiary_tab(self) -> None:
+        shell = GameShell(lambda: None, tts_enabled=False, ai_enabled=False)
+
+        index = shell._tab_index_for_key("bestiary")
+        self.assertGreaterEqual(index, 0)
+        self.assertEqual(shell.tabs.tabText(index), "Bestiary")
+        self.assertIs(shell.tabs.widget(index), shell.bestiary_screen)
+        shell.close()
 
     def test_npcs_auto_refresh_after_repository_change_without_refresh_button(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -435,6 +1413,55 @@ class InventoryUiTests(unittest.TestCase):
         )
 
         screen.close()
+
+    def test_party_screen_shows_party_data_with_shared_npc_id(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = SaveRepository.create_new_save(Path(temp_dir), "Party UI Test")
+            repository.upsert_npc(
+                npc_id="mira_coppercup",
+                name="Mira Coppercup",
+                display_name="Mira",
+                role="Scout",
+                location="Old Road",
+                public_description="A keen-eyed traveler in a green cloak.",
+                player_facing_information="A trusted traveling companion.",
+            )
+            repository.upsert_party_member(
+                "mira_coppercup",
+                status="Wounded",
+                health_current=8,
+                health_max=18,
+                armor_class=13,
+                combat_style="Mobile archer",
+                skills=["Archery", "Tracking"],
+            )
+            shell = GameShell(lambda: None, tts_enabled=False, ai_enabled=False)
+            shell.set_repository(repository)
+            screen = shell.party_screen
+            self.app.processEvents()
+
+            self.assertIn(
+                "Party",
+                [shell.tabs.tabText(index) for index in range(shell.tabs.count())],
+            )
+            self.assertEqual(screen.table.rowCount(), 1)
+            name_item = screen.table.item(0, 0)
+            health_item = screen.table.item(0, 2)
+            armor_item = screen.table.item(0, 3)
+            self.assertIsNotNone(name_item)
+            self.assertIsNotNone(health_item)
+            self.assertIsNotNone(armor_item)
+            assert name_item is not None
+            assert health_item is not None
+            assert armor_item is not None
+            self.assertEqual(name_item.text(), "Mira")
+            self.assertEqual(health_item.text(), "8/18")
+            self.assertEqual(armor_item.text(), "13")
+            self.assertEqual(
+                name_item.data(Qt.ItemDataRole.UserRole),
+                "mira_coppercup",
+            )
+            shell.close()
 
     def test_inventory_uses_location_panels_and_modal_details(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -673,6 +1700,28 @@ class InventoryUiTests(unittest.TestCase):
             )
             self.assertTrue(home_panel.item_buttons[0].text().startswith("Zinc Plate"))
             self.assertEqual(home_panel.sort_direction_combo.currentData(), False)
+            self.assertEqual(len(carried_panel.group_separators), 1)
+            self.assertEqual(len(home_panel.group_separators), 1)
+
+            carried_panel.sort_field_combo.setCurrentIndex(
+                carried_panel.sort_field_combo.findData("name")
+            )
+            self.app.processEvents()
+            self.assertEqual(len(carried_panel.group_separators), 1)
+
+            carried_panel.sort_field_combo.setCurrentIndex(
+                carried_panel.sort_field_combo.findData("quantity")
+            )
+            self.app.processEvents()
+            self.assertEqual(len(carried_panel.group_separators), 1)
+
+            carried_panel.sort_field_combo.setCurrentIndex(
+                carried_panel.sort_field_combo.findData("price")
+            )
+            carried_panel.sort_direction_combo.setCurrentIndex(
+                carried_panel.sort_direction_combo.findData(True)
+            )
+            self.app.processEvents()
 
             screen.refresh()
             self.app.processEvents()

@@ -19,6 +19,7 @@ from ai_adventure.alchemy.ingredients import (
     normalize_crafting_item_rarity,
     normalize_recipe_ingredients,
 )
+from ai_adventure.ascii_art import ensure_substantive_ascii_art
 from ai_adventure.context.creative_guardrails import (
     contains_banned_creative_term,
     find_banned_creative_terms,
@@ -33,6 +34,7 @@ from ai_adventure.combat import (
     equipped_weapon_combat_profile,
     equipped_weapon_damage,
     normalize_damage_expression,
+    normalize_combat_preferences,
     normalize_item_metadata,
     roll_combat_initiative,
 )
@@ -54,7 +56,8 @@ _SKILL_CHECK_GATED_EVENT_TYPES = {
     "ReagentDiscoveredEvent",
     "RecipeDiscoveredEvent",
     "SkillXpAddedEvent",
-    "SpellLearnedEvent",
+    "CharacterSpellLearnedEvent",
+    "MagicAdvancementRecordedEvent",
 }
 _BAD_LUCK_HISTORY_LIMIT = 8
 _BAD_LUCK_MIN_HISTORY = 5
@@ -274,8 +277,20 @@ class EventApplier:
             if event_type == "CalendarEventDeletedEvent":
                 return self._apply_calendar_event_deleted(event_type, payload)
 
-            if event_type == "SpellLearnedEvent":
-                return self._apply_spell_learned(event_type, payload)
+            if event_type == "SpellCatalogUpsertedEvent":
+                return self._apply_spell_catalog_upserted(event_type, payload)
+
+            if event_type == "CharacterSpellLearnedEvent":
+                return self._apply_character_spell_learned(event_type, payload)
+
+            if event_type == "PlayerSpellCastEvent":
+                return self._apply_player_spell_cast(event_type, payload)
+
+            if event_type == "MagicAdvancementRecordedEvent":
+                return self._apply_magic_advancement_recorded(event_type, payload)
+
+            if event_type == "MagicEffectUpsertedEvent":
+                return self._apply_magic_effect_upserted(event_type, payload)
 
             if event_type == "NpcUpsertedEvent":
                 return self._apply_npc_upserted(event_type, payload)
@@ -358,6 +373,11 @@ class EventApplier:
             merged_metadata["ascii_art"] = str(
                 catalog_entry.get("ascii_art", payload.get("ascii_art", "")) or ""
             ).strip("\r\n")
+        merged_metadata["ascii_art"] = ensure_substantive_ascii_art(
+            merged_metadata.get("ascii_art", ""),
+            item_name=name,
+            category=category,
+        )
 
         self.repository.add_inventory_item(
             name=name,
@@ -771,6 +791,25 @@ class EventApplier:
     ) -> AppliedEventResult:
         """Applies CombatStartedEvent."""
 
+        combat_preferences = normalize_combat_preferences(
+            self.repository.get_setting(
+                "combat.preferences",
+                {
+                    "resolution_mode": self.repository.get_setting(
+                        "combat.resolution_mode", "strict"
+                    ),
+                    "focus": self.repository.get_setting("combat.focus", "balanced"),
+                },
+            )
+        )
+        if combat_preferences["resolution_mode"] == "narrative":
+            return AppliedEventResult(
+                event_type,
+                "skipped",
+                "CombatStartedEvent is disabled for narrative combat.",
+                payload,
+            )
+
         if self.repository.is_combat_active():
             return AppliedEventResult(
                 event_type,
@@ -821,6 +860,24 @@ class EventApplier:
             ]
 
         allies = _combatants_from_payload(payload.get("allies", []), team="party", start_index=2)
+        for ally in allies:
+            ally_npc_id = str(ally.get("npc_id", "") or "").strip()
+            if ally_npc_id:
+                ally_health = int(ally["current_health"])
+                ally_health_max = int(ally["max_health"])
+                self.repository.upsert_party_member(
+                    ally_npc_id,
+                    status=(
+                        "Incapacitated"
+                        if ally_health <= 0
+                        else "Wounded"
+                        if ally_health_max >= 0 and ally_health < ally_health_max
+                        else "Active"
+                    ),
+                    health_current=ally_health,
+                    health_max=ally_health_max,
+                    armor_class=int(ally["armor_rating"]),
+                )
         inventory_items = self.repository.list_inventory_items()
         equipment = self.repository.get_player_equipment()
         attack_skill = equipped_weapon_attack_skill(equipment, inventory_items)
@@ -1300,7 +1357,11 @@ class EventApplier:
         description = _first_text(payload, "description", "notes")
         location = _first_text(payload, "location", "found_at", "source")
         uses = _as_string_list(payload.get("uses", []))
-        ascii_art = str(payload.get("ascii_art", "") or "").strip("\r\n")
+        ascii_art = ensure_substantive_ascii_art(
+            payload.get("ascii_art", ""),
+            item_name=name,
+            category=_first_text(payload, "category") or "Material",
+        )
         rarity = normalize_crafting_item_rarity(payload.get("rarity"))
         notes = _first_text(payload, "notes")
         value_base_units = max(
@@ -1456,6 +1517,12 @@ class EventApplier:
             _first_text(payload, "description", "objective", "summary")
             or str((existing_task or {}).get("description", "")).strip()
         )
+        if not description:
+            return _invalid(
+                event_type,
+                payload,
+                "An active task requires a player-visible description.",
+            )
         status = (
             _first_text(payload, "status")
             or str((existing_task or {}).get("status", "")).strip()
@@ -1538,21 +1605,146 @@ class EventApplier:
             payload,
         )
 
-    def _apply_spell_learned(
+    def _apply_spell_catalog_upserted(
         self,
         event_type: str,
         payload: dict[str, Any],
     ) -> AppliedEventResult:
-        """Applies SpellLearnedEvent as durable state/history."""
+        """Stores one authoritative spell definition without granting it."""
 
         name = _first_text(payload, "name")
-
         if not name:
             return _invalid(event_type, payload, "Spell name is required.")
+        spell = self.repository.upsert_spell_catalog(
+            spell_id=_first_text(payload, "spell_id"),
+            name=name,
+            tier=int(_safe_int(payload.get("tier", 0), default=0) or 0),
+            school=_first_text(payload, "school"),
+            description=_first_text(payload, "description"),
+            casting_time=_first_text(payload, "casting_time") or "Action",
+            range=_first_text(payload, "range"),
+            duration=_first_text(payload, "duration"),
+            requirements=_first_text(payload, "requirements"),
+            mana_cost=int(_safe_int(payload.get("mana_cost", 0), default=0) or 0),
+        )
+        if spell is None:
+            return _invalid(event_type, payload, "Spell could not be stored.")
+        payload["spell_id"] = spell["spell_id"]
+        return AppliedEventResult(event_type, "applied", f"Cataloged spell: {name}.", payload)
 
-        self.repository.set_state_value(f"spell.{name}.known", "true")
+    def _apply_character_spell_learned(
+        self,
+        event_type: str,
+        payload: dict[str, Any],
+    ) -> AppliedEventResult:
+        """Stores a complete spell definition and grants it to the player."""
+
+        catalog_result = self._apply_spell_catalog_upserted(event_type, payload)
+        if catalog_result.status != "applied":
+            return catalog_result
+        spell_id = str(catalog_result.payload["spell_id"])
+        learned = self.repository.learn_character_spell(
+            spell_id,
+            prepared=bool(payload.get("prepared", True)),
+            source=_first_text(payload, "source") or "Story",
+        )
+        if learned is None:
+            return _invalid(event_type, payload, "Spell could not be learned.")
+        name = str(learned["name"])
         self.repository.append_history("spell", f"Learned spell: {name}.")
         return AppliedEventResult(event_type, "applied", f"Learned spell: {name}.", payload)
+
+    def _apply_player_spell_cast(
+        self,
+        event_type: str,
+        payload: dict[str, Any],
+    ) -> AppliedEventResult:
+        """Validates an explicitly player-authorized cast and consumes resources."""
+
+        if not bool(payload.get("player_authorized", False)):
+            return _invalid(
+                event_type,
+                payload,
+                "A player spell cast requires explicit player authorization.",
+            )
+        spell_id = _first_text(payload, "spell_id")
+        if not spell_id:
+            return _invalid(event_type, payload, "spell_id is required for casting.")
+        result = self.repository.cast_character_spell(
+            spell_id,
+            cast_tier=int(_safe_int(payload.get("cast_tier", 0), default=0) or 0),
+            target=_first_text(payload, "target"),
+            message_id=self.message_id or "",
+        )
+        status = str(result.get("status", "rejected"))
+        if status != "cast":
+            return AppliedEventResult(
+                event_type, "skipped", str(result.get("message", "Cast rejected.")), payload
+            )
+        payload.update(result)
+        return AppliedEventResult(event_type, "applied", str(result["message"]), payload)
+
+    def _apply_magic_advancement_recorded(
+        self,
+        event_type: str,
+        payload: dict[str, Any],
+    ) -> AppliedEventResult:
+        """Records validated evidence of meaningful magical development."""
+
+        result = self.repository.record_magic_advancement(
+            category=_first_text(payload, "category"),
+            reason=_first_text(payload, "reason"),
+            significance=_first_text(payload, "significance") or "meaningful",
+            spell_id=_first_text(payload, "spell_id"),
+            source=_first_text(payload, "source"),
+            message_id=self.message_id,
+        )
+        status = str(result.get("status", "rejected"))
+        if status == "recorded":
+            entry = result.get("entry", {})
+            if isinstance(entry, dict):
+                payload["advancement_id"] = str(entry.get("advancement_id", ""))
+            return AppliedEventResult(
+                event_type,
+                "applied",
+                str(result.get("message", "Recorded meaningful magic advancement.")),
+                payload,
+            )
+        return AppliedEventResult(
+            event_type,
+            "skipped",
+            str(result.get("message", "Magic advancement was not recorded.")),
+            payload,
+        )
+
+    def _apply_magic_effect_upserted(
+        self,
+        event_type: str,
+        payload: dict[str, Any],
+    ) -> AppliedEventResult:
+        """Tracks one active magical effect after narration establishes it."""
+
+        effect = self.repository.upsert_active_magic_effect(
+            effect_id=_first_text(payload, "effect_id"),
+            spell_id=_first_text(payload, "spell_id"),
+            name=_first_text(payload, "name"),
+            target=_first_text(payload, "target"),
+            description=_first_text(payload, "description"),
+            start_elapsed_minutes=int(
+                _safe_int(payload.get("start_elapsed_minutes", -1), default=-1) or 0
+            ),
+            end_elapsed_minutes=int(
+                _safe_int(payload.get("end_elapsed_minutes", -1), default=-1) or 0
+            ),
+            requires_concentration=bool(payload.get("requires_concentration", False)),
+            active=bool(payload.get("active", True)),
+        )
+        if effect is None:
+            return _invalid(event_type, payload, "Magic effect name is required.")
+        payload["effect_id"] = effect["effect_id"]
+        return AppliedEventResult(
+            event_type, "applied", f"Updated magic effect: {effect['name']}.", payload
+        )
 
     def _apply_npc_upserted(
         self,
@@ -1622,6 +1814,63 @@ class EventApplier:
 
         if npc is None:
             return _invalid(event_type, payload, "NPC could not be stored.")
+
+        has_party_fields = any(
+            key in payload
+            for key in (
+                "party_status",
+                "party_health_current",
+                "party_health_max",
+                "party_armor_class",
+                "party_armor_rating",
+                "party_combat_style",
+                "party_skills",
+            )
+        )
+        if payload.get("party_member") is False:
+            self.repository.remove_party_member(str(npc["npc_id"]))
+        elif payload.get("party_member") is True or has_party_fields:
+            party_member = self.repository.upsert_party_member(
+                str(npc["npc_id"]),
+                status=(
+                    _first_text(payload, "party_status")
+                    if "party_status" in payload
+                    else None
+                ),
+                health_current=(
+                    _safe_int(payload.get("party_health_current"), default=-1)
+                    if "party_health_current" in payload
+                    else None
+                ),
+                health_max=(
+                    _safe_int(payload.get("party_health_max"), default=-1)
+                    if "party_health_max" in payload
+                    else None
+                ),
+                armor_class=(
+                    _safe_int(
+                        payload.get(
+                            "party_armor_class",
+                            payload.get("party_armor_rating", -1),
+                        ),
+                        default=-1,
+                    )
+                    if "party_armor_class" in payload or "party_armor_rating" in payload
+                    else None
+                ),
+                combat_style=(
+                    _first_text(payload, "party_combat_style")
+                    if "party_combat_style" in payload
+                    else None
+                ),
+                skills=(
+                    _text_list(payload.get("party_skills", []))
+                    if "party_skills" in payload
+                    else None
+                ),
+            )
+            if party_member is None:
+                return _invalid(event_type, payload, "Party member could not be stored.")
 
         return AppliedEventResult(
             event_type,
@@ -1929,6 +2178,7 @@ def _combatant_from_payload(
     )
     return {
         "id": f"{team}-{index}-{_slug_for_event_id(name)}",
+        "npc_id": str(raw_combatant.get("npc_id", "") or "").strip(),
         "name": name,
         "team": team,
         "current_health": max(0, min(current_health, max_health)),

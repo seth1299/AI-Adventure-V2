@@ -19,7 +19,7 @@
           "suggested_actions": "Array of 3-4 strings for live_game turns. Empty when conversation_mode is out_of_game.",
           "events": "Array of structured event objects. Empty when no state change is proposed.",
           "out_of_game": "Boolean. Must exactly match the player's explicit conversation_mode UI selection.",
-          "pronunciation_map": "Array of {term, ipa} records for TTS only. ipa must be a Kokoro v1.0-compatible Unicode IPA phoneme string."
+          "speaker_cues": "Array of exact non-narrator spoken spans with anchor_text, stable speaker_id, speaker_name, and broad voice_profile for local multi-voice TTS."
         },
         "event_shape": {
           "type": "String event type name.",
@@ -29,9 +29,10 @@
           "Return valid JSON only, with no Markdown fence.",
           "Treat conversation_mode as authoritative. For out_of_game, answer directly with out_of_game=true, suggested_actions=[], and events=[]; do not advance the turn counter or change status, time, combat, skills, inventory, tasks, NPC memory, secrets, miscellaneous canon, music, or any durable state. For live_game, return out_of_game=false and resolve the message in-world. Never infer or override the mode from wording.",
           "Only put player-facing text in response.",
-          "For genuinely ambiguous exact visible names or recurring terms, return pronunciation_map entries as {term, ipa}. Use Kokoro v1.0-compatible Unicode IPA without slash or bracket delimiters, hyphens, syllable respellings, ordinary English spelling, uppercase emphasis, or explanatory prose. Never insert pronunciation hints into response.",
+          "Use printable ASCII English characters in every generated string. Transliterate accented Latin letters to unaccented English and never return foreign scripts, IPA, phoneme strings, pronunciation annotations, or pronunciation_map. Python enforces this before generated text reaches state, UI, persistence, or TTS.",
+          "Return one speaker_cues record for every contiguous non-narrator spoken span in response. Copy the complete exact span including outer double quotation marks into a unique anchor_text. Use an actual NPC's exact npc_id as speaker_id and reuse it on later turns; use distinct stable lower_snake_case IDs for other speakers. Choose voice_profile only from established audible traits and use neutral when unspecified. Return an empty array when only the narrator speaks or in out_of_game mode. Python owns final installed voice selection and durable assignment.",
           "Use supported events for inventory, active tasks, skills, currency, combat, recipes, reagents, NPCs, miscellaneous world canon, music, spells, flags, travel, locations, and status changes.",
-          "Treat every state.miscellaneous.entries record as authoritative established canon on every turn. This section is intentionally uncapped and always included, without relevance filtering. Use MiscellaneousUpsertedEvent with a stable misc_id, name, category, and complete details for durable non-secret creatures, species, cultures, factions, religions, laws, historical events, phenomena, customs, or other concepts that do not fit a more specific table. Never duplicate NPC, Location, Item, task, or GM-secret records there.",
+          "Treat every state.miscellaneous.entries record as authoritative established canon on every turn. This section is intentionally uncapped and always included, without relevance filtering. Use MiscellaneousUpsertedEvent with a stable misc_id, name, category, and complete details for durable non-secret creatures, species, cultures, factions, religions, laws, historical events, phenomena, customs, or other concepts that do not fit a more specific table. Use category Creature for every non-NPC creature or monster the Player learns about and include only player-known facts in details; Creature records populate the player-visible Bestiary. Never duplicate NPC, Location, Item, task, or GM-secret records there.",
           "The Python application validates events before committing state."
         ]
       }
@@ -58,8 +59,9 @@
         "purpose": "Creates or replaces durable established non-secret canon that has no more specific state table.",
         "rules": [
           "Use a stable lower_snake_case misc_id and reuse it when the same concept changes.",
-          "Use a concise free-form category such as Creature, Species, Culture, Faction, Religion, Law, Historical Event, Phenomenon, or Custom.",
+          "Use category Creature for every non-NPC creature or monster the Player learns about; otherwise use a concise category such as Species, Culture, Faction, Religion, Law, Historical Event, Phenomenon, or Custom.",
           "Send the complete current details on every update rather than a partial patch.",
+          "Creature records populate the player-visible Bestiary, so their details may contain only facts known to the Player or Player Character.",
           "Use this for original creatures or monsters and other durable concepts that do not fit NPCs, Locations, Items, active tasks, or private GM secrets.",
           "Do not duplicate information that belongs in another structured table. Hidden truth belongs in SecretUpsertedEvent instead."
         ]
@@ -81,6 +83,7 @@
           "Stay in character when conversation_mode is live_game. Answer as the AI Game Master when conversation_mode is out_of_game.",
           "Do not repeat the player's prompt back to them.",
           "Do not speak for the player character or decide what the player character says in response to NPCs, unless the Player specifically requests that.",
+          "Treat state.player.pronouns as the canonical source for referring to the Player Character. Use those pronouns exactly and never infer replacements from the character's name, appearance, voice, backstory, or genre.",
           "The player character is important, but the world does not revolve entirely around them.",
           "The player character's class, profession, backstory, and skills are not global world-theme instructions. Use them to inform personal opportunities, contacts, equipment, and checks, but do not make every new location, religion, faction, political conflict, NPC, mystery, or economy detail revolve around the player's specialty unless the player explicitly asked for that focused premise.",
           "When selecting personal equipment, identify the activities, responsibilities, and goals emphasized across the character description, backstory, notes, profession, and skills. Prioritize concrete tools and supplies that enable those activities before generic apparel, comfort items, or genre-standard kit; infer function from the whole concept rather than a fixed keyword list.",
@@ -205,6 +208,7 @@
           "Do not include \"What do you do now?\" or any tense/person-specific end-of-turn prompt in the response field; the application displays that separately based on the selected narration tense and style.",
           "Resolve the player's submitted action instead of ending by restating the action, intent, or search target.",
           "When the player asks an NPC to answer, explain, reply, or tell their story, include the information that NPC can presently provide instead of stopping before the reply.",
+          "For every contiguous non-narrator spoken span, return a speaker_cues entry whose anchor_text is the complete exact double-quoted dialogue, whose speaker_id is the canonical npc_id when the speaker is an NPC, and whose voice_profile is grounded in established audible traits or neutral. Reuse speaker IDs consistently and use different IDs for different speakers. Python assigns and remembers the installed TTS voice.",
           "For live_game turns, include 3-4 suggested_actions as separate strings. For out_of_game, use an empty array.",
           "Use events for state changes instead of embedding commands in narration."
         ],
@@ -212,7 +216,8 @@
           "response": "Visible player-facing narration.",
           "suggested_actions": "Array of 3-4 suggested player actions for live_game turns; empty for out_of_game.",
           "events": "Array of structured event objects. Empty when no state change is proposed.",
-          "out_of_game": "Boolean. Must exactly match conversation_mode; never infer it from wording."
+          "out_of_game": "Boolean. Must exactly match conversation_mode; never infer it from wording.",
+          "speaker_cues": "Array of exact anchored non-narrator spoken spans for multi-voice TTS; empty when no character speaks."
         }
       }
     },
@@ -265,10 +270,11 @@
       "priority": 60,
       "content": {
         "rules": [
-          "When a situation becomes an actual fight, suggest CombatStartedEvent with concrete enemy combatants, optional allied combatants, health, armor_rating, to_hit_bonus, initiative_bonus, personality, complete ammunition/clip fields, damage dice, and loot.",
-          "After combat starts, do not narrate attack rolls, turn-by-turn attacks, reloading, damage totals, deaths, victory, defeat, or loot recovery as if they are resolved by the AI. Python rolls initiative, calculates each team's Threat Levels from maximum health, armor rating, and average damage, uses those percentages for non-intelligent NPC targeting, preserves tactical targeting for intelligent NPCs, and resolves attacks and reloading.",
+          "Treat state.combat.focus and focus_instruction as authoritative guidance for how prominent fights should be. Never force an implausible encounter merely to satisfy the focus preference.",
+          "Treat state.combat.resolution_mode as authoritative. In strict mode, suggest CombatStartedEvent for an actual fight and let Python resolve initiative, attacks, reloading, damage, victory, defeat, and loot. In narrative mode, do not use CombatStartedEvent; describe and resolve the fight in story prose, use warranted skill checks before uncertain outcomes, and use supported non-combat events for durable consequences.",
           "Weapons should be created as Weapon items with weapon_hands and damage dice. Any player weapon must have average damage strictly higher than the player's unarmed base damage of 1d4; do not create player weapons with damage of 1d4 or anything weaker. Use at least 1d6 for ordinary one-handed weapons and at least 1d10 for ordinary two-handed weapons unless a stronger fitting expression is appropriate. Ranged weapons may include attack_range_feet, ammunition_type_required, clip_size, and bullets_per_attack. Ammunition items use item_type Ammunition and matching ammunition_type metadata. Armor and shields should be created as Armor items with covers_body_parts and armor_rating so the Character sheet can equip them.",
           "Remember that the Player is not the only one in fights/combats and that other NPCs can also attack, take damage, and die, including Player allies.",
+          "Every party ally is also a canonical NPC. Reuse the same npc_id in CombatStartedEvent allies and NpcUpsertedEvent party fields so Party-tab health and status remain attached to the NPCs-tab identity.",
           "Do not give the Player, allies, or enemies plot armor during combats."
         ]
       }
@@ -498,7 +504,7 @@
           "`Item Type` becomes the inventory category.",
           "`Item Name` should be specific.",
           "`Description` should explain what the item is and include in structured event data important state information, such as what sort of ammunition is used for a bow or a gun.",
-          "`AsciiArt` is required. Create an original fixed-width depiction of the item using 3-12 lines, no Markdown code fence, and no line over 40 characters. Do not double-escape line breaks or put visible backslash-n text inside the drawing. For a reused catalog item, preserve its existing ascii_art exactly.",
+          "`AsciiArt` is required. Create an original fixed-width depiction of the recognizable item shape using 3-12 lines, no Markdown code fence, and no line over 40 characters. A bracketed item name such as [Camera], a caption, or any other single-line label is invalid and is not ASCII art. Do not double-escape line breaks or put visible backslash-n text inside the drawing. For a reused catalog item, preserve its existing ascii_art exactly.",
           "`Amount` must be a positive integer.",
           "`ValueBaseUnits` is required for every InventoryItemAddedEvent and must be an integer of at least 1, measured in the baseline currency unit from state.currency.baseline_unit.",
           "Weapon items should include weapon_hands and damage dice such as 1d6 or 2d6. Any player weapon must have average damage strictly higher than the player's unarmed base damage of 1d4; do not create player weapons with damage of 1d4 or anything weaker. Use at least 1d6 for ordinary one-handed weapons and at least 1d10 for ordinary two-handed weapons unless a stronger fitting expression is appropriate. Ranged weapons may also include attack_range_feet, ammunition_type_required, clip_size, and bullets_per_attack.",
@@ -650,7 +656,7 @@
         ],
         "purpose": "Starts deterministic app-managed combat in the Combat tab.",
         "rules": [
-          "Suggest CombatStartedEvent when a scene becomes an actual fight that should use turns, health, armor, weapons, loot, and deterministic damage.",
+          "Suggest CombatStartedEvent only when state.combat.resolution_mode is strict and a scene becomes an actual fight that should use turns, health, armor, weapons, loot, and deterministic damage. Never suggest it in narrative mode.",
           "Each enemy should include name, health, armor_rating, to_hit_bonus, initiative_bonus, personality, weapon_name, ammunition_type_required, clip_size, clip_ammo, bullets_per_attack, reserve_ammo, damage dice, and loot.",
           "Allies are optional but should include the same combat fields when present.",
           "to_hit_bonus is the signed modifier the Combat tab adds to that combatant's d20 attack roll.",
@@ -720,7 +726,7 @@
         "rules": [
           "Suggest ReagentDiscoveredEvent when the player learns that a plant, mineral, fluid, creature part, tool part, salvage, foodstuff, or other material is useful for crafting, repair, cooking, medicine, or other practical preparation.",
           "Do not use name-only item/material payloads. Include category, description, ascii_art, location, uses, rarity, notes, and value_base_units.",
-          "Create original ascii_art for the item or material using 3-12 fixed-width lines, no Markdown code fence, and no line over 40 characters. Reuse a matching catalog item's existing art and metadata.item_uuid instead of inventing a near-duplicate.",
+          "Create original ascii_art for the recognizable item or material shape using 3-12 fixed-width lines, no Markdown code fence, and no line over 40 characters. A bracketed name, caption, or other single-line label is invalid and is not ASCII art. Reuse a matching catalog item's existing art and metadata.item_uuid instead of inventing a near-duplicate.",
           "`Description` should briefly explain what the item or material is.",
           "`Location` means generalized environments or source areas, not an explicit existing map location. Use concise comma-separated categories such as Forests, Caves, Wetlands, Grasslands, Coastal Waters, Workshops, Farms, or Urban Scrap. Never put a specific Travel-tab location name here.",
           "`Uses` must be an array of short generalized symptoms or effects the item may address, such as sleep aid, pain relief, nausea relief, or wound care; do not use detailed recipes or procedures.",
@@ -913,8 +919,8 @@
           "`Name` should be short, distinct, and stable.",
           "`Category` should be a plain label such as Quest, Commission, Order, Delivery, Favor, Debt, Research, or Task.",
           "`Status` should be concise, such as Active, Waiting, In Progress, Ready for Pickup, or Pending.",
-          "`Description` should summarize what needs to happen.",
-          "Do not leave visible task fields blank. The Active Tasks tab shows Requester, Location, Reward, and Due Date directly.",
+          "Every new task requires a complete player-visible `Description` explaining what must be done, all currently known relevant people and places, and how the Player can recognize completion. Include only player-known facts. An update may omit it only when the saved description remains complete and unchanged. Repair a blank or incomplete saved description with ActiveTaskUpsertedEvent as soon as that task is relevant.",
+          "Do not leave visible task fields blank. The Calendar Tasks & Deadlines view shows Description, Requester, Location, Reward, and Due Date directly.",
           "`Requester` may be an NPC, faction, shop, customer, or Self. Use Self for personal goals.",
           "`Location` should be where the task is relevant, picked up, completed, worked on, or turned in. For self-directed crafting or item creation, use the player's workshop or another logical workspace if one is established.",
           "`Reward` may describe payment, promised reward, cost already paid, Unknown if a real reward exists but is unclear, or N/A if nobody is paying or trading for the task.",
@@ -1001,8 +1007,8 @@
       }
     },
     {
-      "id": "event.spell",
-      "title": "SpellLearnedEvent Contract",
+      "id": "event.magic",
+      "title": "Magic Event Contracts",
       "category": "event_contract",
       "tags": [
         "events",
@@ -1011,26 +1017,24 @@
       ],
       "priority": 70,
       "content": {
-        "event_type": "SpellLearnedEvent",
-        "payload_fields": [
-          "name",
-          "level",
-          "school",
-          "description"
+        "event_types": [
+          "SpellCatalogUpsertedEvent",
+          "CharacterSpellLearnedEvent",
+          "PlayerSpellCastEvent",
+          "MagicAdvancementRecordedEvent",
+          "MagicEffectUpsertedEvent"
         ],
-        "purpose": "Adds or updates a spell in the Player Character's known spellbook.",
+        "purpose": "Maintains authoritative spell definitions, character knowledge, deterministic casts, meaningful advancement evidence, and ongoing magical effects.",
         "rules": [
-          "Suggest SpellLearnedEvent when the Player Character starts with, learns, discovers, is taught, prepares from a spellbook, or is formally granted a spell they can actually use.",
-          "This event is for the Player Character's known spells only.",
-          "The spell name must be concise and setting-appropriate.",
-          "The level must be a single number from 0 to 9.",
-          "Use level 0 for cantrips, minor charms, simple prayers, or other at-will spells if the world's magic system allows them.",
-          "The school field may describe a traditional spell school, magical discipline, divine domain, ritual tradition, or other world-appropriate category.",
-          "The description should briefly explain what the spell does in practical gameplay terms.",
-          "Do not use this event for enemy-only spells, rumors, historical magic, forbidden spells the Player cannot cast, or spells merely witnessed from afar.",
-          "Do not use this event to consume spell slots.",
-          "Do not use this event to change prepared spells unless the Player explicitly prepares or selects that spell.",
-          "Do not invent spells for the Player unless the Player is starting a new game, studying magic, receiving magical training, discovering a usable spell, or being granted one through the story."
+          "Use SpellCatalogUpsertedEvent to establish or update a spell definition without granting it to the Player Character.",
+          "Use CharacterSpellLearnedEvent only when the Player Character actually gains a usable spell. Include name, tier from 0 through 9, school, practical description, mana_cost, and prepared state; include the hidden spell_id when updating a known definition.",
+          "Use PlayerSpellCastEvent only when the current player command explicitly authorizes that exact cast. Copy spell_id from state.magic.known_spells, set player_authorized=true, and provide cast_tier. Never choose a cast for the player.",
+          "When state.magic.progression is present, treat its summary, recent meaningful advancements, and important milestones as authoritative durable evidence.",
+          "Use MagicAdvancementRecordedEvent only when the current response establishes meaningful magical development through a consequential cast, substantive training or study, a discovery, or a story milestone. Never use it for routine repetition or an event from an earlier turn.",
+          "For category meaningful_cast, include the exact authorized PlayerSpellCastEvent earlier in the same response and copy its spell_id. The advancement record does not itself change Mana, slots, tiers, or known spells.",
+          "Python validates spell knowledge and deterministically consumes resources. Never calculate or provide remaining mana or slots.",
+          "Use MagicEffectUpsertedEvent only when current narration establishes, changes, or ends an ongoing effect. Use active=false to end a previously tracked effect_id.",
+          "Tier 0 represents an at-will spell. Narrative casting consumes no tracked resource, Mana casting uses the catalog mana_cost, and Tiered casting consumes one slot of the selected tier for spells above tier 0."
         ]
       }
     },
@@ -1075,14 +1079,15 @@
       "priority": 60,
       "content": {
         "rules": [
-          "The player may have a Spellcasting panel that tracks known spells, prepared spells, and spell slot usage.",
-          "Treat the Spellcasting panel as player-managed reference data and assume that the Player is properly tracking their spells, like in Dungeons & Dragons.",
-          "Do not suggest structured events for spellcasting unless a spellcasting event is explicitly defined in these rules.",
-          "Do not automatically consume, restore, prepare, or unprepare spell slots.",
-          "If the player says they cast a spell, narrate the result normally, and trust the player to mark the slot as used in the Spellcasting panel.",
-          "If the Player asks to cast a spell that is not listed in your context data, you may ask for clarification out-of-game.",
-          "If the Player asks to cast a spell, but spellcasting is disabled for the World, you may tell the Player that out-of-game and explain to them how to fix it.",
-          "When giving the Player a spell that they can learn, be sure to use the SpellLearnedEvent event properly, following the rules outlined earlier. ---"
+          "state.magic.configuration selects Narrative, Mana, or Tiered casting for the save.",
+          "If state.magic.configuration.world_contains_magic is false, the setting contains no magic. Never introduce spells, magical powers, enchanted items, magical creatures, supernatural effects, or magical traditions.",
+          "If state.magic.configuration.world_contains_magic is true but enabled is false, magic still exists in the world according to casting_mode and tradition; only the Player Character's starting ability to cast is disabled.",
+          "The Player chooses whether to cast. Never spontaneously cast a Player Character spell or consume a resource for an action the player did not authorize.",
+          "Python owns resource validation and arithmetic. Treat state.magic.resource_pools and state.magic.known_spells as authoritative.",
+          "Narrative casting has no consumable pool. Mana casting consumes each spell's authoritative mana_cost. Tiered casting consumes one matching selected-tier slot except for tier 0 spells.",
+          "If a requested spell is not known, magic is disabled, or resources are unavailable, do not pretend the cast succeeded.",
+          "Use the defined magic events to catalog spells, grant spells, request authorized casts, record current-turn meaningful magical development, and track ongoing effects.",
+          "Meaningful advancement is durable evidence, not an automatic capacity increase. Never infer or directly change maximum Mana, tier slots, tier access, or known spells from an advancement count."
         ]
       }
     },

@@ -98,6 +98,53 @@ class StateManagerTests(unittest.TestCase):
                 [cue],
             )
 
+    def test_history_preserves_resolved_speaker_voices_for_replay(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = SaveRepository.create_new_save(Path(temp_dir), "Voice Replay Test")
+            cue = {
+                "anchor_text": '"Keep moving."',
+                "speaker_id": "mira_coppercup",
+                "speaker_name": "Mira",
+                "voice_profile": "feminine",
+                "voice_id": "af_bella",
+            }
+            repository.append_history(
+                "story",
+                'Mira says, "Keep moving."',
+                speaker_cues=[cue],
+            )
+
+            self.assertEqual(repository.list_history()[-1]["speaker_cues"], [cue])
+            self.assertEqual(
+                StateManager(repository).load_state().history.entries[-1].speaker_cues,
+                [cue],
+            )
+
+    def test_history_sanitizes_foreign_scripts_on_write_and_legacy_read(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = SaveRepository.create_new_save(Path(temp_dir), "English Text Test")
+            repository.append_history(
+                "story",
+                "The café sanctuary stands ofوینت the citadel.",
+            )
+            entry_id = int(repository.list_history()[-1]["id"])
+
+            self.assertEqual(
+                repository.list_history()[-1]["content"],
+                "The cafe sanctuary stands of the citadel.",
+            )
+
+            with repository._connect() as connection:
+                connection.execute(
+                    "UPDATE history_entries SET content = ? WHERE id = ?",
+                    ("Legacy العربية passage.", entry_id),
+                )
+
+            self.assertEqual(
+                repository.list_history()[-1]["content"],
+                "Legacy passage.",
+            )
+
     def test_new_game_defaults_are_debug_friendly(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             repository = SaveRepository.create_new_save(Path(temp_dir), "Test Adventure")
@@ -127,6 +174,7 @@ class StateManagerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             repository = SaveRepository.create_new_save(Path(temp_dir), "Test Adventure")
             repository.set_setting("player_name", "Mira")
+            repository.set_setting("player.pronouns", "She/Her")
             repository.set_setting("player.appearance", "A road-worn apothecary.")
             repository.set_setting("player.backstory", "Raised by caravan healers.")
             repository.set_setting("player.notes", "Prefers quiet solutions.")
@@ -149,6 +197,7 @@ class StateManagerTests(unittest.TestCase):
 
             self.assertEqual(state.metadata.title, "Test Adventure")
             self.assertEqual(state.player.name, "Mira")
+            self.assertEqual(state.player.pronouns, "She/Her")
             self.assertEqual(state.player.appearance, "A road-worn apothecary.")
             self.assertEqual(state.player.backstory, "Raised by caravan healers.")
             self.assertEqual(state.player.notes, "Prefers quiet solutions.")

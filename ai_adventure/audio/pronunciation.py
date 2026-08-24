@@ -1,4 +1,4 @@
-"""Pronunciation glossary normalization and TTS-only phoneme overrides."""
+"""English-only pronunciation glossary normalization for local TTS."""
 
 from __future__ import annotations
 
@@ -8,6 +8,8 @@ from collections.abc import Callable
 from difflib import SequenceMatcher
 from functools import lru_cache
 from typing import Any, TypedDict
+
+from ai_adventure.text_sanitization import sanitize_english_text
 
 
 MAX_PRONUNCIATION_ENTRIES = 200
@@ -23,11 +25,8 @@ KOKORO_V1_PHONEME_CHARACTERS = frozenset(
     "ˈˌːʰʲ↓→↗↘ᵻ"
 )
 KOKORO_IPA_PROMPT_RULE = (
-    "Return ipa as a Kokoro v1.0-compatible Unicode IPA phoneme string. "
-    "Use General American English pronunciation unless the requested voice or "
-    "language clearly requires another dialect. Include stress marks when useful. "
-    "Do not use slash or bracket delimiters, hyphens, syllable respellings, ordinary "
-    "English spelling, uppercase emphasis, or explanatory prose."
+    "Do not return IPA, phoneme strings, pronunciation annotations, or non-ASCII "
+    "characters. Let the local English TTS engine pronounce visible ASCII spelling."
 )
 
 _PHONETIC_SEPARATOR_RE = re.compile(r"(?<=[^\W\d_])[-\u2010-\u2015](?=[^\W\d_])")
@@ -67,22 +66,16 @@ def invalid_kokoro_ipa_characters(raw_value: Any) -> tuple[str, ...]:
 
 
 def normalize_kokoro_ipa(raw_value: Any) -> str:
-    """Returns a validated Kokoro-compatible IPA string, or an empty string."""
+    """Rejects IPA overrides so TTS always uses its English grapheme path."""
 
-    value = _strip_ipa_delimiters(str(raw_value or "").strip())
-    value = unicodedata.normalize("NFD", value)[:MAX_PRONUNCIATION_VALUE_LENGTH]
-    value = re.sub(r"\s+", " ", value).strip()
-    if not value or invalid_kokoro_ipa_characters(value):
-        return ""
-    if not any(character.isalpha() for character in value):
-        return ""
-    return value
+    del raw_value
+    return ""
 
 
 def normalize_pronunciation_value(term: str, raw_value: Any) -> str:
     """Returns a pause-safe legacy respelling for one visible term."""
 
-    value = str(raw_value or "").strip()[:MAX_PRONUNCIATION_VALUE_LENGTH]
+    value = sanitize_english_text(raw_value)[:MAX_PRONUNCIATION_VALUE_LENGTH]
     if not value:
         return ""
 
@@ -118,24 +111,17 @@ def normalize_pronunciation_value(term: str, raw_value: Any) -> str:
 def _normalize_pronunciation_entry(term: str, raw_value: Any) -> PronunciationEntry:
     entry: PronunciationEntry = {}
     if isinstance(raw_value, dict):
-        raw_ipa = raw_value.get("ipa", raw_value.get("phonemes", ""))
         raw_respelling = raw_value.get(
             "respelling",
             raw_value.get("phonetic", raw_value.get("pronunciation", "")),
         )
-        ipa = normalize_kokoro_ipa(raw_ipa)
         respelling = normalize_pronunciation_value(term, raw_respelling)
-        if ipa:
-            entry["ipa"] = ipa
         if respelling:
             entry["respelling"] = respelling
         return entry
 
     value = str(raw_value or "").strip()
     if _has_explicit_ipa_delimiters(value):
-        ipa = normalize_kokoro_ipa(value)
-        if ipa:
-            entry["ipa"] = ipa
         return entry
 
     respelling = normalize_pronunciation_value(term, value)
@@ -256,7 +242,7 @@ def normalize_pronunciation_map(raw_map: Any) -> PronunciationMap:
     normalized: PronunciationMap = {}
     seen_terms: set[str] = set()
     for raw_term, raw_value in raw_entries:
-        term = str(raw_term or "").strip()[:MAX_PRONUNCIATION_TERM_LENGTH]
+        term = sanitize_english_text(raw_term)[:MAX_PRONUNCIATION_TERM_LENGTH]
         entry = _normalize_pronunciation_entry(term, raw_value)
         key = term.casefold()
         if not term or not entry or key in seen_terms:
@@ -330,9 +316,9 @@ def set_authoritative_pronunciation(
 
 
 def apply_pronunciation_map(text: str, raw_map: Any) -> str:
-    """Applies IPA annotations or pause-safe respellings to a TTS-only copy."""
+    """Applies only ASCII English respellings to a TTS-only copy."""
 
-    clean_text = str(text or "")
+    clean_text = sanitize_english_text(text)
     pronunciation_map = normalize_pronunciation_map(raw_map)
     if not clean_text or not pronunciation_map:
         return clean_text
@@ -348,52 +334,25 @@ def apply_pronunciation_map(text: str, raw_map: Any) -> str:
 
     def replace_term(match: re.Match[str]) -> str:
         entry = by_casefold[match.group(0).casefold()]
-        ipa = entry.get("ipa", "")
-        if ipa and not any(character in match.group(0) for character in "[]{}"):
-            return f'[{match.group(0)}]{{ph="{ipa}"}}'
-        return entry.get("respelling", match.group(0))
+        return sanitize_english_text(entry.get("respelling", match.group(0)))
 
     return pattern.sub(replace_term, clean_text)
+
+
+def strip_phoneme_overrides(text: str) -> str:
+    """Replaces any legacy inline phoneme annotation with visible text."""
+
+    return _PHONEME_OVERRIDE_RE.sub(lambda match: match.group(1), str(text or ""))
 
 
 def compile_kokoro_phoneme_overrides(
     text: str,
     phonemize: Callable[[str], str],
 ) -> str | None:
-    """Compiles mixed SSMD IPA overrides into one Kokoro phoneme stream."""
+    """Ignores legacy IPA markup so Kokoro uses normal English G2P."""
 
-    matches = list(_PHONEME_OVERRIDE_RE.finditer(str(text or "")))
-    if not matches:
-        return None
-
-    # Kept local to avoid making the plain SSMD helper depend on this module.
-    from ai_adventure.audio.ssmd import strip_ssmd_markup_for_plain_tts
-
-    phoneme_parts: list[str] = []
-    cursor = 0
-    for match in matches:
-        plain_prefix = strip_ssmd_markup_for_plain_tts(text[cursor : match.start()])
-        if plain_prefix:
-            prefix_phonemes = str(phonemize(plain_prefix) or "").strip()
-            if prefix_phonemes:
-                phoneme_parts.append(prefix_phonemes)
-
-        ipa = normalize_kokoro_ipa(match.group(2))
-        if ipa:
-            phoneme_parts.append(ipa)
-        else:
-            visible_phonemes = str(phonemize(match.group(1)) or "").strip()
-            if visible_phonemes:
-                phoneme_parts.append(visible_phonemes)
-        cursor = match.end()
-
-    plain_suffix = strip_ssmd_markup_for_plain_tts(text[cursor:])
-    if plain_suffix:
-        suffix_phonemes = str(phonemize(plain_suffix) or "").strip()
-        if suffix_phonemes:
-            phoneme_parts.append(suffix_phonemes)
-
-    return " ".join(phoneme_parts).strip()
+    del text, phonemize
+    return None
 
 
 def _has_explicit_ipa_delimiters(value: str) -> bool:

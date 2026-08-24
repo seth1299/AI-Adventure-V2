@@ -8,6 +8,7 @@ import types
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from typing import Any, cast
 from unittest.mock import patch
 
 from ai_adventure.app.app_paths import AppPaths
@@ -33,6 +34,10 @@ from ai_adventure.audio.sound_manager import (
     prepare_sound_directory,
     prepare_sound_effect_directory,
 )
+from ai_adventure.audio.voices import (
+    VOICE_IDS_BY_PROFILE,
+    assign_speaker_voices,
+)
 from ai_adventure.audio.tts import tts_manager
 from ai_adventure.audio.tts.tts_manager import (
     KokoroOnnxTTSEngine,
@@ -42,6 +47,90 @@ from ai_adventure.audio.tts.tts_manager import (
 
 
 class AudioTests(unittest.TestCase):
+    def test_speaker_voice_assignments_are_distinct_and_durable(self) -> None:
+        cues = [
+            {
+                "anchor_text": '"Hold the gate."',
+                "speaker_id": "captain_orin",
+                "speaker_name": "Captain Orin",
+                "voice_profile": "deep_masculine",
+            },
+            {
+                "anchor_text": '"I am trying."',
+                "speaker_id": "mira_coppercup",
+                "speaker_name": "Mira",
+                "voice_profile": "feminine",
+            },
+        ]
+        available = [
+            "af_sarah",
+            "af_bella",
+            "af_nicole",
+            "am_onyx",
+            "am_fenrir",
+        ]
+
+        resolved, assignments = assign_speaker_voices(
+            cues,
+            narrator_voice="af_sarah",
+            available_voice_ids=available,
+        )
+        replayed, replay_assignments = assign_speaker_voices(
+            [cues[0]],
+            narrator_voice="af_sarah",
+            available_voice_ids=available,
+            existing_assignments=assignments,
+        )
+
+        self.assertEqual(len({cue["voice_id"] for cue in resolved}), 2)
+        self.assertNotIn("af_sarah", {cue["voice_id"] for cue in resolved})
+        self.assertIn(
+            resolved[0]["voice_id"],
+            VOICE_IDS_BY_PROFILE["deep_masculine"],
+        )
+        self.assertEqual(replayed[0]["voice_id"], resolved[0]["voice_id"])
+        self.assertEqual(replay_assignments, assignments)
+
+    def test_local_replay_forwards_sound_cues_to_narration(self) -> None:
+        player = NarrationPlayer.__new__(NarrationPlayer)
+        player.enabled = False
+        calls: list[tuple[str, dict[str, object]]] = []
+        cues = [
+            {
+                "filename": "Market Bell.wav",
+                "anchor_text": "market",
+                "position": "before",
+            }
+        ]
+        speaker_cues = [
+            {
+                "anchor_text": '"The market opens."',
+                "speaker_id": "town_crier",
+                "speaker_name": "Town Crier",
+                "voice_profile": "deep_masculine",
+                "voice_id": "am_onyx",
+            }
+        ]
+
+        with patch.object(
+            player,
+            "narrate",
+            side_effect=lambda text, **kwargs: calls.append((text, kwargs)) or True,
+        ):
+            started = player.play_sample(
+                text="The market opens.",
+                sound_effect_cues=cues,
+                speaker_cues=speaker_cues,
+                on_sound_effect=lambda _filename: None,
+            )
+
+        self.assertTrue(started)
+        self.assertTrue(player.enabled)
+        self.assertEqual(calls[0][0], "The market opens.")
+        self.assertEqual(calls[0][1]["sound_effect_cues"], cues)
+        self.assertEqual(calls[0][1]["speaker_cues"], speaker_cues)
+        self.assertIsNotNone(calls[0][1]["on_sound_effect"])
+
     def test_music_loops_while_sound_effect_plays_once(self) -> None:
         class FakeMusic:
             def __init__(self) -> None:
@@ -217,7 +306,7 @@ class AudioTests(unittest.TestCase):
         self.assertIn('[Ironpeak City]{ph="ˈaɪɚnˌpik ˈsɪti"}', chunks[0].tts_text)
         self.assertNotIn("ˈaɪɚnˌpik", chunks[1].tts_text)
 
-    def test_kokoro_onnx_uses_native_phoneme_mode_for_ipa_overrides(self) -> None:
+    def test_kokoro_onnx_discards_ipa_and_uses_ascii_english_text(self) -> None:
         create_calls: list[tuple[str, dict[str, object]]] = []
 
         class FakeTokenizer:
@@ -274,8 +363,8 @@ class AudioTests(unittest.TestCase):
                 else:
                     sys.modules["soundfile"] = original_soundfile
 
-        self.assertEqual(create_calls[0][0], "<The> kəˈθɑlə <waits.>")
-        self.assertTrue(create_calls[0][1]["is_phonemes"])
+        self.assertEqual(create_calls[0][0], "The Qh'thala waits.")
+        self.assertNotIn("is_phonemes", create_calls[0][1])
         self.assertEqual(len(writes), 1)
 
     def test_narration_sound_cue_forces_exact_word_boundary(self) -> None:
@@ -295,6 +384,120 @@ class AudioTests(unittest.TestCase):
         self.assertEqual(chunks[0].display_text, "The hammer")
         self.assertEqual(chunks[0].sound_effects_after, ("Hammer Strike.wav",))
         self.assertEqual(chunks[1].display_text, " falls. Sparks leap from the anvil.")
+
+    def test_narration_chunks_switch_voice_only_for_exact_speaker_spans(self) -> None:
+        text = 'Mira whispers, "Stay low." The watch passes. Orin says, "Now run."'
+        chunks = build_narration_chunks(
+            text,
+            speaker_cues=[
+                {
+                    "anchor_text": '"Stay low."',
+                    "speaker_id": "mira",
+                    "speaker_name": "Mira",
+                    "voice_profile": "feminine",
+                    "voice_id": "af_bella",
+                },
+                {
+                    "anchor_text": '"Now run."',
+                    "speaker_id": "orin",
+                    "speaker_name": "Orin",
+                    "voice_profile": "deep_masculine",
+                    "voice_id": "am_onyx",
+                },
+            ],
+        )
+
+        self.assertEqual("".join(chunk.display_text for chunk in chunks), text)
+        self.assertEqual(
+            [(chunk.display_text, chunk.voice_id) for chunk in chunks],
+            [
+                ("Mira whispers, ", ""),
+                ('"Stay low."', "af_bella"),
+                (" The watch passes. Orin says, ", ""),
+                ('"Now run."', "am_onyx"),
+            ],
+        )
+
+    def test_speaker_voice_survives_sound_effect_boundary_inside_dialogue(self) -> None:
+        chunks = build_narration_chunks(
+            'Mira shouts, "Duck!"',
+            sound_effect_cues=[
+                {
+                    "filename": "Arrow.wav",
+                    "anchor_text": "Duck",
+                    "position": "after",
+                }
+            ],
+            speaker_cues=[
+                {
+                    "anchor_text": '"Duck!"',
+                    "voice_id": "af_bella",
+                }
+            ],
+        )
+
+        voiced_chunks = [chunk for chunk in chunks if chunk.voice_id]
+        self.assertEqual(
+            "".join(chunk.display_text for chunk in voiced_chunks),
+            '"Duck!"',
+        )
+        self.assertTrue(all(chunk.voice_id == "af_bella" for chunk in voiced_chunks))
+        self.assertEqual(
+            [effect for chunk in chunks for effect in chunk.sound_effects_after],
+            ["Arrow.wav"],
+        )
+
+    def test_chunk_producer_prefetches_each_speaker_with_its_assigned_voice(self) -> None:
+        requests: list[object] = []
+
+        class FakeTtsManager:
+            def synthesize_to_file(self, request: object) -> Path:
+                requests.append(request)
+                path = Path(f"voice_chunk_{len(requests)}.wav")
+                path.touch()
+                return path
+
+        player = NarrationPlayer.__new__(NarrationPlayer)
+        player.enabled = True
+        player.speed = 1.0
+        player.tts_manager = cast(Any, FakeTtsManager())
+        player._session_id = 9
+        player._state_lock = threading.Lock()
+        player._generation_lock = threading.Lock()
+        audio_queue: queue.Queue[GeneratedNarrationChunk | None] = queue.Queue()
+        chunks = [
+            build_narration_chunks("Narration first.")[0],
+            build_narration_chunks(
+                '"Deep warning."',
+                speaker_cues=[
+                    {
+                        "anchor_text": '"Deep warning."',
+                        "voice_id": "am_onyx",
+                    }
+                ],
+            )[0],
+            build_narration_chunks(
+                '"Quiet answer."',
+                speaker_cues=[
+                    {
+                        "anchor_text": '"Quiet answer."',
+                        "voice_id": "af_bella",
+                    }
+                ],
+            )[0],
+        ]
+
+        player._produce_chunks(9, chunks, audio_queue, "af_sarah")
+
+        try:
+            self.assertEqual(
+                [getattr(request, "voice") for request in requests],
+                ["af_sarah", "am_onyx", "af_bella"],
+            )
+            self.assertEqual(audio_queue.qsize(), 4)
+        finally:
+            for index in range(1, 4):
+                Path(f"voice_chunk_{index}.wav").unlink(missing_ok=True)
 
     def test_narration_player_fires_cue_after_anchored_audio_chunk(self) -> None:
         player = NarrationPlayer.__new__(NarrationPlayer)

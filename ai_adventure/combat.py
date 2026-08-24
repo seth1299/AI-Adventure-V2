@@ -18,6 +18,70 @@ DEFAULT_TO_HIT_BONUS = 0
 DEFAULT_ATTACK_RANGE_FEET = 5
 DEFAULT_RANGED_ATTACK_RANGE_FEET = 100
 COMBAT_PERSONALITIES = ("balanced", "aggressive", "cautious", "intelligent")
+COMBAT_RESOLUTION_MODES = ("strict", "narrative")
+COMBAT_RESOLUTION_MODE_LABELS = {
+    "strict": "Strict / App-Managed Combat",
+    "narrative": "Narrative / Gemini-Managed Combat",
+}
+COMBAT_FOCUS_LEVELS = ("low", "balanced", "high")
+COMBAT_FOCUS_LABELS = {
+    "low": "Low - Combat is uncommon",
+    "balanced": "Balanced - Combat when the story calls for it",
+    "high": "High - Combat is a major focus",
+}
+COMBAT_FOCUS_INSTRUCTIONS = {
+    "low": (
+        "Keep combat uncommon. Prefer negotiation, evasion, investigation, travel, "
+        "and other non-combat challenges unless violence follows naturally from "
+        "established stakes or the player pursues it."
+    ),
+    "balanced": (
+        "Use combat when it follows naturally from the story and player choices, "
+        "without forcing a fight into every conflict or avoiding warranted danger."
+    ),
+    "high": (
+        "Make combat a major recurring part of the adventure, with varied opponents "
+        "and meaningful stakes, while still respecting player choices and narrative logic."
+    ),
+}
+
+
+def normalize_combat_preferences(raw_preferences: Any) -> dict[str, str]:
+    """Returns safe player preferences for combat frequency and resolution."""
+
+    preferences = raw_preferences if isinstance(raw_preferences, dict) else {}
+    raw_resolution = str(
+        preferences.get("resolution_mode", preferences.get("mode", "strict")) or "strict"
+    ).strip().casefold().replace("-", "_").replace(" ", "_")
+    resolution_aliases = {
+        "app": "strict",
+        "app_managed": "strict",
+        "deterministic": "strict",
+        "mechanical": "strict",
+        "gemini": "narrative",
+        "gemini_managed": "narrative",
+        "narrated": "narrative",
+    }
+    resolution_mode = resolution_aliases.get(raw_resolution, raw_resolution)
+    if resolution_mode not in COMBAT_RESOLUTION_MODES:
+        resolution_mode = "strict"
+
+    raw_focus = str(
+        preferences.get("focus", preferences.get("frequency", "balanced")) or "balanced"
+    ).strip().casefold().replace("-", "_").replace(" ", "_")
+    focus_aliases = {
+        "rare": "low",
+        "minimal": "low",
+        "normal": "balanced",
+        "standard": "balanced",
+        "frequent": "high",
+        "combat_heavy": "high",
+    }
+    focus = focus_aliases.get(raw_focus, raw_focus)
+    if focus not in COMBAT_FOCUS_LEVELS:
+        focus = "balanced"
+
+    return {"resolution_mode": resolution_mode, "focus": focus}
 
 
 def empty_equipment() -> dict[str, str]:
@@ -952,6 +1016,7 @@ def _normalize_combatant(raw_combatant: dict[str, Any], index: int) -> dict[str,
 
     return {
         "id": str(raw_combatant.get("id", f"combatant-{index + 1}")),
+        "npc_id": str(raw_combatant.get("npc_id", "") or "").strip(),
         "name": str(raw_combatant.get("name", f"Combatant {index + 1}")).strip()
         or f"Combatant {index + 1}",
         "display_name": str(raw_combatant.get("display_name", "")).strip(),

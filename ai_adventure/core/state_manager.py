@@ -18,6 +18,7 @@ from ai_adventure.core.models import (
     ActiveTasksState,
     AlchemyNotebookState,
     CalendarState,
+    CharacterSpell,
     CurrencyState,
     HistoryEntry,
     HistoryState,
@@ -25,6 +26,10 @@ from ai_adventure.core.models import (
     ItemCatalogState,
     InventoryItem,
     InventoryState,
+    MagicResourcePool,
+    MagicAdvancement,
+    MagicState,
+    ActiveMagicEffect,
     PlayerState,
     ReagentKnowledge,
     RecipeIngredient,
@@ -92,6 +97,9 @@ class StateManager:
                 name_pronunciation=str(
                     settings.values.get("player.name_pronunciation", "")
                 ),
+                pronouns=str(
+                    settings.values.get("player.pronouns", "They/Them")
+                ),
                 appearance=str(settings.values.get("player.appearance", "")),
                 backstory=str(settings.values.get("player.backstory", "")),
                 condition=_read_string(state_snapshot, "condition", "Healthy"),
@@ -136,6 +144,7 @@ class StateManager:
             calendar=CalendarState(**calendar_snapshot),
             alchemy=self._load_alchemy(),
             skills=self._load_skills(),
+            magic=self._load_magic(),
             active_tasks=self._load_active_tasks(),
             history=self._load_history(),
             settings=settings,
@@ -329,6 +338,70 @@ class StateManager:
 
         return ActiveTasksState(tasks=tasks)
 
+    def _load_magic(self) -> MagicState:
+        """Loads the typed player-magic state."""
+
+        return MagicState(
+            configuration=self.repository.get_magic_configuration(),
+            known_spells=[
+                CharacterSpell(
+                    spell_id=_read_string(row, "spell_id", ""),
+                    name=_read_string(row, "name", ""),
+                    tier=_read_int(row, "tier", 0),
+                    school=_read_string(row, "school", ""),
+                    description=_read_string(row, "description", ""),
+                    casting_time=_read_string(row, "casting_time", "Action"),
+                    range=_read_string(row, "range", ""),
+                    duration=_read_string(row, "duration", ""),
+                    requirements=_read_string(row, "requirements", ""),
+                    mana_cost=_read_int(row, "mana_cost", 0),
+                    prepared=bool(row.get("prepared", True)),
+                    favorite=bool(row.get("favorite", False)),
+                )
+                for row in self.repository.list_character_spells()
+            ],
+            resource_pools=[
+                MagicResourcePool(
+                    pool_id=_read_string(row, "pool_id", ""),
+                    name=_read_string(row, "name", ""),
+                    resource_type=_read_string(row, "resource_type", ""),
+                    tier=_read_int(row, "tier", 0),
+                    current_amount=_read_int(row, "current_amount", 0),
+                    maximum_amount=_read_int(row, "maximum_amount", 0),
+                    recovery_rule=_read_string(row, "recovery_rule", ""),
+                )
+                for row in self.repository.list_magic_resource_pools()
+            ],
+            active_effects=[
+                ActiveMagicEffect(
+                    effect_id=_read_string(row, "effect_id", ""),
+                    spell_id=_read_string(row, "spell_id", ""),
+                    name=_read_string(row, "name", ""),
+                    target=_read_string(row, "target", ""),
+                    description=_read_string(row, "description", ""),
+                    start_elapsed_minutes=_read_int(row, "start_elapsed_minutes", -1),
+                    end_elapsed_minutes=_read_int(row, "end_elapsed_minutes", -1),
+                    requires_concentration=bool(row.get("requires_concentration", False)),
+                )
+                for row in self.repository.list_active_magic_effects()
+            ],
+            advancement_summary=self.repository.get_magic_advancement_summary(),
+            advancement_history=[
+                MagicAdvancement(
+                    advancement_id=_read_string(row, "advancement_id", ""),
+                    category=_read_string(row, "category", ""),
+                    significance=_read_string(row, "significance", "meaningful"),
+                    reason=_read_string(row, "reason", ""),
+                    spell_id=_read_string(row, "spell_id", ""),
+                    source=_read_string(row, "source", ""),
+                    message_id=_read_string(row, "message_id", ""),
+                    elapsed_minutes=_read_int(row, "elapsed_minutes", -1),
+                    created_at=_read_string(row, "created_at", ""),
+                )
+                for row in self.repository.list_magic_advancement_history(limit=50)
+            ],
+        )
+
     def _load_history(self) -> HistoryState:
         """Loads typed history state."""
 
@@ -344,6 +417,11 @@ class StateManager:
                     sound_effect_cues=[
                         cue
                         for cue in row.get("sound_effect_cues", [])
+                        if isinstance(cue, dict)
+                    ],
+                    speaker_cues=[
+                        cue
+                        for cue in row.get("speaker_cues", [])
                         if isinstance(cue, dict)
                     ],
                     created_at=_read_string(row, "created_at", ""),

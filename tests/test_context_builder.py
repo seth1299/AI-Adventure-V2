@@ -25,6 +25,66 @@ from ai_adventure.core.models import (
 
 
 class ContextBuilderTests(unittest.TestCase):
+    def test_party_context_reuses_npc_identity_and_exposes_party_specific_data(self) -> None:
+        state = AdventureState()
+        party_member = {
+            "npc_id": "mira_coppercup",
+            "name": "Mira Coppercup",
+            "display_name": "Mira",
+            "role": "Scout",
+            "location": "Old Road",
+            "description": "A keen-eyed traveler.",
+            "notes": "A trusted companion.",
+            "status": "Wounded",
+            "health_current": 8,
+            "health_max": 18,
+            "armor_class": 13,
+            "combat_style": "Mobile archer",
+            "skills": ["Archery", "Tracking"],
+        }
+
+        packet = AiContextBuilder(
+            ContextReferenceLoader().load_default_library()
+        ).build_story_context(
+            state,
+            player_command="Mira tends her wounds.",
+            party_members=[party_member],
+        )
+
+        self.assertEqual(packet["state"]["party"]["members"][0]["npc_id"], "mira_coppercup")
+        self.assertEqual(packet["state"]["party"]["members"][0]["health_current"], 8)
+        self.assertEqual(packet["state"]["party"]["members"][0]["skills"], ["Archery", "Tracking"])
+        self.assertIn(
+            "mira_coppercup",
+            [npc["npc_id"] for npc in packet["state"]["npcs"]["relevant"]],
+        )
+        self.assertIn("same stable identity", packet["state"]["party"]["rules"])
+
+    def test_narrative_combat_preferences_replace_strict_handoff_contract(self) -> None:
+        state = AdventureState(
+            settings=SettingsState(
+                values={
+                    "combat.preferences": {
+                        "resolution_mode": "narrative",
+                        "focus": "low",
+                    }
+                }
+            )
+        )
+
+        packet = AiContextBuilder(
+            ContextReferenceLoader().load_default_library()
+        ).build_story_context(state, player_command="I fight the bandit.")
+
+        self.assertEqual(packet["state"]["combat"]["resolution_mode"], "narrative")
+        self.assertEqual(packet["state"]["combat"]["focus"], "low")
+        self.assertIn("Keep combat uncommon", packet["state"]["combat"]["focus_instruction"])
+        self.assertIn("narrative_combat", packet["response_contract"])
+        self.assertNotIn("combat_handoff", packet["response_contract"])
+        self.assertNotIn(
+            "CombatStartedEvent", packet["response_contract"]["known_event_types"]
+        )
+
     def test_player_created_calendar_events_are_omitted_from_ai_context(self) -> None:
         state = AdventureState(
             settings=SettingsState(
@@ -81,8 +141,18 @@ class ContextBuilderTests(unittest.TestCase):
             packet["response_contract"]["status_event"],
         )
         self.assertIn(
-            "Kokoro v1.0-compatible Unicode IPA",
-            packet["response_contract"]["pronunciation_map"],
+            "printable ASCII English characters only",
+            packet["response_contract"]["english_text"],
+        )
+        self.assertNotIn("pronunciation_map", packet["response_contract"])
+        self.assertIn("speaker_cues", packet["response_contract"])
+        self.assertIn(
+            "exact canonical npc_id",
+            packet["response_contract"]["speaker_cues"],
+        )
+        self.assertIn(
+            "durably remembers",
+            packet["state"]["audio"]["rules"]["speaker_voice_rule"],
         )
 
     def test_default_library_loads(self) -> None:
@@ -156,6 +226,7 @@ class ContextBuilderTests(unittest.TestCase):
             metadata=AdventureMetadata(title="Context Test"),
             player=PlayerState(
                 name="Mira",
+                pronouns="She/Her",
                 appearance="A road-worn apothecary in a green cloak.",
                 backstory="Raised by caravan healers.",
                 condition="Curious",
@@ -301,6 +372,7 @@ class ContextBuilderTests(unittest.TestCase):
 
         self.assertEqual(packet["state"]["adventure_title"], "Context Test")
         self.assertEqual(packet["state"]["player"]["appearance"], "A road-worn apothecary in a green cloak.")
+        self.assertEqual(packet["state"]["player"]["pronouns"], "She/Her")
         self.assertEqual(packet["state"]["player"]["backstory"], "Raised by caravan healers.")
         self.assertEqual(packet["state"]["player"]["notes"], "Distrusts locked doors.")
         self.assertEqual(packet["state"]["player"]["health_current"], 17)
@@ -376,6 +448,10 @@ class ContextBuilderTests(unittest.TestCase):
         self.assertEqual(packet["state"]["calendar"]["current"]["season_hint"], "spring")
         self.assertIn("calendar_time", packet["response_contract"])
         self.assertIn("character_profile", packet["response_contract"])
+        self.assertIn(
+            "canonical source",
+            packet["response_contract"]["character_profile"],
+        )
         self.assertIn("character_scope", packet["response_contract"])
         self.assertIn(
             "not proof that the whole world shares that theme",
@@ -659,8 +735,28 @@ class ContextBuilderTests(unittest.TestCase):
             packet["state"]["active_tasks"]["rules"]["field_completion_rule"],
         )
         self.assertIn(
+            "what must be done",
+            packet["state"]["active_tasks"]["rules"]["description_rule"],
+        )
+        self.assertIn(
+            "how the Player can recognize completion",
+            packet["state"]["active_tasks"]["rules"]["description_rule"],
+        )
+        self.assertIn(
+            "complete player-visible description",
+            packet["response_contract"]["active_tasks"],
+        )
+        self.assertIn(
             "instead of vague due-date prose",
             packet["response_contract"]["active_tasks"],
+        )
+        self.assertIn(
+            "[Camera]",
+            packet["state"]["item_catalog"]["rules"]["ascii_art_rule"],
+        )
+        self.assertIn(
+            "single-line label is invalid",
+            packet["state"]["item_catalog"]["rules"]["ascii_art_rule"],
         )
         self.assertIn(
             "should not be blank",
@@ -759,6 +855,14 @@ class ContextBuilderTests(unittest.TestCase):
             "event.miscellaneous_upsert",
             {section["id"] for section in packet["reference_sections"]},
         )
+        self.assertIn(
+            "player-visible Bestiary",
+            packet["response_contract"]["miscellaneous_memory"],
+        )
+        self.assertIn(
+            "category Creature",
+            packet["state"]["miscellaneous"]["rules"]["scope"],
+        )
 
     def test_creative_ideas_are_omitted_when_not_relevant(self) -> None:
         packet = AiContextBuilder(
@@ -841,7 +945,7 @@ class ContextBuilderTests(unittest.TestCase):
         self.assertIn("event.active_task", section_ids)
         self.assertIn("event.upsert_location", section_ids)
         self.assertNotIn("event.upsert_world", section_ids)
-        pronunciation_rules = json.dumps(
+        english_text_rules = json.dumps(
             [
                 section.content
                 for section in library.sections
@@ -849,7 +953,16 @@ class ContextBuilderTests(unittest.TestCase):
             ],
             ensure_ascii=False,
         )
-        self.assertIn("Kokoro v1.0-compatible Unicode IPA", pronunciation_rules)
+        self.assertIn("printable ASCII English characters", english_text_rules)
+        self.assertIn("never return foreign scripts, IPA", english_text_rules)
+        active_task_rules = json.dumps(
+            next(
+                section.content
+                for section in library.sections
+                if section.id == "event.active_task"
+            )
+        )
+        self.assertIn("how the Player can recognize completion", active_task_rules)
 
 
 if __name__ == "__main__":

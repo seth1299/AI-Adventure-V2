@@ -24,6 +24,7 @@ class PlayerState:
 
     name: str = ""
     name_pronunciation: str = ""
+    pronouns: str = "They/Them"
     appearance: str = ""
     backstory: str = ""
     condition: str = "Healthy"
@@ -266,6 +267,7 @@ class HistoryEntry:
     kind: str = "misc"
     content: str = ""
     sound_effect_cues: list[dict[str, str]] = field(default_factory=list)
+    speaker_cues: list[dict[str, str]] = field(default_factory=list)
     created_at: str = ""
 
     def to_dict(self) -> dict[str, Any]:
@@ -340,6 +342,102 @@ class SkillsState:
 
 
 @dataclass
+class CharacterSpell:
+    """One authoritative spell known by the player character."""
+
+    spell_id: str = ""
+    name: str = ""
+    tier: int = 0
+    school: str = ""
+    description: str = ""
+    casting_time: str = "Action"
+    range: str = ""
+    duration: str = ""
+    requirements: str = ""
+    mana_cost: int = 0
+    prepared: bool = True
+    favorite: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class MagicResourcePool:
+    """One deterministic mana or tiered-slot resource pool."""
+
+    pool_id: str = ""
+    name: str = ""
+    resource_type: str = ""
+    tier: int = 0
+    current_amount: int = 0
+    maximum_amount: int = 0
+    recovery_rule: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class ActiveMagicEffect:
+    """One ongoing magical effect visible to the player and Gemini."""
+
+    effect_id: str = ""
+    spell_id: str = ""
+    name: str = ""
+    target: str = ""
+    description: str = ""
+    start_elapsed_minutes: int = -1
+    end_elapsed_minutes: int = -1
+    requires_concentration: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class MagicAdvancement:
+    """One durable, narratively meaningful magic-development record."""
+
+    advancement_id: str = ""
+    category: str = ""
+    significance: str = "meaningful"
+    reason: str = ""
+    spell_id: str = ""
+    source: str = ""
+    message_id: str = ""
+    elapsed_minutes: int = -1
+    created_at: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class MagicState:
+    """The composed player-magic configuration and current tracked state."""
+
+    configuration: dict[str, Any] = field(default_factory=dict)
+    known_spells: list[CharacterSpell] = field(default_factory=list)
+    resource_pools: list[MagicResourcePool] = field(default_factory=list)
+    active_effects: list[ActiveMagicEffect] = field(default_factory=list)
+    advancement_summary: dict[str, Any] = field(default_factory=dict)
+    advancement_history: list[MagicAdvancement] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "configuration": dict(self.configuration),
+            "known_spells": [spell.to_dict() for spell in self.known_spells],
+            "resource_pools": [pool.to_dict() for pool in self.resource_pools],
+            "active_effects": [effect.to_dict() for effect in self.active_effects],
+            "advancement_summary": dict(self.advancement_summary),
+            "advancement_history": [
+                advancement.to_dict() for advancement in self.advancement_history
+            ],
+        }
+
+
+@dataclass
 class ActiveTask:
     """A visible ongoing quest, commission, order, or other obligation."""
 
@@ -403,6 +501,7 @@ class AdventureState:
     calendar: CalendarState = field(default_factory=CalendarState)
     alchemy: AlchemyNotebookState = field(default_factory=AlchemyNotebookState)
     skills: SkillsState = field(default_factory=SkillsState)
+    magic: MagicState = field(default_factory=MagicState)
     active_tasks: ActiveTasksState = field(default_factory=ActiveTasksState)
     history: HistoryState = field(default_factory=HistoryState)
     settings: SettingsState = field(default_factory=SettingsState)
@@ -420,6 +519,7 @@ class AdventureState:
             "calendar": self.calendar.to_dict(),
             "alchemy": self.alchemy.to_dict(),
             "skills": self.skills.to_dict(),
+            "magic": self.magic.to_dict(),
             "active_tasks": self.active_tasks.to_dict(),
             "history": self.history.to_dict(),
             "settings": self.settings.to_dict(),

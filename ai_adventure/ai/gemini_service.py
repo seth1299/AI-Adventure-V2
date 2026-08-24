@@ -42,15 +42,22 @@ from ai_adventure.currency import (
     normalize_visible_currency_text,
 )
 from ai_adventure.audio.pronunciation import (
-    KOKORO_IPA_PROMPT_RULE,
     PronunciationMap,
     merge_pronunciation_maps,
-    normalize_pronunciation_map,
+)
+from ai_adventure.ascii_art import (
+    ensure_substantive_ascii_art,
+    is_substantive_ascii_art,
 )
 from ai_adventure.audio.catalog import distinct_audio_track_catalogs
+from ai_adventure.audio.voices import VOICE_PROFILE_OPTIONS
 from ai_adventure.locations import clean_player_location_name, normalize_known_locations
 from ai_adventure.new_game_setup import STARTER_INVENTORY_MIN_ITEMS
 from ai_adventure.skills.rules import MAX_SKILL_LEVEL
+from ai_adventure.text_sanitization import (
+    sanitize_english_text,
+    sanitize_english_text_in_data,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -98,7 +105,12 @@ OBVIOUS_NARRATED_WEATHER_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
             r"hammers?|hammered)\b|"
             r"\b(?:begins?|began|starts?|started)\s+to\s+(?:rain|drizzle)\b|"
             r"\b(?:steady|heavy|light|cold|warm|driving|pouring|torrential)\s+"
-            r"(?:rain|drizzle)\b",
+            r"(?:rain|drizzle)\b|"
+            r"\b(?:slick|wet|soaked|drenched)\s+(?:with|from|by)\s+"
+            r"(?:the\s+)?(?:midnight\s+|cold\s+|heavy\s+|steady\s+)?"
+            r"(?:rain|drizzle|downpour)\b|"
+            r"\b(?:out\s+in|through|beneath|under|against)\s+(?:the\s+)?"
+            r"(?:rain|drizzle|downpour)\b",
             re.IGNORECASE,
         ),
     ),
@@ -163,7 +175,11 @@ KNOWN_EVENT_TYPE_NAMES = [
     "ActiveTaskCompletedEvent",
     "CalendarEventUpsertedEvent",
     "CalendarEventDeletedEvent",
-    "SpellLearnedEvent",
+    "SpellCatalogUpsertedEvent",
+    "CharacterSpellLearnedEvent",
+    "PlayerSpellCastEvent",
+    "MagicAdvancementRecordedEvent",
+    "MagicEffectUpsertedEvent",
     "NpcUpsertedEvent",
     "NpcKnowledgeAddedEvent",
     "SecretUpsertedEvent",
@@ -312,7 +328,10 @@ NEW_GAME_CRAFTING_ITEM_SCHEMA: dict[str, Any] = {
             "type": "string",
             "minLength": 3,
             "maxLength": 1200,
-            "description": "Original 3-12 line fixed-width depiction, without Markdown fences.",
+            "description": (
+                "Original 3-12 line fixed-width drawing, without Markdown fences. "
+                "A bracketed name or single-line label is invalid."
+            ),
         },
         "location": {
             "type": "string",
@@ -550,6 +569,8 @@ EVENT_RESPONSE_SCHEMA: dict[str, Any] = {
                     "description": (
                         "Original fixed-width ASCII art depicting the item. Use 3-12 "
                         "lines, no Markdown fence, and keep each line at most 40 characters. "
+                        "A bracketed item name such as [Camera], a caption, or any "
+                        "other single-line label is invalid and is not ASCII art. "
                         "Do not double-escape line breaks or place visible backslash-n text in the art."
                     ),
                 },
@@ -852,7 +873,10 @@ EVENT_RESPONSE_SCHEMA: dict[str, Any] = {
                     "type": "string",
                     "minLength": 3,
                     "maxLength": 1200,
-                    "description": "Original 3-12 line fixed-width depiction, without Markdown fences.",
+                    "description": (
+                        "Original 3-12 line fixed-width drawing, without Markdown "
+                        "fences. A bracketed name or single-line label is invalid."
+                    ),
                 },
                 "location": {
                     "type": "string",
@@ -1021,14 +1045,96 @@ EVENT_RESPONSE_SCHEMA: dict[str, Any] = {
             ["name"],
         ),
         _event_response_schema(
-            "SpellLearnedEvent",
+            "SpellCatalogUpsertedEvent",
             {
+                "spell_id": {"type": "string"},
                 "name": {"type": "string"},
-                "level": {"type": "integer", "minimum": 0, "maximum": 9},
+                "tier": {"type": "integer", "minimum": 0, "maximum": 9},
+                "school": {"type": "string"},
+                "description": {
+                    "type": "string",
+                    "description": (
+                        "Complete player-known objective: what must be done, relevant "
+                        "people and places, and how the player can recognize completion."
+                    ),
+                },
+                "casting_time": {"type": "string"},
+                "range": {"type": "string"},
+                "duration": {"type": "string"},
+                "requirements": {"type": "string"},
+                "mana_cost": {"type": "integer", "minimum": 0},
+            },
+            ["name", "tier", "school", "description", "mana_cost"],
+        ),
+        _event_response_schema(
+            "CharacterSpellLearnedEvent",
+            {
+                "spell_id": {"type": "string"},
+                "name": {"type": "string"},
+                "tier": {"type": "integer", "minimum": 0, "maximum": 9},
                 "school": {"type": "string"},
                 "description": {"type": "string"},
+                "casting_time": {"type": "string"},
+                "range": {"type": "string"},
+                "duration": {"type": "string"},
+                "requirements": {"type": "string"},
+                "mana_cost": {"type": "integer", "minimum": 0},
+                "prepared": {"type": "boolean"},
+                "source": {"type": "string"},
             },
-            ["name"],
+            ["name", "tier", "school", "description", "mana_cost", "prepared"],
+        ),
+        _event_response_schema(
+            "PlayerSpellCastEvent",
+            {
+                "spell_id": {"type": "string"},
+                "cast_tier": {"type": "integer", "minimum": 0, "maximum": 9},
+                "target": {"type": "string"},
+                "player_authorized": {"type": "boolean"},
+            },
+            ["spell_id", "cast_tier", "player_authorized"],
+        ),
+        _event_response_schema(
+            "MagicAdvancementRecordedEvent",
+            {
+                "category": {
+                    "type": "string",
+                    "enum": [
+                        "meaningful_cast",
+                        "training",
+                        "study",
+                        "discovery",
+                        "story_milestone",
+                    ],
+                },
+                "significance": {
+                    "type": "string",
+                    "enum": ["meaningful", "major", "milestone"],
+                },
+                "reason": {"type": "string"},
+                "spell_id": {"type": "string"},
+                "source": {"type": "string"},
+            },
+            ["category", "significance", "reason"],
+            description=(
+                "Records one current-turn instance of meaningful magical development; "
+                "it does not itself change Mana, slots, tiers, or known spells."
+            ),
+        ),
+        _event_response_schema(
+            "MagicEffectUpsertedEvent",
+            {
+                "effect_id": {"type": "string"},
+                "spell_id": {"type": "string"},
+                "name": {"type": "string"},
+                "target": {"type": "string"},
+                "description": {"type": "string"},
+                "start_elapsed_minutes": {"type": "integer", "minimum": -1},
+                "end_elapsed_minutes": {"type": "integer", "minimum": -1},
+                "requires_concentration": {"type": "boolean"},
+                "active": {"type": "boolean"},
+            },
+            ["name", "description", "active"],
         ),
         _event_response_schema(
             "NpcUpsertedEvent",
@@ -1042,6 +1148,13 @@ EVENT_RESPONSE_SCHEMA: dict[str, Any] = {
                 "player_facing_information": {"type": "string"},
                 "knowledge_scope": NONEMPTY_STRING_LIST_SCHEMA,
                 "known_facts": NONEMPTY_STRING_LIST_SCHEMA,
+                "party_member": {"type": "boolean"},
+                "party_status": {"type": "string"},
+                "party_health_current": {"type": "integer", "minimum": -1},
+                "party_health_max": {"type": "integer", "minimum": -1},
+                "party_armor_class": {"type": "integer", "minimum": -1},
+                "party_combat_style": {"type": "string"},
+                "party_skills": STRING_LIST_SCHEMA,
             },
             [
                 "display_name",
@@ -1121,6 +1234,53 @@ NEW_GAME_EVENT_RESPONSE_SCHEMA: dict[str, Any] = {
         for event_type in NEW_GAME_EVENT_TYPE_NAMES
     ]
 }
+SPEAKER_CUE_RESPONSE_SCHEMA: dict[str, Any] = {
+    "type": "array",
+    "description": (
+        "Exact non-narrator spoken spans for local multi-voice TTS. Return one "
+        "entry for every contiguous NPC or other non-player speaker passage; "
+        "return an empty array when only the narrator speaks."
+    ),
+    "maxItems": 40,
+    "items": {
+        "type": "object",
+        "properties": {
+            "anchor_text": {
+                "type": "string",
+                "description": (
+                    "The complete exact spoken span, including its outer double "
+                    "quotation marks, copied from one unique place in visible prose."
+                ),
+            },
+            "speaker_id": {
+                "type": "string",
+                "description": (
+                    "Exact canonical npc_id for an actual NPC; otherwise one stable "
+                    "lower_snake_case identity for the distinct incidental speaker."
+                ),
+            },
+            "speaker_name": {
+                "type": "string",
+                "description": "Short player-safe speaker label or known name.",
+            },
+            "voice_profile": {
+                "type": "string",
+                "enum": list(VOICE_PROFILE_OPTIONS),
+                "description": (
+                    "Broad audible delivery grounded in established speaker traits. "
+                    "Use neutral when no fitting profile is established."
+                ),
+            },
+        },
+        "required": [
+            "anchor_text",
+            "speaker_id",
+            "speaker_name",
+            "voice_profile",
+        ],
+        "additionalProperties": False,
+    },
+}
 STORY_RESPONSE_JSON_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
@@ -1147,25 +1307,7 @@ STORY_RESPONSE_JSON_SCHEMA: dict[str, Any] = {
             "type": "boolean",
             "description": "True only when the response is fully out-of-game.",
         },
-        "pronunciation_map": {
-            "type": "array",
-            "description": (
-                "TTS-only glossary for genuinely ambiguous visible terms. Omit "
-                "ordinary words already pronounced as written. "
-                f"{KOKORO_IPA_PROMPT_RULE} Do not alter the response text to add "
-                "pronunciation hints."
-            ),
-            "maxItems": 40,
-            "items": {
-                "type": "object",
-                "properties": {
-                    "term": {"type": "string"},
-                    "ipa": {"type": "string"},
-                },
-                "required": ["term", "ipa"],
-                "additionalProperties": False,
-            },
-        },
+        "speaker_cues": SPEAKER_CUE_RESPONSE_SCHEMA,
     },
     "required": [
         "response",
@@ -1194,6 +1336,7 @@ STORY_EVENT_TYPE_NAMES_BY_CONTEXT_TAG: dict[str, tuple[str, ...]] = {
         "InventoryItemAddedEvent",
         "InventoryItemRemovedEvent",
         "InventoryItemModifiedEvent",
+        "NpcUpsertedEvent",
     ),
     "crafting": (
         "InventoryItemAddedEvent",
@@ -1243,7 +1386,15 @@ STORY_EVENT_TYPE_NAMES_BY_CONTEXT_TAG: dict[str, tuple[str, ...]] = {
         "NpcKnowledgeAddedEvent",
         "SecretUpsertedEvent",
     ),
-    "magic": ("InventoryItemModifiedEvent", "FlagSetEvent", "SpellLearnedEvent"),
+    "magic": (
+        "InventoryItemModifiedEvent",
+        "FlagSetEvent",
+        "SpellCatalogUpsertedEvent",
+        "CharacterSpellLearnedEvent",
+        "PlayerSpellCastEvent",
+        "MagicAdvancementRecordedEvent",
+        "MagicEffectUpsertedEvent",
+    ),
     "merchant": (
         "InventoryItemAddedEvent",
         "InventoryItemRemovedEvent",
@@ -1279,7 +1430,13 @@ STORY_EVENT_TYPE_NAMES_BY_CONTEXT_TAG: dict[str, tuple[str, ...]] = {
         "SkillUpsertedEvent",
         "SkillXpAddedEvent",
     ),
-    "spell": ("SpellLearnedEvent",),
+    "spell": (
+        "SpellCatalogUpsertedEvent",
+        "CharacterSpellLearnedEvent",
+        "PlayerSpellCastEvent",
+        "MagicAdvancementRecordedEvent",
+        "MagicEffectUpsertedEvent",
+    ),
     "state": ("FlagSetEvent",),
     "task": ("ActiveTaskUpsertedEvent", "ActiveTaskCompletedEvent"),
     "time": ("CalendarEventUpsertedEvent", "CalendarEventDeletedEvent"),
@@ -1326,6 +1483,45 @@ SKILL_CHECK_PLAN_RESPONSE_JSON_SCHEMA: dict[str, Any] = {
     "required": ["checks", "relevant_tags"],
     "additionalProperties": False,
 }
+NEW_GAME_STARTING_SPELL_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "name": {"type": "string", "minLength": 1},
+        "tier": {"type": "integer", "minimum": 0, "maximum": 9},
+        "school": {"type": "string"},
+        "description": {"type": "string", "minLength": 1},
+        "casting_time": {"type": "string", "minLength": 1},
+        "range": {"type": "string"},
+        "duration": {"type": "string"},
+        "requirements": {"type": "string"},
+        "mana_cost": {"type": "integer", "minimum": 0},
+        "prepared": {"type": "boolean"},
+        "source_index": {
+            "type": "integer",
+            "minimum": 0,
+            "description": (
+                "Zero-based setup.magic.starting_spell_requests index for the "
+                "player description that produced this spell."
+            ),
+        },
+    },
+    "required": [
+        "name",
+        "tier",
+        "school",
+        "description",
+        "casting_time",
+        "range",
+        "duration",
+        "requirements",
+        "mana_cost",
+        "prepared",
+        "source_index",
+    ],
+    "additionalProperties": False,
+}
+
+
 NEW_GAME_RESPONSE_JSON_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
@@ -1400,6 +1596,7 @@ NEW_GAME_RESPONSE_JSON_SCHEMA: dict[str, Any] = {
                     "items": {
                         "type": "object",
                         "properties": {
+                            "npc_id": {"type": "string"},
                             "name": {"type": "string"},
                             "weather_hint": {"type": "string"},
                         },
@@ -1431,8 +1628,9 @@ NEW_GAME_RESPONSE_JSON_SCHEMA: dict[str, Any] = {
         "weather": {"type": "string"},
         "character": {
             "type": "object",
-            "properties": {
-                "name": {"type": "string"},
+                        "properties": {
+                            "npc_id": {"type": "string"},
+                            "name": {"type": "string"},
                 "appearance": {"type": "string"},
                 "backstory": {"type": "string"},
                 "notes": {"type": "string"},
@@ -1452,6 +1650,15 @@ NEW_GAME_RESPONSE_JSON_SCHEMA: dict[str, Any] = {
                 "required": ["name", "description", "level"],
                 "additionalProperties": False,
             },
+        },
+        "speaker_cues": SPEAKER_CUE_RESPONSE_SCHEMA,
+        "starting_spells": {
+            "type": "array",
+            "description": (
+                "Gemini-finalized Player Character spells created from Basic-mode "
+                "setup.magic.starting_spell_requests."
+            ),
+            "items": NEW_GAME_STARTING_SPELL_SCHEMA,
         },
         "starting_items": {
             "type": "array",
@@ -1502,6 +1709,8 @@ NEW_GAME_RESPONSE_JSON_SCHEMA: dict[str, Any] = {
                         "description": (
                             "Original fixed-width ASCII art depicting the item. Use "
                             "3-12 lines, no Markdown fence, with lines at most 40 characters. "
+                            "A bracketed item name such as [Camera], a caption, or "
+                            "any other single-line label is invalid. "
                             "Do not double-escape line breaks or place visible backslash-n text in the art."
                         ),
                     },
@@ -1586,24 +1795,6 @@ NEW_GAME_RESPONSE_JSON_SCHEMA: dict[str, Any] = {
             ),
         },
         "introductory_message": {"type": "string"},
-        "pronunciation_map": {
-            "type": "array",
-            "description": (
-                "TTS-only glossary for genuinely ambiguous visible terms introduced "
-                "in the initial world. Omit ordinary words already pronounced as "
-                f"written. {KOKORO_IPA_PROMPT_RULE}"
-            ),
-            "maxItems": 80,
-            "items": {
-                "type": "object",
-                "properties": {
-                    "term": {"type": "string"},
-                    "ipa": {"type": "string"},
-                },
-                "required": ["term", "ipa"],
-                "additionalProperties": False,
-            },
-        },
         "suggested_actions": {
             "type": "array",
             "description": "Three or four short player-facing action options for the opening scene.",
@@ -1705,10 +1896,42 @@ def build_new_game_response_schema(setup_packet: dict[str, Any]) -> dict[str, An
     if not skills or not skills_need_invention:
         omit("skills")
 
+    magic = setup.get("magic", {})
+    if not isinstance(magic, dict):
+        magic = {}
+    starting_spell_requests = magic.get("starting_spell_requests", [])
+    if not isinstance(starting_spell_requests, list):
+        starting_spell_requests = []
+    generate_starting_spells = (
+        bool(magic.get("enabled", False))
+        and str(magic.get("starting_spells_mode", "basic")).casefold() == "basic"
+        and bool(starting_spell_requests)
+    )
+    if not generate_starting_spells:
+        omit("starting_spells")
+    else:
+        if "starting_spells" not in required:
+            required.append("starting_spells")
+        spell_count = len(starting_spell_requests)
+        starting_spells_schema = properties["starting_spells"]
+        starting_spells_schema["minItems"] = spell_count
+        starting_spells_schema["maxItems"] = spell_count
+        starting_spells_schema["items"]["properties"]["source_index"]["enum"] = list(
+            range(spell_count)
+        )
+
     denominations = setup.get("currency_denominations", [])
     if isinstance(denominations, list) and denominations:
         omit("currency_denominations")
         omit("currency_description")
+
+    starting_wealth = setup.get("starting_wealth", {})
+    if (
+        isinstance(starting_wealth, dict)
+        and str(starting_wealth.get("mode", "basic")).strip().casefold()
+        == "advanced"
+    ):
+        omit("starting_currency_balance_base_units")
 
     event_types: list[str] = []
     starting_npcs = setup.get("starting_npcs", [])
@@ -1814,6 +2037,9 @@ def _story_event_type_names(context_packet: dict[str, Any]) -> tuple[str, ...]:
         enabled_event_types.discard("MusicChangedEvent")
     if not valid_sound_effect_tracks:
         enabled_event_types.discard("SoundEffectChangedEvent")
+    combat = _state_subpacket(context_packet, "combat")
+    if str(combat.get("resolution_mode", "strict")) == "narrative":
+        enabled_event_types.discard("CombatStartedEvent")
     return tuple(
         event_type
         for event_type in KNOWN_EVENT_TYPE_NAMES
@@ -1917,6 +2143,7 @@ class AiNarrationResult:
     suggested_actions: list[str] = field(default_factory=list)
     suggested_events: list[dict[str, Any]] = field(default_factory=list)
     sound_effect_cues: list[dict[str, str]] = field(default_factory=list)
+    speaker_cues: list[dict[str, str]] = field(default_factory=list)
     pronunciation_map: PronunciationMap = field(default_factory=dict)
     out_of_game: bool = False
     raw_text: str = ""
@@ -1947,6 +2174,7 @@ class AiWorldSetupResult:
     miscellaneous: list[dict[str, Any]] = field(default_factory=list)
     finalized_character: dict[str, str] = field(default_factory=dict)
     finalized_skills: list[dict[str, Any]] = field(default_factory=list)
+    finalized_starting_spells: list[dict[str, Any]] = field(default_factory=list)
     finalized_starter_items: list[dict[str, Any]] = field(default_factory=list)
     known_crafting_items: list[dict[str, Any]] = field(default_factory=list)
     known_crafting_recipes: list[dict[str, Any]] = field(default_factory=list)
@@ -1957,6 +2185,7 @@ class AiWorldSetupResult:
     suggested_actions: list[str] = field(default_factory=list)
     suggested_events: list[dict[str, Any]] = field(default_factory=list)
     sound_effect_cues: list[dict[str, str]] = field(default_factory=list)
+    speaker_cues: list[dict[str, str]] = field(default_factory=list)
     raw_text: str = ""
 
 
@@ -2074,6 +2303,7 @@ class GeminiNarrationService:
         result = _enforce_explicit_conversation_mode(result, context_packet)
         result = _drop_unwarranted_skill_check_events(result, context_packet)
         result = _drop_duplicate_resolved_skill_check_events(result, context_packet)
+        result = _drop_unauthorized_player_spell_cast_events(result, context_packet)
         result = _ensure_in_game_suggested_actions(result, context_packet)
         result = _ensure_status_event_for_in_game_response(result, context_packet)
         result = _enforce_container_reward_flow(result, context_packet)
@@ -2437,15 +2667,25 @@ def _build_xml_story_prompt(context_packet: dict[str, Any]) -> str:
                 "stable NPC, item, secret, task, location, and miscellaneous lore "
                 "identities. Never use "
                 "banned terms, close spellings, hyphenation variants, obvious reskins, "
-                "or bare category-label proper nouns for newly invented names. Return "
-                "a pronunciation_map for exact visible names and recurring terms whose "
-                "ordinary spelling may be mispronounced by TTS. Include locations, NPCs, "
-                "items, factions, creatures, spells, and other repeated names. The map "
-                "must never change the player-facing response; it is a TTS-only glossary. "
-                "Omit ordinary words already pronounced as written, such as Kit or "
-                f"Copper Square. {KOKORO_IPA_PROMPT_RULE} For example, Qh'thala may "
-                "map to kəˈθɑlə. "
-                "Honor the player's explicit character-name pronunciation.",
+                "or bare category-label proper nouns for newly invented names. Every "
+                "generated string value must use printable ASCII English characters "
+                "only. Transliterate accented Latin letters to their unaccented English "
+                "equivalents and never emit foreign scripts, IPA, phoneme strings, or "
+                "pronunciation annotations. Do not return pronunciation_map. "
+                "For every newly defined inventory or crafting item, ascii_art must "
+                "be an original 3-12 line fixed-width drawing of the recognizable "
+                "item shape. A bracketed item name such as [Camera], a caption, or "
+                "any other single-line label is invalid and is not ASCII art. "
+                "For local multi-voice TTS, return one speaker_cues entry for every "
+                "contiguous span of non-narrator spoken dialogue. anchor_text must "
+                "copy the complete exact dialogue span, including its outer double "
+                "quotation marks, from one unique place in response. Use the exact "
+                "canonical npc_id as speaker_id for a real NPC, including an NPC "
+                "created by this response; otherwise use one stable lower_snake_case "
+                "speaker identity. Reuse a speaker_id for the same person and use "
+                "different IDs for different speakers. Choose voice_profile only from "
+                "established audible traits; use neutral when unspecified. Do not add "
+                "speaker cues for narrator prose or invent player-character dialogue.",
             ),
             _xml_text_section(
                 "gm_secret_knowledge_boundary",
@@ -2470,7 +2710,10 @@ def _build_xml_story_prompt(context_packet: dict[str, Any]) -> str:
                 "law, historical event, phenomenon, custom, or other concept that does "
                 "not fit an NPC, Location, Item, active task, or GM secret. Reuse the "
                 "same misc_id for updates and send the complete current record. Never "
-                "duplicate information that belongs in a more specific table; use "
+                "duplicate information that belongs in a more specific table. Use "
+                "category Creature for each non-NPC creature or monster the Player "
+                "learns about, and put only player-known facts in details because "
+                "Creature records appear in the player-visible Bestiary; use "
                 "SecretUpsertedEvent instead for hidden truth.",
             ),
             _xml_text_section(
@@ -2514,8 +2757,10 @@ def _build_xml_story_prompt(context_packet: dict[str, Any]) -> str:
                 "the narration keeps the current value unchanged. If the narration "
                 "introduces rain, snow, fog, or any other current weather different "
                 "from state.scene.weather, set weather to that actual condition rather "
-                "than AUTO. pronunciation_map must be an array of {term, ipa} records. "
-                f"{KOKORO_IPA_PROMPT_RULE} "
+                "than AUTO. Every returned string must contain printable ASCII English "
+                "characters only; do not return pronunciation_map or phonetic markup. "
+                "speaker_cues must be an array, empty when no non-narrator character "
+                "speaks, with every anchor copied exactly from response. "
                 "No surrounding Markdown.",
             ),
             _xml_text_section(
@@ -2548,7 +2793,7 @@ def _story_prompt_packet(context_packet: dict[str, Any]) -> dict[str, Any]:
     always = {
         "response", "suggested_actions", "events", "status_event", "skill_checks",
         "player_ai_preferences", "creative_ideas", "conversation_mode", "out_of_game", "event_shape",
-        "known_event_types", "miscellaneous_memory",
+        "known_event_types", "miscellaneous_memory", "speaker_cues",
     }
     tags_by_contract = {
         "calendar_time": {"time", "events"},
@@ -2562,6 +2807,7 @@ def _story_prompt_packet(context_packet: dict[str, Any]) -> dict[str, Any]:
         "secret_memory": {"events", "lore"},
         "currency_transactions": {"currency", "merchant"},
         "combat_handoff": {"combat"},
+        "narrative_combat": {"combat"},
     }
     filtered_contract = {
         key: value
@@ -2601,23 +2847,36 @@ def _build_xml_new_game_prompt(setup_packet: dict[str, Any]) -> str:
                 "includes the requested start location, suggestion-mode location names "
                 "and descriptions, and suggestion-mode NPC descriptions. Exact-mode "
                 "values must remain unchanged. Maintain "
-                "source_index links and consistent finalized names everywhere. Keep GM "
-                "secrets out of player-visible fields. Never use banned terms, close "
+                "source_index links and finalized names consistent. Use canonical "
+                "setup.character.pronouns exactly; never infer others. Never use "
+                "banned terms, close "
                 "variants, reskins, or bare category-label proper nouns for NPC names, "
                 "location names, or references to those names in other fields. Calendar settings are "
                 "exempt from the banned creative terms; calendar day, month, and season "
-                "names only need to obey the separate calendar-generation rules. Return "
-                "a pronunciation_map for exact visible names and recurring terms whose "
-                "ordinary spelling may be mispronounced by TTS, including locations, "
-                "NPCs, items, factions, creatures, and spells. This map is TTS-only and "
-                "must not insert pronunciation data into player-facing prose. Honor the "
-                "player's explicit character-name pronunciation. Omit ordinary words "
-                "already pronounced as written, such as Kit or Copper Square. "
-                f"{KOKORO_IPA_PROMPT_RULE} If the setup includes "
+                "names only need to obey the separate calendar-generation rules. Every "
+                "generated string value must use printable ASCII English characters "
+                "only. Transliterate accented Latin letters to unaccented English and "
+                "never emit foreign scripts, IPA, phoneme strings, pronunciation "
+                "annotations, or pronunciation_map. For local multi-voice TTS, return "
+                "speaker_cues for every contiguous non-narrator spoken span in "
+                "introductory_message. Copy each complete dialogue span including "
+                "outer double quotation marks into a unique anchor_text. Use the "
+                "exact NpcUpsertedEvent npc_id as speaker_id for an actual NPC, reuse "
+                "the same ID for the same person, and use distinct stable "
+                "lower_snake_case IDs for incidental speakers. Ground voice_profile "
+                "in established audible traits and use neutral when unspecified. Do "
+                "not cue narrator prose or player-character dialogue. If the setup includes "
                 "opening_scene_request, treat it as optional player-authored guidance "
                 "for the first scene at the selected start_location: honor its intent "
                 "when coherent, but write finalized in-world narration instead of "
-                "copying request text or exposing meta-instructions.",
+                "copying request text or exposing meta-instructions. The top-level "
+                "weather must match introductory_message and the actual start_location "
+                "description. If either establishes rain, drizzle, snow, fog, or "
+                "another current condition, weather must name that condition and must "
+                "not retain Clear or another contradictory default. If "
+                "setup.starting_task.mode is ai and starting_task.guidance is "
+                "non-empty, use that nudge as inspiration for the opening quest "
+                "while inventing every unspecified quest detail.",
             ),
             _xml_text_section(
                 "gm_secret_knowledge_boundary",
@@ -2647,6 +2906,9 @@ def _build_xml_new_game_prompt(setup_packet: dict[str, Any]) -> str:
                 "Use it for original creatures or species, cultures, factions, "
                 "religions, laws, historical events, phenomena, customs, and other "
                 "durable concepts introduced by the finalized world or opening scene. "
+                "Use category Creature for each non-NPC creature or monster known to "
+                "the Player, with only player-known facts in details; those records "
+                "populate the player-visible Bestiary. "
                 "Use stable misc_id values and complete records. Do not duplicate "
                 "information that belongs in another structured field; return an "
                 "empty array when no miscellaneous starting canon is established.",
@@ -2687,8 +2949,10 @@ def _build_xml_new_game_prompt(setup_packet: dict[str, Any]) -> str:
                 "output_format",
                 "Return exactly one JSON object matching the configured new-game "
                 "schema, with no surrounding Markdown. Complete every required field. "
-                "pronunciation_map must be an array of {term, ipa} records mapping "
-                f"exact visible terms to native TTS phonemes. {KOKORO_IPA_PROMPT_RULE}",
+                "Every returned string must contain printable ASCII English characters "
+                "only; do not return pronunciation_map or phonetic markup. "
+                "speaker_cues must be an array and must be empty when only the "
+                "narrator speaks.",
             ),
             _xml_text_section(
                 "task",
@@ -2939,6 +3203,25 @@ def build_gemini_story_prompt(context_packet: dict[str, Any]) -> str:
         "eating, drinking, and casual conversation are not skill checks unless "
         "the player adds a contested, risky, hidden, time-sensitive, or "
         "deceptive goal.\n"
+        "- state.magic is authoritative. Never cast a spell for the player unless "
+        "the current player command explicitly authorizes that cast. For an authorized "
+        "typed casting command, suggest PlayerSpellCastEvent with the exact spell_id "
+        "from state.magic.known_spells, the chosen cast_tier, and player_authorized=true. "
+        "Never calculate, narrate, or set remaining mana or slots; Python validates and "
+        "consumes the resource. Narrative mode has no consumable resource, Mana mode uses "
+        "the catalog mana_cost, and Tiered mode consumes one slot at the cast tier except "
+        "for tier 0. Use CharacterSpellLearnedEvent only when the player actually gains a "
+        "usable spell, and include its complete definition. Use SpellCatalogUpsertedEvent "
+        "for established spells the player does not learn. Use MagicEffectUpsertedEvent "
+        "only for an ongoing effect actually established by the current narration. When "
+        "state.magic.progression is present, treat its summary, recent meaningful "
+        "advancements, and milestones as authoritative. Suggest "
+        "MagicAdvancementRecordedEvent only when this response establishes meaningful "
+        "magical development through a consequential cast, substantive training or study, "
+        "a discovery, or a story milestone. Never award it for routine repetition or an "
+        "event from an earlier turn. For category=meaningful_cast, first include the exact "
+        "authorized PlayerSpellCastEvent in this response and copy its spell_id. This "
+        "advancement record does not itself change Mana, slots, tiers, or known spells.\n"
         "- state.travel is the authoritative player-known travel map. Its x_miles "
         "and y_miles coordinates use a shared map measured in miles; do not invent "
         "a conflicting distance for known locations. When the player learns a new "
@@ -2970,7 +3253,9 @@ def build_gemini_story_prompt(context_packet: dict[str, Any]) -> str:
         "as an integer of at least 1.\n"
         "- Every InventoryItemAddedEvent must include original ascii_art for the "
         "item: 3-12 fixed-width lines, no Markdown code fence, and no line over "
-        "40 characters. Do not double-escape line breaks or put visible backslash-n "
+        "40 characters. A bracketed item name such as [Camera], a caption, or any "
+        "other single-line label is invalid and is not ASCII art. Do not "
+        "double-escape line breaks or put visible backslash-n "
         "text in the drawing. When reusing state.item_catalog.items, copy its existing "
         "ascii_art instead of redrawing the item.\n"
         "- Every InventoryItemAddedEvent must also include quantity_unit and "
@@ -3104,7 +3389,14 @@ def build_gemini_story_prompt(context_packet: dict[str, Any]) -> str:
         "- ActiveTaskUpsertedEvent is shown directly in the Active Tasks tab. Fill "
         "only category, status, description, requester, location, reward, due_date, "
         "and due_elapsed_minutes with useful player-facing values. Do not add "
-        "notes, Notes, or any other extra active-task fields. Use requester='Self' "
+        "notes, Notes, or any other extra active-task fields. Every new task must "
+        "have a complete description explaining what must be done, all currently "
+        "known relevant people and places, and how the Player can tell the task is "
+        "complete. Include only player-known facts. An update may omit description "
+        "only when the existing description remains complete and unchanged. "
+        "If state contains a task with a blank or incomplete description, repair it "
+        "with ActiveTaskUpsertedEvent as soon as that task is relevant. "
+        "Use requester='Self' "
         "for personal goals, reward='N/A' when nobody is paying or trading for "
         "the task, due_date='N/A' and due_elapsed_minutes=-1 when no deadline is "
         "known, and location as the relevant place for doing, picking up, "
@@ -3189,8 +3481,10 @@ def build_gemini_new_game_prompt(setup_packet: dict[str, Any]) -> str:
         f"- {content_rule}\n"
         "- If the setup packet includes character_generation_guidance, follow its "
         "gender_presentation_hint when inventing blank/default player character "
-        "fields. A blank/default player character does not imply male. Vary gender "
-        "presentation, pronouns, names, appearance, and backstory across new games, "
+        "fields, but never conflict with canonical_pronouns. setup.character.pronouns "
+        "is canonical: use it exactly and never infer replacements from the name, "
+        "appearance, voice, backstory, invented details, or genre. A blank/default "
+        "player character does not imply male. Vary names, appearance, and backstory, "
         "and use creative_ideas.player_character_name_examples as a balanced name "
         "pool when useful.\n"
         "- If setup.specified_genre is blank/default, choose a specific genre or "
@@ -3267,7 +3561,8 @@ def build_gemini_new_game_prompt(setup_packet: dict[str, Any]) -> str:
         "setup.narration.tense_label and setup.narration.style_label. Do not "
         "fall back to second-person wording unless the selected style is "
         "Second-Person. First-person styles should use I/me/my; third-person "
-        "styles should use the player character's name or pronouns instead of "
+        "styles should use the player character's name or exact canonical "
+        "setup.character.pronouns instead of "
         "you/your. Limited styles stay within the player character's observed "
         "or reasonably inferred experience. Omniscient styles may use a broader "
         "narrative camera, but must not reveal secrets, hidden state, mystery "
@@ -3278,7 +3573,10 @@ def build_gemini_new_game_prompt(setup_packet: dict[str, Any]) -> str:
         "current_calendar is deliberately absent: invent calendar_settings and "
         "starting_calendar first, then make introductory_message match those generated "
         "values. introductory_message must match setup_packet.current_weather unless "
-        "you return weather to change it.\n"
+        "you return weather to change it. If introductory_message or the actual "
+        "start_location description establishes rain, drizzle, snow, fog, or another "
+        "current condition, the top-level weather field must name that condition and "
+        "must not retain Clear or another contradictory default.\n"
         "- start_location must be the actual named location where the player starts. "
         "If setup.start_location is blank/default, choose any coherent starting "
         "location for the selected genre and character. The player does not need "
@@ -3433,12 +3731,14 @@ def build_gemini_new_game_prompt(setup_packet: dict[str, Any]) -> str:
         "may use credits. Use setup.economy_examples as common-price calibration "
         "for ordinary goods when it is present. If setup.currency_denominations "
         "already contains player-provided values, preserve them.\n"
-        "- starting_currency_balance_base_units must be a reasonable starting money "
-        "amount for the finalized character, genre, and economy. This is the "
-        "player's actual starting money stored in game_state/currency.balance as "
-        "one integer in the baseline currency unit. Account for any "
-        "setup.economy_examples common-price rows when choosing it. Do not create "
-        "coin or purse items in starting_items to represent spendable money.\n"
+        "- setup.starting_wealth is authoritative. In basic mode, "
+        "starting_currency_balance_base_units must be a nonnegative starting-money "
+        "amount that follows setup.starting_wealth.guidance and fits the finalized "
+        "character, genre, economy, and setup.economy_examples. In advanced mode, "
+        "Python already calculated the exact balance from the player's denomination "
+        "and count rows; do not return or replace it. Starting wealth is stored as "
+        "one integer in game_state/currency.balance. Never create coin, purse, cash, "
+        "wallet, credit, or other spendable-money items in starting_items.\n"
         "- The API response schema defines the required output fields and event "
         "envelope. New-game events may only be NpcUpsertedEvent, "
         "ActiveTaskUpsertedEvent, MusicChangedEvent, or "
@@ -3448,7 +3748,9 @@ def build_gemini_new_game_prompt(setup_packet: dict[str, Any]) -> str:
         "or the events array. The app stores those starting secrets as active. "
         "Put established non-secret creatures, species, cultures, factions, laws, "
         "history, phenomena, customs, and other concepts without a more specific "
-        "home in the top-level miscellaneous array. "
+        "home in the top-level miscellaneous array. Use category Creature for each "
+        "non-NPC creature or monster known to the Player, and include only "
+        "player-known facts in details because these records populate the Bestiary. "
         "Use the direct setup fields for locations, crafting knowledge, inventory, "
         "currency, character, skills, calendar, and all other initial state that "
         "has a direct field. Use type and payload for each event; "
@@ -3460,7 +3762,11 @@ def build_gemini_new_game_prompt(setup_packet: dict[str, Any]) -> str:
         "requires one. If it is ai, create one fitting starting quest. If it is "
         "custom, create exactly one ActiveTaskUpsertedEvent using the player's "
         "provided task fields as anchors and filling any blank/default task fields "
-        "from the rest of the setup. Use category Quest unless the player provided "
+        "from the rest of the setup. Every new quest must have a complete "
+        "player-visible description explaining what must be done, all currently "
+        "known relevant people and places, and how the Player can recognize "
+        "completion. Include only player-known facts. Use category Quest unless "
+        "the player provided "
         "a different category.\n"
         "- Use NpcUpsertedEvent for prominent NPCs the player can know about at "
         "setup. Use zero, one, or many NPC events according to setup.starting_npcs "
@@ -3468,7 +3774,12 @@ def build_gemini_new_game_prompt(setup_packet: dict[str, Any]) -> str:
         "in a new city can start with no known NPCs; a local, commander, teacher, "
         "noble, merchant, or socially connected character can start with several. "
         "Do not parse NPCs out of ordinary setup prose or plaintext fields. For "
-        "each setup.starting_npcs row, create one NpcUpsertedEvent. Fill blank "
+        "each setup.starting_npcs row, create one NpcUpsertedEvent and copy its "
+        "npc_id exactly into payload.npc_id. Set payload.party_member true exactly "
+        "when that npc_id appears in setup.starting_party_npc_ids, and false "
+        "otherwise. When location_source_index is nonnegative, payload.location "
+        "must use the finalized name of the corresponding setup.starting_locations "
+        "row, including when its suggestion-mode name changes. Fill blank "
         "name, location, or description fields with fitting specifics. If "
         "description_mode is exact, copy description into payload.public_description "
         "unchanged; if description_mode is suggestion, use description as a guide "
@@ -3858,6 +4169,20 @@ def _suggested_setup_terms(setup_packet: dict[str, Any]) -> tuple[str, ...]:
             if description:
                 terms.append(description)
 
+    raw_magic = setup.get("magic", {})
+    raw_spell_requests = (
+        raw_magic.get("starting_spell_requests", [])
+        if isinstance(raw_magic, dict)
+        else []
+    )
+    if isinstance(raw_spell_requests, list):
+        for raw_request in raw_spell_requests:
+            if not isinstance(raw_request, dict):
+                continue
+            request = str(raw_request.get("spell_request", "") or "").strip()
+            if request:
+                terms.append(request)
+
     return tuple(dict.fromkeys(terms))
 
 
@@ -3973,6 +4298,45 @@ def _unfinalized_suggested_setup_terms(
                 finalized_description,
             ):
                 unresolved.append(requested_description)
+
+    raw_magic = setup.get("magic", {}) if isinstance(setup, dict) else {}
+    raw_spell_requests = (
+        raw_magic.get("starting_spell_requests", [])
+        if isinstance(raw_magic, dict)
+        else []
+    )
+    returned_spells = data.get("starting_spells", [])
+    if isinstance(raw_spell_requests, list):
+        for source_index, raw_request in enumerate(raw_spell_requests):
+            if not isinstance(raw_request, dict):
+                continue
+            request = str(raw_request.get("spell_request", "") or "").strip()
+            if not request:
+                continue
+            match = (
+                next(
+                    (
+                        spell
+                        for spell in returned_spells
+                        if isinstance(spell, dict)
+                        and _coerce_int(spell.get("source_index"), default=-1)
+                        == source_index
+                    ),
+                    None,
+                )
+                if isinstance(returned_spells, list)
+                else None
+            )
+            finalized_name = (
+                str(match.get("name", "") or "").strip()
+                if isinstance(match, dict)
+                else ""
+            )
+            if not finalized_name or _suggestion_text_is_unchanged(
+                request,
+                finalized_name,
+            ):
+                unresolved.append(request)
 
     return unresolved
 
@@ -4093,6 +4457,47 @@ def _unfinalized_suggested_setup_paths(
             ):
                 paths.append(
                     f"events[NpcUpsertedEvent][{source_index}].payload.public_description"
+                )
+
+    raw_magic = setup.get("magic", {})
+    raw_spell_requests = (
+        raw_magic.get("starting_spell_requests", [])
+        if isinstance(raw_magic, dict)
+        else []
+    )
+    returned_spells = data.get("starting_spells", [])
+    if isinstance(raw_spell_requests, list):
+        for source_index, raw_request in enumerate(raw_spell_requests):
+            if not isinstance(raw_request, dict):
+                continue
+            request = str(raw_request.get("spell_request", "") or "").strip()
+            if not request:
+                continue
+            match = (
+                next(
+                    (
+                        spell
+                        for spell in returned_spells
+                        if isinstance(spell, dict)
+                        and _coerce_int(spell.get("source_index"), default=-1)
+                        == source_index
+                    ),
+                    None,
+                )
+                if isinstance(returned_spells, list)
+                else None
+            )
+            finalized_name = (
+                str(match.get("name", "") or "").strip()
+                if isinstance(match, dict)
+                else ""
+            )
+            if not finalized_name or _suggestion_text_is_unchanged(
+                request,
+                finalized_name,
+            ):
+                paths.append(
+                    f"starting_spells[source_index={source_index}].name"
                 )
 
     return paths
@@ -4312,11 +4717,24 @@ def _new_game_response_quality_errors(
     # Extra fields are safe for the tolerant Python parser and can appear in older
     # compatible responses. Missing, malformed, or out-of-contract required data is
     # what makes a New Game materially incomplete.
-    return [
+    errors = [
         error
         for error in _json_schema_shape_errors(data, response_schema)
         if not error.endswith(" is not allowed")
     ]
+    for field_name in ("starting_items", "known_crafting_items"):
+        raw_items = data.get(field_name, [])
+        if not isinstance(raw_items, list):
+            continue
+        for index, raw_item in enumerate(raw_items):
+            if not isinstance(raw_item, dict):
+                continue
+            if not is_substantive_ascii_art(raw_item.get("ascii_art", "")):
+                errors.append(
+                    f"$.{field_name}[{index}].ascii_art must be a real 3-12 line "
+                    "drawing; a bracketed name or single-line label is invalid"
+                )
+    return errors
 
 
 def _new_game_response_quality_score(
@@ -4347,6 +4765,8 @@ def _generate_content_with_retry(
     allow_schema_fallback: bool = True,
 ) -> Any:
     """Calls Gemini with one bounded retry for temporary service failures."""
+
+    contents = sanitize_english_text(contents)
 
     if _is_embedding_model_name(model):
         raise GeminiConfigurationError(
@@ -4638,7 +5058,7 @@ def _sanitize_gemini_creative_terms(
     *,
     terms: tuple[str, ...] | list[str] | None = None,
 ) -> Any:
-    """Removes banned generated-name terms before AI output reaches state or UI."""
+    """Removes banned terms and non-English characters before state or UI."""
 
     excluded_paths = _creative_guardrail_excluded_paths(response_label)
     scan_value = _json_data_or_original(value)
@@ -4648,42 +5068,63 @@ def _sanitize_gemini_creative_terms(
         excluded_paths=excluded_paths,
     )
 
-    if not banned_terms:
-        return value
+    sanitized_value = value
 
-    LOGGER.warning(
-        "Gemini %s contained banned creative term(s): %s. "
-        "Sanitized before display, logging, or persistence.",
-        response_label,
-        ", ".join(banned_terms),
-    )
+    if banned_terms:
+        LOGGER.warning(
+            "Gemini %s contained banned creative term(s): %s. "
+            "Sanitized before display, logging, or persistence.",
+            response_label,
+            ", ".join(banned_terms),
+        )
 
-    if isinstance(value, str):
-        clean_text = _strip_json_fence(value.strip())
+        if isinstance(value, str):
+            clean_text = _strip_json_fence(value.strip())
 
-        try:
-            data = json.loads(clean_text)
-        except json.JSONDecodeError:
-            return sanitize_banned_creative_terms_in_data(
+            try:
+                data = json.loads(clean_text)
+            except json.JSONDecodeError:
+                sanitized_value = sanitize_banned_creative_terms_in_data(
+                    value,
+                    terms=terms,
+                    excluded_paths=excluded_paths,
+                )
+            else:
+                sanitized_value = json.dumps(
+                    sanitize_banned_creative_terms_in_data(
+                        data,
+                        terms=terms,
+                        excluded_paths=excluded_paths,
+                    ),
+                    ensure_ascii=False,
+                )
+        else:
+            sanitized_value = sanitize_banned_creative_terms_in_data(
                 value,
                 terms=terms,
                 excluded_paths=excluded_paths,
             )
 
-        return json.dumps(
-            sanitize_banned_creative_terms_in_data(
-                data,
-                terms=terms,
-                excluded_paths=excluded_paths,
-            ),
-            ensure_ascii=False,
+    if isinstance(sanitized_value, str):
+        clean_text = _strip_json_fence(sanitized_value.strip())
+        try:
+            structured_value = json.loads(clean_text)
+        except json.JSONDecodeError:
+            english_value = sanitize_english_text_in_data(sanitized_value)
+        else:
+            english_value = json.dumps(
+                sanitize_english_text_in_data(structured_value),
+                ensure_ascii=False,
+            )
+    else:
+        english_value = sanitize_english_text_in_data(sanitized_value)
+    if english_value != sanitized_value:
+        LOGGER.warning(
+            "Gemini %s contained non-English Unicode characters. "
+            "Converted or removed them before display, state, persistence, or TTS.",
+            response_label,
         )
-
-    return sanitize_banned_creative_terms_in_data(
-        value,
-        terms=terms,
-        excluded_paths=excluded_paths,
-    )
+    return english_value
 
 
 def _creative_guardrail_excluded_paths(
@@ -4790,7 +5231,30 @@ def _skill_check_planning_packet(context_packet: dict[str, Any]) -> dict[str, An
     if not isinstance(recent_history, list):
         recent_history = []
 
-    return {
+    selection = context_packet.get("selection", {})
+    selected_tags = {
+        str(tag).strip().casefold()
+        for tag in selection.get("tags", [])
+        if isinstance(tag, str) and str(tag).strip()
+    } if isinstance(selection, dict) else set()
+    magic = state.get("magic", {}) if isinstance(state.get("magic"), dict) else {}
+    magic_planning_context: dict[str, Any] = {}
+    if selected_tags.intersection({"magic", "spell"}):
+        magic_planning_context = {
+            "configuration": magic.get("configuration", {}),
+            "known_spells": [
+                {
+                    key: spell.get(key)
+                    for key in ("spell_id", "name", "tier", "school", "mana_cost")
+                }
+                for spell in magic.get("known_spells", [])
+                if isinstance(spell, dict)
+            ],
+            "active_effects": magic.get("active_effects", []),
+            "progression": magic.get("progression", {}),
+        }
+
+    packet = {
         "packet_type": "skill_check_planning",
         "player_command": str(context_packet.get("player_command", "")).strip(),
         "scene": state.get("scene", {}) if isinstance(state.get("scene"), dict) else {},
@@ -4817,6 +5281,9 @@ def _skill_check_planning_packet(context_packet: dict[str, Any]) -> dict[str, An
         "recent_checks": skills.get("recent_checks", []),
         "recent_history": recent_history[-2:],
     }
+    if magic_planning_context:
+        packet["magic"] = magic_planning_context
+    return packet
 
 
 def _context_packet_stats(
@@ -4842,6 +5309,9 @@ def _context_packet_stats(
         "crafting_recipes": _list_len(_nested_value(state, "alchemy", "known_recipes")),
         "known_skills": _list_len(_nested_value(state, "skills", "known_skills")),
         "recent_checks": _list_len(_nested_value(state, "skills", "recent_checks")),
+        "magic_advancements": _list_len(
+            _nested_value(state, "magic", "progression", "recent_meaningful_advancements")
+        ),
         "active_tasks": _list_len(_nested_value(state, "active_tasks", "tasks")),
         "relevant_npcs": _list_len(_nested_value(state, "npcs", "relevant")),
         "active_gm_secrets": _list_len(_nested_value(state, "gm_secrets", "active")),
@@ -5010,6 +5480,76 @@ def _extract_narration_sound_effect_cues(
     return remaining_events, cues
 
 
+def _extract_narration_speaker_cues(
+    raw_cues: Any,
+    narrative_text: str,
+    *,
+    response_label: str,
+) -> list[dict[str, str]]:
+    """Validates exact, non-overlapping spoken spans for multi-voice TTS."""
+
+    if not isinstance(raw_cues, list):
+        if raw_cues is not None:
+            LOGGER.warning(
+                "Gemini %s speaker_cues was not a list; ignoring it.",
+                response_label,
+            )
+        return []
+
+    clean_narrative = str(narrative_text or "")
+    occupied_ranges: list[tuple[int, int]] = []
+    cues: list[dict[str, str]] = []
+    for raw_cue in raw_cues:
+        if not isinstance(raw_cue, dict):
+            continue
+        anchor_text = str(raw_cue.get("anchor_text", "") or "").strip()
+        speaker_id = str(raw_cue.get("speaker_id", "") or "").strip().casefold()
+        speaker_name = str(raw_cue.get("speaker_name", "") or "").strip()
+        voice_profile = str(
+            raw_cue.get("voice_profile", "neutral") or "neutral"
+        ).strip().casefold()
+        if (
+            not anchor_text
+            or not speaker_id
+            or not speaker_name
+            or voice_profile not in VOICE_PROFILE_OPTIONS
+        ):
+            LOGGER.warning(
+                "Dropped incomplete narration speaker cue from Gemini %s.",
+                response_label,
+            )
+            continue
+        if clean_narrative.count(anchor_text) != 1:
+            LOGGER.warning(
+                "Dropped narration speaker cue for %r from Gemini %s because "
+                "anchor %r does not appear exactly once.",
+                speaker_id,
+                response_label,
+                anchor_text,
+            )
+            continue
+        start = clean_narrative.index(anchor_text)
+        end = start + len(anchor_text)
+        if any(start < old_end and end > old_start for old_start, old_end in occupied_ranges):
+            LOGGER.warning(
+                "Dropped overlapping narration speaker cue for %r from Gemini %s.",
+                speaker_id,
+                response_label,
+            )
+            continue
+        occupied_ranges.append((start, end))
+        cues.append(
+            {
+                "anchor_text": anchor_text,
+                "speaker_id": speaker_id,
+                "speaker_name": speaker_name,
+                "voice_profile": voice_profile,
+            }
+        )
+
+    return cues
+
+
 def parse_skill_check_plan_response(raw_text: str) -> SkillCheckPlanResult:
     """
     Parses Gemini skill-check planning output.
@@ -5167,9 +5707,56 @@ def _drop_unwarranted_skill_check_events(
         suggested_actions=result.suggested_actions,
         suggested_events=filtered_events,
         sound_effect_cues=result.sound_effect_cues,
+        speaker_cues=result.speaker_cues,
+        pronunciation_map=result.pronunciation_map,
         out_of_game=result.out_of_game,
         raw_text=result.raw_text,
     )
+
+
+def _drop_unauthorized_player_spell_cast_events(
+    result: AiNarrationResult,
+    context_packet: dict[str, Any],
+) -> AiNarrationResult:
+    """Drops player-cast events not clearly authorized by the current command."""
+
+    cast_events = [
+        event
+        for event in result.suggested_events
+        if _raw_event_type(event) == "PlayerSpellCastEvent"
+    ]
+    if not cast_events:
+        return result
+
+    command = str(context_packet.get("player_command", "") or "").strip().casefold()
+    state = context_packet.get("state", {})
+    magic = state.get("magic", {}) if isinstance(state, dict) else {}
+    known_spells = magic.get("known_spells", []) if isinstance(magic, dict) else []
+    spell_names_by_id = {
+        str(spell.get("spell_id", "")): str(spell.get("name", "")).strip().casefold()
+        for spell in known_spells
+        if isinstance(spell, dict)
+    }
+    has_casting_language = bool(
+        re.search(r"\b(cast|casts|casting|invoke|invokes|channel|conjure|spell|magic)\b", command)
+    )
+
+    def authorized(event: dict[str, Any]) -> bool:
+        payload = event.get("payload", {})
+        if not isinstance(payload, dict) or payload.get("player_authorized") is not True:
+            return False
+        spell_name = spell_names_by_id.get(str(payload.get("spell_id", "")), "")
+        return bool(command and (has_casting_language or (spell_name and spell_name in command)))
+
+    filtered_events = [
+        event
+        for event in result.suggested_events
+        if _raw_event_type(event) != "PlayerSpellCastEvent" or authorized(event)
+    ]
+    if len(filtered_events) == len(result.suggested_events):
+        return result
+    LOGGER.warning("Dropped PlayerSpellCastEvent without current player authorization.")
+    return replace(result, suggested_events=filtered_events)
 
 
 def _player_command_is_routine_no_check(context_packet: dict[str, Any]) -> bool:
@@ -5262,7 +5849,12 @@ def parse_gemini_story_response(
         response_text,
         response_label="story response",
     )
-    pronunciation_map = normalize_pronunciation_map(data.get("pronunciation_map", {}))
+    speaker_cues = _extract_narration_speaker_cues(
+        data.get("speaker_cues", []),
+        response_text,
+        response_label="story response",
+    )
+    pronunciation_map: PronunciationMap = {}
     explicit_out_of_game = (
         isinstance(context_packet, dict)
         and context_packet.get("conversation_mode") == "out_of_game"
@@ -5271,6 +5863,7 @@ def parse_gemini_story_response(
         suggested_actions = []
         suggested_events = []
         sound_effect_cues = []
+        speaker_cues = []
     event_types = [
         str(event.get("type", "UnknownEvent")).strip() or "UnknownEvent"
         for event in suggested_events
@@ -5292,6 +5885,7 @@ def parse_gemini_story_response(
         suggested_actions=suggested_actions,
         suggested_events=suggested_events,
         sound_effect_cues=sound_effect_cues,
+        speaker_cues=speaker_cues,
         pronunciation_map=pronunciation_map,
         out_of_game=(
             explicit_out_of_game
@@ -5346,6 +5940,8 @@ def _normalize_visible_currency_phrasing(
         suggested_actions=suggested_actions,
         suggested_events=result.suggested_events,
         sound_effect_cues=result.sound_effect_cues,
+        speaker_cues=result.speaker_cues,
+        pronunciation_map=result.pronunciation_map,
         out_of_game=result.out_of_game,
         raw_text=result.raw_text,
     )
@@ -5378,6 +5974,8 @@ def _ensure_in_game_suggested_actions(
         suggested_actions=fallback_actions,
         suggested_events=result.suggested_events,
         sound_effect_cues=result.sound_effect_cues,
+        speaker_cues=result.speaker_cues,
+        pronunciation_map=result.pronunciation_map,
         out_of_game=result.out_of_game,
         raw_text=result.raw_text,
     )
@@ -5395,6 +5993,7 @@ def _enforce_explicit_conversation_mode(
         and (not is_out_of_game or not result.suggested_actions)
         and (not is_out_of_game or not result.suggested_events)
         and (not is_out_of_game or not result.sound_effect_cues)
+        and (not is_out_of_game or not result.speaker_cues)
     ):
         return result
 
@@ -5402,6 +6001,7 @@ def _enforce_explicit_conversation_mode(
         result.suggested_actions
         or result.suggested_events
         or result.sound_effect_cues
+        or result.speaker_cues
     ):
         LOGGER.warning(
             "Discarded suggested actions/events from an explicit out-of-game response."
@@ -5416,6 +6016,8 @@ def _enforce_explicit_conversation_mode(
         suggested_actions=[] if is_out_of_game else result.suggested_actions,
         suggested_events=[] if is_out_of_game else result.suggested_events,
         sound_effect_cues=[] if is_out_of_game else result.sound_effect_cues,
+        speaker_cues=[] if is_out_of_game else result.speaker_cues,
+        pronunciation_map=result.pronunciation_map,
         out_of_game=is_out_of_game,
         raw_text=result.raw_text,
     )
@@ -5585,6 +6187,8 @@ def _enforce_container_reward_flow(
         suggested_actions=result.suggested_actions,
         suggested_events=filtered_events,
         sound_effect_cues=result.sound_effect_cues,
+        speaker_cues=result.speaker_cues,
+        pronunciation_map=result.pronunciation_map,
         out_of_game=result.out_of_game,
         raw_text=result.raw_text,
     )
@@ -5704,6 +6308,8 @@ def _drop_duplicate_resolved_skill_check_events(
         suggested_actions=result.suggested_actions,
         suggested_events=filtered_events,
         sound_effect_cues=result.sound_effect_cues,
+        speaker_cues=result.speaker_cues,
+        pronunciation_map=result.pronunciation_map,
         out_of_game=result.out_of_game,
         raw_text=result.raw_text,
     )
@@ -5839,6 +6445,8 @@ def _ensure_inventory_for_collected_reagents(
         suggested_actions=result.suggested_actions,
         suggested_events=updated_events,
         sound_effect_cues=result.sound_effect_cues,
+        speaker_cues=result.speaker_cues,
+        pronunciation_map=result.pronunciation_map,
         out_of_game=result.out_of_game,
         raw_text=result.raw_text,
     )
@@ -5888,6 +6496,8 @@ def _ensure_inventory_for_narrated_collection(
         suggested_actions=result.suggested_actions,
         suggested_events=result.suggested_events,
         sound_effect_cues=result.sound_effect_cues,
+        speaker_cues=result.speaker_cues,
+        pronunciation_map=result.pronunciation_map,
         out_of_game=result.out_of_game,
         raw_text=result.raw_text,
     )
@@ -6138,8 +6748,17 @@ def parse_gemini_new_game_response(
     introductory_message = str(
         data.get("introductory_message", data.get("response", ""))
     ).strip()
+    start_weather = _synchronize_new_game_narrated_weather(
+        start_weather,
+        introductory_message,
+        locations,
+        start_location,
+    )
     finalized_character = _parse_new_game_character(data.get("character"))
     finalized_skills = _parse_new_game_skills(data.get("skills"))
+    finalized_starting_spells = _parse_new_game_starting_spells(
+        data.get("starting_spells")
+    )
     finalized_starter_items = _parse_new_game_starter_items(
         _new_game_starter_items_payload(data)
     )
@@ -6154,7 +6773,7 @@ def parse_gemini_new_game_response(
     finalized_starting_currency_balance_base_units = (
         _parse_new_game_starting_currency_balance(data)
     )
-    pronunciation_map = normalize_pronunciation_map(data.get("pronunciation_map", {}))
+    pronunciation_map: PronunciationMap = {}
     raw_events = data.get("events", [])
     suggested_actions = _parse_suggested_actions(
         data.get("suggested_actions", []),
@@ -6188,6 +6807,11 @@ def parse_gemini_new_game_response(
     suggested_events = [
         event for event in raw_events if isinstance(event, dict)
     ]
+    suggested_events = _synchronize_starting_npc_event_identity(
+        suggested_events,
+        setup,
+        locations,
+    )
     suggested_events = _filter_audio_events_for_catalogs(
         suggested_events,
         setup_packet,
@@ -6195,6 +6819,11 @@ def parse_gemini_new_game_response(
     )
     suggested_events, sound_effect_cues = _extract_narration_sound_effect_cues(
         suggested_events,
+        str(data.get("introductory_message", data.get("response", ""))).strip(),
+        response_label="new-game response",
+    )
+    speaker_cues = _extract_narration_speaker_cues(
+        data.get("speaker_cues", []),
         str(data.get("introductory_message", data.get("response", ""))).strip(),
         response_label="new-game response",
     )
@@ -6217,6 +6846,7 @@ def parse_gemini_new_game_response(
         miscellaneous=miscellaneous,
         finalized_character=finalized_character,
         finalized_skills=finalized_skills,
+        finalized_starting_spells=finalized_starting_spells,
         finalized_starter_items=finalized_starter_items,
         known_crafting_items=known_crafting_items,
         known_crafting_recipes=known_crafting_recipes,
@@ -6229,8 +6859,101 @@ def parse_gemini_new_game_response(
         suggested_actions=suggested_actions,
         suggested_events=suggested_events,
         sound_effect_cues=sound_effect_cues,
+        speaker_cues=speaker_cues,
         raw_text=guarded_raw_text,
     )
+
+
+def _synchronize_new_game_narrated_weather(
+    start_weather: str,
+    introductory_message: str,
+    locations: list[dict[str, Any]],
+    start_location: str,
+) -> str:
+    """Aligns starting weather with explicit opening-scene weather prose."""
+
+    start_key = str(start_location).strip().casefold()
+    start_location_description = next(
+        (
+            str(location.get("description", ""))
+            for location in locations
+            if str(location.get("name", "")).strip().casefold() == start_key
+        ),
+        "",
+    )
+    narrated_weather = _obvious_narrated_weather(
+        " ".join((introductory_message, start_location_description))
+    )
+    if not narrated_weather:
+        return start_weather
+    if narrated_weather.casefold() in str(start_weather).casefold():
+        return start_weather
+
+    LOGGER.warning(
+        "Corrected new-game weather from %r to %r to match explicit opening-scene "
+        "narration.",
+        start_weather,
+        narrated_weather,
+    )
+    return narrated_weather
+
+
+def _synchronize_starting_npc_event_identity(
+    events: list[dict[str, Any]],
+    setup: dict[str, Any],
+    finalized_locations: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Enforces Wizard NPC IDs and starting-party membership on setup events."""
+
+    raw_npcs = setup.get("starting_npcs", [])
+    if not isinstance(raw_npcs, list):
+        return events
+    party_ids = {
+        str(npc_id).strip()
+        for npc_id in setup.get("starting_party_npc_ids", [])
+        if str(npc_id).strip()
+    }
+    npc_event_indexes = [
+        index
+        for index, event in enumerate(events)
+        if event.get("type") == "NpcUpsertedEvent"
+        and isinstance(event.get("payload"), dict)
+    ]
+    finalized_location_names = {
+        int(location.get("source_index", -1)): str(location.get("name", "")).strip()
+        for location in finalized_locations
+        if isinstance(location, dict)
+        and str(location.get("name", "")).strip()
+        and isinstance(location.get("source_index"), int)
+        and int(location.get("source_index", -1)) >= 0
+    }
+    synchronized = list(events)
+    for source_index, raw_npc in enumerate(raw_npcs):
+        if source_index >= len(npc_event_indexes) or not isinstance(raw_npc, dict):
+            continue
+        npc_id = str(raw_npc.get("npc_id", "")).strip()
+        if not npc_id:
+            continue
+        event_index = npc_event_indexes[source_index]
+        event = dict(synchronized[event_index])
+        payload = dict(event.get("payload", {}))
+        payload["npc_id"] = npc_id
+        payload["party_member"] = npc_id in party_ids
+        try:
+            location_source_index = int(raw_npc.get("location_source_index", -1))
+        except (TypeError, ValueError):
+            location_source_index = -1
+        finalized_location_name = finalized_location_names.get(
+            location_source_index,
+            "",
+        )
+        if finalized_location_name:
+            payload["location"] = finalized_location_name
+        if npc_id in party_ids:
+            payload.setdefault("party_status", "Active")
+        event["payload"] = payload
+        synchronized[event_index] = event
+    return synchronized
 
 
 def _parse_new_game_character(raw_character: Any) -> dict[str, str]:
@@ -6509,6 +7232,55 @@ def _parse_new_game_skills(raw_skills: Any) -> list[dict[str, Any]]:
     return skills
 
 
+def _parse_new_game_starting_spells(raw_spells: Any) -> list[dict[str, Any]]:
+    """Parses Gemini-finalized Basic-mode starting spells."""
+
+    if not isinstance(raw_spells, list):
+        return []
+
+    spells: list[dict[str, Any]] = []
+    seen_source_indexes: set[int] = set()
+    for raw_spell in raw_spells:
+        if not isinstance(raw_spell, dict):
+            continue
+        name = str(raw_spell.get("name", "")).strip()
+        description = str(raw_spell.get("description", "")).strip()
+        source_index = _coerce_int(raw_spell.get("source_index"), default=-1)
+        if (
+            not name
+            or not description
+            or source_index < 0
+            or source_index in seen_source_indexes
+        ):
+            continue
+        spells.append(
+            {
+                "name": name,
+                "tier": max(
+                    0,
+                    min(9, _coerce_int(raw_spell.get("tier"), default=0)),
+                ),
+                "school": str(raw_spell.get("school", "")).strip(),
+                "description": description,
+                "casting_time": (
+                    str(raw_spell.get("casting_time", "Action")).strip()
+                    or "Action"
+                ),
+                "range": str(raw_spell.get("range", "")).strip(),
+                "duration": str(raw_spell.get("duration", "")).strip(),
+                "requirements": str(raw_spell.get("requirements", "")).strip(),
+                "mana_cost": max(
+                    0,
+                    _coerce_int(raw_spell.get("mana_cost"), default=0),
+                ),
+                "prepared": bool(raw_spell.get("prepared", True)),
+                "source_index": source_index,
+            }
+        )
+        seen_source_indexes.add(source_index)
+    return spells
+
+
 def _parse_new_game_starter_items(raw_items: Any) -> list[dict[str, Any]]:
     """Parses finalized new-game starter inventory from Gemini."""
 
@@ -6554,7 +7326,11 @@ def _parse_new_game_starter_items(raw_items: Any) -> list[dict[str, Any]]:
                     raw_item.get("storage_location", "actively_carried")
                 ),
                 "description": str(raw_item.get("description", "")).strip(),
-                "ascii_art": str(raw_item.get("ascii_art", "") or "").strip("\r\n")[:1200],
+                "ascii_art": ensure_substantive_ascii_art(
+                    raw_item.get("ascii_art", ""),
+                    item_name=name,
+                    category=_normalize_starter_item_category(raw_item),
+                ),
                 "value_base_units": max(0, value_base_units),
                 "source_index": _parse_optional_source_index(raw_item),
                 **{
@@ -6623,7 +7399,11 @@ def _parse_new_game_crafting_items(raw_items: Any) -> list[dict[str, Any]]:
                 "name": name,
                 "category": category,
                 "description": str(raw_item.get("description", "")).strip(),
-                "ascii_art": str(raw_item.get("ascii_art", "") or "").strip("\r\n")[:1200],
+                "ascii_art": ensure_substantive_ascii_art(
+                    raw_item.get("ascii_art", ""),
+                    item_name=name,
+                    category=category,
+                ),
                 "location": str(raw_item.get("location", "")).strip(),
                 "uses": uses,
                 "rarity": normalize_crafting_item_rarity(raw_item.get("rarity")),

@@ -16,7 +16,7 @@ from ai_adventure.new_game_setup import normalize_new_game_setup
 
 
 class PronunciationTests(unittest.TestCase):
-    def test_normalizes_ipa_and_legacy_structured_entries(self) -> None:
+    def test_drops_ipa_and_keeps_ascii_legacy_respelling(self) -> None:
         self.assertEqual(
             normalize_pronunciation_map(
                 [
@@ -24,15 +24,12 @@ class PronunciationTests(unittest.TestCase):
                     {"term": "ignored", "phonetic": "ihg-NORED"},
                 ]
             ),
-            {
-                "Qh’thala": {"ipa": "kəˈθɑlə"},
-                "ignored": {"respelling": "ihgnored"},
-            },
+            {"ignored": {"respelling": "ihgnored"}},
         )
 
-    def test_validates_kokoro_ipa_and_strips_human_delimiters(self) -> None:
-        self.assertEqual(normalize_kokoro_ipa("/kəˈθɑlə/"), "kəˈθɑlə")
-        self.assertEqual(normalize_kokoro_ipa("[ˈɑnɪkˌspaɪɚ]"), "ˈɑnɪkˌspaɪɚ")
+    def test_rejects_all_kokoro_ipa_overrides(self) -> None:
+        self.assertEqual(normalize_kokoro_ipa("/kəˈθɑlə/"), "")
+        self.assertEqual(normalize_kokoro_ipa("[ˈɑnɪkˌspaɪɚ]"), "")
         self.assertEqual(normalize_kokoro_ipa("kah-tha-lah"), "")
         self.assertEqual(invalid_kokoro_ipa_characters("kah-tha-lah"), ("-",))
 
@@ -74,7 +71,7 @@ class PronunciationTests(unittest.TestCase):
             ),
             {
                 "Onyxspire": {"respelling": "oniksspire"},
-                "Qh’thala Market": {"respelling": "kahthalah markit"},
+                "Qh'thala Market": {"respelling": "kahthalah markit"},
                 "Sunlit Bazaar": {"respelling": "sunlit bazaar"},
                 "Droynga": {"respelling": "droynga"},
             },
@@ -86,7 +83,7 @@ class PronunciationTests(unittest.TestCase):
             {},
         )
 
-    def test_longer_ipa_terms_are_annotated_before_shorter_terms(self) -> None:
+    def test_ipa_entries_are_ignored_and_visible_text_becomes_ascii(self) -> None:
         self.assertEqual(
             apply_pronunciation_map(
                 "Qh’thala Market is outside Qh’thala.",
@@ -95,10 +92,7 @@ class PronunciationTests(unittest.TestCase):
                     "Qh’thala": {"ipa": "kəˈθɑlə"},
                 },
             ),
-            (
-                '[Qh’thala Market]{ph="kəˈθɑlə ˈmɑɹkət"} is outside '
-                '[Qh’thala]{ph="kəˈθɑlə"}.'
-            ),
+            "Qh'thala Market is outside Qh'thala.",
         )
 
     def test_legacy_respelling_replaces_only_tts_text_without_hyphens(self) -> None:
@@ -123,11 +117,11 @@ class PronunciationTests(unittest.TestCase):
             }
         )
         self.assertEqual(
-            setup["pronunciation_map"]["Qh’thala"],
+            setup["pronunciation_map"]["Qh'thala"],
             {"respelling": "kahthalah"},
         )
 
-    def test_character_name_can_use_explicit_validated_ipa(self) -> None:
+    def test_character_name_explicit_ipa_is_rejected(self) -> None:
         setup = normalize_new_game_setup(
             {
                 "character": {
@@ -136,10 +130,7 @@ class PronunciationTests(unittest.TestCase):
                 }
             }
         )
-        self.assertEqual(
-            setup["pronunciation_map"]["Qh’thala"],
-            {"ipa": "kəˈθɑlə"},
-        )
+        self.assertEqual(setup["pronunciation_map"], {})
 
     def test_identity_name_pronunciation_clears_conflicting_ai_entry(self) -> None:
         setup = normalize_new_game_setup(
@@ -159,7 +150,7 @@ class PronunciationTests(unittest.TestCase):
             {"Myr": {"respelling": "meer"}},
         )
 
-    def test_merge_preserves_first_spelling_and_fills_missing_ipa(self) -> None:
+    def test_merge_preserves_ascii_respelling_and_drops_ipa(self) -> None:
         self.assertEqual(
             merge_pronunciation_maps(
                 {"Qh’thala": "KAH-tha-lah"},
@@ -168,24 +159,21 @@ class PronunciationTests(unittest.TestCase):
                     "Myr": {"ipa": "mɪɹ"},
                 },
             ),
-            {
-                "Qh’thala": {"respelling": "kahthalah", "ipa": "kəˈθɑlə"},
-                "Myr": {"ipa": "mɪɹ"},
-            },
+            {"Qh'thala": {"respelling": "kahthalah"}},
         )
 
-    def test_compiles_mixed_ipa_annotations_for_kokoro_onnx(self) -> None:
+    def test_legacy_ipa_annotations_are_not_compiled(self) -> None:
         compiled = compile_kokoro_phoneme_overrides(
             'The [Qh’thala]{ph="kəˈθɑlə"} waits.',
             lambda value: f"<{value}>",
         )
-        self.assertEqual(compiled, "<The> kəˈθɑlə <waits.>")
+        self.assertIsNone(compiled)
 
-    def test_story_parser_reads_validated_ipa_entries(self) -> None:
+    def test_story_parser_discards_ipa_and_sanitizes_visible_text(self) -> None:
         result = parse_gemini_story_response(
             json.dumps(
                 {
-                    "response": "Qh’thala waits beside Myr.",
+                    "response": "Qh’thala waits ofوینت beside Myr.",
                     "suggested_actions": [],
                     "events": [],
                     "out_of_game": True,
@@ -197,10 +185,9 @@ class PronunciationTests(unittest.TestCase):
             ),
             context_packet={"conversation_mode": "out_of_game"},
         )
-        self.assertEqual(
-            result.pronunciation_map["Qh’thala"],
-            {"ipa": "kəˈθɑlə"},
-        )
+        self.assertEqual(result.pronunciation_map, {})
+        self.assertEqual(result.narrative_text, "Qh'thala waits of beside Myr.")
+        self.assertTrue(result.narrative_text.isascii())
 
 
 if __name__ == "__main__":

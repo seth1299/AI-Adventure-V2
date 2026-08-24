@@ -97,6 +97,21 @@ def delete_new_game_template(template_path: Path, template_name: str) -> bool:
     return write_new_game_templates(template_path, templates)
 
 
+def template_setup_has_changes(
+    original_setup: Any,
+    current_setup: Any,
+) -> bool:
+    """Returns whether template data other than the separate save title changed."""
+
+    original = _json_safe_value(original_setup)
+    current = _json_safe_value(current_setup)
+    if isinstance(original, dict):
+        original.pop("title", None)
+    if isinstance(current, dict):
+        current.pop("title", None)
+    return original != current
+
+
 def write_new_game_templates(
     template_path: Path,
     templates: list[NewGameTemplate],

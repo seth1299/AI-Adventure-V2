@@ -18,7 +18,10 @@ from ai_adventure.alchemy.ingredients import (
     normalize_crafting_item_notes,
     normalize_recipe_ingredients,
 )
-from ai_adventure.ascii_art import normalize_ascii_art
+from ai_adventure.ascii_art import (
+    ensure_substantive_ascii_art,
+    is_substantive_ascii_art,
+)
 from ai_adventure.ai.modes import (
     default_ai_mode_settings,
     normalize_ai_mode_preferences,
@@ -52,7 +55,15 @@ from ai_adventure.locations import (
     normalize_known_location,
     normalize_known_locations,
 )
+from ai_adventure.notes import normalize_note_entries
+from ai_adventure.magic import (
+    magic_resource_specs,
+    normalize_magic_advancement_category,
+    normalize_magic_advancement_significance,
+    normalize_magic_setup,
+)
 from ai_adventure.skills.rules import bonus_for_level, clamp_skill_level, level_for_xp
+from ai_adventure.text_sanitization import sanitize_english_text
 
 
 LOGGER = logging.getLogger(__name__)
@@ -141,6 +152,7 @@ class SaveRepository:
 
         repository.set_setting("player_name", "Player Name")
         repository.set_setting("player.name_pronunciation", "")
+        repository.set_setting("player.pronouns", "They/Them")
         repository.set_setting("player.appearance", "")
         repository.set_setting("player.backstory", "")
         repository.set_setting("player.notes", "")
@@ -164,8 +176,8 @@ class SaveRepository:
         repository.set_setting("audio.tts_custom_voices", [])
         repository.set_setting("tts.pronunciation_map", {})
         repository.set_setting("audio.current_music", "")
-        repository.set_journal_notes("")
-        repository.set_journal_share_with_ai(False)
+        repository.set_note_entries([])
+        repository.set_notes_share_with_ai(False)
         repository.set_currency_denominations(DEFAULT_CURRENCY_DENOMINATIONS)
         repository.set_calendar_settings(DEFAULT_CALENDAR_SETTINGS)
         repository.set_current_calendar_minute(DEFAULT_START_ELAPSED_MINUTES)
@@ -256,6 +268,7 @@ class SaveRepository:
         self.set_meta("title", title)
         self.set_setting("player_name", character["name"])
         self.set_setting("player.name_pronunciation", character["name_pronunciation"])
+        self.set_setting("player.pronouns", character["pronouns"])
         self.set_setting("player.appearance", character["appearance"])
         self.set_setting("player.backstory", character["backstory"])
         self.set_setting("player.notes", character["notes"])
@@ -286,10 +299,24 @@ class SaveRepository:
         self.set_setting("world.setup_context", clean_setup["world_context"])
         self.set_setting("world.genre", clean_setup["specified_genre"])
         self.set_setting("world.game_style", clean_setup["game_style"])
+        self.set_setting("combat.preferences", clean_setup["combat"])
+        self.set_setting(
+            "combat.resolution_mode", clean_setup["combat"]["resolution_mode"]
+        )
+        self.set_setting("combat.focus", clean_setup["combat"]["focus"])
         self.set_setting("currency.description", clean_setup["currency_description"])
-        self.set_journal_notes("")
-        self.set_journal_share_with_ai(False)
+        self.set_note_entries([])
+        self.set_notes_share_with_ai(False)
         self.set_currency_denominations(clean_setup["currency_denominations"])
+        starting_wealth = clean_setup["starting_wealth"]
+        self.set_state_value(
+            "currency.balance",
+            str(
+                int(starting_wealth["balance_base_units"])
+                if starting_wealth["mode"] == "advanced"
+                else 0
+            ),
+        )
         self.set_calendar_settings(calendar_settings)
         starting_minute = resolve_starting_calendar_minute(
             clean_setup.get("starting_calendar", {}),
@@ -325,6 +352,12 @@ class SaveRepository:
                     skill["description"],
                     int(skill["level"]),
                 )
+
+        self.set_magic_configuration(clean_setup["magic"])
+        self.learn_starting_spells(
+            clean_setup["magic"]["starting_spells"],
+            source="New Game Wizard",
+        )
 
         self.append_history("system", "New adventure created from wizard setup.")
 
@@ -666,8 +699,10 @@ class SaveRepository:
         clean_metadata["quantity_unit"] = _inventory_quantity_unit(raw_metadata)
         clean_metadata["storage_location"] = _inventory_storage_location(raw_metadata)
         clean_metadata["item_uuid"] = str(raw_metadata.get("item_uuid", "")).strip() or str(uuid.uuid4())
-        clean_metadata["ascii_art"] = normalize_ascii_art(
-            raw_metadata.get("ascii_art", "")
+        clean_metadata["ascii_art"] = ensure_substantive_ascii_art(
+            raw_metadata.get("ascii_art", ""),
+            item_name=clean_name,
+            category=category,
         )
         metadata_json = _encode_json_dict(clean_metadata)
 
@@ -836,8 +871,10 @@ class SaveRepository:
             clean_metadata["item_uuid"] = (
                 str(raw_metadata.get("item_uuid", "")).strip() or str(uuid.uuid4())
             )
-            clean_metadata["ascii_art"] = normalize_ascii_art(
-                raw_metadata.get("ascii_art", "")
+            clean_metadata["ascii_art"] = ensure_substantive_ascii_art(
+                raw_metadata.get("ascii_art", ""),
+                item_name=name,
+                category=str(raw_item.get("category", "Item")),
             )
             clean_items.append(
                 {
@@ -1388,6 +1425,539 @@ class SaveRepository:
             )
 
         return recipes
+
+    def get_magic_configuration(self) -> dict[str, Any]:
+        """Returns the normalized casting configuration for this save."""
+
+        return normalize_magic_setup(self.get_setting("magic.configuration", {}))
+
+    def set_magic_configuration(self, raw_magic: Any) -> dict[str, Any]:
+        """Stores magic configuration and rebuilds its initial resource pools."""
+
+        magic = normalize_magic_setup(raw_magic)
+        self.set_setting("magic.configuration", magic)
+        specs = magic_resource_specs(magic)
+        with self._connect() as connection:
+            connection.execute("DELETE FROM magic_resource_pools")
+            for pool in specs:
+                connection.execute(
+                    """
+                    INSERT INTO magic_resource_pools (
+                        pool_id, name, resource_type, tier, current_amount,
+                        maximum_amount, recovery_rule
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        pool["pool_id"], pool["name"], pool["resource_type"],
+                        pool["tier"], pool["current_amount"],
+                        pool["maximum_amount"], pool["recovery_rule"],
+                    ),
+                )
+        return magic
+
+    def upsert_spell_catalog(
+        self,
+        *,
+        name: str,
+        spell_id: str = "",
+        tier: int = 0,
+        school: str = "",
+        description: str = "",
+        casting_time: str = "Action",
+        range: str = "",
+        duration: str = "",
+        requirements: str = "",
+        mana_cost: int = 0,
+        metadata: dict[str, Any] | None = None,
+        prepared: bool = True,
+    ) -> dict[str, Any] | None:
+        """Creates or updates one authoritative spell definition."""
+
+        del prepared
+        clean_name = name.strip()
+        if not clean_name:
+            return None
+        clean_tier = max(0, min(9, _safe_int(tier, default=0)))
+        clean_cost = max(0, _safe_int(mana_cost, default=0))
+        timestamp = datetime.now().isoformat(timespec="seconds")
+        with self._connect() as connection:
+            existing = connection.execute(
+                "SELECT spell_id, created_at FROM spell_catalog WHERE name = ? COLLATE NOCASE",
+                (clean_name,),
+            ).fetchone()
+            clean_id = (
+                str(existing["spell_id"])
+                if existing is not None
+                else (spell_id.strip() or f"spell_{uuid.uuid4().hex}")
+            )
+            created_at = timestamp if existing is None else str(existing["created_at"])
+            connection.execute(
+                """
+                INSERT INTO spell_catalog (
+                    spell_id, name, tier, school, description, casting_time,
+                    range_text, duration, requirements, mana_cost, metadata_json,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(spell_id) DO UPDATE SET
+                    name = excluded.name,
+                    tier = excluded.tier,
+                    school = excluded.school,
+                    description = excluded.description,
+                    casting_time = excluded.casting_time,
+                    range_text = excluded.range_text,
+                    duration = excluded.duration,
+                    requirements = excluded.requirements,
+                    mana_cost = excluded.mana_cost,
+                    metadata_json = excluded.metadata_json,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    clean_id, clean_name, clean_tier, school.strip(),
+                    description.strip(), casting_time.strip() or "Action",
+                    range.strip(), duration.strip(), requirements.strip(), clean_cost,
+                    _encode_json_dict(metadata or {}), created_at, timestamp,
+                ),
+            )
+        return self.get_spell(clean_id)
+
+    def get_spell(self, spell_id: str) -> dict[str, Any] | None:
+        """Reads a spell definition by hidden durable identifier."""
+
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM spell_catalog WHERE spell_id = ?", (spell_id.strip(),)
+            ).fetchone()
+        return None if row is None else _spell_row_to_dict(row)
+
+    def list_spell_catalog(self) -> list[dict[str, Any]]:
+        """Lists all established spell definitions."""
+
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM spell_catalog ORDER BY tier, name COLLATE NOCASE"
+            ).fetchall()
+        return [_spell_row_to_dict(row) for row in rows]
+
+    def learn_character_spell(
+        self,
+        spell_id: str,
+        *,
+        prepared: bool = True,
+        source: str = "",
+    ) -> dict[str, Any] | None:
+        """Marks one catalog spell as known by the player character."""
+
+        spell = self.get_spell(spell_id)
+        if spell is None:
+            return None
+        timestamp = datetime.now().isoformat(timespec="seconds")
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO character_spells (
+                    spell_id, known, prepared, favorite, source, learned_at
+                ) VALUES (?, 1, ?, 0, ?, ?)
+                ON CONFLICT(spell_id) DO UPDATE SET
+                    known = 1,
+                    prepared = excluded.prepared,
+                    source = CASE WHEN excluded.source != '' THEN excluded.source ELSE source END
+                """,
+                (spell_id, int(prepared), source.strip(), timestamp),
+            )
+        return next(
+            (entry for entry in self.list_character_spells() if entry["spell_id"] == spell_id),
+            None,
+        )
+
+    def set_character_spell_prepared(self, spell_id: str, prepared: bool) -> bool:
+        """Changes the player's preparation marker for a known spell."""
+
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "UPDATE character_spells SET prepared = ? WHERE spell_id = ? AND known = 1",
+                (int(prepared), spell_id.strip()),
+            )
+        return cursor.rowcount > 0
+
+    def list_character_spells(self) -> list[dict[str, Any]]:
+        """Lists player-known spells with their complete catalog definitions."""
+
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT sc.*, cs.known, cs.prepared, cs.favorite, cs.source, cs.learned_at
+                FROM character_spells cs
+                JOIN spell_catalog sc ON sc.spell_id = cs.spell_id
+                WHERE cs.known = 1
+                ORDER BY sc.tier, sc.name COLLATE NOCASE
+                """
+            ).fetchall()
+        return [_character_spell_row_to_dict(row) for row in rows]
+
+    def learn_starting_spells(
+        self,
+        raw_spells: Any,
+        *,
+        source: str,
+    ) -> list[dict[str, Any]]:
+        """Stores complete starting spells and grants them to the player."""
+
+        magic = normalize_magic_setup(
+            {
+                "world_contains_magic": True,
+                "player_magic_enabled": True,
+                "starting_spells_mode": "advanced",
+                "starting_spells": raw_spells,
+            }
+        )
+        learned_spells: list[dict[str, Any]] = []
+        for spell in magic["starting_spells"]:
+            stored_spell = self.upsert_spell_catalog(
+                spell_id=str(spell.get("spell_id", "")),
+                name=str(spell.get("name", "")),
+                tier=_safe_int(spell.get("tier"), default=0),
+                school=str(spell.get("school", "")),
+                description=str(spell.get("description", "")),
+                casting_time=str(spell.get("casting_time", "Action")),
+                range=str(spell.get("range", "")),
+                duration=str(spell.get("duration", "")),
+                requirements=str(spell.get("requirements", "")),
+                mana_cost=_safe_int(spell.get("mana_cost"), default=0),
+                prepared=bool(spell.get("prepared", True)),
+            )
+            if stored_spell is None:
+                continue
+            learned = self.learn_character_spell(
+                str(stored_spell["spell_id"]),
+                prepared=bool(spell.get("prepared", True)),
+                source=source,
+            )
+            if learned is not None:
+                learned_spells.append(learned)
+        return learned_spells
+
+    def list_magic_resource_pools(self) -> list[dict[str, Any]]:
+        """Lists the current deterministic magic resources."""
+
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM magic_resource_pools ORDER BY tier, name COLLATE NOCASE"
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def cast_character_spell(
+        self,
+        spell_id: str,
+        *,
+        cast_tier: int | None = None,
+        target: str = "",
+        message_id: str = "",
+    ) -> dict[str, Any]:
+        """Validates and records one player-authorized cast, consuming resources."""
+
+        magic = self.get_magic_configuration()
+        spell = next(
+            (row for row in self.list_character_spells() if row["spell_id"] == spell_id),
+            None,
+        )
+        if not magic["enabled"]:
+            return {"status": "rejected", "message": "Magic is disabled for this save."}
+        if spell is None:
+            return {"status": "rejected", "message": "The player does not know that spell."}
+        selected_tier = max(int(spell["tier"]), _safe_int(cast_tier, default=int(spell["tier"])))
+        selected_tier = min(9, selected_tier)
+        pool_id = ""
+        amount_spent = 0
+        mode = str(magic["casting_mode"])
+
+        with self._connect() as connection:
+            if mode == "mana":
+                pool_id = "mana"
+                amount_spent = max(0, int(spell["mana_cost"]))
+            elif mode == "tiered" and selected_tier > 0:
+                pool_id = f"tier_{selected_tier}"
+                amount_spent = 1
+
+            if pool_id:
+                pool = connection.execute(
+                    "SELECT current_amount FROM magic_resource_pools WHERE pool_id = ?",
+                    (pool_id,),
+                ).fetchone()
+                if pool is None or int(pool["current_amount"]) < amount_spent:
+                    return {
+                        "status": "rejected",
+                        "message": "The required magic resource is not available.",
+                    }
+                connection.execute(
+                    "UPDATE magic_resource_pools SET current_amount = current_amount - ? WHERE pool_id = ?",
+                    (amount_spent, pool_id),
+                )
+
+            timestamp = datetime.now().isoformat(timespec="seconds")
+            cursor = connection.execute(
+                """
+                INSERT INTO spell_cast_history (
+                    spell_id, cast_tier, pool_id, amount_spent, target,
+                    status, message_id, cast_at
+                ) VALUES (?, ?, ?, ?, ?, 'cast', ?, ?)
+                """,
+                (
+                    spell_id, selected_tier, pool_id, amount_spent,
+                    target.strip(), message_id.strip(), timestamp,
+                ),
+            )
+
+        return {
+            "status": "cast",
+            "message": f"Cast {spell['name']}.",
+            "cast_id": int(cursor.lastrowid or 0),
+            "spell_id": spell_id,
+            "spell_name": spell["name"],
+            "cast_tier": selected_tier,
+            "pool_id": pool_id,
+            "amount_spent": amount_spent,
+        }
+
+    def list_spell_cast_history(self, limit: int = 50) -> list[dict[str, Any]]:
+        """Lists recent spell casts with player-facing spell names."""
+
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT sch.*, sc.name AS spell_name
+                FROM spell_cast_history sch
+                LEFT JOIN spell_catalog sc ON sc.spell_id = sch.spell_id
+                ORDER BY sch.id DESC LIMIT ?
+                """,
+                (max(1, limit),),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def record_magic_advancement(
+        self,
+        *,
+        category: str,
+        reason: str,
+        significance: str = "meaningful",
+        spell_id: str = "",
+        source: str = "",
+        message_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Records one validated, narratively meaningful magic-development entry."""
+
+        magic = self.get_magic_configuration()
+        if not magic["world_contains_magic"]:
+            return {
+                "status": "rejected",
+                "message": "Magic advancement cannot occur in a world without magic.",
+            }
+        clean_category = normalize_magic_advancement_category(category)
+        if not clean_category:
+            return {"status": "rejected", "message": "Unsupported magic advancement category."}
+        clean_reason = str(reason or "").strip()[:500]
+        if not clean_reason:
+            return {"status": "rejected", "message": "Magic advancement requires a reason."}
+        clean_significance = normalize_magic_advancement_significance(significance)
+        clean_spell_id = str(spell_id or "").strip()
+        clean_source = str(source or "").strip()[:160]
+        resolved_message_id = self._resolve_message_id(message_id)
+
+        if clean_spell_id and self.get_spell(clean_spell_id) is None:
+            return {"status": "rejected", "message": "Referenced magic-advancement spell does not exist."}
+
+        with self._connect() as connection:
+            if clean_category == "meaningful_cast":
+                if not clean_spell_id:
+                    return {
+                        "status": "rejected",
+                        "message": "Meaningful casting advancement requires an exact spell_id.",
+                    }
+                cast = connection.execute(
+                    """
+                    SELECT 1 FROM spell_cast_history
+                    WHERE message_id = ? AND spell_id = ? AND status = 'cast'
+                    LIMIT 1
+                    """,
+                    (resolved_message_id, clean_spell_id),
+                ).fetchone()
+                if cast is None:
+                    return {
+                        "status": "rejected",
+                        "message": (
+                            "Meaningful casting advancement requires that exact spell "
+                            "to have been cast in the current response."
+                        ),
+                    }
+
+            dedupe_material = "\x1f".join(
+                (
+                    resolved_message_id,
+                    clean_category,
+                    clean_spell_id,
+                    clean_reason.casefold(),
+                )
+            )
+            dedupe_key = uuid.uuid5(uuid.NAMESPACE_URL, dedupe_material).hex
+            existing = connection.execute(
+                "SELECT * FROM magic_advancement_history WHERE dedupe_key = ?",
+                (dedupe_key,),
+            ).fetchone()
+            if existing is not None:
+                return {
+                    "status": "duplicate",
+                    "message": "That magic advancement is already recorded for this response.",
+                    "entry": dict(existing),
+                }
+
+            advancement_id = f"magic_adv_{uuid.uuid4().hex}"
+            timestamp = datetime.now().isoformat(timespec="seconds")
+            elapsed_minutes = self.get_current_calendar_minute()
+            connection.execute(
+                """
+                INSERT INTO magic_advancement_history (
+                    advancement_id, category, significance, reason, spell_id,
+                    source, message_id, elapsed_minutes, dedupe_key, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    advancement_id,
+                    clean_category,
+                    clean_significance,
+                    clean_reason,
+                    clean_spell_id,
+                    clean_source,
+                    resolved_message_id,
+                    elapsed_minutes,
+                    dedupe_key,
+                    timestamp,
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM magic_advancement_history WHERE advancement_id = ?",
+                (advancement_id,),
+            ).fetchone()
+
+        return {
+            "status": "recorded",
+            "message": "Recorded meaningful magic advancement.",
+            "entry": dict(row) if row is not None else {},
+        }
+
+    def list_magic_advancement_history(self, limit: int = 50) -> list[dict[str, Any]]:
+        """Lists the newest durable magic-development records first."""
+
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT advancement_id, category, significance, reason, spell_id,
+                       source, message_id, elapsed_minutes, created_at
+                FROM magic_advancement_history
+                ORDER BY created_at DESC, rowid DESC
+                LIMIT ?
+                """,
+                (max(1, int(limit)),),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_magic_advancement_summary(self) -> dict[str, Any]:
+        """Builds compact authoritative counts and lasting milestone evidence."""
+
+        with self._connect() as connection:
+            total_row = connection.execute(
+                "SELECT COUNT(*) AS total FROM magic_advancement_history"
+            ).fetchone()
+            category_rows = connection.execute(
+                """
+                SELECT category, COUNT(*) AS count
+                FROM magic_advancement_history
+                GROUP BY category ORDER BY category
+                """
+            ).fetchall()
+            milestone_rows = connection.execute(
+                """
+                SELECT advancement_id, category, significance, reason, spell_id,
+                       source, message_id, elapsed_minutes, created_at
+                FROM magic_advancement_history
+                WHERE significance = 'milestone'
+                ORDER BY created_at DESC, rowid DESC
+                LIMIT 10
+                """
+            ).fetchall()
+        return {
+            "total_meaningful_advancements": int(total_row["total"] if total_row else 0),
+            "counts_by_category": {
+                str(row["category"]): int(row["count"]) for row in category_rows
+            },
+            "important_milestones": [dict(row) for row in milestone_rows],
+        }
+
+    def upsert_active_magic_effect(
+        self,
+        *,
+        name: str,
+        effect_id: str = "",
+        spell_id: str = "",
+        target: str = "",
+        description: str = "",
+        start_elapsed_minutes: int = -1,
+        end_elapsed_minutes: int = -1,
+        requires_concentration: bool = False,
+        active: bool = True,
+    ) -> dict[str, Any] | None:
+        """Creates or updates a currently tracked magical effect."""
+
+        clean_name = name.strip()
+        if not clean_name:
+            return None
+        clean_id = effect_id.strip() or f"effect_{uuid.uuid4().hex}"
+        timestamp = datetime.now().isoformat(timespec="seconds")
+        with self._connect() as connection:
+            existing = connection.execute(
+                "SELECT created_at FROM active_magic_effects WHERE effect_id = ?",
+                (clean_id,),
+            ).fetchone()
+            created_at = timestamp if existing is None else str(existing["created_at"])
+            connection.execute(
+                """
+                INSERT INTO active_magic_effects (
+                    effect_id, spell_id, name, target, description,
+                    start_elapsed_minutes, end_elapsed_minutes,
+                    requires_concentration, active, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(effect_id) DO UPDATE SET
+                    spell_id = excluded.spell_id,
+                    name = excluded.name,
+                    target = excluded.target,
+                    description = excluded.description,
+                    start_elapsed_minutes = excluded.start_elapsed_minutes,
+                    end_elapsed_minutes = excluded.end_elapsed_minutes,
+                    requires_concentration = excluded.requires_concentration,
+                    active = excluded.active,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    clean_id, spell_id.strip(), clean_name, target.strip(),
+                    description.strip(), _safe_int(start_elapsed_minutes, default=-1),
+                    _safe_int(end_elapsed_minutes, default=-1),
+                    int(requires_concentration), int(active), created_at, timestamp,
+                ),
+            )
+        return next(
+            (effect for effect in self.list_active_magic_effects(False) if effect["effect_id"] == clean_id),
+            None,
+        )
+
+    def list_active_magic_effects(self, active_only: bool = True) -> list[dict[str, Any]]:
+        """Lists tracked magical effects."""
+
+        query = "SELECT * FROM active_magic_effects"
+        parameters: tuple[Any, ...] = ()
+        if active_only:
+            query += " WHERE active = 1"
+        query += " ORDER BY updated_at DESC, name COLLATE NOCASE"
+        with self._connect() as connection:
+            rows = connection.execute(query, parameters).fetchall()
+        return [dict(row) for row in rows]
 
     def upsert_skill(self, name: str, description: str, level: int) -> None:
         """
@@ -2144,6 +2714,143 @@ class SaveRepository:
 
         return visible_npcs
 
+    def upsert_party_member(
+        self,
+        npc_id: str,
+        *,
+        status: str | None = None,
+        health_current: int | None = None,
+        health_max: int | None = None,
+        armor_class: int | None = None,
+        combat_style: str | None = None,
+        skills: list[str] | None = None,
+    ) -> dict[str, Any] | None:
+        """Creates or updates party-specific data for an existing NPC identity."""
+
+        clean_npc_id = npc_id.strip()
+        if not clean_npc_id or self.get_npc(clean_npc_id) is None:
+            LOGGER.warning("Skipped party-member upsert for unknown NPC %r.", npc_id)
+            return None
+
+        timestamp = datetime.now().isoformat(timespec="seconds")
+        with self._connect() as connection:
+            existing = connection.execute(
+                "SELECT * FROM party_members WHERE npc_id = ?",
+                (clean_npc_id,),
+            ).fetchone()
+            existing_status = str(existing["status"]) if existing is not None else "Active"
+            existing_health_current = int(existing["health_current"]) if existing is not None else -1
+            existing_health_max = int(existing["health_max"]) if existing is not None else -1
+            existing_armor_class = int(existing["armor_class"]) if existing is not None else -1
+            existing_combat_style = str(existing["combat_style"]) if existing is not None else ""
+            existing_skills = (
+                _decode_string_list(existing["skills_json"], "party skills")
+                if existing is not None
+                else []
+            )
+
+            clean_health_max = (
+                max(-1, _safe_int(health_max))
+                if health_max is not None
+                else existing_health_max
+            )
+            clean_health_current = (
+                max(-1, _safe_int(health_current))
+                if health_current is not None
+                else existing_health_current
+            )
+            if clean_health_max >= 0 and clean_health_current >= 0:
+                clean_health_current = min(clean_health_current, clean_health_max)
+
+            connection.execute(
+                """
+                INSERT INTO party_members (
+                    npc_id, status, health_current, health_max, armor_class,
+                    combat_style, skills_json, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(npc_id) DO UPDATE SET
+                    status = excluded.status,
+                    health_current = excluded.health_current,
+                    health_max = excluded.health_max,
+                    armor_class = excluded.armor_class,
+                    combat_style = excluded.combat_style,
+                    skills_json = excluded.skills_json,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    clean_npc_id,
+                    status.strip() if isinstance(status, str) and status.strip() else existing_status,
+                    clean_health_current,
+                    clean_health_max,
+                    max(-1, _safe_int(armor_class))
+                    if armor_class is not None
+                    else existing_armor_class,
+                    combat_style.strip() if isinstance(combat_style, str) else existing_combat_style,
+                    _encode_string_list(
+                        _clean_string_list(skills) if skills is not None else existing_skills
+                    ),
+                    str(existing["created_at"]) if existing is not None else timestamp,
+                    timestamp,
+                ),
+            )
+
+        return next(
+            (
+                member
+                for member in self.list_party_members()
+                if str(member.get("npc_id", "")) == clean_npc_id
+            ),
+            None,
+        )
+
+    def remove_party_member(self, npc_id: str) -> bool:
+        """Removes party membership without deleting the canonical NPC profile."""
+
+        clean_npc_id = npc_id.strip()
+        if not clean_npc_id:
+            return False
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "DELETE FROM party_members WHERE npc_id = ?",
+                (clean_npc_id,),
+            )
+        return cursor.rowcount > 0
+
+    def list_party_members(self) -> list[dict[str, Any]]:
+        """Lists party-specific data joined to canonical player-visible NPC data."""
+
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT
+                    p.npc_id,
+                    p.status,
+                    p.health_current,
+                    p.health_max,
+                    p.armor_class,
+                    p.combat_style,
+                    p.skills_json,
+                    p.created_at AS party_created_at,
+                    p.updated_at AS party_updated_at,
+                    n.name,
+                    n.display_name,
+                    n.role,
+                    n.location,
+                    n.public_description,
+                    n.player_facing_information,
+                    n.knowledge_scope_json,
+                    n.known_facts_json,
+                    n.disposition,
+                    n.created_at,
+                    n.updated_at
+                FROM party_members AS p
+                JOIN npcs AS n ON n.npc_id = p.npc_id
+                ORDER BY n.display_name COLLATE NOCASE, n.name COLLATE NOCASE
+                """
+            ).fetchall()
+        return [_party_member_row_to_dict(row) for row in rows]
+
     def list_relevant_npcs(
         self,
         *,
@@ -2397,7 +3104,7 @@ class SaveRepository:
         """Creates or replaces one general world-lore record."""
 
         clean_name = " ".join(name.strip().split())
-        clean_category = " ".join(category.strip().split()) or "Miscellaneous"
+        clean_category = _normalize_miscellaneous_category(category)
         clean_details = details.strip()
 
         if not clean_name or not clean_details:
@@ -2472,6 +3179,23 @@ class SaveRepository:
 
         return [_miscellaneous_row_to_dict(row) for row in rows]
 
+    def list_bestiary_entries(self) -> list[dict[str, Any]]:
+        """Lists player-known creature lore without consulting GM-secret state."""
+
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT misc_id, name, category, details, created_at, updated_at
+                FROM miscellaneous
+                WHERE LOWER(TRIM(category)) IN (
+                    'creature', 'creatures', 'monster', 'monsters', 'beast', 'beasts'
+                )
+                ORDER BY name COLLATE NOCASE, misc_id
+                """
+            ).fetchall()
+
+        return [_miscellaneous_row_to_dict(row) for row in rows]
+
     @staticmethod
     def create_message_id() -> str:
         """Returns a globally unique identifier for one conversation message."""
@@ -2507,6 +3231,7 @@ class SaveRepository:
         *,
         message_id: str | None = None,
         sound_effect_cues: list[dict[str, str]] | None = None,
+        speaker_cues: list[dict[str, str]] | None = None,
     ) -> str:
         """
         Appends an entry to the adventure history.
@@ -2516,12 +3241,13 @@ class SaveRepository:
             content: Entry text.
             message_id: Optional conversation message ID.
             sound_effect_cues: Exact one-shot narration cue anchors for replay.
+            speaker_cues: Exact anchored speaker/voice assignments for replay.
 
         Returns:
             The associated conversation message ID.
         """
 
-        clean_content = content.strip()
+        clean_content = sanitize_english_text(content)
 
         if not clean_content:
             LOGGER.warning("Skipped blank history entry of kind '%s'.", kind)
@@ -2531,7 +3257,7 @@ class SaveRepository:
         clean_sound_effect_cues = [
             {
                 "filename": str(cue.get("filename", "") or "").strip(),
-                "anchor_text": str(cue.get("anchor_text", "") or "").strip(),
+                "anchor_text": sanitize_english_text(cue.get("anchor_text", "")),
                 "position": str(cue.get("position", "") or "").strip().casefold(),
             }
             for cue in (sound_effect_cues or [])
@@ -2540,6 +3266,24 @@ class SaveRepository:
             and str(cue.get("anchor_text", "") or "").strip()
             and str(cue.get("position", "") or "").strip().casefold()
             in {"before", "after"}
+        ]
+        clean_speaker_cues = [
+            {
+                "anchor_text": sanitize_english_text(cue.get("anchor_text", "")),
+                "speaker_id": sanitize_english_text(
+                    cue.get("speaker_id", "")
+                ).casefold(),
+                "speaker_name": sanitize_english_text(cue.get("speaker_name", "")),
+                "voice_profile": str(
+                    cue.get("voice_profile", "neutral") or "neutral"
+                ).strip().casefold(),
+                "voice_id": str(cue.get("voice_id", "") or "").strip(),
+            }
+            for cue in (speaker_cues or [])
+            if isinstance(cue, dict)
+            and str(cue.get("anchor_text", "") or "").strip()
+            and str(cue.get("speaker_id", "") or "").strip()
+            and str(cue.get("voice_id", "") or "").strip()
         ]
 
         with self._connect() as connection:
@@ -2550,15 +3294,17 @@ class SaveRepository:
                     kind,
                     content,
                     sound_effect_cues_json,
+                    speaker_cues_json,
                     created_at
                 )
-                VALUES (?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?)
                 """,
                 (
                     resolved_message_id,
                     kind.strip() or "misc",
                     clean_content,
                     json.dumps(clean_sound_effect_cues, ensure_ascii=False),
+                    json.dumps(clean_speaker_cues, ensure_ascii=False),
                     datetime.now().isoformat(timespec="seconds"),
                 ),
             )
@@ -2660,7 +3406,8 @@ class SaveRepository:
         with self._connect() as connection:
             rows = connection.execute(
                 """
-                SELECT id, message_id, kind, content, sound_effect_cues_json, created_at
+                SELECT id, message_id, kind, content, sound_effect_cues_json,
+                       speaker_cues_json, created_at
                 FROM history_entries
                 ORDER BY id ASC
                 """
@@ -2669,14 +3416,53 @@ class SaveRepository:
         history: list[dict[str, Any]] = []
         for row in rows:
             entry = dict(row)
+            entry["content"] = sanitize_english_text(entry.get("content", ""))
             try:
                 raw_cues = json.loads(str(entry.pop("sound_effect_cues_json", "[]")))
             except json.JSONDecodeError:
                 LOGGER.warning("History entry %s has invalid sound cue JSON.", entry["id"])
                 raw_cues = []
             entry["sound_effect_cues"] = (
-                [cue for cue in raw_cues if isinstance(cue, dict)]
+                [
+                    {
+                        **cue,
+                        "anchor_text": sanitize_english_text(
+                            cue.get("anchor_text", "")
+                        ),
+                    }
+                    for cue in raw_cues
+                    if isinstance(cue, dict)
+                ]
                 if isinstance(raw_cues, list)
+                else []
+            )
+            try:
+                raw_speaker_cues = json.loads(
+                    str(entry.pop("speaker_cues_json", "[]"))
+                )
+            except json.JSONDecodeError:
+                LOGGER.warning(
+                    "History entry %s has invalid speaker cue JSON.", entry["id"]
+                )
+                raw_speaker_cues = []
+            entry["speaker_cues"] = (
+                [
+                    {
+                        **cue,
+                        "anchor_text": sanitize_english_text(
+                            cue.get("anchor_text", "")
+                        ),
+                        "speaker_id": sanitize_english_text(
+                            cue.get("speaker_id", "")
+                        ).casefold(),
+                        "speaker_name": sanitize_english_text(
+                            cue.get("speaker_name", "")
+                        ),
+                    }
+                    for cue in raw_speaker_cues
+                    if isinstance(cue, dict)
+                ]
+                if isinstance(raw_speaker_cues, list)
                 else []
             )
             history.append(entry)
@@ -3101,25 +3887,25 @@ class SaveRepository:
 
         return row
 
-    def set_journal_notes(self, notes: str) -> None:
-        """Stores the player's journal notes."""
+    def set_note_entries(self, entries: Any) -> None:
+        """Stores the player's structured, tagged notes."""
 
-        self.set_setting("journal.private_notes", str(notes))
+        self.set_setting("notes.entries", normalize_note_entries(entries))
 
-    def get_journal_notes(self) -> str:
-        """Reads the player's journal notes."""
+    def get_note_entries(self) -> list[dict[str, Any]]:
+        """Reads the player's structured, tagged notes."""
 
-        return str(self.get_setting("journal.private_notes", ""))
+        return normalize_note_entries(self.get_setting("notes.entries", []))
 
-    def set_journal_share_with_ai(self, share_with_ai: bool) -> None:
-        """Stores whether journal notes should be included in AI context."""
+    def set_notes_share_with_ai(self, share_with_ai: bool) -> None:
+        """Stores whether player notes should be included in AI context."""
 
-        self.set_setting("journal.share_with_ai", bool(share_with_ai))
+        self.set_setting("notes.share_with_ai", bool(share_with_ai))
 
-    def get_journal_share_with_ai(self) -> bool:
-        """Reads whether journal notes should be included in AI context."""
+    def get_notes_share_with_ai(self) -> bool:
+        """Reads whether player notes should be included in AI context."""
 
-        return _safe_bool(self.get_setting("journal.share_with_ai", False), default=False)
+        return _safe_bool(self.get_setting("notes.share_with_ai", False), default=False)
 
     def set_world_summary(self, summary: str) -> None:
         """
@@ -3700,6 +4486,80 @@ class SaveRepository:
                     created_at TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS spell_catalog (
+                    spell_id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                    tier INTEGER NOT NULL DEFAULT 0,
+                    school TEXT NOT NULL DEFAULT '',
+                    description TEXT NOT NULL DEFAULT '',
+                    casting_time TEXT NOT NULL DEFAULT 'Action',
+                    range_text TEXT NOT NULL DEFAULT '',
+                    duration TEXT NOT NULL DEFAULT '',
+                    requirements TEXT NOT NULL DEFAULT '',
+                    mana_cost INTEGER NOT NULL DEFAULT 0,
+                    metadata_json TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS character_spells (
+                    spell_id TEXT PRIMARY KEY,
+                    known INTEGER NOT NULL DEFAULT 1,
+                    prepared INTEGER NOT NULL DEFAULT 1,
+                    favorite INTEGER NOT NULL DEFAULT 0,
+                    source TEXT NOT NULL DEFAULT '',
+                    learned_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS magic_resource_pools (
+                    pool_id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    resource_type TEXT NOT NULL,
+                    tier INTEGER NOT NULL DEFAULT 0,
+                    current_amount INTEGER NOT NULL DEFAULT 0,
+                    maximum_amount INTEGER NOT NULL DEFAULT 0,
+                    recovery_rule TEXT NOT NULL DEFAULT ''
+                );
+
+                CREATE TABLE IF NOT EXISTS spell_cast_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    spell_id TEXT NOT NULL,
+                    cast_tier INTEGER NOT NULL DEFAULT 0,
+                    pool_id TEXT NOT NULL DEFAULT '',
+                    amount_spent INTEGER NOT NULL DEFAULT 0,
+                    target TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL DEFAULT 'cast',
+                    message_id TEXT NOT NULL DEFAULT '',
+                    cast_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS magic_advancement_history (
+                    advancement_id TEXT PRIMARY KEY,
+                    category TEXT NOT NULL,
+                    significance TEXT NOT NULL DEFAULT 'meaningful',
+                    reason TEXT NOT NULL,
+                    spell_id TEXT NOT NULL DEFAULT '',
+                    source TEXT NOT NULL DEFAULT '',
+                    message_id TEXT NOT NULL DEFAULT '',
+                    elapsed_minutes INTEGER NOT NULL DEFAULT -1,
+                    dedupe_key TEXT NOT NULL UNIQUE,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS active_magic_effects (
+                    effect_id TEXT PRIMARY KEY,
+                    spell_id TEXT NOT NULL DEFAULT '',
+                    name TEXT NOT NULL,
+                    target TEXT NOT NULL DEFAULT '',
+                    description TEXT NOT NULL DEFAULT '',
+                    start_elapsed_minutes INTEGER NOT NULL DEFAULT -1,
+                    end_elapsed_minutes INTEGER NOT NULL DEFAULT -1,
+                    requires_concentration INTEGER NOT NULL DEFAULT 0,
+                    active INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
                 CREATE TABLE IF NOT EXISTS active_tasks (
                     id TEXT PRIMARY KEY NOT NULL DEFAULT ('rec_' || lower(hex(randomblob(16)))),
                     name TEXT NOT NULL UNIQUE,
@@ -3733,6 +4593,19 @@ class SaveRepository:
                     updated_at TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS party_members (
+                    npc_id TEXT PRIMARY KEY,
+                    status TEXT NOT NULL DEFAULT 'Active',
+                    health_current INTEGER NOT NULL DEFAULT -1,
+                    health_max INTEGER NOT NULL DEFAULT -1,
+                    armor_class INTEGER NOT NULL DEFAULT -1,
+                    combat_style TEXT NOT NULL DEFAULT '',
+                    skills_json TEXT NOT NULL DEFAULT '[]',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY (npc_id) REFERENCES npcs(npc_id) ON DELETE CASCADE
+                );
+
                 CREATE TABLE IF NOT EXISTS gm_secrets (
                     secret_id TEXT PRIMARY KEY,
                     title TEXT NOT NULL,
@@ -3760,6 +4633,7 @@ class SaveRepository:
                     kind TEXT NOT NULL,
                     content TEXT NOT NULL,
                     sound_effect_cues_json TEXT NOT NULL DEFAULT '[]',
+                    speaker_cues_json TEXT NOT NULL DEFAULT '[]',
                     created_at TEXT NOT NULL
                 );
 
@@ -3869,6 +4743,12 @@ class SaveRepository:
             )
             _ensure_column(
                 connection,
+                "history_entries",
+                "speaker_cues_json",
+                "TEXT NOT NULL DEFAULT '[]'",
+            )
+            _ensure_column(
+                connection,
                 "mechanical_events",
                 "message_id",
                 "TEXT NOT NULL DEFAULT ''",
@@ -3886,6 +4766,7 @@ class SaveRepository:
                 "INTEGER NOT NULL DEFAULT -1",
             )
             self._migrate_calendar_minute_from_game_state(connection)
+            self._migrate_legacy_spells(connection)
             self._coalesce_inventory_stacks(connection)
             self._seed_item_catalog_from_inventory(connection)
             self._synchronize_item_identity_metadata(connection)
@@ -3927,6 +4808,65 @@ class SaveRepository:
             "DELETE FROM game_state WHERE key = ?",
             ("elapsed_minutes",),
         )
+
+    def _migrate_legacy_spells(self, connection: sqlite3.Connection) -> None:
+        """Moves legacy spell.<name>.known flags into the relational magic model."""
+
+        rows = connection.execute(
+            "SELECT key, value FROM game_state WHERE key LIKE 'spell.%.known'"
+        ).fetchall()
+        timestamp = datetime.now().isoformat(timespec="seconds")
+        migrated_any = False
+        for row in rows:
+            if str(row["value"]).strip().casefold() not in {"true", "1", "yes"}:
+                continue
+            key = str(row["key"])
+            name = key.removeprefix("spell.").removesuffix(".known").strip()
+            if not name:
+                continue
+            existing = connection.execute(
+                "SELECT spell_id FROM spell_catalog WHERE name = ? COLLATE NOCASE",
+                (name,),
+            ).fetchone()
+            spell_id = (
+                str(existing["spell_id"])
+                if existing is not None
+                else f"spell_{uuid.uuid4().hex}"
+            )
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO spell_catalog (
+                    spell_id, name, tier, description, created_at, updated_at
+                ) VALUES (?, ?, 0, 'Imported from legacy spell knowledge.', ?, ?)
+                """,
+                (spell_id, name, timestamp, timestamp),
+            )
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO character_spells (
+                    spell_id, known, prepared, source, learned_at
+                ) VALUES (?, 1, 1, 'Legacy save migration', ?)
+                """,
+                (spell_id, timestamp),
+            )
+            migrated_any = True
+        if migrated_any:
+            existing_configuration = connection.execute(
+                "SELECT 1 FROM settings WHERE key = 'magic.configuration'"
+            ).fetchone()
+            if existing_configuration is None:
+                connection.execute(
+                    "INSERT INTO settings (key, value_json) VALUES (?, ?)",
+                    (
+                        "magic.configuration",
+                        json.dumps(
+                            normalize_magic_setup(
+                                {"enabled": True, "casting_mode": "narrative"}
+                            )
+                        ),
+                    ),
+                )
+        connection.execute("DELETE FROM game_state WHERE key LIKE 'spell.%.known'")
 
     def _coalesce_inventory_stacks(self, connection: sqlite3.Connection) -> None:
         """Merges duplicate inventory rows by case-insensitive item name."""
@@ -4135,6 +5075,22 @@ def _miscellaneous_id(value: str) -> str:
 
     cleaned = re.sub(r"[^a-zA-Z0-9]+", "_", value.strip().casefold()).strip("_")
     return (cleaned or "unnamed_miscellaneous_entry")[:100]
+
+
+def _normalize_miscellaneous_category(value: str) -> str:
+    """Normalizes public creature-lore aliases into the Bestiary category."""
+
+    cleaned = " ".join(str(value or "").strip().split()) or "Miscellaneous"
+    if cleaned.casefold() in {
+        "creature",
+        "creatures",
+        "monster",
+        "monsters",
+        "beast",
+        "beasts",
+    }:
+        return "Creature"
+    return cleaned
 
 
 def _fallback_npc_display_name(name: str, role: str) -> str:
@@ -4415,7 +5371,11 @@ def _upsert_item_catalog_entry(
     clean_description = description.strip()
     clean_value = max(0, _safe_int(value_base_units, default=0) or 0)
     raw_metadata = metadata if isinstance(metadata, dict) else {}
-    clean_ascii_art = normalize_ascii_art(raw_metadata.get("ascii_art", ""))
+    clean_ascii_art = ensure_substantive_ascii_art(
+        raw_metadata.get("ascii_art", ""),
+        item_name=clean_name,
+        category=clean_category,
+    )
     clean_metadata = normalize_item_metadata(
         metadata,
         name=clean_name,
@@ -4467,6 +5427,15 @@ def _upsert_item_catalog_entry(
         )
         return
 
+    resolved_ascii_art = (
+        clean_ascii_art
+        if is_substantive_ascii_art(raw_metadata.get("ascii_art", ""))
+        else ensure_substantive_ascii_art(
+            row["ascii_art"],
+            item_name=clean_name,
+            category=clean_category or str(row["category"]),
+        )
+    )
     existing_metadata = _decode_json_dict(
         row["metadata_json"],
         "item catalog metadata",
@@ -4494,7 +5463,7 @@ def _upsert_item_catalog_entry(
             clean_category or str(row["category"]),
             clean_description or str(row["description"]),
             clean_value if clean_value > 0 else int(row["value_base_units"]),
-            clean_ascii_art or str(row["ascii_art"]),
+            resolved_ascii_art,
             metadata_json
             if clean_metadata.get("item_type") != "Item"
             else str(row["metadata_json"]),
@@ -4520,6 +5489,11 @@ def _inventory_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
     normalized_metadata["quantity_unit"] = metadata["quantity_unit"]
     normalized_metadata["storage_location"] = storage_location
     normalized_metadata["item_uuid"] = str(metadata.get("item_uuid", "")).strip()
+    normalized_metadata["ascii_art"] = ensure_substantive_ascii_art(
+        metadata.get("ascii_art", ""),
+        item_name=str(row["name"]),
+        category=str(row["category"]),
+    )
     return {
         "id": row["id"],
         "name": row["name"],
@@ -4552,7 +5526,11 @@ def _item_catalog_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
         "category": row["category"],
         "description": row["description"],
         "value_base_units": row["value_base_units"],
-        "ascii_art": normalize_ascii_art(row["ascii_art"]),
+        "ascii_art": ensure_substantive_ascii_art(
+            row["ascii_art"],
+            item_name=str(row["name"]),
+            category=str(row["category"]),
+        ),
         "metadata": normalized_metadata,
         "first_seen_at": row["first_seen_at"],
         "updated_at": row["updated_at"],
@@ -4580,6 +5558,64 @@ def _npc_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
     }
+
+
+def _party_member_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    """Converts a joined party/NPC row to one player-safe party record."""
+
+    return {
+        "npc_id": row["npc_id"],
+        "name": row["name"],
+        "display_name": row["display_name"] or row["name"] or "Unknown NPC",
+        "role": row["role"],
+        "location": row["location"],
+        "description": row["public_description"],
+        "notes": row["player_facing_information"],
+        "status": row["status"],
+        "health_current": row["health_current"],
+        "health_max": row["health_max"],
+        "armor_class": row["armor_class"],
+        "combat_style": row["combat_style"],
+        "skills": _decode_string_list(row["skills_json"], "party skills"),
+        "party_created_at": row["party_created_at"],
+        "party_updated_at": row["party_updated_at"],
+    }
+
+
+def _spell_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    """Converts one authoritative spell definition to a plain dictionary."""
+
+    return {
+        "spell_id": row["spell_id"],
+        "name": row["name"],
+        "tier": row["tier"],
+        "school": row["school"],
+        "description": row["description"],
+        "casting_time": row["casting_time"],
+        "range": row["range_text"],
+        "duration": row["duration"],
+        "requirements": row["requirements"],
+        "mana_cost": row["mana_cost"],
+        "metadata": _decode_json_dict(row["metadata_json"], "spell metadata"),
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
+def _character_spell_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    """Converts a joined character-spell row to a plain dictionary."""
+
+    spell = _spell_row_to_dict(row)
+    spell.update(
+        {
+            "known": bool(row["known"]),
+            "prepared": bool(row["prepared"]),
+            "favorite": bool(row["favorite"]),
+            "source": row["source"],
+            "learned_at": row["learned_at"],
+        }
+    )
+    return spell
 
 
 def _inventory_quantity_unit(metadata: dict[str, Any]) -> str:

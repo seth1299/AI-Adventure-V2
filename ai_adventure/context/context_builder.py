@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from ai_adventure.alchemy.ingredients import (
@@ -13,13 +14,14 @@ from ai_adventure.context.models import ContextLibrary
 from ai_adventure.context.naming import GENERIC_PROPER_NOUN_PLACEHOLDER_RULE
 from ai_adventure.context.reference_loader import ContextReferenceLoader
 from ai_adventure.context.tags import PLANNABLE_CONTEXT_TAGS
-from ai_adventure.combat import normalize_combat_state
+from ai_adventure.combat import (
+    COMBAT_FOCUS_INSTRUCTIONS,
+    normalize_combat_preferences,
+    normalize_combat_state,
+)
 from ai_adventure.currency import format_currency_amount
 from ai_adventure.core.models import AdventureState
-from ai_adventure.audio.pronunciation import (
-    KOKORO_IPA_PROMPT_RULE,
-    normalize_pronunciation_map,
-)
+from ai_adventure.notes import note_entries_for_ai, normalize_note_entries
 from ai_adventure.narration_preferences import normalize_narration_preferences
 
 
@@ -227,6 +229,7 @@ class AiContextBuilder:
         player_command: str,
         conversation_mode: str = "live_game",
         relevant_npcs: list[dict[str, Any]] | None = None,
+        party_members: list[dict[str, Any]] | None = None,
         gm_secrets: list[dict[str, Any]] | None = None,
         miscellaneous: list[dict[str, Any]] | None = None,
         valid_music_tracks: list[str] | None = None,
@@ -243,6 +246,7 @@ class AiContextBuilder:
             player_command: The player's pending command.
             conversation_mode: Explicit UI-selected mode: live_game or out_of_game.
             relevant_npcs: NPC memory profiles likely relevant this turn.
+            party_members: Current party records joined to canonical NPC profiles.
             gm_secrets: Active private GM-memory records for every turn.
             miscellaneous: Every general world-lore record, always sent uncapped.
             valid_music_tracks: Playable background music filenames.
@@ -264,6 +268,13 @@ class AiContextBuilder:
             infer_context_tags(clean_command)
             if planner_context_tags is None
             else _normalize_planner_context_tags(planner_context_tags)
+        )
+        selected_tags.update(
+            _hybrid_magic_relevance_tags(
+                state,
+                player_command=clean_command,
+                relevant_npcs=relevant_npcs or [],
+            )
         )
         selected_tags.add("story")
         if clean_conversation_mode == "out_of_game":
@@ -324,6 +335,20 @@ class AiContextBuilder:
             _npc_context_profile(npc)
             for npc in (relevant_npcs or [])
         ]
+        clean_party_members = [
+            _party_context_profile(member)
+            for member in (party_members or [])
+            if isinstance(member, dict)
+        ]
+        relevant_npc_ids = {
+            str(npc.get("npc_id", "")) for npc in clean_relevant_npcs
+        }
+        for member in party_members or []:
+            clean_member_npc = _npc_context_profile(member)
+            member_npc_id = str(clean_member_npc.get("npc_id", ""))
+            if member_npc_id and member_npc_id not in relevant_npc_ids:
+                clean_relevant_npcs.append(clean_member_npc)
+                relevant_npc_ids.add(member_npc_id)
         clean_gm_secrets = [
             _gm_secret_context_record(secret)
             for secret in (gm_secrets or [])
@@ -334,16 +359,24 @@ class AiContextBuilder:
             for entry in (miscellaneous or [])
             if isinstance(entry, dict)
         ]
-        journal_share_with_ai = _coerce_bool(
-            state.settings.values.get("journal.share_with_ai", False),
+        notes_share_with_ai = _coerce_bool(
+            state.settings.values.get("notes.share_with_ai", False),
             default=False,
         )
-        journal_notes = ""
+        note_entries: list[dict[str, Any]] = []
 
-        if journal_share_with_ai:
-            journal_notes = _compact_text(
-                state.settings.values.get("journal.private_notes", "")
+        if notes_share_with_ai:
+            note_entries = note_entries_for_ai(
+                normalize_note_entries(state.settings.values.get("notes.entries", []))
             )
+            note_entries = [
+                {
+                    "heading": _compact_text(entry["heading"], max_chars=300),
+                    "body": _compact_text(entry["body"]),
+                    "tags": entry["tags"],
+                }
+                for entry in note_entries[:MAX_CONTEXT_LIST_ITEMS]
+            ]
         narration_preferences = normalize_narration_preferences(
             {
                 "tense": state.settings.values.get("ai.narration_tense", ""),
@@ -352,6 +385,22 @@ class AiContextBuilder:
         )
         ai_mode_preferences = ai_mode_preferences_from_settings(state.settings.values)
         combat_state = normalize_combat_state(state.settings.values.get("combat.state", {}))
+        combat_preferences = normalize_combat_preferences(
+            state.settings.values.get(
+                "combat.preferences",
+                {
+                    "resolution_mode": state.settings.values.get(
+                        "combat.resolution_mode", "strict"
+                    ),
+                    "focus": state.settings.values.get("combat.focus", "balanced"),
+                },
+            )
+        )
+        strict_combat = combat_preferences["resolution_mode"] == "strict"
+        magic_context = _magic_context_packet(
+            state.magic,
+            include_progression="magic" in selected_tags or "spell" in selected_tags,
+        )
 
         packet = {
             "schema_version": 1,
@@ -367,9 +416,7 @@ class AiContextBuilder:
                 "adventure_title": state.metadata.title,
                 "player": {
                     "name": state.player.name,
-                    "name_pronunciation": _compact_text(
-                        state.player.name_pronunciation
-                    ),
+                    "pronouns": _compact_text(state.player.pronouns),
                     "appearance": _compact_text(state.player.appearance),
                     "backstory": _compact_text(state.player.backstory),
                     "condition": _compact_text(
@@ -382,9 +429,6 @@ class AiContextBuilder:
                     "armor_rating": state.player.armor_rating,
                     "equipment": state.player.equipment,
                 },
-                "pronunciation_map": normalize_pronunciation_map(
-                    state.settings.values.get("tts.pronunciation_map", {})
-                ),
                 "player_ai_preferences": {
                     "additional_context": _compact_text(
                         state.settings.values.get("ai.additional_context", "")
@@ -436,12 +480,14 @@ class AiContextBuilder:
                         "structured response rules."
                     ),
                 },
-                "journal": {
-                    "share_with_ai": journal_share_with_ai,
-                    "player_notes": journal_notes,
+                "notes": {
+                    "share_with_ai": notes_share_with_ai,
+                    "entries": note_entries,
                     "rules": (
-                        "Use player_notes only when share_with_ai is true. "
-                        "These are player-authored journal notes, not verified "
+                        "Use entries only when share_with_ai is true. Each heading, "
+                        "body, and tag is player-authored, not verified. Bodies may "
+                        "contain Markdown formatting; interpret the content without "
+                        "treating Markdown syntax as world facts. These are not verified "
                         "world facts unless supported by established state or "
                         "story history."
                     ),
@@ -572,6 +618,13 @@ class AiContextBuilder:
                             "reuse it for the same item and do not split one item "
                             "into duplicate definitions because of name variations."
                         ),
+                        "ascii_art_rule": (
+                            "New item definitions require an original 3-12 line "
+                            "fixed-width drawing of the recognizable item shape. A "
+                            "bracketed item name such as [Camera], a caption, or any "
+                            "other single-line label is invalid and is not ASCII art. "
+                            "Reuse valid existing catalog art exactly."
+                        ),
                     },
                 },
                 "currency": {
@@ -618,6 +671,11 @@ class AiContextBuilder:
                     ),
                 },
                 "combat": {
+                    "resolution_mode": combat_preferences["resolution_mode"],
+                    "focus": combat_preferences["focus"],
+                    "focus_instruction": COMBAT_FOCUS_INSTRUCTIONS[
+                        combat_preferences["focus"]
+                    ],
                     "active": bool(combat_state.get("active", False)),
                     "round": combat_state.get("round", 1),
                     "turn_index": combat_state.get("turn_index", 0),
@@ -626,16 +684,25 @@ class AiContextBuilder:
                         for combatant in combat_state.get("combatants", [])
                     ],
                     "rules": (
-                        "When a fight starts, suggest CombatStartedEvent with "
-                        "enemy/allied combatants, health, armor_rating, "
-                        "to_hit_bonus, initiative_bonus, personality, ammunition/clip "
-                        "fields, damage dice, and loot. The Python combat system "
-                        "rolls initiative, calculates each team's Threat Levels "
-                        "from health, armor, and average damage, and uses those "
-                        "percentages for non-intelligent NPC targeting. Intelligent "
-                        "NPCs target tactically. Do not resolve attacks, turns, damage, "
-                        "victory, defeat, or loot in story prose after combat "
-                        "starts; the Python Combat tab handles those mechanics."
+                        (
+                            "When a fight starts, suggest CombatStartedEvent with "
+                            "enemy/allied combatants, health, armor_rating, "
+                            "to_hit_bonus, initiative_bonus, personality, ammunition/clip "
+                            "fields, damage dice, and loot. The Python combat system "
+                            "rolls initiative, calculates team Threat Levels, and resolves "
+                            "attacks, damage, victory, defeat, and loot. Do not resolve "
+                            "those mechanics in story prose after combat starts."
+                        )
+                        if strict_combat
+                        else (
+                            "Resolve and describe combat narratively in story prose. "
+                            "Do not suggest CombatStartedEvent and do not hand the fight "
+                            "to the Combat tab. Respect the player's declared actions, "
+                            "use warranted skill checks before uncertain outcomes, give "
+                            "all participants meaningful agency, and persist any actual "
+                            "injuries, items, currency, status, or other durable changes "
+                            "with the supported non-combat events."
+                        )
                     ),
                 },
                 "alchemy": {
@@ -748,6 +815,42 @@ class AiContextBuilder:
                         if isinstance(check, dict)
                     ],
                 },
+                "magic": {
+                    **magic_context,
+                    "rules": {
+                        "authority": (
+                            "If configuration.world_contains_magic is false, the world "
+                            "contains no magic: never introduce spells, magical powers, "
+                            "enchanted items, magical creatures, or supernatural effects. "
+                            "If world_contains_magic is true but enabled is false, "
+                            "magic still exists in the world according to casting_mode "
+                            "and tradition, but the Player Character cannot cast at the "
+                            "start. Otherwise, the player chooses whether to cast. Python "
+                            "validates known spells and deterministically consumes mana "
+                            "or tiered slots. Never invent a player cast or calculate "
+                            "remaining resources."
+                        ),
+                        "narrative": "Narrative casting consumes no tracked resource.",
+                        "mana": "Mana casting consumes the authoritative mana_cost from the spell catalog.",
+                        "tiered": (
+                            "Tiered casting consumes one slot at the selected tier. Tier 0 "
+                            "spells consume no slot."
+                        ),
+                        **(
+                            {
+                                "advancement": (
+                                    "progression is authoritative durable evidence. Use "
+                                    "MagicAdvancementRecordedEvent only for meaningful magical "
+                                    "development established by this response, never routine "
+                                    "repetition. The event records evidence only and does not "
+                                    "change Mana, slots, tiers, or known spells."
+                                )
+                            }
+                            if "progression" in magic_context
+                            else {}
+                        ),
+                    },
+                },
                 "active_tasks": {
                     "rules": {
                         "purpose": (
@@ -771,6 +874,16 @@ class AiContextBuilder:
                             "deadlines, include an exact due_elapsed_minutes value; "
                             "the app will display it with the current calendar and "
                             "time settings."
+                        ),
+                        "description_rule": (
+                            "Every new task requires a complete player-visible "
+                            "description explaining what must be done, all currently "
+                            "known relevant people and places, and how the Player can "
+                            "recognize completion. Include only player-known facts. "
+                            "Preserve an existing description when an update does not "
+                            "change it. When an existing task has a blank or incomplete "
+                            "description, repair it with ActiveTaskUpsertedEvent as "
+                            "soon as the task is relevant."
                         ),
                         "completion_rule": (
                             "Suggest ActiveTaskCompletedEvent when a task is fulfilled, "
@@ -845,6 +958,26 @@ class AiContextBuilder:
                             "cue-count target; omit cues when no listed sound fits. The "
                             "app replays each saved cue at that same boundary."
                         ),
+                        "english_text_rule": (
+                            "Every generated string value must use printable ASCII "
+                            "English characters only. Transliterate accented Latin "
+                            "letters to unaccented English and never emit foreign "
+                            "scripts, IPA, phoneme strings, pronunciation annotations, "
+                            "or pronunciation_map. Python enforces this before any "
+                            "generated text reaches state, UI, persistence, or TTS."
+                        ),
+                        "speaker_voice_rule": (
+                            "Return speaker_cues for every exact contiguous span of "
+                            "non-narrator dialogue in response. Copy the complete span, "
+                            "including outer double quotation marks, into a unique "
+                            "anchor_text. Use an actual NPC's exact npc_id as speaker_id "
+                            "and reuse it on later turns; use distinct stable "
+                            "lower_snake_case IDs for other speakers. Choose only a "
+                            "broad established voice_profile and use neutral when "
+                            "unspecified. Python selects and durably remembers the "
+                            "installed voice ID. Do not cue narrator prose or the "
+                            "Player Character."
+                        ),
                     },
                 },
                 "npcs": {
@@ -896,6 +1029,19 @@ class AiContextBuilder:
                     },
                     "relevant": clean_relevant_npcs,
                 },
+                "party": {
+                    "members": clean_party_members,
+                    "rules": (
+                        "Every party member is also a canonical NPC. party.members.npc_id "
+                        "is the same stable identity used in state.npcs.relevant and the "
+                        "NPCs tab. Never create a duplicate NPC when party membership or "
+                        "party stats change. Use NpcUpsertedEvent with that same npc_id, "
+                        "party_member=true, and the changed party fields. Use "
+                        "party_member=false to remove someone from the party without "
+                        "deleting their NPC profile. Keep health, armor class, status, "
+                        "combat style, and skills consistent with narrated outcomes."
+                    ),
+                },
                 "gm_secrets": {
                     "visibility": "AI-only; never display this section to the player.",
                     "rules": {
@@ -944,7 +1090,11 @@ class AiContextBuilder:
                             "home, such as original creatures or species, cultures, "
                             "factions, religions, laws, historical events, phenomena, "
                             "or customs. Do not duplicate NPCs, locations, items, tasks, "
-                            "or hidden GM secrets."
+                            "or hidden GM secrets. Use category Creature for every "
+                            "non-NPC creature or monster the Player learns about; its "
+                            "details must contain only facts known to the Player or "
+                            "Player Character because Creature records populate the "
+                            "player-visible Bestiary."
                         ),
                     },
                     "entries": clean_miscellaneous,
@@ -987,11 +1137,21 @@ class AiContextBuilder:
                     "applies events. Include multiple entries of the same event type "
                     "when multiple distinct state changes happen in one turn."
                 ),
-                "pronunciation_map": (
-                    "TTS-only array of {term, ipa} records for exact visible names or "
-                    "recurring terms whose spelling is genuinely ambiguous. Omit ordinary "
-                    "words and never place pronunciation hints in response. "
-                    f"{KOKORO_IPA_PROMPT_RULE}"
+                "english_text": (
+                    "Every string in the response object must use printable ASCII "
+                    "English characters only. Use unaccented English transliterations "
+                    "and never return pronunciation_map, IPA, phoneme strings, foreign "
+                    "scripts, or inline pronunciation markup."
+                ),
+                "speaker_cues": (
+                    "TTS-only array covering every contiguous non-narrator spoken "
+                    "span in response. Each record must contain anchor_text copied "
+                    "exactly with outer double quotes, speaker_id, speaker_name, and "
+                    "voice_profile. Use the exact canonical npc_id for an NPC, reuse "
+                    "one ID for the same speaker, and use different IDs for different "
+                    "speakers. Return [] when only the narrator speaks or for "
+                    "out_of_game. Python owns final installed voice assignment and "
+                    "persistence."
                 ),
                 "conversation_mode": (
                     "conversation_mode is selected explicitly by the player in the UI "
@@ -1038,12 +1198,12 @@ class AiContextBuilder:
                     "new date labels."
                 ),
                 "character_profile": (
-                    "Use state.player.name, name_pronunciation, appearance, backstory, and notes as "
+                    "Use state.player.name, pronouns, appearance, backstory, and notes as "
                     "player-authored character context. Treat it as true for the "
-                    "player character. If name_pronunciation is non-empty, preserve it "
-                    "as the authoritative player guide for TTS and use it when choosing "
-                    "the character name's IPA. Do not expose pronunciation data "
-                    "it in player-facing prose. Do not let NPCs know private profile "
+                    "player character. state.player.pronouns is the canonical source "
+                    "for referring to the player character: use it exactly and never "
+                    "infer different pronouns from the name, appearance, voice, "
+                    "backstory, or genre. Do not let NPCs know private profile "
                     "details unless they have observed them, been told, or have a "
                     "clear in-world reason to know."
                 ),
@@ -1065,15 +1225,18 @@ class AiContextBuilder:
                     "player-facing prose. Also use "
                     "state.player_ai_preferences.additional_context as persistent "
                     "player-provided guidance for boundaries and miscellaneous "
-                    "preferences. This is always AI-facing; Journal notes are only "
-                    "AI-facing when state.journal.share_with_ai is true."
+                    "preferences. This is always AI-facing; Notes are only AI-facing "
+                    "when state.notes.share_with_ai is true."
                 ),
-                "journal": (
-                    "When state.journal.share_with_ai is true, use "
-                    "state.journal.player_notes as player-authored notes, theories, "
-                    "reminders, and priorities. Treat them as the player's perspective, "
-                    "not automatically true world facts. When share_with_ai is false, "
-                    "ignore Journal notes because they are private."
+                "notes": (
+                    "When state.notes.share_with_ai is true, use state.notes.entries "
+                    "headings, bodies, and tags as player-authored notes, "
+                    "theories, reminders, and priorities. Treat them as the player's "
+                    "perspective, not automatically true world facts. Interpret Markdown "
+                    "formatting in note bodies as presentation syntax. Entry headings may "
+                    "contain player-edited in-game date and time labels. When "
+                    "share_with_ai is false, "
+                    "ignore Notes because they are private."
                 ),
                 "mature_content": ai_mode_preferences["model_content_rules"],
                 "active_tasks": (
@@ -1081,7 +1244,10 @@ class AiContextBuilder:
                     "commissions, custom orders, pending purchases, and other "
                     "ongoing obligations. Suggest ActiveTaskUpsertedEvent for new "
                     "or changed tasks and ActiveTaskCompletedEvent when one is no "
-                    "longer active. Use due_elapsed_minutes for exact deadlines "
+                    "longer active. Every new task needs a complete player-visible "
+                    "description covering the objective, currently known relevant "
+                    "people and places, and how to recognize completion. Use "
+                    "due_elapsed_minutes for exact deadlines "
                     "instead of vague due-date prose."
                 ),
                 "item_catalog": (
@@ -1136,7 +1302,12 @@ class AiContextBuilder:
                     "person is already listed, reuse that existing npc_id/internal "
                     "identifier and update the one profile; do not create a second "
                     "internal name for the same role/person at the same location. Use "
-                    "one NpcUpsertedEvent per distinct meaningful NPC introduced."
+                    "one NpcUpsertedEvent per distinct meaningful NPC introduced. "
+                    "Every party member remains that same canonical NPC: reuse npc_id "
+                    "with party_member=true and party_status, party_health_current, "
+                    "party_health_max, party_armor_class, party_combat_style, and "
+                    "party_skills when those visible details change. Use "
+                    "party_member=false to remove membership without deleting the NPC."
                 ),
                 "secret_memory": (
                     "Use state.gm_secrets.active as authoritative AI-only hidden "
@@ -1168,6 +1339,9 @@ class AiContextBuilder:
                     "culture, faction, religion, law, historical event, phenomenon, "
                     "custom, or other concept is established or changed and no more "
                     "specific state table fits. Reuse the same misc_id for updates. "
+                    "Use category Creature for every non-NPC creature or monster the "
+                    "Player learns about and include only player-known facts in its "
+                    "details; these records populate the player-visible Bestiary. "
                     "Never duplicate NPC, Location, Item, task, or GM-secret records."
                 ),
                 "currency_transactions": (
@@ -1186,16 +1360,25 @@ class AiContextBuilder:
                     "must not use CurrencyChangedEvent; Python adds it only when an "
                     "open container receives ContainerContentsTakenEvent."
                 ),
-                "combat_handoff": (
-                    "When a fight begins, suggest CombatStartedEvent with concrete "
-                    "enemy/allied combatants, health, armor_rating, to_hit_bonus, "
-                    "initiative_bonus, personality, complete ammunition/clip fields, "
-                    "damage dice, and loot. Python rolls initiative, calculates "
-                    "team Threat Levels from maximum health, armor rating, and average "
-                    "damage, uses them for non-intelligent NPC targets, and preserves "
-                    "tactical targeting for intelligent NPCs. After that, do not resolve "
-                    "attacks, turns, reloading, damage, victory, "
-                    "defeat, or loot in story prose; the Combat tab owns those mechanics."
+                (
+                    "combat_handoff" if strict_combat else "narrative_combat"
+                ): (
+                    (
+                        "When a fight begins, suggest CombatStartedEvent with concrete "
+                        "enemy/allied combatants, health, armor_rating, to_hit_bonus, "
+                        "initiative_bonus, personality, complete ammunition/clip fields, "
+                        "damage dice, and loot. Python rolls initiative, calculates team "
+                        "Threat Levels from maximum health, armor rating, and average "
+                        "damage, uses them for non-intelligent NPC targets, preserves "
+                        "tactical targeting for intelligent NPCs, and owns attacks, "
+                        "reloading, damage, victory, defeat, and loot in the Combat tab."
+                    )
+                    if strict_combat
+                    else (
+                        "Narrate and resolve the complete fight in the story without "
+                        "CombatStartedEvent. Use warranted skill checks for uncertain "
+                        "actions and supported non-combat events for durable consequences."
+                    )
                 ),
                 "out_of_game": (
                     "Boolean. Must be true exactly when conversation_mode is out_of_game; "
@@ -1227,7 +1410,11 @@ class AiContextBuilder:
                     "TravelModeChangedEvent",
                     "ActiveTaskUpsertedEvent",
                     "ActiveTaskCompletedEvent",
-                    "SpellLearnedEvent",
+                    "SpellCatalogUpsertedEvent",
+                    "CharacterSpellLearnedEvent",
+                    "PlayerSpellCastEvent",
+                    "MagicAdvancementRecordedEvent",
+                    "MagicEffectUpsertedEvent",
                     "NpcUpsertedEvent",
                     "NpcKnowledgeAddedEvent",
                     "SecretUpsertedEvent",
@@ -1240,6 +1427,7 @@ class AiContextBuilder:
             event_type
             for event_type in known_event_types
             if event_type not in disabled_audio_event_types
+            and (strict_combat or event_type != "CombatStartedEvent")
         ]
         return packet
 
@@ -1326,6 +1514,159 @@ def _npc_context_profile(npc: dict[str, Any]) -> dict[str, Any]:
     return {
         key: _compact_context_value(value)
         for key, value in npc.items()
+        if key in allowed_fields
+    }
+
+
+def _hybrid_magic_relevance_tags(
+    state: AdventureState,
+    *,
+    player_command: str,
+    relevant_npcs: list[dict[str, Any]],
+) -> set[str]:
+    """Combines deterministic state signals with planner/keyword magic relevance."""
+
+    command = player_command.casefold()
+    command_words = {
+        word.strip(".,!?;:()[]{}\"'") for word in command.split() if word.strip()
+    }
+    magic_words = {
+        "arcane", "cantrip", "cast", "casting", "enchant", "magic", "magical",
+        "mana", "ritual", "sorcery", "spell", "spellbook", "wizardry",
+    }
+    spell_words = {"cantrip", "cast", "casting", "spell", "spellbook"}
+    tags: set[str] = set()
+    if command_words.intersection(magic_words):
+        tags.add("magic")
+    if command_words.intersection(spell_words):
+        tags.add("spell")
+
+    known_spell_names = {
+        spell.name.strip().casefold()
+        for spell in state.magic.known_spells
+        if spell.name.strip()
+    }
+    if _contains_known_spell_name(command, known_spell_names):
+        tags.update({"magic", "spell"})
+
+    if state.magic.active_effects:
+        tags.add("magic")
+
+    refers_back = bool(
+        command_words.intersection(
+            {
+                "again", "continue", "exercise", "lesson", "practice", "resume",
+                "same", "study", "train", "training", "try",
+            }
+        )
+    )
+
+    task_text = " ".join(
+        " ".join(
+            (
+                task.name,
+                task.category,
+                task.description,
+                task.requester,
+                task.notes,
+            )
+        )
+        for task in state.active_tasks.tasks
+        if task.status.strip().casefold() not in {"completed", "cancelled", "failed"}
+    ).casefold()
+    npc_text = " ".join(str(npc) for npc in relevant_npcs).casefold()
+    if refers_back and _contains_magic_relevance_signal(task_text, known_spell_names):
+        tags.add("magic")
+    if _contains_magic_relevance_signal(npc_text, known_spell_names):
+        tags.add("magic")
+
+    if refers_back:
+        recent_text = " ".join(
+            entry.content for entry in state.history.entries[-4:]
+        ).casefold()
+        if _contains_magic_relevance_signal(recent_text, known_spell_names):
+            tags.add("magic")
+
+    if "spell" in tags:
+        tags.add("magic")
+    return tags
+
+
+def _contains_magic_relevance_signal(text: str, known_spell_names: set[str]) -> bool:
+    """Returns whether text contains a strong magic-domain routing signal."""
+
+    if not text:
+        return False
+    words = {
+        word.strip(".,!?;:()[]{}\"'") for word in text.split() if word.strip()
+    }
+    if words.intersection(
+        {
+            "arcane", "cantrip", "cast", "casting", "enchant", "mage", "magic",
+            "magical", "mana", "ritual", "sorcery", "spell", "spellbook", "wizard",
+        }
+    ):
+        return True
+    return _contains_known_spell_name(text, known_spell_names)
+
+
+def _contains_known_spell_name(text: str, known_spell_names: set[str]) -> bool:
+    """Matches exact known spell names without substring false positives."""
+
+    return any(
+        re.search(rf"(?<!\w){re.escape(name)}(?!\w)", text) is not None
+        for name in known_spell_names
+    )
+
+
+def _magic_context_packet(magic_state, *, include_progression: bool) -> dict[str, Any]:
+    """Projects full magic state while conditionally attaching advancement evidence."""
+
+    data = magic_state.to_dict()
+    history = data.pop("advancement_history", [])
+    summary = data.pop("advancement_summary", {})
+    if not include_progression:
+        return data
+    recent = history[:8] if isinstance(history, list) else []
+    milestones = (
+        summary.get("important_milestones", []) if isinstance(summary, dict) else []
+    )
+    data["progression"] = {
+        "summary": {
+            "total_meaningful_advancements": summary.get(
+                "total_meaningful_advancements", 0
+            ) if isinstance(summary, dict) else 0,
+            "counts_by_category": summary.get("counts_by_category", {})
+            if isinstance(summary, dict) else {},
+        },
+        "recent_meaningful_advancements": recent,
+        "important_milestones": milestones[:10]
+        if isinstance(milestones, list) else [],
+    }
+    return data
+
+
+def _party_context_profile(member: dict[str, Any]) -> dict[str, Any]:
+    """Returns party fields plus the shared NPC identity sent to Gemini."""
+
+    allowed_fields = {
+        "npc_id",
+        "name",
+        "display_name",
+        "role",
+        "location",
+        "description",
+        "notes",
+        "status",
+        "health_current",
+        "health_max",
+        "armor_class",
+        "combat_style",
+        "skills",
+    }
+    return {
+        key: _compact_context_value(value)
+        for key, value in member.items()
         if key in allowed_fields
     }
 
