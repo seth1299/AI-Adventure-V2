@@ -42,6 +42,45 @@ PykokoroModelQuality = Literal[
 ]
 
 
+def _configure_kokoro_cli_no_console_windows() -> None:
+    """Prevent the espeak CLI fallback from flashing a console on Windows.
+
+    kokorog2p normally uses the native espeak library, but falls back to its
+    CLI wrapper when that library cannot be loaded.  The wrapper launches
+    ``espeak-ng`` with ``subprocess.run`` and does not set Windows' hidden
+    console flag.  Keep the fallback available while limiting the fix to that
+    third-party module instead of changing subprocess behavior application-wide.
+    """
+
+    if os.name != "nt":
+        return
+
+    try:
+        cli_wrapper: Any = importlib.import_module(
+            "kokorog2p.backends.espeak.cli_wrapper"
+        )
+    except ImportError:
+        return
+
+    if getattr(cli_wrapper, "_ai_adventure_no_console", False):
+        return
+
+    import subprocess
+
+    original_subprocess = cli_wrapper.subprocess
+
+    class _SubprocessProxy:
+        def run(self, *args: Any, **kwargs: Any) -> Any:
+            kwargs.setdefault("creationflags", subprocess.CREATE_NO_WINDOW)
+            return subprocess.run(*args, **kwargs)
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(original_subprocess, name)
+
+    cli_wrapper.subprocess = _SubprocessProxy()
+    cli_wrapper._ai_adventure_no_console = True
+
+
 @dataclass(frozen=True)
 class TTSRequest:
     """A single text-to-speech synthesis request."""
@@ -86,6 +125,7 @@ class PyKokoroTTSEngine(TTSEngine):
     ) -> None:
         """Initializes the PyKokoro pipeline wrappers."""
 
+        _configure_kokoro_cli_no_console_windows()
         from pykokoro import KokoroPipeline, PipelineConfig
         from pykokoro.generation_config import GenerationConfig
         from pykokoro.tokenizer import TokenizerConfig
@@ -201,6 +241,7 @@ class KokoroOnnxTTSEngine(TTSEngine):
     ) -> None:
         """Initializes Kokoro once so chunked narration can reuse it."""
 
+        _configure_kokoro_cli_no_console_windows()
         from kokoro_onnx import Kokoro
 
         self.model_path = Path(model_path)

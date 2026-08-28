@@ -18,10 +18,6 @@ from ai_adventure.alchemy.ingredients import (
     normalize_crafting_item_notes,
     normalize_recipe_ingredients,
 )
-from ai_adventure.ascii_art import (
-    ensure_substantive_ascii_art,
-    is_substantive_ascii_art,
-)
 from ai_adventure.ai.modes import (
     default_ai_mode_settings,
     normalize_ai_mode_preferences,
@@ -52,6 +48,7 @@ from ai_adventure.locations import (
     DEFAULT_TRAVEL_SPEED_MULTIPLIER,
     KnownLocation,
     clean_player_location_name,
+    ensure_location_ids,
     normalize_known_location,
     normalize_known_locations,
 )
@@ -144,6 +141,7 @@ class SaveRepository:
 
         repository = cls(db_path)
         repository.set_meta("title", clean_title)
+        repository.set_setting("player.id", f"player_{uuid.uuid4().hex}")
 
         if setup is not None:
             repository.apply_new_game_setup(setup)
@@ -162,9 +160,11 @@ class SaveRepository:
         repository._set_default_ai_mode_settings()
         repository.set_setting("audio.music_enabled", True)
         repository.set_setting("audio.sound_effects_enabled", True)
+        repository.set_setting("audio.background_ambience_enabled", True)
         repository.set_setting("audio.narrator_enabled", True)
         repository.set_setting("audio.music_volume", 25)
         repository.set_setting("audio.sound_effects_volume", 35)
+        repository.set_setting("audio.background_ambience_volume", 15)
         repository.set_setting("audio.tts_volume", 90)
         repository.set_setting("audio.tts_voice", DEFAULT_NARRATOR_VOICE)
         repository.set_setting("audio.tts_speed", 100)
@@ -176,6 +176,7 @@ class SaveRepository:
         repository.set_setting("audio.tts_custom_voices", [])
         repository.set_setting("tts.pronunciation_map", {})
         repository.set_setting("audio.current_music", "")
+        repository.set_setting("audio.current_background_ambience", "")
         repository.set_note_entries([])
         repository.set_notes_share_with_ai(False)
         repository.set_currency_denominations(DEFAULT_CURRENCY_DENOMINATIONS)
@@ -281,11 +282,19 @@ class SaveRepository:
             "audio.sound_effects_enabled",
             bool(audio_settings["sound_effects_enabled"]),
         )
+        self.set_setting(
+            "audio.background_ambience_enabled",
+            bool(audio_settings["background_ambience_enabled"]),
+        )
         self.set_setting("audio.narrator_enabled", bool(audio_settings["narrator_enabled"]))
         self.set_setting("audio.music_volume", int(audio_settings["music_volume"]))
         self.set_setting(
             "audio.sound_effects_volume",
             int(audio_settings["sound_effects_volume"]),
+        )
+        self.set_setting(
+            "audio.background_ambience_volume",
+            int(audio_settings["background_ambience_volume"]),
         )
         self.set_setting("audio.tts_volume", int(audio_settings["tts_volume"]))
         self.set_setting("audio.tts_voice", audio_settings["tts_voice"])
@@ -295,6 +304,7 @@ class SaveRepository:
         self.set_setting("audio.tts_custom_voices", audio_settings["tts_custom_voices"])
         self.set_setting("tts.pronunciation_map", clean_setup["pronunciation_map"])
         self.set_setting("audio.current_music", "")
+        self.set_setting("audio.current_background_ambience", "")
         self.set_setting("new_game.setup", clean_setup)
         self.set_setting("world.setup_context", clean_setup["world_context"])
         self.set_setting("world.genre", clean_setup["specified_genre"])
@@ -329,7 +339,7 @@ class SaveRepository:
             "time",
             build_calendar_snapshot(starting_minute, calendar_settings)["display_label"],
         )
-        self.set_state_value("weather", "Clear")
+        self.set_state_value("weather", clean_setup["starting_weather"] or "Clear")
         self.set_state_value("condition", "Healthy")
 
         for item in clean_setup["starter_items"]:
@@ -446,8 +456,8 @@ class SaveRepository:
         return cls._save_title_exists(saves_dir, title)
 
     @classmethod
-    def rename_save(cls, saves_dir: Path, db_path: Path, new_title: str) -> None:
-        """Renames an existing save's player-facing title."""
+    def rename_save(cls, saves_dir: Path, db_path: Path, new_title: str) -> Path:
+        """Renames an existing save's title and containing directory."""
 
         save_dir = cls._save_dir_for_db_path(saves_dir, db_path)
         clean_title = new_title.strip() or "New Adventure"
@@ -462,8 +472,18 @@ class SaveRepository:
                 f"A save named '{clean_title}' already exists."
             )
 
-        repository = cls(resolved_db_path)
+        target_save_dir = _unique_save_dir(
+            saves_dir,
+            _slugify(clean_title),
+            datetime.now().strftime("%Y%m%d_%H%M%S_%f"),
+        )
+        if target_save_dir.resolve() != save_dir.resolve():
+            save_dir.rename(target_save_dir)
+
+        renamed_db_path = target_save_dir / cls.DATABASE_NAME
+        repository = cls(renamed_db_path)
         repository.set_meta("title", clean_title)
+        return renamed_db_path
 
     @classmethod
     def delete_save(cls, saves_dir: Path, db_path: Path) -> None:
@@ -699,11 +719,6 @@ class SaveRepository:
         clean_metadata["quantity_unit"] = _inventory_quantity_unit(raw_metadata)
         clean_metadata["storage_location"] = _inventory_storage_location(raw_metadata)
         clean_metadata["item_uuid"] = str(raw_metadata.get("item_uuid", "")).strip() or str(uuid.uuid4())
-        clean_metadata["ascii_art"] = ensure_substantive_ascii_art(
-            raw_metadata.get("ascii_art", ""),
-            item_name=clean_name,
-            category=category,
-        )
         metadata_json = _encode_json_dict(clean_metadata)
 
         with self._connect() as connection:
@@ -726,11 +741,7 @@ class SaveRepository:
                 updated_description = description.strip() or str(primary_row["description"])
                 updated_quantity = existing_quantity + quantity
                 updated_value = clean_value if clean_value > 0 else existing_value
-                updated_metadata = (
-                    metadata_json
-                    if clean_metadata.get("item_type") != "Item"
-                    else str(primary_row["metadata_json"])
-                )
+                updated_metadata = metadata_json
                 connection.execute(
                     """
                     UPDATE inventory_items
@@ -871,11 +882,6 @@ class SaveRepository:
             clean_metadata["item_uuid"] = (
                 str(raw_metadata.get("item_uuid", "")).strip() or str(uuid.uuid4())
             )
-            clean_metadata["ascii_art"] = ensure_substantive_ascii_art(
-                raw_metadata.get("ascii_art", ""),
-                item_name=name,
-                category=str(raw_item.get("category", "Item")),
-            )
             clean_items.append(
                 {
                     "name": name,
@@ -974,7 +980,6 @@ class SaveRepository:
                     category,
                     description,
                     value_base_units,
-                    ascii_art,
                     metadata_json,
                     first_seen_at,
                     updated_at
@@ -1179,7 +1184,6 @@ class SaveRepository:
         notes: str = "",
         rarity: str = "Common",
         value_base_units: int = 0,
-        ascii_art: str = "",
         item_uuid: str = "",
     ) -> None:
         """
@@ -1251,10 +1255,7 @@ class SaveRepository:
                 category=clean_category,
                 description=clean_description,
                 value_base_units=clean_value,
-                metadata={
-                    "ascii_art": ascii_art,
-                    "item_uuid": item_uuid,
-                },
+                metadata={"item_uuid": item_uuid},
             )
 
         self.append_history("crafting", f"Discovered crafting item/material: {clean_name}.")
@@ -3468,6 +3469,205 @@ class SaveRepository:
             history.append(entry)
         return history
 
+    def ensure_visual_asset(
+        self,
+        *,
+        asset_id: str,
+        subject_type: str,
+        subject_key: str,
+        display_name: str,
+        descriptor_hash: str,
+        filename: str,
+        prompt: str,
+        model: str,
+        message_ids: tuple[str, ...] | list[str] = (),
+        ready: bool = False,
+    ) -> dict[str, Any]:
+        """Creates one versioned visual-asset record and links related messages."""
+
+        clean_asset_id = str(asset_id or "").strip()
+        clean_subject_type = str(subject_type or "").strip().casefold()
+        clean_subject_key = str(subject_key or "").strip().casefold()
+        filename_path = Path(str(filename or ""))
+        clean_filename = filename_path.as_posix()
+        if (
+            not clean_asset_id
+            or clean_subject_type not in {"player", "location", "inventory", "npc"}
+            or not clean_subject_key
+            or not clean_filename
+            or filename_path.is_absolute()
+            or ".." in filename_path.parts
+        ):
+            raise ValueError("Visual assets require a valid id, subject, key, and filename.")
+
+        timestamp = datetime.now().isoformat(timespec="seconds")
+        requested_status = "ready" if ready else "queued"
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO visual_assets (
+                    asset_id, subject_type, subject_key, display_name,
+                    descriptor_hash, filename, prompt, model, status,
+                    error_message, width, height, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, '', 0, 0, ?, ?)
+                ON CONFLICT(asset_id) DO UPDATE SET
+                    display_name = excluded.display_name,
+                    filename = excluded.filename,
+                    prompt = excluded.prompt,
+                    model = excluded.model,
+                    status = CASE
+                        WHEN visual_assets.status = 'ready' THEN 'ready'
+                        WHEN excluded.status = 'ready' THEN 'ready'
+                        ELSE visual_assets.status
+                    END,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    clean_asset_id,
+                    clean_subject_type,
+                    clean_subject_key,
+                    str(display_name or "").strip(),
+                    str(descriptor_hash or "").strip(),
+                    clean_filename,
+                    str(prompt or "").strip(),
+                    str(model or "").strip(),
+                    requested_status,
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            for message_id in message_ids:
+                clean_message_id = str(message_id or "").strip()
+                if not clean_message_id:
+                    continue
+                connection.execute(
+                    """
+                    INSERT OR IGNORE INTO message_visual_assets (message_id, asset_id)
+                    VALUES (?, ?)
+                    """,
+                    (clean_message_id, clean_asset_id),
+                )
+            row = connection.execute(
+                "SELECT * FROM visual_assets WHERE asset_id = ?",
+                (clean_asset_id,),
+            ).fetchone()
+        return dict(row) if row is not None else {}
+
+    def set_visual_asset_status(
+        self,
+        asset_id: str,
+        status: str,
+        *,
+        error_message: str = "",
+        width: int = 0,
+        height: int = 0,
+    ) -> None:
+        """Updates one image generation record after worker completion."""
+
+        clean_status = str(status or "").strip().casefold()
+        if clean_status not in {"queued", "generating", "ready", "failed"}:
+            raise ValueError(f"Unsupported visual asset status: {status}")
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE visual_assets
+                SET status = ?,
+                    error_message = ?,
+                    width = ?,
+                    height = ?,
+                    generation_requested = CASE
+                        WHEN ? = 'generating' THEN generation_requested + 1
+                        ELSE generation_requested
+                    END,
+                    updated_at = ?
+                WHERE asset_id = ?
+                """,
+                (
+                    clean_status,
+                    str(error_message or "").strip()[:500],
+                    max(0, int(width)),
+                    max(0, int(height)),
+                    clean_status,
+                    datetime.now().isoformat(timespec="seconds"),
+                    str(asset_id or "").strip(),
+                ),
+            )
+
+    def get_visual_asset(self, subject_type: str, subject_key: str) -> dict[str, Any] | None:
+        """Returns the newest ready image for one visible subject."""
+
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM visual_assets
+                WHERE subject_type = ? AND subject_key = ? AND status = 'ready'
+                ORDER BY updated_at DESC, created_at DESC
+                LIMIT 1
+                """,
+                (
+                    str(subject_type or "").strip().casefold(),
+                    str(subject_key or "").strip().casefold(),
+                ),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def list_visual_assets_for_message(self, message_id: str) -> list[dict[str, Any]]:
+        """Returns ready images linked to one conversation turn."""
+
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT va.*
+                FROM message_visual_assets AS mva
+                JOIN visual_assets AS va ON va.asset_id = mva.asset_id
+                WHERE mva.message_id = ? AND va.status = 'ready'
+                ORDER BY
+                    CASE va.subject_type
+                        WHEN 'player' THEN 0
+                        WHEN 'location' THEN 1
+                        WHEN 'npc' THEN 2
+                        ELSE 3
+                    END,
+                    va.display_name COLLATE NOCASE
+                """,
+                (str(message_id or "").strip(),),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_visual_asset_by_id(self, asset_id: str) -> dict[str, Any] | None:
+        """Returns one exact visual-asset version regardless of status."""
+
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM visual_assets WHERE asset_id = ?",
+                (str(asset_id or "").strip(),),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def visual_asset_generation_count(self) -> int:
+        """Returns the total paid generation attempts recorded for this save."""
+
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT COALESCE(SUM(generation_requested), 0) AS count FROM visual_assets"
+            ).fetchone()
+        return int(row["count"]) if row is not None else 0
+
+    def reset_failed_visual_assets(self) -> int:
+        """Requeues failed images only when the player explicitly requests a retry."""
+
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE visual_assets
+                SET status = 'queued', error_message = '', updated_at = ?
+                WHERE status = 'failed'
+                """,
+                (datetime.now().isoformat(timespec="seconds"),),
+            )
+        return max(0, int(cursor.rowcount))
+
     def capture_message_snapshot(self, message_id: str) -> None:
         """Captures the complete database state immediately before one response."""
 
@@ -3930,25 +4130,29 @@ class SaveRepository:
     def get_travel_locations(self) -> list[dict[str, Any]]:
         """Reads structured player-known locations used by the Travel screen."""
 
-        return [
-            location.to_dict()
-            for location in normalize_known_locations(
-                self.get_setting("travel.locations", [])
-            )
-        ]
+        raw_locations = self.get_setting("travel.locations", [])
+        locations = ensure_location_ids(normalize_known_locations(raw_locations))
+        serialized = [location.to_dict() for location in locations]
+        if raw_locations != serialized:
+            self.set_setting("travel.locations", serialized)
+        return serialized
 
     def set_travel_locations(self, locations: Any) -> None:
         """Stores normalized structured player-known travel locations."""
 
+        normalized = ensure_location_ids(normalize_known_locations(locations))
         self.set_setting(
             "travel.locations",
-            [location.to_dict() for location in normalize_known_locations(locations)],
+            [location.to_dict() for location in normalized],
         )
 
     def ensure_travel_locations(self) -> list[dict[str, Any]]:
         """Bootstraps travel data from the current scene when needed."""
 
-        locations = normalize_known_locations(self.get_setting("travel.locations", []))
+        locations = [
+            normalize_known_location(location) for location in self.get_travel_locations()
+        ]
+        locations = [location for location in locations if location is not None]
         indexes_by_name = {
             location.name.casefold(): index for index, location in enumerate(locations)
         }
@@ -3962,6 +4166,7 @@ class SaveRepository:
             locations.append(
                 KnownLocation(
                     name=current_location,
+                    location_id=f"loc_{uuid.uuid4().hex}",
                     description="Current player location.",
                     x_miles=0.0 if not locations else None,
                     y_miles=0.0 if not locations else None,
@@ -3973,6 +4178,15 @@ class SaveRepository:
             self.set_travel_locations([location.to_dict() for location in locations])
 
         return [location.to_dict() for location in locations]
+
+    def get_player_id(self) -> str:
+        """Returns the save-scoped stable identity for the player character."""
+
+        player_id = str(self.get_setting("player.id", "") or "").strip()
+        if not player_id:
+            player_id = f"player_{uuid.uuid4().hex}"
+            self.set_setting("player.id", player_id)
+        return player_id
 
     def find_travel_location(self, name: str) -> dict[str, Any] | None:
         """Finds one structured location by its player-visible name."""
@@ -4436,7 +4650,6 @@ class SaveRepository:
                     category TEXT NOT NULL DEFAULT '',
                     description TEXT NOT NULL DEFAULT '',
                     value_base_units INTEGER NOT NULL DEFAULT 0,
-                    ascii_art TEXT NOT NULL DEFAULT '',
                     metadata_json TEXT NOT NULL DEFAULT '{}',
                     first_seen_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
@@ -4658,10 +4871,44 @@ class SaveRepository:
                     value_json TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS visual_assets (
+                    asset_id TEXT PRIMARY KEY,
+                    subject_type TEXT NOT NULL,
+                    subject_key TEXT NOT NULL,
+                    display_name TEXT NOT NULL,
+                    descriptor_hash TEXT NOT NULL,
+                    filename TEXT NOT NULL,
+                    prompt TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'queued',
+                    error_message TEXT NOT NULL DEFAULT '',
+                    width INTEGER NOT NULL DEFAULT 0,
+                    height INTEGER NOT NULL DEFAULT 0,
+                    generation_requested INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_visual_assets_subject
+                ON visual_assets(subject_type, subject_key, updated_at);
+
+                CREATE TABLE IF NOT EXISTS message_visual_assets (
+                    message_id TEXT NOT NULL,
+                    asset_id TEXT NOT NULL,
+                    PRIMARY KEY (message_id, asset_id),
+                    FOREIGN KEY (asset_id) REFERENCES visual_assets(asset_id) ON DELETE CASCADE
+                );
+
                 DROP TABLE IF EXISTS alchemy_notes;
                 DROP TABLE IF EXISTS alchemy_reagents;
                 DROP TABLE IF EXISTS alchemy_recipes;
                 """
+            )
+            _ensure_column(
+                connection,
+                "visual_assets",
+                "generation_requested",
+                "INTEGER NOT NULL DEFAULT 0",
             )
             _ensure_column(
                 connection,
@@ -5371,11 +5618,6 @@ def _upsert_item_catalog_entry(
     clean_description = description.strip()
     clean_value = max(0, _safe_int(value_base_units, default=0) or 0)
     raw_metadata = metadata if isinstance(metadata, dict) else {}
-    clean_ascii_art = ensure_substantive_ascii_art(
-        raw_metadata.get("ascii_art", ""),
-        item_name=clean_name,
-        category=clean_category,
-    )
     clean_metadata = normalize_item_metadata(
         metadata,
         name=clean_name,
@@ -5390,7 +5632,7 @@ def _upsert_item_catalog_entry(
     now = datetime.now().isoformat(timespec="seconds")
     row = connection.execute(
         """
-        SELECT id, category, description, value_base_units, ascii_art, metadata_json, first_seen_at
+        SELECT id, category, description, value_base_units, metadata_json, first_seen_at
         FROM item_catalog
         WHERE name = ? COLLATE NOCASE
         ORDER BY id ASC
@@ -5407,19 +5649,17 @@ def _upsert_item_catalog_entry(
                 category,
                 description,
                 value_base_units,
-                ascii_art,
                 metadata_json,
                 first_seen_at,
                 updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 clean_name,
                 clean_category,
                 clean_description,
                 clean_value,
-                clean_ascii_art,
                 metadata_json,
                 now,
                 now,
@@ -5427,15 +5667,6 @@ def _upsert_item_catalog_entry(
         )
         return
 
-    resolved_ascii_art = (
-        clean_ascii_art
-        if is_substantive_ascii_art(raw_metadata.get("ascii_art", ""))
-        else ensure_substantive_ascii_art(
-            row["ascii_art"],
-            item_name=clean_name,
-            category=clean_category or str(row["category"]),
-        )
-    )
     existing_metadata = _decode_json_dict(
         row["metadata_json"],
         "item catalog metadata",
@@ -5453,7 +5684,6 @@ def _upsert_item_catalog_entry(
             category = ?,
             description = ?,
             value_base_units = ?,
-            ascii_art = ?,
             metadata_json = ?,
             updated_at = ?
         WHERE id = ?
@@ -5463,10 +5693,7 @@ def _upsert_item_catalog_entry(
             clean_category or str(row["category"]),
             clean_description or str(row["description"]),
             clean_value if clean_value > 0 else int(row["value_base_units"]),
-            resolved_ascii_art,
-            metadata_json
-            if clean_metadata.get("item_type") != "Item"
-            else str(row["metadata_json"]),
+            metadata_json,
             now,
             row["id"],
         ),
@@ -5489,11 +5716,6 @@ def _inventory_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
     normalized_metadata["quantity_unit"] = metadata["quantity_unit"]
     normalized_metadata["storage_location"] = storage_location
     normalized_metadata["item_uuid"] = str(metadata.get("item_uuid", "")).strip()
-    normalized_metadata["ascii_art"] = ensure_substantive_ascii_art(
-        metadata.get("ascii_art", ""),
-        item_name=str(row["name"]),
-        category=str(row["category"]),
-    )
     return {
         "id": row["id"],
         "name": row["name"],
@@ -5526,11 +5748,6 @@ def _item_catalog_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
         "category": row["category"],
         "description": row["description"],
         "value_base_units": row["value_base_units"],
-        "ascii_art": ensure_substantive_ascii_art(
-            row["ascii_art"],
-            item_name=str(row["name"]),
-            category=str(row["category"]),
-        ),
         "metadata": normalized_metadata,
         "first_seen_at": row["first_seen_at"],
         "updated_at": row["updated_at"],

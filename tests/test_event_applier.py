@@ -276,9 +276,9 @@ class EventApplierTests(unittest.TestCase):
             self.assertEqual(lantern["storage_location"], "Pack Mule")
             catalog_lantern = next(item for item in catalog if item["name"] == "Brass Lantern")
             self.assertNotIn("Old Brass Light", {item["name"] for item in catalog})
-            self.assertEqual(catalog_lantern["ascii_art"], "  ___\n /___\\\n | * |")
+            self.assertNotIn("ascii_art", catalog_lantern)
 
-    def test_inventory_item_added_replaces_bracket_label_ascii_art(self) -> None:
+    def test_inventory_item_added_drops_legacy_art_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             repository = SaveRepository.create_new_save(
                 Path(temp_dir),
@@ -305,8 +305,7 @@ class EventApplierTests(unittest.TestCase):
                 if item["name"] == "Camera"
             )
             self.assertEqual(result.status, "applied")
-            self.assertGreaterEqual(len(camera["ascii_art"].splitlines()), 3)
-            self.assertNotIn("Camera", camera["ascii_art"])
+            self.assertNotIn("ascii_art", camera)
 
     def test_inventory_item_added_normalizes_finished_toxin_to_poison(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -539,6 +538,42 @@ class EventApplierTests(unittest.TestCase):
             self.assertTrue(container["is_open"])
             self.assertFalse(container["is_locked"])
             self.assertFalse(container["is_trapped"])
+
+    def test_matching_key_opens_locked_container_without_lockpick_check(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = SaveRepository.create_new_save(Path(temp_dir), "Keyed Container")
+            repository.add_inventory_item(
+                "Storage Chest",
+                "Container",
+                1,
+                "A locked storage chest.",
+                20,
+                metadata=_test_container_metadata(locked=True),
+            )
+            repository.add_inventory_item(
+                "Storage Chest Key",
+                "Key",
+                1,
+                "The key to the storage chest.",
+                1,
+                metadata={"item_type": "Key"},
+            )
+
+            result = EventApplier(repository).apply_event(
+                {
+                    "type": "ContainerOpenedEvent",
+                    "payload": {"container_name": "Storage Chest"},
+                }
+            )
+            chest = next(
+                item
+                for item in repository.list_inventory_items()
+                if item["name"] == "Storage Chest"
+            )
+
+            self.assertEqual(result.status, "applied")
+            self.assertTrue(chest["metadata"]["container"]["is_open"])
+            self.assertFalse(chest["metadata"]["container"]["is_locked"])
 
     def test_container_batch_rejects_duplicate_direct_rewards(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1198,6 +1233,35 @@ class EventApplierTests(unittest.TestCase):
             self.assertEqual(result.status, "skipped")
             self.assertIsNone(repository.get_setting("audio.current_sound_effect"))
 
+    def test_background_ambience_event_starts_and_stops_persistent_loop(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = SaveRepository.create_new_save(Path(temp_dir), "Ambience Test")
+            applier = EventApplier(repository)
+
+            started = applier.apply_event(
+                {
+                    "type": "BackgroundAmbienceChangedEvent",
+                    "payload": {"filename": "Steady Rain.ogg"},
+                }
+            )
+            self.assertEqual(started.status, "applied")
+            self.assertEqual(
+                repository.get_setting("audio.current_background_ambience"),
+                "Steady Rain.ogg",
+            )
+
+            stopped = applier.apply_event(
+                {
+                    "type": "BackgroundAmbienceChangedEvent",
+                    "payload": {"filename": "STOP"},
+                }
+            )
+            self.assertEqual(stopped.status, "applied")
+            self.assertEqual(
+                repository.get_setting("audio.current_background_ambience"),
+                "",
+            )
+
     def test_normalizes_event_type_alias_from_new_game_events(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             repository = SaveRepository.create_new_save(Path(temp_dir), "Alias Test")
@@ -1413,7 +1477,7 @@ class EventApplierTests(unittest.TestCase):
             catalog = repository.list_item_catalog()
             catalog_moonwater = next(item for item in catalog if item["name"] == "Moonwater")
             self.assertEqual(catalog_moonwater["category"], "Ingredient")
-            self.assertEqual(catalog_moonwater["ascii_art"], " ~~~~\n(____)\n \\__/")
+            self.assertNotIn("ascii_art", catalog_moonwater)
             mooncap = next(
                 reagent for reagent in reagents
                 if reagent["name"] == "Mooncap Fungus"

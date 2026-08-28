@@ -15,6 +15,7 @@ from ai_adventure.app.app_paths import AppPaths
 from ai_adventure.audio.narration import (
     GeneratedNarrationChunk,
     NarrationPlayer,
+    _merge_compatible_narration_chunks,
     build_narration_chunks,
     chunk_tts_text,
     normalize_tts_time_text,
@@ -29,8 +30,10 @@ from ai_adventure.audio.tts_settings import (
     parse_voice_blend_spec,
 )
 from ai_adventure.audio.sound_manager import (
+    BACKGROUND_AMBIENCE_CHANNEL_INDEX,
     SOUND_EFFECT_CHANNEL_INDEX,
     SoundManager,
+    prepare_background_ambience_directory,
     prepare_sound_directory,
     prepare_sound_effect_directory,
 )
@@ -197,22 +200,31 @@ class AudioTests(unittest.TestCase):
             with TemporaryDirectory() as temp_dir:
                 music_dir = Path(temp_dir) / "music"
                 effect_dir = Path(temp_dir) / "effects"
+                ambience_dir = Path(temp_dir) / "ambience"
                 music_dir.mkdir()
                 effect_dir.mkdir()
+                ambience_dir.mkdir()
                 music_path = music_dir / "Slow Jazz.mp3"
                 effect_path = effect_dir / "Steady Rain.wav"
+                ambience_path = ambience_dir / "Quiet Rain.ogg"
                 music_path.write_bytes(b"music")
                 effect_path.write_bytes(b"rain")
+                ambience_path.write_bytes(b"looping rain")
                 (effect_dir / music_path.name).write_bytes(b"misfiled music")
-                manager = SoundManager(music_dir, effect_dir)
+                manager = SoundManager(music_dir, effect_dir, ambience_dir)
                 self.assertEqual(manager.get_valid_track_names(), [music_path.name])
                 self.assertEqual(
                     manager.get_valid_sound_effect_names(),
                     [effect_path.name],
                 )
+                self.assertEqual(
+                    manager.get_valid_background_ambience_names(),
+                    [ambience_path.name],
+                )
                 manager.play_music(music_path.name)
                 music_stop_calls = fake_music.stop_calls
                 manager.play_sound_effect(effect_path.name)
+                manager.play_background_ambience(ambience_path.name)
 
                 self.assertEqual(manager.current_music, music_path.name)
                 self.assertEqual(fake_music.stop_calls, music_stop_calls)
@@ -221,6 +233,16 @@ class AudioTests(unittest.TestCase):
                     fake_channels[SOUND_EFFECT_CHANNEL_INDEX].played[0][1],
                     0,
                 )
+                self.assertEqual(
+                    fake_channels[BACKGROUND_AMBIENCE_CHANNEL_INDEX].played[0][1],
+                    -1,
+                )
+                self.assertEqual(
+                    manager.current_background_ambience,
+                    ambience_path.name,
+                )
+                manager.stop_background_ambience()
+                self.assertIsNone(manager.current_background_ambience)
         finally:
             if original_pygame is None:
                 sys.modules.pop("pygame", None)
@@ -290,6 +312,18 @@ class AudioTests(unittest.TestCase):
             chunks[0].tts_text,
             "The bell rings at [7:00 A.M.](as: time) What do you do now?",
         )
+
+    def test_player_merges_short_same_voice_paragraphs_for_gapless_playback(self) -> None:
+        chunks = build_narration_chunks(
+            "The bell rings.\n\nThe gates open.",
+        )
+
+        merged = _merge_compatible_narration_chunks(chunks)
+
+        self.assertEqual(len(chunks), 2)
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0].display_text, "The bell rings.\n\nThe gates open.")
+        self.assertIn("...p", merged[0].tts_text)
 
     def test_narration_chunks_apply_pronunciation_only_to_spoken_text(self) -> None:
         text = "Ironpeak City wakes.\n\nThe market opens."
@@ -852,6 +886,7 @@ class AudioTests(unittest.TestCase):
             )
             sound_directory = prepare_sound_directory(paths)
             sound_effect_directory = prepare_sound_effect_directory(paths)
+            background_ambience_directory = prepare_background_ambience_directory(paths)
 
             self.assertEqual(sound_directory, paths.package_music_tracks_dir)
             self.assertTrue((sound_directory / "Boss_Fight.mp3").exists())
@@ -862,6 +897,14 @@ class AudioTests(unittest.TestCase):
             self.assertEqual(paths.package_sound_effects_dir.name, "sound_effects")
             self.assertTrue(
                 any(path.suffix.casefold() == ".mp3" for path in sound_effect_directory.iterdir())
+            )
+            self.assertEqual(
+                background_ambience_directory,
+                paths.background_ambience_dir,
+            )
+            self.assertEqual(
+                paths.package_background_ambience_dir.name,
+                "background_ambience_tracks",
             )
             self.assertEqual(paths.app_icon_path, paths.package_data_dir / "app_icon.ico")
             self.assertTrue(paths.app_icon_path.exists())

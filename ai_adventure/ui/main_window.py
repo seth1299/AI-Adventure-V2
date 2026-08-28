@@ -6,6 +6,7 @@ import re
 import logging
 import importlib
 import random
+import shutil
 import uuid
 from pathlib import Path
 from typing import Any, Callable, Protocol
@@ -18,20 +19,20 @@ from PySide6.QtCore import (
     QStringListModel,
     Qt,
     QThread,
+    QTime,
     QTimer,
     Signal,
     Slot,
 )
 from PySide6.QtGui import (
     QColor,
-    QFontMetrics,
     QIcon,
     QMouseEvent,
     QPalette,
+    QPixmap,
     QResizeEvent,
     QStandardItem,
     QStandardItemModel,
-    QTextBlockFormat,
     QTextCursor,
     QWheelEvent,
 )
@@ -73,6 +74,7 @@ from PySide6.QtWidgets import (
     QTableWidget,
     QTableWidgetItem,
     QTextEdit,
+    QTimeEdit,
     QTreeWidget,
     QTreeWidgetItem,
     QVBoxLayout,
@@ -91,7 +93,6 @@ from ai_adventure.alchemy.ingredients import (
     normalize_recipe_ingredient,
     normalize_recipe_ingredients,
 )
-from ai_adventure.ascii_art import ensure_substantive_ascii_art, normalize_ascii_art
 from ai_adventure.app.api_key_store import (
     read_api_key,
     record_terms_acceptance,
@@ -120,12 +121,29 @@ from ai_adventure.ai.modes import (
     RESPONSE_LENGTH_OPTIONS,
     normalize_ai_mode_preferences,
 )
+from ai_adventure.inventory_sorting import sort_inventory_items
+from ai_adventure.ui.story_bubbles import split_story_bubble_segments
+from ai_adventure.visual_assets import (
+    DEFAULT_IMAGE_LIMIT,
+    DEFAULT_IMAGE_MODEL,
+    DISPLAY_IMAGE_MAX_PIXELS,
+    GeminiVisualAssetService,
+    VisualAssetRequest,
+    build_visual_asset_requests,
+    find_reusable_inventory_asset,
+    save_relative_image_filename,
+    save_scaled_jpeg,
+)
+
+
 class SoundManagerProtocol(Protocol):
     """Runtime surface used from the background music manager."""
 
     def get_valid_track_names(self) -> list[str]: ...
 
     def get_valid_sound_effect_names(self) -> list[str]: ...
+
+    def get_valid_background_ambience_names(self) -> list[str]: ...
 
     def set_music_enabled(self, enabled: bool) -> None: ...
 
@@ -135,15 +153,23 @@ class SoundManagerProtocol(Protocol):
 
     def set_sound_effects_volume(self, volume: float | int | None) -> None: ...
 
+    def set_background_ambience_enabled(self, enabled: bool) -> None: ...
+
+    def set_background_ambience_volume(self, volume: float | int | None) -> None: ...
+
     def play_music(self, track_name_or_path: str | Path | None) -> None: ...
 
     def play_music_preview(self, track_name_or_path: str | Path | None) -> None: ...
 
     def play_sound_effect(self, track_name_or_path: str | Path | None) -> None: ...
 
+    def play_background_ambience(self, track_name_or_path: str | Path | None) -> None: ...
+
     def stop_music(self, *, clear_current: bool = True) -> None: ...
 
     def stop_sound_effect(self, *, clear_current: bool = True) -> None: ...
+
+    def stop_background_ambience(self, *, clear_current: bool = True) -> None: ...
 
 
 class NarrationPlayerProtocol(Protocol):
@@ -210,6 +236,7 @@ if not is_playtesting_build():
     from ai_adventure.audio.narration import NarrationPlayer as _NarrationPlayerClass
     from ai_adventure.audio.sound_manager import (
         SoundManager as _SoundManagerClass,
+        prepare_background_ambience_directory,
         prepare_sound_directory,
         prepare_sound_effect_directory,
     )
@@ -226,6 +253,11 @@ else:
         """Returns a harmless placeholder effect path in the audio-free build."""
 
         return Path(app_paths.sound_effects_dir)
+
+    def prepare_background_ambience_directory(app_paths: Any) -> Path:
+        """Returns a harmless placeholder ambience path in the audio-free build."""
+
+        return Path(app_paths.background_ambience_dir)
 from ai_adventure.audio.tts_settings import (
     DEFAULT_TTS_SPEED_PERCENT,
     active_voice_spec_from_audio,
@@ -321,6 +353,7 @@ from ai_adventure.new_game_setup import (
     describe_economy_examples,
     fallback_introductory_message,
     fallback_world_summary,
+    merge_authoritative_starting_calendar,
     normalize_economy_examples,
     normalize_character_pronouns,
     normalize_new_game_setup,
@@ -336,6 +369,7 @@ from ai_adventure.narration_preferences import (
 from ai_adventure.notes import parse_note_tags, prefix_markdown_lines, wrap_markdown_text
 from ai_adventure.new_game_templates import (
     NewGameTemplate,
+    available_automatic_template_name,
     delete_new_game_template,
     load_new_game_templates,
     save_new_game_template,
@@ -367,8 +401,17 @@ class _NoWheelSpinBox(QSpinBox):
         event.ignore()
 
 
-GM_THINKING_TEXT = "GM is thinking..."
-STORY_REVEAL_STALL_TIMEOUT_MS = 8000
+GM_THINKING_FRAMES = (
+    "GM is thinking.",
+    "GM is thinking..",
+    "GM is thinking...",
+)
+GM_THINKING_TIMER_INTERVAL_MS = 500
+UNRESOLVED_STATUS_TEXT = "---"
+# Kokoro can spend well over eight seconds on its first local synthesis while
+# loading the model and phonemizer.  Keep the fallback as a true failure guard
+# instead of racing normal cold-start work.
+STORY_REVEAL_STALL_TIMEOUT_MS = 30_000
 NPC_TURN_DELAY_MS = 2000
 CONTINUE_STORY_INSTRUCTION = (
     "Continue the previous story response as though it had been longer originally. "
@@ -650,7 +693,27 @@ class RepositoryBackedWidget(QWidget):
     def __init__(self) -> None:
         super().__init__()
         self._repository: SaveRepository | None = None
+        self._visual_assets_dir: Path | None = None
         self.on_repository_changed: Callable[["RepositoryBackedWidget"], None] | None = None
+
+    def set_visual_assets_dir(self, directory: Path | str) -> None:
+        """Sets the device-local cache root used by image-bearing screens."""
+
+        self._visual_assets_dir = Path(directory).expanduser().resolve()
+
+    def visual_asset_path(self, asset: dict[str, Any] | None) -> Path | None:
+        """Resolves a safe cached filename beneath the configured images directory."""
+
+        if self._visual_assets_dir is None or not isinstance(asset, dict):
+            return None
+        filename = Path(str(asset.get("filename", "") or ""))
+        if not filename or filename.is_absolute() or ".." in filename.parts:
+            return None
+        root = self._visual_assets_dir.resolve()
+        path = (root / filename).resolve()
+        if root not in path.parents and path != root:
+            return None
+        return path if path.is_file() else None
 
     def set_repository(self, repository: SaveRepository | None) -> None:
         """
@@ -681,6 +744,39 @@ class RepositoryBackedWidget(QWidget):
 
         if self.on_repository_changed is not None:
             self.on_repository_changed(self)
+
+
+def _set_generated_image(
+    label: QLabel,
+    path: Path | None,
+    *,
+    maximum_width: int,
+    maximum_height: int,
+    accessible_name: str = "Generated image",
+) -> bool:
+    """Loads and scales one cached image without distorting its aspect ratio."""
+
+    if path is None:
+        label.clear()
+        label.hide()
+        return False
+    pixmap = QPixmap(str(path))
+    if pixmap.isNull():
+        label.clear()
+        label.hide()
+        return False
+    scaled = pixmap.scaled(
+        max(64, maximum_width),
+        max(64, maximum_height),
+        Qt.AspectRatioMode.KeepAspectRatio,
+        Qt.TransformationMode.SmoothTransformation,
+    )
+    label.setPixmap(scaled)
+    label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+    label.setAccessibleName(accessible_name)
+    label.setToolTip(accessible_name)
+    label.show()
+    return True
 
 
 def _screen_content_signature(screen: QWidget) -> str:
@@ -853,6 +949,414 @@ class _GeminiSkillCheckPlanWorker(QObject):
             self.finished.emit()
 
 
+class _GeminiNewGameWorker(QObject):
+    """Runs one Gemini new-game request away from the Qt UI thread."""
+
+    completed = Signal(object)
+    configuration_error = Signal(str)
+    request_failed = Signal(str)
+    failed = Signal()
+    finished = Signal()
+
+    def __init__(
+        self,
+        setup_packet: dict[str, Any],
+        api_key_path: Path | None = None,
+    ) -> None:
+        super().__init__()
+        self._setup_packet = setup_packet
+        self._api_key_path = api_key_path
+
+    @Slot()
+    def run(self) -> None:
+        """Generates the initial world and emits the result on completion."""
+
+        try:
+            if GeminiNarrationService is None:
+                raise GeminiConfigurationError("AI generation is disabled in this build.")
+
+            result = GeminiNarrationService(
+                api_key_path=self._api_key_path,
+            ).generate_new_game_world(self._setup_packet)
+        except GeminiConfigurationError as error:
+            LOGGER.warning("Gemini new-game synthesis skipped: %s", error)
+            self.configuration_error.emit(str(error))
+        except GeminiRequestError as error:
+            LOGGER.warning("Gemini new-game synthesis ended cleanly: %s", error)
+            self.request_failed.emit(str(error))
+        except Exception:
+            LOGGER.exception("Gemini new-game synthesis failed.")
+            self.failed.emit()
+        else:
+            self.completed.emit(result)
+        finally:
+            self.finished.emit()
+
+
+class _GeminiVisualAssetWorker(QObject):
+    """Runs one separately billed image-only request away from the Qt UI thread."""
+
+    completed = Signal(object, bytes, str)
+    failed = Signal(object, str)
+    finished = Signal()
+
+    def __init__(
+        self,
+        request: VisualAssetRequest,
+        *,
+        api_key_path: Path,
+        model: str,
+    ) -> None:
+        super().__init__()
+        self._request = request
+        self._api_key_path = api_key_path
+        self._model = model
+
+    @Slot()
+    def run(self) -> None:
+        """Generates one image without sharing the structured story request path."""
+
+        try:
+            image_bytes, mime_type = GeminiVisualAssetService(
+                api_key_path=self._api_key_path,
+                model=self._model,
+            ).generate(self._request)
+        except Exception as error:
+            LOGGER.warning(
+                "Gemini visual asset generation failed for %s %r: %s",
+                self._request.subject_type,
+                self._request.display_name,
+                error,
+            )
+            self.failed.emit(self._request, str(error))
+        else:
+            self.completed.emit(self._request, image_bytes, mime_type)
+        finally:
+            self.finished.emit()
+
+
+class _VisualAssetCoordinator(QObject):
+    """Queues reusable image assets one at a time and applies results on the GUI thread."""
+
+    assets_changed = Signal()
+    initial_batch_finished = Signal(object)
+
+    def __init__(
+        self,
+        *,
+        images_dir: Path,
+        api_key_path: Path,
+        enabled: bool,
+        parent: QObject | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.images_dir = images_dir.expanduser().resolve()
+        self.api_key_path = api_key_path.expanduser().resolve()
+        self.enabled = bool(enabled)
+        self._queue: list[tuple[SaveRepository, VisualAssetRequest, str, int]] = []
+        self._queued_asset_ids: set[str] = set()
+        self._thread: QThread | None = None
+        self._worker: QObject | None = None
+        self._initial_batch_repositories: set[str] = set()
+        self._initial_batch_repository_objects: dict[str, SaveRepository] = {}
+        if self.enabled:
+            self.images_dir.mkdir(parents=True, exist_ok=True)
+
+    def begin_initial_batch(self, repository: SaveRepository) -> None:
+        """Defers the opening-scene reveal until this save's first images settle."""
+
+        self._initial_batch_repositories.add(str(repository.db_path))
+        self._initial_batch_repository_objects[str(repository.db_path)] = repository
+        self.scan(repository)
+        self._finish_initial_batch_if_ready(repository)
+
+    def _is_initial_batch(self, repository: SaveRepository) -> bool:
+        """Returns whether per-image refreshes are currently suppressed for a save."""
+
+        return str(repository.db_path) in self._initial_batch_repositories
+
+    def _initial_batch_has_pending_work(self, repository: SaveRepository) -> bool:
+        """Checks queued, active, and still-generatable visual assets for a save."""
+
+        if not self.enabled or not _bool_setting(
+            repository.get_setting("images.enabled", True),
+            True,
+        ) or not read_api_key(self.api_key_path):
+            return False
+        limit = _clamped_int(
+            repository.get_setting("images.maximum_generated", DEFAULT_IMAGE_LIMIT),
+            DEFAULT_IMAGE_LIMIT,
+            1,
+            10_000,
+        )
+        if repository.visual_asset_generation_count() >= limit:
+            return False
+
+        repository_key = str(repository.db_path)
+        if any(
+            str(queued_repository.db_path) == repository_key
+            for queued_repository, _request, _model, _limit in self._queue
+        ):
+            return True
+        if self._thread is not None:
+            worker_request = getattr(self._worker, "_request", None)
+            if isinstance(worker_request, VisualAssetRequest):
+                current_record = repository.get_visual_asset_by_id(
+                    worker_request.asset_id
+                )
+                if current_record is not None and current_record.get("status") == "generating":
+                    return True
+        return any(
+            str(record.get("status", "")) in {"queued", "generating"}
+            for record in (
+                repository.get_visual_asset_by_id(request.asset_id)
+                for request in build_visual_asset_requests(repository)
+            )
+            if record is not None
+        )
+
+    def _finish_initial_batch_if_ready(self, repository: SaveRepository) -> None:
+        """Emits one completion signal after the initial visual queue is drained."""
+
+        repository_key = str(repository.db_path)
+        if (
+            repository_key in self._initial_batch_repositories
+            and self._thread is None
+            and not self._initial_batch_has_pending_work(repository)
+        ):
+            self._initial_batch_repositories.discard(repository_key)
+            self._initial_batch_repository_objects.pop(repository_key, None)
+            self.initial_batch_finished.emit(repository)
+
+    def scan(self, repository: SaveRepository | None) -> None:
+        """Registers cache hits and queues missing current entity images."""
+
+        if repository is None or not self.enabled:
+            return
+        if not _bool_setting(repository.get_setting("images.enabled", True), True):
+            return
+
+        has_api_key = bool(read_api_key(self.api_key_path))
+        model = str(
+            repository.get_setting("images.model", DEFAULT_IMAGE_MODEL)
+            or DEFAULT_IMAGE_MODEL
+        ).strip()
+        limit = _clamped_int(
+            repository.get_setting("images.maximum_generated", DEFAULT_IMAGE_LIMIT),
+            DEFAULT_IMAGE_LIMIT,
+            1,
+            10_000,
+        )
+        for request in build_visual_asset_requests(repository):
+            relative_filename = save_relative_image_filename(repository, request)
+            target_path = self.images_dir / relative_filename
+            record = repository.ensure_visual_asset(
+                asset_id=request.asset_id,
+                subject_type=request.subject_type,
+                subject_key=request.subject_key,
+                display_name=request.display_name,
+                descriptor_hash=request.descriptor_hash,
+                filename=relative_filename,
+                prompt=request.prompt,
+                model=model,
+                message_ids=request.message_ids,
+                ready=target_path.is_file(),
+            )
+            if (
+                target_path.is_file()
+                or record.get("status") != "queued"
+                or not has_api_key
+            ):
+                continue
+            if request.asset_id in self._queued_asset_ids:
+                continue
+            reusable = find_reusable_inventory_asset(
+                images_dir=self.images_dir,
+                saves_dir=self.images_dir.parent / "saves",
+                repository=repository,
+                request=request,
+            )
+            if reusable is not None:
+                try:
+                    target_path.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(reusable["source_path"], target_path)
+                    repository.set_visual_asset_status(
+                        request.asset_id,
+                        "ready",
+                        width=int(reusable.get("width", 0)),
+                        height=int(reusable.get("height", 0)),
+                    )
+                    LOGGER.info(
+                        "Reused visual asset %s for %s from another save (score %.1f).",
+                        request.filename,
+                        request.display_name,
+                        float(reusable.get("score", 0.0)),
+                    )
+                    continue
+                except OSError as error:
+                    LOGGER.warning(
+                        "Could not reuse visual asset for %s: %s",
+                        request.display_name,
+                        error,
+                    )
+            self._queue.append((repository, request, model, limit))
+            self._queued_asset_ids.add(request.asset_id)
+        self._start_next()
+        self._finish_initial_batch_if_ready(repository)
+
+    def retry_failed(self, repository: SaveRepository | None) -> int:
+        """Requeues failed requests only after an explicit player action."""
+
+        if repository is None:
+            return 0
+        reset_count = repository.reset_failed_visual_assets()
+        if reset_count:
+            self.scan(repository)
+        return reset_count
+
+    def _start_next(self) -> None:
+        """Starts the next affordable queued request."""
+
+        if self._thread is not None:
+            return
+        while self._queue:
+            repository, request, model, limit = self._queue.pop(0)
+            self._queued_asset_ids.discard(request.asset_id)
+            record = repository.get_visual_asset_by_id(request.asset_id)
+            if record is None or record.get("status") != "queued":
+                continue
+            if not _bool_setting(
+                repository.get_setting("images.enabled", True),
+                True,
+            ):
+                continue
+            if repository.visual_asset_generation_count() >= limit:
+                LOGGER.info(
+                    "Visual asset generation limit reached for %s; leaving %s queued.",
+                    repository.db_path,
+                    request.asset_id,
+                )
+                continue
+
+            repository.set_visual_asset_status(request.asset_id, "generating")
+            thread = QThread(self)
+            worker = _GeminiVisualAssetWorker(
+                request,
+                api_key_path=self.api_key_path,
+                model=model,
+            )
+            worker.moveToThread(thread)
+            thread.started.connect(worker.run)
+            worker.completed.connect(
+                lambda completed_request, image_bytes, mime_type,
+                repository=repository: self._handle_completed(
+                    repository,
+                    completed_request,
+                    image_bytes,
+                    mime_type,
+                )
+            )
+            worker.failed.connect(
+                lambda failed_request, message,
+                repository=repository: self._handle_failed(
+                    repository,
+                    failed_request,
+                    message,
+                )
+            )
+            worker.finished.connect(thread.quit)
+            worker.finished.connect(worker.deleteLater)
+            thread.finished.connect(thread.deleteLater)
+            # Use the coordinator's bound slot directly.  A lambda here can be
+            # lost during Qt thread teardown, leaving the coordinator holding a
+            # completed thread and preventing the next visual request from starting.
+            thread.finished.connect(self._clear_worker)
+            self._thread = thread
+            self._worker = worker
+            thread.start()
+            return
+
+    def _handle_completed(
+        self,
+        repository: SaveRepository,
+        request: VisualAssetRequest,
+        image_bytes: bytes,
+        _mime_type: str,
+    ) -> None:
+        """Downscales and records one completed generated image."""
+
+        try:
+            width, height = save_scaled_jpeg(
+                image_bytes,
+                self.images_dir
+                / save_relative_image_filename(repository, request),
+            )
+        except Exception as error:
+            LOGGER.warning("Failed to save generated image %s: %s", request.filename, error)
+            repository.set_visual_asset_status(
+                request.asset_id,
+                "failed",
+                error_message=str(error),
+            )
+            return
+        repository.set_visual_asset_status(
+            request.asset_id,
+            "ready",
+            width=width,
+            height=height,
+        )
+        record = repository.get_visual_asset_by_id(request.asset_id)
+        LOGGER.info(
+            "Generated visual asset %s (%sx%s) using %s.",
+            request.filename,
+            width,
+            height,
+            record.get("model", "") if record else DEFAULT_IMAGE_MODEL,
+        )
+        if not self._is_initial_batch(repository):
+            self.assets_changed.emit()
+
+    def _handle_failed(
+        self,
+        repository: SaveRepository,
+        request: VisualAssetRequest,
+        message: str,
+    ) -> None:
+        """Records one clean failure without automatic paid retries."""
+
+        repository.set_visual_asset_status(
+            request.asset_id,
+            "failed",
+            error_message=message,
+        )
+        if not self._is_initial_batch(repository):
+            self.assets_changed.emit()
+
+    @Slot()
+    def _clear_worker(
+        self,
+        thread: QThread | None = None,
+        worker: QObject | None = None,
+    ) -> None:
+        """Releases one worker and continues the serial queue."""
+
+        if thread is None or self._thread is thread:
+            self._thread = None
+        if worker is None or self._worker is worker:
+            self._worker = None
+        LOGGER.debug(
+            "Visual asset worker finished; %s request(s) remain queued.",
+            len(self._queue),
+        )
+        self._start_next()
+        if self._thread is None:
+            for repository in tuple(self._initial_batch_repository_objects.values()):
+                # Reconcile durable queued records in case a previous worker
+                # exited before its in-memory queue entry was advanced.
+                self.scan(repository)
+                self._finish_initial_batch_if_ready(repository)
+
+
 def _create_narration_player(app_paths: AppPaths) -> NarrationPlayerProtocol | None:
     """Creates the narration player only when TTS support is enabled."""
 
@@ -896,6 +1400,11 @@ class MainWindow(QMainWindow):
 
         self.app_paths = app_paths
         self.active_repository: SaveRepository | None = None
+        self._new_game_thread: QThread | None = None
+        self._new_game_worker: QObject | None = None
+        self._pending_new_game_repository: SaveRepository | None = None
+        self._pending_new_game_setup: dict[str, Any] | None = None
+        self._waiting_for_initial_visuals: SaveRepository | None = None
         self.playtesting_build = is_playtesting_build()
         self.ai_enabled = is_ai_enabled()
         self.tts_enabled = is_tts_enabled()
@@ -911,6 +1420,7 @@ class MainWindow(QMainWindow):
             else _SoundManagerClass(
                 prepare_sound_directory(self.app_paths),
                 prepare_sound_effect_directory(self.app_paths),
+                prepare_background_ambience_directory(self.app_paths),
             )
         )
         self.narration_player = _create_narration_player(self.app_paths)
@@ -948,8 +1458,12 @@ class MainWindow(QMainWindow):
             global_tts_settings_provider=lambda: self.app_settings["audio"],
             custom_voice_storage_path=self.app_paths.app_settings_path,
             gemini_api_key_path=self.app_paths.gemini_api_key_path,
+            generated_images_dir=self.app_paths.images_dir,
             playtesting_tools=self.playtesting_build,
             ai_enabled=self.ai_enabled,
+        )
+        self.game_shell.visual_asset_coordinator.initial_batch_finished.connect(
+            self._handle_initial_visuals_ready
         )
 
         self.stack.addWidget(self.main_menu)
@@ -1036,6 +1550,7 @@ class MainWindow(QMainWindow):
                     self._create_new_game_from_setup(
                         clean_setup,
                         template_save_name=template_save_name,
+                        auto_save_template_if_available=loaded_template_name is None,
                     )
                     return
                 except DuplicateSaveTitleError as error:
@@ -1347,7 +1862,10 @@ class MainWindow(QMainWindow):
         clean_setup = self._normalize_new_game_setup_for_runtime(setup)
 
         try:
-            self._create_new_game_from_setup(clean_setup)
+            self._create_new_game_from_setup(
+                clean_setup,
+                auto_save_template_if_available=True,
+            )
         except DuplicateSaveTitleError as error:
             QMessageBox.warning(self, "Save Name Already Exists", str(error))
             return False
@@ -1363,6 +1881,7 @@ class MainWindow(QMainWindow):
         clean_setup: dict[str, Any],
         *,
         template_save_name: str | None = None,
+        auto_save_template_if_available: bool = False,
     ) -> None:
         """Creates a new save from normalized setup and opens the shell."""
 
@@ -1375,10 +1894,18 @@ class MainWindow(QMainWindow):
         )
         repository.set_setting("theme", self.menu_theme)
 
-        if template_save_name and not save_new_game_template(
+        effective_template_name = template_save_name
+        if effective_template_name is None and auto_save_template_if_available:
+            effective_template_name = available_automatic_template_name(
+                self.app_paths.new_game_templates_path,
+                clean_setup,
+                legacy_template_path=self.app_paths.legacy_new_game_template_path,
+            )
+
+        if effective_template_name and not save_new_game_template(
             self.app_paths.new_game_templates_path,
-            {**clean_setup, "title": template_save_name},
-            template_name=template_save_name,
+            {**clean_setup, "title": effective_template_name},
+            template_name=effective_template_name,
         ):
             QMessageBox.warning(
                 self,
@@ -1391,89 +1918,159 @@ class MainWindow(QMainWindow):
             return
 
         self.game_shell.story_screen.set_initial_generation_pending(True)
-        QApplication.processEvents()
-        QTimer.singleShot(
-            0,
-            lambda: self._finish_new_game_generation(repository, clean_setup),
-        )
+        self.game_shell.menu_button.setEnabled(False)
+        self._start_new_game_generation(repository, clean_setup)
 
-    def _finish_new_game_generation(
+    def _start_new_game_generation(
         self,
         repository: SaveRepository,
         setup: dict[str, Any],
     ) -> None:
-        """Completes AI world synthesis after the fresh save is visible."""
-
-        if self.active_repository is not repository:
-            return
-
-        narration_started = False
-        try:
-            self._synthesize_new_game_world(repository, setup)
-            narration_started = self.game_shell.story_screen.narrate_latest_story(
-                reveal_progressively=True,
-            )
-            self.game_shell.refresh_screens()
-        finally:
-            if not narration_started:
-                self.game_shell.story_screen.set_initial_generation_pending(False)
-
-    def _synthesize_new_game_world(
-        self,
-        repository: SaveRepository,
-        setup: dict[str, Any],
-    ) -> None:
-        """Uses Gemini to synthesize the initial world and opening scene."""
-
-        if GeminiNarrationService is None:
-            self._apply_fallback_currency_if_needed(repository, setup)
-            repository.set_world_summary(fallback_world_summary(setup))
-            repository.append_history("story", fallback_introductory_message(setup))
-            return
+        """Starts initial world synthesis without blocking the Qt UI thread."""
 
         try:
-            result = GeminiNarrationService(
-                api_key_path=self.app_paths.gemini_api_key_path,
-            ).generate_new_game_world(
-                build_new_game_setup_packet(
-                    setup,
-                    valid_music_tracks=(
-                        self.sound_manager.get_valid_track_names()
-                        if self.sound_manager is not None
-                        else []
-                    ),
-                    valid_sound_effect_tracks=(
-                        self.sound_manager.get_valid_sound_effect_names()
-                        if self.sound_manager is not None
-                        else []
-                    ),
-                )
-            )
-        except GeminiConfigurationError as error:
-            LOGGER.warning("Gemini new-game synthesis skipped: %s", error)
-            self._apply_fallback_currency_if_needed(repository, setup)
-            repository.set_world_summary(fallback_world_summary(setup))
-            repository.append_history("story", fallback_introductory_message(setup))
-            return
-        except GeminiRequestError as error:
-            LOGGER.warning("Gemini new-game synthesis ended cleanly: %s", error)
-            self._apply_fallback_currency_if_needed(repository, setup)
-            repository.set_world_summary(fallback_world_summary(setup))
-            repository.append_history(
-                "story",
-                (
-                    "Gemini is temporarily unavailable, so this new game opened "
-                    "with a local fallback. Your save is safe; try another action "
-                    "shortly."
+            setup_packet = build_new_game_setup_packet(
+                setup,
+                valid_music_tracks=(
+                    self.sound_manager.get_valid_track_names()
+                    if self.sound_manager is not None
+                    else []
+                ),
+                valid_sound_effect_tracks=(
+                    self.sound_manager.get_valid_sound_effect_names()
+                    if self.sound_manager is not None
+                    else []
+                ),
+                valid_background_ambience_tracks=(
+                    getattr(
+                        self.sound_manager,
+                        "get_valid_background_ambience_names",
+                        lambda: [],
+                    )()
+                    if self.sound_manager is not None
+                    else []
                 ),
             )
-            return
         except Exception:
-            LOGGER.exception("Gemini new-game synthesis failed.")
-            self._apply_fallback_currency_if_needed(repository, setup)
-            repository.set_world_summary(fallback_world_summary(setup))
-            repository.append_history("story", fallback_introductory_message(setup))
+            LOGGER.exception("Failed to build the Gemini new-game request.")
+            self._apply_new_game_fallback(repository, setup)
+            self._complete_new_game_generation(repository)
             return
+
+        thread = QThread(self)
+        worker = _GeminiNewGameWorker(
+            setup_packet,
+            self.app_paths.gemini_api_key_path,
+        )
+        worker.moveToThread(thread)
+
+        thread.started.connect(worker.run)
+        worker.completed.connect(self._handle_new_game_generation_result)
+        worker.configuration_error.connect(
+            self._handle_new_game_generation_configuration_error
+        )
+        worker.request_failed.connect(self._handle_new_game_generation_request_failure)
+        worker.failed.connect(self._handle_new_game_generation_failure)
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(
+            lambda thread=thread, worker=worker: self._clear_new_game_worker(
+                thread,
+                worker,
+            )
+        )
+
+        self._pending_new_game_repository = repository
+        self._pending_new_game_setup = dict(setup)
+        self._new_game_thread = thread
+        self._new_game_worker = worker
+        thread.start()
+
+    @Slot(object)
+    def _handle_new_game_generation_result(self, result: Any) -> None:
+        """Applies a completed initial-world response on the Qt UI thread."""
+
+        repository = self._pending_new_game_repository
+        setup = self._pending_new_game_setup
+
+        if repository is None or setup is None:
+            return
+
+        try:
+            self._apply_new_game_generation_result(repository, setup, result)
+        except Exception:
+            LOGGER.exception("Failed to apply Gemini new-game synthesis.")
+            self._apply_new_game_fallback(repository, setup)
+        finally:
+            self._complete_new_game_generation(repository)
+
+    @Slot(str)
+    def _handle_new_game_generation_configuration_error(self, _message: str) -> None:
+        """Uses the ordinary local opening when Gemini is not configured."""
+
+        self._finish_failed_new_game_generation(temporary_failure=False)
+
+    @Slot(str)
+    def _handle_new_game_generation_request_failure(self, _message: str) -> None:
+        """Uses a request-failure opening when Gemini is temporarily unavailable."""
+
+        self._finish_failed_new_game_generation(temporary_failure=True)
+
+    @Slot()
+    def _handle_new_game_generation_failure(self) -> None:
+        """Uses the ordinary local opening after an unexpected worker failure."""
+
+        self._finish_failed_new_game_generation(temporary_failure=False)
+
+    def _finish_failed_new_game_generation(self, *, temporary_failure: bool) -> None:
+        """Applies the appropriate local fallback after a worker error."""
+
+        repository = self._pending_new_game_repository
+        setup = self._pending_new_game_setup
+
+        if repository is None or setup is None:
+            return
+
+        try:
+            self._apply_new_game_fallback(
+                repository,
+                setup,
+                temporary_failure=temporary_failure,
+            )
+        finally:
+            self._complete_new_game_generation(repository)
+
+    def _apply_new_game_fallback(
+        self,
+        repository: SaveRepository,
+        setup: dict[str, Any],
+        *,
+        temporary_failure: bool = False,
+    ) -> None:
+        """Writes a local opening after Gemini could not initialize a new game."""
+
+        self._apply_fallback_currency_if_needed(repository, setup)
+        repository.set_world_summary(fallback_world_summary(setup))
+        repository.append_history(
+            "story",
+            (
+                "Gemini is temporarily unavailable, so this new game opened "
+                "with a local fallback. Your save is safe; try another action "
+                "shortly."
+                if temporary_failure
+                else fallback_introductory_message(setup)
+            ),
+        )
+
+    def _apply_new_game_generation_result(
+        self,
+        repository: SaveRepository,
+        setup: dict[str, Any],
+        result: Any,
+    ) -> None:
+        """Persists one completed Gemini new-game result."""
+
         LOGGER.debug(f"INITIAL NEW GAME GEMINI PROMPT: \n\n{result}")
         self._apply_new_game_ai_state(repository, setup, result)
         repository.set_world_summary(
@@ -1493,7 +2090,7 @@ class MainWindow(QMainWindow):
             self.narration_player,
             getattr(result, "speaker_cues", []),
         )
-        repository.append_history(
+        message_id = repository.append_history(
             "story",
             introductory_message,
             sound_effect_cues=result.sound_effect_cues,
@@ -1501,7 +2098,10 @@ class MainWindow(QMainWindow):
         )
 
         if result.suggested_events:
-            event_results = EventApplier(repository).apply_events(result.suggested_events)
+            event_results = EventApplier(
+                repository,
+                message_id=message_id,
+            ).apply_events(result.suggested_events)
             applied_count = sum(
                 1 for event_result in event_results if event_result.status == "applied"
             )
@@ -1511,6 +2111,59 @@ class MainWindow(QMainWindow):
                 applied_count,
                 skipped_count,
             )
+
+    def _complete_new_game_generation(self, repository: SaveRepository) -> None:
+        """Refreshes the active game and prepares its opening visual batch."""
+
+        self._pending_new_game_repository = None
+        self._pending_new_game_setup = None
+        self.game_shell.menu_button.setEnabled(True)
+
+        if self.active_repository is not repository:
+            return
+
+        _apply_audio_settings_to_managers(
+            repository,
+            sound_manager=self.sound_manager,
+            narration_player=self.narration_player,
+        )
+        self._waiting_for_initial_visuals = repository
+        self.game_shell.visual_asset_coordinator.begin_initial_batch(repository)
+        self.game_shell.refresh_screens()
+
+    def _reveal_initial_story(self, repository: SaveRepository) -> None:
+        """Shows and narrates the opening only after initial images are settled."""
+
+        if self.active_repository is not repository:
+            return
+
+        self.game_shell.story_screen.set_initial_generation_pending(False)
+        self.game_shell.story_screen.narrate_latest_story(
+            reveal_progressively=True,
+        )
+
+    @Slot(object)
+    def _handle_initial_visuals_ready(self, repository: SaveRepository) -> None:
+        """Reveals the opening scene once its initial image batch is complete."""
+
+        if self._waiting_for_initial_visuals is not repository:
+            return
+        self._waiting_for_initial_visuals = None
+        self._reveal_initial_story(repository)
+
+    @Slot()
+    def _clear_new_game_worker(
+        self,
+        thread: QThread | None = None,
+        worker: QObject | None = None,
+    ) -> None:
+        """Drops references after the new-game request thread exits."""
+
+        if thread is None or self._new_game_thread is thread:
+            self._new_game_thread = None
+
+        if worker is None or self._new_game_worker is worker:
+            self._new_game_worker = None
 
     def _normalize_new_game_setup_for_runtime(self, setup: dict[str, Any]) -> dict[str, Any]:
         """Normalizes setup and disables narrator settings when TTS is unavailable."""
@@ -1600,14 +2253,11 @@ class MainWindow(QMainWindow):
                 )
             )
 
-        result_starting_calendar = (
-            dict(result.starting_calendar)
-            if isinstance(result.starting_calendar, dict)
-            else {}
-        )
         setup_starting_calendar = setup.get("starting_calendar", {})
-        if isinstance(setup_starting_calendar, dict):
-            result_starting_calendar.update(setup_starting_calendar)
+        result_starting_calendar = merge_authoritative_starting_calendar(
+            result.starting_calendar,
+            setup_starting_calendar,
+        )
 
         if result_starting_calendar:
             current_minute = resolve_starting_calendar_minute(
@@ -1622,7 +2272,12 @@ class MainWindow(QMainWindow):
             repository.set_current_calendar_minute(current_minute)
             repository.set_state_value("time", calendar_snapshot["display_label"])
 
-        if result.start_weather:
+        authoritative_starting_weather = str(
+            setup.get("starting_weather", "") or ""
+        ).strip()
+        if authoritative_starting_weather:
+            repository.set_state_value("weather", authoritative_starting_weather)
+        elif result.start_weather:
             repository.set_state_value("weather", result.start_weather)
 
         starting_wealth = setup.get("starting_wealth", {})
@@ -1823,6 +2478,9 @@ class MainWindow(QMainWindow):
             repository,
             initially_hide_empty_tabs=new_game,
         )
+        self.game_shell.story_screen.set_initial_generation_pending(
+            new_game and self.ai_enabled
+        )
         self._apply_active_theme()
         self.stack.setCurrentWidget(self.game_shell)
 
@@ -1900,9 +2558,24 @@ class MainWindow(QMainWindow):
         if self.sound_manager is not None:
             self.sound_manager.set_music_volume(audio["music_volume"])
             self.sound_manager.set_music_enabled(audio["music_enabled"])
+            self.sound_manager.set_sound_effects_volume(audio["sound_effects_volume"])
+            self.sound_manager.set_sound_effects_enabled(audio["sound_effects_enabled"])
+            if hasattr(self.sound_manager, "set_background_ambience_volume"):
+                self.sound_manager.set_background_ambience_volume(
+                    audio["background_ambience_volume"]
+                )
+            if hasattr(self.sound_manager, "set_background_ambience_enabled"):
+                self.sound_manager.set_background_ambience_enabled(
+                    audio["background_ambience_enabled"]
+                )
 
             if not audio["music_enabled"]:
                 self.sound_manager.stop_music(clear_current=False)
+            if (
+                not audio["background_ambience_enabled"]
+                and hasattr(self.sound_manager, "stop_background_ambience")
+            ):
+                self.sound_manager.stop_background_ambience(clear_current=False)
 
         if self.narration_player is not None:
             self.narration_player.set_volume(audio["tts_volume"])
@@ -3160,6 +3833,24 @@ class MainMenuSettingsDialog(QDialog):
             lambda value: self.sound_effects_volume_label.setText(f"{value}%")
         )
 
+        self.background_ambience_enabled_checkbox = QCheckBox(
+            "Background ambience enabled"
+        )
+        self.background_ambience_enabled_checkbox.setChecked(
+            bool(audio["background_ambience_enabled"])
+        )
+        self.background_ambience_volume_slider = QSlider(Qt.Orientation.Horizontal)
+        self.background_ambience_volume_slider.setRange(0, 100)
+        self.background_ambience_volume_slider.setValue(
+            int(audio["background_ambience_volume"])
+        )
+        self.background_ambience_volume_label = QLabel(
+            f"{self.background_ambience_volume_slider.value()}%"
+        )
+        self.background_ambience_volume_slider.valueChanged.connect(
+            lambda value: self.background_ambience_volume_label.setText(f"{value}%")
+        )
+
         self.narrator_enabled_checkbox: QCheckBox | None = None
         self.tts_volume_slider: QSlider | None = None
         self.tts_volume_label: QLabel | None = None
@@ -3184,6 +3875,18 @@ class MainMenuSettingsDialog(QDialog):
                 _slider_row(
                     self.sound_effects_volume_slider,
                     self.sound_effects_volume_label,
+                ),
+            )
+
+            form.addRow(
+                "Background Ambience:",
+                self.background_ambience_enabled_checkbox,
+            )
+            form.addRow(
+                "Ambience Volume:",
+                _slider_row(
+                    self.background_ambience_volume_slider,
+                    self.background_ambience_volume_label,
                 ),
             )
 
@@ -3233,6 +3936,12 @@ class MainMenuSettingsDialog(QDialog):
                         self.sound_effects_enabled_checkbox.isChecked()
                     ),
                     "sound_effects_volume": self.sound_effects_volume_slider.value(),
+                    "background_ambience_enabled": (
+                        self.background_ambience_enabled_checkbox.isChecked()
+                    ),
+                    "background_ambience_volume": (
+                        self.background_ambience_volume_slider.value()
+                    ),
                     **self._tts_settings_value(),
                 },
             },
@@ -3805,8 +4514,25 @@ class NewGameTemplateManagerDialog(QDialog):
         self.sound_effects_volume_slider.valueChanged.connect(
             lambda value: self.sound_effects_volume_label.setText(f"{value}%")
         )
+        self.background_ambience_enabled_checkbox = QCheckBox(
+            "Background ambience enabled"
+        )
+        self.background_ambience_volume_slider = QSlider(Qt.Orientation.Horizontal)
+        self.background_ambience_volume_slider.setRange(0, 100)
+        self.background_ambience_volume_label = QLabel()
+        self.background_ambience_volume_slider.valueChanged.connect(
+            lambda value: self.background_ambience_volume_label.setText(f"{value}%")
+        )
         self.music_test_button = QPushButton("Test")
         self.music_test_button.clicked.connect(self._test_music_preview)
+        self.sound_effects_test_button = QPushButton("Test")
+        self.sound_effects_test_button.clicked.connect(
+            self._test_sound_effects_preview
+        )
+        self.background_ambience_test_button = QPushButton("Test")
+        self.background_ambience_test_button.clicked.connect(
+            self._test_background_ambience_preview
+        )
         self.template_tts_settings_widget = TTSSettingsWidget(
             audio_settings=self.audio_defaults,
             voice_options=self.voice_options,
@@ -3938,7 +4664,7 @@ class NewGameTemplateManagerDialog(QDialog):
         form.addRow("Background Music:", self.music_enabled_checkbox)
         form.addRow("Music Volume:", _slider_row(self.music_volume_slider, self.music_volume_label))
         form.addRow("Music Preview:", self.music_test_button)
-        form.addRow("Ambient Sound Effects:", self.sound_effects_enabled_checkbox)
+        form.addRow("Narration Sound Effects:", self.sound_effects_enabled_checkbox)
         form.addRow(
             "Sound Effects Volume:",
             _slider_row(
@@ -3946,6 +4672,16 @@ class NewGameTemplateManagerDialog(QDialog):
                 self.sound_effects_volume_label,
             ),
         )
+        form.addRow("Sound Effects Preview:", self.sound_effects_test_button)
+        form.addRow("Background Ambience:", self.background_ambience_enabled_checkbox)
+        form.addRow(
+            "Ambience Volume:",
+            _slider_row(
+                self.background_ambience_volume_slider,
+                self.background_ambience_volume_label,
+            ),
+        )
+        form.addRow("Ambience Preview:", self.background_ambience_test_button)
         form.addRow("Narration / TTS:", self.template_tts_settings_widget)
         tab = QWidget()
         tab.setLayout(form)
@@ -3962,14 +4698,44 @@ class NewGameTemplateManagerDialog(QDialog):
         self.sound_manager.set_music_volume(self.music_volume_slider.value())
         self.sound_manager.play_music_preview(random.choice(tracks))
 
+    def _test_sound_effects_preview(self) -> None:
+        if self.sound_manager is None:
+            return
+
+        sound_effects = self.sound_manager.get_valid_sound_effect_names()
+        if not sound_effects:
+            return
+
+        self.sound_manager.set_sound_effects_volume(
+            self.sound_effects_volume_slider.value()
+        )
+        self.sound_manager.play_sound_effect(random.choice(sound_effects))
+
+    def _test_background_ambience_preview(self) -> None:
+        if self.sound_manager is None:
+            return
+
+        ambience_tracks = self.sound_manager.get_valid_background_ambience_names()
+        if not ambience_tracks:
+            return
+
+        self.sound_manager.set_background_ambience_volume(
+            self.background_ambience_volume_slider.value()
+        )
+        self.sound_manager.play_background_ambience(random.choice(ambience_tracks))
+
     def _bind_music_preview_stop_buttons(self) -> None:
         for button in self.findChildren(QPushButton):
-            if button is not self.music_test_button:
-                button.clicked.connect(self._stop_music_preview)
+            if button not in {
+                self.music_test_button,
+                self.background_ambience_test_button,
+            }:
+                button.clicked.connect(self._stop_audio_previews)
 
-    def _stop_music_preview(self) -> None:
+    def _stop_audio_previews(self) -> None:
         if self.sound_manager is not None:
             self.sound_manager.stop_music()
+            self.sound_manager.stop_background_ambience()
 
     def _build_locations_tab(self) -> QWidget:
         """Builds the template starting locations tab."""
@@ -4456,6 +5222,15 @@ class NewGameTemplateManagerDialog(QDialog):
             self.sound_effects_volume_label.setText(
                 f"{self.sound_effects_volume_slider.value()}%"
             )
+            self.background_ambience_enabled_checkbox.setChecked(
+                bool(audio.get("background_ambience_enabled", True))
+            )
+            self.background_ambience_volume_slider.setValue(
+                _safe_int(audio.get("background_ambience_volume"), 15)
+            )
+            self.background_ambience_volume_label.setText(
+                f"{self.background_ambience_volume_slider.value()}%"
+            )
             self.template_tts_settings_widget.load_audio_settings(audio)
             ai_settings = (
                 setup.get("ai_settings", {})
@@ -4625,6 +5400,12 @@ class NewGameTemplateManagerDialog(QDialog):
             "music_volume": self.music_volume_slider.value(),
             "sound_effects_enabled": self.sound_effects_enabled_checkbox.isChecked(),
             "sound_effects_volume": self.sound_effects_volume_slider.value(),
+            "background_ambience_enabled": (
+                self.background_ambience_enabled_checkbox.isChecked()
+            ),
+            "background_ambience_volume": (
+                self.background_ambience_volume_slider.value()
+            ),
             **self.template_tts_settings_widget.build_audio_settings(),
         }
         setup["ai_settings"] = dict(self._new_game_ai_settings)
@@ -6075,8 +6856,17 @@ class NewGameWizard(QWizard):
         season_name = self.calendar_start_season_input.text().strip()
         if season_name:
             starting_calendar["season_name"] = season_name
+        if self.calendar_start_year_input.value() > 0:
+            starting_calendar["year"] = self.calendar_start_year_input.value()
+        if self.calendar_start_month_input.value() > 0:
+            starting_calendar["month_number"] = self.calendar_start_month_input.value()
         if self.calendar_start_day_input.value() > 0:
             starting_calendar["day_of_month"] = self.calendar_start_day_input.value()
+        if self.calendar_start_time_checkbox.isChecked():
+            start_time = self.calendar_start_time_input.time()
+            starting_calendar["time_of_day_minutes"] = (
+                start_time.hour() * 60 + start_time.minute()
+            )
         economy_examples = self._economy_examples_from_table()
 
         skills = [
@@ -6118,6 +6908,7 @@ class NewGameWizard(QWizard):
             "starting_task": self._starting_task_from_controls(),
             "calendar": calendar_settings,
             "starting_calendar": starting_calendar,
+            "starting_weather": self.calendar_start_weather_input.text().strip(),
             "audio": {
                 "music_enabled": self.music_enabled_checkbox.isChecked(),
                 "music_volume": self.music_volume_slider.value(),
@@ -6125,6 +6916,12 @@ class NewGameWizard(QWizard):
                     self.sound_effects_enabled_checkbox.isChecked()
                 ),
                 "sound_effects_volume": self.sound_effects_volume_slider.value(),
+                "background_ambience_enabled": (
+                    self.background_ambience_enabled_checkbox.isChecked()
+                ),
+                "background_ambience_volume": (
+                    self.background_ambience_volume_slider.value()
+                ),
                 **self._tts_settings_value(),
             },
             "pronunciation_map": dict(self._pronunciation_map),
@@ -6305,13 +7102,39 @@ class NewGameWizard(QWizard):
         self.calendar_start_season_input.setText(
             str(starting_calendar.get("season_name", "") or "")
         )
+        self.calendar_start_year_input.setValue(
+            min(9999, max(0, _safe_int(starting_calendar.get("year"), 0)))
+        )
+        self.calendar_start_month_input.setValue(
+            min(24, max(0, _safe_int(starting_calendar.get("month_number"), 0)))
+        )
         self.calendar_start_day_input.setValue(
             min(366, max(0, _safe_int(starting_calendar.get("day_of_month"), 0)))
+        )
+        raw_start_time = starting_calendar.get("time_of_day_minutes")
+        has_start_time = raw_start_time is not None
+        start_minutes = min(1439, max(0, _safe_int(raw_start_time, 8 * 60)))
+        self.calendar_start_time_input.setTime(
+            QTime(start_minutes // 60, start_minutes % 60)
+        )
+        self.calendar_start_time_checkbox.setChecked(has_start_time)
+        self.calendar_start_weather_input.setText(
+            str(clean_setup.get("starting_weather", "") or "")
         )
         self._custom_calendar_settings = dict(calendar)
         self._sync_calendar_settings_button()
         self.music_enabled_checkbox.setChecked(bool(audio["music_enabled"]))
         self.music_volume_slider.setValue(int(audio["music_volume"]))
+        self.sound_effects_enabled_checkbox.setChecked(
+            bool(audio["sound_effects_enabled"])
+        )
+        self.sound_effects_volume_slider.setValue(int(audio["sound_effects_volume"]))
+        self.background_ambience_enabled_checkbox.setChecked(
+            bool(audio["background_ambience_enabled"])
+        )
+        self.background_ambience_volume_slider.setValue(
+            int(audio["background_ambience_volume"])
+        )
 
         if self.tts_settings_widget is not None:
             self.tts_settings_widget.load_audio_settings(audio)
@@ -8199,7 +9022,7 @@ class NewGameWizard(QWizard):
         page = QWizardPage()
         page.setTitle("Audio")
         page.setSubTitle(
-            "Choose music and sound-effect preferences before the save starts."
+            "Choose music, background ambience, and narration sound-effect preferences."
         )
 
         self.music_enabled_checkbox = QCheckBox("Music enabled")
@@ -8227,6 +9050,23 @@ class NewGameWizard(QWizard):
         self.sound_effects_volume_slider.valueChanged.connect(
             lambda value: self.sound_effects_volume_label.setText(f"{value}%")
         )
+        self.background_ambience_enabled_checkbox = QCheckBox(
+            "Background ambience enabled"
+        )
+        self.background_ambience_enabled_checkbox.setChecked(
+            bool(self.audio_defaults["background_ambience_enabled"])
+        )
+        self.background_ambience_volume_slider = QSlider(Qt.Orientation.Horizontal)
+        self.background_ambience_volume_slider.setRange(0, 100)
+        self.background_ambience_volume_slider.setValue(
+            int(self.audio_defaults["background_ambience_volume"])
+        )
+        self.background_ambience_volume_label = QLabel(
+            f"{self.background_ambience_volume_slider.value()}%"
+        )
+        self.background_ambience_volume_slider.valueChanged.connect(
+            lambda value: self.background_ambience_volume_label.setText(f"{value}%")
+        )
         self.music_test_button = QPushButton("Test")
         self.music_test_button.clicked.connect(self._test_music_preview)
         self.sound_effects_test_button = QPushButton("Test")
@@ -8234,12 +9074,17 @@ class NewGameWizard(QWizard):
             self._test_sound_effects_preview
         )
 
+        self.background_ambience_test_button = QPushButton("Test")
+        self.background_ambience_test_button.clicked.connect(
+            self._test_background_ambience_preview
+        )
+
         layout = QFormLayout()
         _configure_responsive_form(layout)
         layout.addRow("Background Music:", self.music_enabled_checkbox)
         layout.addRow("Music Volume:", _slider_row(self.music_volume_slider, self.music_volume_label))
         layout.addRow("Music Preview:", self.music_test_button)
-        layout.addRow("Ambient Sound Effects:", self.sound_effects_enabled_checkbox)
+        layout.addRow("Narration Sound Effects:", self.sound_effects_enabled_checkbox)
         layout.addRow(
             "Sound Effects Volume:",
             _slider_row(
@@ -8248,6 +9093,18 @@ class NewGameWizard(QWizard):
             ),
         )
         layout.addRow("Sound Effects Preview:", self.sound_effects_test_button)
+        layout.addRow(
+            "Background Ambience:",
+            self.background_ambience_enabled_checkbox,
+        )
+        layout.addRow(
+            "Ambience Volume:",
+            _slider_row(
+                self.background_ambience_volume_slider,
+                self.background_ambience_volume_label,
+            ),
+        )
+        layout.addRow("Ambience Preview:", self.background_ambience_test_button)
 
         page.setLayout(layout)
 
@@ -8277,14 +9134,31 @@ class NewGameWizard(QWizard):
         )
         self.sound_manager.play_sound_effect(random.choice(sound_effects))
 
+    def _test_background_ambience_preview(self) -> None:
+        if self.sound_manager is None:
+            return
+
+        ambience_tracks = self.sound_manager.get_valid_background_ambience_names()
+        if not ambience_tracks:
+            return
+
+        self.sound_manager.set_background_ambience_volume(
+            self.background_ambience_volume_slider.value()
+        )
+        self.sound_manager.play_background_ambience(random.choice(ambience_tracks))
+
     def _bind_music_preview_stop_buttons(self) -> None:
         for button in self.findChildren(QPushButton):
-            if button is not self.music_test_button:
-                button.clicked.connect(self._stop_music_preview)
+            if button not in {
+                self.music_test_button,
+                self.background_ambience_test_button,
+            }:
+                button.clicked.connect(self._stop_audio_previews)
 
-    def _stop_music_preview(self) -> None:
+    def _stop_audio_previews(self) -> None:
         if self.sound_manager is not None:
             self.sound_manager.stop_music()
+            self.sound_manager.stop_background_ambience()
 
     def _build_tts_page(self) -> None:
         """Builds the dedicated starting TTS preferences page."""
@@ -8694,10 +9568,27 @@ class NewGameWizard(QWizard):
         self.calendar_start_season_input.setPlaceholderText(
             "Optional season name, such as Spring or Autumn"
         )
+        self.calendar_start_year_input = QSpinBox()
+        self.calendar_start_year_input.setRange(0, 9999)
+        self.calendar_start_year_input.setSpecialValueText("Use calendar default")
+        self.calendar_start_month_input = QSpinBox()
+        self.calendar_start_month_input.setRange(0, 24)
+        self.calendar_start_month_input.setSpecialValueText("Use calendar default")
         self.calendar_start_day_input = QSpinBox()
         self.calendar_start_day_input.setRange(0, 366)
         self.calendar_start_day_input.setSpecialValueText("Use calendar default")
         self.calendar_start_day_input.setValue(0)
+        self.calendar_start_time_checkbox = QCheckBox("Specify an exact starting time")
+        self.calendar_start_time_checkbox.toggled.connect(
+            lambda checked: self.calendar_start_time_input.setVisible(checked)
+        )
+        self.calendar_start_time_input = QTimeEdit(QTime(8, 0))
+        self.calendar_start_time_input.setDisplayFormat("h:mm AP")
+        self.calendar_start_time_input.setVisible(False)
+        self.calendar_start_weather_input = QLineEdit()
+        self.calendar_start_weather_input.setPlaceholderText(
+            "Optional exact weather, such as Clear, Rain, Snow, or Fog"
+        )
 
         self.calendar_generation_guidance_label = QLabel("AI Calendar Details:")
         self.calendar_generation_guidance_input = QTextEdit()
@@ -8715,7 +9606,12 @@ class NewGameWizard(QWizard):
         _configure_responsive_form(layout)
         layout.addRow("Calendar:", self.calendar_type_combo)
         layout.addRow("Starting Season:", self.calendar_start_season_input)
-        layout.addRow("Starting Day:", self.calendar_start_day_input)
+        layout.addRow("Starting Year:", self.calendar_start_year_input)
+        layout.addRow("Starting Month:", self.calendar_start_month_input)
+        layout.addRow("Starting Day of Month:", self.calendar_start_day_input)
+        layout.addRow("Starting Time:", self.calendar_start_time_checkbox)
+        layout.addRow("", self.calendar_start_time_input)
+        layout.addRow("Starting Weather:", self.calendar_start_weather_input)
         layout.addRow(self.calendar_settings_label, self.calendar_settings_button)
         layout.addRow(
             self.calendar_generation_guidance_label,
@@ -8858,6 +9754,7 @@ class GameShell(QWidget):
         global_tts_settings_provider: Callable[[], dict[str, Any]] | None = None,
         custom_voice_storage_path: Path | str | None = None,
         gemini_api_key_path: Path | str | None = None,
+        generated_images_dir: Path | str | None = None,
         playtesting_tools: bool = False,
         ai_enabled: bool = True,
     ) -> None:
@@ -8881,20 +9778,40 @@ class GameShell(QWidget):
             if gemini_api_key_path is not None
             else None
         )
+        self.generated_images_dir = (
+            Path(generated_images_dir).expanduser().resolve()
+            if generated_images_dir is not None
+            else Path.cwd() / "images"
+        )
         self.playtesting_tools = bool(playtesting_tools)
         self.ai_enabled = bool(ai_enabled)
         self.repository: SaveRepository | None = None
-
+        self.visual_asset_coordinator = _VisualAssetCoordinator(
+            images_dir=self.generated_images_dir,
+            api_key_path=(
+                self.gemini_api_key_path or Path.cwd() / ".gemini_api_key.txt"
+            ),
+            enabled=(
+                self.ai_enabled
+                and not self.playtesting_tools
+                and gemini_api_key_path is not None
+                and generated_images_dir is not None
+            ),
+            parent=self,
+        )
+        self.visual_asset_coordinator.assets_changed.connect(
+            self._handle_visual_assets_changed
+        )
         self.title_label = QLabel("No Save Loaded")
         self.title_label.setStyleSheet("font-size: 18px; font-weight: bold;")
 
-        menu_button = QPushButton("Main Menu")
-        menu_button.clicked.connect(self.on_return_to_menu)
+        self.menu_button = QPushButton("Main Menu")
+        self.menu_button.clicked.connect(self.on_return_to_menu)
 
         top_bar = QHBoxLayout()
         top_bar.addWidget(self.title_label)
         top_bar.addStretch()
-        top_bar.addWidget(menu_button)
+        top_bar.addWidget(self.menu_button)
 
         self.tabs = QTabWidget()
         self.tab_bar = _DetachableTabBar(self.tabs)
@@ -8948,6 +9865,7 @@ class GameShell(QWidget):
             global_tts_settings_provider=self.global_tts_settings_provider,
             custom_voice_storage_path=self.custom_voice_storage_path,
             ai_enabled=self.ai_enabled,
+            sound_manager=self.sound_manager,
             music_enabled=not self.playtesting_tools,
             playtesting_tools=self.playtesting_tools,
         )
@@ -8971,6 +9889,7 @@ class GameShell(QWidget):
         ]
 
         for screen in self.screens:
+            screen.set_visual_assets_dir(self.generated_images_dir)
             screen.on_repository_changed = self._handle_screen_repository_changed
 
         visible_tabs = (
@@ -9276,6 +10195,7 @@ class GameShell(QWidget):
             for tab_key, (screen, _label, _closable) in self._tab_specs.items()
         }
         self._apply_audio_settings()
+        self.visual_asset_coordinator.scan(repository)
 
     def _hide_empty_starting_tabs(self, repository: SaveRepository) -> None:
         """Hides empty NPC, Party, and Magic tabs for a newly created game."""
@@ -9382,6 +10302,13 @@ class GameShell(QWidget):
             ):
                 self._mark_tab_changed(tab_key)
         self._reveal_populated_smart_hidden_tabs()
+        self.visual_asset_coordinator.scan(self.repository)
+
+    @Slot()
+    def _handle_visual_assets_changed(self) -> None:
+        """Refreshes image-bearing surfaces after one background generation completes."""
+
+        self.refresh_screens()
 
     def _handle_screen_repository_changed(self, source: RepositoryBackedWidget) -> None:
         """Refreshes tabs after a screen or event changes repository data."""
@@ -9484,6 +10411,7 @@ class StoryScreen(RepositoryBackedWidget):
         )
         self._revealing_story_id: int | None = None
         self._revealed_story_chunks: list[str] = []
+        self._progressive_story_message: QTextEdit | None = None
         self._story_reveal_generation = 0
         self._gemini_thread: QThread | None = None
         self._gemini_worker: QObject | None = None
@@ -9494,17 +10422,30 @@ class StoryScreen(RepositoryBackedWidget):
         self._pending_regeneration_request: dict[str, Any] | None = None
         self._conversation_render_generation = 0
         self._waiting_for_gm = False
+        self._thinking_frame_index = 0
+        self._thinking_timer = QTimer(self)
+        self._thinking_timer.setInterval(GM_THINKING_TIMER_INTERVAL_MS)
+        self._thinking_timer.timeout.connect(self._advance_thinking_indicator)
         self._combat_active = False
         self._default_input_placeholder = "Enter a player action..."
         self._out_of_game_input_placeholder = "Ask the AI about the adventure..."
         self._narration_chunk_ready.connect(self._append_revealed_story_chunk)
         self._narration_complete.connect(self._complete_revealed_story)
-        self.location_value = QLabel("-")
-        self.day_value = QLabel("-")
-        self.time_value = QLabel("-")
-        self.weather_value = QLabel("-")
+        self._initial_generation_pending = False
+        self.location_value = QLabel(UNRESOLVED_STATUS_TEXT)
+        self.day_value = QLabel(UNRESOLVED_STATUS_TEXT)
+        self.time_value = QLabel(UNRESOLVED_STATUS_TEXT)
+        self.weather_value = QLabel(UNRESOLVED_STATUS_TEXT)
+        self.location_image_label = QLabel()
+        self.location_image_label.setObjectName("storyCurrentLocationImage")
+        self.location_image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.location_image_label.setStyleSheet(
+            "background: rgba(15, 23, 42, 96); border-radius: 8px; padding: 3px;"
+        )
+        self.location_image_label.hide()
 
         status_row = QHBoxLayout()
+        status_row.addStretch()
         status_row.addWidget(_status_label("Location", self.location_value))
         status_row.addWidget(_status_label("Day", self.day_value))
         status_row.addWidget(_status_label("Time", self.time_value))
@@ -9555,6 +10496,12 @@ class StoryScreen(RepositoryBackedWidget):
 
         layout = QVBoxLayout()
         layout.addLayout(status_row)
+        location_image_row = QHBoxLayout()
+        location_image_row.setContentsMargins(0, 0, 0, 0)
+        location_image_row.addStretch()
+        location_image_row.addWidget(self.location_image_label)
+        location_image_row.addStretch()
+        layout.addLayout(location_image_row)
         layout.addWidget(self.conversation_scroll)
         layout.addLayout(input_row)
 
@@ -9564,6 +10511,7 @@ class StoryScreen(RepositoryBackedWidget):
         """Sets the active save and clears any stale narration reveal state."""
 
         self._clear_story_reveal_state()
+        self._initial_generation_pending = False
         self._pending_travel_request = None
         self._pending_conversation_mode = "live_game"
         self.mode_button.setChecked(False)
@@ -9598,10 +10546,7 @@ class StoryScreen(RepositoryBackedWidget):
 
         if repository is None:
             self._clear_conversation_messages()
-            self.location_value.setText("-")
-            self.day_value.setText("-")
-            self.time_value.setText("-")
-            self.weather_value.setText("-")
+            self._show_unresolved_status()
             self._combat_active = False
             self._sync_story_input_state()
             self._update_continue_button_state()
@@ -9609,10 +10554,28 @@ class StoryScreen(RepositoryBackedWidget):
 
         state = StateManager(repository).load_state()
         self._combat_active = repository.is_combat_active()
-        self.location_value.setText(state.world.location or "-")
-        self.day_value.setText(state.calendar.date_label or "-")
-        self.time_value.setText(state.calendar.time_label or "-")
-        self.weather_value.setText(state.world.weather or "-")
+        if self._initial_generation_pending:
+            self._show_unresolved_status()
+        else:
+            self.location_value.setText(
+                state.world.location or UNRESOLVED_STATUS_TEXT
+            )
+            self.day_value.setText(
+                state.calendar.date_label or UNRESOLVED_STATUS_TEXT
+            )
+            self.time_value.setText(
+                state.calendar.time_label or UNRESOLVED_STATUS_TEXT
+            )
+            self.weather_value.setText(
+                state.world.weather or UNRESOLVED_STATUS_TEXT
+            )
+            self._refresh_current_location_image(state.world.location)
+
+        if self._initial_generation_pending:
+            self._render_conversation([])
+            self._sync_story_input_state()
+            self._update_continue_button_state()
+            return
 
         entries = repository.list_history()
         conversation_entries: list[tuple[Any, ...]] = []
@@ -9638,28 +10601,57 @@ class StoryScreen(RepositoryBackedWidget):
                 if kind == "story":
                     live_turn_number += 1
                     turn_number = live_turn_number
-
-                if entry_id == self._revealing_story_id:
-                    if self._revealed_story_chunks:
-                        conversation_entries.append(
-                            (
-                                "ai",
-                                "live_game",
-                                "".join(self._revealed_story_chunks),
-                                entry_id,
-                                str(entry.get("message_id", "") or ""),
-                                turn_number,
-                            )
-                        )
-                else:
+                is_revealing = entry_id == self._revealing_story_id
+                visible_content = (
+                    "".join(self._revealed_story_chunks)
+                    if is_revealing
+                    else content
+                )
+                if not visible_content:
+                    continue
+                mode = "out_of_game" if kind == "story_oog" else "live_game"
+                speaker_cues = (
+                    entry.get("speaker_cues", []) if kind == "story" else []
+                )
+                sound_effect_cues = (
+                    entry.get("sound_effect_cues", []) if kind == "story" else []
+                )
+                if is_revealing:
                     conversation_entries.append(
                         (
                             "ai",
-                            "out_of_game" if kind == "story_oog" else "live_game",
-                            format_story_message(content),
+                            mode,
+                            visible_content,
                             entry_id,
                             str(entry.get("message_id", "") or ""),
                             turn_number,
+                            "",
+                            visible_content,
+                            [],
+                            [],
+                        )
+                    )
+                    continue
+                for segment in split_story_bubble_segments(
+                    visible_content,
+                    sound_effect_cues=sound_effect_cues,
+                    speaker_cues=speaker_cues,
+                ):
+                    segment_text = str(segment["content"])
+                    conversation_entries.append(
+                        (
+                            "ai",
+                            mode,
+                            (
+                                format_story_message(segment_text)
+                            ),
+                            entry_id,
+                            str(entry.get("message_id", "") or ""),
+                            turn_number,
+                            str(segment.get("speaker_name", "") or ""),
+                            segment_text,
+                            segment.get("sound_effect_cues", []),
+                            segment.get("speaker_cues", []),
                         )
                     )
 
@@ -9690,12 +10682,25 @@ class StoryScreen(RepositoryBackedWidget):
         render_generation = self._conversation_render_generation
 
         self._clear_conversation_messages()
+        self._progressive_story_message = None
         repository = self.repository()
         latest_ai_entry = self._latest_ai_message_entry()
         latest_ai_history_id = _safe_int(
             latest_ai_entry.get("id") if latest_ai_entry is not None else None,
             -1,
         )
+        rendered_visual_message_ids: set[str] = set()
+        opening_live_message_id = ""
+        opening_live_history_id = -1
+        for candidate in entries:
+            if candidate[0] != "ai" or candidate[1] != "live_game":
+                continue
+            opening_live_message_id = str(candidate[4]) if len(candidate) > 4 else ""
+            opening_live_history_id = _safe_int(
+                candidate[3] if len(candidate) > 3 else -1,
+                -1,
+            )
+            break
         for entry in entries:
             role, mode, content, entry_id = entry[:4]
             message_id = str(entry[4]) if len(entry) > 4 else ""
@@ -9704,6 +10709,33 @@ class StoryScreen(RepositoryBackedWidget):
                 if len(entry) > 5 and entry[5] is not None
                 else None
             )
+            speaker_name = str(entry[6]) if len(entry) > 6 else ""
+            narration_text = str(entry[7]) if len(entry) > 7 else None
+            sound_effect_cues = entry[8] if len(entry) > 8 else None
+            speaker_cues = entry[9] if len(entry) > 9 else None
+            is_opening_message = (
+                role == "ai"
+                and mode == "live_game"
+                and (
+                    (
+                        bool(opening_live_message_id)
+                        and message_id == opening_live_message_id
+                    )
+                    or (
+                        not opening_live_message_id
+                        and _safe_int(entry_id, -1) == opening_live_history_id
+                    )
+                )
+            )
+            show_visual_assets = bool(
+                role == "ai"
+                and mode == "live_game"
+                and message_id
+                and message_id not in rendered_visual_message_ids
+                and not is_opening_message
+            )
+            if show_visual_assets:
+                rendered_visual_message_ids.add(message_id)
             can_regenerate = (
                 role == "ai"
                 and mode == "live_game"
@@ -9713,17 +10745,29 @@ class StoryScreen(RepositoryBackedWidget):
                 and repository.has_message_snapshot(message_id)
                 and not self._waiting_for_gm
             )
+            bubble = self._conversation_bubble(
+                role,
+                mode,
+                content,
+                history_entry_id=_safe_int(entry_id, -1),
+                message_id=message_id,
+                can_regenerate=can_regenerate,
+                turn_number=turn_number,
+                speaker_name=speaker_name,
+                narration_text=narration_text,
+                sound_effect_cues=sound_effect_cues,
+                speaker_cues=speaker_cues,
+                show_visual_assets=show_visual_assets,
+                is_opening_message=is_opening_message,
+            )
+            if (
+                role == "ai"
+                and _safe_int(entry_id, -1) == self._revealing_story_id
+            ):
+                self._progressive_story_message = bubble.findChild(QTextEdit)
             self.conversation_layout.insertWidget(
                 self.conversation_layout.count() - 2,
-                self._conversation_bubble(
-                    role,
-                    mode,
-                    content,
-                    history_entry_id=_safe_int(entry_id, -1),
-                    message_id=message_id,
-                    can_regenerate=can_regenerate,
-                    turn_number=turn_number,
-                ),
+                bubble,
             )
         QTimer.singleShot(
             0,
@@ -9785,9 +10829,16 @@ class StoryScreen(RepositoryBackedWidget):
         message_id: str = "",
         can_regenerate: bool = False,
         turn_number: int | None = None,
+        speaker_name: str = "",
+        narration_text: str | None = None,
+        sound_effect_cues: list[dict[str, str]] | None = None,
+        speaker_cues: list[dict[str, str]] | None = None,
+        show_visual_assets: bool = False,
+        is_opening_message: bool = False,
     ) -> QWidget:
         """Builds one readable AI or player chat bubble."""
 
+        repository = self.repository()
         is_player = role == "player"
         is_out_of_game = mode == "out_of_game"
         row = QWidget()
@@ -9801,7 +10852,9 @@ class StoryScreen(RepositoryBackedWidget):
         bubble_layout.setContentsMargins(14, 10, 14, 10)
         bubble_layout.setSpacing(5)
 
-        speaker = "You" if is_player else "AI Game Master"
+        speaker = (
+            "You" if is_player else (speaker_name.strip() or "AI Game Master")
+        )
         mode_label = "Out-of-Game" if is_out_of_game else "Live Game"
         turn_label = (
             f"  |  Turn #{turn_number}"
@@ -9813,7 +10866,7 @@ class StoryScreen(RepositoryBackedWidget):
         read_aloud_button = QPushButton("Read Aloud")
         read_aloud_button.setEnabled(self.narration_player is not None)
         read_aloud_button.setToolTip(
-            "Regenerate and play this message with the local narrator. No AI request is sent."
+            "Play this bubble with its saved narrator or character voice. No AI request is sent."
             if self.narration_player is not None
             else "Local narrator playback is unavailable in this build."
         )
@@ -9823,14 +10876,16 @@ class StoryScreen(RepositoryBackedWidget):
             "border-radius: 7px; padding: 3px 9px; font-size: 11px; } "
             "QPushButton:hover { background-color: rgba(255, 255, 255, 48); }"
         )
-        read_aloud_button.clicked.connect(
-            lambda _checked=False, message_text=content, entry_id=history_entry_id: (
-                self._read_conversation_message_aloud(
-                    message_text,
-                    history_entry_id=entry_id,
-                )
+        def read_message_aloud(*_args: Any) -> None:
+            self._read_conversation_message_aloud(
+                content,
+                history_entry_id=history_entry_id,
+                narration_text=narration_text,
+                sound_effect_cues=sound_effect_cues,
+                speaker_cues=speaker_cues,
             )
-        )
+
+        read_aloud_button.clicked.connect(read_message_aloud)
 
         header_row = QHBoxLayout()
         header_row.setContentsMargins(0, 0, 0, 0)
@@ -9840,7 +10895,8 @@ class StoryScreen(RepositoryBackedWidget):
         if can_regenerate:
             regenerate_button = QPushButton("Regenerate")
             regenerate_button.setToolTip(
-                "Regenerate only the latest live-game message after reverting its changes."
+                "Regenerate this whole turn after reverting every bubble and state "
+                "change tied to its message ID."
             )
             regenerate_button.setStyleSheet(
                 "QPushButton { background-color: rgba(255, 255, 255, 28); "
@@ -9855,6 +10911,60 @@ class StoryScreen(RepositoryBackedWidget):
             )
             header_row.addWidget(regenerate_button)
         bubble_layout.addLayout(header_row)
+
+        speaker_asset = self._conversation_speaker_asset(
+            role,
+            speaker_cues,
+        )
+        if speaker_asset is not None:
+            portrait_label = QLabel()
+            portrait_label.setObjectName("conversationSpeakerPortrait")
+            portrait_label.setStyleSheet(
+                "background: rgba(15, 23, 42, 96); border-radius: 8px; padding: 3px;"
+            )
+            _set_generated_image(
+                portrait_label,
+                self.visual_asset_path(speaker_asset),
+                maximum_width=76,
+                maximum_height=96,
+                accessible_name=f"Profile picture of {speaker}",
+            )
+            bubble_layout.addWidget(
+                portrait_label,
+                0,
+                Qt.AlignmentFlag.AlignLeft,
+            )
+
+        if show_visual_assets and repository is not None and message_id:
+            visual_assets = [
+                asset
+                for asset in repository.list_visual_assets_for_message(message_id)
+                if str(asset.get("subject_type", "")).casefold() == "inventory"
+            ]
+            if visual_assets:
+                image_grid = QGridLayout()
+                image_grid.setContentsMargins(0, 3, 0, 3)
+                image_grid.setHorizontalSpacing(8)
+                image_grid.setVerticalSpacing(8)
+                for index, asset in enumerate(visual_assets[:12]):
+                    image_label = QLabel()
+                    image_label.setObjectName("conversationGeneratedImage")
+                    image_label.setStyleSheet(
+                        "background: rgba(15, 23, 42, 96); border-radius: 8px; padding: 3px;"
+                    )
+                    if not _set_generated_image(
+                        image_label,
+                        self.visual_asset_path(asset),
+                        maximum_width=220,
+                        maximum_height=180,
+                        accessible_name=(
+                            f"Generated {asset.get('subject_type', 'subject')} image: "
+                            f"{asset.get('display_name', '')}"
+                        ),
+                    ):
+                        continue
+                    image_grid.addWidget(image_label, index // 3, index % 3)
+                bubble_layout.addLayout(image_grid)
 
         message = QTextEdit()
         message.setReadOnly(True)
@@ -9894,11 +11004,66 @@ class StoryScreen(RepositoryBackedWidget):
             row_layout.addWidget(bubble, 1)
         return row
 
+    def _conversation_speaker_asset(
+        self,
+        role: str,
+        speaker_cues: Any,
+    ) -> dict[str, Any] | None:
+        """Returns the ready portrait for a player or explicitly named NPC speaker."""
+
+        repository = self.repository()
+        if repository is None:
+            return None
+        if role == "player":
+            return repository.get_visual_asset("player", repository.get_player_id())
+        if role != "ai" or not isinstance(speaker_cues, list):
+            return None
+
+        for cue in speaker_cues:
+            if not isinstance(cue, dict):
+                continue
+            speaker_id = str(cue.get("speaker_id", "") or "").strip()
+            if speaker_id:
+                return repository.get_visual_asset("npc", speaker_id)
+        return None
+
+    def _refresh_current_location_image(self, location_name: str) -> None:
+        """Shows the ready establishing image for the player's current location."""
+
+        repository = self.repository()
+        if repository is None or not str(location_name or "").strip():
+            self.location_image_label.hide()
+            return
+
+        location = repository.find_travel_location(location_name)
+        if not isinstance(location, dict):
+            self.location_image_label.hide()
+            return
+        location_key = str(
+            location.get("location_id", "") or location.get("name", "")
+        ).strip()
+        location_asset = repository.get_visual_asset("location", location_key)
+        if location_asset is None:
+            location_asset = repository.get_visual_asset(
+                "location",
+                str(location.get("name", "") or ""),
+            )
+        _set_generated_image(
+            self.location_image_label,
+            self.visual_asset_path(location_asset),
+            maximum_width=560,
+            maximum_height=280,
+            accessible_name=f"Current location: {location.get('name', location_name)}",
+        )
+
     def _read_conversation_message_aloud(
         self,
         text: str,
         *,
         history_entry_id: int = -1,
+        narration_text: str | None = None,
+        sound_effect_cues: list[dict[str, str]] | None = None,
+        speaker_cues: list[dict[str, str]] | None = None,
     ) -> bool:
         """Replays one saved passage and its sound cues without contacting Gemini."""
 
@@ -9918,10 +11083,18 @@ class StoryScreen(RepositoryBackedWidget):
             if repository is not None
             else {}
         )
-        narration_text = text
-        sound_effect_cues: list[dict[str, str]] = []
-        speaker_cues: list[dict[str, str]] = []
-        if repository is not None and history_entry_id >= 0:
+        playback_text = text if narration_text is None else narration_text
+        playback_sound_effect_cues = [
+            cue for cue in (sound_effect_cues or []) if isinstance(cue, dict)
+        ]
+        playback_speaker_cues = [
+            cue for cue in (speaker_cues or []) if isinstance(cue, dict)
+        ]
+        if (
+            narration_text is None
+            and repository is not None
+            and history_entry_id >= 0
+        ):
             history_entry = next(
                 (
                     entry
@@ -9931,23 +11104,23 @@ class StoryScreen(RepositoryBackedWidget):
                 None,
             )
             if history_entry is not None:
-                narration_text = str(history_entry.get("content", text))
+                playback_text = str(history_entry.get("content", text))
                 raw_cues = history_entry.get("sound_effect_cues", [])
                 if isinstance(raw_cues, list):
-                    sound_effect_cues = [
+                    playback_sound_effect_cues = [
                         cue for cue in raw_cues if isinstance(cue, dict)
                     ]
                 raw_speaker_cues = history_entry.get("speaker_cues", [])
                 if isinstance(raw_speaker_cues, list):
-                    speaker_cues = [
+                    playback_speaker_cues = [
                         cue for cue in raw_speaker_cues if isinstance(cue, dict)
                     ]
 
         return bool(
             self.narration_player.play_sample(
-                text=narration_text,
-                sound_effect_cues=sound_effect_cues,
-                speaker_cues=speaker_cues,
+                text=playback_text,
+                sound_effect_cues=playback_sound_effect_cues,
+                speaker_cues=playback_speaker_cues,
                 tts_text_transform=lambda chunk: apply_pronunciation_map(
                     chunk,
                     pronunciation_map,
@@ -10252,6 +11425,15 @@ class StoryScreen(RepositoryBackedWidget):
             if self.sound_manager is not None
             else []
         )
+        valid_background_ambience_tracks = (
+            getattr(
+                self.sound_manager,
+                "get_valid_background_ambience_names",
+                lambda: [],
+            )()
+            if self.sound_manager is not None
+            else []
+        )
         return AiContextBuilder.from_default_library().build_story_context(
             state,
             player_command=player_text,
@@ -10263,6 +11445,10 @@ class StoryScreen(RepositoryBackedWidget):
             valid_music_tracks=valid_music_tracks,
             current_music=str(repository.get_setting("audio.current_music", "")),
             valid_sound_effect_tracks=valid_sound_effect_tracks,
+            valid_background_ambience_tracks=valid_background_ambience_tracks,
+            current_background_ambience=str(
+                repository.get_setting("audio.current_background_ambience", "")
+            ),
             resolved_skill_checks=resolved_skill_checks,
             planner_context_tags=planner_context_tags,
         )
@@ -10538,14 +11724,16 @@ class StoryScreen(RepositoryBackedWidget):
         """Toggles player input while Gemini or narration is still working."""
 
         self._waiting_for_gm = waiting
+        if waiting:
+            self._thinking_frame_index = 0
+            self._thinking_timer.start()
+        else:
+            self._thinking_timer.stop()
         self._sync_story_input_state()
         self._update_continue_button_state()
 
         if waiting:
-            self.player_input.setPlaceholderText(GM_THINKING_TEXT)
-            self.player_input.setToolTip(GM_THINKING_TEXT)
-            self.submit_button.setToolTip(GM_THINKING_TEXT)
-            self.continue_button.setToolTip(GM_THINKING_TEXT)
+            self._apply_thinking_indicator_text()
         elif self._combat_active and self._conversation_mode() == "live_game":
             tooltip = "Resolve the active combat in the Combat tab before sending story actions."
             self.player_input.setPlaceholderText("Combat is active...")
@@ -10560,9 +11748,29 @@ class StoryScreen(RepositoryBackedWidget):
             )
             self.player_input.setToolTip("")
             self.submit_button.setToolTip("")
-            self.continue_button.setToolTip(
-                "Ask the GM to expand the latest live-game response."
-            )
+        self.continue_button.setToolTip(
+            "Ask the GM to expand the latest live-game response."
+        )
+
+    def _advance_thinking_indicator(self) -> None:
+        """Advances the visible thinking indicator while a request is active."""
+
+        if not self._waiting_for_gm:
+            self._thinking_timer.stop()
+            return
+        self._thinking_frame_index = (
+            self._thinking_frame_index + 1
+        ) % len(GM_THINKING_FRAMES)
+        self._apply_thinking_indicator_text()
+
+    def _apply_thinking_indicator_text(self) -> None:
+        """Applies the current animated thinking text to the input affordances."""
+
+        text = GM_THINKING_FRAMES[self._thinking_frame_index]
+        self.player_input.setPlaceholderText(text)
+        self.player_input.setToolTip(text)
+        self.submit_button.setToolTip(text)
+        self.continue_button.setToolTip(text)
 
     def _sync_story_input_state(self) -> None:
         """Enables input according to request state, combat, and explicit mode."""
@@ -10574,10 +11782,7 @@ class StoryScreen(RepositoryBackedWidget):
         self.mode_button.setEnabled(not self._waiting_for_gm)
 
         if self._waiting_for_gm:
-            self.player_input.setPlaceholderText(GM_THINKING_TEXT)
-            self.player_input.setToolTip(GM_THINKING_TEXT)
-            self.submit_button.setToolTip(GM_THINKING_TEXT)
-            self.continue_button.setToolTip(GM_THINKING_TEXT)
+            self._apply_thinking_indicator_text()
             return
 
         if self._combat_active and not is_out_of_game:
@@ -10619,7 +11824,18 @@ class StoryScreen(RepositoryBackedWidget):
     def set_initial_generation_pending(self, pending: bool) -> None:
         """Toggles the story input while the opening scene is generated."""
 
+        self._initial_generation_pending = bool(pending)
         self._set_waiting_for_gm(pending)
+        self.refresh()
+
+    def _show_unresolved_status(self) -> None:
+        """Shows neutral values while the opening game state is unresolved."""
+
+        self.location_value.setText(UNRESOLVED_STATUS_TEXT)
+        self.day_value.setText(UNRESOLVED_STATUS_TEXT)
+        self.time_value.setText(UNRESOLVED_STATUS_TEXT)
+        self.weather_value.setText(UNRESOLVED_STATUS_TEXT)
+        self.location_image_label.hide()
 
     def narrate_latest_story(self, *, reveal_progressively: bool = False) -> bool:
         """Narrates the latest story, optionally revealing its chunks on screen."""
@@ -10754,7 +11970,21 @@ class StoryScreen(RepositoryBackedWidget):
             return
 
         self._revealed_story_chunks.append(clean_chunk)
-        self.refresh()
+        message = self._progressive_story_message
+        if message is None:
+            self.refresh()
+            return
+
+        bar = self.conversation_scroll.verticalScrollBar()
+        follow_bottom = bar.maximum() - bar.value() <= 48
+        message.setPlainText("".join(self._revealed_story_chunks))
+        message.document().adjustSize()
+        message.setFixedHeight(max(24, int(message.document().size().height()) + 4))
+        self.conversation_layout.activate()
+        self.conversation_contents.adjustSize()
+        self._update_conversation_bottom_padding()
+        if follow_bottom:
+            bar.setValue(bar.maximum())
 
     def _complete_revealed_story(self, story_id: int) -> None:
         """Restores normal full-history rendering after chunked narration."""
@@ -10763,8 +11993,11 @@ class StoryScreen(RepositoryBackedWidget):
             return
 
         self._clear_story_reveal_state()
-        self._set_waiting_for_gm(False)
-        self.refresh()
+        if self._initial_generation_pending:
+            self.set_initial_generation_pending(False)
+        else:
+            self._set_waiting_for_gm(False)
+            self.refresh()
 
     def _recover_stalled_story_reveal(
         self,
@@ -10788,8 +12021,11 @@ class StoryScreen(RepositoryBackedWidget):
             story_id,
         )
         self._clear_story_reveal_state()
-        self._set_waiting_for_gm(False)
-        self.refresh()
+        if self._initial_generation_pending:
+            self.set_initial_generation_pending(False)
+        else:
+            self._set_waiting_for_gm(False)
+            self.refresh()
 
     def _clear_story_reveal_state(self) -> None:
         """Clears progressive story reveal state."""
@@ -10797,6 +12033,7 @@ class StoryScreen(RepositoryBackedWidget):
         self._story_reveal_generation += 1
         self._revealing_story_id = None
         self._revealed_story_chunks = []
+        self._progressive_story_message = None
 
     def _latest_story_entry(self) -> dict[str, Any] | None:
         """Returns the most recent saved story entry."""
@@ -10994,7 +12231,16 @@ class CharacterScreen(RepositoryBackedWidget):
         condition_layout.addRow("Condition:", self.condition_label)
         self.condition_group.setLayout(condition_layout)
 
+        self.portrait_group = QGroupBox("Portrait")
+        portrait_layout = QVBoxLayout()
+        self.portrait_label = QLabel()
+        self.portrait_label.setMinimumWidth(220)
+        portrait_layout.addWidget(self.portrait_label, 0, Qt.AlignmentFlag.AlignHCenter)
+        self.portrait_group.setLayout(portrait_layout)
+        self.portrait_group.hide()
+
         left_layout = QVBoxLayout()
+        left_layout.addWidget(self.portrait_group)
         left_layout.addWidget(self.condition_group)
         left_layout.addWidget(self.stats_group)
         left_layout.addWidget(self.equipment_group)
@@ -11081,6 +12327,7 @@ class CharacterScreen(RepositoryBackedWidget):
 
         try:
             if repository is None:
+                self.portrait_group.hide()
                 self.name_input.clear()
                 self.name_pronunciation_input.clear()
                 self._set_pronouns(DEFAULT_CHARACTER_PRONOUNS)
@@ -11121,6 +12368,19 @@ class CharacterScreen(RepositoryBackedWidget):
             self._populate_equipment_combos(inventory_items, equipment)
             self._sync_equipment_summary()
             self.condition_label.setText(state.player.condition or "Healthy")
+            portrait_asset = repository.get_visual_asset(
+                "player",
+                repository.get_player_id(),
+            )
+            self.portrait_group.setVisible(
+                _set_generated_image(
+                    self.portrait_label,
+                    self.visual_asset_path(portrait_asset),
+                    maximum_width=280,
+                    maximum_height=340,
+                    accessible_name=f"Generated portrait of {state.player.name}",
+                )
+            )
             self._sync_contextual_controls(repository)
         finally:
             self._loading_character = False
@@ -12897,6 +14157,10 @@ class TravelScreen(RepositoryBackedWidget):
         self.details_output = QTextEdit()
         self.details_output.setReadOnly(True)
 
+        self.location_image_label = QLabel()
+        self.location_image_label.setObjectName("travelLocationImage")
+        self.location_image_label.hide()
+
         self.travel_context_input = QTextEdit()
         self.travel_context_input.setPlaceholderText("Optional details for the GM")
         self.travel_context_input.setMaximumHeight(92)
@@ -12910,6 +14174,7 @@ class TravelScreen(RepositoryBackedWidget):
         list_layout.addWidget(self.location_list)
 
         details_layout = QVBoxLayout()
+        details_layout.addWidget(self.location_image_label)
         details_layout.addWidget(self.details_output)
         details_layout.addWidget(QLabel("Travel Context"))
         details_layout.addWidget(self.travel_context_input)
@@ -12931,6 +14196,7 @@ class TravelScreen(RepositoryBackedWidget):
 
         if repository is None:
             self.location_list.blockSignals(False)
+            self.location_image_label.hide()
             self.details_output.clear()
             self.travel_button.setEnabled(False)
             return
@@ -12962,6 +14228,7 @@ class TravelScreen(RepositoryBackedWidget):
         self.location_list.blockSignals(False)
 
         if self.location_list.count() == 0:
+            self.location_image_label.hide()
             self.details_output.setPlainText("No locations are known yet.")
             self.travel_button.setEnabled(False)
             return
@@ -13016,6 +14283,7 @@ class TravelScreen(RepositoryBackedWidget):
         destination = normalize_known_location(raw_destination)
 
         if repository is None or destination is None:
+            self.location_image_label.hide()
             self.details_output.clear()
             self.travel_button.setEnabled(False)
             return
@@ -13064,6 +14332,17 @@ class TravelScreen(RepositoryBackedWidget):
             sections.append("## Conditions\n\n" + "\n\n".join(conditions))
 
         _set_markdown_text(self.details_output, "\n\n".join(sections))
+        location_asset = repository.get_visual_asset(
+            "location",
+            str(destination.location_id or destination.name).casefold(),
+        )
+        _set_generated_image(
+            self.location_image_label,
+            self.visual_asset_path(location_asset),
+            maximum_width=560,
+            maximum_height=280,
+            accessible_name=f"Generated view of {destination.name}",
+        )
         can_travel = (
             estimate.is_available
             and destination.name.casefold() != state.world.location.casefold()
@@ -14007,6 +15286,7 @@ class InventoryItemDetailsDialog(QDialog):
         item: dict[str, Any],
         catalog_entry: dict[str, Any] | None,
         denominations: list[dict[str, Any]],
+        image_path: Path | None = None,
         show_structured_details: bool = False,
         parent: QWidget | None = None,
     ) -> None:
@@ -14022,34 +15302,11 @@ class InventoryItemDetailsDialog(QDialog):
         self.setModal(True)
         self.setWindowModality(Qt.WindowModality.ApplicationModal)
         self.setMinimumSize(520, 520 if show_structured_details else 440)
+        self.setSizeGripEnabled(True)
 
         title = QLabel(name)
         title.setObjectName("inventoryItemDetailTitle")
         title.setStyleSheet("font-size: 20px; font-weight: 700;")
-
-        ascii_art = ensure_substantive_ascii_art(
-            (catalog_entry or {}).get("ascii_art", "")
-            or item.get("ascii_art", "")
-            or "",
-            item_name=str(item.get("name", "Unnamed Item")),
-            category=str(item.get("category", "Item")),
-        )
-        art_view = QPlainTextEdit()
-        art_view.setObjectName("inventoryAsciiArt")
-        art_view.setReadOnly(True)
-        art_view.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
-        art_view.setPlainText(
-            ascii_art
-            or "No ASCII art was saved for this item."
-        )
-        _center_ascii_art_blocks(art_view)
-        art_view.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        art_view.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        art_view.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        art_view.setStyleSheet(
-            "font-family: Consolas, 'Courier New', monospace;"
-        )
-        art_width, art_height = _size_ascii_art_view(art_view, art_view.toPlainText())
 
         storage_location = _inventory_location_label(
             item.get("storage_location", "actively_carried")
@@ -14088,7 +15345,6 @@ class InventoryItemDetailsDialog(QDialog):
             inventory_metadata = item.get("metadata", {})
             if isinstance(inventory_metadata, dict):
                 metadata.update(inventory_metadata)
-            metadata.pop("ascii_art", None)
             metadata_view = QPlainTextEdit()
             metadata_view.setObjectName("inventoryStructuredDetails")
             metadata_view.setReadOnly(True)
@@ -14113,7 +15369,16 @@ class InventoryItemDetailsDialog(QDialog):
 
         layout = QVBoxLayout()
         layout.addWidget(title)
-        layout.addWidget(art_view, 0, Qt.AlignmentFlag.AlignHCenter)
+        generated_image = QLabel()
+        generated_image.setObjectName("inventoryGeneratedImage")
+        if _set_generated_image(
+            generated_image,
+            image_path,
+            maximum_width=384,
+            maximum_height=300,
+            accessible_name=f"Generated image of {name}",
+        ):
+            layout.addWidget(generated_image, 0, Qt.AlignmentFlag.AlignHCenter)
         layout.addLayout(summary)
         layout.addWidget(QLabel("Description"))
         layout.addWidget(description)
@@ -14127,14 +15392,8 @@ class InventoryItemDetailsDialog(QDialog):
         layout.addWidget(buttons)
         self.setLayout(layout)
         self.resize(
-            max(560, art_width + 48),
-            min(
-                900,
-                max(
-                    580 if show_structured_details else 500,
-                    (500 if show_structured_details else 360) + art_height,
-                ),
-            ),
+            560,
+            580 if show_structured_details else 500,
         )
 
 
@@ -14261,7 +15520,9 @@ class InventoryLocationPanel(QGroupBox):
         *,
         sort_field: str = "name",
         sort_descending: bool = False,
-        on_sort_changed: Callable[[str, bool], None] | None = None,
+        secondary_sort_field: str = "",
+        secondary_sort_descending: bool = False,
+        on_sort_changed: Callable[[str, bool, str, bool], None] | None = None,
     ) -> None:
         super().__init__(f"{_inventory_location_label(location)} ({len(items)})")
         self.location = location
@@ -14290,6 +15551,33 @@ class InventoryLocationPanel(QGroupBox):
         controls.addWidget(self.sort_direction_combo)
         layout.addLayout(controls)
 
+        secondary_controls = QHBoxLayout()
+        secondary_controls.addWidget(QLabel("Then by:"))
+        self.secondary_sort_field_combo = QComboBox()
+        self.secondary_sort_field_combo.setObjectName(
+            "inventoryLocationSecondarySortField"
+        )
+        self.secondary_sort_field_combo.addItem("None", "")
+        for label, value in self.SORT_OPTIONS:
+            self.secondary_sort_field_combo.addItem(label, value)
+        _set_combo_to_data(self.secondary_sort_field_combo, secondary_sort_field)
+        secondary_controls.addWidget(self.secondary_sort_field_combo, 1)
+
+        self.secondary_sort_direction_combo = QComboBox()
+        self.secondary_sort_direction_combo.setObjectName(
+            "inventoryLocationSecondarySortDirection"
+        )
+        self.secondary_sort_direction_combo.addItem("Ascending", False)
+        self.secondary_sort_direction_combo.addItem("Descending", True)
+        secondary_direction_index = self.secondary_sort_direction_combo.findData(
+            bool(secondary_sort_descending)
+        )
+        self.secondary_sort_direction_combo.setCurrentIndex(
+            max(0, secondary_direction_index)
+        )
+        secondary_controls.addWidget(self.secondary_sort_direction_combo)
+        layout.addLayout(secondary_controls)
+
         self.item_list_layout = QVBoxLayout()
         layout.addLayout(self.item_list_layout)
         layout.addStretch(1)
@@ -14297,6 +15585,13 @@ class InventoryLocationPanel(QGroupBox):
 
         self.sort_field_combo.currentIndexChanged.connect(self._sorting_changed)
         self.sort_direction_combo.currentIndexChanged.connect(self._sorting_changed)
+        self.secondary_sort_field_combo.currentIndexChanged.connect(
+            self._sorting_changed
+        )
+        self.secondary_sort_direction_combo.currentIndexChanged.connect(
+            self._sorting_changed
+        )
+        self._sync_secondary_sort_controls()
         self._render_items()
 
     def _sorting_changed(self, _index: int) -> None:
@@ -14304,9 +15599,27 @@ class InventoryLocationPanel(QGroupBox):
 
         sort_field = str(self.sort_field_combo.currentData() or "name")
         sort_descending = bool(self.sort_direction_combo.currentData())
+        secondary_sort_field = str(
+            self.secondary_sort_field_combo.currentData() or ""
+        )
+        secondary_sort_descending = bool(
+            self.secondary_sort_direction_combo.currentData()
+        )
+        self._sync_secondary_sort_controls()
         if self._on_sort_changed is not None:
-            self._on_sort_changed(sort_field, sort_descending)
+            self._on_sort_changed(
+                sort_field,
+                sort_descending,
+                secondary_sort_field,
+                secondary_sort_descending,
+            )
         self._render_items()
+
+    def _sync_secondary_sort_controls(self) -> None:
+        """Enables secondary direction only when a secondary field is selected."""
+
+        has_secondary_sort = bool(self.secondary_sort_field_combo.currentData())
+        self.secondary_sort_direction_combo.setEnabled(has_secondary_sort)
 
     def _render_items(self) -> None:
         """Rebuilds the item buttons in the selected order."""
@@ -14323,10 +15636,18 @@ class InventoryLocationPanel(QGroupBox):
         self.group_separators.clear()
         sort_field = str(self.sort_field_combo.currentData() or "name")
         sort_descending = bool(self.sort_direction_combo.currentData())
-        sorted_items = sorted(
+        secondary_sort_field = str(
+            self.secondary_sort_field_combo.currentData() or ""
+        )
+        secondary_sort_descending = bool(
+            self.secondary_sort_direction_combo.currentData()
+        )
+        sorted_items = sort_inventory_items(
             self._items,
-            key=lambda candidate: self._item_sort_key(candidate, sort_field),
-            reverse=sort_descending,
+            primary_field=sort_field,
+            primary_descending=sort_descending,
+            secondary_field=secondary_sort_field,
+            secondary_descending=secondary_sort_descending,
         )
         previous_group: Any = None
         for index, item in enumerate(sorted_items):
@@ -14375,19 +15696,6 @@ class InventoryLocationPanel(QGroupBox):
         name = str(item.get("name", "")).strip().casefold()
         return name[:1] or "#"
 
-    @staticmethod
-    def _item_sort_key(item: dict[str, Any], sort_field: str) -> tuple[Any, str]:
-        """Returns a stable player-facing sort key for one inventory item."""
-
-        name = str(item.get("name", "")).casefold()
-        if sort_field == "category":
-            return str(item.get("category", "Item") or "Item").casefold(), name
-        if sort_field == "price":
-            return max(0, _safe_int(item.get("value_base_units", 0), 0)), name
-        if sort_field == "quantity":
-            return max(0, _safe_int(item.get("quantity", 0), 0)), name
-        return name, name
-
 
 def _selectable_label(value: Any) -> QLabel:
     """Creates a selectable, wrapping value label for a detail form."""
@@ -14396,43 +15704,6 @@ def _selectable_label(value: Any) -> QLabel:
     label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
     label.setWordWrap(True)
     return label
-
-
-def _size_ascii_art_view(view: QPlainTextEdit, ascii_art: str) -> tuple[int, int]:
-    """Sizes a centered fixed-width art field from its longest line and line count."""
-
-    lines = ascii_art.splitlines() or [ascii_art]
-    metrics = QFontMetrics(view.font())
-    view.document().setDocumentMargin(0)
-    longest_line_width = max(
-        (metrics.horizontalAdvance(line) for line in lines),
-        default=0,
-    )
-    width = max(280, min(900, longest_line_width + 40))
-    height = max(64, min(360, (len(lines) * metrics.lineSpacing()) + 28))
-    view.setFixedSize(width, height)
-    content_height = len(lines) * metrics.lineSpacing()
-    top_padding = max(0, (height - content_height) // 2)
-    view.setViewportMargins(0, top_padding, 0, 0)
-    return width, height
-
-
-def _center_ascii_art_blocks(view: QPlainTextEdit) -> None:
-    """Centers every ASCII-art paragraph horizontally in the art viewport."""
-
-    block_format = QTextBlockFormat()
-    block_format.setAlignment(Qt.AlignmentFlag.AlignCenter)
-    document = view.document()
-    cursor = QTextCursor(document)
-    block = document.firstBlock()
-    while block.isValid():
-        cursor.setPosition(block.position())
-        cursor.movePosition(
-            QTextCursor.MoveOperation.EndOfBlock,
-            QTextCursor.MoveMode.KeepAnchor,
-        )
-        cursor.mergeBlockFormat(block_format)
-        block = block.next()
 
 
 def _inventory_location_label(value: Any) -> str:
@@ -14458,7 +15729,10 @@ class InventoryScreen(RepositoryBackedWidget):
         self._inventory_items: dict[str, dict[str, Any]] = {}
         self._catalog_by_name: dict[str, dict[str, Any]] = {}
         self._denominations: list[dict[str, Any]] = []
-        self._location_sort_settings: dict[str, tuple[str, bool]] = {}
+        self._location_sort_settings: dict[
+            str,
+            tuple[str, bool, str, bool],
+        ] = {}
         self.location_panels: list[InventoryLocationPanel] = []
         self.currency_label = QLabel("Currency: 0")
 
@@ -14685,17 +15959,30 @@ class InventoryScreen(RepositoryBackedWidget):
         ordered_locations = sorted(grouped_items, key=location_key)
         location_count = len(ordered_locations)
         for index, location in enumerate(ordered_locations):
-            sort_field, sort_descending = self._location_sort_settings.get(
+            (
+                sort_field,
+                sort_descending,
+                secondary_sort_field,
+                secondary_sort_descending,
+            ) = self._location_sort_settings.get(
                 location,
-                ("name", False),
+                ("name", False, "", False),
             )
 
             def remember_sort(
                 field: str,
                 descending: bool,
+                secondary_field: str,
+                secondary_descending: bool,
                 panel_location: str = location,
             ) -> None:
-                self._remember_location_sort(panel_location, field, descending)
+                self._remember_location_sort(
+                    panel_location,
+                    field,
+                    descending,
+                    secondary_field,
+                    secondary_descending,
+                )
 
             panel = InventoryLocationPanel(
                 location,
@@ -14703,6 +15990,8 @@ class InventoryScreen(RepositoryBackedWidget):
                 self._open_item_details,
                 sort_field=sort_field,
                 sort_descending=sort_descending,
+                secondary_sort_field=secondary_sort_field,
+                secondary_sort_descending=secondary_sort_descending,
                 on_sort_changed=remember_sort,
             )
             is_unpaired_final_panel = location_count % 2 == 1 and index == location_count - 1
@@ -14718,10 +16007,17 @@ class InventoryScreen(RepositoryBackedWidget):
         location: str,
         sort_field: str,
         sort_descending: bool,
+        secondary_sort_field: str,
+        secondary_sort_descending: bool,
     ) -> None:
         """Keeps each location's sort choice across inventory refreshes."""
 
-        self._location_sort_settings[location] = (sort_field, sort_descending)
+        self._location_sort_settings[location] = (
+            sort_field,
+            sort_descending,
+            secondary_sort_field,
+            secondary_sort_descending,
+        )
 
     def _open_item_details(self, item: dict[str, Any]) -> None:
         """Opens one blocking item-detail dialog and primes playtesting edits."""
@@ -14731,10 +16027,25 @@ class InventoryScreen(RepositoryBackedWidget):
         if self.playtesting_tools:
             self._load_selected_item(selected_name)
         catalog_entry = item.get("catalog_entry")
+        repository = self.repository()
+        image_asset = (
+            repository.get_visual_asset(
+                "inventory",
+                str(
+                    (item.get("metadata") or {}).get("item_uuid", "")
+                    if isinstance(item.get("metadata"), dict)
+                    else ""
+                ).strip()
+                or selected_name.casefold(),
+            )
+            if repository is not None and selected_name
+            else None
+        )
         dialog = InventoryItemDetailsDialog(
             item=item,
             catalog_entry=catalog_entry if isinstance(catalog_entry, dict) else None,
             denominations=self._denominations,
+            image_path=self.visual_asset_path(image_asset),
             show_structured_details=self.playtesting_tools,
             parent=self,
         )
@@ -15025,6 +16336,74 @@ class PartyScreen(RepositoryBackedWidget):
         _resize_wrapping_table_rows(self.table)
 
 
+class NpcDetailsDialog(QDialog):
+    """Resizable, player-facing detail view for one known NPC."""
+
+    def __init__(
+        self,
+        *,
+        npc: dict[str, Any],
+        image_path: Path | None = None,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        display_name = str(npc.get("display_name", "Unknown NPC") or "Unknown NPC")
+        self.setWindowTitle(display_name)
+        self.setModal(True)
+        self.setWindowModality(Qt.WindowModality.ApplicationModal)
+        self.setMinimumSize(520, 480)
+        self.setSizeGripEnabled(True)
+
+        title = QLabel(display_name)
+        title.setObjectName("npcDetailTitle")
+        title.setStyleSheet("font-size: 20px; font-weight: 700;")
+
+        summary = QFormLayout()
+        summary.addRow("Name:", _selectable_label(display_name))
+        summary.addRow(
+            "Location:",
+            _selectable_label(npc.get("location", "") or "Not specified"),
+        )
+
+        description = QTextEdit()
+        description.setObjectName("npcDetailDescription")
+        description.setReadOnly(True)
+        description.setPlainText(
+            str(npc.get("description", "") or "No description recorded.")
+        )
+        description.setMinimumHeight(100)
+
+        notes = QTextEdit()
+        notes.setObjectName("npcDetailNotes")
+        notes.setReadOnly(True)
+        notes.setPlainText(str(npc.get("notes", "") or "No notes recorded."))
+        notes.setMinimumHeight(100)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        buttons.rejected.connect(self.reject)
+
+        layout = QVBoxLayout()
+        layout.addWidget(title)
+        generated_image = QLabel()
+        generated_image.setObjectName("npcGeneratedDetailImage")
+        if _set_generated_image(
+            generated_image,
+            image_path,
+            maximum_width=384,
+            maximum_height=320,
+            accessible_name=f"Generated portrait of {display_name}",
+        ):
+            layout.addWidget(generated_image, 0, Qt.AlignmentFlag.AlignHCenter)
+        layout.addLayout(summary)
+        layout.addWidget(QLabel("Description"))
+        layout.addWidget(description, 1)
+        layout.addWidget(QLabel("Notes"))
+        layout.addWidget(notes, 1)
+        layout.addWidget(buttons)
+        self.setLayout(layout)
+        self.resize(560, 620)
+
+
 class NpcsScreen(RepositoryBackedWidget):
     """Player-facing NPC journal."""
 
@@ -15033,11 +16412,14 @@ class NpcsScreen(RepositoryBackedWidget):
 
         self._sort_column = 0
         self._sort_order = Qt.SortOrder.AscendingOrder
-        self.table = _AppTableWidget(0, 3)
+        self._npcs_by_id: dict[str, dict[str, Any]] = {}
+        self.table = _AppTableWidget(0, 4)
         self.table.setHorizontalHeaderLabels(
-            ["Name", "Location", "Notes"]
+            ["Name", "Location", "Notes", "Portrait"]
         )
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.table.cellClicked.connect(self._open_npc_details)
         _configure_wrapping_table(self.table, {2})
         _enable_table_sorting(self.table, self._sort_by_column)
         self.table.horizontalHeader().setSortIndicator(self._sort_column, self._sort_order)
@@ -15053,6 +16435,7 @@ class NpcsScreen(RepositoryBackedWidget):
         repository = self.repository()
 
         if repository is None:
+            self._npcs_by_id.clear()
             self.table.setRowCount(0)
             return
 
@@ -15061,18 +16444,69 @@ class NpcsScreen(RepositoryBackedWidget):
             key=self._sort_key,
             reverse=_sort_descending(self._sort_order),
         )
+        self._npcs_by_id = {
+            str(npc.get("npc_id", "") or "").strip(): dict(npc)
+            for npc in npcs
+            if str(npc.get("npc_id", "") or "").strip()
+        }
         self.table.setRowCount(len(npcs))
 
         for row_index, npc in enumerate(npcs):
-            self.table.setItem(
-                row_index,
-                0,
-                _table_item(str(npc.get("display_name", "Unknown NPC"))),
+            npc_id = str(npc.get("npc_id", "") or "").strip()
+            values = (
+                str(npc.get("display_name", "Unknown NPC")),
+                str(npc.get("location", "")),
+                str(npc.get("notes", "")),
             )
-            self.table.setItem(row_index, 1, _table_item(str(npc.get("location", ""))))
-            self.table.setItem(row_index, 2, _table_item(str(npc.get("notes", ""))))
+            for column, value in enumerate(values):
+                table_item = _table_item(value)
+                table_item.setData(Qt.ItemDataRole.UserRole, npc_id)
+                self.table.setItem(row_index, column, table_item)
+            portrait = QLabel()
+            portrait.setObjectName("npcGeneratedPortrait")
+            portrait.setMargin(4)
+            asset = repository.get_visual_asset(
+                "npc",
+                str(npc.get("npc_id", "") or "").casefold(),
+            )
+            if _set_generated_image(
+                portrait,
+                self.visual_asset_path(asset),
+                maximum_width=96,
+                maximum_height=96,
+                accessible_name=(
+                    f"Generated portrait of {npc.get('display_name', 'Unknown NPC')}"
+                ),
+            ):
+                self.table.setCellWidget(row_index, 3, portrait)
 
         _resize_wrapping_table_rows(self.table)
+        for row_index in range(self.table.rowCount()):
+            if self.table.cellWidget(row_index, 3) is not None:
+                self.table.setRowHeight(row_index, max(104, self.table.rowHeight(row_index)))
+
+    def _open_npc_details(self, row: int, _column: int) -> None:
+        """Opens the selected NPC's complete player-visible profile."""
+
+        if row < 0:
+            return
+        table_item = self.table.item(row, 0)
+        npc_id = (
+            str(table_item.data(Qt.ItemDataRole.UserRole) or "").strip()
+            if table_item is not None
+            else ""
+        )
+        npc = self._npcs_by_id.get(npc_id)
+        repository = self.repository()
+        if npc is None or repository is None:
+            return
+        asset = repository.get_visual_asset("npc", npc_id.casefold())
+        dialog = NpcDetailsDialog(
+            npc=npc,
+            image_path=self.visual_asset_path(asset),
+            parent=self,
+        )
+        dialog.exec()
 
     def _sort_by_column(self, column_index: int) -> None:
         """Sorts NPCs by a clicked header column."""
@@ -16675,6 +18109,7 @@ class SettingsScreen(RepositoryBackedWidget):
         self,
         on_audio_settings_changed=None,
         on_theme_changed=None,
+        sound_manager: SoundManagerProtocol | None = None,
         tts_enabled: bool = True,
         voice_options: dict[str, str] | None = None,
         on_sample_voice: SampleVoiceCallback | None = None,
@@ -16689,6 +18124,7 @@ class SettingsScreen(RepositoryBackedWidget):
 
         self.on_audio_settings_changed = on_audio_settings_changed
         self.on_theme_changed = on_theme_changed
+        self.sound_manager = sound_manager
         self.tts_enabled = bool(tts_enabled)
         self.voice_options = voice_options or available_narrator_voices()
         self.on_sample_voice = on_sample_voice
@@ -16721,9 +18157,50 @@ class SettingsScreen(RepositoryBackedWidget):
         self.ai_settings_button.setEnabled(False)
         self.ai_settings_button.clicked.connect(self._open_ai_settings_dialog)
 
+        self.generated_images_enabled_checkbox = QCheckBox(
+            "Generate and reuse portraits, locations, items, and NPC images"
+        )
+        self.generated_images_enabled_checkbox.setChecked(True)
+        self.generated_images_enabled_checkbox.setToolTip(
+            "New subjects may incur one Gemini image-generation charge; matching "
+            "descriptions reuse the existing cached image."
+        )
+        self.generated_images_enabled_checkbox.toggled.connect(
+            lambda _checked: self._save_settings()
+        )
+        self.maximum_generated_images_input = QSpinBox()
+        self.maximum_generated_images_input.setRange(1, 10_000)
+        self.maximum_generated_images_input.setValue(DEFAULT_IMAGE_LIMIT)
+        self.maximum_generated_images_input.setSuffix(" images")
+        self.maximum_generated_images_input.setToolTip(
+            "Maximum paid image-generation attempts for this save. Cached reuse is free."
+        )
+        self.maximum_generated_images_input.valueChanged.connect(
+            lambda _value: self._save_settings()
+        )
+        self.generated_image_model_label = QLabel(DEFAULT_IMAGE_MODEL)
+        self.generated_image_model_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        self.retry_failed_images_button = QPushButton("Retry Failed Images")
+        self.retry_failed_images_button.setToolTip(
+            "Explicitly requeue failed image requests. Failures are never retried automatically."
+        )
+        self.retry_failed_images_button.clicked.connect(self._retry_failed_images)
+
         self.music_enabled_checkbox = QCheckBox("Music enabled")
         self.music_enabled_checkbox.setChecked(True)
         self.music_enabled_checkbox.toggled.connect(lambda _checked: self._save_settings())
+
+        self.music_track_combo = QComboBox()
+        self.music_track_combo.setObjectName("settingsMusicTrack")
+        self._populate_audio_track_combo(
+            self.music_track_combo,
+            "get_valid_track_names",
+        )
+        self.music_track_combo.currentIndexChanged.connect(
+            lambda _index: self._save_settings()
+        )
 
         self.music_volume_slider = QSlider(Qt.Orientation.Horizontal)
         self.music_volume_slider.setRange(0, 100)
@@ -16748,6 +18225,35 @@ class SettingsScreen(RepositoryBackedWidget):
         )
         self.sound_effects_volume_slider.sliderReleased.connect(self._save_settings)
 
+        self.background_ambience_enabled_checkbox = QCheckBox(
+            "Background ambience enabled"
+        )
+        self.background_ambience_enabled_checkbox.setChecked(True)
+        self.background_ambience_enabled_checkbox.toggled.connect(
+            lambda _checked: self._save_settings()
+        )
+        self.background_ambience_track_combo = QComboBox()
+        self.background_ambience_track_combo.setObjectName(
+            "settingsBackgroundAmbienceTrack"
+        )
+        self._populate_audio_track_combo(
+            self.background_ambience_track_combo,
+            "get_valid_background_ambience_names",
+        )
+        self.background_ambience_track_combo.currentIndexChanged.connect(
+            lambda _index: self._save_settings()
+        )
+        self.background_ambience_volume_slider = QSlider(Qt.Orientation.Horizontal)
+        self.background_ambience_volume_slider.setRange(0, 100)
+        self.background_ambience_volume_slider.setValue(15)
+        self.background_ambience_volume_label = QLabel("15%")
+        self.background_ambience_volume_slider.valueChanged.connect(
+            lambda value: self.background_ambience_volume_label.setText(f"{value}%")
+        )
+        self.background_ambience_volume_slider.sliderReleased.connect(
+            self._save_settings
+        )
+
         if self.tts_enabled:
             self.tts_settings_button = QPushButton("TTS Settings")
             self.tts_settings_button.clicked.connect(self._open_tts_settings_dialog)
@@ -16769,18 +18275,36 @@ class SettingsScreen(RepositoryBackedWidget):
         layout.addRow("Theme Preference:", self.theme_combo)
         if self.ai_enabled:
             layout.addRow("Artificial Intelligence:", self.ai_settings_button)
+        if self.ai_enabled and not self.playtesting_tools:
+            layout.addRow("Generated Images:", self.generated_images_enabled_checkbox)
+            layout.addRow("Image Model:", self.generated_image_model_label)
+            layout.addRow("Generation Limit:", self.maximum_generated_images_input)
+            layout.addRow("Failed Images:", self.retry_failed_images_button)
         if self.music_feature_enabled:
             layout.addRow("Background Music:", self.music_enabled_checkbox)
+            layout.addRow("Music Track:", self.music_track_combo)
             layout.addRow(
                 "Music Volume:",
                 _slider_row(self.music_volume_slider, self.music_volume_label),
             )
-            layout.addRow("Ambient Sound Effects:", self.sound_effects_enabled_checkbox)
+            layout.addRow("Narration Sound Effects:", self.sound_effects_enabled_checkbox)
             layout.addRow(
                 "Sound Effects Volume:",
                 _slider_row(
                     self.sound_effects_volume_slider,
                     self.sound_effects_volume_label,
+                ),
+            )
+            layout.addRow(
+                "Background Ambience:",
+                self.background_ambience_enabled_checkbox,
+            )
+            layout.addRow("Ambience Track:", self.background_ambience_track_combo)
+            layout.addRow(
+                "Ambience Volume:",
+                _slider_row(
+                    self.background_ambience_volume_slider,
+                    self.background_ambience_volume_label,
                 ),
             )
 
@@ -16795,6 +18319,44 @@ class SettingsScreen(RepositoryBackedWidget):
             layout.addRow("", self.add_settings_currency_button)
 
         self.setLayout(layout)
+
+    def _populate_audio_track_combo(
+        self,
+        combo: QComboBox,
+        method_name: str,
+    ) -> None:
+        """Loads locally available music or ambience names into one selector."""
+
+        combo.clear()
+        combo.addItem("No track selected", "")
+        sound_manager = self.sound_manager
+        if sound_manager is None:
+            combo.setEnabled(False)
+            return
+        provider = getattr(sound_manager, method_name, None)
+        if not callable(provider):
+            combo.setEnabled(False)
+            return
+        try:
+            track_names = provider()
+        except Exception as error:
+            LOGGER.warning("Failed to load audio track choices: %s", error)
+            combo.setEnabled(False)
+            return
+        for track_name in track_names if isinstance(track_names, list) else []:
+            clean_name = str(track_name or "").strip()
+            if clean_name:
+                combo.addItem(clean_name, clean_name)
+        combo.setEnabled(True)
+
+    @staticmethod
+    def _set_audio_track_combo_value(combo: QComboBox, value: Any) -> None:
+        """Selects a saved track while preserving a name from an older catalog."""
+
+        clean_value = str(value or "").strip()
+        if clean_value and combo.findData(clean_value) < 0:
+            combo.addItem(clean_value, clean_value)
+        _set_combo_to_data(combo, clean_value)
 
     def _add_settings_currency_row(self) -> None:
         """Adds a blank currency row to the settings screen."""
@@ -16955,10 +18517,24 @@ class SettingsScreen(RepositoryBackedWidget):
             if repository is None:
                 self.theme_combo.setCurrentText("Light")
                 self.ai_settings_button.setEnabled(False)
+                self.generated_images_enabled_checkbox.setChecked(True)
+                self.generated_images_enabled_checkbox.setEnabled(False)
+                self.maximum_generated_images_input.setValue(DEFAULT_IMAGE_LIMIT)
+                self.maximum_generated_images_input.setEnabled(False)
+                self.retry_failed_images_button.setEnabled(False)
                 self.music_enabled_checkbox.setChecked(True)
+                self._set_audio_track_combo_value(self.music_track_combo, "")
+                self.music_track_combo.setEnabled(False)
                 self.music_volume_slider.setValue(25)
                 self.sound_effects_enabled_checkbox.setChecked(True)
                 self.sound_effects_volume_slider.setValue(35)
+                self.background_ambience_enabled_checkbox.setChecked(True)
+                self._set_audio_track_combo_value(
+                    self.background_ambience_track_combo,
+                    "",
+                )
+                self.background_ambience_track_combo.setEnabled(False)
+                self.background_ambience_volume_slider.setValue(15)
                 self._load_settings_currency_rows([])
                 self.add_settings_currency_button.setEnabled(False)
 
@@ -16997,6 +18573,34 @@ class SettingsScreen(RepositoryBackedWidget):
             self._load_settings_currency_rows(denominations)
             self.add_settings_currency_button.setEnabled(True)
             self.ai_settings_button.setEnabled(True)
+            self.generated_images_enabled_checkbox.setEnabled(True)
+            self.generated_images_enabled_checkbox.setChecked(
+                _bool_setting(repository.get_setting("images.enabled", True), True)
+            )
+            self.maximum_generated_images_input.setEnabled(True)
+            self.maximum_generated_images_input.setValue(
+                _clamped_int(
+                    repository.get_setting(
+                        "images.maximum_generated",
+                        DEFAULT_IMAGE_LIMIT,
+                    ),
+                    DEFAULT_IMAGE_LIMIT,
+                    1,
+                    10_000,
+                )
+            )
+            self.generated_image_model_label.setText(
+                str(
+                    repository.get_setting("images.model", DEFAULT_IMAGE_MODEL)
+                    or DEFAULT_IMAGE_MODEL
+                )
+            )
+            self.retry_failed_images_button.setEnabled(True)
+            self._set_audio_track_combo_value(
+                self.music_track_combo,
+                repository.get_setting("audio.current_music", ""),
+            )
+            self.music_track_combo.setEnabled(self.sound_manager is not None)
             self.music_enabled_checkbox.setChecked(
                 _bool_setting(repository.get_setting("audio.music_enabled", True), True)
             )
@@ -17013,6 +18617,25 @@ class SettingsScreen(RepositoryBackedWidget):
                 _clamped_int(
                     repository.get_setting("audio.sound_effects_volume", 35),
                     35,
+                    0,
+                    100,
+                )
+            )
+            self.background_ambience_enabled_checkbox.setChecked(
+                _bool_setting(
+                    repository.get_setting("audio.background_ambience_enabled", True),
+                    True,
+                )
+            )
+            self._set_audio_track_combo_value(
+                self.background_ambience_track_combo,
+                repository.get_setting("audio.current_background_ambience", ""),
+            )
+            self.background_ambience_track_combo.setEnabled(self.sound_manager is not None)
+            self.background_ambience_volume_slider.setValue(
+                _clamped_int(
+                    repository.get_setting("audio.background_ambience_volume", 15),
+                    15,
                     0,
                     100,
                 )
@@ -17074,8 +18697,21 @@ class SettingsScreen(RepositoryBackedWidget):
 
         try:
             repository.set_setting("theme", self.theme_combo.currentText())
+            repository.set_setting(
+                "images.enabled",
+                self.generated_images_enabled_checkbox.isChecked(),
+            )
+            repository.set_setting("images.model", DEFAULT_IMAGE_MODEL)
+            repository.set_setting(
+                "images.maximum_generated",
+                self.maximum_generated_images_input.value(),
+            )
             repository.set_setting("audio.music_enabled", self.music_enabled_checkbox.isChecked())
             repository.set_setting("audio.music_volume", self.music_volume_slider.value())
+            repository.set_setting(
+                "audio.current_music",
+                str(self.music_track_combo.currentData() or "").strip(),
+            )
             repository.set_setting(
                 "audio.sound_effects_enabled",
                 self.sound_effects_enabled_checkbox.isChecked(),
@@ -17083,6 +18719,18 @@ class SettingsScreen(RepositoryBackedWidget):
             repository.set_setting(
                 "audio.sound_effects_volume",
                 self.sound_effects_volume_slider.value(),
+            )
+            repository.set_setting(
+                "audio.background_ambience_enabled",
+                self.background_ambience_enabled_checkbox.isChecked(),
+            )
+            repository.set_setting(
+                "audio.current_background_ambience",
+                str(self.background_ambience_track_combo.currentData() or "").strip(),
+            )
+            repository.set_setting(
+                "audio.background_ambience_volume",
+                self.background_ambience_volume_slider.value(),
             )
 
             if self.narrator_enabled_checkbox is not None:
@@ -17106,6 +18754,23 @@ class SettingsScreen(RepositoryBackedWidget):
             self._saving_settings = False
 
         self.notify_repository_changed()
+
+    def _retry_failed_images(self) -> None:
+        """Requeues failed image requests only after explicit player intent."""
+
+        repository = self.repository()
+        if repository is None:
+            return
+        reset_count = repository.reset_failed_visual_assets()
+        self.retry_failed_images_button.setText(
+            f"Requeued {reset_count}" if reset_count else "No Failed Images"
+        )
+        QTimer.singleShot(
+            1800,
+            lambda: self.retry_failed_images_button.setText("Retry Failed Images"),
+        )
+        if reset_count:
+            self.notify_repository_changed()
 
     def _open_ai_settings_dialog(self) -> None:
         """Opens and persists the save-specific A.I. settings modal."""
@@ -17397,6 +19062,10 @@ def _apply_audio_settings_to_managers(
         repository.get_setting("audio.sound_effects_enabled", True),
         True,
     )
+    background_ambience_enabled = _bool_setting(
+        repository.get_setting("audio.background_ambience_enabled", True),
+        True,
+    )
     narrator_enabled = _bool_setting(
         repository.get_setting("audio.narrator_enabled", True),
         True,
@@ -17405,6 +19074,12 @@ def _apply_audio_settings_to_managers(
     sound_effects_volume = _clamped_int(
         repository.get_setting("audio.sound_effects_volume", 35),
         35,
+        0,
+        100,
+    )
+    background_ambience_volume = _clamped_int(
+        repository.get_setting("audio.background_ambience_volume", 15),
+        15,
         0,
         100,
     )
@@ -17428,16 +19103,32 @@ def _apply_audio_settings_to_managers(
         sound_manager.set_music_enabled(music_enabled)
         sound_manager.set_sound_effects_volume(sound_effects_volume)
         sound_manager.set_sound_effects_enabled(sound_effects_enabled)
+        if hasattr(sound_manager, "set_background_ambience_volume"):
+            sound_manager.set_background_ambience_volume(background_ambience_volume)
+        if hasattr(sound_manager, "set_background_ambience_enabled"):
+            sound_manager.set_background_ambience_enabled(background_ambience_enabled)
 
         current_music = str(repository.get_setting("audio.current_music", "") or "").strip()
 
         if music_enabled and current_music:
             sound_manager.play_music(current_music)
-        elif not music_enabled:
+        else:
             sound_manager.stop_music(clear_current=False)
 
         if not sound_effects_enabled:
             sound_manager.stop_sound_effect(clear_current=False)
+
+        current_background_ambience = str(
+            repository.get_setting("audio.current_background_ambience", "") or ""
+        ).strip()
+        if (
+            background_ambience_enabled
+            and current_background_ambience
+            and hasattr(sound_manager, "play_background_ambience")
+        ):
+            sound_manager.play_background_ambience(current_background_ambience)
+        elif hasattr(sound_manager, "stop_background_ambience"):
+            sound_manager.stop_background_ambience(clear_current=False)
 
     if narration_player is not None and hasattr(narration_player, "set_volume"):
         narration_player.set_volume(tts_volume)
@@ -19400,7 +21091,11 @@ def _travel_locations_for_save(
                 existing_notes = str(
                     matched_location.get("travel_notes", "") or ""
                 ).strip()
-                if relationship_note.casefold() not in existing_notes.casefold():
+                has_finalized_parent_note = "located within " in existing_notes.casefold()
+                if (
+                    not has_finalized_parent_note
+                    and relationship_note.casefold() not in existing_notes.casefold()
+                ):
                     matched_location["travel_notes"] = " ".join(
                         value
                         for value in [existing_notes, relationship_note]
@@ -19558,7 +21253,6 @@ def _apply_new_game_crafting_knowledge(
                 0,
                 _safe_int(raw_item.get("value_base_units", 0), 0),
             ),
-            ascii_art=str(raw_item.get("ascii_art", "") or "").strip("\r\n"),
             item_uuid=str(raw_item.get("item_uuid", "") or "").strip(),
         )
         repository.upsert_item_catalog_entry(
@@ -19570,7 +21264,6 @@ def _apply_new_game_crafting_knowledge(
                 _safe_int(raw_item.get("value_base_units", 0), 0),
             ),
             metadata={
-                "ascii_art": raw_item.get("ascii_art", ""),
                 "item_uuid": raw_item.get("item_uuid", ""),
             },
         )

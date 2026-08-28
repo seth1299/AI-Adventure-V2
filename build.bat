@@ -55,6 +55,7 @@ if errorlevel 1 (
     --add-data "%APP_ICON%;ai_adventure\data" ^
     --add-data "ai_adventure\audio\music_tracks;ai_adventure\audio\music_tracks" ^
     --add-data "ai_adventure\audio\sound_effects;ai_adventure\audio\sound_effects" ^
+    --add-data "ai_adventure\audio\background_ambience_tracks;ai_adventure\audio\background_ambience_tracks" ^
     --add-data "%TTS_MODEL%;ai_adventure\audio\tts" ^
     --add-data "%TTS_VOICES%;ai_adventure\audio\tts" ^
     --icon "%APP_ICON%" ^

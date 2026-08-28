@@ -44,6 +44,11 @@ class StateManagerTests(unittest.TestCase):
                 "You find a key.",
                 message_id=response_message_id,
             )
+            repository.append_history(
+                "story",
+                'The locksmith whispers, "Keep it hidden."',
+                message_id=response_message_id,
+            )
 
             self.assertTrue(repository.rollback_message(response_message_id))
             self.assertNotIn(
@@ -53,6 +58,10 @@ class StateManagerTests(unittest.TestCase):
             history = repository.list_history()
             self.assertIn("Search the workbench.", [entry["content"] for entry in history])
             self.assertNotIn("You find a key.", [entry["content"] for entry in history])
+            self.assertNotIn(
+                'The locksmith whispers, "Keep it hidden."',
+                [entry["content"] for entry in history],
+            )
             self.assertFalse(repository.has_message_snapshot(response_message_id))
             self.assertTrue(
                 all(

@@ -19,7 +19,6 @@ from ai_adventure.alchemy.ingredients import (
     normalize_crafting_item_rarity,
     normalize_recipe_ingredients,
 )
-from ai_adventure.ascii_art import ensure_substantive_ascii_art
 from ai_adventure.context.creative_guardrails import (
     contains_banned_creative_term,
     find_banned_creative_terms,
@@ -38,6 +37,7 @@ from ai_adventure.combat import (
     normalize_item_metadata,
     roll_combat_initiative,
 )
+from ai_adventure.container_access import has_immediate_container_unlock_method
 from ai_adventure.currency import format_currency_amount
 from ai_adventure.locations import clean_player_location_name
 from ai_adventure.persistence.save_repository import GM_SECRET_STATUSES, SaveRepository
@@ -307,6 +307,9 @@ class EventApplier:
             if event_type == "MusicChangedEvent":
                 return self._apply_music_changed(event_type, payload)
 
+            if event_type == "BackgroundAmbienceChangedEvent":
+                return self._apply_background_ambience_changed(event_type, payload)
+
             message = f"Unsupported event type: {event_type}"
             LOGGER.warning(message)
             return AppliedEventResult(event_type, "skipped", message, payload)
@@ -370,14 +373,6 @@ class EventApplier:
             merged_metadata["item_uuid"] = str(
                 catalog_metadata.get("item_uuid", payload.get("item_uuid", ""))
             ).strip()
-            merged_metadata["ascii_art"] = str(
-                catalog_entry.get("ascii_art", payload.get("ascii_art", "")) or ""
-            ).strip("\r\n")
-        merged_metadata["ascii_art"] = ensure_substantive_ascii_art(
-            merged_metadata.get("ascii_art", ""),
-            item_name=name,
-            category=category,
-        )
 
         self.repository.add_inventory_item(
             name=name,
@@ -597,26 +592,38 @@ class EventApplier:
             )
 
         if container.get("is_locked") is True:
-            required_skill = str(container.get("lockpick_skill", "Lockpicking"))
-            required_dc = max(1, _safe_int(container.get("lockpick_dc"), default=10) or 10)
-
-            if not _has_successful_skill_check(
-                skill_check_results,
-                skill_name=required_skill,
-                minimum_total=required_dc,
-            ):
-                consequence = str(
-                    container.get("lockpick_failure_consequence", "") or ""
-                ).strip()
-                return _invalid(
-                    event_type,
-                    payload,
-                    (
-                        f"{item['name']} remains locked; opening it requires a "
-                        f"successful {required_skill} check against DC {required_dc}."
-                        + (f" Failure consequence: {consequence}" if consequence else "")
-                    ),
+            has_unlock_method = has_immediate_container_unlock_method(
+                self.repository.list_inventory_items(),
+                str(item["name"]),
+            )
+            if not has_unlock_method:
+                required_skill = str(container.get("lockpick_skill", "Lockpicking"))
+                required_dc = max(
+                    1,
+                    _safe_int(container.get("lockpick_dc"), default=10) or 10,
                 )
+
+                if not _has_successful_skill_check(
+                    skill_check_results,
+                    skill_name=required_skill,
+                    minimum_total=required_dc,
+                ):
+                    consequence = str(
+                        container.get("lockpick_failure_consequence", "") or ""
+                    ).strip()
+                    return _invalid(
+                        event_type,
+                        payload,
+                        (
+                            f"{item['name']} remains locked; opening it requires a "
+                            f"successful {required_skill} check against DC {required_dc}."
+                            + (
+                                f" Failure consequence: {consequence}"
+                                if consequence
+                                else ""
+                            )
+                        ),
+                    )
 
             container["is_locked"] = False
 
@@ -1357,11 +1364,6 @@ class EventApplier:
         description = _first_text(payload, "description", "notes")
         location = _first_text(payload, "location", "found_at", "source")
         uses = _as_string_list(payload.get("uses", []))
-        ascii_art = ensure_substantive_ascii_art(
-            payload.get("ascii_art", ""),
-            item_name=name,
-            category=_first_text(payload, "category") or "Material",
-        )
         rarity = normalize_crafting_item_rarity(payload.get("rarity"))
         notes = _first_text(payload, "notes")
         value_base_units = max(
@@ -1395,7 +1397,6 @@ class EventApplier:
             rarity=rarity,
             notes=notes,
             value_base_units=value_base_units,
-            ascii_art=ascii_art,
             item_uuid=_first_text(payload, "item_uuid"),
         )
         self.repository.upsert_item_catalog_entry(
@@ -1403,10 +1404,7 @@ class EventApplier:
             category=category,
             description=description,
             value_base_units=value_base_units,
-            metadata={
-                "ascii_art": ascii_art,
-                "item_uuid": _first_text(payload, "item_uuid"),
-            },
+            metadata={"item_uuid": _first_text(payload, "item_uuid")},
         )
 
         return AppliedEventResult(
@@ -1716,6 +1714,33 @@ class EventApplier:
             str(result.get("message", "Magic advancement was not recorded.")),
             payload,
         )
+
+    def _apply_background_ambience_changed(
+        self,
+        event_type: str,
+        payload: dict[str, Any],
+    ) -> AppliedEventResult:
+        """Starts, replaces, or stops persistent looping background ambience."""
+
+        filename = _first_text(
+            payload,
+            "filename",
+            "file_name",
+            "track",
+            "track_name",
+            "ambience",
+        )
+        if not filename:
+            return _invalid(event_type, payload, "Ambience filename or STOP is required.")
+
+        if filename.casefold() in {"stop", "none", "off", "silence"}:
+            self.repository.set_setting("audio.current_background_ambience", "")
+            message = "Stopped background ambience."
+        else:
+            self.repository.set_setting("audio.current_background_ambience", filename)
+            message = f"Changed background ambience to: {filename}."
+
+        return AppliedEventResult(event_type, "applied", message, payload)
 
     def _apply_magic_effect_upserted(
         self,

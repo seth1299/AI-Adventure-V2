@@ -51,6 +51,18 @@ class AppPaths:
         return self.app_data_dir / "sound_effects"
 
     @property
+    def background_ambience_dir(self) -> Path:
+        """Returns the app-managed looping background-ambience directory."""
+
+        return self.app_data_dir / "background_ambience_tracks"
+
+    @property
+    def images_dir(self) -> Path:
+        """Returns the persistent cross-save generated-image cache directory."""
+
+        return self.app_data_dir / "images"
+
+    @property
     def package_audio_dir(self) -> Path:
         """Returns the packaged source-tree audio asset directory."""
 
@@ -79,6 +91,12 @@ class AppPaths:
         """Returns the packaged one-shot sound-effect directory."""
 
         return self.package_audio_dir / "sound_effects"
+
+    @property
+    def package_background_ambience_dir(self) -> Path:
+        """Returns the packaged looping background-ambience directory."""
+
+        return self.package_audio_dir / "background_ambience_tracks"
 
     @property
     def package_tts_dir(self) -> Path:
@@ -192,12 +210,14 @@ class AppPaths:
         saves_dir = app_data_dir / "saves"
         logs_dir = app_data_dir / "logs"
         sounds_dir = app_data_dir / "sounds"
+        images_dir = app_data_dir / "images"
         tts_output_dir = app_data_dir / "tts_cache"
         log_file = logs_dir / "ai_adventure.log"
 
         saves_dir.mkdir(parents=True, exist_ok=True)
         logs_dir.mkdir(parents=True, exist_ok=True)
         sounds_dir.mkdir(parents=True, exist_ok=True)
+        images_dir.mkdir(parents=True, exist_ok=True)
         tts_output_dir.mkdir(parents=True, exist_ok=True)
 
         return cls(

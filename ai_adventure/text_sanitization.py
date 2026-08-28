@@ -97,7 +97,7 @@ def sanitize_english_text_in_data(
         return {
             key: sanitize_english_text_in_data(
                 item,
-                preserve_whitespace=(str(key).casefold() == "ascii_art"),
+                preserve_whitespace=False,
             )
             for key, item in value.items()
         }

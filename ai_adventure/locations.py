@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import math
 import re
-from dataclasses import asdict, dataclass
+import uuid
+from dataclasses import asdict, dataclass, replace
 from typing import Any
 
 
@@ -23,6 +24,7 @@ class KnownLocation:
     """Player-known location data used by the Travel screen and AI context."""
 
     name: str
+    location_id: str = ""
     description: str = ""
     x_miles: float | None = None
     y_miles: float | None = None
@@ -106,6 +108,7 @@ def normalize_known_location(raw_location: Any) -> KnownLocation | None:
 
     return KnownLocation(
         name=name,
+        location_id=_clean_text(raw_location.get("location_id")),
         description=_clean_text(raw_location.get("description")),
         x_miles=_optional_coordinate(raw_location.get("x_miles", raw_location.get("x"))),
         y_miles=_optional_coordinate(raw_location.get("y_miles", raw_location.get("y"))),
@@ -264,6 +267,7 @@ def _merge_locations(existing: KnownLocation, incoming: KnownLocation) -> KnownL
 
     return KnownLocation(
         name=existing.name,
+        location_id=existing.location_id or incoming.location_id,
         description=incoming.description or existing.description,
         x_miles=incoming.x_miles if incoming.x_miles is not None else existing.x_miles,
         y_miles=incoming.y_miles if incoming.y_miles is not None else existing.y_miles,
@@ -275,6 +279,17 @@ def _merge_locations(existing: KnownLocation, incoming: KnownLocation) -> KnownL
         ),
         travel_notes=incoming.travel_notes or existing.travel_notes,
     )
+
+
+def ensure_location_ids(locations: list[KnownLocation]) -> list[KnownLocation]:
+    """Assigns stable UUIDs to locations that predate the location-id field."""
+
+    return [
+        location
+        if location.location_id
+        else replace(location, location_id=f"loc_{uuid.uuid4().hex}")
+        for location in locations
+    ]
 
 
 def _clean_text(value: Any) -> str:

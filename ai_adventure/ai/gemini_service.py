@@ -30,6 +30,7 @@ from ai_adventure.ai.modes import (
     normalize_ai_mode_preferences,
 )
 from ai_adventure.calendar_system import normalize_calendar_settings
+from ai_adventure.container_access import has_immediate_container_unlock_method
 from ai_adventure.context.creative_guardrails import (
     default_banned_creative_terms,
     find_banned_creative_terms,
@@ -45,11 +46,10 @@ from ai_adventure.audio.pronunciation import (
     PronunciationMap,
     merge_pronunciation_maps,
 )
-from ai_adventure.ascii_art import (
-    ensure_substantive_ascii_art,
-    is_substantive_ascii_art,
+from ai_adventure.audio.catalog import (
+    distinct_audio_track_catalogs,
+    distinct_audio_track_catalogs_with_ambience,
 )
-from ai_adventure.audio.catalog import distinct_audio_track_catalogs
 from ai_adventure.audio.voices import VOICE_PROFILE_OPTIONS
 from ai_adventure.locations import clean_player_location_name, normalize_known_locations
 from ai_adventure.new_game_setup import STARTER_INVENTORY_MIN_ITEMS
@@ -95,6 +95,21 @@ CHECK_WARRANTING_ACTION_RE = re.compile(
     r")\b",
     re.IGNORECASE,
 )
+FORAGING_ACTION_RE = re.compile(
+    r"\b(?:find|forage|gather|harvest|locate|look|scavenge|search|seek)\w*\b",
+    re.IGNORECASE,
+)
+FORAGING_TARGET_RE = re.compile(
+    r"\b(?:botanicals?|flowers?|fungi|fungus|herbs?|mushrooms?|plants?|"
+    r"reagents?|roots?|berries?|wild ingredients?|natural materials?)\b",
+    re.IGNORECASE,
+)
+GENERIC_SEARCH_SKILL_NAMES = {
+    "awareness",
+    "investigation",
+    "perception",
+    "search",
+}
 OBVIOUS_NARRATED_WEATHER_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     (
         "Rain",
@@ -168,6 +183,7 @@ KNOWN_EVENT_TYPE_NAMES = [
     "CurrencyDefinedEvent",
     "MusicChangedEvent",
     "SoundEffectChangedEvent",
+    "BackgroundAmbienceChangedEvent",
     "FlagSetEvent",
     "LocationUpsertedEvent",
     "TravelModeChangedEvent",
@@ -324,15 +340,6 @@ NEW_GAME_CRAFTING_ITEM_SCHEMA: dict[str, Any] = {
             "enum": list(CRAFTING_INGREDIENT_CATEGORIES),
         },
         "description": {"type": "string"},
-        "ascii_art": {
-            "type": "string",
-            "minLength": 3,
-            "maxLength": 1200,
-            "description": (
-                "Original 3-12 line fixed-width drawing, without Markdown fences. "
-                "A bracketed name or single-line label is invalid."
-            ),
-        },
         "location": {
             "type": "string",
             "description": (
@@ -352,7 +359,7 @@ NEW_GAME_CRAFTING_ITEM_SCHEMA: dict[str, Any] = {
         "value_base_units": {"type": "integer", "minimum": 0},
     },
     "required": [
-        "name", "category", "description", "ascii_art", "location", "uses",
+        "name", "category", "description", "location", "uses",
         "rarity", "notes", "value_base_units",
     ],
     "additionalProperties": False,
@@ -562,18 +569,6 @@ EVENT_RESPONSE_SCHEMA: dict[str, Any] = {
                 "item_name": {"type": "string"},
                 "item_uuid": {"type": "string", "description": "Existing catalog UUID when this is a known item; otherwise use an empty string and Python assigns one."},
                 "description": {"type": "string"},
-                "ascii_art": {
-                    "type": "string",
-                    "minLength": 3,
-                    "maxLength": 1200,
-                    "description": (
-                        "Original fixed-width ASCII art depicting the item. Use 3-12 "
-                        "lines, no Markdown fence, and keep each line at most 40 characters. "
-                        "A bracketed item name such as [Camera], a caption, or any "
-                        "other single-line label is invalid and is not ASCII art. "
-                        "Do not double-escape line breaks or place visible backslash-n text in the art."
-                    ),
-                },
                 "amount": {"type": "integer", "minimum": 1},
                 "quantity_unit": {"type": "string", "description": "Unit for the amount, such as each, bottle, vial, gram, kilogram, liter, or meter."},
                 "storage_location": {
@@ -611,7 +606,6 @@ EVENT_RESPONSE_SCHEMA: dict[str, Any] = {
                 "item_type",
                 "item_name",
                 "description",
-                "ascii_art",
                 "amount",
                 "value_base_units",
             ],
@@ -869,15 +863,6 @@ EVENT_RESPONSE_SCHEMA: dict[str, Any] = {
                 "name": {"type": "string"},
                 "item_uuid": {"type": "string"},
                 "description": {"type": "string"},
-                "ascii_art": {
-                    "type": "string",
-                    "minLength": 3,
-                    "maxLength": 1200,
-                    "description": (
-                        "Original 3-12 line fixed-width drawing, without Markdown "
-                        "fences. A bracketed name or single-line label is invalid."
-                    ),
-                },
                 "location": {
                     "type": "string",
                     "description": (
@@ -908,7 +893,7 @@ EVENT_RESPONSE_SCHEMA: dict[str, Any] = {
                 },
             },
             [
-                "name", "description", "ascii_art", "location", "uses", "category",
+                "name", "description", "location", "uses", "category",
                 "rarity", "notes", "value_base_units",
             ],
             description=(
@@ -976,6 +961,20 @@ EVENT_RESPONSE_SCHEMA: dict[str, Any] = {
             description=(
                 "Plays one short sound once at an exact boundary in this narration."
             ),
+        ),
+        _event_response_schema(
+            "BackgroundAmbienceChangedEvent",
+            {
+                "filename": {
+                    "type": "string",
+                    "description": (
+                        "Exact filename from valid_background_ambience_tracks, or "
+                        "STOP when persistent ambience is no longer appropriate."
+                    ),
+                }
+            },
+            ["filename"],
+            description="Starts, changes, or stops a quiet persistent ambience loop.",
         ),
         _event_response_schema(
             "FlagSetEvent",
@@ -1197,8 +1196,6 @@ EVENT_RESPONSE_SCHEMA: dict[str, Any] = {
 NEW_GAME_EVENT_TYPE_NAMES = (
     "NpcUpsertedEvent",
     "ActiveTaskUpsertedEvent",
-    "MusicChangedEvent",
-    "SoundEffectChangedEvent",
 )
 NEW_GAME_ACTIVE_TASK_EVENT_RESPONSE_SCHEMA: dict[str, Any] = _event_response_schema(
     "ActiveTaskUpsertedEvent",
@@ -1221,10 +1218,39 @@ NEW_GAME_ACTIVE_TASK_EVENT_RESPONSE_SCHEMA: dict[str, Any] = _event_response_sch
     },
     ["name"],
 )
+NEW_GAME_NPC_EVENT_RESPONSE_SCHEMA: dict[str, Any] = _event_response_schema(
+    "NpcUpsertedEvent",
+    {
+        "npc_id": {
+            "type": "string",
+            "description": "Exact stable npc_id copied from setup.starting_npcs.",
+        },
+        "name": {"type": "string"},
+        "location": {"type": "string"},
+        "public_description": {"type": "string"},
+        "party_member": {
+            "type": "boolean",
+            "description": (
+                "True exactly when npc_id is listed in "
+                "setup.starting_party_npc_ids."
+            ),
+        },
+        "party_status": {"type": "string"},
+    },
+    [
+        "npc_id",
+        "name",
+        "location",
+        "public_description",
+        "party_member",
+    ],
+)
 NEW_GAME_EVENT_RESPONSE_SCHEMA: dict[str, Any] = {
     "anyOf": [
         NEW_GAME_ACTIVE_TASK_EVENT_RESPONSE_SCHEMA
         if event_type == "ActiveTaskUpsertedEvent"
+        else NEW_GAME_NPC_EVENT_RESPONSE_SCHEMA
+        if event_type == "NpcUpsertedEvent"
         else
         next(
             branch
@@ -1237,9 +1263,10 @@ NEW_GAME_EVENT_RESPONSE_SCHEMA: dict[str, Any] = {
 SPEAKER_CUE_RESPONSE_SCHEMA: dict[str, Any] = {
     "type": "array",
     "description": (
-        "Exact non-narrator spoken spans for local multi-voice TTS. Return one "
-        "entry for every contiguous NPC or other non-player speaker passage; "
-        "return an empty array when only the narrator speaks."
+        "Exact non-narrator spoken spans used for visible speaker chat bubbles and "
+        "local multi-voice TTS. Return one entry for every contiguous NPC or other "
+        "non-player speaker passage; return an empty array when only the narrator "
+        "speaks."
     ),
     "maxItems": 40,
     "items": {
@@ -1261,7 +1288,10 @@ SPEAKER_CUE_RESPONSE_SCHEMA: dict[str, Any] = {
             },
             "speaker_name": {
                 "type": "string",
-                "description": "Short player-safe speaker label or known name.",
+                "description": (
+                    "Player-visible chat-bubble label: use the speaker's known name, "
+                    "or a concise player-safe description when the name is unknown."
+                ),
             },
             "voice_profile": {
                 "type": "string",
@@ -1274,6 +1304,42 @@ SPEAKER_CUE_RESPONSE_SCHEMA: dict[str, Any] = {
         },
         "required": [
             "anchor_text",
+            "speaker_id",
+            "speaker_name",
+            "voice_profile",
+        ],
+        "additionalProperties": False,
+    },
+}
+NEW_GAME_OPENING_CUE_SCHEMA: dict[str, Any] = {
+    "type": "array",
+    "items": {
+        "type": "object",
+        "properties": {
+            "kind": {
+                "type": "string",
+                "enum": [
+                    "speaker",
+                    "music",
+                    "sound_effect",
+                    "background_ambience",
+                ],
+            },
+            "filename": {"type": "string"},
+            "anchor_text": {"type": "string"},
+            "position": {"type": "string", "enum": ["", "before", "after"]},
+            "speaker_id": {"type": "string"},
+            "speaker_name": {"type": "string"},
+            "voice_profile": {
+                "type": "string",
+                "enum": list(VOICE_PROFILE_OPTIONS),
+            },
+        },
+        "required": [
+            "kind",
+            "filename",
+            "anchor_text",
+            "position",
             "speaker_id",
             "speaker_name",
             "voice_profile",
@@ -1402,7 +1468,11 @@ STORY_EVENT_TYPE_NAMES_BY_CONTEXT_TAG: dict[str, tuple[str, ...]] = {
         "CurrencyChangedEvent",
         "CurrencyDefinedEvent",
     ),
-    "music": ("MusicChangedEvent", "SoundEffectChangedEvent"),
+    "music": (
+        "MusicChangedEvent",
+        "SoundEffectChangedEvent",
+        "BackgroundAmbienceChangedEvent",
+    ),
     "naming": ("LocationUpsertedEvent", "NpcUpsertedEvent"),
     "quest": (
         "FlagSetEvent",
@@ -1541,6 +1611,8 @@ NEW_GAME_RESPONSE_JSON_SCHEMA: dict[str, Any] = {
                     "travel_multiplier": {"type": "number", "minimum": 0.1, "maximum": 3.0},
                     "travel_notes": {"type": "string"},
                     "source_index": {"type": "integer", "minimum": -1},
+                    "is_sublocation": {"type": "boolean"},
+                    "parent_location": {"type": "string"},
                 },
                 "required": [
                     "name",
@@ -1551,6 +1623,8 @@ NEW_GAME_RESPONSE_JSON_SCHEMA: dict[str, Any] = {
                     "travel_multiplier",
                     "travel_notes",
                     "source_index",
+                    "is_sublocation",
+                    "parent_location",
                 ],
                 "additionalProperties": False,
             },
@@ -1596,7 +1670,6 @@ NEW_GAME_RESPONSE_JSON_SCHEMA: dict[str, Any] = {
                     "items": {
                         "type": "object",
                         "properties": {
-                            "npc_id": {"type": "string"},
                             "name": {"type": "string"},
                             "weather_hint": {"type": "string"},
                         },
@@ -1628,9 +1701,8 @@ NEW_GAME_RESPONSE_JSON_SCHEMA: dict[str, Any] = {
         "weather": {"type": "string"},
         "character": {
             "type": "object",
-                        "properties": {
-                            "npc_id": {"type": "string"},
-                            "name": {"type": "string"},
+            "properties": {
+                "name": {"type": "string"},
                 "appearance": {"type": "string"},
                 "backstory": {"type": "string"},
                 "notes": {"type": "string"},
@@ -1651,7 +1723,14 @@ NEW_GAME_RESPONSE_JSON_SCHEMA: dict[str, Any] = {
                 "additionalProperties": False,
             },
         },
-        "speaker_cues": SPEAKER_CUE_RESPONSE_SCHEMA,
+        "opening_cues": NEW_GAME_OPENING_CUE_SCHEMA,
+        "starting_npcs": {
+            "type": "array",
+            "items": NEW_GAME_NPC_EVENT_RESPONSE_SCHEMA["properties"]["payload"],
+        },
+        "starting_task": NEW_GAME_ACTIVE_TASK_EVENT_RESPONSE_SCHEMA["properties"][
+            "payload"
+        ],
         "starting_spells": {
             "type": "array",
             "description": (
@@ -1702,18 +1781,6 @@ NEW_GAME_RESPONSE_JSON_SCHEMA: dict[str, Any] = {
                         ),
                     },
                     "description": {"type": "string"},
-                    "ascii_art": {
-                        "type": "string",
-                        "minLength": 3,
-                        "maxLength": 1200,
-                        "description": (
-                            "Original fixed-width ASCII art depicting the item. Use "
-                            "3-12 lines, no Markdown fence, with lines at most 40 characters. "
-                            "A bracketed item name such as [Camera], a caption, or "
-                            "any other single-line label is invalid. "
-                            "Do not double-escape line breaks or place visible backslash-n text in the art."
-                        ),
-                    },
                     "value_base_units": {"type": "integer", "minimum": 0},
                     "weapon_hands": {
                         "type": "string",
@@ -1748,7 +1815,6 @@ NEW_GAME_RESPONSE_JSON_SCHEMA: dict[str, Any] = {
                     "quantity_unit",
                     "storage_location",
                     "description",
-                    "ascii_art",
                     "value_base_units",
                     "source_index",
                 ],
@@ -1800,7 +1866,6 @@ NEW_GAME_RESPONSE_JSON_SCHEMA: dict[str, Any] = {
             "description": "Three or four short player-facing action options for the opening scene.",
             "items": {"type": "string"},
         },
-        "events": {"type": "array", "items": NEW_GAME_EVENT_RESPONSE_SCHEMA},
     },
     "required": [
         "selected_genre",
@@ -1819,13 +1884,16 @@ NEW_GAME_RESPONSE_JSON_SCHEMA: dict[str, Any] = {
         "currency_description",
         "starting_currency_balance_base_units",
         "introductory_message",
-        "events",
     ],
     "additionalProperties": False,
 }
 
 
-def build_new_game_response_schema(setup_packet: dict[str, Any]) -> dict[str, Any]:
+def build_new_game_response_schema(
+    setup_packet: dict[str, Any],
+    *,
+    for_api: bool = True,
+) -> dict[str, Any]:
     """Builds the smallest new-game schema needed for this exact setup packet."""
 
     schema = copy.deepcopy(NEW_GAME_RESPONSE_JSON_SCHEMA)
@@ -1933,66 +2001,97 @@ def build_new_game_response_schema(setup_packet: dict[str, Any]) -> dict[str, An
     ):
         omit("starting_currency_balance_base_units")
 
-    event_types: list[str] = []
     starting_npcs = setup.get("starting_npcs", [])
     if isinstance(starting_npcs, list) and starting_npcs:
-        event_types.append("NpcUpsertedEvent")
+        if "starting_npcs" not in required:
+            required.append("starting_npcs")
+        properties["starting_npcs"]["minItems"] = len(starting_npcs)
+        properties["starting_npcs"]["maxItems"] = len(starting_npcs)
+    else:
+        omit("starting_npcs")
     starting_task = setup.get("starting_task", {})
     if (
         isinstance(starting_task, dict)
         and str(starting_task.get("mode", "none") or "none").casefold() != "none"
     ):
-        event_types.append("ActiveTaskUpsertedEvent")
+        if "starting_task" not in required:
+            required.append("starting_task")
+    else:
+        omit("starting_task")
     audio = setup_packet.get("audio", {})
     if not isinstance(audio, dict):
         audio = {}
-    valid_music_tracks, valid_sound_effect_tracks = distinct_audio_track_catalogs(
+    (
+        valid_music_tracks,
+        valid_sound_effect_tracks,
+        valid_background_ambience_tracks,
+    ) = distinct_audio_track_catalogs_with_ambience(
         audio.get("valid_music_tracks", []),
         audio.get("valid_sound_effect_tracks", []),
+        audio.get("valid_background_ambience_tracks", []),
     )
     setup_audio = setup.get("audio", {})
     music_enabled = not isinstance(setup_audio, dict) or bool(
         setup_audio.get("music_enabled", True)
     )
-    if music_enabled and valid_music_tracks:
-        event_types.append("MusicChangedEvent")
     sound_effects_enabled = not isinstance(setup_audio, dict) or bool(
         setup_audio.get("sound_effects_enabled", True)
     )
-    if (
-        sound_effects_enabled
-        and valid_sound_effect_tracks
-    ):
-        event_types.append("SoundEffectChangedEvent")
-
-    if not event_types:
-        omit("events")
-    else:
-        event_branches = [
-            branch
-            for branch in NEW_GAME_EVENT_RESPONSE_SCHEMA["anyOf"]
-            if branch["properties"]["type"]["enum"][0] in event_types
-        ]
-        properties["events"]["items"] = (
-            event_branches[0]
-            if len(event_branches) == 1
-            else {"anyOf": event_branches}
-        )
+    background_ambience_enabled = not isinstance(setup_audio, dict) or bool(
+        setup_audio.get("background_ambience_enabled", True)
+    )
+    enabled_opening_cue_kinds = ["speaker"]
+    has_configured_opening_audio = bool(
+        (music_enabled and valid_music_tracks)
+        or (sound_effects_enabled and valid_sound_effect_tracks)
+        or (background_ambience_enabled and valid_background_ambience_tracks)
+    )
+    if has_configured_opening_audio and "opening_cues" not in required:
+        required.append("opening_cues")
+    if music_enabled and valid_music_tracks:
+        enabled_opening_cue_kinds.append("music")
+    if sound_effects_enabled and valid_sound_effect_tracks:
+        enabled_opening_cue_kinds.append("sound_effect")
+    if background_ambience_enabled and valid_background_ambience_tracks:
+        enabled_opening_cue_kinds.append("background_ambience")
+    properties["opening_cues"]["items"]["properties"]["kind"]["enum"] = (
+        enabled_opening_cue_kinds
+    )
 
     if "suggested_actions" in properties and "suggested_actions" not in required:
         required.append("suggested_actions")
-    return _condense_response_schema_for_api(schema)
+    if not for_api:
+        return schema
+    api_schema = _condense_response_schema_for_api(
+        schema,
+        strip_additional_properties=True,
+    )
+    starter_item_schema = api_schema["properties"]["starting_items"]["items"]
+    starter_required_fields = set(starter_item_schema.get("required", []))
+    starter_item_schema["properties"] = {
+        field_name: field_schema
+        for field_name, field_schema in starter_item_schema["properties"].items()
+        if field_name in starter_required_fields
+    }
+    return api_schema
 
 
 def _condense_response_schema_for_api(
     value: Any,
     *,
     property_map: bool = False,
+    strip_additional_properties: bool = False,
 ) -> Any:
     """Removes prompt prose and locally enforced bounds from the API schema."""
 
     if isinstance(value, list):
-        return [_condense_response_schema_for_api(item) for item in value]
+        return [
+            _condense_response_schema_for_api(
+                item,
+                strip_additional_properties=strip_additional_properties,
+            )
+            for item in value
+        ]
     if not isinstance(value, dict):
         return value
     locally_enforced_keywords = {
@@ -2008,9 +2107,12 @@ def _condense_response_schema_for_api(
     for key, item in value.items():
         if not property_map and key in locally_enforced_keywords:
             continue
+        if strip_additional_properties and key == "additionalProperties":
+            continue
         condensed[key] = _condense_response_schema_for_api(
             item,
             property_map=(key == "properties"),
+            strip_additional_properties=strip_additional_properties,
         )
     return condensed
 
@@ -2029,14 +2131,21 @@ def _story_event_type_names(context_packet: dict[str, Any]) -> tuple[str, ...]:
     for tag in selected_tags:
         enabled_event_types.update(STORY_EVENT_TYPE_NAMES_BY_CONTEXT_TAG.get(tag, ()))
     audio = _state_subpacket(context_packet, "audio")
-    valid_music_tracks, valid_sound_effect_tracks = distinct_audio_track_catalogs(
+    (
+        valid_music_tracks,
+        valid_sound_effect_tracks,
+        valid_background_ambience_tracks,
+    ) = distinct_audio_track_catalogs_with_ambience(
         audio.get("valid_music_tracks", []),
         audio.get("valid_sound_effect_tracks", []),
+        audio.get("valid_background_ambience_tracks", []),
     )
     if not valid_music_tracks:
         enabled_event_types.discard("MusicChangedEvent")
     if not valid_sound_effect_tracks:
         enabled_event_types.discard("SoundEffectChangedEvent")
+    if not valid_background_ambience_tracks:
+        enabled_event_types.discard("BackgroundAmbienceChangedEvent")
     combat = _state_subpacket(context_packet, "combat")
     if str(combat.get("resolution_mode", "strict")) == "narrative":
         enabled_event_types.discard("CombatStartedEvent")
@@ -2076,6 +2185,7 @@ def _new_game_prompt_packet_for_schema(
     output_fields = list(schema.get("required", []))
     packet["response_contract"] = {
         "required_output_fields": output_fields,
+        "required_nested_fields": _new_game_required_nested_fields(schema),
         "rule": (
             "Return exactly the configured fields. Omitted setup fields are already "
             "authoritative in Python and must not be echoed or rewritten."
@@ -2091,35 +2201,89 @@ def _new_game_prompt_packet_for_schema(
         "character": ("character_generation",),
         "skills": ("skill_generation", "skill_limits"),
         "currency_denominations": ("currency_generation",),
-        "events": (
-            "events",
-            "starting_task",
-            "starting_music",
-            "starting_sound_effect",
-        ),
+        "starting_npcs": ("events",),
+        "starting_task": ("starting_task",),
     }
     for output_field, requirement_names in field_requirements.items():
         if output_field in schema.get("properties", {}):
             continue
         for requirement_name in requirement_names:
             requirements.pop(requirement_name, None)
-    event_schema = schema.get("properties", {}).get("events", {}).get("items", {})
-    event_branches = event_schema.get("anyOf", [event_schema])
-    enabled_event_types = {
-        str(branch.get("properties", {}).get("type", {}).get("enum", [""])[0])
-        for branch in event_branches
-        if isinstance(branch, dict)
-        and branch.get("properties", {}).get("type", {}).get("enum")
-    }
-    if "NpcUpsertedEvent" not in enabled_event_types:
-        requirements.pop("events", None)
-    if "ActiveTaskUpsertedEvent" not in enabled_event_types:
-        requirements.pop("starting_task", None)
-    if "MusicChangedEvent" not in enabled_event_types:
+    cue_schema = schema.get("properties", {}).get("opening_cues", {})
+    cue_items = cue_schema.get("items", {}) if isinstance(cue_schema, dict) else {}
+    cue_properties = (
+        cue_items.get("properties", {}) if isinstance(cue_items, dict) else {}
+    )
+    enabled_cue_kinds = (
+        cue_properties.get("kind", {}).get("enum", [])
+        if isinstance(cue_properties, dict)
+        else []
+    )
+    if "music" not in enabled_cue_kinds:
         requirements.pop("starting_music", None)
-    if "SoundEffectChangedEvent" not in enabled_event_types:
+    if "sound_effect" not in enabled_cue_kinds:
         requirements.pop("starting_sound_effect", None)
+    if "background_ambience" not in enabled_cue_kinds:
+        requirements.pop("starting_background_ambience", None)
     return packet
+
+
+def _new_game_required_nested_fields(schema: dict[str, Any]) -> dict[str, Any]:
+    """Returns a compact nested-field outline for schema-free JSON retries."""
+
+    properties = schema.get("properties", {})
+    if not isinstance(properties, dict):
+        return {}
+    outline: dict[str, Any] = {}
+    for field_name, field_schema in properties.items():
+        if not isinstance(field_schema, dict):
+            continue
+        item_schema = field_schema.get("items")
+        if field_name == "events" and isinstance(item_schema, dict):
+            branches = item_schema.get("anyOf", [item_schema])
+            event_fields: dict[str, list[str]] = {}
+            for branch in branches:
+                if not isinstance(branch, dict):
+                    continue
+                branch_properties = branch.get("properties", {})
+                type_values = (
+                    branch_properties.get("type", {}).get("enum", [])
+                    if isinstance(branch_properties, dict)
+                    else []
+                )
+                payload_schema = (
+                    branch_properties.get("payload", {})
+                    if isinstance(branch_properties, dict)
+                    else {}
+                )
+                if type_values and isinstance(payload_schema, dict):
+                    event_fields[str(type_values[0])] = list(
+                        payload_schema.get("required", [])
+                    )
+            if event_fields:
+                outline[field_name] = event_fields
+            continue
+        has_item_schema = isinstance(item_schema, dict)
+        nested_schema = item_schema if has_item_schema else field_schema
+        required = nested_schema.get("required", [])
+        if isinstance(required, list) and required:
+            outline[field_name] = list(required)
+        nested_properties = nested_schema.get("properties", {})
+        if not isinstance(nested_properties, dict):
+            continue
+        for nested_name, child_schema in nested_properties.items():
+            if not isinstance(child_schema, dict):
+                continue
+            child_items = child_schema.get("items")
+            if not isinstance(child_items, dict):
+                continue
+            child_required = child_items.get("required", [])
+            if isinstance(child_required, list) and child_required:
+                item_marker = "[]" if has_item_schema else ""
+                outline[f"{field_name}{item_marker}.{nested_name}"] = list(
+                    child_required
+                )
+    return outline
 
 @dataclass(frozen=True)
 class GeminiSettings:
@@ -2382,7 +2546,10 @@ class GeminiNarrationService:
             return SkillCheckPlanResult(raw_text=raw_text)
 
         return _filter_unwarranted_planned_skill_checks(
-            parse_skill_check_plan_response(raw_text),
+            _prefer_clearly_relevant_known_skill(
+                parse_skill_check_plan_response(raw_text),
+                context_packet,
+            ),
             context_packet,
         )
 
@@ -2604,7 +2771,14 @@ def _build_xml_skill_check_plan_prompt(context_packet: dict[str, Any]) -> str:
                 "Return checks=[] for routine or low-stakes actions. Request a "
                 "check only when current uncertainty, opposition, hidden information, "
                 "danger, scarcity, time pressure, or meaningful consequences make "
-                "failure matter. Prefer known skills and exact container DC metadata. "
+                "failure matter. Choose the most directly relevant known skill, not "
+                "merely a plausible broad skill. For example, locating or gathering "
+                "wild plants, herbs, or reagents uses a known Foraging skill rather "
+                "than Investigation or Perception. Use a new skill only when no known "
+                "skill fits. Prefer exact container DC metadata. "
+                "Opening an unlocked container is routine. If inventory contains an "
+                "unambiguous key or equivalent access item for a locked container, "
+                "infer its routine use and do not request a lockpick check. "
                 "Do not narrate or roll. relevant_tags must use only available tags.",
             ),
             _xml_json_section("available_tags", tag_rundown),
@@ -2672,18 +2846,17 @@ def _build_xml_story_prompt(context_packet: dict[str, Any]) -> str:
                 "only. Transliterate accented Latin letters to their unaccented English "
                 "equivalents and never emit foreign scripts, IPA, phoneme strings, or "
                 "pronunciation annotations. Do not return pronunciation_map. "
-                "For every newly defined inventory or crafting item, ascii_art must "
-                "be an original 3-12 line fixed-width drawing of the recognizable "
-                "item shape. A bracketed item name such as [Camera], a caption, or "
-                "any other single-line label is invalid and is not ASCII art. "
-                "For local multi-voice TTS, return one speaker_cues entry for every "
-                "contiguous span of non-narrator spoken dialogue. anchor_text must "
+                "For visible speaker chat bubbles and local multi-voice TTS, return "
+                "one speaker_cues entry for every contiguous span of non-narrator "
+                "spoken dialogue. anchor_text must "
                 "copy the complete exact dialogue span, including its outer double "
                 "quotation marks, from one unique place in response. Use the exact "
                 "canonical npc_id as speaker_id for a real NPC, including an NPC "
                 "created by this response; otherwise use one stable lower_snake_case "
                 "speaker identity. Reuse a speaker_id for the same person and use "
-                "different IDs for different speakers. Choose voice_profile only from "
+                "different IDs for different speakers. speaker_name becomes the "
+                "visible bubble label: use the known name, or a concise player-safe "
+                "description if the name is unknown. Choose voice_profile only from "
                 "established audible traits; use neutral when unspecified. Do not add "
                 "speaker cues for narrator prose or invent player-character dialogue.",
             ),
@@ -2743,7 +2916,7 @@ def _build_xml_story_prompt(context_packet: dict[str, Any]) -> str:
                     },
                     {
                         "situation": "Player receives one ordinary item",
-                        "output": {"response": "The courier hands over the sealed letter.", "suggested_actions": ["Inspect the seal.", "Ask who sent it.", "Put the letter away."], "events": [{"type": "InventoryItemAddedEvent", "payload": {"item_name": "Sealed Letter", "item_type": "Document", "description": "A folded letter closed with a red wax seal.", "ascii_art": " ______\n/_____/|\n| seal|/", "amount": 1, "quantity_unit": "each", "storage_location": "actively_carried", "value_base_units": 1}}], "out_of_game": False},
+                        "output": {"response": "The courier hands over the sealed letter.", "suggested_actions": ["Inspect the seal.", "Ask who sent it.", "Put the letter away."], "events": [{"type": "InventoryItemAddedEvent", "payload": {"item_name": "Sealed Letter", "item_type": "Document", "description": "A folded letter closed with a red wax seal.", "amount": 1, "quantity_unit": "each", "storage_location": "actively_carried", "value_base_units": 1}}], "out_of_game": False},
                     },
                 ],
             ),
@@ -2846,8 +3019,14 @@ def _build_xml_new_game_prompt(setup_packet: dict[str, Any]) -> str:
                 "different finalized value; do not copy or cosmetically edit it. This "
                 "includes the requested start location, suggestion-mode location names "
                 "and descriptions, and suggestion-mode NPC descriptions. Exact-mode "
-                "values must remain unchanged. Maintain "
-                "source_index links and finalized names consistent. Use canonical "
+                "values must remain unchanged. Maintain source_index links and "
+                "finalized names consistently. "
+                "For any finalized character appearance, location description, item "
+                "description, or NPC public_description, include concise concrete "
+                "visual traits sufficient to depict the subject, using only facts "
+                "visible to the player. Do not add image fields, prompts, filenames, "
+                "URLs, or encoded image data; the application derives cached images "
+                "from the ordinary finalized fields after saving. Use canonical "
                 "setup.character.pronouns exactly; never infer others. Never use "
                 "banned terms, close "
                 "variants, reskins, or bare category-label proper nouns for NPC names, "
@@ -2857,13 +3036,17 @@ def _build_xml_new_game_prompt(setup_packet: dict[str, Any]) -> str:
                 "generated string value must use printable ASCII English characters "
                 "only. Transliterate accented Latin letters to unaccented English and "
                 "never emit foreign scripts, IPA, phoneme strings, pronunciation "
-                "annotations, or pronunciation_map. For local multi-voice TTS, return "
-                "speaker_cues for every contiguous non-narrator spoken span in "
+                "annotations, or pronunciation_map. For visible speaker chat bubbles "
+                "and local multi-voice TTS, return "
+                "one opening_cues record with kind speaker for every contiguous "
+                "non-narrator spoken span in "
                 "introductory_message. Copy each complete dialogue span including "
                 "outer double quotation marks into a unique anchor_text. Use the "
-                "exact NpcUpsertedEvent npc_id as speaker_id for an actual NPC, reuse "
+                "exact starting_npcs npc_id as speaker_id for an actual NPC, reuse "
                 "the same ID for the same person, and use distinct stable "
-                "lower_snake_case IDs for incidental speakers. Ground voice_profile "
+                "lower_snake_case IDs for incidental speakers. speaker_name is a "
+                "visible bubble label, so use the known name or a concise player-safe "
+                "description when the name is unknown. Ground voice_profile "
                 "in established audible traits and use neutral when unspecified. Do "
                 "not cue narrator prose or player-character dialogue. If the setup includes "
                 "opening_scene_request, treat it as optional player-authored guidance "
@@ -2951,14 +3134,15 @@ def _build_xml_new_game_prompt(setup_packet: dict[str, Any]) -> str:
                 "schema, with no surrounding Markdown. Complete every required field. "
                 "Every returned string must contain printable ASCII English characters "
                 "only; do not return pronunciation_map or phonetic markup. "
-                "speaker_cues must be an array and must be empty when only the "
-                "narrator speaks.",
+                "opening_cues must contain no kind=speaker records when only the "
+                "narrator speaks. Use empty strings in cue fields that do not apply "
+                "to that kind.",
             ),
             _xml_text_section(
                 "task",
                 "Based on all setup sections above, synthesize the complete initial "
                 "world, finalized character state, known locations, opening scene, "
-                "and permitted setup events. Validate names and cross-references before returning.",
+                "and permitted setup records. Validate names and cross-references before returning.",
             ),
         ]
     )
@@ -3016,8 +3200,10 @@ def build_skill_check_plan_prompt(context_packet: dict[str, Any]) -> str:
         "when noticing the trap is uncertain, trap_disarm_skill/trap_disarm_dc when "
         "disarming it, and lockpick_skill/lockpick_dc when picking its lock. Do not "
         "invent a generic check or substitute a different DC.\n"
-        "- Prefer an existing known skill_name when one fits. If no existing skill "
-        "fits, use a clear new skill_name.\n"
+        "- Choose the most directly relevant existing known skill_name, not merely "
+        "a plausible broad skill. Locating or gathering wild plants, herbs, or "
+        "reagents uses a known Foraging skill rather than Investigation or "
+        "Perception. Only if no existing skill fits, use a clear new skill_name.\n"
         "- Include difficulty or dc when the action's risk is clear. Use reason "
         "to briefly explain why the check is needed.\n"
         "- Also return relevant_tags: the small list of rule categories that need "
@@ -3097,6 +3283,12 @@ def build_gemini_story_prompt(context_packet: dict[str, Any]) -> str:
         "mystery solutions, private plans, or GM-only facts in "
         "player_facing_information. Store hidden NPC or mystery information with "
         "SecretUpsertedEvent instead of a player-visible event field.\n\n"
+        "Visual-description boundary:\n"
+        "- Make new item descriptions, LocationUpsertedEvent descriptions, and "
+        "NpcUpsertedEvent public_description values concise, concrete, and visually "
+        "depictable using player-observable traits. Never expose hidden facts.\n"
+        "- Do not return image prompts, filenames, URLs, base64, or extra image fields. "
+        "The application independently generates and reuses images after state is saved.\n\n"
         "Private GM secret memory:\n"
         "- state.gm_secrets.active contains authoritative hidden truths that the AI "
         "must remember across turns. Use those truths for continuity, clues, NPC "
@@ -3251,13 +3443,6 @@ def build_gemini_story_prompt(context_packet: dict[str, Any]) -> str:
         "dice, raw roll numbers, totals, DCs, or game mechanics in the story.\n"
         "- Every InventoryItemAddedEvent payload must include value_base_units "
         "as an integer of at least 1.\n"
-        "- Every InventoryItemAddedEvent must include original ascii_art for the "
-        "item: 3-12 fixed-width lines, no Markdown code fence, and no line over "
-        "40 characters. A bracketed item name such as [Camera], a caption, or any "
-        "other single-line label is invalid and is not ASCII art. Do not "
-        "double-escape line breaks or put visible backslash-n "
-        "text in the drawing. When reusing state.item_catalog.items, copy its existing "
-        "ascii_art instead of redrawing the item.\n"
         "- Every InventoryItemAddedEvent must also include quantity_unit and "
         "storage_location. quantity_unit states what the amount measures, such "
         "as each, grams, mL, bottle, or vial. For recipe ingredients, the matching "
@@ -3269,6 +3454,12 @@ def build_gemini_story_prompt(context_packet: dict[str, Any]) -> str:
         "home for items stored at the player's Home and actively_carried for "
         "items currently carried by the Player Character. storage_location is a "
         "free-text storage label and must not be treated as a Travel-tab location.\n"
+        "- Every new or modified fictional, unfamiliar, or newly invented item must "
+        "have a concrete player-visible description beyond its name. Include form, "
+        "approximate size, color, material, texture, markings, condition, opacity "
+        "or translucency, and any visible changes under relevant conditions such as "
+        "sunlight, darkness, heat, or moisture when established. Never rely on an "
+        "invented name alone to communicate what the item looks like.\n"
         "- Classify inventory by the finished item's present primary function, not "
         "by its origin or packaging. Ingredient, Reagent, Material, and Crafting "
         "Item are inputs that can be consumed by recipes. A ready-to-use poison or "
@@ -3295,13 +3486,13 @@ def build_gemini_story_prompt(context_packet: dict[str, Any]) -> str:
         "Before inventing an item, look there and prefer a fitting existing "
         "definition for ordinary loot, purchases, supplies, equipment, and recipe "
         "results. Create a new definition only when no catalog item reasonably fits. "
-        "Use it to remember item descriptions and ASCII art after items leave inventory, but "
+        "Use it to remember item descriptions after items leave inventory, but "
         "only state.inventory.items are current possessions. Each catalog entry's "
         "metadata.item_uuid is its stable internal identity: preserve and reuse it "
         "when referring to the same item, even if its player-facing name changes. "
         "Do not invent duplicate item definitions merely because wording differs. "
         "ReagentDiscoveredEvent also creates or updates a catalog definition, so it "
-        "must include ascii_art and should preserve the matching item_uuid.\n"
+        "must preserve the matching item_uuid.\n"
         "- Containers are inventory items with item_type='Container' and a required "
         "container metadata object. When the player acquires a closed pouch, purse, "
         "chest, box, bag, or similar object, add only that container. Store its exact "
@@ -3572,8 +3763,11 @@ def build_gemini_new_game_prompt(setup_packet: dict[str, Any]) -> str:
         "starting date, season, or time. When setup.calendar.ai_generated is true, "
         "current_calendar is deliberately absent: invent calendar_settings and "
         "starting_calendar first, then make introductory_message match those generated "
-        "values. introductory_message must match setup_packet.current_weather unless "
-        "you return weather to change it. If introductory_message or the actual "
+        "values. Explicit setup.starting_calendar fields are authoritative and must "
+        "not be replaced. introductory_message must match setup_packet.current_weather. "
+        "When setup.starting_weather is non-empty, that exact condition is also "
+        "authoritative and must be returned in weather. Otherwise you may return "
+        "weather to change it. If introductory_message or the actual "
         "start_location description establishes rain, drizzle, snow, fog, or another "
         "current condition, the top-level weather field must name that condition and "
         "must not retain Clear or another contradictory default.\n"
@@ -3619,6 +3813,11 @@ def build_gemini_new_game_prompt(setup_packet: dict[str, Any]) -> str:
         "introductory_message, and events. Do not rename, partially rename, "
         "embellish, paraphrase, or reinterpret a player-provided character name, "
         "appearance, backstory, or notes field.\n"
+        "- A finalized character appearance, location description, starting-item "
+        "description, and NPC public_description must include concise concrete "
+        "player-visible visual traits. Do not add image prompts, filenames, URLs, "
+        "base64, or any image-specific output field; the application creates and "
+        "reuses images separately from these ordinary fields.\n"
         "- skills must contain every starting skill with name, description, and level. "
         "Return exactly the skill slots present in setup.skills, preserving every "
         "slot's level; when setup.skills is empty, return an empty skills array. "
@@ -3711,8 +3910,7 @@ def build_gemini_new_game_prompt(setup_packet: dict[str, Any]) -> str:
         "herbalist, survivalist, medic, scientist, crafter, or other profession "
         "that logically starts with practical making knowledge, return as many "
         "useful known items/materials and recipes as fit the backstory. Every "
-        "known_crafting_items entry must include original ascii_art using 3-12 "
-        "fixed-width lines, no Markdown fence, and no line over 40 characters. Recipe "
+        "known_crafting_items entries must include complete player-facing descriptions. Recipe "
         "ingredients must use item names from known_crafting_items or other known "
         "item catalog entries. Ingredient objects must use reagent_name, quantity, "
         "measure_amount, and a finite measure_unit from the schema enum. Do not use "
@@ -3739,10 +3937,11 @@ def build_gemini_new_game_prompt(setup_packet: dict[str, Any]) -> str:
         "and count rows; do not return or replace it. Starting wealth is stored as "
         "one integer in game_state/currency.balance. Never create coin, purse, cash, "
         "wallet, credit, or other spendable-money items in starting_items.\n"
-        "- The API response schema defines the required output fields and event "
-        "envelope. New-game events may only be NpcUpsertedEvent, "
-        "ActiveTaskUpsertedEvent, MusicChangedEvent, or "
-        "SoundEffectChangedEvent. Put hidden identities, "
+        "- The API response schema defines the required output fields. Return Wizard "
+        "NPCs in top-level starting_npcs, the optional initial quest in top-level "
+        "starting_task, and opening presentation through top-level opening_cues. "
+        "Do not return an events field; Python converts these setup groups into "
+        "canonical runtime events. Put hidden identities, "
         "motives, mystery solutions, off-screen plans, and other GM-only starting "
         "truths in the top-level gm_secrets array, not in player-facing fields "
         "or the events array. The app stores those starting secrets as active. "
@@ -3799,7 +3998,13 @@ def build_gemini_new_game_prompt(setup_packet: dict[str, Any]) -> str:
         "and its filename must exactly match one listed sound-effect track, never "
         "valid_music_tracks. For every event, copy anchor_text exactly from one unique "
         "place in introductory_message and use position before or after to locate the "
-        "precise narration boundary. The API response "
+        "precise narration boundary. When "
+        "setup_packet.audio.valid_background_ambience_tracks is non-empty, use "
+        "BackgroundAmbienceChangedEvent to start or replace a fitting quiet "
+        "environmental loop. Its filename must exactly match that ambience catalog. "
+        "During later story turns, return filename STOP when the current ambience "
+        "no longer fits and no replacement is appropriate. Ambience is persistent, "
+        "separate from music, and never uses anchor_text. The API response "
         "schema defines the required JSON fields.\n\n"
         "Setup packet:\n"
         f"{packet_json}"
@@ -4186,6 +4391,26 @@ def _suggested_setup_terms(setup_packet: dict[str, Any]) -> tuple[str, ...]:
     return tuple(dict.fromkeys(terms))
 
 
+def _new_game_npc_payloads(data: dict[str, Any]) -> list[dict[str, Any]]:
+    """Reads direct new-game NPC records with legacy event-envelope fallback."""
+
+    direct_npcs = data.get("starting_npcs", [])
+    if isinstance(direct_npcs, list):
+        payloads = [npc for npc in direct_npcs if isinstance(npc, dict)]
+        if payloads or "starting_npcs" in data:
+            return payloads
+    events = data.get("events", [])
+    if not isinstance(events, list):
+        return []
+    return [
+        event["payload"]
+        for event in events
+        if isinstance(event, dict)
+        and event.get("type") == "NpcUpsertedEvent"
+        and isinstance(event.get("payload"), dict)
+    ]
+
+
 def _unfinalized_suggested_setup_terms(
     raw_text: str,
     setup_packet: dict[str, Any] | None,
@@ -4258,14 +4483,7 @@ def _unfinalized_suggested_setup_terms(
             unresolved.append(requested_description)
 
     raw_npcs = setup.get("starting_npcs", []) if isinstance(setup, dict) else []
-    events = data.get("events", [])
-    npc_payloads = [
-        event.get("payload", {})
-        for event in events
-        if isinstance(event, dict)
-        and event.get("type") == "NpcUpsertedEvent"
-        and isinstance(event.get("payload"), dict)
-    ] if isinstance(events, list) else []
+    npc_payloads = _new_game_npc_payloads(data)
     if isinstance(raw_npcs, list):
         for source_index, requested in enumerate(raw_npcs):
             if not isinstance(requested, dict):
@@ -4283,7 +4501,9 @@ def _unfinalized_suggested_setup_terms(
                     payload
                     for payload in npc_payloads
                     if requested_name
-                    and str(payload.get("display_name", "") or "").strip().casefold()
+                    and str(
+                        payload.get("name", payload.get("display_name", "")) or ""
+                    ).strip().casefold()
                     == requested_name.casefold()
                 ),
                 npc_payloads[source_index] if source_index < len(npc_payloads) else None,
@@ -4418,14 +4638,7 @@ def _unfinalized_suggested_setup_paths(
                 paths.append(f"locations[source_index={source_index}].description")
 
     raw_npcs = setup.get("starting_npcs", [])
-    returned_events = data.get("events", [])
-    npc_payloads = [
-        event.get("payload", {})
-        for event in returned_events
-        if isinstance(event, dict)
-        and event.get("type") == "NpcUpsertedEvent"
-        and isinstance(event.get("payload"), dict)
-    ] if isinstance(returned_events, list) else []
+    npc_payloads = _new_game_npc_payloads(data)
     if isinstance(raw_npcs, list):
         for source_index, requested in enumerate(raw_npcs):
             if not isinstance(requested, dict):
@@ -4456,7 +4669,7 @@ def _unfinalized_suggested_setup_paths(
                 finalized_description,
             ):
                 paths.append(
-                    f"events[NpcUpsertedEvent][{source_index}].payload.public_description"
+                    f"starting_npcs[{source_index}].public_description"
                 )
 
     raw_magic = setup.get("magic", {})
@@ -4631,7 +4844,6 @@ def _generate_new_game_response_with_quality_retry(
             contents=request_contents,
             config=request_config,
             request_label=request_label,
-            allow_schema_fallback=False,
         )
         candidate_text = str(getattr(response, "text", "") or "").strip()
         candidate_errors = _new_game_response_quality_errors(
@@ -4722,18 +4934,6 @@ def _new_game_response_quality_errors(
         for error in _json_schema_shape_errors(data, response_schema)
         if not error.endswith(" is not allowed")
     ]
-    for field_name in ("starting_items", "known_crafting_items"):
-        raw_items = data.get(field_name, [])
-        if not isinstance(raw_items, list):
-            continue
-        for index, raw_item in enumerate(raw_items):
-            if not isinstance(raw_item, dict):
-                continue
-            if not is_substantive_ascii_art(raw_item.get("ascii_art", "")):
-                errors.append(
-                    f"$.{field_name}[{index}].ascii_art must be a real 3-12 line "
-                    "drawing; a bracketed name or single-line label is invalid"
-                )
     return errors
 
 
@@ -5254,19 +5454,29 @@ def _skill_check_planning_packet(context_packet: dict[str, Any]) -> dict[str, An
             "progression": magic.get("progression", {}),
         }
 
+    containers = [
+        item
+        for item in inventory_items
+        if isinstance(item, dict)
+        and isinstance(item.get("metadata"), dict)
+        and str(item["metadata"].get("item_type", "")).casefold()
+        == "container"
+    ]
     packet = {
         "packet_type": "skill_check_planning",
         "player_command": str(context_packet.get("player_command", "")).strip(),
         "scene": state.get("scene", {}) if isinstance(state.get("scene"), dict) else {},
         "player": state.get("player", {}) if isinstance(state.get("player"), dict) else {},
         "known_skills": skills.get("known_skills", []),
-        "containers": [
-            item
-            for item in inventory_items
-            if isinstance(item, dict)
-            and isinstance(item.get("metadata"), dict)
-            and str(item["metadata"].get("item_type", "")).casefold()
-            == "container"
+        "containers": containers,
+        "immediately_unlockable_containers": [
+            str(item.get("name", "") or "").strip()
+            for item in containers
+            if str(item.get("name", "") or "").strip()
+            and has_immediate_container_unlock_method(
+                inventory_items,
+                str(item.get("name", "") or "").strip(),
+            )
         ],
         "gm_secrets": (
             state.get("gm_secrets", {})
@@ -5369,17 +5579,23 @@ def _filter_audio_events_for_catalogs(
     raw_audio = context_packet.get("audio")
     if not isinstance(raw_audio, dict) or not raw_audio:
         raw_audio = _state_subpacket(context_packet, "audio")
-    valid_music, valid_effects = distinct_audio_track_catalogs(
+    valid_music, valid_effects, valid_ambience = distinct_audio_track_catalogs_with_ambience(
         raw_audio.get("valid_music_tracks", []),
         raw_audio.get("valid_sound_effect_tracks", []),
+        raw_audio.get("valid_background_ambience_tracks", []),
     )
     music_by_key = {track.casefold(): track for track in valid_music}
     effects_by_key = {track.casefold(): track for track in valid_effects}
+    ambience_by_key = {track.casefold(): track for track in valid_ambience}
     filtered: list[dict[str, Any]] = []
 
     for event in events:
         event_type = str(event.get("type", "") or "").strip()
-        if event_type not in {"MusicChangedEvent", "SoundEffectChangedEvent"}:
+        if event_type not in {
+            "MusicChangedEvent",
+            "SoundEffectChangedEvent",
+            "BackgroundAmbienceChangedEvent",
+        }:
             filtered.append(event)
             continue
 
@@ -5400,10 +5616,25 @@ def _filter_audio_events_for_catalogs(
         ).strip()
         filename_key = filename.casefold()
 
-        catalog = music_by_key if event_type == "MusicChangedEvent" else effects_by_key
+        if event_type == "MusicChangedEvent":
+            catalog = music_by_key
+            catalog_label = "music"
+        elif event_type == "SoundEffectChangedEvent":
+            catalog = effects_by_key
+            catalog_label = "sound-effect"
+        else:
+            catalog = ambience_by_key
+            catalog_label = "background-ambience"
+            if filename_key in {"stop", "none", "off", "silence"}:
+                if filename != "STOP":
+                    event = dict(event)
+                    payload = dict(payload)
+                    payload["filename"] = "STOP"
+                    event["payload"] = payload
+                filtered.append(event)
+                continue
         canonical_filename = catalog.get(filename_key)
         if canonical_filename is None:
-            catalog_label = "music" if event_type == "MusicChangedEvent" else "sound-effect"
             LOGGER.warning(
                 "Dropped %s from Gemini %s because %r is not in the distinct %s catalog.",
                 event_type,
@@ -5712,6 +5943,80 @@ def _drop_unwarranted_skill_check_events(
         out_of_game=result.out_of_game,
         raw_text=result.raw_text,
     )
+
+
+def _prefer_clearly_relevant_known_skill(
+    result: SkillCheckPlanResult,
+    context_packet: dict[str, Any],
+) -> SkillCheckPlanResult:
+    """Corrects broad or invented planner skills for unambiguous known-skill cases."""
+
+    if not result.checks:
+        return result
+
+    command = str(context_packet.get("player_command", "") or "")
+    if not (
+        FORAGING_ACTION_RE.search(command)
+        and FORAGING_TARGET_RE.search(command)
+    ):
+        return result
+
+    known_skills = _known_skills_from_context(context_packet)
+    foraging_name = known_skills.get("foraging")
+    if not foraging_name:
+        return result
+
+    corrected_checks: list[dict[str, Any]] = []
+    corrected_names: list[str] = []
+    seen_names: set[str] = set()
+    for check in result.checks:
+        check_name = str(check.get("skill_name", "") or "").strip()
+        folded_name = check_name.casefold()
+        should_correct = (
+            folded_name not in known_skills
+            or folded_name in GENERIC_SEARCH_SKILL_NAMES
+        )
+        corrected_check = dict(check)
+        if should_correct and folded_name != "foraging":
+            corrected_check["skill_name"] = foraging_name
+            corrected_names.append(check_name)
+
+        final_name = str(corrected_check.get("skill_name", "") or "").casefold()
+        if final_name in seen_names:
+            continue
+        corrected_checks.append(corrected_check)
+        seen_names.add(final_name)
+
+    if not corrected_names:
+        return result
+
+    LOGGER.warning(
+        "Corrected Gemini planned skill check(s) %s to %s because the player is "
+        "locating or gathering wild plants/reagents and that known skill is the "
+        "direct fit.",
+        corrected_names,
+        foraging_name,
+    )
+    return SkillCheckPlanResult(
+        checks=corrected_checks,
+        relevant_tags=result.relevant_tags,
+        raw_text=result.raw_text,
+    )
+
+
+def _known_skills_from_context(context_packet: dict[str, Any]) -> dict[str, str]:
+    state = context_packet.get("state", {})
+    skills = state.get("skills", {}) if isinstance(state, dict) else {}
+    known_skills = skills.get("known_skills", []) if isinstance(skills, dict) else []
+    if not isinstance(known_skills, list):
+        return {}
+
+    return {
+        name.casefold(): name
+        for skill in known_skills
+        if isinstance(skill, dict)
+        and (name := str(skill.get("name", "") or "").strip())
+    }
 
 
 def _drop_unauthorized_player_spell_cast_events(
@@ -6118,12 +6423,14 @@ def _enforce_container_reward_flow(
             result.narrative_text,
         ]
     )
-    closed_container_names = _closed_container_names_from_context(context_packet)
-    accesses_closed_container = (
+    inaccessible_container_names = _inaccessible_container_names_from_context(
+        context_packet
+    )
+    accesses_inaccessible_container = (
         _text_indicates_unopened_container(current_turn_text)
         and any(
             name.casefold() in current_turn_text.casefold()
-            for name in closed_container_names
+            for name in inaccessible_container_names
         )
     )
     adds_closed_container = any(
@@ -6135,7 +6442,7 @@ def _enforce_container_reward_flow(
         for event in result.suggested_events
     )
     protects_closed_contents = (
-        accesses_closed_container
+        accesses_inaccessible_container
         or adds_closed_container
         or takes_contents
     )
@@ -6194,10 +6501,10 @@ def _enforce_container_reward_flow(
     )
 
 
-def _closed_container_names_from_context(
+def _inaccessible_container_names_from_context(
     context_packet: dict[str, Any],
 ) -> set[str]:
-    """Reads the names of unopened inventory containers from story state."""
+    """Reads closed containers that cannot be opened immediately from story state."""
 
     state = context_packet.get("state", {})
     inventory = state.get("inventory", {}) if isinstance(state, dict) else {}
@@ -6214,15 +6521,24 @@ def _closed_container_names_from_context(
         metadata = item.get("metadata", {})
         container = metadata.get("container", {}) if isinstance(metadata, dict) else {}
 
-        if (
+        if not (
             isinstance(container, dict)
             and str(metadata.get("item_type", "")).casefold() == "container"
             and container.get("is_open") is not True
         ):
-            name = str(item.get("name", "") or "").strip()
+            continue
 
-            if name:
-                names.add(name)
+        name = str(item.get("name", "") or "").strip()
+        if not name:
+            continue
+
+        is_trapped = container.get("is_trapped") is True
+        is_locked_without_access = (
+            container.get("is_locked") is True
+            and not has_immediate_container_unlock_method(items, name)
+        )
+        if is_trapped or is_locked_without_access:
+            names.add(name)
 
     return names
 
@@ -6415,7 +6731,6 @@ def _ensure_inventory_for_collected_reagents(
                 "item_name": name,
                 "item_uuid": str(payload.get("item_uuid", "") or ""),
                 "description": _reagent_inventory_description(payload),
-                "ascii_art": str(payload.get("ascii_art", "") or ""),
                 "amount": 1,
                 "quantity_unit": "each",
                 "storage_location": "actively_carried",
@@ -6720,7 +7035,7 @@ def parse_gemini_new_game_response(
     guarded_raw_text = json.dumps(data, ensure_ascii=False)
 
     response_schema = (
-        build_new_game_response_schema(setup_packet)
+        build_new_game_response_schema(setup_packet, for_api=False)
         if isinstance(setup_packet, dict)
         else NEW_GAME_RESPONSE_JSON_SCHEMA
     )
@@ -6804,6 +7119,80 @@ def parse_gemini_new_game_response(
         LOGGER.warning("Gemini new-game events was not a list. Ignoring it.")
         raw_events = []
 
+    raw_starting_npcs = data.get("starting_npcs", [])
+    if isinstance(raw_starting_npcs, list):
+        raw_events.extend(
+            {
+                "type": "NpcUpsertedEvent",
+                "payload": dict(npc),
+            }
+            for npc in raw_starting_npcs
+            if isinstance(npc, dict)
+        )
+    raw_starting_task = data.get("starting_task")
+    if isinstance(raw_starting_task, dict) and raw_starting_task:
+        raw_events.append(
+            {
+                "type": "ActiveTaskUpsertedEvent",
+                "payload": dict(raw_starting_task),
+            }
+        )
+
+    raw_opening_cues = data.get("opening_cues", [])
+    if not isinstance(raw_opening_cues, list):
+        raw_opening_cues = []
+    music_cues = [
+        cue for cue in raw_opening_cues
+        if isinstance(cue, dict) and cue.get("kind") == "music"
+    ]
+    starting_music = str(
+        (
+            music_cues[0].get("filename", "")
+            if music_cues
+            else data.get("starting_music", "")
+        )
+        or ""
+    ).strip()
+    if starting_music:
+        raw_events.append(
+            {
+                "type": "MusicChangedEvent",
+                "payload": {"filename": starting_music},
+            }
+        )
+    raw_sound_effects = [
+        cue for cue in raw_opening_cues
+        if isinstance(cue, dict) and cue.get("kind") == "sound_effect"
+    ] or data.get("starting_sound_effects", [])
+    if isinstance(raw_sound_effects, list):
+        raw_events.extend(
+            {
+                "type": "SoundEffectChangedEvent",
+                "payload": dict(cue),
+            }
+            for cue in raw_sound_effects
+            if isinstance(cue, dict)
+        )
+    starting_background_ambience = str(
+        next(
+            (
+                cue.get("filename", "")
+                for cue in raw_opening_cues
+                if isinstance(cue, dict)
+                and cue.get("kind") == "background_ambience"
+            ),
+            data.get("starting_background_ambience", ""),
+        )
+        or ""
+    ).strip()
+    if starting_background_ambience:
+        raw_events.append(
+            {
+                "type": "BackgroundAmbienceChangedEvent",
+                "payload": {"filename": starting_background_ambience},
+            }
+        )
+
     suggested_events = [
         event for event in raw_events if isinstance(event, dict)
     ]
@@ -6823,7 +7212,11 @@ def parse_gemini_new_game_response(
         response_label="new-game response",
     )
     speaker_cues = _extract_narration_speaker_cues(
-        data.get("speaker_cues", []),
+        [
+            cue for cue in raw_opening_cues
+            if isinstance(cue, dict) and cue.get("kind") == "speaker"
+        ]
+        or data.get("speaker_cues", []),
         str(data.get("introductory_message", data.get("response", ""))).strip(),
         response_label="new-game response",
     )
@@ -7071,7 +7464,25 @@ def _parse_new_game_locations(
 ) -> list[dict[str, Any]]:
     """Parses player-known location metadata and anchors the starting map origin."""
 
-    locations = normalize_known_locations(raw_locations)
+    relationship_aware_locations: Any = raw_locations
+    if isinstance(raw_locations, list):
+        relationship_aware_locations = []
+        for raw_location in raw_locations:
+            if not isinstance(raw_location, dict):
+                relationship_aware_locations.append(raw_location)
+                continue
+            location = dict(raw_location)
+            parent_location = str(location.get("parent_location", "") or "").strip()
+            if bool(location.get("is_sublocation")) and parent_location:
+                relationship_note = f"Located within {parent_location}."
+                travel_notes = str(location.get("travel_notes", "") or "").strip()
+                if relationship_note.casefold() not in travel_notes.casefold():
+                    location["travel_notes"] = " ".join(
+                        value for value in (travel_notes, relationship_note) if value
+                    )
+            relationship_aware_locations.append(location)
+
+    locations = normalize_known_locations(relationship_aware_locations)
     source_indexes_by_name: dict[str, int] = {}
     if isinstance(raw_locations, list):
         for raw_location in raw_locations:
@@ -7326,11 +7737,6 @@ def _parse_new_game_starter_items(raw_items: Any) -> list[dict[str, Any]]:
                     raw_item.get("storage_location", "actively_carried")
                 ),
                 "description": str(raw_item.get("description", "")).strip(),
-                "ascii_art": ensure_substantive_ascii_art(
-                    raw_item.get("ascii_art", ""),
-                    item_name=name,
-                    category=_normalize_starter_item_category(raw_item),
-                ),
                 "value_base_units": max(0, value_base_units),
                 "source_index": _parse_optional_source_index(raw_item),
                 **{
@@ -7399,11 +7805,6 @@ def _parse_new_game_crafting_items(raw_items: Any) -> list[dict[str, Any]]:
                 "name": name,
                 "category": category,
                 "description": str(raw_item.get("description", "")).strip(),
-                "ascii_art": ensure_substantive_ascii_art(
-                    raw_item.get("ascii_art", ""),
-                    item_name=name,
-                    category=category,
-                ),
                 "location": str(raw_item.get("location", "")).strip(),
                 "uses": uses,
                 "rarity": normalize_crafting_item_rarity(raw_item.get("rarity")),

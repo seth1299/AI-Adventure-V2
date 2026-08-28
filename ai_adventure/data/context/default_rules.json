@@ -19,7 +19,7 @@
           "suggested_actions": "Array of 3-4 strings for live_game turns. Empty when conversation_mode is out_of_game.",
           "events": "Array of structured event objects. Empty when no state change is proposed.",
           "out_of_game": "Boolean. Must exactly match the player's explicit conversation_mode UI selection.",
-          "speaker_cues": "Array of exact non-narrator spoken spans with anchor_text, stable speaker_id, speaker_name, and broad voice_profile for local multi-voice TTS."
+          "speaker_cues": "Array of exact non-narrator spoken spans with anchor_text, stable speaker_id, visible player-safe speaker_name, and broad voice_profile for separate same-turn chat bubbles and local multi-voice TTS."
         },
         "event_shape": {
           "type": "String event type name.",
@@ -30,7 +30,7 @@
           "Treat conversation_mode as authoritative. For out_of_game, answer directly with out_of_game=true, suggested_actions=[], and events=[]; do not advance the turn counter or change status, time, combat, skills, inventory, tasks, NPC memory, secrets, miscellaneous canon, music, or any durable state. For live_game, return out_of_game=false and resolve the message in-world. Never infer or override the mode from wording.",
           "Only put player-facing text in response.",
           "Use printable ASCII English characters in every generated string. Transliterate accented Latin letters to unaccented English and never return foreign scripts, IPA, phoneme strings, pronunciation annotations, or pronunciation_map. Python enforces this before generated text reaches state, UI, persistence, or TTS.",
-          "Return one speaker_cues record for every contiguous non-narrator spoken span in response. Copy the complete exact span including outer double quotation marks into a unique anchor_text. Use an actual NPC's exact npc_id as speaker_id and reuse it on later turns; use distinct stable lower_snake_case IDs for other speakers. Choose voice_profile only from established audible traits and use neutral when unspecified. Return an empty array when only the narrator speaks or in out_of_game mode. Python owns final installed voice selection and durable assignment.",
+          "Return one speaker_cues record for every contiguous non-narrator spoken span in response. Copy the complete exact span including outer double quotation marks into a unique anchor_text. Use an actual NPC's exact npc_id as speaker_id and reuse it on later turns; use distinct stable lower_snake_case IDs for other speakers. speaker_name becomes the visible chat-bubble label, so use the known name or a concise player-safe description when the name is unknown. Choose voice_profile only from established audible traits and use neutral when unspecified. Return an empty array when only the narrator speaks or in out_of_game mode. Python owns same-turn bubble splitting, final installed voice selection, and durable assignment.",
           "Use supported events for inventory, active tasks, skills, currency, combat, recipes, reagents, NPCs, miscellaneous world canon, music, spells, flags, travel, locations, and status changes.",
           "Treat every state.miscellaneous.entries record as authoritative established canon on every turn. This section is intentionally uncapped and always included, without relevance filtering. Use MiscellaneousUpsertedEvent with a stable misc_id, name, category, and complete details for durable non-secret creatures, species, cultures, factions, religions, laws, historical events, phenomena, customs, or other concepts that do not fit a more specific table. Use category Creature for every non-NPC creature or monster the Player learns about and include only player-known facts in details; Creature records populate the player-visible Bestiary. Never duplicate NPC, Location, Item, task, or GM-secret records there.",
           "The Python application validates events before committing state."
@@ -95,7 +95,8 @@
           "When an inventory item changes condition or state, suggest an InventoryItemModifiedEvent instead of hiding the change in prose.",
           "For completed merchant transactions, suggest normal InventoryItemAddedEvent or InventoryItemRemovedEvent entries for transferred goods and CurrencyChangedEvent for the net money change.",
           "Containers are the exception to generic item-state editing: use ContainerOpenedEvent and ContainerContentsTakenEvent for opening and taking contents so Python can enforce hidden metadata and exact-once transfer.",
-          "Classify an item as a Container only when its primary function is holding physical contents that can be put in and taken out. Items that store writing, records, instructions, or information are not Containers merely because they store information."
+          "Classify an item as a Container only when its primary function is holding physical contents that can be put in and taken out. Items that store writing, records, instructions, or information are not Containers merely because they store information.",
+          "For every fictional, unfamiliar, or newly invented item, make its player-visible description communicate concrete traits beyond the name, including form, approximate size, color, material, texture, markings, condition, opacity or translucency, and relevant changes under sunlight, darkness, heat, or moisture when established. Never rely on an invented name alone to communicate appearance."
         ]
       }
     },
@@ -208,7 +209,7 @@
           "Do not include \"What do you do now?\" or any tense/person-specific end-of-turn prompt in the response field; the application displays that separately based on the selected narration tense and style.",
           "Resolve the player's submitted action instead of ending by restating the action, intent, or search target.",
           "When the player asks an NPC to answer, explain, reply, or tell their story, include the information that NPC can presently provide instead of stopping before the reply.",
-          "For every contiguous non-narrator spoken span, return a speaker_cues entry whose anchor_text is the complete exact double-quoted dialogue, whose speaker_id is the canonical npc_id when the speaker is an NPC, and whose voice_profile is grounded in established audible traits or neutral. Reuse speaker IDs consistently and use different IDs for different speakers. Python assigns and remembers the installed TTS voice.",
+          "For every contiguous non-narrator spoken span, return a speaker_cues entry whose anchor_text is the complete exact double-quoted dialogue, whose speaker_id is the canonical npc_id when the speaker is an NPC, whose speaker_name is the visible bubble label using a known name or a concise player-safe description when unknown, and whose voice_profile is grounded in established audible traits or neutral. Reuse speaker IDs consistently and use different IDs for different speakers. Python splits the response into same-turn bubbles and assigns and remembers the installed TTS voice.",
           "For live_game turns, include 3-4 suggested_actions as separate strings. For out_of_game, use an empty array.",
           "Use events for state changes instead of embedding commands in narration."
         ],
@@ -217,7 +218,7 @@
           "suggested_actions": "Array of 3-4 suggested player actions for live_game turns; empty for out_of_game.",
           "events": "Array of structured event objects. Empty when no state change is proposed.",
           "out_of_game": "Boolean. Must exactly match conversation_mode; never infer it from wording.",
-          "speaker_cues": "Array of exact anchored non-narrator spoken spans for multi-voice TTS; empty when no character speaks."
+          "speaker_cues": "Array of exact anchored non-narrator spoken spans for visible same-turn speaker bubbles and multi-voice TTS; empty when no character speaks."
         }
       }
     },
@@ -335,14 +336,15 @@
         "purpose": "Suggest SkillCheckRequestedEvent before narrating the final outcome only when the current command has meaningful uncertainty, opposition, hidden information, danger, scarcity, time pressure, or consequences. Do not request checks merely because an action could theoretically vary in quality or take extra time. Routine movement, paying a known price, receiving ordinary goods, eating, drinking, and casual conversation are not checks unless the player adds a contested, risky, hidden, time-sensitive, or deceptive goal.",
         "rules": [
           "Suggest SkillCheckRequestedEvent only when the current command has meaningful stakes: uncertainty, opposition, hidden information, danger, resource pressure, time pressure, or consequences.",
-          "skill_name may be absent from state.skills.known_skills. When requesting a check for an unknown skill, include skill_description describing its generalized capability; Python creates it at level 1 before rolling.",
+          "Choose the most directly relevant skill from state.skills.known_skills, not merely a plausible broad skill. Locating or gathering wild plants, herbs, or reagents uses known Foraging rather than Investigation or Perception.",
+          "skill_name may be absent from state.skills.known_skills only when no known skill fits. When requesting a check for an unknown skill, include skill_description describing its generalized capability; Python creates it at level 1 before rolling.",
           "Do not request a check merely because an action could theoretically vary in quality or take extra time.",
           "Foraging, harvesting, searching, researching, identifying, crafting experiments, persuasion, stealth, and combat need checks only when real stakes are present.",
           "Do not request checks for routine movement, paying a known price, receiving ordinary goods, eating, drinking, or casual conversation unless the player adds a contested, risky, hidden, time-sensitive, or deceptive goal.",
           "Prefer SkillCheckRequestedEvent over SkillXpAddedEvent when the player is attempting a risky or uncertain action.",
           "Do not narrate found items, harvested resources, crafted products, persuaded NPC outcomes, stealth results, combat results, or research conclusions as final success until after the Python application resolves the check.",
-          "Use the most relevant skill name.",
-          "If no existing skill fits and the player is attempting something new, choose a clear new skill name.",
+          "Use the most directly relevant skill name, not merely a broadly plausible one.",
+          "If and only if no existing skill fits and the player is attempting something new, choose a clear new skill name.",
           "Die rolls are non-diegetic. Do not mention dice, raw roll numbers, or game mechanics in the story narration.",
           "After the system returns the roll result, incorporate the outcome into the narrative naturally.",
           "When state.skills.resolved_checks_this_turn contains results, treat them as authoritative for the current player command and do not request duplicate checks for those skills.",
@@ -482,7 +484,6 @@
           "item_type",
           "item_name",
           "description",
-          "ascii_art",
           "amount",
           "value_base_units",
           "weapon_hands",
@@ -503,8 +504,7 @@
           "Suggest InventoryItemAddedEvent every time the player receives a new item in the current turn, including completed purchases.",
           "`Item Type` becomes the inventory category.",
           "`Item Name` should be specific.",
-          "`Description` should explain what the item is and include in structured event data important state information, such as what sort of ammunition is used for a bow or a gun.",
-          "`AsciiArt` is required. Create an original fixed-width depiction of the recognizable item shape using 3-12 lines, no Markdown code fence, and no line over 40 characters. A bracketed item name such as [Camera], a caption, or any other single-line label is invalid and is not ASCII art. Do not double-escape line breaks or put visible backslash-n text inside the drawing. For a reused catalog item, preserve its existing ascii_art exactly.",
+          "`Description` should explain what the item is and include in structured event data important state information, such as what sort of ammunition is used for a bow or a gun. For a newly defined item, include concise concrete player-visible visual traits that can depict it consistently.",
           "`Amount` must be a positive integer.",
           "`ValueBaseUnits` is required for every InventoryItemAddedEvent and must be an integer of at least 1, measured in the baseline currency unit from state.currency.baseline_unit.",
           "Weapon items should include weapon_hands and damage dice such as 1d6 or 2d6. Any player weapon must have average damage strictly higher than the player's unarmed base damage of 1d4; do not create player weapons with damage of 1d4 or anything weaker. Use at least 1d6 for ordinary one-handed weapons and at least 1d10 for ordinary two-handed weapons unless a stronger fitting expression is appropriate. Ranged weapons may also include attack_range_feet, ammunition_type_required, clip_size, and bullets_per_attack.",
@@ -514,7 +514,7 @@
           "Container metadata must specify exact hidden currency/items, is_open, contents_taken, is_locked, lockpick_skill, lockpick_dc, lockpick_failure_consequence, is_trapped, trap_notice_skill, trap_notice_dc, trap_disarm_skill, trap_disarm_dc, and trap_failure_consequence.",
           "When the player acquires a closed container, add only the container. Do not emit CurrencyChangedEvent or separate InventoryItemAddedEvent entries for anything stored inside it.",
           "Quest-related items should use `Quest Item` as the item type.",
-          "Before inventing an item, inspect state.item_catalog.items and prefer a fitting existing definition for ordinary loot, purchases, supplies, equipment, and recipe results. Preserve its metadata.item_uuid and ascii_art. Create a new definition only when no catalog item reasonably fits.",
+          "Before inventing an item, inspect state.item_catalog.items and prefer a fitting existing definition for ordinary loot, purchases, supplies, equipment, and recipe results. Preserve its metadata.item_uuid. Create a new definition only when no catalog item reasonably fits.",
           "Raw materials and refined materials should use different item types when relevant.",
           "Food, tools, weapons, ammo, armor, clothes, containers, crafting materials, books, documents, poisons, and valuables should be classified clearly by their finished present primary function, not their origin or packaging. A ready-to-use poison or toxin is Poison even when stored in a vial; reserve Ingredient, Reagent, Material, and Crafting Item for recipe inputs that still need processing. A physical journal, notebook, ledger, manual, or other book is Book or Document; Information describes content and is not a physical inventory category."
         ]
@@ -606,8 +606,10 @@
         "purpose": "Asks Python to validate and open a named inventory container.",
         "rules": [
           "Use only when the player actually attempts to open the named container.",
-          "For a locked or trapped container, the pre-narration planner must request the exact skill and DC stored in container metadata.",
-          "Python rejects the event unless every required lockpick or trap-disarm check succeeded, then marks the container open and clears the resolved lock/trap.",
+          "When the player attempts to access or take from an unlocked container, infer that they routinely open it and return ContainerOpenedEvent; do not request a check.",
+          "When the player owns an unambiguous key, keycard, combination, or equivalent access item for the named locked container, infer that an attempt to access or take from it includes routinely using that item and return ContainerOpenedEvent; do not request a lockpick check.",
+          "For a locked container without an immediate access method, or for a trapped container, the pre-narration planner must request the exact skill and DC stored in container metadata.",
+          "Python accepts an unambiguous matching access item in place of a lockpick check. Otherwise it rejects the event unless every required lockpick or trap-disarm check succeeded, then marks the container open and clears the resolved lock/trap.",
           "Opening a container does not give the player its contents.",
           "Do not accompany this event with CurrencyChangedEvent or InventoryItemAddedEvent for stored contents."
         ]
@@ -715,7 +717,6 @@
           "name",
           "category",
           "description",
-          "ascii_art",
           "location",
           "uses",
           "rarity",
@@ -725,8 +726,8 @@
         "purpose": "Saves a discovered useful item/material for the Crafting tab.",
         "rules": [
           "Suggest ReagentDiscoveredEvent when the player learns that a plant, mineral, fluid, creature part, tool part, salvage, foodstuff, or other material is useful for crafting, repair, cooking, medicine, or other practical preparation.",
-          "Do not use name-only item/material payloads. Include category, description, ascii_art, location, uses, rarity, notes, and value_base_units.",
-          "Create original ascii_art for the recognizable item or material shape using 3-12 fixed-width lines, no Markdown code fence, and no line over 40 characters. A bracketed name, caption, or other single-line label is invalid and is not ASCII art. Reuse a matching catalog item's existing art and metadata.item_uuid instead of inventing a near-duplicate.",
+          "Do not use name-only item/material payloads. Include category, description, location, uses, rarity, notes, and value_base_units.",
+          "Reuse a matching catalog item's metadata.item_uuid instead of inventing a near-duplicate.",
           "`Description` should briefly explain what the item or material is.",
           "`Location` means generalized environments or source areas, not an explicit existing map location. Use concise comma-separated categories such as Forests, Caves, Wetlands, Grasslands, Coastal Waters, Workshops, Farms, or Urban Scrap. Never put a specific Travel-tab location name here.",
           "`Uses` must be an array of short generalized symptoms or effects the item may address, such as sleep aid, pain relief, nausea relief, or wound care; do not use detailed recipes or procedures.",
@@ -823,7 +824,7 @@
         "rules": [
           "Use this when the player learns a location or learns new player-visible details about a known location.",
           "Coordinates are relative map miles. Keep them consistent with state.travel.locations and use x_miles=0 and y_miles=0 for the starting map origin.",
-          "Description, terrain, and travel_notes must contain only player-known facts. Put player-known local religion, culture, economy, factions, laws, customs, landmarks, and practical context for that place in description or travel_notes. Do not include secret routes, hidden dangers, mystery solutions, or GM-only information.",
+          "Description, terrain, and travel_notes must contain only player-known facts. Put player-known local religion, culture, economy, factions, laws, customs, landmarks, and practical context for that place in description or travel_notes. Make description concise, concrete, and visually depictable. Do not include secret routes, hidden dangers, mystery solutions, or GM-only information.",
           "travel_multiplier must be positive. Use values below 1 for terrain that slows ordinary travel and values above 1 only for reliably faster routes.",
           "Use NpcUpsertedEvent for people the player can recognize or remember at this location."
         ]
@@ -974,7 +975,7 @@
         "rules": [
           "Suggest MusicChangedEvent when the scene mood, location, danger level, or environment changes enough to justify new background music.",
           "The filename must exactly match one of the valid sound files.",
-          "Valid background-music filenames are listed only in state.audio.valid_music_tracks. Never use a filename from state.audio.valid_sound_effect_tracks for MusicChangedEvent.",
+          "Valid background-music filenames are listed only in state.audio.valid_music_tracks. Never use a filename from state.audio.valid_sound_effect_tracks or state.audio.valid_background_ambience_tracks for MusicChangedEvent.",
           "Do not invent filenames.",
           "Do not overuse this event for every minor action, however, do check and make sure that the currently playing music is appropriate for the location and the mood, even if the \"Location\" didn't actually change from one action to another. For example, if an ally suddenly turns traitor, you can start a fight song track, even if the Player is still in a \"Forest\" location."
         ]
@@ -1001,8 +1002,32 @@
         "rules": [
           "Use SoundEffectChangedEvent only for a brief, meaningful sound directly tied to a moment described in the current response. Never use it for looping or persistent ambience.",
           "Copy anchor_text exactly from one unique place in the player-facing response. Set position to before or after to choose the precise spoken boundary where the one-shot sound begins.",
-          "The filename must exactly match one entry from state.audio.valid_sound_effect_tracks. Never use a filename from state.audio.valid_music_tracks for SoundEffectChangedEvent, even when it appears to match the scene. Do not invent filenames.",
+          "The filename must exactly match one entry from state.audio.valid_sound_effect_tracks. Never use a filename from state.audio.valid_music_tracks for SoundEffectChangedEvent, even when it appears to match the scene. Never use a filename from state.audio.valid_background_ambience_tracks for SoundEffectChangedEvent. Do not invent filenames.",
           "Use as many separately anchored cues as the response genuinely benefits from, with no fixed cue-count target. Every cue must have an appropriate filename from the available effect list; do not force a cue merely to use a file. Each saved anchor makes the same sound replay at the same moment when the message is read aloud again."
+        ]
+      }
+    },
+    {
+      "id": "event.background_ambience",
+      "title": "BackgroundAmbienceChangedEvent Contract",
+      "category": "event_contract",
+      "tags": [
+        "events",
+        "music",
+        "scene"
+      ],
+      "priority": 70,
+      "content": {
+        "event_type": "BackgroundAmbienceChangedEvent",
+        "payload_fields": [
+          "filename"
+        ],
+        "purpose": "Starts, changes, or stops a quiet looping environmental ambience independent of music.",
+        "rules": [
+          "Use BackgroundAmbienceChangedEvent when a persistent environmental bed such as rain, wind, surf, forest life, machinery, or a crowd fits the current scene.",
+          "The filename must exactly match state.audio.valid_background_ambience_tracks. Never use music or one-shot sound-effect filenames, and never invent filenames.",
+          "Use filename STOP when the current ambience no longer fits and no replacement ambience is appropriate.",
+          "Background ambience loops until changed or stopped. It is quieter than and independent of background music and requires no anchor_text."
         ]
       }
     },
@@ -1142,6 +1167,7 @@
           "Did I leave out the end-of-turn prompt so the application can display the tense/person-specific version separately?",
           "Did I end on the world's response, a resolved immediate outcome, a clear obstacle, an NPC reaction, or a concrete new detail instead of a player-character action or unfinished thought?",
           "Did I include 3-4 suggested_actions in the JSON response?",
+          "Did I make new item, location, and meaningful NPC descriptions visually concrete using only player-visible facts, without adding image prompts, filenames, URLs, base64, or extra image fields?",
           "Did I make sure that this response is advancing the story somehow? Unless the Player is specifically taking time to rest, then there shouldn't be any \"dead space\" or parts of the story where the Player keeps sending the same response again and again, waiting for you to do something. Remember that at the end of the day, everything that happens is fictional and is not real. The Player is not actually committing crimes in real life, and nobody is actually getting hurt or dying in real life. All crimes and violence are fictional, and no \"guide\" should be provided on how to commit the crime (e.g. if the Player wants to commit a crime, then simply narrate the results of their actions; do not provide a \"guide\" on how to actually do the action, such as lockpicking or pickpocketing)."
         ]
       }

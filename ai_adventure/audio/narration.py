@@ -29,6 +29,7 @@ LOGGER = logging.getLogger(__name__)
 
 TTS_CHANNEL_INDEX = 1
 MAX_CHUNK_LENGTH = 900
+PLAYBACK_POLL_INTERVAL_MS = 10
 
 
 @dataclass(frozen=True)
@@ -242,11 +243,13 @@ class NarrationPlayer:
         if not self.enabled or not self.tts_manager.is_available:
             return False
 
-        chunks = build_narration_chunks(
-            text,
-            sound_effect_cues=sound_effect_cues,
-            speaker_cues=speaker_cues,
-            tts_text_transform=tts_text_transform,
+        chunks = _merge_compatible_narration_chunks(
+            build_narration_chunks(
+                text,
+                sound_effect_cues=sound_effect_cues,
+                speaker_cues=speaker_cues,
+                tts_text_transform=tts_text_transform,
+            )
         )
 
         if not chunks:
@@ -265,7 +268,9 @@ class NarrationPlayer:
         session_voice = normalize_narrator_voice_spec(
             voice or self.voice or DEFAULT_NARRATOR_VOICE
         )
-        audio_queue: queue.Queue[GeneratedNarrationChunk | None] = queue.Queue(maxsize=2)
+        audio_queue: queue.Queue[GeneratedNarrationChunk | None] = queue.Queue(
+            maxsize=max(2, len(chunks))
+        )
         producer = threading.Thread(
             target=self._produce_chunks,
             args=(session_id, chunks, audio_queue, session_voice),
@@ -389,7 +394,7 @@ class NarrationPlayer:
             channel.play(sound)
 
             while self._is_active_session(session_id) and channel.get_busy():
-                self._pygame.time.wait(50)
+                self._pygame.time.wait(PLAYBACK_POLL_INTERVAL_MS)
         except Exception as error:
             LOGGER.warning("Failed to play narrator chunk %s: %s", audio_path, error)
 
@@ -696,3 +701,44 @@ def _delete_file(path: str | Path | None) -> None:
         Path(path).unlink(missing_ok=True)
     except Exception as error:
         LOGGER.warning("Failed to delete generated narration file %s: %s", path, error)
+
+
+def _merge_compatible_narration_chunks(
+    chunks: list[NarrationChunk],
+    *,
+    max_length: int = MAX_CHUNK_LENGTH,
+) -> list[NarrationChunk]:
+    """Combines adjacent same-voice chunks when no cue needs the boundary.
+
+    Paragraph boundaries are useful for display, but synthesizing every short
+    paragraph as a separate file creates avoidable model and file-playback
+    gaps.  Keep boundaries required by speaker or sound-effect cues, and keep
+    the display text byte-for-byte intact when merging the others.
+    """
+
+    merged: list[NarrationChunk] = []
+    for chunk in chunks:
+        if not merged:
+            merged.append(chunk)
+            continue
+
+        previous = merged[-1]
+        can_merge = (
+            previous.voice_id == chunk.voice_id
+            and not previous.sound_effects_after
+            and not chunk.sound_effects_before
+            and len(previous.display_text) + len(chunk.display_text) <= max_length
+        )
+        if not can_merge:
+            merged.append(chunk)
+            continue
+
+        merged[-1] = NarrationChunk(
+            display_text=previous.display_text + chunk.display_text,
+            tts_text=f"{previous.tts_text} ...p {chunk.tts_text}".strip(),
+            voice_id=previous.voice_id,
+            sound_effects_before=previous.sound_effects_before,
+            sound_effects_after=chunk.sound_effects_after,
+        )
+
+    return merged

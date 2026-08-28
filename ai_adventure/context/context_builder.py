@@ -8,7 +8,7 @@ from ai_adventure.alchemy.ingredients import (
     CRAFTING_INGREDIENT_CATEGORY_NAMES,
 )
 from ai_adventure.ai.modes import ai_mode_preferences_from_settings
-from ai_adventure.audio.catalog import distinct_audio_track_catalogs
+from ai_adventure.audio.catalog import distinct_audio_track_catalogs_with_ambience
 from ai_adventure.context.creative_ideas import CreativeIdeasLibrary
 from ai_adventure.context.models import ContextLibrary
 from ai_adventure.context.naming import GENERIC_PROPER_NOUN_PLACEHOLDER_RULE
@@ -235,6 +235,8 @@ class AiContextBuilder:
         valid_music_tracks: list[str] | None = None,
         current_music: str | None = None,
         valid_sound_effect_tracks: list[str] | None = None,
+        valid_background_ambience_tracks: list[str] | None = None,
+        current_background_ambience: str | None = None,
         resolved_skill_checks: list[dict[str, Any]] | None = None,
         planner_context_tags: list[str] | None = None,
     ) -> dict[str, Any]:
@@ -279,9 +281,14 @@ class AiContextBuilder:
         selected_tags.add("story")
         if clean_conversation_mode == "out_of_game":
             selected_tags.add("out_of_game")
-        clean_music_tracks, clean_sound_effect_tracks = distinct_audio_track_catalogs(
+        (
+            clean_music_tracks,
+            clean_sound_effect_tracks,
+            clean_background_ambience_tracks,
+        ) = distinct_audio_track_catalogs_with_ambience(
             valid_music_tracks,
             valid_sound_effect_tracks,
+            valid_background_ambience_tracks,
         )
         clean_current_music = str(
             current_music
@@ -292,7 +299,16 @@ class AiContextBuilder:
             track.casefold() for track in clean_music_tracks
         }:
             clean_current_music = ""
-        if clean_music_tracks or clean_sound_effect_tracks:
+        clean_current_background_ambience = str(
+            current_background_ambience
+            or state.settings.values.get("audio.current_background_ambience", "")
+            or ""
+        ).strip()
+        if clean_current_background_ambience.casefold() not in {
+            track.casefold() for track in clean_background_ambience_tracks
+        }:
+            clean_current_background_ambience = ""
+        if clean_music_tracks or clean_sound_effect_tracks or clean_background_ambience_tracks:
             selected_tags.add("music")
 
         reference_sections = self.library.select_sections(
@@ -304,6 +320,8 @@ class AiContextBuilder:
             disabled_audio_event_types.add("MusicChangedEvent")
         if not clean_sound_effect_tracks:
             disabled_audio_event_types.add("SoundEffectChangedEvent")
+        if not clean_background_ambience_tracks:
+            disabled_audio_event_types.add("BackgroundAmbienceChangedEvent")
         reference_sections = [
             section
             for section in reference_sections
@@ -368,6 +386,15 @@ class AiContextBuilder:
         if notes_share_with_ai:
             note_entries = note_entries_for_ai(
                 normalize_note_entries(state.settings.values.get("notes.entries", []))
+            )
+        if clean_background_ambience_tracks:
+            audio_transition_rules.append(
+                "Use BackgroundAmbienceChangedEvent to start or replace a quiet, "
+                "persistent environmental loop when the scene warrants it. filename "
+                "must exactly match state.audio.valid_background_ambience_tracks. "
+                "Use filename STOP when the current ambience no longer fits and no "
+                "replacement is appropriate. This is separate from music and one-shot "
+                "sound effects."
             )
             note_entries = [
                 {
@@ -572,8 +599,12 @@ class AiContextBuilder:
                         "information are not Containers merely because they store "
                         "information. Never "
                         "reveal or award a closed container's contents. Use "
-                        "ContainerOpenedEvent only after required lock/trap checks "
-                        "succeed, then ContainerContentsTakenEvent only when the "
+                        "When the player attempts to access an unlocked container, or "
+                        "has an unambiguous key or equivalent access item for a locked "
+                        "container, infer the routine opening and use "
+                        "ContainerOpenedEvent; no lockpick check is needed. "
+                        "Otherwise use ContainerOpenedEvent only after required "
+                        "lock/trap checks succeed, then ContainerContentsTakenEvent only when the "
                         "player explicitly takes the contents. Python transfers "
                         "the exact stored currency/items once."
                     ),
@@ -593,7 +624,6 @@ class AiContextBuilder:
                             "category": item.category,
                             "description": _compact_text(item.description),
                             "value_base_units": item.value_base_units,
-                            "ascii_art": item.ascii_art,
                             "metadata": _compact_context_value(item.metadata),
                         }
                         for item in state.item_catalog.items
@@ -612,18 +642,11 @@ class AiContextBuilder:
                         "Travel-tab locations; use actively_carried only when the "
                         "Player Character is carrying it. "
                             "Use item_catalog to remember descriptions, categories, "
-                            "values, and ASCII art for previously seen items. Each item also "
+                            "values for previously seen items. Each item also "
                             "has database_id, a globally unique database identity, and "
                             "metadata.item_uuid, a stable item identity; "
                             "reuse it for the same item and do not split one item "
                             "into duplicate definitions because of name variations."
-                        ),
-                        "ascii_art_rule": (
-                            "New item definitions require an original 3-12 line "
-                            "fixed-width drawing of the recognizable item shape. A "
-                            "bracketed item name such as [Camera], a caption, or any "
-                            "other single-line label is invalid and is not ASCII art. "
-                            "Reuse valid existing catalog art exactly."
                         ),
                     },
                 },
@@ -767,8 +790,12 @@ class AiContextBuilder:
                             "that requires a skill level above 5."
                         ),
                         "unknown_skill_rule": (
-                            "skill_name may identify a generalized capability absent "
-                            "from known_skills. When it does, include skill_description "
+                            "Choose the most directly relevant known skill, not merely "
+                            "a plausible broad skill. Locating or gathering wild plants, "
+                            "herbs, or reagents uses known Foraging rather than "
+                            "Investigation or Perception. skill_name may identify a "
+                            "generalized capability absent from known_skills only when "
+                            "no known skill fits. When it does, include skill_description "
                             "so Python can create the new skill at level 1 before rolling."
                         ),
                         "uncertain_action_rule": (
@@ -936,6 +963,8 @@ class AiContextBuilder:
                     "current_music": clean_current_music,
                     "valid_music_tracks": clean_music_tracks,
                     "valid_sound_effect_tracks": clean_sound_effect_tracks,
+                    "current_background_ambience": clean_current_background_ambience,
+                    "valid_background_ambience_tracks": clean_background_ambience_tracks,
                     "rules": {
                         "music_change_rule": (
                             "When scene mood, location, danger level, or environment "
@@ -958,6 +987,12 @@ class AiContextBuilder:
                             "cue-count target; omit cues when no listed sound fits. The "
                             "app replays each saved cue at that same boundary."
                         ),
+                        "background_ambience_rule": (
+                            "BackgroundAmbienceChangedEvent controls a quiet persistent "
+                            "environmental loop independent of music. filename must "
+                            "exactly match valid_background_ambience_tracks, or be STOP "
+                            "when ambience should end without replacement."
+                        ),
                         "english_text_rule": (
                             "Every generated string value must use printable ASCII "
                             "English characters only. Transliterate accented Latin "
@@ -974,9 +1009,11 @@ class AiContextBuilder:
                             "and reuse it on later turns; use distinct stable "
                             "lower_snake_case IDs for other speakers. Choose only a "
                             "broad established voice_profile and use neutral when "
-                            "unspecified. Python selects and durably remembers the "
-                            "installed voice ID. Do not cue narrator prose or the "
-                            "Player Character."
+                            "unspecified. speaker_name is the visible chat-bubble label: "
+                            "use the known name or a concise player-safe description "
+                            "when the name is unknown. Python splits the response into "
+                            "same-turn bubbles and durably remembers the installed "
+                            "voice ID. Do not cue narrator prose or the Player Character."
                         ),
                     },
                 },
@@ -1144,14 +1181,16 @@ class AiContextBuilder:
                     "scripts, or inline pronunciation markup."
                 ),
                 "speaker_cues": (
-                    "TTS-only array covering every contiguous non-narrator spoken "
-                    "span in response. Each record must contain anchor_text copied "
-                    "exactly with outer double quotes, speaker_id, speaker_name, and "
-                    "voice_profile. Use the exact canonical npc_id for an NPC, reuse "
-                    "one ID for the same speaker, and use different IDs for different "
-                    "speakers. Return [] when only the narrator speaks or for "
-                    "out_of_game. Python owns final installed voice assignment and "
-                    "persistence."
+                    "Array covering every contiguous non-narrator spoken span in "
+                    "response for visible speaker bubbles and multi-voice TTS. Each "
+                    "record must contain anchor_text copied exactly with outer double "
+                    "quotes, speaker_id, speaker_name, and voice_profile. speaker_name "
+                    "is the visible bubble label: use the known name or a concise "
+                    "player-safe description when the name is unknown. Use the exact "
+                    "canonical npc_id for an NPC, reuse one ID for the same speaker, "
+                    "and use different IDs for different speakers. Return [] when only "
+                    "the narrator speaks or for out_of_game. Python owns bubble "
+                    "splitting, final installed voice assignment, and persistence."
                 ),
                 "conversation_mode": (
                     "conversation_mode is selected explicitly by the player in the UI "
@@ -1180,6 +1219,10 @@ class AiContextBuilder:
                     "or difficulty only for actions with meaningful uncertainty, "
                     "opposition, hidden information, danger, resource pressure, time "
                     "pressure, or consequences in the current scene. "
+                    "Choose the most directly relevant known skill. Locating or "
+                    "gathering wild plants, herbs, or reagents uses known Foraging "
+                    "rather than Investigation or Perception; create a new skill "
+                    "only when no known skill fits. "
                     "When state.skills.resolved_checks_this_turn is non-empty, those "
                     "checks are already resolved for the current player command; "
                     "narrate the outcome from those results and do not request "
@@ -1254,7 +1297,7 @@ class AiContextBuilder:
                     "Use state.item_catalog.items as the master list of remembered "
                     "item definitions. Before inventing an item, reuse a fitting "
                     "existing catalog definition whenever one can serve the story. "
-                    "It preserves descriptions, categories, values, ASCII art, "
+                "It preserves descriptions, categories, and values, "
                     "and metadata.item_uuid stable internal identities; reuse the same "
                     "item_uuid for the same item even when its display name changes. "
                     "It also preserves equipment metadata after items leave inventory. "
@@ -1297,7 +1340,8 @@ class AiContextBuilder:
                     "player-visible and must not include secrets or undiscovered names. "
                     "role, location, public_description, knowledge_scope, and known_facts "
                     "are required NPC memory fields; do not add unsupported fields such "
-                    "as disposition. "
+                    "as disposition. Make public_description concise, concrete, and "
+                    "visually depictable using only player-observable traits. "
                     "Before creating an NPC, inspect state.npcs.relevant. If the same "
                     "person is already listed, reuse that existing npc_id/internal "
                     "identifier and update the one profile; do not create a second "
@@ -1308,6 +1352,13 @@ class AiContextBuilder:
                     "party_health_max, party_armor_class, party_combat_style, and "
                     "party_skills when those visible details change. Use "
                     "party_member=false to remove membership without deleting the NPC."
+                ),
+                "generated_visuals": (
+                    "Write new inventory descriptions, location descriptions, and NPC "
+                    "public_description values with concise concrete player-visible "
+                    "visual traits. Do not output image prompts, filenames, URLs, "
+                    "base64, or extra image fields. The application separately derives "
+                    "and reuses cached images from finalized ordinary state."
                 ),
                 "secret_memory": (
                     "Use state.gm_secrets.active as authoritative AI-only hidden "
@@ -1405,6 +1456,7 @@ class AiContextBuilder:
                     "CurrencyDefinedEvent",
                     "MusicChangedEvent",
                     "SoundEffectChangedEvent",
+                    "BackgroundAmbienceChangedEvent",
                     "FlagSetEvent",
                     "LocationUpsertedEvent",
                     "TravelModeChangedEvent",

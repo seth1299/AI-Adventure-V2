@@ -151,6 +151,14 @@ class ContextBuilderTests(unittest.TestCase):
             packet["response_contract"]["speaker_cues"],
         )
         self.assertIn(
+            "visible bubble label",
+            packet["response_contract"]["speaker_cues"],
+        )
+        self.assertIn(
+            "when the name is unknown",
+            packet["state"]["audio"]["rules"]["speaker_voice_rule"],
+        )
+        self.assertIn(
             "durably remembers",
             packet["state"]["audio"]["rules"]["speaker_voice_rule"],
         )
@@ -256,7 +264,6 @@ class ContextBuilderTests(unittest.TestCase):
                         category="tool",
                         description="A brass lantern.",
                         value_base_units=12,
-                        ascii_art="  ___\n /___\\\n | * |",
                         metadata={"item_type": "Tool"},
                     )
                 ]
@@ -355,6 +362,8 @@ class ContextBuilderTests(unittest.TestCase):
             valid_music_tracks=["Town Village City.mp3", "Boss_Fight.mp3"],
             current_music="Town Village City.mp3",
             valid_sound_effect_tracks=["Steady Rain.wav", "Crowd Ambience.ogg"],
+            valid_background_ambience_tracks=["Quiet Rain.ogg"],
+            current_background_ambience="Quiet Rain.ogg",
             resolved_skill_checks=[
                 {
                     "skill_name": "Foraging",
@@ -499,6 +508,22 @@ class ContextBuilderTests(unittest.TestCase):
             packet["response_contract"]["known_event_types"],
         )
         self.assertIn(
+            "BackgroundAmbienceChangedEvent",
+            packet["response_contract"]["known_event_types"],
+        )
+        self.assertEqual(
+            packet["state"]["audio"]["current_background_ambience"],
+            "Quiet Rain.ogg",
+        )
+        self.assertEqual(
+            packet["state"]["audio"]["valid_background_ambience_tracks"],
+            ["Quiet Rain.ogg"],
+        )
+        self.assertIn(
+            "be STOP",
+            packet["state"]["audio"]["rules"]["background_ambience_rule"],
+        )
+        self.assertIn(
             "short one-shot narration cue",
             packet["state"]["audio"]["rules"]["sound_effect_rule"],
         )
@@ -521,11 +546,15 @@ class ContextBuilderTests(unittest.TestCase):
             "exact stored currency/items once",
             packet["state"]["inventory"]["container_rule"],
         )
+        self.assertIn(
+            "unambiguous key or equivalent access item",
+            packet["state"]["inventory"]["container_rule"],
+        )
         self.assertEqual(packet["state"]["item_catalog"]["items"][0]["name"], "Lantern")
         self.assertNotIn("quantity", packet["state"]["item_catalog"]["items"][0])
-        self.assertEqual(
-            packet["state"]["item_catalog"]["items"][0]["ascii_art"],
-            "  ___\n /___\\\n | * |",
+        self.assertNotIn(
+            "ascii_art",
+            packet["state"]["item_catalog"]["items"][0],
         )
         self.assertEqual(
             packet["state"]["item_catalog"]["items"][0]["metadata"]["item_type"],
@@ -571,6 +600,14 @@ class ContextBuilderTests(unittest.TestCase):
         self.assertIn(
             "meaningful uncertainty",
             packet["response_contract"]["skill_checks"],
+        )
+        self.assertIn(
+            "most directly relevant known skill",
+            packet["response_contract"]["skill_checks"],
+        )
+        self.assertIn(
+            "known Foraging rather than Investigation or Perception",
+            packet["state"]["skills"]["rules"]["unknown_skill_rule"],
         )
         self.assertIn(
             "Do not request checks merely",
@@ -749,14 +786,6 @@ class ContextBuilderTests(unittest.TestCase):
         self.assertIn(
             "instead of vague due-date prose",
             packet["response_contract"]["active_tasks"],
-        )
-        self.assertIn(
-            "[Camera]",
-            packet["state"]["item_catalog"]["rules"]["ascii_art_rule"],
-        )
-        self.assertIn(
-            "single-line label is invalid",
-            packet["state"]["item_catalog"]["rules"]["ascii_art_rule"],
         )
         self.assertIn(
             "should not be blank",
