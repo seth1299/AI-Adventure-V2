@@ -483,6 +483,7 @@
         "payload_fields": [
           "item_type",
           "item_name",
+          "owner_npc_id",
           "description",
           "amount",
           "value_base_units",
@@ -497,9 +498,11 @@
           "ammunition_type",
           "covers_body_parts",
           "armor_rating",
+          "equipped",
+          "equipment_slot",
           "container"
         ],
-        "purpose": "Adds an item to the player's inventory.",
+        "purpose": "Adds an item to the Player Character or, when owner_npc_id is supplied, a current party member's dedicated inventory.",
         "rules": [
           "Suggest InventoryItemAddedEvent every time the player receives a new item in the current turn, including completed purchases.",
           "`Item Type` becomes the inventory category.",
@@ -533,9 +536,10 @@
         "event_type": "InventoryItemRemovedEvent",
         "payload_fields": [
           "item_name",
+          "owner_npc_id",
           "amount"
         ],
-        "purpose": "Removes or decreases an item in the player's inventory.",
+        "purpose": "Removes or decreases an item in the Player Character or a current party member's dedicated inventory.",
         "rules": [
           "Suggest InventoryItemRemovedEvent when the player consumes, spends, gives away, sells, places, breaks, loses, sacrifices, turns in, or uses up an item.",
           "`Item Name` should match the inventory item name as closely as possible.",
@@ -559,6 +563,7 @@
         "event_type": "InventoryItemModifiedEvent",
         "payload_fields": [
           "target_name",
+          "owner_npc_id",
           "new_name",
           "new_category",
           "new_description",
@@ -574,7 +579,9 @@
           "bullets_per_attack",
           "ammunition_type",
           "covers_body_parts",
-          "armor_rating"
+          "armor_rating",
+          "equipped",
+          "equipment_slot"
         ],
         "purpose": "Changes the name, description, or amount of an existing inventory item without fully removing and re-adding it.",
         "rules": [
@@ -585,7 +592,8 @@
           "`NewAmount` must be an integer, `SAME`, or `SKIP`.",
           "`NewValueBaseUnits` may update the item value as an integer measured in the baseline currency unit.",
           "Do not use this event to open a container or take its contents. Use ContainerOpenedEvent and ContainerContentsTakenEvent.",
-          "Do not use this to create a brand-new item. Use InventoryItemAddedEvent for that."
+          "Do not use this to create a brand-new item. Use InventoryItemAddedEvent for that.",
+          "For party-member items, set owner_npc_id to the exact party member npc_id. Use equipped and equipment_slot to track worn or readied equipment; omit owner_npc_id for Player Character inventory."
         ]
       }
     },

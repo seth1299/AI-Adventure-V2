@@ -567,6 +567,13 @@ EVENT_RESPONSE_SCHEMA: dict[str, Any] = {
             {
                 "item_type": {"type": "string"},
                 "item_name": {"type": "string"},
+                "owner_npc_id": {
+                    "type": "string",
+                    "description": (
+                        "Exact npc_id of a current party member when this item belongs "
+                        "in that member's dedicated inventory; omit for player inventory."
+                    ),
+                },
                 "item_uuid": {"type": "string", "description": "Existing catalog UUID when this is a known item; otherwise use an empty string and Python assigns one."},
                 "description": {"type": "string"},
                 "amount": {"type": "integer", "minimum": 1},
@@ -600,6 +607,8 @@ EVENT_RESPONSE_SCHEMA: dict[str, Any] = {
                     "items": {"type": "string"},
                 },
                 "armor_rating": INT_OR_SKIP_SCHEMA,
+                "equipped": {"type": "boolean"},
+                "equipment_slot": {"type": "string"},
                 "container": CONTAINER_METADATA_SCHEMA,
             },
             [
@@ -614,6 +623,10 @@ EVENT_RESPONSE_SCHEMA: dict[str, Any] = {
             "InventoryItemRemovedEvent",
             {
                 "item_name": {"type": "string"},
+                "owner_npc_id": {
+                    "type": "string",
+                    "description": "Exact npc_id of the current party member whose inventory loses this item.",
+                },
                 "amount": {"type": "integer", "minimum": 1},
             },
             ["item_name", "amount"],
@@ -622,6 +635,10 @@ EVENT_RESPONSE_SCHEMA: dict[str, Any] = {
             "InventoryItemModifiedEvent",
             {
                 "target_name": {"type": "string"},
+                "owner_npc_id": {
+                    "type": "string",
+                    "description": "Exact npc_id of a current party member; omit for player inventory.",
+                },
                 "new_name": {"type": "string"},
                 "new_category": {"type": "string"},
                 "new_description": {"type": "string"},
@@ -646,6 +663,8 @@ EVENT_RESPONSE_SCHEMA: dict[str, Any] = {
                     "items": {"type": "string"},
                 },
                 "armor_rating": INT_OR_SKIP_SCHEMA,
+                "equipped": {"type": "boolean"},
+                "equipment_slot": {"type": "string"},
                 "container": CONTAINER_METADATA_SCHEMA,
             },
             ["target_name"],
@@ -1145,6 +1164,9 @@ EVENT_RESPONSE_SCHEMA: dict[str, Any] = {
                 "location": {"type": "string"},
                 "public_description": {"type": "string"},
                 "player_facing_information": {"type": "string"},
+                "gender_identity": {"type": "string"},
+                "age": {"type": "string"},
+                "species": {"type": "string"},
                 "knowledge_scope": NONEMPTY_STRING_LIST_SCHEMA,
                 "known_facts": NONEMPTY_STRING_LIST_SCHEMA,
                 "party_member": {"type": "boolean"},
@@ -1228,6 +1250,9 @@ NEW_GAME_NPC_EVENT_RESPONSE_SCHEMA: dict[str, Any] = _event_response_schema(
         "name": {"type": "string"},
         "location": {"type": "string"},
         "public_description": {"type": "string"},
+        "gender_identity": {"type": "string"},
+        "age": {"type": "string"},
+        "species": {"type": "string"},
         "party_member": {
             "type": "boolean",
             "description": (
@@ -1236,6 +1261,11 @@ NEW_GAME_NPC_EVENT_RESPONSE_SCHEMA: dict[str, Any] = _event_response_schema(
             ),
         },
         "party_status": {"type": "string"},
+        "party_health_current": {"type": "integer", "minimum": -1},
+        "party_health_max": {"type": "integer", "minimum": -1},
+        "party_armor_class": {"type": "integer", "minimum": -1},
+        "party_combat_style": {"type": "string"},
+        "party_skills": STRING_LIST_SCHEMA,
     },
     [
         "npc_id",
@@ -3283,6 +3313,17 @@ def build_gemini_story_prompt(context_packet: dict[str, Any]) -> str:
         "mystery solutions, private plans, or GM-only facts in "
         "player_facing_information. Store hidden NPC or mystery information with "
         "SecretUpsertedEvent instead of a player-visible event field.\n\n"
+        "- NpcUpsertedEvent may include the player-visible identity fields "
+        "gender_identity, age, and species. Provide them when established or "
+        "clearly known, and leave them blank when unknown; do not infer a "
+        "sensitive identity without evidence.\n"
+        "- Every party member is also a canonical NPC. Reuse its exact npc_id and "
+        "keep party_combat_style and party_skills populated whenever those "
+        "preferences are known, including in narrative combat mode. For party "
+        "equipment, use InventoryItemAddedEvent, InventoryItemRemovedEvent, or "
+        "InventoryItemModifiedEvent with owner_npc_id set to the exact party "
+        "member npc_id. Set equipped=true and equipment_slot when appropriate; "
+        "omit owner_npc_id for Player Character inventory.\n\n"
         "Visual-description boundary:\n"
         "- Make new item descriptions, LocationUpsertedEvent descriptions, and "
         "NpcUpsertedEvent public_description values concise, concrete, and visually "
@@ -3450,6 +3491,9 @@ def build_gemini_story_prompt(context_packet: dict[str, Any]) -> str:
         "InventoryItemModifiedEvent with quantity_unit to correct an existing "
         "ingredient stack whose stored unit is wrong. Preserve item_uuid whenever "
         "the item already exists in state.item_catalog.items. "
+        "For an item belonging to a party member, set owner_npc_id to the "
+        "canonical party npc_id and use storage_location such as on_person; "
+        "never place party equipment in the Player Character inventory.\n"
         "as each, bottle, vial, gram, kilogram, liter, or meter. Use exactly "
         "home for items stored at the player's Home and actively_carried for "
         "items currently carried by the Player Character. storage_location is a "
@@ -3978,7 +4022,13 @@ def build_gemini_new_game_prompt(setup_packet: dict[str, Any]) -> str:
         "when that npc_id appears in setup.starting_party_npc_ids, and false "
         "otherwise. When location_source_index is nonnegative, payload.location "
         "must use the finalized name of the corresponding setup.starting_locations "
-        "row, including when its suggestion-mode name changes. Fill blank "
+        "row, including when its suggestion-mode name changes. For party members, "
+        "also return party_status, party_combat_style, "
+        "and party_skills even when combat resolution mode is narrative; include "
+        "party health and armor when the setup establishes them. Return "
+        "gender_identity, age, and species for each NPC when established, and "
+        "leave those fields blank when unknown.\n"
+        "Fill blank "
         "name, location, or description fields with fitting specifics. If "
         "description_mode is exact, copy description into payload.public_description "
         "unchanged; if description_mode is suggestion, use description as a guide "

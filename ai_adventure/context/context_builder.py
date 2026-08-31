@@ -1076,7 +1076,12 @@ class AiContextBuilder:
                         "party_member=true, and the changed party fields. Use "
                         "party_member=false to remove someone from the party without "
                         "deleting their NPC profile. Keep health, armor class, status, "
-                        "combat style, and skills consistent with narrated outcomes."
+                        "combat style, and skills consistent with narrated outcomes. "
+                        "Party equipment is stored in party.members.inventory and "
+                        "party.members.equipment; use the existing inventory events "
+                        "with owner_npc_id set to the exact party member npc_id to "
+                        "add, remove, modify, or mark an item equipped. Do not put "
+                        "party-member items in the Player Character inventory."
                     ),
                 },
                 "gm_secrets": {
@@ -1558,6 +1563,9 @@ def _npc_context_profile(npc: dict[str, Any]) -> dict[str, Any]:
         "location",
         "public_description",
         "player_facing_information",
+        "gender_identity",
+        "age",
+        "species",
         "knowledge_scope",
         "known_facts",
         "created_at",
@@ -1709,12 +1717,17 @@ def _party_context_profile(member: dict[str, Any]) -> dict[str, Any]:
         "location",
         "description",
         "notes",
+        "gender_identity",
+        "age",
+        "species",
         "status",
         "health_current",
         "health_max",
         "armor_class",
         "combat_style",
         "skills",
+        "inventory",
+        "equipment",
     }
     return {
         key: _compact_context_value(value)

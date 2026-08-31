@@ -2247,6 +2247,9 @@ class SaveRepository:
         location: str = "",
         public_description: str = "",
         player_facing_information: str = "",
+        gender_identity: str = "",
+        age: str = "",
+        species: str = "",
         knowledge_scope: list[str] | None = None,
         known_facts: list[str] | None = None,
         disposition: str = "",
@@ -2262,6 +2265,9 @@ class SaveRepository:
             location: Usual or last-known location.
             public_description: Observable public description.
             player_facing_information: Player-safe information for the NPCs tab.
+            gender_identity: Player-visible gender identity, when established.
+            age: Player-visible age or age description, when established.
+            species: Player-visible species, when established.
             knowledge_scope: Plain-language topics this NPC can plausibly know.
             known_facts: Specific facts this NPC has learned.
             disposition: Current broad attitude toward the player.
@@ -2289,6 +2295,9 @@ class SaveRepository:
             or clean_public_description
             or clean_role
         )
+        clean_gender_identity = gender_identity.strip()
+        clean_age = age.strip()
+        clean_species = species.strip()
         explicit_npc_id = npc_id.strip()
         clean_npc_id = explicit_npc_id or _npc_id_from_parts(
             clean_name,
@@ -2349,13 +2358,16 @@ class SaveRepository:
                     location,
                     public_description,
                     player_facing_information,
+                    gender_identity,
+                    age,
+                    species,
                     knowledge_scope_json,
                     known_facts_json,
                     disposition,
                     created_at,
                     updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(npc_id) DO UPDATE SET
                     name = excluded.name,
                     display_name = CASE
@@ -2378,6 +2390,18 @@ class SaveRepository:
                         WHEN excluded.player_facing_information != '' THEN excluded.player_facing_information
                         ELSE npcs.player_facing_information
                     END,
+                    gender_identity = CASE
+                        WHEN excluded.gender_identity != '' THEN excluded.gender_identity
+                        ELSE npcs.gender_identity
+                    END,
+                    age = CASE
+                        WHEN excluded.age != '' THEN excluded.age
+                        ELSE npcs.age
+                    END,
+                    species = CASE
+                        WHEN excluded.species != '' THEN excluded.species
+                        ELSE npcs.species
+                    END,
                     knowledge_scope_json = excluded.knowledge_scope_json,
                     known_facts_json = excluded.known_facts_json,
                     disposition = CASE
@@ -2394,6 +2418,9 @@ class SaveRepository:
                     clean_location,
                     clean_public_description,
                     clean_player_facing_information,
+                    clean_gender_identity,
+                    clean_age,
+                    clean_species,
                     _encode_string_list(merged_knowledge_scope),
                     _encode_string_list(merged_known_facts),
                     disposition.strip(),
@@ -2545,6 +2572,9 @@ class SaveRepository:
             location=str(npc.get("location", "")),
             public_description=str(npc.get("public_description", "")),
             player_facing_information=str(npc.get("player_facing_information", "")),
+            gender_identity=str(npc.get("gender_identity", "")),
+            age=str(npc.get("age", "")),
+            species=str(npc.get("species", "")),
             knowledge_scope=list(npc.get("knowledge_scope", [])),
             known_facts=updated_facts,
             disposition=str(npc.get("disposition", "")),
@@ -2578,6 +2608,9 @@ class SaveRepository:
                     location,
                     public_description,
                     player_facing_information,
+                    gender_identity,
+                    age,
+                    species,
                     knowledge_scope_json,
                     known_facts_json,
                     disposition,
@@ -2622,6 +2655,9 @@ class SaveRepository:
                     location,
                     public_description,
                     player_facing_information,
+                    gender_identity,
+                    age,
+                    species,
                     knowledge_scope_json,
                     known_facts_json,
                     disposition,
@@ -2663,6 +2699,9 @@ class SaveRepository:
                     location,
                     public_description,
                     player_facing_information,
+                    gender_identity,
+                    age,
+                    species,
                     knowledge_scope_json,
                     known_facts_json,
                     disposition,
@@ -2708,6 +2747,9 @@ class SaveRepository:
                         or "Unknown NPC"
                     ),
                     "description": description,
+                    "gender_identity": npc.get("gender_identity", ""),
+                    "age": npc.get("age", ""),
+                    "species": npc.get("species", ""),
                     "location": npc["location"],
                     "notes": notes,
                 }
@@ -2840,6 +2882,9 @@ class SaveRepository:
                     n.location,
                     n.public_description,
                     n.player_facing_information,
+                    n.gender_identity,
+                    n.age,
+                    n.species,
                     n.knowledge_scope_json,
                     n.known_facts_json,
                     n.disposition,
@@ -2850,7 +2895,331 @@ class SaveRepository:
                 ORDER BY n.display_name COLLATE NOCASE, n.name COLLATE NOCASE
                 """
             ).fetchall()
-        return [_party_member_row_to_dict(row) for row in rows]
+        members = [_party_member_row_to_dict(row) for row in rows]
+        for member in members:
+            member["inventory"] = self.list_party_inventory_items(
+                str(member.get("npc_id", ""))
+            )
+            member["equipment"] = [
+                item
+                for item in member["inventory"]
+                if bool(item.get("equipped", False))
+                or str(item.get("equipment_slot", "")).strip()
+            ]
+        return members
+
+    def add_party_inventory_item(
+        self,
+        npc_id: str,
+        name: str,
+        category: str,
+        quantity: int,
+        description: str,
+        value_base_units: int = 0,
+        metadata: Any | None = None,
+    ) -> None:
+        """Adds an item to one current party member's dedicated inventory."""
+
+        clean_npc_id = npc_id.strip()
+        clean_name = name.strip()
+        if not clean_npc_id or self.get_npc(clean_npc_id) is None:
+            LOGGER.warning("Skipped party inventory add for unknown NPC %r.", npc_id)
+            return
+        with self._connect() as connection:
+            party_exists = connection.execute(
+                "SELECT 1 FROM party_members WHERE npc_id = ?",
+                (clean_npc_id,),
+            ).fetchone()
+        if party_exists is None:
+            LOGGER.warning("Skipped party inventory add for non-party NPC %r.", npc_id)
+            return
+        if not clean_name:
+            LOGGER.warning("Skipped party inventory add with blank name.")
+            return
+        clean_quantity = max(1, _safe_int(quantity, default=1))
+        raw_metadata = metadata if isinstance(metadata, dict) else {}
+        clean_category = normalize_inventory_category(
+            category,
+            name=clean_name,
+            description=description,
+            item_type=str(raw_metadata.get("item_type", "")),
+        )
+        clean_metadata = normalize_item_metadata(
+            raw_metadata,
+            name=clean_name,
+            category=clean_category,
+            description=description,
+        )
+        clean_metadata["quantity_unit"] = _inventory_quantity_unit(raw_metadata)
+        clean_metadata["storage_location"] = (
+            _inventory_storage_location(raw_metadata)
+            if "storage_location" in raw_metadata
+            else "on_person"
+        )
+        clean_metadata["item_uuid"] = (
+            str(raw_metadata.get("item_uuid", "")).strip() or str(uuid.uuid4())
+        )
+        equipped = _safe_bool(raw_metadata.get("equipped"), default=False)
+        equipment_slot = str(
+            raw_metadata.get("equipment_slot", raw_metadata.get("slot", "")) or ""
+        ).strip()
+        clean_value = max(0, _safe_int(value_base_units, default=0))
+
+        with self._connect() as connection:
+            existing = connection.execute(
+                """
+                SELECT id, category, quantity, description, value_base_units,
+                       metadata_json, equipped, equipment_slot
+                FROM party_inventory_items
+                WHERE npc_id = ? AND name = ? COLLATE NOCASE
+                ORDER BY id ASC
+                LIMIT 1
+                """,
+                (clean_npc_id, clean_name),
+            ).fetchone()
+            if existing is None:
+                connection.execute(
+                    """
+                    INSERT INTO party_inventory_items (
+                        npc_id, name, category, quantity, equipped, equipment_slot,
+                        storage_location, description, value_base_units, metadata_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        clean_npc_id,
+                        clean_name,
+                        clean_category,
+                        clean_quantity,
+                        int(equipped),
+                        equipment_slot,
+                        _inventory_storage_location(clean_metadata),
+                        description.strip(),
+                        clean_value,
+                        _encode_json_dict(clean_metadata),
+                    ),
+                )
+            else:
+                connection.execute(
+                    """
+                    UPDATE party_inventory_items
+                    SET category = ?, quantity = ?, equipped = ?, equipment_slot = ?,
+                        storage_location = ?, description = ?, value_base_units = ?,
+                        metadata_json = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        clean_category or str(existing["category"]),
+                        int(existing["quantity"]) + clean_quantity,
+                        int(equipped or bool(existing["equipped"])),
+                        equipment_slot or str(existing["equipment_slot"] or ""),
+                        _inventory_storage_location(clean_metadata),
+                        description.strip() or str(existing["description"]),
+                        max(clean_value, int(existing["value_base_units"])),
+                        _encode_json_dict(clean_metadata),
+                        existing["id"],
+                    ),
+                )
+            _upsert_item_catalog_entry(
+                connection,
+                name=clean_name,
+                category=clean_category,
+                description=description,
+                value_base_units=clean_value,
+                metadata=clean_metadata,
+            )
+        self.append_history(
+            "inventory",
+            f"Added {clean_quantity} x {clean_name} to party member {clean_npc_id}.",
+        )
+
+    def list_party_inventory_items(
+        self,
+        npc_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Lists dedicated inventory items for one party member or the whole party."""
+
+        query = """
+            SELECT id, npc_id, name, category, quantity, equipped, equipment_slot,
+                   storage_location, description, value_base_units, metadata_json
+            FROM party_inventory_items
+        """
+        parameters: tuple[Any, ...] = ()
+        clean_npc_id = str(npc_id or "").strip()
+        if clean_npc_id:
+            query += " WHERE npc_id = ?"
+            parameters = (clean_npc_id,)
+        query += " ORDER BY npc_id COLLATE NOCASE, name COLLATE NOCASE"
+        with self._connect() as connection:
+            rows = connection.execute(query, parameters).fetchall()
+        return [_party_inventory_row_to_dict(row) for row in rows]
+
+    def remove_party_inventory_item(
+        self,
+        npc_id: str,
+        name: str,
+        quantity: int,
+    ) -> None:
+        """Removes or decreases an item in one party member's inventory."""
+
+        clean_npc_id = npc_id.strip()
+        clean_name = name.strip()
+        clean_quantity = max(1, _safe_int(quantity, default=1))
+        if not clean_npc_id or not clean_name:
+            return
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT id, quantity FROM party_inventory_items
+                WHERE npc_id = ? AND name = ? COLLATE NOCASE
+                ORDER BY id ASC LIMIT 1
+                """,
+                (clean_npc_id, clean_name),
+            ).fetchone()
+            if row is None:
+                LOGGER.warning(
+                    "Attempted to remove missing party inventory item %s for %s.",
+                    clean_name,
+                    clean_npc_id,
+                )
+                return
+            new_quantity = int(row["quantity"]) - clean_quantity
+            if new_quantity > 0:
+                connection.execute(
+                    "UPDATE party_inventory_items SET quantity = ? WHERE id = ?",
+                    (new_quantity, row["id"]),
+                )
+            else:
+                connection.execute(
+                    "DELETE FROM party_inventory_items WHERE id = ?",
+                    (row["id"],),
+                )
+        self.append_history(
+            "inventory",
+            f"Removed {clean_quantity} x {clean_name} from party member {clean_npc_id}.",
+        )
+
+    def modify_party_inventory_item(
+        self,
+        *,
+        npc_id: str,
+        target_name: str,
+        new_name: str | None = None,
+        category: str | None = None,
+        description: str | None = None,
+        quantity: int | None = None,
+        value_base_units: int | None = None,
+        metadata: Any | None = None,
+    ) -> None:
+        """Modifies one item in a party member's dedicated inventory."""
+
+        clean_npc_id = npc_id.strip()
+        clean_target = target_name.strip()
+        if not clean_npc_id or not clean_target:
+            return
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT id, name, category, description, quantity, equipped,
+                       equipment_slot, storage_location, value_base_units, metadata_json
+                FROM party_inventory_items
+                WHERE npc_id = ? AND name = ? COLLATE NOCASE
+                ORDER BY id ASC LIMIT 1
+                """,
+                (clean_npc_id, clean_target),
+            ).fetchone()
+            if row is None:
+                LOGGER.warning(
+                    "Attempted to modify missing party inventory item %s for %s.",
+                    clean_target,
+                    clean_npc_id,
+                )
+                return
+            updated_name = (
+                new_name.strip() if isinstance(new_name, str) and new_name.strip()
+                else str(row["name"])
+            )
+            updated_category = (
+                category.strip() if isinstance(category, str) and category.strip()
+                else str(row["category"])
+            )
+            updated_description = (
+                description.strip()
+                if isinstance(description, str) and description.strip()
+                else str(row["description"])
+            )
+            updated_quantity = (
+                max(1, int(quantity)) if quantity is not None and int(quantity) > 0
+                else int(row["quantity"])
+            )
+            updated_value = (
+                max(0, int(value_base_units))
+                if value_base_units is not None and int(value_base_units) >= 0
+                else int(row["value_base_units"])
+            )
+            existing_metadata = _decode_json_dict(
+                row["metadata_json"], "party inventory item metadata"
+            )
+            updates = metadata if isinstance(metadata, dict) else {}
+            merged_metadata = {**existing_metadata, **updates}
+            normalized_metadata = normalize_item_metadata(
+                merged_metadata,
+                name=updated_name,
+                category=updated_category,
+                description=updated_description,
+            )
+            normalized_metadata["quantity_unit"] = _inventory_quantity_unit(merged_metadata)
+            normalized_metadata["storage_location"] = (
+                _inventory_storage_location(merged_metadata)
+                if "storage_location" in merged_metadata
+                else _clean_storage_location(row["storage_location"])
+            )
+            normalized_metadata["item_uuid"] = (
+                str(merged_metadata.get("item_uuid", "")).strip() or str(uuid.uuid4())
+            )
+            equipped = _safe_bool(
+                merged_metadata.get("equipped"),
+                default=bool(row["equipped"]),
+            )
+            equipment_slot = str(
+                merged_metadata.get(
+                    "equipment_slot",
+                    merged_metadata.get("slot", row["equipment_slot"]),
+                )
+                or ""
+            ).strip()
+            connection.execute(
+                """
+                UPDATE party_inventory_items
+                SET name = ?, category = ?, quantity = ?, equipped = ?,
+                    equipment_slot = ?, storage_location = ?, description = ?,
+                    value_base_units = ?, metadata_json = ?
+                WHERE id = ?
+                """,
+                (
+                    updated_name,
+                    updated_category,
+                    updated_quantity,
+                    int(equipped),
+                    equipment_slot,
+                    normalized_metadata["storage_location"],
+                    updated_description,
+                    updated_value,
+                    _encode_json_dict(normalized_metadata),
+                    row["id"],
+                ),
+            )
+            _upsert_item_catalog_entry(
+                connection,
+                name=updated_name,
+                category=updated_category,
+                description=updated_description,
+                value_base_units=updated_value,
+                metadata=normalized_metadata,
+            )
+        self.append_history(
+            "inventory",
+            f"Modified {clean_target} for party member {clean_npc_id}.",
+        )
 
     def list_relevant_npcs(
         self,
@@ -4644,6 +5013,24 @@ class SaveRepository:
                     metadata_json TEXT NOT NULL DEFAULT '{}'
                 );
 
+                CREATE TABLE IF NOT EXISTS party_inventory_items (
+                    id TEXT PRIMARY KEY NOT NULL DEFAULT ('rec_' || lower(hex(randomblob(16)))),
+                    npc_id TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    category TEXT NOT NULL DEFAULT '',
+                    quantity INTEGER NOT NULL DEFAULT 1,
+                    equipped INTEGER NOT NULL DEFAULT 0,
+                    equipment_slot TEXT NOT NULL DEFAULT '',
+                    storage_location TEXT NOT NULL DEFAULT 'on_person',
+                    description TEXT NOT NULL DEFAULT '',
+                    value_base_units INTEGER NOT NULL DEFAULT 0,
+                    metadata_json TEXT NOT NULL DEFAULT '{}',
+                    FOREIGN KEY (npc_id) REFERENCES npcs(npc_id) ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_party_inventory_owner
+                ON party_inventory_items(npc_id, name COLLATE NOCASE);
+
                 CREATE TABLE IF NOT EXISTS item_catalog (
                     id TEXT PRIMARY KEY NOT NULL DEFAULT ('rec_' || lower(hex(randomblob(16)))),
                     name TEXT NOT NULL UNIQUE COLLATE NOCASE,
@@ -4799,6 +5186,9 @@ class SaveRepository:
                     location TEXT NOT NULL DEFAULT '',
                     public_description TEXT NOT NULL DEFAULT '',
                     player_facing_information TEXT NOT NULL DEFAULT '',
+                    gender_identity TEXT NOT NULL DEFAULT '',
+                    age TEXT NOT NULL DEFAULT '',
+                    species TEXT NOT NULL DEFAULT '',
                     knowledge_scope_json TEXT NOT NULL DEFAULT '[]',
                     known_facts_json TEXT NOT NULL DEFAULT '[]',
                     disposition TEXT NOT NULL DEFAULT '',
@@ -5004,6 +5394,24 @@ class SaveRepository:
                 connection,
                 "npcs",
                 "player_facing_information",
+                "TEXT NOT NULL DEFAULT ''",
+            )
+            _ensure_column(
+                connection,
+                "npcs",
+                "gender_identity",
+                "TEXT NOT NULL DEFAULT ''",
+            )
+            _ensure_column(
+                connection,
+                "npcs",
+                "age",
+                "TEXT NOT NULL DEFAULT ''",
+            )
+            _ensure_column(
+                connection,
+                "npcs",
+                "species",
                 "TEXT NOT NULL DEFAULT ''",
             )
             _ensure_column(
@@ -5766,6 +6174,9 @@ def _npc_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
         "location": row["location"],
         "public_description": row["public_description"],
         "player_facing_information": row["player_facing_information"],
+        "gender_identity": row["gender_identity"],
+        "age": row["age"],
+        "species": row["species"],
         "knowledge_scope": _decode_string_list(
             row["knowledge_scope_json"],
             "npc knowledge scope",
@@ -5788,6 +6199,9 @@ def _party_member_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
         "location": row["location"],
         "description": row["public_description"],
         "notes": row["player_facing_information"],
+        "gender_identity": row["gender_identity"],
+        "age": row["age"],
+        "species": row["species"],
         "status": row["status"],
         "health_current": row["health_current"],
         "health_max": row["health_max"],
@@ -5796,6 +6210,42 @@ def _party_member_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
         "skills": _decode_string_list(row["skills_json"], "party skills"),
         "party_created_at": row["party_created_at"],
         "party_updated_at": row["party_updated_at"],
+    }
+
+
+def _party_inventory_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    """Converts a dedicated party-inventory row to a player-safe dictionary."""
+
+    metadata = _decode_json_dict(
+        row["metadata_json"],
+        "party inventory item metadata",
+    )
+    metadata["quantity_unit"] = _inventory_quantity_unit(metadata)
+    storage_location = _clean_storage_location(row["storage_location"])
+    metadata["storage_location"] = storage_location
+    metadata["item_uuid"] = str(metadata.get("item_uuid", "")).strip()
+    normalized_metadata = normalize_item_metadata(
+        metadata,
+        name=str(row["name"]),
+        category=str(row["category"]),
+        description=str(row["description"]),
+    )
+    normalized_metadata["quantity_unit"] = metadata["quantity_unit"]
+    normalized_metadata["storage_location"] = storage_location
+    normalized_metadata["item_uuid"] = metadata["item_uuid"]
+    return {
+        "id": row["id"],
+        "npc_id": row["npc_id"],
+        "name": row["name"],
+        "category": row["category"],
+        "quantity": row["quantity"],
+        "quantity_unit": metadata["quantity_unit"],
+        "storage_location": storage_location,
+        "equipped": bool(row["equipped"]),
+        "equipment_slot": row["equipment_slot"],
+        "description": row["description"],
+        "value_base_units": row["value_base_units"],
+        "metadata": normalized_metadata,
     }
 
 

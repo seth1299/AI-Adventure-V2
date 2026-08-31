@@ -1980,6 +1980,26 @@ class InventoryUiTests(unittest.TestCase):
                 [shell.tabs.tabText(index) for index in range(shell.tabs.count())],
             )
             self.assertEqual(screen.table.rowCount(), 1)
+            header_texts = []
+            for index in range(screen.table.columnCount()):
+                header_item = screen.table.horizontalHeaderItem(index)
+                self.assertIsNotNone(header_item)
+                assert header_item is not None
+                header_texts.append(header_item.text())
+            self.assertEqual(
+                header_texts,
+                [
+                    "Name",
+                    "Status",
+                    "Health",
+                    "Armor Class",
+                    "Combat Style",
+                    "Skills",
+                    "Description",
+                    "Equipment",
+                    "Portrait",
+                ],
+            )
             name_item = screen.table.item(0, 0)
             health_item = screen.table.item(0, 2)
             armor_item = screen.table.item(0, 3)

@@ -41,6 +41,25 @@ class ContextBuilderTests(unittest.TestCase):
             "armor_class": 13,
             "combat_style": "Mobile archer",
             "skills": ["Archery", "Tracking"],
+            "gender_identity": "Woman",
+            "age": "32",
+            "species": "Human",
+            "inventory": [
+                {
+                    "name": "Ashwood Bow",
+                    "quantity": 1,
+                    "equipped": True,
+                    "equipment_slot": "main hand",
+                }
+            ],
+            "equipment": [
+                {
+                    "name": "Ashwood Bow",
+                    "quantity": 1,
+                    "equipped": True,
+                    "equipment_slot": "main hand",
+                }
+            ],
         }
 
         packet = AiContextBuilder(
@@ -54,6 +73,14 @@ class ContextBuilderTests(unittest.TestCase):
         self.assertEqual(packet["state"]["party"]["members"][0]["npc_id"], "mira_coppercup")
         self.assertEqual(packet["state"]["party"]["members"][0]["health_current"], 8)
         self.assertEqual(packet["state"]["party"]["members"][0]["skills"], ["Archery", "Tracking"])
+        self.assertEqual(
+            packet["state"]["party"]["members"][0]["equipment"][0]["name"],
+            "Ashwood Bow",
+        )
+        self.assertEqual(
+            packet["state"]["npcs"]["relevant"][0]["species"],
+            "Human",
+        )
         self.assertIn(
             "mira_coppercup",
             [npc["npc_id"] for npc in packet["state"]["npcs"]["relevant"]],

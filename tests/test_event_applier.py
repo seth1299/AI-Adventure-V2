@@ -68,6 +68,107 @@ def _test_container_metadata(
 
 
 class EventApplierTests(unittest.TestCase):
+    def test_party_inventory_events_are_owner_scoped_and_track_equipment(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = SaveRepository.create_new_save(Path(temp_dir), "Party Inventory Test")
+            repository.upsert_npc(
+                npc_id="mira_coppercup",
+                name="Mira Coppercup",
+                display_name="Mira",
+                role="Scout",
+                location="Old Road",
+            )
+            repository.upsert_party_member("mira_coppercup")
+            applier = EventApplier(repository)
+
+            added = applier.apply_event(
+                {
+                    "type": "InventoryItemAddedEvent",
+                    "payload": {
+                        "owner_npc_id": "mira_coppercup",
+                        "item_type": "Weapon",
+                        "item_name": "Ashwood Bow",
+                        "description": "A short recurved bow.",
+                        "amount": 1,
+                        "value_base_units": 40,
+                        "equipped": True,
+                        "equipment_slot": "main hand",
+                    },
+                }
+            )
+
+            party_items = repository.list_party_inventory_items("mira_coppercup")
+            self.assertEqual(added.status, "applied")
+            self.assertNotIn(
+                "Ashwood Bow",
+                [item["name"] for item in repository.list_inventory_items()],
+            )
+            self.assertEqual(len(party_items), 1)
+            self.assertEqual(party_items[0]["name"], "Ashwood Bow")
+            self.assertTrue(party_items[0]["equipped"])
+            self.assertEqual(party_items[0]["equipment_slot"], "main hand")
+            self.assertEqual(
+                repository.list_party_members()[0]["equipment"][0]["name"],
+                "Ashwood Bow",
+            )
+
+            modified = applier.apply_event(
+                {
+                    "type": "InventoryItemModifiedEvent",
+                    "payload": {
+                        "owner_npc_id": "mira_coppercup",
+                        "target_name": "Ashwood Bow",
+                        "equipped": False,
+                        "equipment_slot": "",
+                    },
+                }
+            )
+            self.assertEqual(modified.status, "applied")
+            self.assertEqual(repository.list_party_members()[0]["equipment"], [])
+
+            removed = applier.apply_event(
+                {
+                    "type": "InventoryItemRemovedEvent",
+                    "payload": {
+                        "owner_npc_id": "mira_coppercup",
+                        "item_name": "Ashwood Bow",
+                        "amount": 1,
+                    },
+                }
+            )
+            self.assertEqual(removed.status, "applied")
+            self.assertEqual(repository.list_party_inventory_items("mira_coppercup"), [])
+
+    def test_npc_identity_fields_are_player_visible_and_persisted(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = SaveRepository.create_new_save(Path(temp_dir), "NPC Identity Test")
+            result = EventApplier(repository).apply_event(
+                {
+                    "type": "NpcUpsertedEvent",
+                    "payload": {
+                        "npc_id": "mira_coppercup",
+                        "name": "Mira Coppercup",
+                        "display_name": "Mira",
+                        "role": "Scout",
+                        "location": "Old Road",
+                        "public_description": "A keen-eyed traveler.",
+                        "player_facing_information": "A trusted companion.",
+                        "gender_identity": "Woman",
+                        "age": "32",
+                        "species": "Human",
+                        "knowledge_scope": ["Roads"],
+                        "known_facts": ["She knows the Old Road."],
+                    },
+                }
+            )
+            npc = _require(repository.get_npc("mira_coppercup"))
+            visible = repository.list_player_visible_npcs()[0]
+            self.assertEqual(result.status, "applied")
+            self.assertEqual(npc["gender_identity"], "Woman")
+            self.assertEqual(npc["age"], "32")
+            self.assertEqual(npc["species"], "Human")
+            self.assertEqual(visible["species"], "Human")
+
     def test_party_member_uses_same_npc_id_and_can_leave_without_deleting_npc(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             repository = SaveRepository.create_new_save(Path(temp_dir), "Party NPC Test")

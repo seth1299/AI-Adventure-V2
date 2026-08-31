@@ -329,6 +329,14 @@ class EventApplier:
         if not name:
             return _invalid(event_type, payload, "Inventory item name is required.")
 
+        owner_npc_id = _first_text(payload, "owner_npc_id")
+        if owner_npc_id and not self._is_current_party_member(owner_npc_id):
+            return _invalid(
+                event_type,
+                payload,
+                f"Party member is not active: {owner_npc_id}.",
+            )
+
         catalog_entry = self._matching_item_catalog_entry(payload, name)
         catalog_metadata = (
             dict(catalog_entry.get("metadata", {}))
@@ -374,23 +382,40 @@ class EventApplier:
                 catalog_metadata.get("item_uuid", payload.get("item_uuid", ""))
             ).strip()
 
-        self.repository.add_inventory_item(
-            name=name,
-            category=category,
-            quantity=quantity,
-            description=description,
-            value_base_units=value_base_units,
-            metadata={
-                **merged_metadata,
-                "quantity_unit": quantity_unit,
-                "storage_location": storage_location,
-            },
-        )
+        item_metadata = {
+            **merged_metadata,
+            "quantity_unit": quantity_unit,
+            "storage_location": storage_location,
+        }
+        if owner_npc_id:
+            self.repository.add_party_inventory_item(
+                owner_npc_id,
+                name=name,
+                category=category,
+                quantity=quantity,
+                description=description,
+                value_base_units=value_base_units,
+                metadata=item_metadata,
+            )
+        else:
+            self.repository.add_inventory_item(
+                name=name,
+                category=category,
+                quantity=quantity,
+                description=description,
+                value_base_units=value_base_units,
+                metadata=item_metadata,
+            )
 
         return AppliedEventResult(
             event_type,
             "applied",
-            f"Added inventory item: {quantity} x {name}.",
+            (
+                f"Added inventory item: {quantity} x {name} to party member "
+                f"{owner_npc_id}."
+                if owner_npc_id
+                else f"Added inventory item: {quantity} x {name}."
+            ),
             payload,
         )
 
@@ -406,13 +431,28 @@ class EventApplier:
         if not name:
             return _invalid(event_type, payload, "Inventory item name is required.")
 
+        owner_npc_id = _first_text(payload, "owner_npc_id")
+        if owner_npc_id and not self._is_current_party_member(owner_npc_id):
+            return _invalid(
+                event_type,
+                payload,
+                f"Party member is not active: {owner_npc_id}.",
+            )
         quantity = _first_int(payload, 1, "amount", "quantity")
-        self.repository.remove_inventory_item(name, quantity)
+        if owner_npc_id:
+            self.repository.remove_party_inventory_item(owner_npc_id, name, quantity)
+        else:
+            self.repository.remove_inventory_item(name, quantity)
 
         return AppliedEventResult(
             event_type,
             "applied",
-            f"Removed inventory item: {quantity} x {name}.",
+            (
+                f"Removed inventory item: {quantity} x {name} from party member "
+                f"{owner_npc_id}."
+                if owner_npc_id
+                else f"Removed inventory item: {quantity} x {name}."
+            ),
             payload,
         )
 
@@ -427,6 +467,14 @@ class EventApplier:
 
         if not target_name:
             return _invalid(event_type, payload, "Inventory target name is required.")
+
+        owner_npc_id = _first_text(payload, "owner_npc_id")
+        if owner_npc_id and not self._is_current_party_member(owner_npc_id):
+            return _invalid(
+                event_type,
+                payload,
+                f"Party member is not active: {owner_npc_id}.",
+            )
 
         if _find_inventory_container(self.repository, target_name) is not None:
             return _invalid(
@@ -448,21 +496,46 @@ class EventApplier:
             "value",
         )
 
-        self.repository.modify_inventory_item(
-            target_name=target_name,
-            new_name=_first_text(payload, "new_name"),
-            category=_first_text(payload, "new_category", "category"),
-            description=_first_text(payload, "new_description", "description"),
-            quantity=quantity,
-            value_base_units=value_base_units,
-            metadata=payload,
-        )
+        if owner_npc_id:
+            self.repository.modify_party_inventory_item(
+                npc_id=owner_npc_id,
+                target_name=target_name,
+                new_name=_first_text(payload, "new_name"),
+                category=_first_text(payload, "new_category", "category"),
+                description=_first_text(payload, "new_description", "description"),
+                quantity=quantity,
+                value_base_units=value_base_units,
+                metadata=payload,
+            )
+        else:
+            self.repository.modify_inventory_item(
+                target_name=target_name,
+                new_name=_first_text(payload, "new_name"),
+                category=_first_text(payload, "new_category", "category"),
+                description=_first_text(payload, "new_description", "description"),
+                quantity=quantity,
+                value_base_units=value_base_units,
+                metadata=payload,
+            )
 
         return AppliedEventResult(
             event_type,
             "applied",
-            f"Modified inventory item: {target_name}.",
+            (
+                f"Modified inventory item: {target_name} for party member "
+                f"{owner_npc_id}."
+                if owner_npc_id
+                else f"Modified inventory item: {target_name}."
+            ),
             payload,
+        )
+
+    def _is_current_party_member(self, npc_id: str) -> bool:
+        """Returns whether an NPC currently has party-specific state."""
+
+        return any(
+            str(member.get("npc_id", "")).strip() == npc_id.strip()
+            for member in self.repository.list_party_members()
         )
 
     def _matching_item_catalog_entry(
@@ -1806,6 +1879,9 @@ class EventApplier:
             "description",
             "appearance",
         )
+        gender_identity = _first_text(payload, "gender_identity", "gender")
+        age = _first_text(payload, "age")
+        species = _first_text(payload, "species", "race")
         player_facing_information = _first_text(
             payload,
             "player_facing_information",
@@ -1833,6 +1909,9 @@ class EventApplier:
             location=location,
             public_description=public_description,
             player_facing_information=player_facing_information,
+            gender_identity=gender_identity,
+            age=age,
+            species=species,
             knowledge_scope=knowledge_scope,
             known_facts=known_facts,
         )

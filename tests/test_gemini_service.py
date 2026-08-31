@@ -155,7 +155,15 @@ class GeminiServiceTests(unittest.TestCase):
                     "events": [
                         {
                             "type": "NpcUpsertedEvent",
-                            "payload": {"npc_id": "wrong_one", "display_name": "Mira"},
+                            "payload": {
+                                "npc_id": "wrong_one",
+                                "display_name": "Mira",
+                                "party_combat_style": "Mobile archer",
+                                "party_skills": ["Archery", "Tracking"],
+                                "gender_identity": "Woman",
+                                "age": "32",
+                                "species": "Human",
+                            },
                         },
                         {
                             "type": "NpcUpsertedEvent",
@@ -173,6 +181,9 @@ class GeminiServiceTests(unittest.TestCase):
         self.assertEqual(first_payload["location"], "North Road")
         self.assertTrue(first_payload["party_member"])
         self.assertEqual(first_payload["party_status"], "Active")
+        self.assertEqual(first_payload["party_combat_style"], "Mobile archer")
+        self.assertEqual(first_payload["party_skills"], ["Archery", "Tracking"])
+        self.assertEqual(first_payload["species"], "Human")
         self.assertEqual(second_payload["npc_id"], "npc_orin")
         self.assertFalse(second_payload["party_member"])
 
@@ -191,6 +202,14 @@ class GeminiServiceTests(unittest.TestCase):
         self.assertIn("party_armor_class", payload_properties)
         self.assertIn("party_combat_style", payload_properties)
         self.assertIn("party_skills", payload_properties)
+        self.assertIn("owner_npc_id", next(
+            event_branch["properties"]["payload"]["properties"]
+            for event_branch in EVENT_RESPONSE_SCHEMA["anyOf"]
+            if event_branch["properties"]["type"]["enum"] == ["InventoryItemAddedEvent"]
+        ))
+        self.assertIn("gender_identity", payload_properties)
+        self.assertIn("age", payload_properties)
+        self.assertIn("species", payload_properties)
 
     def test_new_game_schema_covers_newer_wizard_contracts(self) -> None:
         schema = build_new_game_response_schema(
@@ -240,6 +259,9 @@ class GeminiServiceTests(unittest.TestCase):
             ["npc_id", "name", "location", "public_description", "party_member"],
         )
         self.assertNotIn("display_name", npc_payload["required"])
+        self.assertIn("party_combat_style", npc_payload["properties"])
+        self.assertIn("party_skills", npc_payload["properties"])
+        self.assertIn("gender_identity", npc_payload["properties"])
         self.assertIn("starting_npcs", schema["required"])
         self.assertIn("starting_task", schema["required"])
         self.assertNotIn("events", schema["properties"])

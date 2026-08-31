@@ -16273,7 +16273,7 @@ class PartyScreen(RepositoryBackedWidget):
     def __init__(self) -> None:
         super().__init__()
 
-        self.table = _AppTableWidget(0, 7)
+        self.table = _AppTableWidget(0, 9)
         self.table.setHorizontalHeaderLabels(
             [
                 "Name",
@@ -16283,11 +16283,13 @@ class PartyScreen(RepositoryBackedWidget):
                 "Combat Style",
                 "Skills",
                 "Description",
+                "Equipment",
+                "Portrait",
             ]
         )
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
-        _configure_wrapping_table(self.table, {4, 5, 6})
+        _configure_wrapping_table(self.table, {4, 5, 6, 7})
 
         explanation = QLabel(
             "Party members are shared NPC identities. Names and descriptions come "
@@ -16327,13 +16329,52 @@ class PartyScreen(RepositoryBackedWidget):
                 member.get("combat_style", ""),
                 ", ".join(str(skill) for skill in member.get("skills", [])),
                 member.get("description") or member.get("notes") or "",
+                ", ".join(
+                    (
+                        f"{item.get('name', 'Unknown item')}"
+                        + (
+                            f" x{item.get('quantity', 1)}"
+                            if _safe_int(item.get("quantity"), 1) != 1
+                            else ""
+                        )
+                        + (
+                            f" [{item.get('equipment_slot')}]"
+                            if str(item.get("equipment_slot", "")).strip()
+                            else ""
+                        )
+                    )
+                    for item in member.get("equipment", [])
+                    if isinstance(item, dict)
+                )
+                or "None recorded",
             )
             for column, value in enumerate(values):
                 item = _table_item(str(value))
                 item.setData(Qt.ItemDataRole.UserRole, str(member.get("npc_id", "")))
                 self.table.setItem(row_index, column, item)
+            npc_id = str(member.get("npc_id", "") or "").strip()
+            portrait = QLabel()
+            portrait.setObjectName("partyGeneratedPortrait")
+            portrait.setMargin(4)
+            asset = repository.get_visual_asset("npc", npc_id.casefold())
+            if _set_generated_image(
+                portrait,
+                self.visual_asset_path(asset),
+                maximum_width=96,
+                maximum_height=96,
+                accessible_name=(
+                    f"Generated portrait of {member.get('display_name', 'Unknown NPC')}"
+                ),
+            ):
+                self.table.setCellWidget(row_index, 8, portrait)
 
         _resize_wrapping_table_rows(self.table)
+        for row_index in range(self.table.rowCount()):
+            if self.table.cellWidget(row_index, 8) is not None:
+                self.table.setRowHeight(
+                    row_index,
+                    max(104, self.table.rowHeight(row_index)),
+                )
 
 
 class NpcDetailsDialog(QDialog):
@@ -16363,6 +16404,18 @@ class NpcDetailsDialog(QDialog):
         summary.addRow(
             "Location:",
             _selectable_label(npc.get("location", "") or "Not specified"),
+        )
+        summary.addRow(
+            "Gender identity:",
+            _selectable_label(npc.get("gender_identity", "") or "Not specified"),
+        )
+        summary.addRow(
+            "Age:",
+            _selectable_label(npc.get("age", "") or "Not specified"),
+        )
+        summary.addRow(
+            "Species:",
+            _selectable_label(npc.get("species", "") or "Not specified"),
         )
 
         description = QTextEdit()
