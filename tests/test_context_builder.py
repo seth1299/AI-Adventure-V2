@@ -320,6 +320,7 @@ class ContextBuilderTests(unittest.TestCase):
         )
         state.settings.values["ai.narration_tense"] = "past"
         state.settings.values["ai.narration_style"] = "third_person_limited"
+        state.settings.values["ai.text_model"] = "gemini-3.7-flash"
         state.settings.values["ai.model_intelligence"] = "smarter"
         state.settings.values["ai.model_tone"] = "friendly"
         state.settings.values["ai.response_length"] = "descriptive"
@@ -434,6 +435,10 @@ class ContextBuilderTests(unittest.TestCase):
         self.assertEqual(
             packet["state"]["player_ai_preferences"]["model_intelligence"],
             "smarter",
+        )
+        self.assertEqual(
+            packet["state"]["player_ai_preferences"]["text_model"],
+            "gemini-3.7-flash",
         )
         self.assertEqual(
             packet["state"]["player_ai_preferences"]["model_tone_label"],
@@ -911,14 +916,20 @@ class ContextBuilderTests(unittest.TestCase):
             "event.miscellaneous_upsert",
             {section["id"] for section in packet["reference_sections"]},
         )
-        self.assertIn(
-            "player-visible Bestiary",
-            packet["response_contract"]["miscellaneous_memory"],
+        self.assertNotIn("bestiary", packet["state"])
+        creature_packet = AiContextBuilder.from_default_library().build_story_context(
+            AdventureState(metadata=AdventureMetadata(title="Creature Context")),
+            player_command="Tell me about Concept 2.",
+            planner_context_tags=[],
+            bestiary=[
+                {"creature_id": "concept_2", "name": "Concept 2", "details": "A creature."},
+            ],
         )
-        self.assertIn(
-            "category Creature",
-            packet["state"]["miscellaneous"]["rules"]["scope"],
+        self.assertEqual(
+            creature_packet["state"]["bestiary"]["entries"][0]["creature_id"],
+            "concept_2",
         )
+        self.assertIn("Do not use this for creatures", packet["state"]["miscellaneous"]["rules"]["scope"])
 
     def test_creative_ideas_are_omitted_when_not_relevant(self) -> None:
         packet = AiContextBuilder(

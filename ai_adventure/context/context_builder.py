@@ -32,6 +32,13 @@ MAX_CONTEXT_LIST_ITEMS = 40
 MAX_INVENTORY_CONTEXT_ITEMS = 50
 MAX_CRAFTING_CONTEXT_ENTRIES = 40
 MAX_ACTIVE_TASK_CONTEXT_ITEMS = 40
+MAX_BESTIARY_CONTEXT_ENTRIES = 12
+
+CONTAINER_ACCESS_RULE = (
+    "Container metadata is authoritative hidden state. Opening an unlocked container, "
+    "or using an unambiguous key or equivalent access item for a locked container, is "
+    "routine; otherwise required lock or trap checks must succeed before opening."
+)
 
 
 KEYWORD_TAGS: dict[str, set[str]] = {
@@ -232,6 +239,7 @@ class AiContextBuilder:
         party_members: list[dict[str, Any]] | None = None,
         gm_secrets: list[dict[str, Any]] | None = None,
         miscellaneous: list[dict[str, Any]] | None = None,
+        bestiary: list[dict[str, Any]] | None = None,
         valid_music_tracks: list[str] | None = None,
         current_music: str | None = None,
         valid_sound_effect_tracks: list[str] | None = None,
@@ -250,7 +258,8 @@ class AiContextBuilder:
             relevant_npcs: NPC memory profiles likely relevant this turn.
             party_members: Current party records joined to canonical NPC profiles.
             gm_secrets: Active private GM-memory records for every turn.
-            miscellaneous: Every general world-lore record, always sent uncapped.
+            miscellaneous: General world-lore records, sent uncapped.
+            bestiary: Player-known creature records, included only when relevant.
             valid_music_tracks: Playable background music filenames.
             current_music: Currently selected background music filename.
             valid_sound_effect_tracks: Playable one-shot sound-effect filenames.
@@ -377,6 +386,10 @@ class AiContextBuilder:
             for entry in (miscellaneous or [])
             if isinstance(entry, dict)
         ]
+        clean_bestiary = _select_relevant_bestiary_entries(
+            bestiary or [],
+            clean_command,
+        )
         notes_share_with_ai = _coerce_bool(
             state.settings.values.get("notes.share_with_ai", False),
             default=False,
@@ -457,6 +470,8 @@ class AiContextBuilder:
                     "equipment": state.player.equipment,
                 },
                 "player_ai_preferences": {
+                    "text_model": ai_mode_preferences["text_model"],
+                    "text_model_label": ai_mode_preferences["text_model_label"],
                     "additional_context": _compact_text(
                         state.settings.values.get("ai.additional_context", "")
                     ),
@@ -592,21 +607,12 @@ class AiContextBuilder:
                         for item in state.inventory.items[:MAX_INVENTORY_CONTEXT_ITEMS]
                     ],
                     "container_rule": (
-                        "Container metadata is authoritative hidden state. Classify "
-                        "an item as a Container only when its primary function is "
-                        "holding physical contents that can be put in and taken out. "
-                        "Items that store writing, records, instructions, or "
-                        "information are not Containers merely because they store "
-                        "information. Never "
-                        "reveal or award a closed container's contents. Use "
-                        "When the player attempts to access an unlocked container, or "
-                        "has an unambiguous key or equivalent access item for a locked "
-                        "container, infer the routine opening and use "
-                        "ContainerOpenedEvent; no lockpick check is needed. "
-                        "Otherwise use ContainerOpenedEvent only after required "
-                        "lock/trap checks succeed, then ContainerContentsTakenEvent only when the "
-                        "player explicitly takes the contents. Python transfers "
-                        "the exact stored currency/items once."
+                        CONTAINER_ACCESS_RULE + " "
+                        "Never reveal or award a closed container's contents. Use "
+                        "ContainerOpenedEvent for access, then "
+                        "ContainerContentsTakenEvent only when the player explicitly "
+                        "takes the contents. Python transfers the exact stored "
+                        "currency/items once."
                     ),
                     "category_rule": (
                         "Classify inventory by the finished item's present primary "
@@ -1115,7 +1121,8 @@ class AiContextBuilder:
                 "miscellaneous": {
                     "visibility": (
                         "Established non-secret world canon. This entire section is "
-                        "included on every turn without relevance filtering or a cap."
+                        "included as general continuity context. Creature records "
+                        "belong in state.bestiary instead."
                     ),
                     "rules": {
                         "continuity": (
@@ -1129,17 +1136,23 @@ class AiContextBuilder:
                         ),
                         "scope": (
                             "Use this only for durable concepts without a more specific "
-                            "home, such as original creatures or species, cultures, "
+                            "home, such as cultures, "
                             "factions, religions, laws, historical events, phenomena, "
                             "or customs. Do not duplicate NPCs, locations, items, tasks, "
-                            "or hidden GM secrets. Use category Creature for every "
-                            "non-NPC creature or monster the Player learns about; its "
-                            "details must contain only facts known to the Player or "
-                            "Player Character because Creature records populate the "
-                            "player-visible Bestiary."
+                            "or hidden GM secrets. Do not use this for creatures."
                         ),
                     },
                     "entries": clean_miscellaneous,
+                },
+                "bestiary": {
+                    "visibility": "Player-known creature lore only.",
+                    "relevance": (
+                        "Python includes this section only when the current command "
+                        "mentions a known creature or explicitly asks about creatures "
+                        "or the Bestiary. Treat included entries as authoritative "
+                        "player-known facts."
+                    ),
+                    "entries": clean_bestiary,
                 },
             },
             "rulebooks": {},
@@ -1387,18 +1400,22 @@ class AiContextBuilder:
                     "Set status to retired when the record is no longer true or useful."
                 ),
                 "miscellaneous_memory": (
-                    "state.miscellaneous.entries contains every miscellaneous canon "
-                    "record and is always present without relevance filtering or a "
-                    "count cap. Treat every entry as authoritative. Suggest "
+                    "state.miscellaneous.entries contains general canon. Treat every "
+                    "included entry as authoritative. Suggest "
                     "MiscellaneousUpsertedEvent with a stable misc_id, name, category, "
                     "and complete details when a durable non-secret creature, species, "
                     "culture, faction, religion, law, historical event, phenomenon, "
                     "custom, or other concept is established or changed and no more "
                     "specific state table fits. Reuse the same misc_id for updates. "
-                    "Use category Creature for every non-NPC creature or monster the "
-                    "Player learns about and include only player-known facts in its "
-                    "details; these records populate the player-visible Bestiary. "
+                    "Never use this for creatures; use BestiaryEntryUpsertedEvent. "
                     "Never duplicate NPC, Location, Item, task, or GM-secret records."
+                ),
+                "bestiary_memory": (
+                    "state.bestiary.entries contains only player-known creatures and "
+                    "is present only when Python determines the command is relevant. "
+                    "Suggest BestiaryEntryUpsertedEvent when a durable non-NPC creature "
+                    "is learned or its public details change. Reuse creature_id and "
+                    "include only facts known to the Player or Player Character."
                 ),
                 "currency_transactions": (
                     "The player's money is state.currency.balance, also shown as "
@@ -1476,9 +1493,17 @@ class AiContextBuilder:
                     "NpcKnowledgeAddedEvent",
                     "SecretUpsertedEvent",
                     "MiscellaneousUpsertedEvent",
+                    "BestiaryEntryUpsertedEvent",
                 ],
             },
         }
+        if not clean_bestiary and not (
+            set(re.findall(r"[a-z0-9]+", clean_command.casefold()))
+            & _BESTIARY_REQUEST_TERMS
+        ):
+            state_packet = packet.get("state")
+            if isinstance(state_packet, dict):
+                state_packet.pop("bestiary", None)
         known_event_types = packet["response_contract"]["known_event_types"]
         packet["response_contract"]["known_event_types"] = [
             event_type
@@ -1765,6 +1790,48 @@ def _miscellaneous_context_record(entry: dict[str, Any]) -> dict[str, Any]:
         "name": str(entry.get("name", "")).strip(),
         "category": str(entry.get("category", "")).strip(),
         "details": str(entry.get("details", "")).strip(),
+    }
+
+
+_BESTIARY_REQUEST_TERMS = {
+    "bestiary", "creature", "creatures", "monster", "monsters", "beast",
+    "beasts", "species", "identify", "identified", "anatomy", "track",
+    "tracks", "hunt", "hunting", "hunted",
+}
+
+
+def _select_relevant_bestiary_entries(
+    entries: list[dict[str, Any]],
+    player_command: str,
+) -> list[dict[str, Any]]:
+    """Selects a small deterministic subset of creature lore for this turn."""
+
+    command_tokens = set(re.findall(r"[a-z0-9]+", player_command.casefold()))
+    explicit_request = bool(command_tokens & _BESTIARY_REQUEST_TERMS)
+    selected: list[dict[str, Any]] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        name_tokens = set(re.findall(r"[a-z0-9]+", str(entry.get("name", "")).casefold()))
+        name_stems = {token.rstrip("s") for token in name_tokens if len(token) >= 3}
+        named_match = bool(command_tokens & name_tokens) or bool(
+            {token.rstrip("s") for token in command_tokens if len(token) >= 3}
+            & name_stems
+        )
+        if named_match or (explicit_request and len(selected) < MAX_BESTIARY_CONTEXT_ENTRIES):
+            selected.append(_bestiary_context_record(entry))
+        if len(selected) >= MAX_BESTIARY_CONTEXT_ENTRIES:
+            break
+    return selected
+
+
+def _bestiary_context_record(entry: dict[str, Any]) -> dict[str, Any]:
+    """Returns the compact public fields used for conditional Bestiary context."""
+
+    return {
+        "creature_id": str(entry.get("creature_id", "")).strip(),
+        "name": str(entry.get("name", "")).strip(),
+        "details": _compact_text(entry.get("details", "")),
     }
 
 

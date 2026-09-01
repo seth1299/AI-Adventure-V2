@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import logging
 from importlib.resources import files
-from pathlib import Path
 from typing import Any
 
 from ai_adventure.context.models import ContextLibrary, ContextSection
@@ -32,19 +31,6 @@ class ContextReferenceLoader:
             libraries.append(self.load_from_text(raw_text, source_name=str(resource)))
 
         return self._merge_libraries(libraries)
-
-    def load_from_path(self, path: Path) -> ContextLibrary:
-        """
-        Loads a context library from a JSON file.
-
-        Args:
-            path: JSON file path.
-
-        Returns:
-            Validated context library.
-        """
-
-        return self.load_from_text(path.read_text(encoding="utf-8"), source_name=str(path))
 
     def load_from_text(self, raw_text: str, *, source_name: str) -> ContextLibrary:
         """

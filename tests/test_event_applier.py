@@ -1418,8 +1418,8 @@ class EventApplierTests(unittest.TestCase):
                     "payload": {
                         "misc_id": "glassback_grazer",
                         "name": "Glassback Grazer",
-                        "category": "Creature",
-                        "details": "A six-legged herbivore with a translucent shell.",
+                        "category": "Culture",
+                        "details": "A riverland tradition of glassworking.",
                     },
                 }
             )
@@ -1429,7 +1429,7 @@ class EventApplierTests(unittest.TestCase):
                     "payload": {
                         "misc_id": "glassback_grazer",
                         "name": "Glassback Grazer",
-                        "category": "Creature",
+                        "category": "Culture",
                         "details": (
                             "A six-legged herbivore whose translucent shell darkens "
                             "before storms."
@@ -1448,10 +1448,9 @@ class EventApplierTests(unittest.TestCase):
     def test_bestiary_lists_only_public_creature_lore_and_normalizes_aliases(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             repository = SaveRepository.create_new_save(Path(temp_dir), "Bestiary Test")
-            repository.upsert_miscellaneous(
-                misc_id="ash_wolf",
+            repository.upsert_bestiary_entry(
+                creature_id="ash_wolf",
                 name="Ash Wolf",
-                category="Monster",
                 details="Its tracks glow faintly at dusk.",
             )
             repository.upsert_miscellaneous(
@@ -1468,8 +1467,7 @@ class EventApplierTests(unittest.TestCase):
 
             entries = repository.list_bestiary_entries()
 
-            self.assertEqual([entry["misc_id"] for entry in entries], ["ash_wolf"])
-            self.assertEqual(entries[0]["category"], "Creature")
+            self.assertEqual([entry["creature_id"] for entry in entries], ["ash_wolf"])
             self.assertNotIn("rainwater", entries[0]["details"])
 
     def test_event_payloads_sanitize_banned_creative_terms_before_storage(self) -> None:

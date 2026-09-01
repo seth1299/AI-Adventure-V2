@@ -304,6 +304,9 @@ class EventApplier:
             if event_type == "MiscellaneousUpsertedEvent":
                 return self._apply_miscellaneous_upserted(event_type, payload)
 
+            if event_type == "BestiaryEntryUpsertedEvent":
+                return self._apply_bestiary_entry_upserted(event_type, payload)
+
             if event_type == "MusicChangedEvent":
                 return self._apply_music_changed(event_type, payload)
 
@@ -2073,6 +2076,15 @@ class EventApplier:
         if not details:
             return _invalid(event_type, payload, "Miscellaneous entry details are required.")
 
+        if str(payload.get("category", "")).strip().casefold() in {
+            "creature", "creatures", "monster", "monsters", "beast", "beasts",
+        }:
+            return _invalid(
+                event_type,
+                payload,
+                "Creature lore must use BestiaryEntryUpsertedEvent.",
+            )
+
         entry = self.repository.upsert_miscellaneous(
             misc_id=_first_text(payload, "misc_id", "id"),
             name=name,
@@ -2088,6 +2100,32 @@ class EventApplier:
             "applied",
             f"Stored miscellaneous world lore: {entry['name']}.",
             {**payload, "misc_id": entry["misc_id"]},
+        )
+
+    def _apply_bestiary_entry_upserted(
+        self,
+        event_type: str,
+        payload: dict[str, Any],
+    ) -> AppliedEventResult:
+        """Applies player-known creature lore to the separate Bestiary table."""
+
+        name = _first_text(payload, "name", "title")
+        details = _first_text(payload, "details", "description")
+        if not name or not details:
+            return _invalid(event_type, payload, "Bestiary name and details are required.")
+
+        entry = self.repository.upsert_bestiary_entry(
+            creature_id=_first_text(payload, "creature_id", "id"),
+            name=name,
+            details=details,
+        )
+        if entry is None:
+            return _invalid(event_type, payload, "Bestiary entry could not be stored.")
+        return AppliedEventResult(
+            event_type,
+            "applied",
+            f"Stored Bestiary creature: {entry['name']}.",
+            {**payload, "creature_id": entry["creature_id"]},
         )
 
 

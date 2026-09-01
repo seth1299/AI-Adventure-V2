@@ -22,6 +22,11 @@ from ai_adventure.ai.modes import (
     default_ai_mode_settings,
     normalize_ai_mode_preferences,
 )
+from ai_adventure.ai.model_catalog import (
+    DEFAULT_IMAGE_MODEL,
+    normalize_image_preferences,
+)
+from ai_adventure.ai.image_styles import DEFAULT_IMAGE_STYLE
 from ai_adventure.calendar_system import (
     DEFAULT_CALENDAR_SETTINGS,
     DEFAULT_START_ELAPSED_MINUTES,
@@ -158,6 +163,9 @@ class SaveRepository:
         repository.set_setting("ai.narration_tense", DEFAULT_NARRATION_TENSE)
         repository.set_setting("ai.narration_style", DEFAULT_NARRATION_STYLE)
         repository._set_default_ai_mode_settings()
+        repository.set_setting("images.enabled", True)
+        repository.set_setting("images.model", DEFAULT_IMAGE_MODEL)
+        repository.set_setting("images.style", DEFAULT_IMAGE_STYLE)
         repository.set_setting("audio.music_enabled", True)
         repository.set_setting("audio.sound_effects_enabled", True)
         repository.set_setting("audio.background_ambience_enabled", True)
@@ -266,6 +274,7 @@ class SaveRepository:
         calendar_settings = clean_setup["calendar"]
         audio_settings = clean_setup["audio"]
         narration_preferences = clean_setup["narration"]
+        image_preferences = normalize_image_preferences(clean_setup["images"])
         self.set_meta("title", title)
         self.set_setting("player_name", character["name"])
         self.set_setting("player.name_pronunciation", character["name_pronunciation"])
@@ -277,6 +286,9 @@ class SaveRepository:
         self.set_setting("ai.narration_tense", narration_preferences["tense"])
         self.set_setting("ai.narration_style", narration_preferences["style"])
         self._set_ai_mode_settings(clean_setup["ai_settings"])
+        self.set_setting("images.enabled", image_preferences["enabled"])
+        self.set_setting("images.model", image_preferences["model"])
+        self.set_setting("images.style", image_preferences["style"])
         self.set_setting("audio.music_enabled", bool(audio_settings["music_enabled"]))
         self.set_setting(
             "audio.sound_effects_enabled",
@@ -1529,15 +1541,6 @@ class SaveRepository:
                 "SELECT * FROM spell_catalog WHERE spell_id = ?", (spell_id.strip(),)
             ).fetchone()
         return None if row is None else _spell_row_to_dict(row)
-
-    def list_spell_catalog(self) -> list[dict[str, Any]]:
-        """Lists all established spell definitions."""
-
-        with self._connect() as connection:
-            rows = connection.execute(
-                "SELECT * FROM spell_catalog ORDER BY tier, name COLLATE NOCASE"
-            ).fetchall()
-        return [_spell_row_to_dict(row) for row in rows]
 
     def learn_character_spell(
         self,
@@ -3555,16 +3558,65 @@ class SaveRepository:
         with self._connect() as connection:
             rows = connection.execute(
                 """
-                SELECT misc_id, name, category, details, created_at, updated_at
-                FROM miscellaneous
-                WHERE LOWER(TRIM(category)) IN (
-                    'creature', 'creatures', 'monster', 'monsters', 'beast', 'beasts'
-                )
-                ORDER BY name COLLATE NOCASE, misc_id
+                SELECT creature_id, name, details, created_at, updated_at
+                FROM bestiary
+                ORDER BY name COLLATE NOCASE, creature_id
                 """
             ).fetchall()
 
-        return [_miscellaneous_row_to_dict(row) for row in rows]
+        return [_bestiary_row_to_dict(row) for row in rows]
+
+    def upsert_bestiary_entry(
+        self,
+        *,
+        name: str,
+        details: str,
+        creature_id: str = "",
+    ) -> dict[str, Any] | None:
+        """Creates or replaces one player-known creature record."""
+
+        clean_name = " ".join(name.strip().split())
+        clean_details = details.strip()
+        if not clean_name or not clean_details:
+            LOGGER.warning("Skipped Bestiary upsert without name and details.")
+            return None
+
+        clean_creature_id = _bestiary_id(creature_id or clean_name)
+        timestamp = datetime.now().isoformat(timespec="seconds")
+        with self._connect() as connection:
+            existing = connection.execute(
+                "SELECT created_at FROM bestiary WHERE creature_id = ?",
+                (clean_creature_id,),
+            ).fetchone()
+            created_at = timestamp if existing is None else str(existing["created_at"])
+            connection.execute(
+                """
+                INSERT INTO bestiary (
+                    creature_id, name, details, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(creature_id) DO UPDATE SET
+                    name = excluded.name,
+                    details = excluded.details,
+                    updated_at = excluded.updated_at
+                """,
+                (clean_creature_id, clean_name, clean_details, created_at, timestamp),
+            )
+
+        return self.get_bestiary_entry(clean_creature_id)
+
+    def get_bestiary_entry(self, creature_id: str) -> dict[str, Any] | None:
+        """Reads one player-known creature record by stable id."""
+
+        clean_creature_id = _bestiary_id(creature_id)
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT creature_id, name, details, created_at, updated_at
+                FROM bestiary WHERE creature_id = ?
+                """,
+                (clean_creature_id,),
+            ).fetchone()
+        return None if row is None else _bestiary_row_to_dict(row)
 
     @staticmethod
     def create_message_id() -> str:
@@ -4668,6 +4720,7 @@ class SaveRepository:
         """Stores normalized save-specific AI behavior modes."""
 
         settings = normalize_ai_mode_preferences(raw_settings)
+        self.set_setting("ai.text_model", settings["text_model"])
         self.set_setting(
             "ai.model_intelligence",
             settings["model_intelligence"],
@@ -5279,6 +5332,14 @@ class SaveRepository:
                     updated_at TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS bestiary (
+                    creature_id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    details TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_visual_assets_subject
                 ON visual_assets(subject_type, subject_key, updated_at);
 
@@ -5730,6 +5791,13 @@ def _miscellaneous_id(value: str) -> str:
 
     cleaned = re.sub(r"[^a-zA-Z0-9]+", "_", value.strip().casefold()).strip("_")
     return (cleaned or "unnamed_miscellaneous_entry")[:100]
+
+
+def _bestiary_id(value: str) -> str:
+    """Builds a stable id for one Bestiary creature."""
+
+    cleaned = "_".join(str(value).strip().casefold().split())
+    return (cleaned or "unnamed_creature")[:100]
 
 
 def _normalize_miscellaneous_category(value: str) -> str:
@@ -6377,6 +6445,18 @@ def _miscellaneous_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
         "details": row["details"],
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
+    }
+
+
+def _bestiary_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    """Converts a Bestiary row to a plain dictionary."""
+
+    return {
+        "creature_id": str(row["creature_id"]),
+        "name": str(row["name"]),
+        "details": str(row["details"]),
+        "created_at": str(row["created_at"]),
+        "updated_at": str(row["updated_at"]),
     }
 
 

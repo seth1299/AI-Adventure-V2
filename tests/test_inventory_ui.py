@@ -43,6 +43,7 @@ from ai_adventure.new_game_templates import (
 from ai_adventure.ui.main_window import (
     _DetachedTabWindow,
     _GeminiNewGameWorker,
+    AISettingsDialog,
     AlchemyNotebookScreen,
     BestiaryScreen,
     CalendarPlayerEventDialog,
@@ -80,20 +81,25 @@ class InventoryUiTests(unittest.TestCase):
         request_threads: list[QThread] = []
         result_marker = object()
         results: list[object] = []
+        service_models: list[object] = []
+        setup_packet = {
+            "title": "Threaded New Game",
+            "player_ai_preferences": {"text_model": "gemini-3.7-flash"},
+        }
 
         class FakeGeminiService:
-            def __init__(self, **_kwargs: object) -> None:
-                pass
+            def __init__(self, **kwargs: object) -> None:
+                service_models.append(kwargs.get("model"))
 
             def generate_new_game_world(self, packet: dict[str, Any]) -> object:
                 request_threads.append(QThread.currentThread())
                 if not release_request.wait(timeout=2):
                     raise TimeoutError("Qt event loop did not remain responsive.")
-                test_case.assertEqual(packet, {"title": "Threaded New Game"})
+                test_case.assertEqual(packet, setup_packet)
                 return result_marker
 
         thread = QThread()
-        worker = _GeminiNewGameWorker({"title": "Threaded New Game"})
+        worker = _GeminiNewGameWorker(setup_packet)
         worker.moveToThread(thread)
         event_loop = QEventLoop()
 
@@ -119,6 +125,7 @@ class InventoryUiTests(unittest.TestCase):
         self.assertTrue(thread.wait(1000))
         self.assertEqual(heartbeat_seen, [True])
         self.assertEqual(results, [result_marker])
+        self.assertEqual(service_models, ["gemini-3.7-flash"])
         self.assertEqual(len(request_threads), 1)
         self.assertIsNot(request_threads[0], self.app.thread())
 
@@ -232,6 +239,63 @@ class InventoryUiTests(unittest.TestCase):
             "Begin with a mystery involving a missing courier.",
         )
         wizard.close()
+
+    def test_new_game_wizard_has_dedicated_ga_model_settings_page(self) -> None:
+        wizard = NewGameWizard(tts_enabled=False)
+        page_titles = [wizard.page(page_id).title() for page_id in wizard.pageIds()]
+
+        self.assertEqual(page_titles[:2], ["Adventure", "A.I. Settings"])
+        self.assertFalse(hasattr(wizard, "ai_settings_button"))
+        self.assertEqual(wizard.text_model_combo.count(), 8)
+        self.assertEqual(wizard.image_model_combo.count(), 4)
+        self.assertEqual(wizard.image_style_combo.count(), 12)
+
+        text_index = wizard.text_model_combo.findData("gemini-3.7-flash")
+        image_index = wizard.image_model_combo.findData("gemini-3-pro-image")
+        style_index = wizard.image_style_combo.findData("oil_painting")
+        wizard.text_model_combo.setCurrentIndex(text_index)
+        wizard.image_model_combo.setCurrentIndex(image_index)
+        wizard.image_style_combo.setCurrentIndex(style_index)
+        wizard.smarter_ai_checkbox.setChecked(True)
+        wizard.generated_images_enabled_checkbox.setChecked(False)
+        wizard.additional_ai_context_input.setPlainText("Keep the pacing tense.")
+        self.app.processEvents()
+
+        self.assertIn("next iteration", wizard.text_model_description.text())
+        self.assertIn("professional-grade", wizard.image_model_description.text())
+        self.assertIn("visible brushwork", wizard.image_style_description.text())
+        self.assertFalse(wizard.image_model_combo.isEnabled())
+        self.assertFalse(wizard.image_style_combo.isEnabled())
+        setup = wizard.build_setup()
+        self.assertEqual(setup["ai_settings"]["text_model"], "gemini-3.7-flash")
+        self.assertEqual(setup["ai_settings"]["model_intelligence"], "smarter")
+        self.assertEqual(
+            setup["ai_settings"]["additional_context"],
+            "Keep the pacing tense.",
+        )
+        self.assertEqual(
+            setup["images"],
+            {
+                "enabled": False,
+                "model": "gemini-3-pro-image",
+                "style": "oil_painting",
+            },
+        )
+        wizard.close()
+
+    def test_in_game_ai_settings_dialog_keeps_existing_mode_controls(self) -> None:
+        dialog = AISettingsDialog()
+
+        self.assertEqual(dialog.model_intelligence_combo.count(), 2)
+        self.assertEqual(
+            [
+                dialog.model_intelligence_combo.itemText(index)
+                for index in range(dialog.model_intelligence_combo.count())
+            ],
+            ["Faster", "Smarter"],
+        )
+        self.assertFalse(hasattr(dialog, "text_model_combo"))
+        dialog.close()
 
     def test_template_selection_reuses_widgets_without_mutating_templates(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1855,10 +1919,9 @@ class InventoryUiTests(unittest.TestCase):
     def test_bestiary_screen_matches_travel_layout_without_action_button(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             repository = SaveRepository.create_new_save(Path(temp_dir), "Bestiary UI")
-            repository.upsert_miscellaneous(
-                misc_id="mist_strider",
+            repository.upsert_bestiary_entry(
+                creature_id="mist_strider",
                 name="Mist-Strider",
-                category="Creature",
                 details="A towering animal seen moving between the fog banks.",
             )
             repository.upsert_miscellaneous(

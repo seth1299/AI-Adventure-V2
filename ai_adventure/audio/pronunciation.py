@@ -24,11 +24,6 @@ KOKORO_V1_PHONEME_CHARACTERS = frozenset(
     "ɑɐɒæβɔɕçɖðʤəɚɛɜɟɡɥɨɪʝɯɰŋɳɲɴøɸθœɹɾɻʁɽʂʃʈʧʊʋʌɣɤχʎʒʔ"
     "ˈˌːʰʲ↓→↗↘ᵻ"
 )
-KOKORO_IPA_PROMPT_RULE = (
-    "Do not return IPA, phoneme strings, pronunciation annotations, or non-ASCII "
-    "characters. Let the local English TTS engine pronounce visible ASCII spelling."
-)
-
 _PHONETIC_SEPARATOR_RE = re.compile(r"(?<=[^\W\d_])[-\u2010-\u2015](?=[^\W\d_])")
 _VISIBLE_WORD_RE = re.compile(r"[^\W\d_]+(?:['\u2019][^\W\d_]+)*")
 _NON_LETTER_RE = re.compile(r"[^a-z]+")

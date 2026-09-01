@@ -152,6 +152,7 @@ class NewGameSetupTests(unittest.TestCase):
                     "style": "third_person_omniscient",
                 },
                 "ai_settings": {
+                    "text_model": "gemini-3.7-flash",
                     "model_intelligence": "smarter",
                     "model_tone": "serious",
                     "response_length": "brief",
@@ -159,6 +160,11 @@ class NewGameSetupTests(unittest.TestCase):
                         "HARM_CATEGORY_DANGEROUS_CONTENT"
                     ],
                     "additional_context": "Keep the mystery grounded.",
+                },
+                "images": {
+                    "enabled": False,
+                    "model": "gemini-3-pro-image",
+                    "style": "film_noir",
                 },
                 "specified_genre": "Realistic detective mystery",
                 "start_location": "Rainmarket Station",
@@ -197,6 +203,7 @@ class NewGameSetupTests(unittest.TestCase):
             "Third-Person Omniscient",
         )
         self.assertEqual(setup["ai_settings"]["model_intelligence"], "smarter")
+        self.assertEqual(setup["ai_settings"]["text_model"], "gemini-3.7-flash")
         self.assertEqual(setup["ai_settings"]["model_tone"], "serious")
         self.assertEqual(setup["ai_settings"]["response_length"], "brief")
         self.assertEqual(
@@ -204,6 +211,14 @@ class NewGameSetupTests(unittest.TestCase):
             ["HARM_CATEGORY_DANGEROUS_CONTENT"],
         )
         self.assertIn("Keep the mystery grounded.", setup["ai_additional_context"])
+        self.assertEqual(
+            setup["images"],
+            {
+                "enabled": False,
+                "model": "gemini-3-pro-image",
+                "style": "film_noir",
+            },
+        )
 
     def test_start_location_mode_and_turn_prompt_are_model_visible(self) -> None:
         setup = normalize_new_game_setup(
@@ -446,6 +461,7 @@ class NewGameSetupTests(unittest.TestCase):
                         "style": "first_person_limited",
                     },
                     "ai_settings": {
+                        "text_model": "gemini-3.6-flash",
                         "model_intelligence": "smarter",
                         "model_tone": "friendly",
                         "response_length": "descriptive",
@@ -453,6 +469,11 @@ class NewGameSetupTests(unittest.TestCase):
                             "HARM_CATEGORY_HARASSMENT"
                         ],
                         "additional_context": "Keep clues internally consistent.",
+                    },
+                    "images": {
+                        "enabled": False,
+                        "model": "gemini-3.1-flash-image",
+                        "style": "crayon",
                     },
                 }
             )
@@ -498,6 +519,16 @@ class NewGameSetupTests(unittest.TestCase):
                 state.settings.values["ai.model_intelligence"],
                 "smarter",
             )
+            self.assertEqual(
+                state.settings.values["ai.text_model"],
+                "gemini-3.6-flash",
+            )
+            self.assertFalse(state.settings.values["images.enabled"])
+            self.assertEqual(
+                state.settings.values["images.model"],
+                "gemini-3.1-flash-image",
+            )
+            self.assertEqual(state.settings.values["images.style"], "crayon")
             self.assertEqual(state.settings.values["ai.model_tone"], "friendly")
             self.assertEqual(
                 state.settings.values["ai.response_length"],
@@ -1266,14 +1297,8 @@ class NewGameSetupTests(unittest.TestCase):
             "Do not duplicate records",
             packet["requirements"]["miscellaneous"],
         )
-        self.assertIn(
-            "category Creature",
-            packet["requirements"]["miscellaneous"],
-        )
-        self.assertIn(
-            "populate the Bestiary",
-            packet["requirements"]["miscellaneous"],
-        )
+        self.assertIn("bestiary", packet["requirements"])
+        self.assertIn("creature_id", packet["requirements"]["bestiary"])
         self.assertIn("item_request", packet["requirements"]["starter_inventory"])
         self.assertIn("at least five", packet["requirements"]["starter_inventory"])
         self.assertIn("has no maximum count", packet["requirements"]["starter_inventory"])

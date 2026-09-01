@@ -23,14 +23,19 @@ except ImportError:  # pragma: no cover - the packaged build includes RapidFuzz.
         return SequenceMatcher(None, left.casefold(), right.casefold()).ratio() * 100
 
 from ai_adventure.app.api_key_store import read_api_key
+from ai_adventure.ai.image_styles import (
+    DEFAULT_IMAGE_STYLE,
+    KNOWN_IMAGE_STYLES,
+    image_style_metadata,
+    normalize_image_style,
+)
+from ai_adventure.ai.model_catalog import DEFAULT_IMAGE_MODEL, normalize_image_model
 
 
 LOGGER = logging.getLogger(__name__)
 
-DEFAULT_IMAGE_MODEL = "gemini-3.1-flash-lite-image"
 DEFAULT_IMAGE_LIMIT = 100
 DISPLAY_IMAGE_MAX_PIXELS = 384
-VISUAL_SUBJECT_TYPES = frozenset({"player", "location", "inventory", "npc"})
 
 
 class VisualAssetRepository(Protocol):
@@ -59,6 +64,7 @@ class VisualAssetRequest:
     description: str
     world_context: str = ""
     message_ids: tuple[str, ...] = ()
+    image_style: str = DEFAULT_IMAGE_STYLE
 
     @property
     def descriptor_hash(self) -> str:
@@ -70,6 +76,7 @@ class VisualAssetRequest:
                 self.subject_key.strip().casefold(),
                 self.display_name.strip().casefold(),
                 " ".join(self.description.split()).casefold(),
+                normalize_image_style(self.image_style),
             )
         )
         return sha256(canonical.encode("utf-8")).hexdigest()
@@ -133,19 +140,22 @@ class VisualAssetRequest:
                 "the item."
             ),
         }[self.subject_type]
+        style = image_style_metadata(self.image_style)
         return (
-            "Generate one cohesive semi-realistic digital game illustration for AI Adventure. "
+            "Generate one cohesive image for AI Adventure. "
+            f"Selected visual style: {style['value']} ({style['label']}). "
+            f"Style direction: {style['prompt']} "
             f"{subject_instruction} Use a coherent centered composition suitable for a compact "
             "desktop game UI. Do not add words, captions, labels, signatures, watermarks, UI "
             "frames, split panels, unrelated duplicate subjects, or extraneous foreground "
             "characters. Only depict player-visible information; do not invent hidden identities "
-            "or secret facts. Use natural, restrained visual treatment rather than a generic AI "
-            "image aesthetic: avoid excessive drop shadows, perfect symmetry, unnaturally perfect "
-            "lighting, glossy studio staging, dramatic cinematic color grading, lens flare, "
-            "overly saturated colors, extreme contrast, plastic-looking materials, and unnaturally "
-            "clean or flawless surfaces. Preserve believable variation, small imperfections, "
-            "subtle texture, and ordinary environmental lighting appropriate to the world and "
-            "subject.\n\n"
+            "or secret facts. Make the selected style feel intentional and specific rather than "
+            "like a generic AI image. Unless the selected style explicitly calls for one of these "
+            "traits, avoid excessive drop shadows, perfect symmetry, unnaturally perfect lighting, "
+            "glossy studio staging, dramatic cinematic color grading, lens flare, overly saturated "
+            "colors, extreme contrast, plastic-looking materials, and unnaturally clean or flawless "
+            "surfaces. Preserve believable variation, small imperfections, and style-appropriate "
+            "texture, materials, and lighting.\n\n"
             f"Subject name: {self.display_name}\n"
             f"Player-visible description: {self.description}\n"
             "World context for visual consistency (honor this when relevant, especially "
@@ -166,7 +176,7 @@ class GeminiVisualAssetService:
         model: str = DEFAULT_IMAGE_MODEL,
     ) -> None:
         self.api_key_path = api_key_path.expanduser().resolve()
-        self.model = str(model or DEFAULT_IMAGE_MODEL).strip() or DEFAULT_IMAGE_MODEL
+        self.model = normalize_image_model(model)
 
     def generate(self, request: VisualAssetRequest) -> tuple[bytes, str]:
         """Generates exactly one image and returns its bytes and MIME type."""
@@ -215,6 +225,9 @@ def build_visual_asset_requests(
     event_messages = _visual_event_message_ids(repository.list_mechanical_events())
     opening_story_message_id = _first_story_message_id(repository.list_history())
     world_context = _visible_world_context(repository)
+    image_style = normalize_image_style(
+        repository.get_setting("images.style", DEFAULT_IMAGE_STYLE)
+    )
     requests: list[VisualAssetRequest] = []
 
     player_name = str(repository.get_setting("player_name", "Player Character") or "").strip()
@@ -233,6 +246,7 @@ def build_visual_asset_requests(
                 description=player_appearance,
                 world_context=world_context,
                 message_ids=(opening_story_message_id,) if opening_story_message_id else (),
+                image_style=image_style,
             )
         )
 
@@ -253,6 +267,7 @@ def build_visual_asset_requests(
                     event_messages.get(("location", subject_key), ())
                     or event_messages.get(("location", name.casefold()), ())
                 ),
+                image_style=image_style,
             )
         )
 
@@ -280,6 +295,7 @@ def build_visual_asset_requests(
                     event_messages.get(("inventory", subject_key), ())
                     or event_messages.get(("inventory", name.casefold()), ())
                 ),
+                image_style=image_style,
             )
         )
 
@@ -299,6 +315,7 @@ def build_visual_asset_requests(
                 description=description,
                 world_context=world_context,
                 message_ids=tuple(event_messages.get(("npc", npc_id), ())),
+                image_style=image_style,
             )
         )
 
@@ -364,6 +381,10 @@ def find_reusable_inventory_asset(
             if name_score < 86:
                 continue
             candidate_prompt = str(row["prompt"] or "")
+            if _image_style_from_prompt(candidate_prompt) != normalize_image_style(
+                request.image_style
+            ):
+                continue
             description_match = re.search(
                 r"Player-visible description:\s*(.*?)(?:\nWorld context|$)",
                 candidate_prompt,
@@ -399,6 +420,22 @@ def find_reusable_inventory_asset(
                 }
 
     return best
+
+
+def _image_style_from_prompt(prompt: str) -> str:
+    """Returns the style identity stored in a generated-asset prompt."""
+
+    style_match = re.search(
+        r"Selected visual style:\s*([a-z0-9_]+)\s*\(",
+        prompt,
+        flags=re.IGNORECASE,
+    )
+    if style_match:
+        value = style_match.group(1).casefold()
+        return value if value in KNOWN_IMAGE_STYLES else ""
+    if "semi-realistic digital game illustration" in prompt.casefold():
+        return DEFAULT_IMAGE_STYLE
+    return ""
 
 
 def _item_visual_description(

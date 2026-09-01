@@ -32,12 +32,6 @@ class KnownLocation:
     travel_multiplier: float = 1.0
     travel_notes: str = ""
 
-    @property
-    def has_coordinates(self) -> bool:
-        """Whether this location can take part in a calculated route estimate."""
-
-        return self.x_miles is not None and self.y_miles is not None
-
     def to_dict(self) -> dict[str, Any]:
         """Returns JSON-serializable location data."""
 

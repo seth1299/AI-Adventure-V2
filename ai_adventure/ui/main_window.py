@@ -121,12 +121,25 @@ from ai_adventure.ai.modes import (
     RESPONSE_LENGTH_OPTIONS,
     normalize_ai_mode_preferences,
 )
+from ai_adventure.ai.model_catalog import (
+    DEFAULT_IMAGE_MODEL,
+    IMAGE_MODEL_OPTIONS,
+    MODEL_CATALOG_REVIEWED_DATE,
+    TEXT_MODEL_OPTIONS,
+    image_model_metadata,
+    normalize_image_model,
+    normalize_image_preferences,
+    normalize_text_model,
+    text_model_metadata,
+)
+from ai_adventure.ai.image_styles import (
+    IMAGE_STYLE_OPTIONS,
+    image_style_metadata,
+)
 from ai_adventure.inventory_sorting import sort_inventory_items
 from ai_adventure.ui.story_bubbles import split_story_bubble_segments
 from ai_adventure.visual_assets import (
     DEFAULT_IMAGE_LIMIT,
-    DEFAULT_IMAGE_MODEL,
-    DISPLAY_IMAGE_MAX_PIXELS,
     GeminiVisualAssetService,
     VisualAssetRequest,
     build_visual_asset_requests,
@@ -296,7 +309,6 @@ from ai_adventure.combat import (
     COMBAT_FOCUS_LEVELS,
     COMBAT_RESOLUTION_MODE_LABELS,
     COMBAT_RESOLUTION_MODES,
-    BODY_PARTS,
     COMBAT_PERSONALITIES,
     DEFAULT_ATTACK_RANGE_FEET,
     DEFAULT_BASE_ARMOR_RATING,
@@ -345,7 +357,6 @@ from ai_adventure.new_game_setup import (
     DEFAULT_CHARACTER_PRONOUNS,
     DEFAULT_STARTING_WEALTH_GUIDANCE,
     GREGORIAN_CALENDAR_SETTINGS,
-    SKILL_LEVEL_PLAN,
     SKILL_PRESET_LEVEL_PLANS,
     STARTER_INVENTORY_MIN_ITEMS,
     ai_generated_calendar_settings_or_fallback,
@@ -422,7 +433,6 @@ CONTINUE_STORY_INSTRUCTION = (
 )
 TABLE_INLINE_EDITOR_HEIGHT = 30
 TABLE_INLINE_EDITOR_MIN_WIDTH = 132
-TABLE_INLINE_BUTTON_MIN_WIDTH = 96
 TABLE_CELL_HORIZONTAL_PADDING = 10
 TABLE_CELL_VERTICAL_PADDING = 4
 STARTER_ITEM_COLUMN_WIDTHS = (140, 132, 140, 220, 132, 150, 100)
@@ -546,7 +556,7 @@ class _TableEditorWheelFilter(QObject):
 
 
 class _AppTableWidget(QTableWidget):
-    """Application-wide table defaults and reusable removable-row behavior."""
+    """Application-wide table defaults and embedded-editor wheel behavior."""
 
     def __init__(self, rows: int = 0, columns: int = 0, parent: QWidget | None = None) -> None:
         super().__init__(rows, columns, parent)
@@ -561,41 +571,6 @@ class _AppTableWidget(QTableWidget):
         for editor in editors:
             if isinstance(editor, (QComboBox, QAbstractSpinBox)):
                 editor.installEventFilter(self._editor_wheel_filter)
-
-    def checked_rows(self, checkbox_column: int | None = None) -> list[int]:
-        column = self.columnCount() - 1 if checkbox_column is None else checkbox_column
-        rows: list[int] = []
-        for row in range(self.rowCount()):
-            cell_widget = self.cellWidget(row, column)
-            checkbox = (
-                cell_widget.findChild(QCheckBox)
-                if cell_widget is not None
-                else None
-            )
-            item = self.item(row, column)
-            if (
-                isinstance(checkbox, QCheckBox) and checkbox.isChecked()
-            ) or (
-                item is not None and item.checkState() == Qt.CheckState.Checked
-            ):
-                rows.append(row)
-        return rows
-
-    def remove_checked_rows(
-        self,
-        checkbox_column: int | None = None,
-        *,
-        preserve_first_row: bool = False,
-    ) -> list[int]:
-        rows = [
-            row
-            for row in self.checked_rows(checkbox_column)
-            if not preserve_first_row or row != 0
-        ]
-        for row in reversed(rows):
-            self.removeRow(row)
-        return rows
-
 
 def _table_item(text: Any, sort_value: Any | None = None) -> QTableWidgetItem:
     """Builds a read-only table item with an optional hidden sort value."""
@@ -673,14 +648,6 @@ def _sort_descending(order: Qt.SortOrder) -> bool:
     """Returns True when table data should be sorted descending."""
 
     return order == Qt.SortOrder.DescendingOrder
-
-
-class RefreshableScreen(Protocol):
-    """Protocol for screens that can reload their data from the save repository."""
-
-    def refresh(self) -> None:
-        """Refreshes visible screen data."""
-        ...
 
 
 class RepositoryBackedWidget(QWidget):
@@ -863,6 +830,18 @@ def _screen_content_signature(screen: QWidget) -> str:
     return json.dumps(values, sort_keys=True, default=str, separators=(",", ":"))
 
 
+def _text_model_from_ai_packet(packet: dict[str, Any]) -> str:
+    """Reads the per-save text model from a story or new-game packet."""
+
+    preferences: Any = packet.get("player_ai_preferences")
+    state = packet.get("state")
+    if isinstance(state, dict) and isinstance(state.get("player_ai_preferences"), dict):
+        preferences = state["player_ai_preferences"]
+    if not isinstance(preferences, dict):
+        preferences = {}
+    return normalize_text_model(preferences.get("text_model"))
+
+
 class _GeminiStoryWorker(QObject):
     """Runs one Gemini story request away from the Qt UI thread."""
 
@@ -888,9 +867,10 @@ class _GeminiStoryWorker(QObject):
             if GeminiNarrationService is None:
                 raise GeminiConfigurationError("AI generation is disabled in this build.")
 
-            result = GeminiNarrationService(api_key_path=self._api_key_path).generate_story_response(
-                self._context_packet
-            )
+            result = GeminiNarrationService(
+                api_key_path=self._api_key_path,
+                model=_text_model_from_ai_packet(self._context_packet),
+            ).generate_story_response(self._context_packet)
         except GeminiConfigurationError as error:
             LOGGER.warning("Gemini narration skipped: %s", error)
             self.configuration_error.emit(str(error))
@@ -931,9 +911,10 @@ class _GeminiSkillCheckPlanWorker(QObject):
             if GeminiNarrationService is None:
                 raise GeminiConfigurationError("AI generation is disabled in this build.")
 
-            result = GeminiNarrationService(api_key_path=self._api_key_path).plan_story_skill_checks(
-                self._context_packet
-            )
+            result = GeminiNarrationService(
+                api_key_path=self._api_key_path,
+                model=_text_model_from_ai_packet(self._context_packet),
+            ).plan_story_skill_checks(self._context_packet)
         except GeminiConfigurationError as error:
             LOGGER.warning("Gemini skill-check planning skipped: %s", error)
             self.configuration_error.emit(str(error))
@@ -977,6 +958,7 @@ class _GeminiNewGameWorker(QObject):
 
             result = GeminiNarrationService(
                 api_key_path=self._api_key_path,
+                model=_text_model_from_ai_packet(self._setup_packet),
             ).generate_new_game_world(self._setup_packet)
         except GeminiConfigurationError as error:
             LOGGER.warning("Gemini new-game synthesis skipped: %s", error)
@@ -1137,10 +1119,9 @@ class _VisualAssetCoordinator(QObject):
             return
 
         has_api_key = bool(read_api_key(self.api_key_path))
-        model = str(
+        model = normalize_image_model(
             repository.get_setting("images.model", DEFAULT_IMAGE_MODEL)
-            or DEFAULT_IMAGE_MODEL
-        ).strip()
+        )
         limit = _clamped_int(
             repository.get_setting("images.maximum_generated", DEFAULT_IMAGE_LIMIT),
             DEFAULT_IMAGE_LIMIT,
@@ -1203,16 +1184,6 @@ class _VisualAssetCoordinator(QObject):
             self._queued_asset_ids.add(request.asset_id)
         self._start_next()
         self._finish_initial_batch_if_ready(repository)
-
-    def retry_failed(self, repository: SaveRepository | None) -> int:
-        """Requeues failed requests only after an explicit player action."""
-
-        if repository is None:
-            return 0
-        reset_count = repository.reset_failed_visual_assets()
-        if reset_count:
-            self.scan(repository)
-        return reset_count
 
     def _start_next(self) -> None:
         """Starts the next affordable queued request."""
@@ -1848,34 +1819,6 @@ class MainWindow(QMainWindow):
                 "Enter a save name before starting.",
             )
 
-    def create_new_game(self, setup: dict[str, Any]) -> bool:
-        """
-        Creates a new save and opens it.
-
-        Args:
-            setup: New-game wizard setup dictionary.
-
-        Returns:
-            True when the save was created and opened.
-        """
-
-        clean_setup = self._normalize_new_game_setup_for_runtime(setup)
-
-        try:
-            self._create_new_game_from_setup(
-                clean_setup,
-                auto_save_template_if_available=True,
-            )
-        except DuplicateSaveTitleError as error:
-            QMessageBox.warning(self, "Save Name Already Exists", str(error))
-            return False
-        except Exception:
-            LOGGER.exception("Failed to create new game.")
-            QMessageBox.critical(self, "New Game Failed", "Could not create a new game.")
-            return False
-
-        return True
-
     def _create_new_game_from_setup(
         self,
         clean_setup: dict[str, Any],
@@ -2238,6 +2181,13 @@ class MainWindow(QMainWindow):
                 misc_id=str(entry.get("misc_id", "")),
                 name=str(entry.get("name", "")),
                 category=str(entry.get("category", "")),
+                details=str(entry.get("details", "")),
+            )
+
+        for entry in getattr(result, "bestiary", []):
+            repository.upsert_bestiary_entry(
+                creature_id=str(entry.get("creature_id", "")),
+                name=str(entry.get("name", "")),
                 details=str(entry.get("details", "")),
             )
 
@@ -3948,14 +3898,6 @@ class MainMenuSettingsDialog(QDialog):
             tts_enabled=self.tts_enabled,
         )
 
-    def _narrator_enabled_value(self) -> bool:
-        """Returns the requested narrator setting."""
-
-        if self.narrator_enabled_checkbox is None:
-            return False
-
-        return self.narrator_enabled_checkbox.isChecked()
-
     def _tts_volume_value(self) -> int:
         """Returns the requested narrator volume."""
 
@@ -4883,10 +4825,14 @@ class NewGameTemplateManagerDialog(QDialog):
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         settings = dialog.build_ai_settings()
+        current_text_model = normalize_text_model(
+            self._new_game_ai_settings.get("text_model")
+        )
         self._new_game_ai_settings = {
             key: value for key, value in settings.items()
             if key not in {"narration_tense", "narration_style"}
         }
+        self._new_game_ai_settings["text_model"] = current_text_model
         _set_combo_to_data(self.narration_tense_combo, settings["narration_tense"])
         _set_combo_to_data(self.narration_style_combo, settings["narration_style"])
         self._refresh_template_ai_settings_summary()
@@ -6401,6 +6347,7 @@ class NewGameWizard(QWizard):
         self._custom_calendar_settings = dict(GREGORIAN_CALENDAR_SETTINGS)
         default_modes = normalize_ai_mode_preferences({})
         self._new_game_ai_settings: dict[str, Any] = {
+            "text_model": default_modes["text_model"],
             "model_intelligence": default_modes["model_intelligence"],
             "model_tone": default_modes["model_tone"],
             "response_length": default_modes["response_length"],
@@ -6409,6 +6356,7 @@ class NewGameWizard(QWizard):
             ],
             "additional_context": "",
         }
+        self._new_game_image_settings = normalize_image_preferences({})
 
         self.setWindowTitle("New Game Wizard")
         self.setWindowFlags(
@@ -6432,6 +6380,7 @@ class NewGameWizard(QWizard):
         self._apply_theme()
 
         self._build_adventure_page()
+        self._build_ai_settings_page()
         self._build_api_key_page()
         self._build_starting_locations_page()
         self._build_starting_task_page()
@@ -6850,6 +6799,8 @@ class NewGameWizard(QWizard):
     def build_setup(self) -> dict[str, Any]:
         """Builds a normalized setup dictionary from wizard fields."""
 
+        self._new_game_ai_settings = self._new_game_ai_settings_from_controls()
+        self._new_game_image_settings = self._new_game_image_settings_from_controls()
         calendar_type = self.calendar_type_combo.currentData() or "gregorian"
         calendar_settings = self._calendar_settings_for_setup(str(calendar_type))
         starting_calendar: dict[str, Any] = {}
@@ -6926,6 +6877,7 @@ class NewGameWizard(QWizard):
             },
             "pronunciation_map": dict(self._pronunciation_map),
             "ai_settings": dict(self._new_game_ai_settings),
+            "images": dict(self._new_game_image_settings),
             "narration": {
                 "tense": self.narration_tense_combo.currentData(),
                 "style": self.narration_style_combo.currentData(),
@@ -7015,7 +6967,8 @@ class NewGameWizard(QWizard):
                 **ai_settings,
                 "narration_tense": narration["tense"],
                 "narration_style": narration["style"],
-            }
+            },
+            clean_setup["images"],
         )
 
         self.character_name_input.setText(character["name"])
@@ -7139,32 +7092,15 @@ class NewGameWizard(QWizard):
         if self.tts_settings_widget is not None:
             self.tts_settings_widget.load_audio_settings(audio)
 
-    def _open_new_game_ai_settings_dialog(self) -> None:
-        """Opens the shared A.I. settings modal during new-game creation."""
-
-        dialog = AISettingsDialog(
-            self,
-            settings={
-                **self._new_game_ai_settings,
-                "narration_tense": (
-                    self.narration_tense_combo.currentData()
-                    or DEFAULT_NARRATION_TENSE
-                ),
-                "narration_style": (
-                    self.narration_style_combo.currentData()
-                    or DEFAULT_NARRATION_STYLE
-                ),
-            },
-        )
-        if dialog.exec() != QDialog.DialogCode.Accepted:
-            return
-
-        self._apply_new_game_ai_settings(dialog.build_ai_settings())
-
-    def _apply_new_game_ai_settings(self, raw_settings: dict[str, Any]) -> None:
-        """Applies modal values to wizard state and its visible summary."""
+    def _apply_new_game_ai_settings(
+        self,
+        raw_settings: dict[str, Any],
+        raw_images: dict[str, Any] | None = None,
+    ) -> None:
+        """Applies normalized settings to the dedicated wizard page."""
 
         modes = normalize_ai_mode_preferences(raw_settings)
+        images = normalize_image_preferences(raw_images)
         narration = normalize_narration_preferences(
             {
                 "tense": raw_settings.get("narration_tense"),
@@ -7172,6 +7108,7 @@ class NewGameWizard(QWizard):
             }
         )
         self._new_game_ai_settings = {
+            "text_model": modes["text_model"],
             "model_intelligence": modes["model_intelligence"],
             "model_tone": modes["model_tone"],
             "response_length": modes["response_length"],
@@ -7182,39 +7119,110 @@ class NewGameWizard(QWizard):
                 raw_settings.get("additional_context", "")
             ).strip(),
         }
+        self._new_game_image_settings = images
+        _set_combo_to_data(self.text_model_combo, modes["text_model"])
+        self.smarter_ai_checkbox.setChecked(
+            modes["model_intelligence"] == "smarter"
+        )
+        _set_combo_to_data(self.model_tone_combo, modes["model_tone"])
+        _set_combo_to_data(self.response_length_combo, modes["response_length"])
+        self.model_content_combo.set_selected_categories(
+            list(modes["allowed_content_categories"])
+        )
         _set_combo_to_data(self.narration_tense_combo, narration["tense"])
         _set_combo_to_data(self.narration_style_combo, narration["style"])
-        self._refresh_new_game_ai_settings_summary()
+        self.additional_ai_context_input.setPlainText(
+            self._new_game_ai_settings["additional_context"]
+        )
+        self.generated_images_enabled_checkbox.setChecked(images["enabled"])
+        _set_combo_to_data(self.image_model_combo, images["model"])
+        _set_combo_to_data(self.image_style_combo, images["style"])
+        self._refresh_new_game_ai_descriptions()
 
-    def _refresh_new_game_ai_settings_summary(self) -> None:
-        """Shows the active wizard A.I. modes without expanding every control."""
+    def _new_game_ai_settings_from_controls(self) -> dict[str, Any]:
+        """Builds the normalized text-model preferences from page controls."""
 
-        if not hasattr(self, "ai_settings_summary_label"):
-            return
-
-        modes = normalize_ai_mode_preferences(self._new_game_ai_settings)
-        narration = normalize_narration_preferences(
+        modes = normalize_ai_mode_preferences(
             {
-                "tense": self.narration_tense_combo.currentData(),
-                "style": self.narration_style_combo.currentData(),
+                "text_model": self.text_model_combo.currentData(),
+                "model_intelligence": (
+                    "smarter" if self.smarter_ai_checkbox.isChecked() else "faster"
+                ),
+                "model_tone": self.model_tone_combo.currentData(),
+                "response_length": self.response_length_combo.currentData(),
+                "allowed_content_categories": (
+                    self.model_content_combo.selected_categories()
+                ),
             }
         )
-        content_label = (
-            "No Restrictions"
+        return {
+            "text_model": modes["text_model"],
+            "model_intelligence": modes["model_intelligence"],
+            "model_tone": modes["model_tone"],
+            "response_length": modes["response_length"],
+            "allowed_content_categories": modes["allowed_content_categories"],
+            "additional_context": self.additional_ai_context_input.toPlainText().strip(),
+        }
+
+    def _new_game_image_settings_from_controls(self) -> dict[str, Any]:
+        """Builds normalized image-generation preferences from page controls."""
+
+        return normalize_image_preferences(
+            {
+                "enabled": self.generated_images_enabled_checkbox.isChecked(),
+                "model": self.image_model_combo.currentData(),
+                "style": self.image_style_combo.currentData(),
+            }
+        )
+
+    def _refresh_new_game_ai_descriptions(self) -> None:
+        """Refreshes model-page descriptions and mode guidance."""
+
+        text_model = text_model_metadata(self.text_model_combo.currentData())
+        image_model = image_model_metadata(self.image_model_combo.currentData())
+        image_style = image_style_metadata(self.image_style_combo.currentData())
+        modes = normalize_ai_mode_preferences(
+            {
+                "model_tone": self.model_tone_combo.currentData(),
+                "response_length": self.response_length_combo.currentData(),
+                "allowed_content_categories": (
+                    self.model_content_combo.selected_categories()
+                ),
+            }
+        )
+        self.text_model_description.setText(str(text_model["description"]))
+        self.image_model_description.setText(str(image_model["description"]))
+        self.image_style_description.setText(str(image_style["description"]))
+        self.model_tone_description.setText(str(modes["model_tone_description"]))
+        self.response_length_description.setText(
+            str(modes["response_length_description"])
+        )
+        self.model_content_description.setText(
+            "No Restrictions: all configurable Gemini harm categories may appear."
             if not modes["blocked_content_labels"]
-            else (
-                ", ".join(modes["allowed_content_labels"])
-                if modes["allowed_content_labels"]
-                else "No Harm Categories"
-            )
+            else "Allowed categories: "
+            + (", ".join(modes["allowed_content_labels"]) or "None")
+            + "."
         )
-        self.ai_settings_summary_label.setText(
-            f"{modes['model_intelligence_label']} · "
-            f"{modes['model_tone_label']} · "
-            f"{modes['response_length_label']} · "
-            f"{content_label}\n"
-            f"{narration['tense_label']} · {narration['style_label']}"
-        )
+        enabled = self.generated_images_enabled_checkbox.isChecked()
+        self.image_model_combo.setEnabled(enabled)
+        self.image_model_description.setEnabled(enabled)
+        self.image_style_combo.setEnabled(enabled)
+        self.image_style_description.setEnabled(enabled)
+
+    @staticmethod
+    def _new_game_ai_choice_field(
+        title: str,
+        control: QWidget,
+        description: QLabel,
+    ) -> QWidget:
+        field = QWidget()
+        layout = QVBoxLayout(field)
+        layout.setContentsMargins(0, 3, 0, 6)
+        layout.addWidget(QLabel(title))
+        layout.addWidget(control)
+        layout.addWidget(description)
+        return field
 
     def _build_adventure_page(self) -> None:
         """Builds the adventure/world setup page."""
@@ -7251,25 +7259,6 @@ class NewGameWizard(QWizard):
             "Optional: describe the situation, mood, event, or hook you want the opening scene to begin with..."
         )
 
-        self.narration_tense_combo = _NoWheelComboBox(page)
-        _add_combo_options(self.narration_tense_combo, NARRATION_TENSE_OPTIONS)
-        _set_combo_to_data(self.narration_tense_combo, DEFAULT_NARRATION_TENSE)
-        self.narration_tense_combo.setVisible(False)
-
-        self.narration_style_combo = _NoWheelComboBox(page)
-        _add_combo_options(self.narration_style_combo, NARRATION_STYLE_OPTIONS)
-        _set_combo_to_data(self.narration_style_combo, DEFAULT_NARRATION_STYLE)
-        self.narration_style_combo.setVisible(False)
-
-        self.ai_settings_button = QPushButton("A.I. Settings...")
-        self.ai_settings_button.clicked.connect(
-            self._open_new_game_ai_settings_dialog
-        )
-        self.ai_settings_summary_label = QLabel()
-        self.ai_settings_summary_label.setWordWrap(True)
-        self.ai_settings_summary_label.setStyleSheet("font-size: 11px;")
-        self._refresh_new_game_ai_settings_summary()
-
         self.world_context_input = QTextEdit()
         self.world_context_input.setPlaceholderText(
             "Named locations, factions, guilds, religions, political tensions, tone, themes..."
@@ -7280,8 +7269,6 @@ class NewGameWizard(QWizard):
         layout.addRow("Game Name:", self.title_input)
         layout.addRow("Genre:", self.genre_input)
         layout.addRow("Game Style:", self.game_style_input)
-        layout.addRow("Artificial Intelligence:", self.ai_settings_button)
-        layout.addRow("", self.ai_settings_summary_label)
         layout.addRow("World Details:", self.world_context_input)
         page.setLayout(layout)
 
@@ -8387,6 +8374,229 @@ class NewGameWizard(QWizard):
         self._sync_magic_controls()
         self.addPage(page)
 
+    def _build_ai_settings_page(self) -> None:
+        """Builds the dedicated new-game A.I. configuration page."""
+
+        page = QWizardPage()
+        page.setTitle("A.I. Settings")
+        page.setSubTitle(
+            "Choose the text and image models used by this adventure, then tune "
+            "narration and content preferences."
+        )
+
+        description_style = "font-size: 11px;"
+        self.text_model_combo = _NoWheelComboBox(page)
+        AISettingsDialog._add_mode_options(self.text_model_combo, TEXT_MODEL_OPTIONS)
+        _set_combo_to_data(self.text_model_combo, self._new_game_ai_settings["text_model"])
+        self.text_model_description = QLabel()
+        self.text_model_description.setWordWrap(True)
+        self.text_model_description.setStyleSheet(description_style)
+
+        self.smarter_ai_checkbox = QCheckBox(
+            'Do you want the A.I. to be "Smarter"?'
+        )
+        self.smarter_ai_checkbox.setChecked(False)
+        self.smarter_ai_checkbox.setToolTip(
+            "May cause longer delays between messages and slower overall gameplay, "
+            "but response quality should increase."
+        )
+        smarter_note = QLabel(
+            "May cause longer delays between messages and slower overall gameplay, "
+            "but response quality should increase."
+        )
+        smarter_note.setWordWrap(True)
+        smarter_note.setStyleSheet(description_style)
+
+        self.generated_images_enabled_checkbox = QCheckBox(
+            "Generate images for characters, locations, NPCs, and inventory items"
+        )
+        self.generated_images_enabled_checkbox.setChecked(True)
+        self.image_model_combo = _NoWheelComboBox(page)
+        AISettingsDialog._add_mode_options(self.image_model_combo, IMAGE_MODEL_OPTIONS)
+        _set_combo_to_data(
+            self.image_model_combo,
+            self._new_game_image_settings["model"],
+        )
+        self.image_model_description = QLabel()
+        self.image_model_description.setWordWrap(True)
+        self.image_model_description.setStyleSheet(description_style)
+
+        self.image_style_combo = _NoWheelComboBox(page)
+        AISettingsDialog._add_mode_options(self.image_style_combo, IMAGE_STYLE_OPTIONS)
+        _set_combo_to_data(
+            self.image_style_combo,
+            self._new_game_image_settings["style"],
+        )
+        self.image_style_description = QLabel()
+        self.image_style_description.setWordWrap(True)
+        self.image_style_description.setStyleSheet(description_style)
+
+        catalog_note = QLabel(
+            "Only Google Gemini API models marked Stable (GA) and supporting the "
+            "required output type are listed. Catalog reviewed "
+            f"{MODEL_CATALOG_REVIEWED_DATE}."
+        )
+        catalog_note.setWordWrap(True)
+        catalog_note.setStyleSheet(description_style)
+
+        model_group = QGroupBox("Models")
+        model_layout = QVBoxLayout(model_group)
+        model_layout.addWidget(catalog_note)
+        model_layout.addWidget(
+            self._new_game_ai_choice_field(
+                "Text Model",
+                self.text_model_combo,
+                self.text_model_description,
+            )
+        )
+        model_layout.addWidget(self.smarter_ai_checkbox)
+        model_layout.addWidget(smarter_note)
+        model_layout.addWidget(self.generated_images_enabled_checkbox)
+        model_layout.addWidget(
+            self._new_game_ai_choice_field(
+                "Image Model",
+                self.image_model_combo,
+                self.image_model_description,
+            )
+        )
+        model_layout.addWidget(
+            self._new_game_ai_choice_field(
+                "Image Style (applies to every generated image)",
+                self.image_style_combo,
+                self.image_style_description,
+            )
+        )
+
+        modes = normalize_ai_mode_preferences(self._new_game_ai_settings)
+        self.model_tone_combo = _NoWheelComboBox(page)
+        AISettingsDialog._add_mode_options(self.model_tone_combo, MODEL_TONE_OPTIONS)
+        _set_combo_to_data(self.model_tone_combo, modes["model_tone"])
+        self.model_tone_description = QLabel()
+        self.model_tone_description.setWordWrap(True)
+        self.model_tone_description.setStyleSheet(description_style)
+
+        self.response_length_combo = _NoWheelComboBox(page)
+        AISettingsDialog._add_mode_options(
+            self.response_length_combo,
+            RESPONSE_LENGTH_OPTIONS,
+        )
+        _set_combo_to_data(self.response_length_combo, modes["response_length"])
+        self.response_length_description = QLabel()
+        self.response_length_description.setWordWrap(True)
+        self.response_length_description.setStyleSheet(description_style)
+
+        self.model_content_combo = ContentCategoryComboBox(
+            list(modes["allowed_content_categories"]),
+            page,
+        )
+        self.model_content_description = QLabel()
+        self.model_content_description.setWordWrap(True)
+        self.model_content_description.setStyleSheet(description_style)
+
+        behavior_group = QGroupBox("Response Preferences")
+        behavior_layout = QVBoxLayout(behavior_group)
+        behavior_layout.addWidget(
+            self._new_game_ai_choice_field(
+                "Model Tone",
+                self.model_tone_combo,
+                self.model_tone_description,
+            )
+        )
+        behavior_layout.addWidget(
+            self._new_game_ai_choice_field(
+                "Response Length",
+                self.response_length_combo,
+                self.response_length_description,
+            )
+        )
+        behavior_layout.addWidget(
+            self._new_game_ai_choice_field(
+                "Model Content (select every category that may appear)",
+                self.model_content_combo,
+                self.model_content_description,
+            )
+        )
+
+        self.narration_tense_combo = _NoWheelComboBox(page)
+        _add_combo_options(self.narration_tense_combo, NARRATION_TENSE_OPTIONS)
+        _set_combo_to_data(self.narration_tense_combo, DEFAULT_NARRATION_TENSE)
+        self.narration_tense_description = QLabel(
+            "Controls the grammatical tense used for player-facing narration."
+        )
+        self.narration_tense_description.setWordWrap(True)
+        self.narration_tense_description.setStyleSheet(description_style)
+
+        self.narration_style_combo = _NoWheelComboBox(page)
+        _add_combo_options(self.narration_style_combo, NARRATION_STYLE_OPTIONS)
+        _set_combo_to_data(self.narration_style_combo, DEFAULT_NARRATION_STYLE)
+        self.narration_style_description = QLabel(
+            "Controls narrative person and camera while preserving hidden information."
+        )
+        self.narration_style_description.setWordWrap(True)
+        self.narration_style_description.setStyleSheet(description_style)
+
+        self.additional_ai_context_input = QTextEdit(page)
+        self.additional_ai_context_input.setPlaceholderText(
+            "Optional AI-facing guidance, style preferences, boundaries, or reminders..."
+        )
+        self.additional_ai_context_input.setMaximumHeight(120)
+        additional_description = QLabel(
+            "Persistent free-form guidance sent to the A.I. with every story turn."
+        )
+        additional_description.setWordWrap(True)
+        additional_description.setStyleSheet(description_style)
+
+        narration_group = QGroupBox("Narration")
+        narration_layout = QVBoxLayout(narration_group)
+        narration_layout.addWidget(
+            self._new_game_ai_choice_field(
+                "Narration Tense",
+                self.narration_tense_combo,
+                self.narration_tense_description,
+            )
+        )
+        narration_layout.addWidget(
+            self._new_game_ai_choice_field(
+                "Narration Style",
+                self.narration_style_combo,
+                self.narration_style_description,
+            )
+        )
+        narration_layout.addWidget(QLabel("Additional A.I. Context"))
+        narration_layout.addWidget(self.additional_ai_context_input)
+        narration_layout.addWidget(additional_description)
+
+        content = QWidget(page)
+        content_layout = QVBoxLayout(content)
+        content_layout.addWidget(model_group)
+        content_layout.addWidget(behavior_group)
+        content_layout.addWidget(narration_group)
+        content_layout.addStretch()
+        scroll_area = QScrollArea(page)
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setWidget(content)
+        page_layout = QVBoxLayout(page)
+        page_layout.addWidget(scroll_area)
+
+        for combo in (
+            self.text_model_combo,
+            self.image_model_combo,
+            self.image_style_combo,
+            self.model_tone_combo,
+            self.response_length_combo,
+        ):
+            combo.currentIndexChanged.connect(
+                lambda _index: self._refresh_new_game_ai_descriptions()
+            )
+        self.model_content_combo.selection_changed.connect(
+            self._refresh_new_game_ai_descriptions
+        )
+        self.generated_images_enabled_checkbox.toggled.connect(
+            lambda _checked: self._refresh_new_game_ai_descriptions()
+        )
+        self._refresh_new_game_ai_descriptions()
+        self.addPage(page)
+
     def _append_starting_spell_request_row(self, request: dict[str, Any]) -> None:
         """Adds one Basic-mode plain-language spell request."""
 
@@ -9186,14 +9396,6 @@ class NewGameWizard(QWizard):
         page.setLayout(layout)
 
         self.addPage(page)
-
-    def _narrator_enabled_value(self) -> bool:
-        """Returns the requested new-game narrator setting."""
-
-        if self.narrator_enabled_checkbox is None:
-            return False
-
-        return self.narrator_enabled_checkbox.isChecked()
 
     def _tts_volume_value(self) -> int:
         """Returns the requested new-game narrator volume."""
@@ -11415,6 +11617,7 @@ class StoryScreen(RepositoryBackedWidget):
         party_members = repository.list_party_members()
         gm_secrets = repository.list_gm_secrets(active_only=True)
         miscellaneous = repository.list_miscellaneous()
+        bestiary = repository.list_bestiary_entries()
         valid_music_tracks = (
             self.sound_manager.get_valid_track_names()
             if self.sound_manager is not None
@@ -11442,6 +11645,7 @@ class StoryScreen(RepositoryBackedWidget):
             party_members=party_members,
             gm_secrets=gm_secrets,
             miscellaneous=miscellaneous,
+            bestiary=bestiary,
             valid_music_tracks=valid_music_tracks,
             current_music=str(repository.get_setting("audio.current_music", "")),
             valid_sound_effect_tracks=valid_sound_effect_tracks,
@@ -14085,7 +14289,7 @@ class BestiaryScreen(RepositoryBackedWidget):
             item.setData(Qt.ItemDataRole.UserRole, creature)
             item.setData(
                 Qt.ItemDataRole.UserRole + 1,
-                str(creature.get("misc_id", "")).strip(),
+                str(creature.get("creature_id", "")).strip(),
             )
             self.creature_list.addItem(item)
 
@@ -18754,7 +18958,6 @@ class SettingsScreen(RepositoryBackedWidget):
                 "images.enabled",
                 self.generated_images_enabled_checkbox.isChecked(),
             )
-            repository.set_setting("images.model", DEFAULT_IMAGE_MODEL)
             repository.set_setting(
                 "images.maximum_generated",
                 self.maximum_generated_images_input.value(),
@@ -19040,12 +19243,6 @@ class SettingsScreen(RepositoryBackedWidget):
         return normalize_tts_audio_fields(global_audio, tts_enabled=self.tts_enabled)[
             "tts_custom_voices"
         ]
-
-    def _handle_narrator_enabled_toggled(self, checked: bool) -> None:
-        """Saves narrator enabled changes and syncs dependent controls."""
-
-        self._sync_narrator_control_states(checked)
-        self._save_settings()
 
     def _tts_voice_value(self) -> str:
         """Returns the selected narrator voice id."""
@@ -21887,20 +22084,6 @@ def _set_markdown_text(text_edit: QTextEdit, markdown_text: str) -> None:
     text_edit.setPlainText(str(markdown_text or ""))
 
 
-def _player_command_markdown(command: str) -> str:
-    """Formats a player command with a normal Markdown speaker label."""
-
-    lines = [line.strip() for line in str(command or "").splitlines() if line.strip()]
-
-    if not lines:
-        return "**You:**"
-
-    first_line, *remaining_lines = lines
-    formatted_lines = [f"**You:** {first_line}"]
-    formatted_lines.extend(remaining_lines)
-    return "\n\n".join(formatted_lines)
-
-
 def _safe_int(value, default: int) -> int:
     """Converts a value to int with a fallback."""
 
@@ -21979,21 +22162,6 @@ def _status_label(label: str, value_label: QLabel) -> QWidget:
     layout.setContentsMargins(0, 0, 24, 8)
     wrapper.setLayout(layout)
     return wrapper
-
-
-def _split_day_time(raw_time: str) -> tuple[str, str]:
-    """Splits a combined world time string into day and time labels."""
-
-    clean_time = raw_time.strip()
-
-    if not clean_time:
-        return "-", "-"
-
-    if "," in clean_time:
-        day, time = clean_time.split(",", 1)
-        return day.strip() or "-", time.strip() or "-"
-
-    return "-", clean_time
 
 
 def _skill_level_label(level: int) -> str:

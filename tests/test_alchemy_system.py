@@ -248,7 +248,6 @@ class AlchemySystemTests(unittest.TestCase):
                 1,
                 "A triangular glass prism.",
                 value_base_units=12,
-                metadata={"ascii_art": "  /\\\n /__\\\n/____\\"},
             )
             repository.remove_inventory_item("Glass Prism", 1)
 
@@ -262,26 +261,6 @@ class AlchemySystemTests(unittest.TestCase):
             prism = next(item for item in catalog if item["name"] == "Glass Prism")
             self.assertNotIn("quantity", prism)
             self.assertEqual(prism["description"], "A triangular glass prism.")
-            self.assertEqual(prism["ascii_art"], "  /\\\n /__\\\n/____\\")
-
-    def test_item_catalog_normalizes_double_escaped_ascii_line_breaks(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            repository = SaveRepository.create_new_save(Path(temp_dir), "ASCII Catalog Test")
-            repository.add_inventory_item(
-                "Lockpick Roll",
-                "Tool",
-                1,
-                "A compact leather tool roll.",
-                metadata={"ascii_art": "+----+\\n| /\\ |\\n+----+"},
-            )
-
-            entry = next(
-                item
-                for item in repository.list_item_catalog()
-                if item["name"] == "Lockpick Roll"
-            )
-
-            self.assertEqual(entry["ascii_art"], "+----+\n| /\\ |\n+----+")
 
 
 if __name__ == "__main__":

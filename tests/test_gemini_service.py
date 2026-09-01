@@ -53,6 +53,7 @@ from ai_adventure.ai.gemini_service import (
     _parse_new_game_starting_spells,
     _parse_new_game_starter_items,
     _pretty_json_for_log,
+    _story_prompt_packet,
     _sanitize_gemini_creative_terms,
     _suggested_setup_terms,
     _unfinalized_suggested_setup_paths,
@@ -1401,12 +1402,12 @@ class GeminiServiceTests(unittest.TestCase):
         )
         self.assertIn("skill_check_planning", call["contents"])
         self.assertNotIn("<inventory>", call["contents"].casefold())
+        self.assertNotIn("<miscellaneous>", call["contents"].casefold())
         self.assertIn("cliff_is_trapped", call["contents"])
         self.assertIn("concealed wire", call["contents"])
         self.assertIn("<available_tags>", call["contents"])
         self.assertIn('"relevant_tags"', call["contents"])
-        self.assertIn("most directly relevant known skill", call["contents"])
-        self.assertIn("known Foraging skill", call["contents"])
+        self.assertIn("Use skill_rules", call["contents"])
 
     def test_parse_skill_check_plan_response_normalizes_checks(self) -> None:
         result = parse_skill_check_plan_response(
@@ -3882,10 +3883,7 @@ class GeminiServiceTests(unittest.TestCase):
         self.assertTrue(prompt.endswith("</task>"))
         self.assertLess(prompt.index("<context>"), prompt.index("<task>"))
         self.assertIn("<critical_constraints>", prompt)
-        self.assertIn("<gm_secret_knowledge_boundary>", prompt)
-        self.assertIn("unknown to both the player and the Player Character", prompt)
-        self.assertIn("own conscious actions", prompt)
-        self.assertIn("rediscover their own knowing act", prompt)
+        self.assertIn("Follow the applicable rules in the context packet", prompt)
         self.assertIn("<banned_terms>\n[\"Elara\"]", prompt)
         self.assertIn("NPC contract sentinel", prompt)
         self.assertIn("Inventory contract sentinel", prompt)
@@ -3895,27 +3893,41 @@ class GeminiServiceTests(unittest.TestCase):
         self.assertNotIn("CombatStartedEvent", prompt)
         self.assertIn("<examples>", prompt)
         self.assertIn("<output_format>", prompt)
-        self.assertIn("printable ASCII English characters only", prompt)
-        self.assertIn("never emit foreign scripts, IPA", prompt)
-        self.assertIn("Do not return pronunciation_map", prompt)
-        self.assertIn("speaker_cues", prompt)
-        self.assertIn("exact canonical npc_id as speaker_id", prompt)
-        self.assertIn("different IDs for different speakers", prompt)
-        self.assertIn("visible bubble label", prompt)
-        self.assertIn("status_event", prompt)
-        self.assertIn("payload contains location, minutes_passed, and weather", prompt)
-        self.assertIn("events must end with exactly one StatusUpdatedEvent", prompt)
+        self.assertNotIn("<gm_secret_knowledge_boundary>", prompt)
+        self.assertNotIn("state.miscellaneous.entries is uncapped", prompt)
         self.assertIn("fully resolve and narrate this player command", prompt)
         self.assertIn("including any immediate NPC response", prompt)
-        self.assertIn("state.miscellaneous.entries is uncapped", prompt)
-        self.assertIn("MiscellaneousUpsertedEvent", prompt)
-        self.assertIn("player-visible Bestiary", prompt)
-        self.assertIn("category Creature", prompt)
         self.assertNotIn("[Camera]", prompt)
         self.assertNotIn("single-line label is invalid", prompt)
         self.assertIn("look around", prompt)
         self.assertNotIn("Context packet:", prompt)
         self.assertLess(len(prompt), 9_000)
+
+    def test_story_prompt_projects_only_relevant_state_sections(self) -> None:
+        packet = _story_prompt_packet(
+            {
+                "packet_type": "story_turn",
+                "player_command": "Check my inventory.",
+                "selection": {"tags": ["inventory"]},
+                "state": {
+                    "player": {"name": "Kit"},
+                    "player_ai_preferences": {"narration_style": "present"},
+                    "scene": {"location": "Workshop"},
+                    "world_profile": {"genre": "Mystery"},
+                    "inventory": {"items": [{"name": "Key"}]},
+                    "magic": {"known_spells": [{"name": "Spark"}]},
+                    "active_tasks": {"tasks": [{"name": "Find the ledger"}]},
+                    "miscellaneous": {"entries": [{"name": "Old faction"}]},
+                },
+                "response_contract": {},
+            }
+        )
+
+        self.assertIn("inventory", packet["state"])
+        self.assertNotIn("magic", packet["state"])
+        self.assertNotIn("active_tasks", packet["state"])
+        self.assertNotIn("miscellaneous", packet["state"])
+        self.assertNotIn("reference_sections", packet)
         """Legacy prose assertions retained here only as migration documentation.
         self.assertIn("response", prompt)
         self.assertIn("suggested_actions", prompt)
@@ -4618,11 +4630,10 @@ class GeminiServiceTests(unittest.TestCase):
                 ],
                 "currency_description": "Crowns and moonmarks are common canal-city money.",
                 "starting_currency_balance_base_units": 49,
-                "miscellaneous": [
+                "bestiary": [
                     {
-                        "misc_id": "glassback_grazer",
+                        "creature_id": "glassback_grazer",
                         "name": "Glassback Grazer",
-                        "category": "Creature",
                         "details": "A six-legged herbivore with a translucent shell.",
                     }
                 ],
@@ -4799,8 +4810,7 @@ class GeminiServiceTests(unittest.TestCase):
             "station_master_is_villain",
         )
         self.assertEqual(result.gm_secrets[0]["status"], "active")
-        self.assertEqual(result.miscellaneous[0]["misc_id"], "glassback_grazer")
-        self.assertEqual(result.miscellaneous[0]["category"], "Creature")
+        self.assertEqual(result.bestiary[0]["creature_id"], "glassback_grazer")
         self.assertEqual(
             result.gm_secrets[0]["reveal_condition"],
             "When Alchemy Level 5 is reached.",

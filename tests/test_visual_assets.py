@@ -201,6 +201,28 @@ class VisualAssetTests(unittest.TestCase):
         self.assertIn("period-authentic vehicles", request.prompt)
         self.assertIn("do not default to modern designs", request.prompt)
 
+    def test_selected_style_is_in_every_prompt_and_asset_identity(self) -> None:
+        digital = VisualAssetRequest(
+            subject_type="location",
+            subject_key="old_station",
+            display_name="Old Station",
+            description="A weathered rural station with faded paint.",
+        )
+        noir = VisualAssetRequest(
+            subject_type="location",
+            subject_key="old_station",
+            display_name="Old Station",
+            description="A weathered rural station with faded paint.",
+            image_style="film_noir",
+        )
+
+        self.assertIn(
+            "Selected visual style: film_noir (Film Noir)",
+            noir.prompt,
+        )
+        self.assertIn("black-and-white film noir", noir.prompt)
+        self.assertNotEqual(digital.asset_id, noir.asset_id)
+
     def test_identity_hash_ignores_volatile_world_summary(self) -> None:
         base = VisualAssetRequest(
             subject_type="player",
@@ -219,6 +241,24 @@ class VisualAssetTests(unittest.TestCase):
 
         self.assertEqual(base.asset_id, with_summary.asset_id)
         self.assertEqual(base.descriptor_hash, with_summary.descriptor_hash)
+
+    def test_requests_apply_the_saved_style_to_every_subject(self) -> None:
+        class _StyledRepository(_VisualRepository):
+            def get_setting(self, key: str, default=None):
+                if key == "images.style":
+                    return "watercolor"
+                return super().get_setting(key, default)
+
+        requests = build_visual_asset_requests(_StyledRepository())
+
+        self.assertTrue(requests)
+        self.assertEqual({request.image_style for request in requests}, {"watercolor"})
+        self.assertTrue(
+            all(
+                "Selected visual style: watercolor" in request.prompt
+                for request in requests
+            )
+        )
 
     def test_requests_use_stable_entity_ids_and_save_grouped_filenames(self) -> None:
         class _IdentifiedRepository(_VisualRepository):
@@ -307,6 +347,24 @@ class VisualAssetTests(unittest.TestCase):
             self.assertIsNotNone(reusable)
             assert reusable is not None
             self.assertEqual(reusable["source_path"], source_path)
+
+            mismatched_style = VisualAssetRequest(
+                subject_type="inventory",
+                subject_key="target_item_oil",
+                display_name="Leather Canvas Backpack",
+                description=(
+                    "Container. A worn canvas backpack with leather straps and a brass buckle."
+                ),
+                image_style="oil_painting",
+            )
+            self.assertIsNone(
+                find_reusable_inventory_asset(
+                    images_dir=root / "images",
+                    saves_dir=saves_dir,
+                    repository=target_repository,
+                    request=mismatched_style,
+                )
+            )
 
     def test_save_assigns_player_and_location_ids(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -5,38 +5,11 @@ import logging
 from pathlib import Path
 from typing import Any
 
-from ai_adventure.audio.voices import (
-    DEFAULT_NARRATOR_VOICE,
-)
 from ai_adventure.audio.tts_settings import normalize_tts_audio_fields
 
 
 LOGGER = logging.getLogger(__name__)
 THEME_NAMES = {"Light", "Dark"}
-DEFAULT_APP_SETTINGS = {
-    "theme": "Light",
-    "audio": {
-        "music_enabled": True,
-        "sound_effects_enabled": True,
-        "background_ambience_enabled": True,
-        "narrator_enabled": True,
-        "music_volume": 25,
-        "sound_effects_volume": 35,
-        "background_ambience_volume": 15,
-        "tts_volume": 90,
-        "tts_voice": DEFAULT_NARRATOR_VOICE,
-        "tts_speed": 100,
-        "tts_voice_mode": "preset",
-        "tts_voice_blend": {
-            "name": "Custom Voice",
-            "voice_a": DEFAULT_NARRATOR_VOICE,
-            "voice_b": "am_echo",
-            "voice_a_weight": 50,
-            "voice_b_weight": 50,
-        },
-        "tts_custom_voices": [],
-    },
-}
 
 
 def load_app_settings(

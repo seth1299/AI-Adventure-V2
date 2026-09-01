@@ -4,6 +4,7 @@ import random
 from typing import Any
 
 from ai_adventure.ai.modes import normalize_ai_mode_preferences
+from ai_adventure.ai.model_catalog import normalize_image_preferences
 from ai_adventure.calendar_system import (
     DEFAULT_START_ELAPSED_MINUTES,
     build_calendar_snapshot,
@@ -40,11 +41,6 @@ DEFAULT_STARTING_WEALTH_GUIDANCE = (
     "They should have enough money to cover a few meals."
 )
 
-CHARACTER_GENDER_PRESENTATION_HINTS = [
-    "female-coded",
-    "male-coded",
-    "androgynous or nonbinary-coded",
-]
 CHARACTER_PRONOUN_OPTIONS = ("He/Him", "She/Her", "They/Them")
 DEFAULT_CHARACTER_PRONOUNS = "They/Them"
 
@@ -278,6 +274,7 @@ def normalize_new_game_setup(raw_setup: Any) -> dict[str, Any]:
     if not isinstance(raw_ai_settings, dict):
         raw_ai_settings = {}
     ai_mode_preferences = normalize_ai_mode_preferences(raw_ai_settings)
+    image_preferences = normalize_image_preferences(raw_setup.get("images", {}))
     custom_ai_context = _clean_text(raw_ai_settings.get("additional_context"))
     skill_preset = _normalize_skill_preset(raw_setup.get("skill_preset"))
     skill_level_plan = _skill_level_plan_for_setup(raw_setup, skill_preset)
@@ -334,6 +331,7 @@ def normalize_new_game_setup(raw_setup: Any) -> dict[str, Any]:
         "pronunciation_map": pronunciation_map,
         "narration": narration_preferences,
         "ai_settings": {
+            "text_model": ai_mode_preferences["text_model"],
             "model_intelligence": ai_mode_preferences["model_intelligence"],
             "model_tone": ai_mode_preferences["model_tone"],
             "response_length": ai_mode_preferences["response_length"],
@@ -342,6 +340,7 @@ def normalize_new_game_setup(raw_setup: Any) -> dict[str, Any]:
             ],
             "additional_context": custom_ai_context,
         },
+        "images": image_preferences,
         "time_display": calendar_settings["time_display"],
         "currency_denominations": currency_denominations,
         "starting_wealth": starting_wealth,
@@ -653,16 +652,21 @@ def build_new_game_setup_packet(
             ),
             "miscellaneous": (
                 "Return established non-secret world canon that does not fit a "
-                "Location, NPC, Item, active task, or GM secret in the top-level "
+                "Location, NPC, Item, active task, creature, or GM secret in the top-level "
                 "miscellaneous array. Use stable misc_id values and complete name, "
                 "category, and details fields. This includes original creatures or "
                 "species, cultures, factions, religions, laws, historical events, "
-                "and supernatural or scientific phenomena. Use category Creature for "
-                "each non-NPC creature or monster known to the Player, with only "
-                "player-known facts in details; these records populate the Bestiary. "
+                "and supernatural or scientific phenomena. Creature records belong "
+                "in the separate bestiary array. "
                 "Do not duplicate records "
                 "that belong in another structured field. Return an empty array when "
                 "no such starting canon is needed."
+            ),
+            "bestiary": (
+                "Return starting player-known non-NPC creatures in the top-level "
+                "bestiary array. Use stable creature_id values and complete details "
+                "containing only facts known to the Player or Player Character. "
+                "Return an empty array when no starting creature lore is needed."
             ),
             "starting_task": (
                 "setup.starting_task.mode controls the initial active quest. If "
@@ -1431,12 +1435,6 @@ def _genre_generation_guidance(clean_setup: dict[str, Any]) -> dict[str, str]:
             "and opening situation that makes the new game feel distinct."
         ),
     }
-
-
-def _has_ai_skill_placeholders(skills: list[dict[str, Any]]) -> bool:
-    """Returns True when at least one starting skill needs AI invention."""
-
-    return any(bool(skill.get("requires_ai_invention")) for skill in skills)
 
 
 def _normalize_skill_preset(value: Any) -> str:
