@@ -217,7 +217,6 @@ class StateManager:
                     category=_read_string(row, "category", ""),
                     description=_read_string(row, "description", ""),
                     value_base_units=_read_int(row, "value_base_units", 0),
-                    ascii_art=_read_string(row, "ascii_art", ""),
                     metadata=dict(row.get("metadata", {}))
                     if isinstance(row.get("metadata"), dict)
                     else {},

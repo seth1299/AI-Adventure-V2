@@ -112,6 +112,36 @@ def template_setup_has_changes(
     return original != current
 
 
+def available_automatic_template_name(
+    template_path: Path,
+    setup: Any,
+    *,
+    legacy_template_path: Path | None = None,
+) -> str | None:
+    """Returns the setup title when it is safe to create a new template.
+
+    Automatic New Game saves never overwrite an existing template. Explicit
+    overwrite/save-as choices remain the only paths that may replace one.
+    """
+
+    if not isinstance(setup, dict):
+        return None
+
+    candidate = str(setup.get("title", "") or "").strip()
+    if not candidate:
+        return None
+
+    existing_names = {
+        template.name.casefold()
+        for template in load_new_game_templates(
+            template_path,
+            legacy_template_path=legacy_template_path,
+            normalize_setups=False,
+        )
+    }
+    return candidate if candidate.casefold() not in existing_names else None
+
+
 def write_new_game_templates(
     template_path: Path,
     templates: list[NewGameTemplate],

@@ -4,6 +4,6 @@ name = "AI-Adventure-V2"
 
 [setup]
 script = '''
-C:\Python313\python.exe -m venv .venv
-.\.venv\Scripts\python.exe -m pip install --upgrade pip
-.\.venv\Scripts\python.exe -m pip install PySide6==6.11.0'''
+C:\Users\sethg\OneDrive\Desktop\Main_Folder\Applications\AI-Adventure-V2\.venv\Scripts\python.exe -m venv .venv
+& C:\Users\sethg\OneDrive\Desktop\Main_Folder\Applications\AI-Adventure-V2\.venv\Scripts\python.exe -m pip install --upgrade pip
+& C:\Users\sethg\OneDrive\Desktop\Main_Folder\Applications\AI-Adventure-V2\.venv\Scripts\python.exe -m pip install -r requirements.txt'''

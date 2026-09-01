@@ -5,7 +5,7 @@ import zipfile
 from pathlib import Path
 from typing import Any
 
-from ai_adventure.audio.catalog import distinct_audio_track_catalogs
+from ai_adventure.audio.catalog import distinct_audio_track_catalogs_with_ambience
 
 
 LOGGER = logging.getLogger(__name__)
@@ -13,6 +13,7 @@ LOGGER = logging.getLogger(__name__)
 
 SUPPORTED_AUDIO_EXTENSIONS = {".mp3", ".ogg", ".wav"}
 SOUND_EFFECT_CHANNEL_INDEX = 2
+BACKGROUND_AMBIENCE_CHANNEL_INDEX = 3
 
 
 def prepare_sound_directory(app_paths: Any) -> Path:
@@ -67,13 +68,29 @@ def prepare_sound_effect_directory(app_paths: Any) -> Path:
     return managed_effects_dir
 
 
+def prepare_background_ambience_directory(app_paths: Any) -> Path:
+    """Finds or prepares the distinct looping background-ambience directory."""
+
+    managed_ambience_dir = Path(app_paths.background_ambience_dir)
+    managed_ambience_dir.mkdir(parents=True, exist_ok=True)
+    if _contains_audio_files(managed_ambience_dir):
+        return managed_ambience_dir
+
+    package_ambience_dir = Path(app_paths.package_background_ambience_dir)
+    if _contains_audio_files(package_ambience_dir):
+        return package_ambience_dir
+
+    return managed_ambience_dir
+
+
 class SoundManager:
-    """Manages looping music and independent one-shot sound effects."""
+    """Manages music, one-shot effects, and independent looping ambience."""
 
     def __init__(
         self,
         sounds_directory: str | Path,
         sound_effects_directory: str | Path | None = None,
+        background_ambience_directory: str | Path | None = None,
     ) -> None:
         self.sounds_directory = Path(sounds_directory).expanduser()
         self.sound_effects_directory = (
@@ -81,16 +98,26 @@ class SoundManager:
             if sound_effects_directory is not None
             else self.sounds_directory / "sound_effects"
         )
+        self.background_ambience_directory = (
+            Path(background_ambience_directory).expanduser()
+            if background_ambience_directory is not None
+            else self.sounds_directory / "background_ambience_tracks"
+        )
         self.current_music: str | None = None
+        self.current_background_ambience: str | None = None
         self.music_volume: float = 0.25
         self.sound_effects_volume: float = 0.35
+        self.background_ambience_volume: float = 0.15
         self.music_enabled = True
         self.sound_effects_enabled = True
+        self.background_ambience_enabled = True
         self._initialized = False
         self._pygame: Any = None
         self._sound_effect: Any = None
+        self._background_ambience: Any = None
         self._music_track_cache: dict[str, Path] = {}
         self._sound_effect_track_cache: dict[str, Path] = {}
+        self._background_ambience_track_cache: dict[str, Path] = {}
 
         self._initialize_audio()
         self.refresh_tracks()
@@ -124,12 +151,17 @@ class SoundManager:
         self._sound_effect_track_cache = _audio_file_cache(
             self.sound_effects_directory,
         )
-        music_names, effect_names = distinct_audio_track_catalogs(
+        self._background_ambience_track_cache = _audio_file_cache(
+            self.background_ambience_directory,
+        )
+        music_names, effect_names, ambience_names = distinct_audio_track_catalogs_with_ambience(
             (path.name for path in self._music_track_cache.values()),
             (path.name for path in self._sound_effect_track_cache.values()),
+            (path.name for path in self._background_ambience_track_cache.values()),
         )
         music_keys = {name.casefold() for name in music_names}
         effect_keys = {name.casefold() for name in effect_names}
+        ambience_keys = {name.casefold() for name in ambience_names}
         self._music_track_cache = {
             key: path
             for key, path in self._music_track_cache.items()
@@ -139,6 +171,11 @@ class SoundManager:
             key: path
             for key, path in self._sound_effect_track_cache.items()
             if key in effect_keys
+        }
+        self._background_ambience_track_cache = {
+            key: path
+            for key, path in self._background_ambience_track_cache.items()
+            if key in ambience_keys
         }
 
     def get_valid_track_names(self) -> list[str]:
@@ -152,6 +189,14 @@ class SoundManager:
 
         self.refresh_tracks()
         return sorted(path.name for path in self._sound_effect_track_cache.values())
+
+    def get_valid_background_ambience_names(self) -> list[str]:
+        """Returns audio files that may loop as quiet environmental ambience."""
+
+        self.refresh_tracks()
+        return sorted(
+            path.name for path in self._background_ambience_track_cache.values()
+        )
 
     def set_music_enabled(self, enabled: bool) -> None:
         """Enables or disables looping music playback."""
@@ -261,6 +306,28 @@ class SoundManager:
             except Exception as error:
                 LOGGER.warning("Failed to update sound-effect volume: %s", error)
 
+    def set_background_ambience_enabled(self, enabled: bool) -> None:
+        """Enables or disables independent looping background ambience."""
+
+        self.background_ambience_enabled = bool(enabled)
+        if not self.background_ambience_enabled:
+            self.stop_background_ambience(clear_current=False)
+
+    def set_background_ambience_volume(self, volume: float | int | None) -> None:
+        """Sets looping background-ambience volume as either 0.0-1.0 or 0-100."""
+
+        parsed_volume = _normalized_volume(value=volume, label="background-ambience")
+        if parsed_volume is None:
+            return
+        self.background_ambience_volume = parsed_volume
+        if self._initialized and self._pygame is not None:
+            try:
+                self._pygame.mixer.Channel(BACKGROUND_AMBIENCE_CHANNEL_INDEX).set_volume(
+                    self.background_ambience_volume
+                )
+            except Exception as error:
+                LOGGER.warning("Failed to update background-ambience volume: %s", error)
+
     def stop_music(self, *, clear_current: bool = True) -> None:
         """Stops currently playing background music."""
 
@@ -312,6 +379,52 @@ class SoundManager:
                 LOGGER.warning("Failed to stop sound effect: %s", error)
 
         self._sound_effect = None
+
+    def play_background_ambience(
+        self,
+        track_name_or_path: str | Path | None,
+    ) -> None:
+        """Loops one ambience track without interrupting music, effects, or narration."""
+
+        if not self.background_ambience_enabled:
+            return
+        if not self._initialized or self._pygame is None:
+            LOGGER.warning("Cannot play background ambience because audio is unavailable.")
+            return
+        track_path = self._resolve_track_path(
+            track_name_or_path,
+            cache=self._background_ambience_track_cache,
+            label="Background ambience",
+        )
+        if track_path is None:
+            return
+        try:
+            channel = self._pygame.mixer.Channel(BACKGROUND_AMBIENCE_CHANNEL_INDEX)
+            if (
+                self.current_background_ambience == track_path.name
+                and getattr(channel, "get_busy", lambda: False)()
+            ):
+                return
+            channel.stop()
+            self._background_ambience = self._pygame.mixer.Sound(str(track_path))
+            channel.set_volume(self.background_ambience_volume)
+            channel.play(self._background_ambience, loops=-1)
+            self.current_background_ambience = track_path.name
+            LOGGER.info("Playing looping background ambience: %s", track_path.name)
+        except Exception as error:
+            LOGGER.warning("Failed to play background ambience %s: %s", track_path, error)
+
+    def stop_background_ambience(self, *, clear_current: bool = True) -> None:
+        """Stops only the looping background-ambience channel."""
+
+        if self._initialized and self._pygame is not None:
+            try:
+                self._pygame.mixer.Channel(BACKGROUND_AMBIENCE_CHANNEL_INDEX).stop()
+            except Exception as error:
+                LOGGER.warning("Failed to stop background ambience: %s", error)
+        self._background_ambience = None
+        if clear_current:
+            self.current_background_ambience = None
 
     def _resolve_track_path(
         self,

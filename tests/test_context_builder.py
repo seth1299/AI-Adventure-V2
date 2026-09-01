@@ -41,6 +41,25 @@ class ContextBuilderTests(unittest.TestCase):
             "armor_class": 13,
             "combat_style": "Mobile archer",
             "skills": ["Archery", "Tracking"],
+            "gender_identity": "Woman",
+            "age": "32",
+            "species": "Human",
+            "inventory": [
+                {
+                    "name": "Ashwood Bow",
+                    "quantity": 1,
+                    "equipped": True,
+                    "equipment_slot": "main hand",
+                }
+            ],
+            "equipment": [
+                {
+                    "name": "Ashwood Bow",
+                    "quantity": 1,
+                    "equipped": True,
+                    "equipment_slot": "main hand",
+                }
+            ],
         }
 
         packet = AiContextBuilder(
@@ -54,6 +73,14 @@ class ContextBuilderTests(unittest.TestCase):
         self.assertEqual(packet["state"]["party"]["members"][0]["npc_id"], "mira_coppercup")
         self.assertEqual(packet["state"]["party"]["members"][0]["health_current"], 8)
         self.assertEqual(packet["state"]["party"]["members"][0]["skills"], ["Archery", "Tracking"])
+        self.assertEqual(
+            packet["state"]["party"]["members"][0]["equipment"][0]["name"],
+            "Ashwood Bow",
+        )
+        self.assertEqual(
+            packet["state"]["npcs"]["relevant"][0]["species"],
+            "Human",
+        )
         self.assertIn(
             "mira_coppercup",
             [npc["npc_id"] for npc in packet["state"]["npcs"]["relevant"]],
@@ -149,6 +176,14 @@ class ContextBuilderTests(unittest.TestCase):
         self.assertIn(
             "exact canonical npc_id",
             packet["response_contract"]["speaker_cues"],
+        )
+        self.assertIn(
+            "visible bubble label",
+            packet["response_contract"]["speaker_cues"],
+        )
+        self.assertIn(
+            "when the name is unknown",
+            packet["state"]["audio"]["rules"]["speaker_voice_rule"],
         )
         self.assertIn(
             "durably remembers",
@@ -256,7 +291,6 @@ class ContextBuilderTests(unittest.TestCase):
                         category="tool",
                         description="A brass lantern.",
                         value_base_units=12,
-                        ascii_art="  ___\n /___\\\n | * |",
                         metadata={"item_type": "Tool"},
                     )
                 ]
@@ -286,6 +320,7 @@ class ContextBuilderTests(unittest.TestCase):
         )
         state.settings.values["ai.narration_tense"] = "past"
         state.settings.values["ai.narration_style"] = "third_person_limited"
+        state.settings.values["ai.text_model"] = "gemini-3.7-flash"
         state.settings.values["ai.model_intelligence"] = "smarter"
         state.settings.values["ai.model_tone"] = "friendly"
         state.settings.values["ai.response_length"] = "descriptive"
@@ -355,6 +390,8 @@ class ContextBuilderTests(unittest.TestCase):
             valid_music_tracks=["Town Village City.mp3", "Boss_Fight.mp3"],
             current_music="Town Village City.mp3",
             valid_sound_effect_tracks=["Steady Rain.wav", "Crowd Ambience.ogg"],
+            valid_background_ambience_tracks=["Quiet Rain.ogg"],
+            current_background_ambience="Quiet Rain.ogg",
             resolved_skill_checks=[
                 {
                     "skill_name": "Foraging",
@@ -398,6 +435,10 @@ class ContextBuilderTests(unittest.TestCase):
         self.assertEqual(
             packet["state"]["player_ai_preferences"]["model_intelligence"],
             "smarter",
+        )
+        self.assertEqual(
+            packet["state"]["player_ai_preferences"]["text_model"],
+            "gemini-3.7-flash",
         )
         self.assertEqual(
             packet["state"]["player_ai_preferences"]["model_tone_label"],
@@ -499,6 +540,22 @@ class ContextBuilderTests(unittest.TestCase):
             packet["response_contract"]["known_event_types"],
         )
         self.assertIn(
+            "BackgroundAmbienceChangedEvent",
+            packet["response_contract"]["known_event_types"],
+        )
+        self.assertEqual(
+            packet["state"]["audio"]["current_background_ambience"],
+            "Quiet Rain.ogg",
+        )
+        self.assertEqual(
+            packet["state"]["audio"]["valid_background_ambience_tracks"],
+            ["Quiet Rain.ogg"],
+        )
+        self.assertIn(
+            "be STOP",
+            packet["state"]["audio"]["rules"]["background_ambience_rule"],
+        )
+        self.assertIn(
             "short one-shot narration cue",
             packet["state"]["audio"]["rules"]["sound_effect_rule"],
         )
@@ -521,11 +578,15 @@ class ContextBuilderTests(unittest.TestCase):
             "exact stored currency/items once",
             packet["state"]["inventory"]["container_rule"],
         )
+        self.assertIn(
+            "unambiguous key or equivalent access item",
+            packet["state"]["inventory"]["container_rule"],
+        )
         self.assertEqual(packet["state"]["item_catalog"]["items"][0]["name"], "Lantern")
         self.assertNotIn("quantity", packet["state"]["item_catalog"]["items"][0])
-        self.assertEqual(
-            packet["state"]["item_catalog"]["items"][0]["ascii_art"],
-            "  ___\n /___\\\n | * |",
+        self.assertNotIn(
+            "ascii_art",
+            packet["state"]["item_catalog"]["items"][0],
         )
         self.assertEqual(
             packet["state"]["item_catalog"]["items"][0]["metadata"]["item_type"],
@@ -571,6 +632,14 @@ class ContextBuilderTests(unittest.TestCase):
         self.assertIn(
             "meaningful uncertainty",
             packet["response_contract"]["skill_checks"],
+        )
+        self.assertIn(
+            "most directly relevant known skill",
+            packet["response_contract"]["skill_checks"],
+        )
+        self.assertIn(
+            "known Foraging rather than Investigation or Perception",
+            packet["state"]["skills"]["rules"]["unknown_skill_rule"],
         )
         self.assertIn(
             "Do not request checks merely",
@@ -751,14 +820,6 @@ class ContextBuilderTests(unittest.TestCase):
             packet["response_contract"]["active_tasks"],
         )
         self.assertIn(
-            "[Camera]",
-            packet["state"]["item_catalog"]["rules"]["ascii_art_rule"],
-        )
-        self.assertIn(
-            "single-line label is invalid",
-            packet["state"]["item_catalog"]["rules"]["ascii_art_rule"],
-        )
-        self.assertIn(
             "should not be blank",
             packet["state"]["npcs"]["rules"]["new_npc_rule"],
         )
@@ -855,14 +916,20 @@ class ContextBuilderTests(unittest.TestCase):
             "event.miscellaneous_upsert",
             {section["id"] for section in packet["reference_sections"]},
         )
-        self.assertIn(
-            "player-visible Bestiary",
-            packet["response_contract"]["miscellaneous_memory"],
+        self.assertNotIn("bestiary", packet["state"])
+        creature_packet = AiContextBuilder.from_default_library().build_story_context(
+            AdventureState(metadata=AdventureMetadata(title="Creature Context")),
+            player_command="Tell me about Concept 2.",
+            planner_context_tags=[],
+            bestiary=[
+                {"creature_id": "concept_2", "name": "Concept 2", "details": "A creature."},
+            ],
         )
-        self.assertIn(
-            "category Creature",
-            packet["state"]["miscellaneous"]["rules"]["scope"],
+        self.assertEqual(
+            creature_packet["state"]["bestiary"]["entries"][0]["creature_id"],
+            "concept_2",
         )
+        self.assertIn("Do not use this for creatures", packet["state"]["miscellaneous"]["rules"]["scope"])
 
     def test_creative_ideas_are_omitted_when_not_relevant(self) -> None:
         packet = AiContextBuilder(

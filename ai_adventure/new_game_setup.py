@@ -4,13 +4,15 @@ import random
 from typing import Any
 
 from ai_adventure.ai.modes import normalize_ai_mode_preferences
+from ai_adventure.ai.model_catalog import normalize_image_preferences
 from ai_adventure.calendar_system import (
     DEFAULT_START_ELAPSED_MINUTES,
     build_calendar_snapshot,
     normalize_calendar_settings,
+    resolve_starting_calendar_minute,
 )
 from ai_adventure.audio.tts_settings import normalize_tts_audio_fields
-from ai_adventure.audio.catalog import distinct_audio_track_catalogs
+from ai_adventure.audio.catalog import distinct_audio_track_catalogs_with_ambience
 from ai_adventure.audio.pronunciation import (
     normalize_pronunciation_map,
     set_authoritative_pronunciation,
@@ -39,11 +41,6 @@ DEFAULT_STARTING_WEALTH_GUIDANCE = (
     "They should have enough money to cover a few meals."
 )
 
-CHARACTER_GENDER_PRESENTATION_HINTS = [
-    "female-coded",
-    "male-coded",
-    "androgynous or nonbinary-coded",
-]
 CHARACTER_PRONOUN_OPTIONS = ("He/Him", "She/Her", "They/Them")
 DEFAULT_CHARACTER_PRONOUNS = "They/Them"
 
@@ -254,6 +251,7 @@ def normalize_new_game_setup(raw_setup: Any) -> dict[str, Any]:
         raw_setup.get("starting_calendar", {})
     )
     audio_settings = _audio_from_setup(raw_setup.get("audio", {}))
+    starting_weather = _clean_text(raw_setup.get("starting_weather"))[:120]
     raw_character_name_pronunciation = _clean_text(
         character.get("name_pronunciation")
     )
@@ -276,6 +274,7 @@ def normalize_new_game_setup(raw_setup: Any) -> dict[str, Any]:
     if not isinstance(raw_ai_settings, dict):
         raw_ai_settings = {}
     ai_mode_preferences = normalize_ai_mode_preferences(raw_ai_settings)
+    image_preferences = normalize_image_preferences(raw_setup.get("images", {}))
     custom_ai_context = _clean_text(raw_ai_settings.get("additional_context"))
     skill_preset = _normalize_skill_preset(raw_setup.get("skill_preset"))
     skill_level_plan = _skill_level_plan_for_setup(raw_setup, skill_preset)
@@ -327,10 +326,12 @@ def normalize_new_game_setup(raw_setup: Any) -> dict[str, Any]:
         "combat": combat,
         "calendar": calendar_settings,
         "starting_calendar": starting_calendar,
+        "starting_weather": starting_weather,
         "audio": audio_settings,
         "pronunciation_map": pronunciation_map,
         "narration": narration_preferences,
         "ai_settings": {
+            "text_model": ai_mode_preferences["text_model"],
             "model_intelligence": ai_mode_preferences["model_intelligence"],
             "model_tone": ai_mode_preferences["model_tone"],
             "response_length": ai_mode_preferences["response_length"],
@@ -339,6 +340,7 @@ def normalize_new_game_setup(raw_setup: Any) -> dict[str, Any]:
             ],
             "additional_context": custom_ai_context,
         },
+        "images": image_preferences,
         "time_display": calendar_settings["time_display"],
         "currency_denominations": currency_denominations,
         "starting_wealth": starting_wealth,
@@ -373,6 +375,12 @@ def _audio_from_setup(raw_audio: Any) -> dict[str, Any]:
         ),
         "sound_effects_volume": _clamped_int(
             raw_audio.get("sound_effects_volume"), 35, 0, 100
+        ),
+        "background_ambience_enabled": _safe_bool(
+            raw_audio.get("background_ambience_enabled"), True
+        ),
+        "background_ambience_volume": _clamped_int(
+            raw_audio.get("background_ambience_volume"), 15, 0, 100
         ),
         **normalize_tts_audio_fields(raw_audio),
     }
@@ -447,6 +455,7 @@ def build_new_game_setup_packet(
     *,
     valid_music_tracks: list[str] | None = None,
     valid_sound_effect_tracks: list[str] | None = None,
+    valid_background_ambience_tracks: list[str] | None = None,
 ) -> dict[str, Any]:
     """Builds a compact AI-facing setup packet for world synthesis."""
 
@@ -461,9 +470,14 @@ def build_new_game_setup_packet(
         guidance = clean_setup["calendar"].get("generation_guidance", "")
         if guidance:
             packet_setup["calendar"]["generation_guidance"] = guidance
-    clean_music_tracks, clean_sound_effect_tracks = distinct_audio_track_catalogs(
+    (
+        clean_music_tracks,
+        clean_sound_effect_tracks,
+        clean_background_ambience_tracks,
+    ) = distinct_audio_track_catalogs_with_ambience(
         valid_music_tracks,
         valid_sound_effect_tracks,
+        valid_background_ambience_tracks,
     )
     creative_ideas = CreativeIdeasLibrary.load_default().select_for_new_game()
     starter_item_count = len(clean_setup["starter_items"])
@@ -477,7 +491,7 @@ def build_new_game_setup_packet(
         "packet_type": "new_game_setup",
         "setup": packet_setup,
         "player_ai_preferences": ai_mode_preferences,
-        "current_weather": "Clear",
+        "current_weather": clean_setup["starting_weather"] or "Clear",
         "requirements": {
             "world_summary": (
                 "Follow player_ai_preferences.response_length_instruction while "
@@ -540,14 +554,18 @@ def build_new_game_setup_packet(
                 "or pronunciation_map."
             ),
             "speaker_cues": (
-                "Return one TTS-only record for every exact contiguous non-narrator "
-                "spoken span in introductory_message. anchor_text must copy the "
-                "complete span including outer double quotation marks from one unique "
-                "place. Use an actual NPC's exact npc_id as speaker_id, reuse IDs for "
-                "the same speaker, and use distinct stable lower_snake_case IDs for "
-                "incidental speakers. Choose voice_profile from established audible "
-                "traits or neutral when unspecified. Return [] when only the narrator "
-                "speaks. Python chooses and durably stores the installed voice ID."
+                "Return one opening_cues record with kind speaker for every exact "
+                "contiguous non-narrator spoken span in introductory_message for "
+                "visible speaker bubbles and multi-voice TTS. anchor_text must copy "
+                "the complete span including outer double "
+                "quotation marks from one unique place. Use an actual NPC's exact "
+                "npc_id as speaker_id, reuse IDs for the same speaker, and use distinct "
+                "stable lower_snake_case IDs for incidental speakers. speaker_name is "
+                "the visible bubble label: use the known name or a concise player-safe "
+                "description when the name is unknown. Choose voice_profile from "
+                "established audible traits or neutral when unspecified. Return [] "
+                "when only the narrator speaks. Python chooses and durably stores the "
+                "installed voice ID."
             ),
             "calendar_weather_consistency": (
                 "When current_calendar is present, opening prose must match it unless "
@@ -556,6 +574,8 @@ def build_new_game_setup_packet(
                 "omitted: invent calendar_settings and starting_calendar first, then "
                 "make opening prose match those generated values. Opening prose must "
                 "also match current_weather unless the returned weather changes it. "
+                "When setup.starting_weather is non-empty, it is authoritative: use "
+                "that exact current condition in the opening prose and weather field. "
                 "If the opening scene or actual starting-location description establishes "
                 "rain, drizzle, snow, fog, or another current condition, return that "
                 "condition in weather instead of Clear or another contradictory default."
@@ -570,8 +590,9 @@ def build_new_game_setup_packet(
                 "day/season, or other calendar details as player requirements, "
                 "while filling in unspecified details coherently. "
                 "When setup.starting_calendar is non-empty, honor its explicit "
-                "season_name and day_of_month in the returned starting_calendar "
-                "for every calendar type. "
+                "year, month_number, season_name, day_of_month, and "
+                "time_of_day_minutes in the returned starting_calendar for every "
+                "calendar type. These player-entered values are authoritative. "
                 "Do not copy the default Gregorian calendar. Never use Monday, "
                 "Tuesday, Wednesday, Thursday, Friday, Saturday, or Sunday as any "
                 "day name. Do not use January-through-December month names, generic "
@@ -586,24 +607,24 @@ def build_new_game_setup_packet(
                 "settings and return calendar_settings as an empty object."
             ),
             "events": (
-                "Use structured events for any setup.starting_npcs rows or "
-                "requested active tasks that should be durable. The number of "
-                "NpcUpsertedEvent entries can be zero, one, or many; choose the "
+                "Use top-level starting_npcs for setup.starting_npcs rows that "
+                "should be durable. The number of starting_npcs entries can be zero, "
+                "one, or many; choose the "
                 "count from setup.starting_npcs and what the player character "
                 "would actually know at setup. Do not parse NPCs out of "
                 "ordinary setup prose or plaintext fields. For each "
-                "setup.starting_npcs row, create one NpcUpsertedEvent and copy its "
-                "npc_id exactly into payload.npc_id. Set payload.party_member true "
+                "setup.starting_npcs row, create one starting_npcs record and copy its "
+                "npc_id exactly. Set party_member true "
                 "exactly when that npc_id appears in setup.starting_party_npc_ids, "
                 "and false otherwise. When location_source_index is nonnegative, "
-                "payload.location must use the finalized name of the corresponding "
+                "location must use the finalized name of the corresponding "
                 "setup.starting_locations row, including when its suggestion-mode "
                 "name changes. Fill blank "
                 "name, location, or description fields with fitting specifics. "
                 "If description_mode is exact, copy description into "
-                "payload.public_description unchanged; if description_mode is "
+                "public_description unchanged; if description_mode is "
                 "suggestion, use description only as inspiration and write a "
-                "materially different payload.public_description; never copy the "
+                "materially different public_description; never copy the "
                 "suggested description unchanged. Return AI-only "
                 "hidden identities, motives, mystery solutions, off-screen plans, "
                 "and other concealed truths in the dedicated gm_secrets setup "
@@ -624,52 +645,68 @@ def build_new_game_setup_packet(
                 "else's off-screen plan, or an object planted without the Player "
                 "Character's knowledge. Player-known facts belong in backstory, notes, "
                 "inventory, or other public state; if setup did not establish such a "
-                "fact, omit it rather than secretly inventing it."
+                "fact, omit it rather than secretly inventing it. Every returned "
+                "record must use exactly secret_id, title, details, reveal_condition, "
+                "related_npc_ids, and related_locations; do not use legacy keys such "
+                "as gm_secret_id or secret."
             ),
             "miscellaneous": (
                 "Return established non-secret world canon that does not fit a "
-                "Location, NPC, Item, active task, or GM secret in the top-level "
+                "Location, NPC, Item, active task, creature, or GM secret in the top-level "
                 "miscellaneous array. Use stable misc_id values and complete name, "
                 "category, and details fields. This includes original creatures or "
                 "species, cultures, factions, religions, laws, historical events, "
-                "and supernatural or scientific phenomena. Use category Creature for "
-                "each non-NPC creature or monster known to the Player, with only "
-                "player-known facts in details; these records populate the Bestiary. "
+                "and supernatural or scientific phenomena. Creature records belong "
+                "in the separate bestiary array. "
                 "Do not duplicate records "
                 "that belong in another structured field. Return an empty array when "
                 "no such starting canon is needed."
             ),
+            "bestiary": (
+                "Return starting player-known non-NPC creatures in the top-level "
+                "bestiary array. Use stable creature_id values and complete details "
+                "containing only facts known to the Player or Player Character. "
+                "Return an empty array when no starting creature lore is needed."
+            ),
             "starting_task": (
                 "setup.starting_task.mode controls the initial active quest. If "
-                "mode is none, do not create an initial ActiveTaskUpsertedEvent "
+                "mode is none, do not return top-level starting_task "
                 "unless another explicit setup field independently asks for one. "
-                "If mode is ai, create one fitting starting quest with "
-                "ActiveTaskUpsertedEvent, including a complete player-visible "
+                "If mode is ai, return one fitting top-level starting_task, including "
+                "a complete player-visible "
                 "description of what must be done, currently known relevant people "
                 "and places, and how to recognize completion. Treat "
                 "setup.starting_task.guidance as "
                 "optional player inspiration: honor its idea while inventing all "
-                "unspecified quest details. If mode is custom, create exactly one "
-                "ActiveTaskUpsertedEvent using the player's provided fields as "
+                "unspecified quest details. If mode is custom, return exactly one "
+                "top-level starting_task using the player's provided fields as "
                 "authoritative anchors, filling any blank/default fields from the "
                 "rest of the setup. Use category Quest unless the player provided "
                 "a different category."
             ),
             "starting_music": (
-                "If valid background music tracks are available, suggest one "
-                "MusicChangedEvent for the opening scene. The filename must exactly "
-                "match one entry from audio.valid_music_tracks."
+                "Return one opening_cues record with kind music and one exact filename "
+                "from audio.valid_music_tracks when a listed track fits the opening; "
+                "otherwise return no music cue."
             ),
             "starting_sound_effect": (
                 "For every specific moment in the opening narration that would "
-                "genuinely benefit from a short sound, suggest a separate "
-                "SoundEffectChangedEvent when an appropriate listed effect exists. "
+                "genuinely benefit from a short sound, return a separate object in "
+                "opening_cues with kind sound_effect when an appropriate listed "
+                "effect exists. "
                 "There is no fixed cue-count target. Each filename must exactly match one entry "
                 "from audio.valid_sound_effect_tracks and must never come from "
                 "audio.valid_music_tracks. "
-                "For every event, copy a unique exact excerpt from introductory_message "
+                "For every cue, copy a unique exact excerpt from introductory_message "
                 "into anchor_text and set position to before or after. Each plays once and "
                 "must never be used for looping ambience."
+            ),
+            "starting_background_ambience": (
+                "When a listed environmental ambience fits the opening location, "
+                "return one opening_cues record with kind background_ambience and its "
+                "exact filename; otherwise return no background_ambience cue. "
+                "This is a quiet, persistent loop separate from music and one-shot "
+                "sound effects."
             ),
             "ai_invention_policy": (
                 "Default, placeholder, or blank fields are not confirmed world facts. "
@@ -691,7 +728,10 @@ def build_new_game_setup_packet(
                 "as a balanced name pool when useful. If the player supplied a custom "
                 "character name, appearance, backstory, or notes value, preserve that "
                 "field exactly instead of rewriting, renaming, embellishing, or "
-                "reinterpreting it."
+                "reinterpreting it. When inventing appearance, make it concise, "
+                "concrete, and visually depictable using player-visible traits. The "
+                "application generates images separately; never add image prompts, "
+                "filenames, URLs, encoded data, or image-specific response fields."
             ),
             "genre_generation": (
                 "If setup.specified_genre is blank/default, choose a specific genre "
@@ -784,11 +824,7 @@ def build_new_game_setup_packet(
                 "For an alchemist, cook, engineer, herbalist, survivalist, medic, "
                 "scientist, crafter, or other profession that logically starts "
                 "with practical making knowledge, return as many useful known "
-                "items/materials and recipes as fit the backstory. Recipe "
-                "Every known_crafting_items entry must include original ascii_art "
-                "using 3-12 fixed-width lines, no Markdown fence, and no line over "
-                "40 characters. A bracketed name, caption, or other single-line "
-                "label is invalid and is not ASCII art. "
+                "items/materials and recipes as fit the backstory. "
                 "For each known crafting item, location must be a comma-separated "
                 "list of generalized environments or source areas such as Forests, "
                 "Caves, Wetlands, Workshops, or Urban Scrap, never a specific named "
@@ -891,18 +927,16 @@ def build_new_game_setup_packet(
                 "notebook, ledger, manual, or other book as Book or Document, not "
                 "Information; Information describes content, not a physical item. "
                 "Every finalized starting item must also include storage_location. "
-                "Every finalized starting item must include original ascii_art that "
-                "visually depicts that concrete item using 3-12 fixed-width lines, "
-                "without a Markdown code fence and with no line over 40 characters. "
-                "A bracketed item name such as [Camera], a caption, or any other "
-                "single-line label is invalid and is not ASCII art. Draw the item's "
-                "recognizable shape instead of writing its name. "
-                "Do not double-escape line breaks or put visible backslash-n text "
-                "inside the drawing. "
                 "Use home for items kept in the player's house, workshop, base, room, "
                 "or other home storage, and actively_carried only for items the Player "
                 "Character is actually carrying. Interpret phrases such as 'kept in "
-                "their house' in item_request as home storage."
+                "their house' in item_request as home storage. For every fictional, "
+                "unfamiliar, or newly invented item, make description explicitly "
+                "state concrete visible traits beyond the name: form, approximate "
+                "size, color, material, texture, markings, condition, opacity or "
+                "translucency, and any visible changes under relevant conditions such "
+                "as sunlight, darkness, heat, or moisture. Never make the name alone "
+                "carry the item's visual identity."
             ),
             "currency_generation": (
                 "If setup.currency_denominations is empty, create a finalized "
@@ -948,7 +982,7 @@ def build_new_game_setup_packet(
                 "output, with matching source_index; invent its name and mechanics "
                 "instead of copying spell_request as its name. In advanced mode, the "
                 "application stores the exact setup.magic.starting_spells directly. "
-                "Never use new-game events to add, remove, rename, or alter starting "
+                "Never use any other new-game field to add, remove, rename, or alter starting "
                 "spells."
             ),
             "combat": (
@@ -1057,6 +1091,8 @@ def build_new_game_setup_packet(
             "valid_music_tracks": clean_music_tracks,
             "current_music": "",
             "valid_sound_effect_tracks": clean_sound_effect_tracks,
+            "valid_background_ambience_tracks": clean_background_ambience_tracks,
+            "current_background_ambience": "",
         },
         "creative_ideas": creative_ideas,
     }
@@ -1064,9 +1100,15 @@ def build_new_game_setup_packet(
         packet["requirements"].pop("starting_music", None)
     if not clean_sound_effect_tracks:
         packet["requirements"].pop("starting_sound_effect", None)
+    if not clean_background_ambience_tracks:
+        packet["requirements"].pop("starting_background_ambience", None)
     if not calendar_is_ai_generated:
         packet["current_calendar"] = build_calendar_snapshot(
-            DEFAULT_START_ELAPSED_MINUTES,
+            resolve_starting_calendar_minute(
+                clean_setup["starting_calendar"],
+                clean_setup["calendar"],
+                default_current_minute=DEFAULT_START_ELAPSED_MINUTES,
+            ),
             clean_setup["calendar"],
         )
     return packet
@@ -1393,12 +1435,6 @@ def _genre_generation_guidance(clean_setup: dict[str, Any]) -> dict[str, str]:
             "and opening situation that makes the new game feel distinct."
         ),
     }
-
-
-def _has_ai_skill_placeholders(skills: list[dict[str, Any]]) -> bool:
-    """Returns True when at least one starting skill needs AI invention."""
-
-    return any(bool(skill.get("requires_ai_invention")) for skill in skills)
 
 
 def _normalize_skill_preset(value: Any) -> str:
@@ -1974,11 +2010,44 @@ def _starting_calendar_from_setup(raw_starting_calendar: Any) -> dict[str, Any]:
     if season_name:
         starting_calendar["season_name"] = season_name
 
+    year = _safe_int(raw_starting_calendar.get("year"), 0)
+    if year > 0:
+        starting_calendar["year"] = min(9999, year)
+
+    month_number = _safe_int(raw_starting_calendar.get("month_number"), 0)
+    if month_number > 0:
+        starting_calendar["month_number"] = min(24, month_number)
+
     day_of_month = _safe_int(raw_starting_calendar.get("day_of_month"), 0)
     if day_of_month > 0:
         starting_calendar["day_of_month"] = min(366, day_of_month)
 
+    raw_time = raw_starting_calendar.get("time_of_day_minutes")
+    if raw_time is not None:
+        starting_calendar["time_of_day_minutes"] = max(
+            0,
+            min(1439, _safe_int(raw_time, DEFAULT_START_ELAPSED_MINUTES)),
+        )
+
     return starting_calendar
+
+
+def merge_authoritative_starting_calendar(
+    ai_starting_calendar: Any,
+    player_starting_calendar: Any,
+) -> dict[str, Any]:
+    """Merges a generated start with player-entered date/time fields taking priority."""
+
+    merged = dict(ai_starting_calendar) if isinstance(ai_starting_calendar, dict) else {}
+    authoritative = _starting_calendar_from_setup(player_starting_calendar)
+    if authoritative:
+        merged.pop("current_minute", None)
+        if "season_name" in authoritative and "month_number" not in authoritative:
+            merged.pop("month_name", None)
+            merged.pop("month_number", None)
+            merged.pop("season_hint", None)
+        merged.update(authoritative)
+    return merged
 
 
 def calendar_looks_like_default_gregorian(raw_calendar: Any) -> bool:

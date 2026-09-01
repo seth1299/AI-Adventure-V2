@@ -3,6 +3,12 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
+from ai_adventure.ai.model_catalog import (
+    DEFAULT_TEXT_MODEL,
+    normalize_text_model,
+    text_model_metadata,
+)
+
 
 DEFAULT_MODEL_INTELLIGENCE = "faster"
 DEFAULT_MODEL_TONE = "neutral"
@@ -214,6 +220,7 @@ def default_ai_mode_settings() -> dict[str, Any]:
     """Returns JSON-safe defaults for save-specific AI mode settings."""
 
     return {
+        "text_model": DEFAULT_TEXT_MODEL,
         "model_intelligence": DEFAULT_MODEL_INTELLIGENCE,
         "model_tone": DEFAULT_MODEL_TONE,
         "response_length": DEFAULT_RESPONSE_LENGTH,
@@ -243,6 +250,8 @@ def normalize_ai_mode_preferences(raw_preferences: Any) -> dict[str, Any]:
     allowed_categories = _normalize_allowed_content_categories(
         raw.get("allowed_content_categories")
     )
+    text_model = normalize_text_model(raw.get("text_model"))
+    text_model_option = text_model_metadata(text_model)
 
     intelligence_option = _INTELLIGENCE_BY_VALUE[intelligence]
     tone_option = _TONE_BY_VALUE[tone]
@@ -261,6 +270,10 @@ def normalize_ai_mode_preferences(raw_preferences: Any) -> dict[str, Any]:
     ]
 
     return {
+        "text_model": text_model,
+        "text_model_label": text_model_option["label"],
+        "text_model_description": text_model_option["description"],
+        "text_model_url": text_model_option["url"],
         "model_intelligence": intelligence,
         "model_intelligence_label": intelligence_option["label"],
         "model_intelligence_description": intelligence_option["description"],
@@ -298,6 +311,7 @@ def ai_mode_preferences_from_settings(settings: Any) -> dict[str, Any]:
     values = settings if isinstance(settings, Mapping) else {}
     return normalize_ai_mode_preferences(
         {
+            "text_model": values.get("ai.text_model", DEFAULT_TEXT_MODEL),
             "model_intelligence": values.get(
                 "ai.model_intelligence",
                 DEFAULT_MODEL_INTELLIGENCE,

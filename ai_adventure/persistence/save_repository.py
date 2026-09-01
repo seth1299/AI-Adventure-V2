@@ -18,14 +18,15 @@ from ai_adventure.alchemy.ingredients import (
     normalize_crafting_item_notes,
     normalize_recipe_ingredients,
 )
-from ai_adventure.ascii_art import (
-    ensure_substantive_ascii_art,
-    is_substantive_ascii_art,
-)
 from ai_adventure.ai.modes import (
     default_ai_mode_settings,
     normalize_ai_mode_preferences,
 )
+from ai_adventure.ai.model_catalog import (
+    DEFAULT_IMAGE_MODEL,
+    normalize_image_preferences,
+)
+from ai_adventure.ai.image_styles import DEFAULT_IMAGE_STYLE
 from ai_adventure.calendar_system import (
     DEFAULT_CALENDAR_SETTINGS,
     DEFAULT_START_ELAPSED_MINUTES,
@@ -52,6 +53,7 @@ from ai_adventure.locations import (
     DEFAULT_TRAVEL_SPEED_MULTIPLIER,
     KnownLocation,
     clean_player_location_name,
+    ensure_location_ids,
     normalize_known_location,
     normalize_known_locations,
 )
@@ -144,6 +146,7 @@ class SaveRepository:
 
         repository = cls(db_path)
         repository.set_meta("title", clean_title)
+        repository.set_setting("player.id", f"player_{uuid.uuid4().hex}")
 
         if setup is not None:
             repository.apply_new_game_setup(setup)
@@ -160,11 +163,16 @@ class SaveRepository:
         repository.set_setting("ai.narration_tense", DEFAULT_NARRATION_TENSE)
         repository.set_setting("ai.narration_style", DEFAULT_NARRATION_STYLE)
         repository._set_default_ai_mode_settings()
+        repository.set_setting("images.enabled", True)
+        repository.set_setting("images.model", DEFAULT_IMAGE_MODEL)
+        repository.set_setting("images.style", DEFAULT_IMAGE_STYLE)
         repository.set_setting("audio.music_enabled", True)
         repository.set_setting("audio.sound_effects_enabled", True)
+        repository.set_setting("audio.background_ambience_enabled", True)
         repository.set_setting("audio.narrator_enabled", True)
         repository.set_setting("audio.music_volume", 25)
         repository.set_setting("audio.sound_effects_volume", 35)
+        repository.set_setting("audio.background_ambience_volume", 15)
         repository.set_setting("audio.tts_volume", 90)
         repository.set_setting("audio.tts_voice", DEFAULT_NARRATOR_VOICE)
         repository.set_setting("audio.tts_speed", 100)
@@ -176,6 +184,7 @@ class SaveRepository:
         repository.set_setting("audio.tts_custom_voices", [])
         repository.set_setting("tts.pronunciation_map", {})
         repository.set_setting("audio.current_music", "")
+        repository.set_setting("audio.current_background_ambience", "")
         repository.set_note_entries([])
         repository.set_notes_share_with_ai(False)
         repository.set_currency_denominations(DEFAULT_CURRENCY_DENOMINATIONS)
@@ -265,6 +274,7 @@ class SaveRepository:
         calendar_settings = clean_setup["calendar"]
         audio_settings = clean_setup["audio"]
         narration_preferences = clean_setup["narration"]
+        image_preferences = normalize_image_preferences(clean_setup["images"])
         self.set_meta("title", title)
         self.set_setting("player_name", character["name"])
         self.set_setting("player.name_pronunciation", character["name_pronunciation"])
@@ -276,16 +286,27 @@ class SaveRepository:
         self.set_setting("ai.narration_tense", narration_preferences["tense"])
         self.set_setting("ai.narration_style", narration_preferences["style"])
         self._set_ai_mode_settings(clean_setup["ai_settings"])
+        self.set_setting("images.enabled", image_preferences["enabled"])
+        self.set_setting("images.model", image_preferences["model"])
+        self.set_setting("images.style", image_preferences["style"])
         self.set_setting("audio.music_enabled", bool(audio_settings["music_enabled"]))
         self.set_setting(
             "audio.sound_effects_enabled",
             bool(audio_settings["sound_effects_enabled"]),
+        )
+        self.set_setting(
+            "audio.background_ambience_enabled",
+            bool(audio_settings["background_ambience_enabled"]),
         )
         self.set_setting("audio.narrator_enabled", bool(audio_settings["narrator_enabled"]))
         self.set_setting("audio.music_volume", int(audio_settings["music_volume"]))
         self.set_setting(
             "audio.sound_effects_volume",
             int(audio_settings["sound_effects_volume"]),
+        )
+        self.set_setting(
+            "audio.background_ambience_volume",
+            int(audio_settings["background_ambience_volume"]),
         )
         self.set_setting("audio.tts_volume", int(audio_settings["tts_volume"]))
         self.set_setting("audio.tts_voice", audio_settings["tts_voice"])
@@ -295,6 +316,7 @@ class SaveRepository:
         self.set_setting("audio.tts_custom_voices", audio_settings["tts_custom_voices"])
         self.set_setting("tts.pronunciation_map", clean_setup["pronunciation_map"])
         self.set_setting("audio.current_music", "")
+        self.set_setting("audio.current_background_ambience", "")
         self.set_setting("new_game.setup", clean_setup)
         self.set_setting("world.setup_context", clean_setup["world_context"])
         self.set_setting("world.genre", clean_setup["specified_genre"])
@@ -329,7 +351,7 @@ class SaveRepository:
             "time",
             build_calendar_snapshot(starting_minute, calendar_settings)["display_label"],
         )
-        self.set_state_value("weather", "Clear")
+        self.set_state_value("weather", clean_setup["starting_weather"] or "Clear")
         self.set_state_value("condition", "Healthy")
 
         for item in clean_setup["starter_items"]:
@@ -446,8 +468,8 @@ class SaveRepository:
         return cls._save_title_exists(saves_dir, title)
 
     @classmethod
-    def rename_save(cls, saves_dir: Path, db_path: Path, new_title: str) -> None:
-        """Renames an existing save's player-facing title."""
+    def rename_save(cls, saves_dir: Path, db_path: Path, new_title: str) -> Path:
+        """Renames an existing save's title and containing directory."""
 
         save_dir = cls._save_dir_for_db_path(saves_dir, db_path)
         clean_title = new_title.strip() or "New Adventure"
@@ -462,8 +484,18 @@ class SaveRepository:
                 f"A save named '{clean_title}' already exists."
             )
 
-        repository = cls(resolved_db_path)
+        target_save_dir = _unique_save_dir(
+            saves_dir,
+            _slugify(clean_title),
+            datetime.now().strftime("%Y%m%d_%H%M%S_%f"),
+        )
+        if target_save_dir.resolve() != save_dir.resolve():
+            save_dir.rename(target_save_dir)
+
+        renamed_db_path = target_save_dir / cls.DATABASE_NAME
+        repository = cls(renamed_db_path)
         repository.set_meta("title", clean_title)
+        return renamed_db_path
 
     @classmethod
     def delete_save(cls, saves_dir: Path, db_path: Path) -> None:
@@ -699,11 +731,6 @@ class SaveRepository:
         clean_metadata["quantity_unit"] = _inventory_quantity_unit(raw_metadata)
         clean_metadata["storage_location"] = _inventory_storage_location(raw_metadata)
         clean_metadata["item_uuid"] = str(raw_metadata.get("item_uuid", "")).strip() or str(uuid.uuid4())
-        clean_metadata["ascii_art"] = ensure_substantive_ascii_art(
-            raw_metadata.get("ascii_art", ""),
-            item_name=clean_name,
-            category=category,
-        )
         metadata_json = _encode_json_dict(clean_metadata)
 
         with self._connect() as connection:
@@ -726,11 +753,7 @@ class SaveRepository:
                 updated_description = description.strip() or str(primary_row["description"])
                 updated_quantity = existing_quantity + quantity
                 updated_value = clean_value if clean_value > 0 else existing_value
-                updated_metadata = (
-                    metadata_json
-                    if clean_metadata.get("item_type") != "Item"
-                    else str(primary_row["metadata_json"])
-                )
+                updated_metadata = metadata_json
                 connection.execute(
                     """
                     UPDATE inventory_items
@@ -871,11 +894,6 @@ class SaveRepository:
             clean_metadata["item_uuid"] = (
                 str(raw_metadata.get("item_uuid", "")).strip() or str(uuid.uuid4())
             )
-            clean_metadata["ascii_art"] = ensure_substantive_ascii_art(
-                raw_metadata.get("ascii_art", ""),
-                item_name=name,
-                category=str(raw_item.get("category", "Item")),
-            )
             clean_items.append(
                 {
                     "name": name,
@@ -974,7 +992,6 @@ class SaveRepository:
                     category,
                     description,
                     value_base_units,
-                    ascii_art,
                     metadata_json,
                     first_seen_at,
                     updated_at
@@ -1179,7 +1196,6 @@ class SaveRepository:
         notes: str = "",
         rarity: str = "Common",
         value_base_units: int = 0,
-        ascii_art: str = "",
         item_uuid: str = "",
     ) -> None:
         """
@@ -1251,10 +1267,7 @@ class SaveRepository:
                 category=clean_category,
                 description=clean_description,
                 value_base_units=clean_value,
-                metadata={
-                    "ascii_art": ascii_art,
-                    "item_uuid": item_uuid,
-                },
+                metadata={"item_uuid": item_uuid},
             )
 
         self.append_history("crafting", f"Discovered crafting item/material: {clean_name}.")
@@ -1528,15 +1541,6 @@ class SaveRepository:
                 "SELECT * FROM spell_catalog WHERE spell_id = ?", (spell_id.strip(),)
             ).fetchone()
         return None if row is None else _spell_row_to_dict(row)
-
-    def list_spell_catalog(self) -> list[dict[str, Any]]:
-        """Lists all established spell definitions."""
-
-        with self._connect() as connection:
-            rows = connection.execute(
-                "SELECT * FROM spell_catalog ORDER BY tier, name COLLATE NOCASE"
-            ).fetchall()
-        return [_spell_row_to_dict(row) for row in rows]
 
     def learn_character_spell(
         self,
@@ -2246,6 +2250,9 @@ class SaveRepository:
         location: str = "",
         public_description: str = "",
         player_facing_information: str = "",
+        gender_identity: str = "",
+        age: str = "",
+        species: str = "",
         knowledge_scope: list[str] | None = None,
         known_facts: list[str] | None = None,
         disposition: str = "",
@@ -2261,6 +2268,9 @@ class SaveRepository:
             location: Usual or last-known location.
             public_description: Observable public description.
             player_facing_information: Player-safe information for the NPCs tab.
+            gender_identity: Player-visible gender identity, when established.
+            age: Player-visible age or age description, when established.
+            species: Player-visible species, when established.
             knowledge_scope: Plain-language topics this NPC can plausibly know.
             known_facts: Specific facts this NPC has learned.
             disposition: Current broad attitude toward the player.
@@ -2288,6 +2298,9 @@ class SaveRepository:
             or clean_public_description
             or clean_role
         )
+        clean_gender_identity = gender_identity.strip()
+        clean_age = age.strip()
+        clean_species = species.strip()
         explicit_npc_id = npc_id.strip()
         clean_npc_id = explicit_npc_id or _npc_id_from_parts(
             clean_name,
@@ -2348,13 +2361,16 @@ class SaveRepository:
                     location,
                     public_description,
                     player_facing_information,
+                    gender_identity,
+                    age,
+                    species,
                     knowledge_scope_json,
                     known_facts_json,
                     disposition,
                     created_at,
                     updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(npc_id) DO UPDATE SET
                     name = excluded.name,
                     display_name = CASE
@@ -2377,6 +2393,18 @@ class SaveRepository:
                         WHEN excluded.player_facing_information != '' THEN excluded.player_facing_information
                         ELSE npcs.player_facing_information
                     END,
+                    gender_identity = CASE
+                        WHEN excluded.gender_identity != '' THEN excluded.gender_identity
+                        ELSE npcs.gender_identity
+                    END,
+                    age = CASE
+                        WHEN excluded.age != '' THEN excluded.age
+                        ELSE npcs.age
+                    END,
+                    species = CASE
+                        WHEN excluded.species != '' THEN excluded.species
+                        ELSE npcs.species
+                    END,
                     knowledge_scope_json = excluded.knowledge_scope_json,
                     known_facts_json = excluded.known_facts_json,
                     disposition = CASE
@@ -2393,6 +2421,9 @@ class SaveRepository:
                     clean_location,
                     clean_public_description,
                     clean_player_facing_information,
+                    clean_gender_identity,
+                    clean_age,
+                    clean_species,
                     _encode_string_list(merged_knowledge_scope),
                     _encode_string_list(merged_known_facts),
                     disposition.strip(),
@@ -2544,6 +2575,9 @@ class SaveRepository:
             location=str(npc.get("location", "")),
             public_description=str(npc.get("public_description", "")),
             player_facing_information=str(npc.get("player_facing_information", "")),
+            gender_identity=str(npc.get("gender_identity", "")),
+            age=str(npc.get("age", "")),
+            species=str(npc.get("species", "")),
             knowledge_scope=list(npc.get("knowledge_scope", [])),
             known_facts=updated_facts,
             disposition=str(npc.get("disposition", "")),
@@ -2577,6 +2611,9 @@ class SaveRepository:
                     location,
                     public_description,
                     player_facing_information,
+                    gender_identity,
+                    age,
+                    species,
                     knowledge_scope_json,
                     known_facts_json,
                     disposition,
@@ -2621,6 +2658,9 @@ class SaveRepository:
                     location,
                     public_description,
                     player_facing_information,
+                    gender_identity,
+                    age,
+                    species,
                     knowledge_scope_json,
                     known_facts_json,
                     disposition,
@@ -2662,6 +2702,9 @@ class SaveRepository:
                     location,
                     public_description,
                     player_facing_information,
+                    gender_identity,
+                    age,
+                    species,
                     knowledge_scope_json,
                     known_facts_json,
                     disposition,
@@ -2707,6 +2750,9 @@ class SaveRepository:
                         or "Unknown NPC"
                     ),
                     "description": description,
+                    "gender_identity": npc.get("gender_identity", ""),
+                    "age": npc.get("age", ""),
+                    "species": npc.get("species", ""),
                     "location": npc["location"],
                     "notes": notes,
                 }
@@ -2839,6 +2885,9 @@ class SaveRepository:
                     n.location,
                     n.public_description,
                     n.player_facing_information,
+                    n.gender_identity,
+                    n.age,
+                    n.species,
                     n.knowledge_scope_json,
                     n.known_facts_json,
                     n.disposition,
@@ -2849,7 +2898,331 @@ class SaveRepository:
                 ORDER BY n.display_name COLLATE NOCASE, n.name COLLATE NOCASE
                 """
             ).fetchall()
-        return [_party_member_row_to_dict(row) for row in rows]
+        members = [_party_member_row_to_dict(row) for row in rows]
+        for member in members:
+            member["inventory"] = self.list_party_inventory_items(
+                str(member.get("npc_id", ""))
+            )
+            member["equipment"] = [
+                item
+                for item in member["inventory"]
+                if bool(item.get("equipped", False))
+                or str(item.get("equipment_slot", "")).strip()
+            ]
+        return members
+
+    def add_party_inventory_item(
+        self,
+        npc_id: str,
+        name: str,
+        category: str,
+        quantity: int,
+        description: str,
+        value_base_units: int = 0,
+        metadata: Any | None = None,
+    ) -> None:
+        """Adds an item to one current party member's dedicated inventory."""
+
+        clean_npc_id = npc_id.strip()
+        clean_name = name.strip()
+        if not clean_npc_id or self.get_npc(clean_npc_id) is None:
+            LOGGER.warning("Skipped party inventory add for unknown NPC %r.", npc_id)
+            return
+        with self._connect() as connection:
+            party_exists = connection.execute(
+                "SELECT 1 FROM party_members WHERE npc_id = ?",
+                (clean_npc_id,),
+            ).fetchone()
+        if party_exists is None:
+            LOGGER.warning("Skipped party inventory add for non-party NPC %r.", npc_id)
+            return
+        if not clean_name:
+            LOGGER.warning("Skipped party inventory add with blank name.")
+            return
+        clean_quantity = max(1, _safe_int(quantity, default=1))
+        raw_metadata = metadata if isinstance(metadata, dict) else {}
+        clean_category = normalize_inventory_category(
+            category,
+            name=clean_name,
+            description=description,
+            item_type=str(raw_metadata.get("item_type", "")),
+        )
+        clean_metadata = normalize_item_metadata(
+            raw_metadata,
+            name=clean_name,
+            category=clean_category,
+            description=description,
+        )
+        clean_metadata["quantity_unit"] = _inventory_quantity_unit(raw_metadata)
+        clean_metadata["storage_location"] = (
+            _inventory_storage_location(raw_metadata)
+            if "storage_location" in raw_metadata
+            else "on_person"
+        )
+        clean_metadata["item_uuid"] = (
+            str(raw_metadata.get("item_uuid", "")).strip() or str(uuid.uuid4())
+        )
+        equipped = _safe_bool(raw_metadata.get("equipped"), default=False)
+        equipment_slot = str(
+            raw_metadata.get("equipment_slot", raw_metadata.get("slot", "")) or ""
+        ).strip()
+        clean_value = max(0, _safe_int(value_base_units, default=0))
+
+        with self._connect() as connection:
+            existing = connection.execute(
+                """
+                SELECT id, category, quantity, description, value_base_units,
+                       metadata_json, equipped, equipment_slot
+                FROM party_inventory_items
+                WHERE npc_id = ? AND name = ? COLLATE NOCASE
+                ORDER BY id ASC
+                LIMIT 1
+                """,
+                (clean_npc_id, clean_name),
+            ).fetchone()
+            if existing is None:
+                connection.execute(
+                    """
+                    INSERT INTO party_inventory_items (
+                        npc_id, name, category, quantity, equipped, equipment_slot,
+                        storage_location, description, value_base_units, metadata_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        clean_npc_id,
+                        clean_name,
+                        clean_category,
+                        clean_quantity,
+                        int(equipped),
+                        equipment_slot,
+                        _inventory_storage_location(clean_metadata),
+                        description.strip(),
+                        clean_value,
+                        _encode_json_dict(clean_metadata),
+                    ),
+                )
+            else:
+                connection.execute(
+                    """
+                    UPDATE party_inventory_items
+                    SET category = ?, quantity = ?, equipped = ?, equipment_slot = ?,
+                        storage_location = ?, description = ?, value_base_units = ?,
+                        metadata_json = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        clean_category or str(existing["category"]),
+                        int(existing["quantity"]) + clean_quantity,
+                        int(equipped or bool(existing["equipped"])),
+                        equipment_slot or str(existing["equipment_slot"] or ""),
+                        _inventory_storage_location(clean_metadata),
+                        description.strip() or str(existing["description"]),
+                        max(clean_value, int(existing["value_base_units"])),
+                        _encode_json_dict(clean_metadata),
+                        existing["id"],
+                    ),
+                )
+            _upsert_item_catalog_entry(
+                connection,
+                name=clean_name,
+                category=clean_category,
+                description=description,
+                value_base_units=clean_value,
+                metadata=clean_metadata,
+            )
+        self.append_history(
+            "inventory",
+            f"Added {clean_quantity} x {clean_name} to party member {clean_npc_id}.",
+        )
+
+    def list_party_inventory_items(
+        self,
+        npc_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Lists dedicated inventory items for one party member or the whole party."""
+
+        query = """
+            SELECT id, npc_id, name, category, quantity, equipped, equipment_slot,
+                   storage_location, description, value_base_units, metadata_json
+            FROM party_inventory_items
+        """
+        parameters: tuple[Any, ...] = ()
+        clean_npc_id = str(npc_id or "").strip()
+        if clean_npc_id:
+            query += " WHERE npc_id = ?"
+            parameters = (clean_npc_id,)
+        query += " ORDER BY npc_id COLLATE NOCASE, name COLLATE NOCASE"
+        with self._connect() as connection:
+            rows = connection.execute(query, parameters).fetchall()
+        return [_party_inventory_row_to_dict(row) for row in rows]
+
+    def remove_party_inventory_item(
+        self,
+        npc_id: str,
+        name: str,
+        quantity: int,
+    ) -> None:
+        """Removes or decreases an item in one party member's inventory."""
+
+        clean_npc_id = npc_id.strip()
+        clean_name = name.strip()
+        clean_quantity = max(1, _safe_int(quantity, default=1))
+        if not clean_npc_id or not clean_name:
+            return
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT id, quantity FROM party_inventory_items
+                WHERE npc_id = ? AND name = ? COLLATE NOCASE
+                ORDER BY id ASC LIMIT 1
+                """,
+                (clean_npc_id, clean_name),
+            ).fetchone()
+            if row is None:
+                LOGGER.warning(
+                    "Attempted to remove missing party inventory item %s for %s.",
+                    clean_name,
+                    clean_npc_id,
+                )
+                return
+            new_quantity = int(row["quantity"]) - clean_quantity
+            if new_quantity > 0:
+                connection.execute(
+                    "UPDATE party_inventory_items SET quantity = ? WHERE id = ?",
+                    (new_quantity, row["id"]),
+                )
+            else:
+                connection.execute(
+                    "DELETE FROM party_inventory_items WHERE id = ?",
+                    (row["id"],),
+                )
+        self.append_history(
+            "inventory",
+            f"Removed {clean_quantity} x {clean_name} from party member {clean_npc_id}.",
+        )
+
+    def modify_party_inventory_item(
+        self,
+        *,
+        npc_id: str,
+        target_name: str,
+        new_name: str | None = None,
+        category: str | None = None,
+        description: str | None = None,
+        quantity: int | None = None,
+        value_base_units: int | None = None,
+        metadata: Any | None = None,
+    ) -> None:
+        """Modifies one item in a party member's dedicated inventory."""
+
+        clean_npc_id = npc_id.strip()
+        clean_target = target_name.strip()
+        if not clean_npc_id or not clean_target:
+            return
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT id, name, category, description, quantity, equipped,
+                       equipment_slot, storage_location, value_base_units, metadata_json
+                FROM party_inventory_items
+                WHERE npc_id = ? AND name = ? COLLATE NOCASE
+                ORDER BY id ASC LIMIT 1
+                """,
+                (clean_npc_id, clean_target),
+            ).fetchone()
+            if row is None:
+                LOGGER.warning(
+                    "Attempted to modify missing party inventory item %s for %s.",
+                    clean_target,
+                    clean_npc_id,
+                )
+                return
+            updated_name = (
+                new_name.strip() if isinstance(new_name, str) and new_name.strip()
+                else str(row["name"])
+            )
+            updated_category = (
+                category.strip() if isinstance(category, str) and category.strip()
+                else str(row["category"])
+            )
+            updated_description = (
+                description.strip()
+                if isinstance(description, str) and description.strip()
+                else str(row["description"])
+            )
+            updated_quantity = (
+                max(1, int(quantity)) if quantity is not None and int(quantity) > 0
+                else int(row["quantity"])
+            )
+            updated_value = (
+                max(0, int(value_base_units))
+                if value_base_units is not None and int(value_base_units) >= 0
+                else int(row["value_base_units"])
+            )
+            existing_metadata = _decode_json_dict(
+                row["metadata_json"], "party inventory item metadata"
+            )
+            updates = metadata if isinstance(metadata, dict) else {}
+            merged_metadata = {**existing_metadata, **updates}
+            normalized_metadata = normalize_item_metadata(
+                merged_metadata,
+                name=updated_name,
+                category=updated_category,
+                description=updated_description,
+            )
+            normalized_metadata["quantity_unit"] = _inventory_quantity_unit(merged_metadata)
+            normalized_metadata["storage_location"] = (
+                _inventory_storage_location(merged_metadata)
+                if "storage_location" in merged_metadata
+                else _clean_storage_location(row["storage_location"])
+            )
+            normalized_metadata["item_uuid"] = (
+                str(merged_metadata.get("item_uuid", "")).strip() or str(uuid.uuid4())
+            )
+            equipped = _safe_bool(
+                merged_metadata.get("equipped"),
+                default=bool(row["equipped"]),
+            )
+            equipment_slot = str(
+                merged_metadata.get(
+                    "equipment_slot",
+                    merged_metadata.get("slot", row["equipment_slot"]),
+                )
+                or ""
+            ).strip()
+            connection.execute(
+                """
+                UPDATE party_inventory_items
+                SET name = ?, category = ?, quantity = ?, equipped = ?,
+                    equipment_slot = ?, storage_location = ?, description = ?,
+                    value_base_units = ?, metadata_json = ?
+                WHERE id = ?
+                """,
+                (
+                    updated_name,
+                    updated_category,
+                    updated_quantity,
+                    int(equipped),
+                    equipment_slot,
+                    normalized_metadata["storage_location"],
+                    updated_description,
+                    updated_value,
+                    _encode_json_dict(normalized_metadata),
+                    row["id"],
+                ),
+            )
+            _upsert_item_catalog_entry(
+                connection,
+                name=updated_name,
+                category=updated_category,
+                description=updated_description,
+                value_base_units=updated_value,
+                metadata=normalized_metadata,
+            )
+        self.append_history(
+            "inventory",
+            f"Modified {clean_target} for party member {clean_npc_id}.",
+        )
 
     def list_relevant_npcs(
         self,
@@ -3185,16 +3558,65 @@ class SaveRepository:
         with self._connect() as connection:
             rows = connection.execute(
                 """
-                SELECT misc_id, name, category, details, created_at, updated_at
-                FROM miscellaneous
-                WHERE LOWER(TRIM(category)) IN (
-                    'creature', 'creatures', 'monster', 'monsters', 'beast', 'beasts'
-                )
-                ORDER BY name COLLATE NOCASE, misc_id
+                SELECT creature_id, name, details, created_at, updated_at
+                FROM bestiary
+                ORDER BY name COLLATE NOCASE, creature_id
                 """
             ).fetchall()
 
-        return [_miscellaneous_row_to_dict(row) for row in rows]
+        return [_bestiary_row_to_dict(row) for row in rows]
+
+    def upsert_bestiary_entry(
+        self,
+        *,
+        name: str,
+        details: str,
+        creature_id: str = "",
+    ) -> dict[str, Any] | None:
+        """Creates or replaces one player-known creature record."""
+
+        clean_name = " ".join(name.strip().split())
+        clean_details = details.strip()
+        if not clean_name or not clean_details:
+            LOGGER.warning("Skipped Bestiary upsert without name and details.")
+            return None
+
+        clean_creature_id = _bestiary_id(creature_id or clean_name)
+        timestamp = datetime.now().isoformat(timespec="seconds")
+        with self._connect() as connection:
+            existing = connection.execute(
+                "SELECT created_at FROM bestiary WHERE creature_id = ?",
+                (clean_creature_id,),
+            ).fetchone()
+            created_at = timestamp if existing is None else str(existing["created_at"])
+            connection.execute(
+                """
+                INSERT INTO bestiary (
+                    creature_id, name, details, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(creature_id) DO UPDATE SET
+                    name = excluded.name,
+                    details = excluded.details,
+                    updated_at = excluded.updated_at
+                """,
+                (clean_creature_id, clean_name, clean_details, created_at, timestamp),
+            )
+
+        return self.get_bestiary_entry(clean_creature_id)
+
+    def get_bestiary_entry(self, creature_id: str) -> dict[str, Any] | None:
+        """Reads one player-known creature record by stable id."""
+
+        clean_creature_id = _bestiary_id(creature_id)
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT creature_id, name, details, created_at, updated_at
+                FROM bestiary WHERE creature_id = ?
+                """,
+                (clean_creature_id,),
+            ).fetchone()
+        return None if row is None else _bestiary_row_to_dict(row)
 
     @staticmethod
     def create_message_id() -> str:
@@ -3467,6 +3889,205 @@ class SaveRepository:
             )
             history.append(entry)
         return history
+
+    def ensure_visual_asset(
+        self,
+        *,
+        asset_id: str,
+        subject_type: str,
+        subject_key: str,
+        display_name: str,
+        descriptor_hash: str,
+        filename: str,
+        prompt: str,
+        model: str,
+        message_ids: tuple[str, ...] | list[str] = (),
+        ready: bool = False,
+    ) -> dict[str, Any]:
+        """Creates one versioned visual-asset record and links related messages."""
+
+        clean_asset_id = str(asset_id or "").strip()
+        clean_subject_type = str(subject_type or "").strip().casefold()
+        clean_subject_key = str(subject_key or "").strip().casefold()
+        filename_path = Path(str(filename or ""))
+        clean_filename = filename_path.as_posix()
+        if (
+            not clean_asset_id
+            or clean_subject_type not in {"player", "location", "inventory", "npc"}
+            or not clean_subject_key
+            or not clean_filename
+            or filename_path.is_absolute()
+            or ".." in filename_path.parts
+        ):
+            raise ValueError("Visual assets require a valid id, subject, key, and filename.")
+
+        timestamp = datetime.now().isoformat(timespec="seconds")
+        requested_status = "ready" if ready else "queued"
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO visual_assets (
+                    asset_id, subject_type, subject_key, display_name,
+                    descriptor_hash, filename, prompt, model, status,
+                    error_message, width, height, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, '', 0, 0, ?, ?)
+                ON CONFLICT(asset_id) DO UPDATE SET
+                    display_name = excluded.display_name,
+                    filename = excluded.filename,
+                    prompt = excluded.prompt,
+                    model = excluded.model,
+                    status = CASE
+                        WHEN visual_assets.status = 'ready' THEN 'ready'
+                        WHEN excluded.status = 'ready' THEN 'ready'
+                        ELSE visual_assets.status
+                    END,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    clean_asset_id,
+                    clean_subject_type,
+                    clean_subject_key,
+                    str(display_name or "").strip(),
+                    str(descriptor_hash or "").strip(),
+                    clean_filename,
+                    str(prompt or "").strip(),
+                    str(model or "").strip(),
+                    requested_status,
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            for message_id in message_ids:
+                clean_message_id = str(message_id or "").strip()
+                if not clean_message_id:
+                    continue
+                connection.execute(
+                    """
+                    INSERT OR IGNORE INTO message_visual_assets (message_id, asset_id)
+                    VALUES (?, ?)
+                    """,
+                    (clean_message_id, clean_asset_id),
+                )
+            row = connection.execute(
+                "SELECT * FROM visual_assets WHERE asset_id = ?",
+                (clean_asset_id,),
+            ).fetchone()
+        return dict(row) if row is not None else {}
+
+    def set_visual_asset_status(
+        self,
+        asset_id: str,
+        status: str,
+        *,
+        error_message: str = "",
+        width: int = 0,
+        height: int = 0,
+    ) -> None:
+        """Updates one image generation record after worker completion."""
+
+        clean_status = str(status or "").strip().casefold()
+        if clean_status not in {"queued", "generating", "ready", "failed"}:
+            raise ValueError(f"Unsupported visual asset status: {status}")
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE visual_assets
+                SET status = ?,
+                    error_message = ?,
+                    width = ?,
+                    height = ?,
+                    generation_requested = CASE
+                        WHEN ? = 'generating' THEN generation_requested + 1
+                        ELSE generation_requested
+                    END,
+                    updated_at = ?
+                WHERE asset_id = ?
+                """,
+                (
+                    clean_status,
+                    str(error_message or "").strip()[:500],
+                    max(0, int(width)),
+                    max(0, int(height)),
+                    clean_status,
+                    datetime.now().isoformat(timespec="seconds"),
+                    str(asset_id or "").strip(),
+                ),
+            )
+
+    def get_visual_asset(self, subject_type: str, subject_key: str) -> dict[str, Any] | None:
+        """Returns the newest ready image for one visible subject."""
+
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM visual_assets
+                WHERE subject_type = ? AND subject_key = ? AND status = 'ready'
+                ORDER BY updated_at DESC, created_at DESC
+                LIMIT 1
+                """,
+                (
+                    str(subject_type or "").strip().casefold(),
+                    str(subject_key or "").strip().casefold(),
+                ),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def list_visual_assets_for_message(self, message_id: str) -> list[dict[str, Any]]:
+        """Returns ready images linked to one conversation turn."""
+
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT va.*
+                FROM message_visual_assets AS mva
+                JOIN visual_assets AS va ON va.asset_id = mva.asset_id
+                WHERE mva.message_id = ? AND va.status = 'ready'
+                ORDER BY
+                    CASE va.subject_type
+                        WHEN 'player' THEN 0
+                        WHEN 'location' THEN 1
+                        WHEN 'npc' THEN 2
+                        ELSE 3
+                    END,
+                    va.display_name COLLATE NOCASE
+                """,
+                (str(message_id or "").strip(),),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_visual_asset_by_id(self, asset_id: str) -> dict[str, Any] | None:
+        """Returns one exact visual-asset version regardless of status."""
+
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM visual_assets WHERE asset_id = ?",
+                (str(asset_id or "").strip(),),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def visual_asset_generation_count(self) -> int:
+        """Returns the total paid generation attempts recorded for this save."""
+
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT COALESCE(SUM(generation_requested), 0) AS count FROM visual_assets"
+            ).fetchone()
+        return int(row["count"]) if row is not None else 0
+
+    def reset_failed_visual_assets(self) -> int:
+        """Requeues failed images only when the player explicitly requests a retry."""
+
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE visual_assets
+                SET status = 'queued', error_message = '', updated_at = ?
+                WHERE status = 'failed'
+                """,
+                (datetime.now().isoformat(timespec="seconds"),),
+            )
+        return max(0, int(cursor.rowcount))
 
     def capture_message_snapshot(self, message_id: str) -> None:
         """Captures the complete database state immediately before one response."""
@@ -3930,25 +4551,29 @@ class SaveRepository:
     def get_travel_locations(self) -> list[dict[str, Any]]:
         """Reads structured player-known locations used by the Travel screen."""
 
-        return [
-            location.to_dict()
-            for location in normalize_known_locations(
-                self.get_setting("travel.locations", [])
-            )
-        ]
+        raw_locations = self.get_setting("travel.locations", [])
+        locations = ensure_location_ids(normalize_known_locations(raw_locations))
+        serialized = [location.to_dict() for location in locations]
+        if raw_locations != serialized:
+            self.set_setting("travel.locations", serialized)
+        return serialized
 
     def set_travel_locations(self, locations: Any) -> None:
         """Stores normalized structured player-known travel locations."""
 
+        normalized = ensure_location_ids(normalize_known_locations(locations))
         self.set_setting(
             "travel.locations",
-            [location.to_dict() for location in normalize_known_locations(locations)],
+            [location.to_dict() for location in normalized],
         )
 
     def ensure_travel_locations(self) -> list[dict[str, Any]]:
         """Bootstraps travel data from the current scene when needed."""
 
-        locations = normalize_known_locations(self.get_setting("travel.locations", []))
+        locations = [
+            normalize_known_location(location) for location in self.get_travel_locations()
+        ]
+        locations = [location for location in locations if location is not None]
         indexes_by_name = {
             location.name.casefold(): index for index, location in enumerate(locations)
         }
@@ -3962,6 +4587,7 @@ class SaveRepository:
             locations.append(
                 KnownLocation(
                     name=current_location,
+                    location_id=f"loc_{uuid.uuid4().hex}",
                     description="Current player location.",
                     x_miles=0.0 if not locations else None,
                     y_miles=0.0 if not locations else None,
@@ -3973,6 +4599,15 @@ class SaveRepository:
             self.set_travel_locations([location.to_dict() for location in locations])
 
         return [location.to_dict() for location in locations]
+
+    def get_player_id(self) -> str:
+        """Returns the save-scoped stable identity for the player character."""
+
+        player_id = str(self.get_setting("player.id", "") or "").strip()
+        if not player_id:
+            player_id = f"player_{uuid.uuid4().hex}"
+            self.set_setting("player.id", player_id)
+        return player_id
 
     def find_travel_location(self, name: str) -> dict[str, Any] | None:
         """Finds one structured location by its player-visible name."""
@@ -4085,6 +4720,7 @@ class SaveRepository:
         """Stores normalized save-specific AI behavior modes."""
 
         settings = normalize_ai_mode_preferences(raw_settings)
+        self.set_setting("ai.text_model", settings["text_model"])
         self.set_setting(
             "ai.model_intelligence",
             settings["model_intelligence"],
@@ -4430,13 +5066,30 @@ class SaveRepository:
                     metadata_json TEXT NOT NULL DEFAULT '{}'
                 );
 
+                CREATE TABLE IF NOT EXISTS party_inventory_items (
+                    id TEXT PRIMARY KEY NOT NULL DEFAULT ('rec_' || lower(hex(randomblob(16)))),
+                    npc_id TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    category TEXT NOT NULL DEFAULT '',
+                    quantity INTEGER NOT NULL DEFAULT 1,
+                    equipped INTEGER NOT NULL DEFAULT 0,
+                    equipment_slot TEXT NOT NULL DEFAULT '',
+                    storage_location TEXT NOT NULL DEFAULT 'on_person',
+                    description TEXT NOT NULL DEFAULT '',
+                    value_base_units INTEGER NOT NULL DEFAULT 0,
+                    metadata_json TEXT NOT NULL DEFAULT '{}',
+                    FOREIGN KEY (npc_id) REFERENCES npcs(npc_id) ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_party_inventory_owner
+                ON party_inventory_items(npc_id, name COLLATE NOCASE);
+
                 CREATE TABLE IF NOT EXISTS item_catalog (
                     id TEXT PRIMARY KEY NOT NULL DEFAULT ('rec_' || lower(hex(randomblob(16)))),
                     name TEXT NOT NULL UNIQUE COLLATE NOCASE,
                     category TEXT NOT NULL DEFAULT '',
                     description TEXT NOT NULL DEFAULT '',
                     value_base_units INTEGER NOT NULL DEFAULT 0,
-                    ascii_art TEXT NOT NULL DEFAULT '',
                     metadata_json TEXT NOT NULL DEFAULT '{}',
                     first_seen_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
@@ -4586,6 +5239,9 @@ class SaveRepository:
                     location TEXT NOT NULL DEFAULT '',
                     public_description TEXT NOT NULL DEFAULT '',
                     player_facing_information TEXT NOT NULL DEFAULT '',
+                    gender_identity TEXT NOT NULL DEFAULT '',
+                    age TEXT NOT NULL DEFAULT '',
+                    species TEXT NOT NULL DEFAULT '',
                     knowledge_scope_json TEXT NOT NULL DEFAULT '[]',
                     known_facts_json TEXT NOT NULL DEFAULT '[]',
                     disposition TEXT NOT NULL DEFAULT '',
@@ -4658,10 +5314,52 @@ class SaveRepository:
                     value_json TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS visual_assets (
+                    asset_id TEXT PRIMARY KEY,
+                    subject_type TEXT NOT NULL,
+                    subject_key TEXT NOT NULL,
+                    display_name TEXT NOT NULL,
+                    descriptor_hash TEXT NOT NULL,
+                    filename TEXT NOT NULL,
+                    prompt TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'queued',
+                    error_message TEXT NOT NULL DEFAULT '',
+                    width INTEGER NOT NULL DEFAULT 0,
+                    height INTEGER NOT NULL DEFAULT 0,
+                    generation_requested INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS bestiary (
+                    creature_id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    details TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_visual_assets_subject
+                ON visual_assets(subject_type, subject_key, updated_at);
+
+                CREATE TABLE IF NOT EXISTS message_visual_assets (
+                    message_id TEXT NOT NULL,
+                    asset_id TEXT NOT NULL,
+                    PRIMARY KEY (message_id, asset_id),
+                    FOREIGN KEY (asset_id) REFERENCES visual_assets(asset_id) ON DELETE CASCADE
+                );
+
                 DROP TABLE IF EXISTS alchemy_notes;
                 DROP TABLE IF EXISTS alchemy_reagents;
                 DROP TABLE IF EXISTS alchemy_recipes;
                 """
+            )
+            _ensure_column(
+                connection,
+                "visual_assets",
+                "generation_requested",
+                "INTEGER NOT NULL DEFAULT 0",
             )
             _ensure_column(
                 connection,
@@ -4757,6 +5455,24 @@ class SaveRepository:
                 connection,
                 "npcs",
                 "player_facing_information",
+                "TEXT NOT NULL DEFAULT ''",
+            )
+            _ensure_column(
+                connection,
+                "npcs",
+                "gender_identity",
+                "TEXT NOT NULL DEFAULT ''",
+            )
+            _ensure_column(
+                connection,
+                "npcs",
+                "age",
+                "TEXT NOT NULL DEFAULT ''",
+            )
+            _ensure_column(
+                connection,
+                "npcs",
+                "species",
                 "TEXT NOT NULL DEFAULT ''",
             )
             _ensure_column(
@@ -5077,6 +5793,13 @@ def _miscellaneous_id(value: str) -> str:
     return (cleaned or "unnamed_miscellaneous_entry")[:100]
 
 
+def _bestiary_id(value: str) -> str:
+    """Builds a stable id for one Bestiary creature."""
+
+    cleaned = "_".join(str(value).strip().casefold().split())
+    return (cleaned or "unnamed_creature")[:100]
+
+
 def _normalize_miscellaneous_category(value: str) -> str:
     """Normalizes public creature-lore aliases into the Bestiary category."""
 
@@ -5371,11 +6094,6 @@ def _upsert_item_catalog_entry(
     clean_description = description.strip()
     clean_value = max(0, _safe_int(value_base_units, default=0) or 0)
     raw_metadata = metadata if isinstance(metadata, dict) else {}
-    clean_ascii_art = ensure_substantive_ascii_art(
-        raw_metadata.get("ascii_art", ""),
-        item_name=clean_name,
-        category=clean_category,
-    )
     clean_metadata = normalize_item_metadata(
         metadata,
         name=clean_name,
@@ -5390,7 +6108,7 @@ def _upsert_item_catalog_entry(
     now = datetime.now().isoformat(timespec="seconds")
     row = connection.execute(
         """
-        SELECT id, category, description, value_base_units, ascii_art, metadata_json, first_seen_at
+        SELECT id, category, description, value_base_units, metadata_json, first_seen_at
         FROM item_catalog
         WHERE name = ? COLLATE NOCASE
         ORDER BY id ASC
@@ -5407,19 +6125,17 @@ def _upsert_item_catalog_entry(
                 category,
                 description,
                 value_base_units,
-                ascii_art,
                 metadata_json,
                 first_seen_at,
                 updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 clean_name,
                 clean_category,
                 clean_description,
                 clean_value,
-                clean_ascii_art,
                 metadata_json,
                 now,
                 now,
@@ -5427,15 +6143,6 @@ def _upsert_item_catalog_entry(
         )
         return
 
-    resolved_ascii_art = (
-        clean_ascii_art
-        if is_substantive_ascii_art(raw_metadata.get("ascii_art", ""))
-        else ensure_substantive_ascii_art(
-            row["ascii_art"],
-            item_name=clean_name,
-            category=clean_category or str(row["category"]),
-        )
-    )
     existing_metadata = _decode_json_dict(
         row["metadata_json"],
         "item catalog metadata",
@@ -5453,7 +6160,6 @@ def _upsert_item_catalog_entry(
             category = ?,
             description = ?,
             value_base_units = ?,
-            ascii_art = ?,
             metadata_json = ?,
             updated_at = ?
         WHERE id = ?
@@ -5463,10 +6169,7 @@ def _upsert_item_catalog_entry(
             clean_category or str(row["category"]),
             clean_description or str(row["description"]),
             clean_value if clean_value > 0 else int(row["value_base_units"]),
-            resolved_ascii_art,
-            metadata_json
-            if clean_metadata.get("item_type") != "Item"
-            else str(row["metadata_json"]),
+            metadata_json,
             now,
             row["id"],
         ),
@@ -5489,11 +6192,6 @@ def _inventory_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
     normalized_metadata["quantity_unit"] = metadata["quantity_unit"]
     normalized_metadata["storage_location"] = storage_location
     normalized_metadata["item_uuid"] = str(metadata.get("item_uuid", "")).strip()
-    normalized_metadata["ascii_art"] = ensure_substantive_ascii_art(
-        metadata.get("ascii_art", ""),
-        item_name=str(row["name"]),
-        category=str(row["category"]),
-    )
     return {
         "id": row["id"],
         "name": row["name"],
@@ -5526,11 +6224,6 @@ def _item_catalog_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
         "category": row["category"],
         "description": row["description"],
         "value_base_units": row["value_base_units"],
-        "ascii_art": ensure_substantive_ascii_art(
-            row["ascii_art"],
-            item_name=str(row["name"]),
-            category=str(row["category"]),
-        ),
         "metadata": normalized_metadata,
         "first_seen_at": row["first_seen_at"],
         "updated_at": row["updated_at"],
@@ -5549,6 +6242,9 @@ def _npc_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
         "location": row["location"],
         "public_description": row["public_description"],
         "player_facing_information": row["player_facing_information"],
+        "gender_identity": row["gender_identity"],
+        "age": row["age"],
+        "species": row["species"],
         "knowledge_scope": _decode_string_list(
             row["knowledge_scope_json"],
             "npc knowledge scope",
@@ -5571,6 +6267,9 @@ def _party_member_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
         "location": row["location"],
         "description": row["public_description"],
         "notes": row["player_facing_information"],
+        "gender_identity": row["gender_identity"],
+        "age": row["age"],
+        "species": row["species"],
         "status": row["status"],
         "health_current": row["health_current"],
         "health_max": row["health_max"],
@@ -5579,6 +6278,42 @@ def _party_member_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
         "skills": _decode_string_list(row["skills_json"], "party skills"),
         "party_created_at": row["party_created_at"],
         "party_updated_at": row["party_updated_at"],
+    }
+
+
+def _party_inventory_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    """Converts a dedicated party-inventory row to a player-safe dictionary."""
+
+    metadata = _decode_json_dict(
+        row["metadata_json"],
+        "party inventory item metadata",
+    )
+    metadata["quantity_unit"] = _inventory_quantity_unit(metadata)
+    storage_location = _clean_storage_location(row["storage_location"])
+    metadata["storage_location"] = storage_location
+    metadata["item_uuid"] = str(metadata.get("item_uuid", "")).strip()
+    normalized_metadata = normalize_item_metadata(
+        metadata,
+        name=str(row["name"]),
+        category=str(row["category"]),
+        description=str(row["description"]),
+    )
+    normalized_metadata["quantity_unit"] = metadata["quantity_unit"]
+    normalized_metadata["storage_location"] = storage_location
+    normalized_metadata["item_uuid"] = metadata["item_uuid"]
+    return {
+        "id": row["id"],
+        "npc_id": row["npc_id"],
+        "name": row["name"],
+        "category": row["category"],
+        "quantity": row["quantity"],
+        "quantity_unit": metadata["quantity_unit"],
+        "storage_location": storage_location,
+        "equipped": bool(row["equipped"]),
+        "equipment_slot": row["equipment_slot"],
+        "description": row["description"],
+        "value_base_units": row["value_base_units"],
+        "metadata": normalized_metadata,
     }
 
 
@@ -5710,6 +6445,18 @@ def _miscellaneous_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
         "details": row["details"],
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
+    }
+
+
+def _bestiary_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    """Converts a Bestiary row to a plain dictionary."""
+
+    return {
+        "creature_id": str(row["creature_id"]),
+        "name": str(row["name"]),
+        "details": str(row["details"]),
+        "created_at": str(row["created_at"]),
+        "updated_at": str(row["updated_at"]),
     }
 
 

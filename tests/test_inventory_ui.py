@@ -3,14 +3,17 @@ from __future__ import annotations
 from copy import deepcopy
 import os
 import tempfile
+import threading
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, cast
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QEventLoop, QThread, QTime, QTimer, Qt
+from PySide6.QtGui import QColor, QImage
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -32,12 +35,15 @@ from PySide6.QtWidgets import (
 )
 
 from ai_adventure.persistence.save_repository import SaveRepository
+from ai_adventure.new_game_setup import normalize_new_game_setup
 from ai_adventure.new_game_templates import (
     load_new_game_templates,
     save_new_game_template,
 )
 from ai_adventure.ui.main_window import (
     _DetachedTabWindow,
+    _GeminiNewGameWorker,
+    AISettingsDialog,
     AlchemyNotebookScreen,
     BestiaryScreen,
     CalendarPlayerEventDialog,
@@ -49,6 +55,7 @@ from ai_adventure.ui.main_window import (
     InventoryLocationPanel,
     InventoryScreen,
     MagicScreen,
+    MainWindow,
     NewGameTemplateManagerDialog,
     NewGameWizard,
     NpcsScreen,
@@ -66,6 +73,120 @@ class InventoryUiTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.app = QApplication.instance() or QApplication([])
+
+    def test_new_game_gemini_worker_keeps_qt_event_loop_responsive(self) -> None:
+        test_case = self
+        release_request = threading.Event()
+        heartbeat_seen: list[bool] = []
+        request_threads: list[QThread] = []
+        result_marker = object()
+        results: list[object] = []
+        service_models: list[object] = []
+        setup_packet = {
+            "title": "Threaded New Game",
+            "player_ai_preferences": {"text_model": "gemini-3.7-flash"},
+        }
+
+        class FakeGeminiService:
+            def __init__(self, **kwargs: object) -> None:
+                service_models.append(kwargs.get("model"))
+
+            def generate_new_game_world(self, packet: dict[str, Any]) -> object:
+                request_threads.append(QThread.currentThread())
+                if not release_request.wait(timeout=2):
+                    raise TimeoutError("Qt event loop did not remain responsive.")
+                test_case.assertEqual(packet, setup_packet)
+                return result_marker
+
+        thread = QThread()
+        worker = _GeminiNewGameWorker(setup_packet)
+        worker.moveToThread(thread)
+        event_loop = QEventLoop()
+
+        thread.started.connect(worker.run)
+        worker.completed.connect(results.append)
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(event_loop.quit)
+
+        def record_heartbeat() -> None:
+            heartbeat_seen.append(True)
+            release_request.set()
+
+        with patch(
+            "ai_adventure.ui.main_window.GeminiNarrationService",
+            FakeGeminiService,
+        ):
+            thread.start()
+            QTimer.singleShot(0, record_heartbeat)
+            QTimer.singleShot(3000, event_loop.quit)
+            event_loop.exec()
+
+        self.assertTrue(thread.wait(1000))
+        self.assertEqual(heartbeat_seen, [True])
+        self.assertEqual(results, [result_marker])
+        self.assertEqual(service_models, ["gemini-3.7-flash"])
+        self.assertEqual(len(request_threads), 1)
+        self.assertIsNot(request_threads[0], self.app.thread())
+
+    def test_new_game_saves_unused_template_before_gemini_generation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            template_path = temp_path / "new_game_templates.json"
+            repository = SimpleNamespace(set_setting=Mock())
+            observed_template_names: list[str] = []
+
+            window = SimpleNamespace(
+                app_paths=SimpleNamespace(
+                    saves_dir=temp_path / "saves",
+                    new_game_templates_path=template_path,
+                    legacy_new_game_template_path=temp_path / "new_game_template.json",
+                ),
+                menu_theme="dark",
+                ai_enabled=True,
+                game_shell=SimpleNamespace(
+                    story_screen=SimpleNamespace(
+                        set_initial_generation_pending=Mock()
+                    ),
+                    menu_button=SimpleNamespace(setEnabled=Mock()),
+                ),
+            )
+            window._normalize_new_game_setup_for_runtime = normalize_new_game_setup
+            window.open_repository = Mock()
+
+            def start_generation(_repository: object, _setup: object) -> None:
+                observed_template_names.extend(
+                    template.name
+                    for template in load_new_game_templates(
+                        template_path,
+                        normalize_setups=False,
+                    )
+                )
+
+            window._start_new_game_generation = start_generation
+
+            with patch.object(
+                SaveRepository,
+                "create_new_save",
+                return_value=repository,
+            ):
+                MainWindow._create_new_game_from_setup(
+                    cast(MainWindow, window),
+                    {
+                        "title": "Gun Jam Online",
+                        "character": {"name": "Kit"},
+                        "specified_genre": "PvP, Combat, Tactical",
+                    },
+                    auto_save_template_if_available=True,
+                )
+
+            self.assertEqual(observed_template_names, ["Gun Jam Online"])
+            stored = load_new_game_templates(template_path, normalize_setups=False)
+            self.assertEqual(stored[0].setup["character"]["name"], "Kit")
+            self.assertEqual(
+                stored[0].setup["specified_genre"],
+                "PvP, Combat, Tactical",
+            )
 
     def test_new_game_wizard_supports_maximize_and_quest_guidance(self) -> None:
         wizard = NewGameWizard(tts_enabled=False)
@@ -118,6 +239,63 @@ class InventoryUiTests(unittest.TestCase):
             "Begin with a mystery involving a missing courier.",
         )
         wizard.close()
+
+    def test_new_game_wizard_has_dedicated_ga_model_settings_page(self) -> None:
+        wizard = NewGameWizard(tts_enabled=False)
+        page_titles = [wizard.page(page_id).title() for page_id in wizard.pageIds()]
+
+        self.assertEqual(page_titles[:2], ["Adventure", "A.I. Settings"])
+        self.assertFalse(hasattr(wizard, "ai_settings_button"))
+        self.assertEqual(wizard.text_model_combo.count(), 8)
+        self.assertEqual(wizard.image_model_combo.count(), 4)
+        self.assertEqual(wizard.image_style_combo.count(), 12)
+
+        text_index = wizard.text_model_combo.findData("gemini-3.7-flash")
+        image_index = wizard.image_model_combo.findData("gemini-3-pro-image")
+        style_index = wizard.image_style_combo.findData("oil_painting")
+        wizard.text_model_combo.setCurrentIndex(text_index)
+        wizard.image_model_combo.setCurrentIndex(image_index)
+        wizard.image_style_combo.setCurrentIndex(style_index)
+        wizard.smarter_ai_checkbox.setChecked(True)
+        wizard.generated_images_enabled_checkbox.setChecked(False)
+        wizard.additional_ai_context_input.setPlainText("Keep the pacing tense.")
+        self.app.processEvents()
+
+        self.assertIn("next iteration", wizard.text_model_description.text())
+        self.assertIn("professional-grade", wizard.image_model_description.text())
+        self.assertIn("visible brushwork", wizard.image_style_description.text())
+        self.assertFalse(wizard.image_model_combo.isEnabled())
+        self.assertFalse(wizard.image_style_combo.isEnabled())
+        setup = wizard.build_setup()
+        self.assertEqual(setup["ai_settings"]["text_model"], "gemini-3.7-flash")
+        self.assertEqual(setup["ai_settings"]["model_intelligence"], "smarter")
+        self.assertEqual(
+            setup["ai_settings"]["additional_context"],
+            "Keep the pacing tense.",
+        )
+        self.assertEqual(
+            setup["images"],
+            {
+                "enabled": False,
+                "model": "gemini-3-pro-image",
+                "style": "oil_painting",
+            },
+        )
+        wizard.close()
+
+    def test_in_game_ai_settings_dialog_keeps_existing_mode_controls(self) -> None:
+        dialog = AISettingsDialog()
+
+        self.assertEqual(dialog.model_intelligence_combo.count(), 2)
+        self.assertEqual(
+            [
+                dialog.model_intelligence_combo.itemText(index)
+                for index in range(dialog.model_intelligence_combo.count())
+            ],
+            ["Faster", "Smarter"],
+        )
+        self.assertFalse(hasattr(dialog, "text_model_combo"))
+        dialog.close()
 
     def test_template_selection_reuses_widgets_without_mutating_templates(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -258,6 +436,33 @@ class InventoryUiTests(unittest.TestCase):
         )
         wizard.close()
 
+    def test_new_game_wizard_builds_authoritative_start_conditions(self) -> None:
+        wizard = NewGameWizard(tts_enabled=False)
+        wizard.calendar_start_year_input.setValue(3)
+        wizard.calendar_start_month_input.setValue(2)
+        wizard.calendar_start_day_input.setValue(6)
+        wizard.calendar_start_time_checkbox.setChecked(True)
+        wizard.calendar_start_time_input.setTime(QTime(21, 15))
+        wizard.calendar_start_weather_input.setText("Heavy Snow")
+        wizard.background_ambience_enabled_checkbox.setChecked(True)
+        wizard.background_ambience_volume_slider.setValue(12)
+
+        setup = wizard.build_setup()
+
+        self.assertEqual(
+            setup["starting_calendar"],
+            {
+                "year": 3,
+                "month_number": 2,
+                "day_of_month": 6,
+                "time_of_day_minutes": 1275,
+            },
+        )
+        self.assertEqual(setup["starting_weather"], "Heavy Snow")
+        self.assertTrue(setup["audio"]["background_ambience_enabled"])
+        self.assertEqual(setup["audio"]["background_ambience_volume"], 12)
+        wizard.close()
+
     def test_new_game_wizard_can_preview_a_sound_effect(self) -> None:
         class FakeSoundManager:
             def __init__(self) -> None:
@@ -289,6 +494,39 @@ class InventoryUiTests(unittest.TestCase):
 
         self.assertEqual(manager.effect_volume, 42)
         self.assertEqual(manager.effect_played, "Rain.wav")
+        wizard.close()
+
+    def test_new_game_wizard_can_preview_background_ambience(self) -> None:
+        class FakeSoundManager:
+            def __init__(self) -> None:
+                self.ambience_volume: float | int | None = None
+                self.ambience_played = ""
+
+            def get_valid_background_ambience_names(self) -> list[str]:
+                return ["Quiet Rain.ogg"]
+
+            def set_background_ambience_volume(
+                self,
+                volume: float | int | None,
+            ) -> None:
+                self.ambience_volume = volume
+
+            def play_background_ambience(
+                self,
+                track_name_or_path: str | Path | None,
+            ) -> None:
+                self.ambience_played = str(track_name_or_path or "")
+
+        manager = FakeSoundManager()
+        wizard = NewGameWizard(
+            tts_enabled=False,
+            sound_manager=cast(Any, manager),
+        )
+        wizard.background_ambience_volume_slider.setValue(18)
+        wizard.background_ambience_test_button.click()
+
+        self.assertEqual(manager.ambience_volume, 18)
+        self.assertEqual(manager.ambience_played, "Quiet Rain.ogg")
         wizard.close()
 
     def test_new_game_wizard_round_trips_magic_configuration(self) -> None:
@@ -846,16 +1084,311 @@ class InventoryUiTests(unittest.TestCase):
             self.assertNotIn("AI Game Master  |  Out-of-Game  |  Turn #2", headers)
             screen.close()
 
+    def test_story_speaker_cues_render_as_same_turn_named_bubbles(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = SaveRepository.create_new_save(
+                Path(temp_dir), "Speaker Bubble Test"
+            )
+            message_id = repository.create_message_id()
+            repository.capture_message_snapshot(message_id)
+            repository.append_history(
+                "story",
+                (
+                    'Rain taps the glass. "Stay close." The hooded figure points '
+                    'east. "Not that door." Silence returns.'
+                ),
+                message_id=message_id,
+                speaker_cues=[
+                    {
+                        "anchor_text": '"Stay close."',
+                        "speaker_id": "mira_coppercup",
+                        "speaker_name": "Mira",
+                        "voice_profile": "feminine",
+                        "voice_id": "af_sarah",
+                    },
+                    {
+                        "anchor_text": '"Not that door."',
+                        "speaker_id": "hooded_figure",
+                        "speaker_name": "Hooded Figure",
+                        "voice_profile": "neutral",
+                        "voice_id": "am_echo",
+                    },
+                ],
+            )
+            screen = StoryScreen()
+            screen.set_repository(repository)
+            screen.show()
+            self.app.processEvents()
+
+            headers = [
+                label.text()
+                for label in screen.findChildren(QLabel)
+                if "  |  Live Game  |  Turn #" in label.text()
+            ]
+
+            self.assertEqual(
+                headers,
+                [
+                    "AI Game Master  |  Live Game  |  Turn #1",
+                    "Mira  |  Live Game  |  Turn #1",
+                    "AI Game Master  |  Live Game  |  Turn #1",
+                    "Hooded Figure  |  Live Game  |  Turn #1",
+                    "AI Game Master  |  Live Game  |  Turn #1",
+                ],
+            )
+            self.assertEqual(
+                len(
+                    [
+                        button
+                        for button in screen.findChildren(QPushButton)
+                        if button.text() == "Regenerate"
+                    ]
+                ),
+                5,
+            )
+            screen.close()
+
+    def test_opening_message_has_no_image_grid_and_current_location_image_is_separate(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            repository = SaveRepository.create_new_save(root / "saves", "Opening Image Test")
+            repository.set_state_value("location", "Glass Market")
+            repository.set_travel_locations(
+                [
+                    {
+                        "location_id": "loc_glass_market",
+                        "name": "Glass Market",
+                        "description": "Blue awnings over wet stone.",
+                    }
+                ]
+            )
+            opening_id = repository.create_message_id()
+            opening_speaker_cue = {
+                "anchor_text": '"Welcome."',
+                "speaker_id": "market_keeper",
+                "speaker_name": "Market Keeper",
+                "voice_profile": "neutral",
+                "voice_id": "am_echo",
+            }
+            repository.append_history(
+                "story",
+                'Rain gathers beneath the awnings. "Welcome."',
+                message_id=opening_id,
+                speaker_cues=[opening_speaker_cue],
+            )
+
+            images_dir = root / "images"
+            image_path = images_dir / "location.jpg"
+            image_path.parent.mkdir(parents=True)
+            image = QImage(320, 180, QImage.Format.Format_RGB32)
+            image.fill(QColor(20, 80, 120))
+            self.assertTrue(image.save(str(image_path)))
+            npc_image = QImage(100, 125, QImage.Format.Format_RGB32)
+            npc_image.fill(QColor(120, 40, 40))
+            self.assertTrue(npc_image.save(str(images_dir / "market_keeper.jpg")))
+            repository.ensure_visual_asset(
+                asset_id="img_location_glass_market",
+                subject_type="location",
+                subject_key="loc_glass_market",
+                display_name="Glass Market",
+                descriptor_hash="location-hash",
+                filename="location.jpg",
+                prompt="location",
+                model="test",
+                message_ids=(opening_id,),
+                ready=True,
+            )
+            repository.ensure_visual_asset(
+                asset_id="img_npc_market_keeper",
+                subject_type="npc",
+                subject_key="market_keeper",
+                display_name="Market Keeper",
+                descriptor_hash="npc-hash",
+                filename="market_keeper.jpg",
+                prompt="portrait",
+                model="test",
+                message_ids=(opening_id,),
+                ready=True,
+            )
+
+            screen = StoryScreen()
+            screen.set_visual_assets_dir(images_dir)
+            screen.set_repository(repository)
+            screen.show()
+            self.app.processEvents()
+
+            self.assertTrue(screen.location_image_label.isVisible())
+            self.assertIsNotNone(screen.location_image_label.pixmap())
+            self.assertEqual(
+                len(screen.findChildren(QLabel, "conversationGeneratedImage")),
+                0,
+            )
+            portraits = screen.findChildren(QLabel, "conversationSpeakerPortrait")
+            self.assertEqual(len(portraits), 1)
+            self.assertEqual(
+                portraits[0].accessibleName(),
+                "Profile picture of Market Keeper",
+            )
+            screen.close()
+
+    def test_player_and_named_npc_messages_show_profile_portraits_but_narrator_does_not(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            repository = SaveRepository.create_new_save(root / "saves", "Portrait Test")
+            repository.set_setting("player.id", "player_test")
+            repository.append_history("story", "The scene opens.")
+            npc_message_id = repository.create_message_id()
+            speaker_cue = {
+                "anchor_text": '"Keep moving."',
+                "speaker_id": "mira_coppercup",
+                "speaker_name": "Mira",
+                "voice_profile": "feminine",
+                "voice_id": "af_sarah",
+            }
+            repository.append_history(
+                "story",
+                'Mira whispers, "Keep moving."',
+                message_id=npc_message_id,
+                speaker_cues=[speaker_cue],
+            )
+            repository.append_history("player", "I follow.")
+
+            images_dir = root / "images"
+            images_dir.mkdir(parents=True)
+            mira_image = QImage(100, 125, QImage.Format.Format_RGB32)
+            mira_image.fill(QColor(120, 40, 40))
+            self.assertTrue(mira_image.save(str(images_dir / "mira.jpg")))
+            player_image = QImage(100, 125, QImage.Format.Format_RGB32)
+            player_image.fill(QColor(40, 120, 40))
+            self.assertTrue(player_image.save(str(images_dir / "player.jpg")))
+            for asset_id, subject_type, subject_key, display_name, filename in (
+                ("img_mira", "npc", "mira_coppercup", "Mira", "mira.jpg"),
+                ("img_player", "player", "player_test", "Player", "player.jpg"),
+            ):
+                repository.ensure_visual_asset(
+                    asset_id=asset_id,
+                    subject_type=subject_type,
+                    subject_key=subject_key,
+                    display_name=display_name,
+                    descriptor_hash=asset_id,
+                    filename=filename,
+                    prompt="portrait",
+                    model="test",
+                    ready=True,
+                )
+
+            screen = StoryScreen()
+            screen.set_visual_assets_dir(images_dir)
+            screen.set_repository(repository)
+            self.app.processEvents()
+
+            portraits = screen.findChildren(QLabel, "conversationSpeakerPortrait")
+            self.assertEqual(len(portraits), 2)
+            self.assertEqual(
+                {portrait.accessibleName() for portrait in portraits},
+                {"Profile picture of Mira", "Profile picture of You"},
+            )
+            screen.close()
+
+    def test_named_speaker_bubble_reads_only_its_saved_voice_passage(self) -> None:
+        class FakeNarrationPlayer:
+            def __init__(self) -> None:
+                self.calls: list[dict[str, Any]] = []
+
+            def set_volume(self, _volume: float | int | None) -> None:
+                pass
+
+            def set_speed(self, _speed: float | int | None) -> None:
+                pass
+
+            def set_voice(self, _voice: str | None) -> None:
+                pass
+
+            def set_enabled(self, _enabled: bool) -> None:
+                pass
+
+            def play_sample(self, **kwargs: Any) -> bool:
+                self.calls.append(kwargs)
+                return True
+
+        speaker_cue = {
+            "anchor_text": '"Keep moving."',
+            "speaker_id": "mira_coppercup",
+            "speaker_name": "Mira",
+            "voice_profile": "feminine",
+            "voice_id": "af_sarah",
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = SaveRepository.create_new_save(
+                Path(temp_dir), "Speaker Bubble Replay Test"
+            )
+            repository.append_history(
+                "story",
+                'Mira leans close. "Keep moving." The footsteps grow louder.',
+                speaker_cues=[speaker_cue],
+            )
+            narrator = FakeNarrationPlayer()
+            screen = StoryScreen(narration_player=cast(Any, narrator))
+            screen.set_repository(repository)
+            self.app.processEvents()
+
+            speaker_header = next(
+                label
+                for label in screen.findChildren(QLabel)
+                if label.text() == "Mira  |  Live Game  |  Turn #1"
+            )
+            bubble = speaker_header.parentWidget()
+            self.assertIsNotNone(bubble)
+            assert bubble is not None
+            read_button = next(
+                button
+                for button in bubble.findChildren(QPushButton)
+                if button.text() == "Read Aloud"
+            )
+            read_button.click()
+
+            self.assertEqual(len(narrator.calls), 1)
+            self.assertEqual(narrator.calls[0]["text"], '"Keep moving."')
+            self.assertEqual(narrator.calls[0]["speaker_cues"], [speaker_cue])
+            screen.close()
+
+    def test_initial_generation_uses_neutral_status_placeholders(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = SaveRepository.create_new_save(
+                Path(temp_dir), "Pending Opening Test"
+            )
+            screen = StoryScreen()
+            screen.set_repository(repository)
+
+            screen.set_initial_generation_pending(True)
+
+            self.assertEqual(screen.location_value.text(), "---")
+            self.assertEqual(screen.day_value.text(), "---")
+            self.assertEqual(screen.time_value.text(), "---")
+            self.assertEqual(screen.weather_value.text(), "---")
+
+            screen.set_initial_generation_pending(False)
+
+            self.assertNotEqual(screen.location_value.text(), "---")
+            self.assertNotEqual(screen.day_value.text(), "---")
+            self.assertNotEqual(screen.time_value.text(), "---")
+            self.assertNotEqual(screen.weather_value.text(), "---")
+            screen.close()
+
     def test_saved_music_starts_without_replaying_a_sound_effect(self) -> None:
         class FakeSoundManager:
             def __init__(self) -> None:
                 self.music_played = ""
                 self.effect_played = ""
+                self.ambience_played = ""
 
             def get_valid_track_names(self) -> list[str]:
                 return []
 
             def get_valid_sound_effect_names(self) -> list[str]:
+                return []
+
+            def get_valid_background_ambience_names(self) -> list[str]:
                 return []
 
             def set_music_volume(self, volume: float | int | None) -> None:
@@ -868,6 +1401,15 @@ class InventoryUiTests(unittest.TestCase):
                 pass
 
             def set_sound_effects_enabled(self, enabled: bool) -> None:
+                pass
+
+            def set_background_ambience_volume(
+                self,
+                volume: float | int | None,
+            ) -> None:
+                pass
+
+            def set_background_ambience_enabled(self, enabled: bool) -> None:
                 pass
 
             def play_music(self, track_name_or_path: str | Path | None) -> None:
@@ -885,6 +1427,19 @@ class InventoryUiTests(unittest.TestCase):
             ) -> None:
                 self.effect_played = str(track_name_or_path or "")
 
+            def play_background_ambience(
+                self,
+                track_name_or_path: str | Path | None,
+            ) -> None:
+                self.ambience_played = str(track_name_or_path or "")
+
+            def stop_background_ambience(
+                self,
+                *,
+                clear_current: bool = True,
+            ) -> None:
+                pass
+
             def stop_music(self, *, clear_current: bool = True) -> None:
                 pass
 
@@ -894,6 +1449,10 @@ class InventoryUiTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             repository = SaveRepository.create_new_save(Path(temp_dir), "Audio Sync Test")
             repository.set_setting("audio.current_music", "Slow Jazz.mp3")
+            repository.set_setting(
+                "audio.current_background_ambience",
+                "Quiet Rain.ogg",
+            )
             manager = FakeSoundManager()
 
             _apply_audio_settings_to_managers(
@@ -904,6 +1463,7 @@ class InventoryUiTests(unittest.TestCase):
 
             self.assertEqual(manager.music_played, "Slow Jazz.mp3")
             self.assertEqual(manager.effect_played, "")
+            self.assertEqual(manager.ambience_played, "Quiet Rain.ogg")
 
     def test_latest_story_can_use_progressive_narration_with_pronunciations(self) -> None:
         class FakeNarrationPlayer:
@@ -997,6 +1557,38 @@ class InventoryUiTests(unittest.TestCase):
             self.assertEqual(transform("Ironpeak City wakes."), "Ironpeak City wakes.")
             screen.close()
 
+    def test_progressive_narration_updates_one_bubble_without_rebuilding_history(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = SaveRepository.create_new_save(
+                Path(temp_dir), "Progressive Render Test"
+            )
+            repository.append_history(
+                "story",
+                "First paragraph.\n\nSecond paragraph.",
+            )
+            story_id = int(repository.list_history()[-1]["id"])
+            screen = StoryScreen()
+            screen.set_repository(repository)
+            screen._revealing_story_id = story_id
+            screen._revealed_story_chunks = ["First paragraph."]
+            screen.refresh()
+            self.app.processEvents()
+
+            message = screen._progressive_story_message
+            self.assertIsNotNone(message)
+            assert message is not None
+
+            with patch.object(screen, "refresh", wraps=screen.refresh) as refresh:
+                screen._append_revealed_story_chunk(
+                    story_id,
+                    "\n\nSecond paragraph.",
+                )
+
+            self.assertFalse(refresh.called)
+            self.assertIs(screen._progressive_story_message, message)
+            self.assertIn("Second paragraph.", message.toPlainText())
+            screen.close()
+
     def test_read_aloud_replays_saved_passage_sound_effect_cues(self) -> None:
         class FakeNarrationPlayer:
             def __init__(self) -> None:
@@ -1041,6 +1633,13 @@ class InventoryUiTests(unittest.TestCase):
                 pass
 
             def stop_sound_effect(self, *, clear_current: bool = True) -> None:
+                pass
+
+            def stop_background_ambience(
+                self,
+                *,
+                clear_current: bool = True,
+            ) -> None:
                 pass
 
             def play_sound_effect(self, track: str | Path | None) -> None:
@@ -1320,10 +1919,9 @@ class InventoryUiTests(unittest.TestCase):
     def test_bestiary_screen_matches_travel_layout_without_action_button(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             repository = SaveRepository.create_new_save(Path(temp_dir), "Bestiary UI")
-            repository.upsert_miscellaneous(
-                misc_id="mist_strider",
+            repository.upsert_bestiary_entry(
+                creature_id="mist_strider",
                 name="Mist-Strider",
-                category="Creature",
                 details="A towering animal seen moving between the fog banks.",
             )
             repository.upsert_miscellaneous(
@@ -1445,6 +2043,26 @@ class InventoryUiTests(unittest.TestCase):
                 [shell.tabs.tabText(index) for index in range(shell.tabs.count())],
             )
             self.assertEqual(screen.table.rowCount(), 1)
+            header_texts = []
+            for index in range(screen.table.columnCount()):
+                header_item = screen.table.horizontalHeaderItem(index)
+                self.assertIsNotNone(header_item)
+                assert header_item is not None
+                header_texts.append(header_item.text())
+            self.assertEqual(
+                header_texts,
+                [
+                    "Name",
+                    "Status",
+                    "Health",
+                    "Armor Class",
+                    "Combat Style",
+                    "Skills",
+                    "Description",
+                    "Equipment",
+                    "Portrait",
+                ],
+            )
             name_item = screen.table.item(0, 0)
             health_item = screen.table.item(0, 2)
             armor_item = screen.table.item(0, 3)
@@ -1512,31 +2130,12 @@ class InventoryUiTests(unittest.TestCase):
                 denominations=screen._denominations,
                 parent=screen,
             )
-            art_view = cast(
-                QPlainTextEdit,
-                dialog.findChild(QPlainTextEdit, "inventoryAsciiArt"),
-            )
-
             self.assertTrue(dialog.isModal())
             self.assertEqual(
                 dialog.windowModality(),
                 Qt.WindowModality.ApplicationModal,
             )
-            self.assertIsNotNone(art_view)
-            self.assertIn("( N  )", art_view.toPlainText())
-            self.assertNotIn("\\n", art_view.toPlainText())
-            self.assertEqual(
-                art_view.document().firstBlock().blockFormat().alignment(),
-                Qt.AlignmentFlag.AlignCenter,
-            )
-            art_blocks = art_view.document().begin()
-            while art_blocks.isValid():
-                self.assertEqual(
-                    art_blocks.blockFormat().alignment(),
-                    Qt.AlignmentFlag.AlignCenter,
-                )
-                art_blocks = art_blocks.next()
-            self.assertGreater(art_view.viewportMargins().top(), 0)
+            self.assertIsNone(dialog.findChild(QPlainTextEdit, "inventoryAsciiArt"))
             dialog_labels = [label.text() for label in dialog.findChildren(QLabel)]
             self.assertNotIn("Item Art", dialog_labels)
             self.assertNotIn("Equipped:", dialog_labels)
@@ -1546,33 +2145,6 @@ class InventoryUiTests(unittest.TestCase):
             self.assertIsNone(
                 dialog.findChild(QLabel, "inventoryStructuredDetailsLabel")
             )
-            dialog_layout = cast(QVBoxLayout, dialog.layout())
-            art_layout_item = cast(
-                QLayoutItem,
-                dialog_layout.itemAt(dialog_layout.indexOf(art_view)),
-            )
-            self.assertIsNotNone(art_layout_item)
-            self.assertTrue(
-                art_layout_item.alignment()
-                & Qt.AlignmentFlag.AlignHCenter
-            )
-
-            tall_catalog_entry = dict(catalog_entry)
-            tall_catalog_entry["ascii_art"] = "\n".join(
-                f"line {index}" for index in range(10)
-            )
-            tall_dialog = InventoryItemDetailsDialog(
-                item=compass,
-                catalog_entry=tall_catalog_entry,
-                denominations=screen._denominations,
-                parent=screen,
-            )
-            tall_art_view = cast(
-                QPlainTextEdit,
-                tall_dialog.findChild(QPlainTextEdit, "inventoryAsciiArt"),
-            )
-            self.assertGreater(tall_art_view.height(), art_view.height())
-
             playtesting_dialog = InventoryItemDetailsDialog(
                 item=compass,
                 catalog_entry=catalog_entry,
@@ -1588,7 +2160,48 @@ class InventoryUiTests(unittest.TestCase):
             structured_details = cast(QPlainTextEdit, structured_details)
             self.assertIn("item_uuid", structured_details.toPlainText())
             playtesting_dialog.close()
-            tall_dialog.close()
+            dialog.close()
+            screen.close()
+
+    def test_npc_rows_open_resizable_player_visible_details(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = SaveRepository.create_new_save(Path(temp_dir), "NPC UI Test")
+            repository.upsert_npc(
+                npc_id="dock_warden",
+                name="Dock Warden",
+                display_name="Dock Warden",
+                role="Harbor guard",
+                location="Glass Market",
+                public_description="A broad woman in an orange rain cape.",
+                player_facing_information="Keeps order at the piers.",
+            )
+
+            screen = NpcsScreen()
+            screen.set_repository(repository)
+            self.app.processEvents()
+            self.assertEqual(screen.table.rowCount(), 1)
+            name_item = screen.table.item(0, 0)
+            self.assertIsNotNone(name_item)
+            assert name_item is not None
+            self.assertEqual(
+                name_item.data(Qt.ItemDataRole.UserRole),
+                "dock_warden",
+            )
+
+            with patch(
+                "ai_adventure.ui.main_window.NpcDetailsDialog.exec",
+                return_value=0,
+            ) as exec_dialog:
+                screen._open_npc_details(0, 0)
+
+            exec_dialog.assert_called_once()
+            dialog = exec_dialog.call_args.args[0]
+            self.assertTrue(dialog.isModal())
+            self.assertTrue(dialog.sizeGripEnabled())
+            self.assertEqual(
+                dialog.findChild(QTextEdit, "npcDetailDescription").toPlainText(),
+                "A broad woman in an orange rain cape.",
+            )
             dialog.close()
             screen.close()
 
@@ -1685,8 +2298,17 @@ class InventoryUiTests(unittest.TestCase):
             carried_panel.sort_direction_combo.setCurrentIndex(
                 carried_panel.sort_direction_combo.findData(True)
             )
+            carried_panel.secondary_sort_field_combo.setCurrentIndex(
+                carried_panel.secondary_sort_field_combo.findData("name")
+            )
+            carried_panel.secondary_sort_direction_combo.setCurrentIndex(
+                carried_panel.secondary_sort_direction_combo.findData(True)
+            )
             home_panel.sort_field_combo.setCurrentIndex(
                 home_panel.sort_field_combo.findData("category")
+            )
+            home_panel.secondary_sort_field_combo.setCurrentIndex(
+                home_panel.secondary_sort_field_combo.findData("quantity")
             )
             self.app.processEvents()
 
@@ -1728,9 +2350,81 @@ class InventoryUiTests(unittest.TestCase):
             carried_panel, home_panel = screen.location_panels
             self.assertEqual(carried_panel.sort_field_combo.currentData(), "price")
             self.assertEqual(carried_panel.sort_direction_combo.currentData(), True)
+            self.assertEqual(
+                carried_panel.secondary_sort_field_combo.currentData(),
+                "name",
+            )
+            self.assertEqual(
+                carried_panel.secondary_sort_direction_combo.currentData(),
+                True,
+            )
             self.assertEqual(home_panel.sort_field_combo.currentData(), "category")
             self.assertEqual(home_panel.sort_direction_combo.currentData(), False)
+            self.assertEqual(
+                home_panel.secondary_sort_field_combo.currentData(),
+                "quantity",
+            )
+            self.assertEqual(
+                home_panel.secondary_sort_direction_combo.currentData(),
+                False,
+            )
             screen.close()
+
+    def test_primary_and_secondary_inventory_sort_directions_are_independent(self) -> None:
+        items = [
+            {
+                "name": "Sickle",
+                "category": "Weapon",
+                "quantity": 1,
+                "value_base_units": 6,
+            },
+            {
+                "name": "Tweezers",
+                "category": "Tool",
+                "quantity": 1,
+                "value_base_units": 6,
+            },
+            {
+                "name": "Small Scissors",
+                "category": "Tool",
+                "quantity": 1,
+                "value_base_units": 6,
+            },
+            {
+                "name": "Pruning Shears",
+                "category": "Tool",
+                "quantity": 1,
+                "value_base_units": 6,
+            },
+        ]
+        panel = InventoryLocationPanel(
+            "actively_carried",
+            items,
+            lambda _item: None,
+            sort_field="category",
+            sort_descending=True,
+        )
+
+        self.assertFalse(panel.secondary_sort_direction_combo.isEnabled())
+        self.assertEqual(
+            [button.text().splitlines()[0] for button in panel.item_buttons],
+            ["Sickle", "Pruning Shears", "Small Scissors", "Tweezers"],
+        )
+
+        panel.secondary_sort_field_combo.setCurrentIndex(
+            panel.secondary_sort_field_combo.findData("name")
+        )
+        panel.secondary_sort_direction_combo.setCurrentIndex(
+            panel.secondary_sort_direction_combo.findData(True)
+        )
+        self.app.processEvents()
+
+        self.assertTrue(panel.secondary_sort_direction_combo.isEnabled())
+        self.assertEqual(
+            [button.text().splitlines()[0] for button in panel.item_buttons],
+            ["Sickle", "Tweezers", "Small Scissors", "Pruning Shears"],
+        )
+        panel.close()
 
     def test_single_location_panel_is_centered_at_half_width(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

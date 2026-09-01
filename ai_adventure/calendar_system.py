@@ -180,7 +180,11 @@ def resolve_starting_calendar_minute(
         month_index = _resolve_month_index_for_season(raw_starting_calendar, clean_settings)
 
     if month_index is None:
-        return default_current_minute
+        default_snapshot = build_calendar_snapshot(
+            default_current_minute,
+            clean_settings,
+        )
+        month_index = int(default_snapshot["month_index"])
 
     day_of_month = _bounded_int(
         raw_starting_calendar.get("day_of_month"),
@@ -191,7 +195,7 @@ def resolve_starting_calendar_minute(
     year = _bounded_int(raw_starting_calendar.get("year"), 1, 1, 9999)
     time_of_day_minutes = _bounded_int(
         raw_starting_calendar.get("time_of_day_minutes"),
-        DEFAULT_START_ELAPSED_MINUTES,
+        default_current_minute % MINUTES_PER_DAY,
         0,
         MINUTES_PER_DAY - 1,
     )

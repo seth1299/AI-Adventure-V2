@@ -68,6 +68,107 @@ def _test_container_metadata(
 
 
 class EventApplierTests(unittest.TestCase):
+    def test_party_inventory_events_are_owner_scoped_and_track_equipment(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = SaveRepository.create_new_save(Path(temp_dir), "Party Inventory Test")
+            repository.upsert_npc(
+                npc_id="mira_coppercup",
+                name="Mira Coppercup",
+                display_name="Mira",
+                role="Scout",
+                location="Old Road",
+            )
+            repository.upsert_party_member("mira_coppercup")
+            applier = EventApplier(repository)
+
+            added = applier.apply_event(
+                {
+                    "type": "InventoryItemAddedEvent",
+                    "payload": {
+                        "owner_npc_id": "mira_coppercup",
+                        "item_type": "Weapon",
+                        "item_name": "Ashwood Bow",
+                        "description": "A short recurved bow.",
+                        "amount": 1,
+                        "value_base_units": 40,
+                        "equipped": True,
+                        "equipment_slot": "main hand",
+                    },
+                }
+            )
+
+            party_items = repository.list_party_inventory_items("mira_coppercup")
+            self.assertEqual(added.status, "applied")
+            self.assertNotIn(
+                "Ashwood Bow",
+                [item["name"] for item in repository.list_inventory_items()],
+            )
+            self.assertEqual(len(party_items), 1)
+            self.assertEqual(party_items[0]["name"], "Ashwood Bow")
+            self.assertTrue(party_items[0]["equipped"])
+            self.assertEqual(party_items[0]["equipment_slot"], "main hand")
+            self.assertEqual(
+                repository.list_party_members()[0]["equipment"][0]["name"],
+                "Ashwood Bow",
+            )
+
+            modified = applier.apply_event(
+                {
+                    "type": "InventoryItemModifiedEvent",
+                    "payload": {
+                        "owner_npc_id": "mira_coppercup",
+                        "target_name": "Ashwood Bow",
+                        "equipped": False,
+                        "equipment_slot": "",
+                    },
+                }
+            )
+            self.assertEqual(modified.status, "applied")
+            self.assertEqual(repository.list_party_members()[0]["equipment"], [])
+
+            removed = applier.apply_event(
+                {
+                    "type": "InventoryItemRemovedEvent",
+                    "payload": {
+                        "owner_npc_id": "mira_coppercup",
+                        "item_name": "Ashwood Bow",
+                        "amount": 1,
+                    },
+                }
+            )
+            self.assertEqual(removed.status, "applied")
+            self.assertEqual(repository.list_party_inventory_items("mira_coppercup"), [])
+
+    def test_npc_identity_fields_are_player_visible_and_persisted(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = SaveRepository.create_new_save(Path(temp_dir), "NPC Identity Test")
+            result = EventApplier(repository).apply_event(
+                {
+                    "type": "NpcUpsertedEvent",
+                    "payload": {
+                        "npc_id": "mira_coppercup",
+                        "name": "Mira Coppercup",
+                        "display_name": "Mira",
+                        "role": "Scout",
+                        "location": "Old Road",
+                        "public_description": "A keen-eyed traveler.",
+                        "player_facing_information": "A trusted companion.",
+                        "gender_identity": "Woman",
+                        "age": "32",
+                        "species": "Human",
+                        "knowledge_scope": ["Roads"],
+                        "known_facts": ["She knows the Old Road."],
+                    },
+                }
+            )
+            npc = _require(repository.get_npc("mira_coppercup"))
+            visible = repository.list_player_visible_npcs()[0]
+            self.assertEqual(result.status, "applied")
+            self.assertEqual(npc["gender_identity"], "Woman")
+            self.assertEqual(npc["age"], "32")
+            self.assertEqual(npc["species"], "Human")
+            self.assertEqual(visible["species"], "Human")
+
     def test_party_member_uses_same_npc_id_and_can_leave_without_deleting_npc(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             repository = SaveRepository.create_new_save(Path(temp_dir), "Party NPC Test")
@@ -276,9 +377,9 @@ class EventApplierTests(unittest.TestCase):
             self.assertEqual(lantern["storage_location"], "Pack Mule")
             catalog_lantern = next(item for item in catalog if item["name"] == "Brass Lantern")
             self.assertNotIn("Old Brass Light", {item["name"] for item in catalog})
-            self.assertEqual(catalog_lantern["ascii_art"], "  ___\n /___\\\n | * |")
+            self.assertNotIn("ascii_art", catalog_lantern)
 
-    def test_inventory_item_added_replaces_bracket_label_ascii_art(self) -> None:
+    def test_inventory_item_added_drops_legacy_art_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             repository = SaveRepository.create_new_save(
                 Path(temp_dir),
@@ -305,8 +406,7 @@ class EventApplierTests(unittest.TestCase):
                 if item["name"] == "Camera"
             )
             self.assertEqual(result.status, "applied")
-            self.assertGreaterEqual(len(camera["ascii_art"].splitlines()), 3)
-            self.assertNotIn("Camera", camera["ascii_art"])
+            self.assertNotIn("ascii_art", camera)
 
     def test_inventory_item_added_normalizes_finished_toxin_to_poison(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -539,6 +639,42 @@ class EventApplierTests(unittest.TestCase):
             self.assertTrue(container["is_open"])
             self.assertFalse(container["is_locked"])
             self.assertFalse(container["is_trapped"])
+
+    def test_matching_key_opens_locked_container_without_lockpick_check(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = SaveRepository.create_new_save(Path(temp_dir), "Keyed Container")
+            repository.add_inventory_item(
+                "Storage Chest",
+                "Container",
+                1,
+                "A locked storage chest.",
+                20,
+                metadata=_test_container_metadata(locked=True),
+            )
+            repository.add_inventory_item(
+                "Storage Chest Key",
+                "Key",
+                1,
+                "The key to the storage chest.",
+                1,
+                metadata={"item_type": "Key"},
+            )
+
+            result = EventApplier(repository).apply_event(
+                {
+                    "type": "ContainerOpenedEvent",
+                    "payload": {"container_name": "Storage Chest"},
+                }
+            )
+            chest = next(
+                item
+                for item in repository.list_inventory_items()
+                if item["name"] == "Storage Chest"
+            )
+
+            self.assertEqual(result.status, "applied")
+            self.assertTrue(chest["metadata"]["container"]["is_open"])
+            self.assertFalse(chest["metadata"]["container"]["is_locked"])
 
     def test_container_batch_rejects_duplicate_direct_rewards(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1198,6 +1334,35 @@ class EventApplierTests(unittest.TestCase):
             self.assertEqual(result.status, "skipped")
             self.assertIsNone(repository.get_setting("audio.current_sound_effect"))
 
+    def test_background_ambience_event_starts_and_stops_persistent_loop(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = SaveRepository.create_new_save(Path(temp_dir), "Ambience Test")
+            applier = EventApplier(repository)
+
+            started = applier.apply_event(
+                {
+                    "type": "BackgroundAmbienceChangedEvent",
+                    "payload": {"filename": "Steady Rain.ogg"},
+                }
+            )
+            self.assertEqual(started.status, "applied")
+            self.assertEqual(
+                repository.get_setting("audio.current_background_ambience"),
+                "Steady Rain.ogg",
+            )
+
+            stopped = applier.apply_event(
+                {
+                    "type": "BackgroundAmbienceChangedEvent",
+                    "payload": {"filename": "STOP"},
+                }
+            )
+            self.assertEqual(stopped.status, "applied")
+            self.assertEqual(
+                repository.get_setting("audio.current_background_ambience"),
+                "",
+            )
+
     def test_normalizes_event_type_alias_from_new_game_events(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             repository = SaveRepository.create_new_save(Path(temp_dir), "Alias Test")
@@ -1253,8 +1418,8 @@ class EventApplierTests(unittest.TestCase):
                     "payload": {
                         "misc_id": "glassback_grazer",
                         "name": "Glassback Grazer",
-                        "category": "Creature",
-                        "details": "A six-legged herbivore with a translucent shell.",
+                        "category": "Culture",
+                        "details": "A riverland tradition of glassworking.",
                     },
                 }
             )
@@ -1264,7 +1429,7 @@ class EventApplierTests(unittest.TestCase):
                     "payload": {
                         "misc_id": "glassback_grazer",
                         "name": "Glassback Grazer",
-                        "category": "Creature",
+                        "category": "Culture",
                         "details": (
                             "A six-legged herbivore whose translucent shell darkens "
                             "before storms."
@@ -1283,10 +1448,9 @@ class EventApplierTests(unittest.TestCase):
     def test_bestiary_lists_only_public_creature_lore_and_normalizes_aliases(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             repository = SaveRepository.create_new_save(Path(temp_dir), "Bestiary Test")
-            repository.upsert_miscellaneous(
-                misc_id="ash_wolf",
+            repository.upsert_bestiary_entry(
+                creature_id="ash_wolf",
                 name="Ash Wolf",
-                category="Monster",
                 details="Its tracks glow faintly at dusk.",
             )
             repository.upsert_miscellaneous(
@@ -1303,8 +1467,7 @@ class EventApplierTests(unittest.TestCase):
 
             entries = repository.list_bestiary_entries()
 
-            self.assertEqual([entry["misc_id"] for entry in entries], ["ash_wolf"])
-            self.assertEqual(entries[0]["category"], "Creature")
+            self.assertEqual([entry["creature_id"] for entry in entries], ["ash_wolf"])
             self.assertNotIn("rainwater", entries[0]["details"])
 
     def test_event_payloads_sanitize_banned_creative_terms_before_storage(self) -> None:
@@ -1413,7 +1576,7 @@ class EventApplierTests(unittest.TestCase):
             catalog = repository.list_item_catalog()
             catalog_moonwater = next(item for item in catalog if item["name"] == "Moonwater")
             self.assertEqual(catalog_moonwater["category"], "Ingredient")
-            self.assertEqual(catalog_moonwater["ascii_art"], " ~~~~\n(____)\n \\__/")
+            self.assertNotIn("ascii_art", catalog_moonwater)
             mooncap = next(
                 reagent for reagent in reagents
                 if reagent["name"] == "Mooncap Fungus"

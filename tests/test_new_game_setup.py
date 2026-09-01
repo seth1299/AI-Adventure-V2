@@ -15,11 +15,13 @@ from ai_adventure.new_game_setup import (
     calendar_looks_like_default_gregorian,
     fallback_introductory_message,
     fallback_world_summary,
+    merge_authoritative_starting_calendar,
     normalize_new_game_setup,
     normalize_character_pronouns,
     parse_starter_items_text,
 )
 from ai_adventure.new_game_templates import (
+    available_automatic_template_name,
     delete_new_game_template,
     load_new_game_template,
     load_new_game_templates,
@@ -150,6 +152,7 @@ class NewGameSetupTests(unittest.TestCase):
                     "style": "third_person_omniscient",
                 },
                 "ai_settings": {
+                    "text_model": "gemini-3.7-flash",
                     "model_intelligence": "smarter",
                     "model_tone": "serious",
                     "response_length": "brief",
@@ -157,6 +160,11 @@ class NewGameSetupTests(unittest.TestCase):
                         "HARM_CATEGORY_DANGEROUS_CONTENT"
                     ],
                     "additional_context": "Keep the mystery grounded.",
+                },
+                "images": {
+                    "enabled": False,
+                    "model": "gemini-3-pro-image",
+                    "style": "film_noir",
                 },
                 "specified_genre": "Realistic detective mystery",
                 "start_location": "Rainmarket Station",
@@ -195,6 +203,7 @@ class NewGameSetupTests(unittest.TestCase):
             "Third-Person Omniscient",
         )
         self.assertEqual(setup["ai_settings"]["model_intelligence"], "smarter")
+        self.assertEqual(setup["ai_settings"]["text_model"], "gemini-3.7-flash")
         self.assertEqual(setup["ai_settings"]["model_tone"], "serious")
         self.assertEqual(setup["ai_settings"]["response_length"], "brief")
         self.assertEqual(
@@ -202,6 +211,14 @@ class NewGameSetupTests(unittest.TestCase):
             ["HARM_CATEGORY_DANGEROUS_CONTENT"],
         )
         self.assertIn("Keep the mystery grounded.", setup["ai_additional_context"])
+        self.assertEqual(
+            setup["images"],
+            {
+                "enabled": False,
+                "model": "gemini-3-pro-image",
+                "style": "film_noir",
+            },
+        )
 
     def test_start_location_mode_and_turn_prompt_are_model_visible(self) -> None:
         setup = normalize_new_game_setup(
@@ -444,6 +461,7 @@ class NewGameSetupTests(unittest.TestCase):
                         "style": "first_person_limited",
                     },
                     "ai_settings": {
+                        "text_model": "gemini-3.6-flash",
                         "model_intelligence": "smarter",
                         "model_tone": "friendly",
                         "response_length": "descriptive",
@@ -451,6 +469,11 @@ class NewGameSetupTests(unittest.TestCase):
                             "HARM_CATEGORY_HARASSMENT"
                         ],
                         "additional_context": "Keep clues internally consistent.",
+                    },
+                    "images": {
+                        "enabled": False,
+                        "model": "gemini-3.1-flash-image",
+                        "style": "crayon",
                     },
                 }
             )
@@ -496,6 +519,16 @@ class NewGameSetupTests(unittest.TestCase):
                 state.settings.values["ai.model_intelligence"],
                 "smarter",
             )
+            self.assertEqual(
+                state.settings.values["ai.text_model"],
+                "gemini-3.6-flash",
+            )
+            self.assertFalse(state.settings.values["images.enabled"])
+            self.assertEqual(
+                state.settings.values["images.model"],
+                "gemini-3.1-flash-image",
+            )
+            self.assertEqual(state.settings.values["images.style"], "crayon")
             self.assertEqual(state.settings.values["ai.model_tone"], "friendly")
             self.assertEqual(
                 state.settings.values["ai.response_length"],
@@ -572,16 +605,21 @@ class NewGameSetupTests(unittest.TestCase):
             saves_dir = Path(temp_dir)
             repository = SaveRepository.create_new_save(saves_dir, "Old Save")
             db_path = repository.db_path
+            old_save_dir = db_path.parent
 
-            SaveRepository.rename_save(saves_dir, db_path, "New Save")
+            renamed_db_path = SaveRepository.rename_save(saves_dir, db_path, "New Save")
 
-            renamed_repository = SaveRepository(db_path)
+            self.assertFalse(old_save_dir.exists())
+            self.assertNotEqual(renamed_db_path.parent, old_save_dir)
+            self.assertIn("New_Save", renamed_db_path.parent.name)
+            self.assertTrue(renamed_db_path.exists())
+            renamed_repository = SaveRepository(renamed_db_path)
             self.assertEqual(renamed_repository.get_meta("title"), "New Save")
             self.assertTrue(SaveRepository.save_title_exists(saves_dir, "new save"))
 
-            SaveRepository.delete_save(saves_dir, db_path)
+            SaveRepository.delete_save(saves_dir, renamed_db_path)
 
-            self.assertFalse(db_path.exists())
+            self.assertFalse(renamed_db_path.exists())
             self.assertEqual(SaveRepository.list_saves(saves_dir), [])
 
     def test_save_repository_rename_rejects_duplicate_title(self) -> None:
@@ -763,7 +801,7 @@ class NewGameSetupTests(unittest.TestCase):
             "A missing courier tied to the opening location",
         )
         self.assertIn("optional player inspiration", ai_packet["requirements"]["starting_task"])
-        self.assertIn("ActiveTaskUpsertedEvent", ai_packet["requirements"]["starting_task"])
+        self.assertIn("top-level starting_task", ai_packet["requirements"]["starting_task"])
         self.assertIn(
             "how to recognize completion",
             ai_packet["requirements"]["starting_task"],
@@ -1026,6 +1064,30 @@ class NewGameSetupTests(unittest.TestCase):
             self.assertEqual(templates[0].name, "Legacy Template")
             self.assertEqual(templates[0].setup["character"]["name"], "Iris Vale")
 
+    def test_automatic_template_name_only_returns_an_unused_game_title(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            template_path = Path(temp_dir) / "new_game_templates.json"
+            setup = {"title": "Gun Jam Online", "specified_genre": "Tactical"}
+
+            self.assertEqual(
+                available_automatic_template_name(template_path, setup),
+                "Gun Jam Online",
+            )
+            self.assertTrue(
+                save_new_game_template(
+                    template_path,
+                    {"title": "Gun Jam Online", "specified_genre": "Existing"},
+                )
+            )
+            self.assertIsNone(
+                available_automatic_template_name(
+                    template_path,
+                    {"title": "gun jam online", "specified_genre": "Replacement"},
+                )
+            )
+            stored = load_new_game_templates(template_path, normalize_setups=False)
+            self.assertEqual(stored[0].setup["specified_genre"], "Existing")
+
     def test_new_game_templates_can_store_partial_shells(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             template_path = Path(temp_dir) / "new_game_templates.json"
@@ -1117,6 +1179,7 @@ class NewGameSetupTests(unittest.TestCase):
             normalize_new_game_setup({}),
             valid_music_tracks=["Town Village City.mp3"],
             valid_sound_effect_tracks=["Steady Rain.wav"],
+            valid_background_ambience_tracks=["Quiet Rain.ogg"],
         )
 
         invention_fields = packet["fields_requiring_ai_invention"]
@@ -1143,6 +1206,10 @@ class NewGameSetupTests(unittest.TestCase):
         self.assertIn("speaker_cues", packet["requirements"])
         self.assertIn(
             "exact npc_id as speaker_id",
+            packet["requirements"]["speaker_cues"],
+        )
+        self.assertIn(
+            "visible bubble label",
             packet["requirements"]["speaker_cues"],
         )
         self.assertIn("genre_generation", packet["requirements"])
@@ -1230,14 +1297,8 @@ class NewGameSetupTests(unittest.TestCase):
             "Do not duplicate records",
             packet["requirements"]["miscellaneous"],
         )
-        self.assertIn(
-            "category Creature",
-            packet["requirements"]["miscellaneous"],
-        )
-        self.assertIn(
-            "populate the Bestiary",
-            packet["requirements"]["miscellaneous"],
-        )
+        self.assertIn("bestiary", packet["requirements"])
+        self.assertIn("creature_id", packet["requirements"]["bestiary"])
         self.assertIn("item_request", packet["requirements"]["starter_inventory"])
         self.assertIn("at least five", packet["requirements"]["starter_inventory"])
         self.assertIn("has no maximum count", packet["requirements"]["starter_inventory"])
@@ -1253,14 +1314,7 @@ class NewGameSetupTests(unittest.TestCase):
         self.assertIn("source_index", packet["requirements"]["starter_inventory"])
         self.assertIn("Fuel instead of Starting Fuel Amount", packet["requirements"]["starter_inventory"])
         self.assertIn("Put quantities in quantity, not name", packet["requirements"]["starter_inventory"])
-        self.assertIn(
-            "[Camera]",
-            packet["requirements"]["starter_inventory"],
-        )
-        self.assertIn(
-            "single-line label is invalid",
-            packet["requirements"]["starter_inventory"],
-        )
+        self.assertNotIn("ascii_art", packet["requirements"]["starter_inventory"])
         self.assertEqual(packet["starter_inventory_contract"]["requested_item_count"], 0)
         self.assertEqual(packet["starter_inventory_contract"]["minimum_finalized_item_count"], 5)
         self.assertEqual(
@@ -1310,10 +1364,15 @@ class NewGameSetupTests(unittest.TestCase):
         )
         self.assertIn("starting_music", packet["requirements"])
         self.assertIn("starting_sound_effect", packet["requirements"])
+        self.assertIn("starting_background_ambience", packet["requirements"])
         self.assertEqual(packet["audio"]["valid_music_tracks"], ["Town Village City.mp3"])
         self.assertEqual(
             packet["audio"]["valid_sound_effect_tracks"],
             ["Steady Rain.wav"],
+        )
+        self.assertEqual(
+            packet["audio"]["valid_background_ambience_tracks"],
+            ["Quiet Rain.ogg"],
         )
         self.assertIn(
             "must never come from audio.valid_music_tracks",
@@ -1331,6 +1390,45 @@ class NewGameSetupTests(unittest.TestCase):
             packet["requirements"]["calendar_weather_consistency"],
         )
         self.assertIn("calendar_generation", packet["requirements"])
+
+    def test_setup_packet_uses_authoritative_start_calendar_and_weather(self) -> None:
+        packet = build_new_game_setup_packet(
+            {
+                "starting_calendar": {
+                    "year": 4,
+                    "month_number": 2,
+                    "day_of_month": 6,
+                    "time_of_day_minutes": 21 * 60 + 15,
+                },
+                "starting_weather": "Heavy Snow",
+            }
+        )
+
+        self.assertEqual(packet["current_calendar"]["year"], 4)
+        self.assertEqual(packet["current_calendar"]["month_number"], 2)
+        self.assertEqual(packet["current_calendar"]["day_of_month"], 6)
+        self.assertEqual(packet["current_calendar"]["time_of_day_minutes"], 1275)
+        self.assertEqual(packet["current_weather"], "Heavy Snow")
+
+    def test_player_start_fields_remove_generated_current_minute_override(self) -> None:
+        merged = merge_authoritative_starting_calendar(
+            {
+                "current_minute": 8 * 60,
+                "month_number": 2,
+                "day_of_month": 1,
+            },
+            {
+                "year": 3,
+                "day_of_month": 6,
+                "time_of_day_minutes": 21 * 60,
+            },
+        )
+
+        self.assertNotIn("current_minute", merged)
+        self.assertEqual(merged["year"], 3)
+        self.assertEqual(merged["month_number"], 2)
+        self.assertEqual(merged["day_of_month"], 6)
+        self.assertEqual(merged["time_of_day_minutes"], 21 * 60)
 
     def test_setup_packet_removes_music_tracks_from_sound_effect_catalog(self) -> None:
         packet = build_new_game_setup_packet(
@@ -1442,7 +1540,7 @@ class NewGameSetupTests(unittest.TestCase):
             "exact",
         )
         self.assertIn("setup.starting_npcs", packet["requirements"]["events"])
-        self.assertIn("payload.public_description", packet["requirements"]["events"])
+        self.assertIn("public_description", packet["requirements"]["events"])
         self.assertIn("materially different", packet["requirements"]["events"])
         self.assertIn("suggested or incomplete starting NPCs", packet["fields_requiring_ai_invention"])
         self.assertIn("Do not parse NPCs out of ordinary setup prose", packet["requirements"]["events"])

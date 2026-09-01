@@ -19,7 +19,6 @@ from ai_adventure.alchemy.ingredients import (
     normalize_crafting_item_rarity,
     normalize_recipe_ingredients,
 )
-from ai_adventure.ascii_art import ensure_substantive_ascii_art
 from ai_adventure.context.creative_guardrails import (
     contains_banned_creative_term,
     find_banned_creative_terms,
@@ -38,6 +37,7 @@ from ai_adventure.combat import (
     normalize_item_metadata,
     roll_combat_initiative,
 )
+from ai_adventure.container_access import has_immediate_container_unlock_method
 from ai_adventure.currency import format_currency_amount
 from ai_adventure.locations import clean_player_location_name
 from ai_adventure.persistence.save_repository import GM_SECRET_STATUSES, SaveRepository
@@ -304,8 +304,14 @@ class EventApplier:
             if event_type == "MiscellaneousUpsertedEvent":
                 return self._apply_miscellaneous_upserted(event_type, payload)
 
+            if event_type == "BestiaryEntryUpsertedEvent":
+                return self._apply_bestiary_entry_upserted(event_type, payload)
+
             if event_type == "MusicChangedEvent":
                 return self._apply_music_changed(event_type, payload)
+
+            if event_type == "BackgroundAmbienceChangedEvent":
+                return self._apply_background_ambience_changed(event_type, payload)
 
             message = f"Unsupported event type: {event_type}"
             LOGGER.warning(message)
@@ -325,6 +331,14 @@ class EventApplier:
 
         if not name:
             return _invalid(event_type, payload, "Inventory item name is required.")
+
+        owner_npc_id = _first_text(payload, "owner_npc_id")
+        if owner_npc_id and not self._is_current_party_member(owner_npc_id):
+            return _invalid(
+                event_type,
+                payload,
+                f"Party member is not active: {owner_npc_id}.",
+            )
 
         catalog_entry = self._matching_item_catalog_entry(payload, name)
         catalog_metadata = (
@@ -370,32 +384,41 @@ class EventApplier:
             merged_metadata["item_uuid"] = str(
                 catalog_metadata.get("item_uuid", payload.get("item_uuid", ""))
             ).strip()
-            merged_metadata["ascii_art"] = str(
-                catalog_entry.get("ascii_art", payload.get("ascii_art", "")) or ""
-            ).strip("\r\n")
-        merged_metadata["ascii_art"] = ensure_substantive_ascii_art(
-            merged_metadata.get("ascii_art", ""),
-            item_name=name,
-            category=category,
-        )
 
-        self.repository.add_inventory_item(
-            name=name,
-            category=category,
-            quantity=quantity,
-            description=description,
-            value_base_units=value_base_units,
-            metadata={
-                **merged_metadata,
-                "quantity_unit": quantity_unit,
-                "storage_location": storage_location,
-            },
-        )
+        item_metadata = {
+            **merged_metadata,
+            "quantity_unit": quantity_unit,
+            "storage_location": storage_location,
+        }
+        if owner_npc_id:
+            self.repository.add_party_inventory_item(
+                owner_npc_id,
+                name=name,
+                category=category,
+                quantity=quantity,
+                description=description,
+                value_base_units=value_base_units,
+                metadata=item_metadata,
+            )
+        else:
+            self.repository.add_inventory_item(
+                name=name,
+                category=category,
+                quantity=quantity,
+                description=description,
+                value_base_units=value_base_units,
+                metadata=item_metadata,
+            )
 
         return AppliedEventResult(
             event_type,
             "applied",
-            f"Added inventory item: {quantity} x {name}.",
+            (
+                f"Added inventory item: {quantity} x {name} to party member "
+                f"{owner_npc_id}."
+                if owner_npc_id
+                else f"Added inventory item: {quantity} x {name}."
+            ),
             payload,
         )
 
@@ -411,13 +434,28 @@ class EventApplier:
         if not name:
             return _invalid(event_type, payload, "Inventory item name is required.")
 
+        owner_npc_id = _first_text(payload, "owner_npc_id")
+        if owner_npc_id and not self._is_current_party_member(owner_npc_id):
+            return _invalid(
+                event_type,
+                payload,
+                f"Party member is not active: {owner_npc_id}.",
+            )
         quantity = _first_int(payload, 1, "amount", "quantity")
-        self.repository.remove_inventory_item(name, quantity)
+        if owner_npc_id:
+            self.repository.remove_party_inventory_item(owner_npc_id, name, quantity)
+        else:
+            self.repository.remove_inventory_item(name, quantity)
 
         return AppliedEventResult(
             event_type,
             "applied",
-            f"Removed inventory item: {quantity} x {name}.",
+            (
+                f"Removed inventory item: {quantity} x {name} from party member "
+                f"{owner_npc_id}."
+                if owner_npc_id
+                else f"Removed inventory item: {quantity} x {name}."
+            ),
             payload,
         )
 
@@ -432,6 +470,14 @@ class EventApplier:
 
         if not target_name:
             return _invalid(event_type, payload, "Inventory target name is required.")
+
+        owner_npc_id = _first_text(payload, "owner_npc_id")
+        if owner_npc_id and not self._is_current_party_member(owner_npc_id):
+            return _invalid(
+                event_type,
+                payload,
+                f"Party member is not active: {owner_npc_id}.",
+            )
 
         if _find_inventory_container(self.repository, target_name) is not None:
             return _invalid(
@@ -453,21 +499,46 @@ class EventApplier:
             "value",
         )
 
-        self.repository.modify_inventory_item(
-            target_name=target_name,
-            new_name=_first_text(payload, "new_name"),
-            category=_first_text(payload, "new_category", "category"),
-            description=_first_text(payload, "new_description", "description"),
-            quantity=quantity,
-            value_base_units=value_base_units,
-            metadata=payload,
-        )
+        if owner_npc_id:
+            self.repository.modify_party_inventory_item(
+                npc_id=owner_npc_id,
+                target_name=target_name,
+                new_name=_first_text(payload, "new_name"),
+                category=_first_text(payload, "new_category", "category"),
+                description=_first_text(payload, "new_description", "description"),
+                quantity=quantity,
+                value_base_units=value_base_units,
+                metadata=payload,
+            )
+        else:
+            self.repository.modify_inventory_item(
+                target_name=target_name,
+                new_name=_first_text(payload, "new_name"),
+                category=_first_text(payload, "new_category", "category"),
+                description=_first_text(payload, "new_description", "description"),
+                quantity=quantity,
+                value_base_units=value_base_units,
+                metadata=payload,
+            )
 
         return AppliedEventResult(
             event_type,
             "applied",
-            f"Modified inventory item: {target_name}.",
+            (
+                f"Modified inventory item: {target_name} for party member "
+                f"{owner_npc_id}."
+                if owner_npc_id
+                else f"Modified inventory item: {target_name}."
+            ),
             payload,
+        )
+
+    def _is_current_party_member(self, npc_id: str) -> bool:
+        """Returns whether an NPC currently has party-specific state."""
+
+        return any(
+            str(member.get("npc_id", "")).strip() == npc_id.strip()
+            for member in self.repository.list_party_members()
         )
 
     def _matching_item_catalog_entry(
@@ -597,26 +668,38 @@ class EventApplier:
             )
 
         if container.get("is_locked") is True:
-            required_skill = str(container.get("lockpick_skill", "Lockpicking"))
-            required_dc = max(1, _safe_int(container.get("lockpick_dc"), default=10) or 10)
-
-            if not _has_successful_skill_check(
-                skill_check_results,
-                skill_name=required_skill,
-                minimum_total=required_dc,
-            ):
-                consequence = str(
-                    container.get("lockpick_failure_consequence", "") or ""
-                ).strip()
-                return _invalid(
-                    event_type,
-                    payload,
-                    (
-                        f"{item['name']} remains locked; opening it requires a "
-                        f"successful {required_skill} check against DC {required_dc}."
-                        + (f" Failure consequence: {consequence}" if consequence else "")
-                    ),
+            has_unlock_method = has_immediate_container_unlock_method(
+                self.repository.list_inventory_items(),
+                str(item["name"]),
+            )
+            if not has_unlock_method:
+                required_skill = str(container.get("lockpick_skill", "Lockpicking"))
+                required_dc = max(
+                    1,
+                    _safe_int(container.get("lockpick_dc"), default=10) or 10,
                 )
+
+                if not _has_successful_skill_check(
+                    skill_check_results,
+                    skill_name=required_skill,
+                    minimum_total=required_dc,
+                ):
+                    consequence = str(
+                        container.get("lockpick_failure_consequence", "") or ""
+                    ).strip()
+                    return _invalid(
+                        event_type,
+                        payload,
+                        (
+                            f"{item['name']} remains locked; opening it requires a "
+                            f"successful {required_skill} check against DC {required_dc}."
+                            + (
+                                f" Failure consequence: {consequence}"
+                                if consequence
+                                else ""
+                            )
+                        ),
+                    )
 
             container["is_locked"] = False
 
@@ -1357,11 +1440,6 @@ class EventApplier:
         description = _first_text(payload, "description", "notes")
         location = _first_text(payload, "location", "found_at", "source")
         uses = _as_string_list(payload.get("uses", []))
-        ascii_art = ensure_substantive_ascii_art(
-            payload.get("ascii_art", ""),
-            item_name=name,
-            category=_first_text(payload, "category") or "Material",
-        )
         rarity = normalize_crafting_item_rarity(payload.get("rarity"))
         notes = _first_text(payload, "notes")
         value_base_units = max(
@@ -1395,7 +1473,6 @@ class EventApplier:
             rarity=rarity,
             notes=notes,
             value_base_units=value_base_units,
-            ascii_art=ascii_art,
             item_uuid=_first_text(payload, "item_uuid"),
         )
         self.repository.upsert_item_catalog_entry(
@@ -1403,10 +1480,7 @@ class EventApplier:
             category=category,
             description=description,
             value_base_units=value_base_units,
-            metadata={
-                "ascii_art": ascii_art,
-                "item_uuid": _first_text(payload, "item_uuid"),
-            },
+            metadata={"item_uuid": _first_text(payload, "item_uuid")},
         )
 
         return AppliedEventResult(
@@ -1717,6 +1791,33 @@ class EventApplier:
             payload,
         )
 
+    def _apply_background_ambience_changed(
+        self,
+        event_type: str,
+        payload: dict[str, Any],
+    ) -> AppliedEventResult:
+        """Starts, replaces, or stops persistent looping background ambience."""
+
+        filename = _first_text(
+            payload,
+            "filename",
+            "file_name",
+            "track",
+            "track_name",
+            "ambience",
+        )
+        if not filename:
+            return _invalid(event_type, payload, "Ambience filename or STOP is required.")
+
+        if filename.casefold() in {"stop", "none", "off", "silence"}:
+            self.repository.set_setting("audio.current_background_ambience", "")
+            message = "Stopped background ambience."
+        else:
+            self.repository.set_setting("audio.current_background_ambience", filename)
+            message = f"Changed background ambience to: {filename}."
+
+        return AppliedEventResult(event_type, "applied", message, payload)
+
     def _apply_magic_effect_upserted(
         self,
         event_type: str,
@@ -1781,6 +1882,9 @@ class EventApplier:
             "description",
             "appearance",
         )
+        gender_identity = _first_text(payload, "gender_identity", "gender")
+        age = _first_text(payload, "age")
+        species = _first_text(payload, "species", "race")
         player_facing_information = _first_text(
             payload,
             "player_facing_information",
@@ -1808,6 +1912,9 @@ class EventApplier:
             location=location,
             public_description=public_description,
             player_facing_information=player_facing_information,
+            gender_identity=gender_identity,
+            age=age,
+            species=species,
             knowledge_scope=knowledge_scope,
             known_facts=known_facts,
         )
@@ -1969,6 +2076,15 @@ class EventApplier:
         if not details:
             return _invalid(event_type, payload, "Miscellaneous entry details are required.")
 
+        if str(payload.get("category", "")).strip().casefold() in {
+            "creature", "creatures", "monster", "monsters", "beast", "beasts",
+        }:
+            return _invalid(
+                event_type,
+                payload,
+                "Creature lore must use BestiaryEntryUpsertedEvent.",
+            )
+
         entry = self.repository.upsert_miscellaneous(
             misc_id=_first_text(payload, "misc_id", "id"),
             name=name,
@@ -1984,6 +2100,32 @@ class EventApplier:
             "applied",
             f"Stored miscellaneous world lore: {entry['name']}.",
             {**payload, "misc_id": entry["misc_id"]},
+        )
+
+    def _apply_bestiary_entry_upserted(
+        self,
+        event_type: str,
+        payload: dict[str, Any],
+    ) -> AppliedEventResult:
+        """Applies player-known creature lore to the separate Bestiary table."""
+
+        name = _first_text(payload, "name", "title")
+        details = _first_text(payload, "details", "description")
+        if not name or not details:
+            return _invalid(event_type, payload, "Bestiary name and details are required.")
+
+        entry = self.repository.upsert_bestiary_entry(
+            creature_id=_first_text(payload, "creature_id", "id"),
+            name=name,
+            details=details,
+        )
+        if entry is None:
+            return _invalid(event_type, payload, "Bestiary entry could not be stored.")
+        return AppliedEventResult(
+            event_type,
+            "applied",
+            f"Stored Bestiary creature: {entry['name']}.",
+            {**payload, "creature_id": entry["creature_id"]},
         )
 
 

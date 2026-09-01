@@ -13,7 +13,6 @@ from typing import Any
 
 from ai_adventure.alchemy.ingredients import (
     COMMON_MEASUREMENT_UNITS,
-    CRAFTING_INGREDIENT_CATEGORY_NAMES,
     CRAFTING_INGREDIENT_CATEGORIES,
     CRAFTING_ITEM_RARITIES,
     is_crafting_ingredient_category,
@@ -29,13 +28,20 @@ from ai_adventure.ai.modes import (
     build_ai_mode_prompt_guidance,
     normalize_ai_mode_preferences,
 )
+from ai_adventure.ai.model_catalog import (
+    DEFAULT_TEXT_MODEL,
+    KNOWN_TEXT_MODELS,
+    normalize_text_model,
+    thinking_config_for_text_model,
+)
 from ai_adventure.calendar_system import normalize_calendar_settings
+from ai_adventure.container_access import has_immediate_container_unlock_method
+from ai_adventure.context.context_builder import CONTAINER_ACCESS_RULE
 from ai_adventure.context.creative_guardrails import (
     default_banned_creative_terms,
     find_banned_creative_terms,
     sanitize_banned_creative_terms_in_data,
 )
-from ai_adventure.context.naming import GENERIC_PROPER_NOUN_PLACEHOLDER_RULE
 from ai_adventure.context.tags import CONTEXT_TAG_DESCRIPTIONS, PLANNABLE_CONTEXT_TAGS
 from ai_adventure.currency import (
     normalize_currency_denominations,
@@ -45,11 +51,9 @@ from ai_adventure.audio.pronunciation import (
     PronunciationMap,
     merge_pronunciation_maps,
 )
-from ai_adventure.ascii_art import (
-    ensure_substantive_ascii_art,
-    is_substantive_ascii_art,
+from ai_adventure.audio.catalog import (
+    distinct_audio_track_catalogs_with_ambience,
 )
-from ai_adventure.audio.catalog import distinct_audio_track_catalogs
 from ai_adventure.audio.voices import VOICE_PROFILE_OPTIONS
 from ai_adventure.locations import clean_player_location_name, normalize_known_locations
 from ai_adventure.new_game_setup import STARTER_INVENTORY_MIN_ITEMS
@@ -62,7 +66,7 @@ from ai_adventure.text_sanitization import (
 LOGGER = logging.getLogger(__name__)
 
 
-DEFAULT_GEMINI_MODEL = "gemini-3.5-flash-lite"
+DEFAULT_GEMINI_MODEL = DEFAULT_TEXT_MODEL
 CREATIVE_TERM_REPAIR_MODEL = DEFAULT_GEMINI_MODEL
 CREATIVE_TERM_REPAIR_ATTEMPTS = 4
 MODEL_REQUEST_ATTEMPTS = 2
@@ -95,6 +99,21 @@ CHECK_WARRANTING_ACTION_RE = re.compile(
     r")\b",
     re.IGNORECASE,
 )
+FORAGING_ACTION_RE = re.compile(
+    r"\b(?:find|forage|gather|harvest|locate|look|scavenge|search|seek)\w*\b",
+    re.IGNORECASE,
+)
+FORAGING_TARGET_RE = re.compile(
+    r"\b(?:botanicals?|flowers?|fungi|fungus|herbs?|mushrooms?|plants?|"
+    r"reagents?|roots?|berries?|wild ingredients?|natural materials?)\b",
+    re.IGNORECASE,
+)
+GENERIC_SEARCH_SKILL_NAMES = {
+    "awareness",
+    "investigation",
+    "perception",
+    "search",
+}
 OBVIOUS_NARRATED_WEATHER_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     (
         "Rain",
@@ -132,15 +151,6 @@ OBVIOUS_NARRATED_WEATHER_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
         ),
     ),
 )
-KNOWN_TEXT_MODELS = {
-    "gemini-3.5-flash-lite",
-    "gemini-3.1-flash-lite",
-    "gemini-2.5-flash",
-    "gemini-2.5-flash-lite",
-    "gemini-2.5-pro",
-}
-
-
 def _is_embedding_model_name(model: str) -> bool:
     """Returns True for Gemini API model ids that cannot generate text."""
 
@@ -168,6 +178,7 @@ KNOWN_EVENT_TYPE_NAMES = [
     "CurrencyDefinedEvent",
     "MusicChangedEvent",
     "SoundEffectChangedEvent",
+    "BackgroundAmbienceChangedEvent",
     "FlagSetEvent",
     "LocationUpsertedEvent",
     "TravelModeChangedEvent",
@@ -184,6 +195,7 @@ KNOWN_EVENT_TYPE_NAMES = [
     "NpcKnowledgeAddedEvent",
     "SecretUpsertedEvent",
     "MiscellaneousUpsertedEvent",
+    "BestiaryEntryUpsertedEvent",
 ]
 TEXT_SAFETY_HARM_CATEGORIES = list(ALL_CONTENT_HARM_CATEGORIES)
 STRING_LIST_SCHEMA: dict[str, Any] = {
@@ -235,12 +247,6 @@ GM_SECRET_RECORD_REQUIRED_FIELDS = [
     "related_locations",
     "status",
 ]
-GM_SECRET_RECORD_SCHEMA: dict[str, Any] = {
-    "type": "object",
-    "properties": GM_SECRET_RECORD_PROPERTIES,
-    "required": GM_SECRET_RECORD_REQUIRED_FIELDS,
-    "additionalProperties": False,
-}
 NEW_GAME_GM_SECRET_RECORD_PROPERTIES: dict[str, Any] = {
     key: value
     for key, value in GM_SECRET_RECORD_PROPERTIES.items()
@@ -290,6 +296,24 @@ MISCELLANEOUS_RECORD_SCHEMA: dict[str, Any] = {
     "required": MISCELLANEOUS_RECORD_REQUIRED_FIELDS,
     "additionalProperties": False,
 }
+BESTIARY_RECORD_PROPERTIES: dict[str, Any] = {
+    "creature_id": {
+        "type": "string",
+        "description": "Stable lower_snake_case identifier reused for future updates.",
+    },
+    "name": {"type": "string"},
+    "details": {
+        "type": "string",
+        "description": "Complete player-known facts about this non-NPC creature.",
+    },
+}
+BESTIARY_RECORD_REQUIRED_FIELDS = ["creature_id", "name", "details"]
+BESTIARY_RECORD_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": BESTIARY_RECORD_PROPERTIES,
+    "required": BESTIARY_RECORD_REQUIRED_FIELDS,
+    "additionalProperties": False,
+}
 RECIPE_INGREDIENT_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
@@ -324,15 +348,6 @@ NEW_GAME_CRAFTING_ITEM_SCHEMA: dict[str, Any] = {
             "enum": list(CRAFTING_INGREDIENT_CATEGORIES),
         },
         "description": {"type": "string"},
-        "ascii_art": {
-            "type": "string",
-            "minLength": 3,
-            "maxLength": 1200,
-            "description": (
-                "Original 3-12 line fixed-width drawing, without Markdown fences. "
-                "A bracketed name or single-line label is invalid."
-            ),
-        },
         "location": {
             "type": "string",
             "description": (
@@ -352,7 +367,7 @@ NEW_GAME_CRAFTING_ITEM_SCHEMA: dict[str, Any] = {
         "value_base_units": {"type": "integer", "minimum": 0},
     },
     "required": [
-        "name", "category", "description", "ascii_art", "location", "uses",
+        "name", "category", "description", "location", "uses",
         "rarity", "notes", "value_base_units",
     ],
     "additionalProperties": False,
@@ -560,20 +575,15 @@ EVENT_RESPONSE_SCHEMA: dict[str, Any] = {
             {
                 "item_type": {"type": "string"},
                 "item_name": {"type": "string"},
-                "item_uuid": {"type": "string", "description": "Existing catalog UUID when this is a known item; otherwise use an empty string and Python assigns one."},
-                "description": {"type": "string"},
-                "ascii_art": {
+                "owner_npc_id": {
                     "type": "string",
-                    "minLength": 3,
-                    "maxLength": 1200,
                     "description": (
-                        "Original fixed-width ASCII art depicting the item. Use 3-12 "
-                        "lines, no Markdown fence, and keep each line at most 40 characters. "
-                        "A bracketed item name such as [Camera], a caption, or any "
-                        "other single-line label is invalid and is not ASCII art. "
-                        "Do not double-escape line breaks or place visible backslash-n text in the art."
+                        "Exact npc_id of a current party member when this item belongs "
+                        "in that member's dedicated inventory; omit for player inventory."
                     ),
                 },
+                "item_uuid": {"type": "string", "description": "Existing catalog UUID when this is a known item; otherwise use an empty string and Python assigns one."},
+                "description": {"type": "string"},
                 "amount": {"type": "integer", "minimum": 1},
                 "quantity_unit": {"type": "string", "description": "Unit for the amount, such as each, bottle, vial, gram, kilogram, liter, or meter."},
                 "storage_location": {
@@ -605,13 +615,14 @@ EVENT_RESPONSE_SCHEMA: dict[str, Any] = {
                     "items": {"type": "string"},
                 },
                 "armor_rating": INT_OR_SKIP_SCHEMA,
+                "equipped": {"type": "boolean"},
+                "equipment_slot": {"type": "string"},
                 "container": CONTAINER_METADATA_SCHEMA,
             },
             [
                 "item_type",
                 "item_name",
                 "description",
-                "ascii_art",
                 "amount",
                 "value_base_units",
             ],
@@ -620,6 +631,10 @@ EVENT_RESPONSE_SCHEMA: dict[str, Any] = {
             "InventoryItemRemovedEvent",
             {
                 "item_name": {"type": "string"},
+                "owner_npc_id": {
+                    "type": "string",
+                    "description": "Exact npc_id of the current party member whose inventory loses this item.",
+                },
                 "amount": {"type": "integer", "minimum": 1},
             },
             ["item_name", "amount"],
@@ -628,6 +643,10 @@ EVENT_RESPONSE_SCHEMA: dict[str, Any] = {
             "InventoryItemModifiedEvent",
             {
                 "target_name": {"type": "string"},
+                "owner_npc_id": {
+                    "type": "string",
+                    "description": "Exact npc_id of a current party member; omit for player inventory.",
+                },
                 "new_name": {"type": "string"},
                 "new_category": {"type": "string"},
                 "new_description": {"type": "string"},
@@ -652,6 +671,8 @@ EVENT_RESPONSE_SCHEMA: dict[str, Any] = {
                     "items": {"type": "string"},
                 },
                 "armor_rating": INT_OR_SKIP_SCHEMA,
+                "equipped": {"type": "boolean"},
+                "equipment_slot": {"type": "string"},
                 "container": CONTAINER_METADATA_SCHEMA,
             },
             ["target_name"],
@@ -869,15 +890,6 @@ EVENT_RESPONSE_SCHEMA: dict[str, Any] = {
                 "name": {"type": "string"},
                 "item_uuid": {"type": "string"},
                 "description": {"type": "string"},
-                "ascii_art": {
-                    "type": "string",
-                    "minLength": 3,
-                    "maxLength": 1200,
-                    "description": (
-                        "Original 3-12 line fixed-width drawing, without Markdown "
-                        "fences. A bracketed name or single-line label is invalid."
-                    ),
-                },
                 "location": {
                     "type": "string",
                     "description": (
@@ -908,7 +920,7 @@ EVENT_RESPONSE_SCHEMA: dict[str, Any] = {
                 },
             },
             [
-                "name", "description", "ascii_art", "location", "uses", "category",
+                "name", "description", "location", "uses", "category",
                 "rarity", "notes", "value_base_units",
             ],
             description=(
@@ -976,6 +988,20 @@ EVENT_RESPONSE_SCHEMA: dict[str, Any] = {
             description=(
                 "Plays one short sound once at an exact boundary in this narration."
             ),
+        ),
+        _event_response_schema(
+            "BackgroundAmbienceChangedEvent",
+            {
+                "filename": {
+                    "type": "string",
+                    "description": (
+                        "Exact filename from valid_background_ambience_tracks, or "
+                        "STOP when persistent ambience is no longer appropriate."
+                    ),
+                }
+            },
+            ["filename"],
+            description="Starts, changes, or stops a quiet persistent ambience loop.",
         ),
         _event_response_schema(
             "FlagSetEvent",
@@ -1146,6 +1172,9 @@ EVENT_RESPONSE_SCHEMA: dict[str, Any] = {
                 "location": {"type": "string"},
                 "public_description": {"type": "string"},
                 "player_facing_information": {"type": "string"},
+                "gender_identity": {"type": "string"},
+                "age": {"type": "string"},
+                "species": {"type": "string"},
                 "knowledge_scope": NONEMPTY_STRING_LIST_SCHEMA,
                 "known_facts": NONEMPTY_STRING_LIST_SCHEMA,
                 "party_member": {"type": "boolean"},
@@ -1192,13 +1221,17 @@ EVENT_RESPONSE_SCHEMA: dict[str, Any] = {
                 "an NPC, location, item, task, or private secret."
             ),
         ),
+        _event_response_schema(
+            "BestiaryEntryUpsertedEvent",
+            BESTIARY_RECORD_PROPERTIES,
+            BESTIARY_RECORD_REQUIRED_FIELDS,
+            description="Creates or replaces player-known creature lore.",
+        ),
     ]
 }
 NEW_GAME_EVENT_TYPE_NAMES = (
     "NpcUpsertedEvent",
     "ActiveTaskUpsertedEvent",
-    "MusicChangedEvent",
-    "SoundEffectChangedEvent",
 )
 NEW_GAME_ACTIVE_TASK_EVENT_RESPONSE_SCHEMA: dict[str, Any] = _event_response_schema(
     "ActiveTaskUpsertedEvent",
@@ -1221,10 +1254,47 @@ NEW_GAME_ACTIVE_TASK_EVENT_RESPONSE_SCHEMA: dict[str, Any] = _event_response_sch
     },
     ["name"],
 )
+NEW_GAME_NPC_EVENT_RESPONSE_SCHEMA: dict[str, Any] = _event_response_schema(
+    "NpcUpsertedEvent",
+    {
+        "npc_id": {
+            "type": "string",
+            "description": "Exact stable npc_id copied from setup.starting_npcs.",
+        },
+        "name": {"type": "string"},
+        "location": {"type": "string"},
+        "public_description": {"type": "string"},
+        "gender_identity": {"type": "string"},
+        "age": {"type": "string"},
+        "species": {"type": "string"},
+        "party_member": {
+            "type": "boolean",
+            "description": (
+                "True exactly when npc_id is listed in "
+                "setup.starting_party_npc_ids."
+            ),
+        },
+        "party_status": {"type": "string"},
+        "party_health_current": {"type": "integer", "minimum": -1},
+        "party_health_max": {"type": "integer", "minimum": -1},
+        "party_armor_class": {"type": "integer", "minimum": -1},
+        "party_combat_style": {"type": "string"},
+        "party_skills": STRING_LIST_SCHEMA,
+    },
+    [
+        "npc_id",
+        "name",
+        "location",
+        "public_description",
+        "party_member",
+    ],
+)
 NEW_GAME_EVENT_RESPONSE_SCHEMA: dict[str, Any] = {
     "anyOf": [
         NEW_GAME_ACTIVE_TASK_EVENT_RESPONSE_SCHEMA
         if event_type == "ActiveTaskUpsertedEvent"
+        else NEW_GAME_NPC_EVENT_RESPONSE_SCHEMA
+        if event_type == "NpcUpsertedEvent"
         else
         next(
             branch
@@ -1237,9 +1307,10 @@ NEW_GAME_EVENT_RESPONSE_SCHEMA: dict[str, Any] = {
 SPEAKER_CUE_RESPONSE_SCHEMA: dict[str, Any] = {
     "type": "array",
     "description": (
-        "Exact non-narrator spoken spans for local multi-voice TTS. Return one "
-        "entry for every contiguous NPC or other non-player speaker passage; "
-        "return an empty array when only the narrator speaks."
+        "Exact non-narrator spoken spans used for visible speaker chat bubbles and "
+        "local multi-voice TTS. Return one entry for every contiguous NPC or other "
+        "non-player speaker passage; return an empty array when only the narrator "
+        "speaks."
     ),
     "maxItems": 40,
     "items": {
@@ -1261,7 +1332,10 @@ SPEAKER_CUE_RESPONSE_SCHEMA: dict[str, Any] = {
             },
             "speaker_name": {
                 "type": "string",
-                "description": "Short player-safe speaker label or known name.",
+                "description": (
+                    "Player-visible chat-bubble label: use the speaker's known name, "
+                    "or a concise player-safe description when the name is unknown."
+                ),
             },
             "voice_profile": {
                 "type": "string",
@@ -1274,6 +1348,42 @@ SPEAKER_CUE_RESPONSE_SCHEMA: dict[str, Any] = {
         },
         "required": [
             "anchor_text",
+            "speaker_id",
+            "speaker_name",
+            "voice_profile",
+        ],
+        "additionalProperties": False,
+    },
+}
+NEW_GAME_OPENING_CUE_SCHEMA: dict[str, Any] = {
+    "type": "array",
+    "items": {
+        "type": "object",
+        "properties": {
+            "kind": {
+                "type": "string",
+                "enum": [
+                    "speaker",
+                    "music",
+                    "sound_effect",
+                    "background_ambience",
+                ],
+            },
+            "filename": {"type": "string"},
+            "anchor_text": {"type": "string"},
+            "position": {"type": "string", "enum": ["", "before", "after"]},
+            "speaker_id": {"type": "string"},
+            "speaker_name": {"type": "string"},
+            "voice_profile": {
+                "type": "string",
+                "enum": list(VOICE_PROFILE_OPTIONS),
+            },
+        },
+        "required": [
+            "kind",
+            "filename",
+            "anchor_text",
+            "position",
             "speaker_id",
             "speaker_name",
             "voice_profile",
@@ -1402,7 +1512,11 @@ STORY_EVENT_TYPE_NAMES_BY_CONTEXT_TAG: dict[str, tuple[str, ...]] = {
         "CurrencyChangedEvent",
         "CurrencyDefinedEvent",
     ),
-    "music": ("MusicChangedEvent", "SoundEffectChangedEvent"),
+    "music": (
+        "MusicChangedEvent",
+        "SoundEffectChangedEvent",
+        "BackgroundAmbienceChangedEvent",
+    ),
     "naming": ("LocationUpsertedEvent", "NpcUpsertedEvent"),
     "quest": (
         "FlagSetEvent",
@@ -1541,6 +1655,8 @@ NEW_GAME_RESPONSE_JSON_SCHEMA: dict[str, Any] = {
                     "travel_multiplier": {"type": "number", "minimum": 0.1, "maximum": 3.0},
                     "travel_notes": {"type": "string"},
                     "source_index": {"type": "integer", "minimum": -1},
+                    "is_sublocation": {"type": "boolean"},
+                    "parent_location": {"type": "string"},
                 },
                 "required": [
                     "name",
@@ -1551,6 +1667,8 @@ NEW_GAME_RESPONSE_JSON_SCHEMA: dict[str, Any] = {
                     "travel_multiplier",
                     "travel_notes",
                     "source_index",
+                    "is_sublocation",
+                    "parent_location",
                 ],
                 "additionalProperties": False,
             },
@@ -1569,11 +1687,16 @@ NEW_GAME_RESPONSE_JSON_SCHEMA: dict[str, Any] = {
             "type": "array",
             "description": (
                 "Established starting canon that does not fit locations, NPCs, items, "
-                "tasks, or private GM secrets. Include original creatures, species, "
+                "tasks, creatures, or private GM secrets. Include species, "
                 "cultures, factions, religions, laws, history, and phenomena when "
                 "needed; otherwise return an empty array."
             ),
             "items": MISCELLANEOUS_RECORD_SCHEMA,
+        },
+        "bestiary": {
+            "type": "array",
+            "description": "Player-known creatures established at the start of the adventure.",
+            "items": BESTIARY_RECORD_SCHEMA,
         },
         "start_location": {"type": "string"},
         "calendar_settings": {
@@ -1596,7 +1719,6 @@ NEW_GAME_RESPONSE_JSON_SCHEMA: dict[str, Any] = {
                     "items": {
                         "type": "object",
                         "properties": {
-                            "npc_id": {"type": "string"},
                             "name": {"type": "string"},
                             "weather_hint": {"type": "string"},
                         },
@@ -1628,9 +1750,8 @@ NEW_GAME_RESPONSE_JSON_SCHEMA: dict[str, Any] = {
         "weather": {"type": "string"},
         "character": {
             "type": "object",
-                        "properties": {
-                            "npc_id": {"type": "string"},
-                            "name": {"type": "string"},
+            "properties": {
+                "name": {"type": "string"},
                 "appearance": {"type": "string"},
                 "backstory": {"type": "string"},
                 "notes": {"type": "string"},
@@ -1651,7 +1772,14 @@ NEW_GAME_RESPONSE_JSON_SCHEMA: dict[str, Any] = {
                 "additionalProperties": False,
             },
         },
-        "speaker_cues": SPEAKER_CUE_RESPONSE_SCHEMA,
+        "opening_cues": NEW_GAME_OPENING_CUE_SCHEMA,
+        "starting_npcs": {
+            "type": "array",
+            "items": NEW_GAME_NPC_EVENT_RESPONSE_SCHEMA["properties"]["payload"],
+        },
+        "starting_task": NEW_GAME_ACTIVE_TASK_EVENT_RESPONSE_SCHEMA["properties"][
+            "payload"
+        ],
         "starting_spells": {
             "type": "array",
             "description": (
@@ -1702,18 +1830,6 @@ NEW_GAME_RESPONSE_JSON_SCHEMA: dict[str, Any] = {
                         ),
                     },
                     "description": {"type": "string"},
-                    "ascii_art": {
-                        "type": "string",
-                        "minLength": 3,
-                        "maxLength": 1200,
-                        "description": (
-                            "Original fixed-width ASCII art depicting the item. Use "
-                            "3-12 lines, no Markdown fence, with lines at most 40 characters. "
-                            "A bracketed item name such as [Camera], a caption, or "
-                            "any other single-line label is invalid. "
-                            "Do not double-escape line breaks or place visible backslash-n text in the art."
-                        ),
-                    },
                     "value_base_units": {"type": "integer", "minimum": 0},
                     "weapon_hands": {
                         "type": "string",
@@ -1748,7 +1864,6 @@ NEW_GAME_RESPONSE_JSON_SCHEMA: dict[str, Any] = {
                     "quantity_unit",
                     "storage_location",
                     "description",
-                    "ascii_art",
                     "value_base_units",
                     "source_index",
                 ],
@@ -1800,7 +1915,6 @@ NEW_GAME_RESPONSE_JSON_SCHEMA: dict[str, Any] = {
             "description": "Three or four short player-facing action options for the opening scene.",
             "items": {"type": "string"},
         },
-        "events": {"type": "array", "items": NEW_GAME_EVENT_RESPONSE_SCHEMA},
     },
     "required": [
         "selected_genre",
@@ -1819,13 +1933,16 @@ NEW_GAME_RESPONSE_JSON_SCHEMA: dict[str, Any] = {
         "currency_description",
         "starting_currency_balance_base_units",
         "introductory_message",
-        "events",
     ],
     "additionalProperties": False,
 }
 
 
-def build_new_game_response_schema(setup_packet: dict[str, Any]) -> dict[str, Any]:
+def build_new_game_response_schema(
+    setup_packet: dict[str, Any],
+    *,
+    for_api: bool = True,
+) -> dict[str, Any]:
     """Builds the smallest new-game schema needed for this exact setup packet."""
 
     schema = copy.deepcopy(NEW_GAME_RESPONSE_JSON_SCHEMA)
@@ -1933,66 +2050,97 @@ def build_new_game_response_schema(setup_packet: dict[str, Any]) -> dict[str, An
     ):
         omit("starting_currency_balance_base_units")
 
-    event_types: list[str] = []
     starting_npcs = setup.get("starting_npcs", [])
     if isinstance(starting_npcs, list) and starting_npcs:
-        event_types.append("NpcUpsertedEvent")
+        if "starting_npcs" not in required:
+            required.append("starting_npcs")
+        properties["starting_npcs"]["minItems"] = len(starting_npcs)
+        properties["starting_npcs"]["maxItems"] = len(starting_npcs)
+    else:
+        omit("starting_npcs")
     starting_task = setup.get("starting_task", {})
     if (
         isinstance(starting_task, dict)
         and str(starting_task.get("mode", "none") or "none").casefold() != "none"
     ):
-        event_types.append("ActiveTaskUpsertedEvent")
+        if "starting_task" not in required:
+            required.append("starting_task")
+    else:
+        omit("starting_task")
     audio = setup_packet.get("audio", {})
     if not isinstance(audio, dict):
         audio = {}
-    valid_music_tracks, valid_sound_effect_tracks = distinct_audio_track_catalogs(
+    (
+        valid_music_tracks,
+        valid_sound_effect_tracks,
+        valid_background_ambience_tracks,
+    ) = distinct_audio_track_catalogs_with_ambience(
         audio.get("valid_music_tracks", []),
         audio.get("valid_sound_effect_tracks", []),
+        audio.get("valid_background_ambience_tracks", []),
     )
     setup_audio = setup.get("audio", {})
     music_enabled = not isinstance(setup_audio, dict) or bool(
         setup_audio.get("music_enabled", True)
     )
-    if music_enabled and valid_music_tracks:
-        event_types.append("MusicChangedEvent")
     sound_effects_enabled = not isinstance(setup_audio, dict) or bool(
         setup_audio.get("sound_effects_enabled", True)
     )
-    if (
-        sound_effects_enabled
-        and valid_sound_effect_tracks
-    ):
-        event_types.append("SoundEffectChangedEvent")
-
-    if not event_types:
-        omit("events")
-    else:
-        event_branches = [
-            branch
-            for branch in NEW_GAME_EVENT_RESPONSE_SCHEMA["anyOf"]
-            if branch["properties"]["type"]["enum"][0] in event_types
-        ]
-        properties["events"]["items"] = (
-            event_branches[0]
-            if len(event_branches) == 1
-            else {"anyOf": event_branches}
-        )
+    background_ambience_enabled = not isinstance(setup_audio, dict) or bool(
+        setup_audio.get("background_ambience_enabled", True)
+    )
+    enabled_opening_cue_kinds = ["speaker"]
+    has_configured_opening_audio = bool(
+        (music_enabled and valid_music_tracks)
+        or (sound_effects_enabled and valid_sound_effect_tracks)
+        or (background_ambience_enabled and valid_background_ambience_tracks)
+    )
+    if has_configured_opening_audio and "opening_cues" not in required:
+        required.append("opening_cues")
+    if music_enabled and valid_music_tracks:
+        enabled_opening_cue_kinds.append("music")
+    if sound_effects_enabled and valid_sound_effect_tracks:
+        enabled_opening_cue_kinds.append("sound_effect")
+    if background_ambience_enabled and valid_background_ambience_tracks:
+        enabled_opening_cue_kinds.append("background_ambience")
+    properties["opening_cues"]["items"]["properties"]["kind"]["enum"] = (
+        enabled_opening_cue_kinds
+    )
 
     if "suggested_actions" in properties and "suggested_actions" not in required:
         required.append("suggested_actions")
-    return _condense_response_schema_for_api(schema)
+    if not for_api:
+        return schema
+    api_schema = _condense_response_schema_for_api(
+        schema,
+        strip_additional_properties=True,
+    )
+    starter_item_schema = api_schema["properties"]["starting_items"]["items"]
+    starter_required_fields = set(starter_item_schema.get("required", []))
+    starter_item_schema["properties"] = {
+        field_name: field_schema
+        for field_name, field_schema in starter_item_schema["properties"].items()
+        if field_name in starter_required_fields
+    }
+    return api_schema
 
 
 def _condense_response_schema_for_api(
     value: Any,
     *,
     property_map: bool = False,
+    strip_additional_properties: bool = False,
 ) -> Any:
     """Removes prompt prose and locally enforced bounds from the API schema."""
 
     if isinstance(value, list):
-        return [_condense_response_schema_for_api(item) for item in value]
+        return [
+            _condense_response_schema_for_api(
+                item,
+                strip_additional_properties=strip_additional_properties,
+            )
+            for item in value
+        ]
     if not isinstance(value, dict):
         return value
     locally_enforced_keywords = {
@@ -2008,9 +2156,12 @@ def _condense_response_schema_for_api(
     for key, item in value.items():
         if not property_map and key in locally_enforced_keywords:
             continue
+        if strip_additional_properties and key == "additionalProperties":
+            continue
         condensed[key] = _condense_response_schema_for_api(
             item,
             property_map=(key == "properties"),
+            strip_additional_properties=strip_additional_properties,
         )
     return condensed
 
@@ -2029,14 +2180,32 @@ def _story_event_type_names(context_packet: dict[str, Any]) -> tuple[str, ...]:
     for tag in selected_tags:
         enabled_event_types.update(STORY_EVENT_TYPE_NAMES_BY_CONTEXT_TAG.get(tag, ()))
     audio = _state_subpacket(context_packet, "audio")
-    valid_music_tracks, valid_sound_effect_tracks = distinct_audio_track_catalogs(
+    (
+        valid_music_tracks,
+        valid_sound_effect_tracks,
+        valid_background_ambience_tracks,
+    ) = distinct_audio_track_catalogs_with_ambience(
         audio.get("valid_music_tracks", []),
         audio.get("valid_sound_effect_tracks", []),
+        audio.get("valid_background_ambience_tracks", []),
     )
     if not valid_music_tracks:
         enabled_event_types.discard("MusicChangedEvent")
     if not valid_sound_effect_tracks:
         enabled_event_types.discard("SoundEffectChangedEvent")
+    if not valid_background_ambience_tracks:
+        enabled_event_types.discard("BackgroundAmbienceChangedEvent")
+    bestiary = _state_subpacket(context_packet, "bestiary")
+    command_terms = set(re.findall(
+        r"[a-z0-9]+",
+        str(context_packet.get("player_command", "")).casefold(),
+    ))
+    if not bestiary.get("entries") and not command_terms.intersection({
+        "bestiary", "creature", "creatures", "monster", "monsters", "beast",
+        "beasts", "species", "identify", "identified", "hunt", "hunting",
+        "track", "tracks",
+    }):
+        enabled_event_types.discard("BestiaryEntryUpsertedEvent")
     combat = _state_subpacket(context_packet, "combat")
     if str(combat.get("resolution_mode", "strict")) == "narrative":
         enabled_event_types.discard("CombatStartedEvent")
@@ -2076,6 +2245,7 @@ def _new_game_prompt_packet_for_schema(
     output_fields = list(schema.get("required", []))
     packet["response_contract"] = {
         "required_output_fields": output_fields,
+        "required_nested_fields": _new_game_required_nested_fields(schema),
         "rule": (
             "Return exactly the configured fields. Omitted setup fields are already "
             "authoritative in Python and must not be echoed or rewritten."
@@ -2091,35 +2261,89 @@ def _new_game_prompt_packet_for_schema(
         "character": ("character_generation",),
         "skills": ("skill_generation", "skill_limits"),
         "currency_denominations": ("currency_generation",),
-        "events": (
-            "events",
-            "starting_task",
-            "starting_music",
-            "starting_sound_effect",
-        ),
+        "starting_npcs": ("events",),
+        "starting_task": ("starting_task",),
     }
     for output_field, requirement_names in field_requirements.items():
         if output_field in schema.get("properties", {}):
             continue
         for requirement_name in requirement_names:
             requirements.pop(requirement_name, None)
-    event_schema = schema.get("properties", {}).get("events", {}).get("items", {})
-    event_branches = event_schema.get("anyOf", [event_schema])
-    enabled_event_types = {
-        str(branch.get("properties", {}).get("type", {}).get("enum", [""])[0])
-        for branch in event_branches
-        if isinstance(branch, dict)
-        and branch.get("properties", {}).get("type", {}).get("enum")
-    }
-    if "NpcUpsertedEvent" not in enabled_event_types:
-        requirements.pop("events", None)
-    if "ActiveTaskUpsertedEvent" not in enabled_event_types:
-        requirements.pop("starting_task", None)
-    if "MusicChangedEvent" not in enabled_event_types:
+    cue_schema = schema.get("properties", {}).get("opening_cues", {})
+    cue_items = cue_schema.get("items", {}) if isinstance(cue_schema, dict) else {}
+    cue_properties = (
+        cue_items.get("properties", {}) if isinstance(cue_items, dict) else {}
+    )
+    enabled_cue_kinds = (
+        cue_properties.get("kind", {}).get("enum", [])
+        if isinstance(cue_properties, dict)
+        else []
+    )
+    if "music" not in enabled_cue_kinds:
         requirements.pop("starting_music", None)
-    if "SoundEffectChangedEvent" not in enabled_event_types:
+    if "sound_effect" not in enabled_cue_kinds:
         requirements.pop("starting_sound_effect", None)
+    if "background_ambience" not in enabled_cue_kinds:
+        requirements.pop("starting_background_ambience", None)
     return packet
+
+
+def _new_game_required_nested_fields(schema: dict[str, Any]) -> dict[str, Any]:
+    """Returns a compact nested-field outline for schema-free JSON retries."""
+
+    properties = schema.get("properties", {})
+    if not isinstance(properties, dict):
+        return {}
+    outline: dict[str, Any] = {}
+    for field_name, field_schema in properties.items():
+        if not isinstance(field_schema, dict):
+            continue
+        item_schema = field_schema.get("items")
+        if field_name == "events" and isinstance(item_schema, dict):
+            branches = item_schema.get("anyOf", [item_schema])
+            event_fields: dict[str, list[str]] = {}
+            for branch in branches:
+                if not isinstance(branch, dict):
+                    continue
+                branch_properties = branch.get("properties", {})
+                type_values = (
+                    branch_properties.get("type", {}).get("enum", [])
+                    if isinstance(branch_properties, dict)
+                    else []
+                )
+                payload_schema = (
+                    branch_properties.get("payload", {})
+                    if isinstance(branch_properties, dict)
+                    else {}
+                )
+                if type_values and isinstance(payload_schema, dict):
+                    event_fields[str(type_values[0])] = list(
+                        payload_schema.get("required", [])
+                    )
+            if event_fields:
+                outline[field_name] = event_fields
+            continue
+        has_item_schema = isinstance(item_schema, dict)
+        nested_schema = item_schema if has_item_schema else field_schema
+        required = nested_schema.get("required", [])
+        if isinstance(required, list) and required:
+            outline[field_name] = list(required)
+        nested_properties = nested_schema.get("properties", {})
+        if not isinstance(nested_properties, dict):
+            continue
+        for nested_name, child_schema in nested_properties.items():
+            if not isinstance(child_schema, dict):
+                continue
+            child_items = child_schema.get("items")
+            if not isinstance(child_items, dict):
+                continue
+            child_required = child_items.get("required", [])
+            if isinstance(child_required, list) and child_required:
+                item_marker = "[]" if has_item_schema else ""
+                outline[f"{field_name}{item_marker}.{nested_name}"] = list(
+                    child_required
+                )
+    return outline
 
 @dataclass(frozen=True)
 class GeminiSettings:
@@ -2172,6 +2396,7 @@ class AiWorldSetupResult:
     locations: list[dict[str, Any]] = field(default_factory=list)
     gm_secrets: list[dict[str, Any]] = field(default_factory=list)
     miscellaneous: list[dict[str, Any]] = field(default_factory=list)
+    bestiary: list[dict[str, Any]] = field(default_factory=list)
     finalized_character: dict[str, str] = field(default_factory=dict)
     finalized_skills: list[dict[str, Any]] = field(default_factory=list)
     finalized_starting_spells: list[dict[str, Any]] = field(default_factory=list)
@@ -2205,6 +2430,7 @@ class GeminiNarrationService:
         settings: GeminiSettings | None = None,
         *,
         api_key_path: Path | None = None,
+        model: str | None = None,
     ) -> None:
         """
         Args:
@@ -2213,6 +2439,11 @@ class GeminiNarrationService:
         """
 
         self.settings = settings or load_gemini_settings(api_key_path=api_key_path)
+        if model is not None:
+            self.settings = replace(
+                self.settings,
+                model=normalize_text_model(model),
+            )
 
     def generate_story_response(
         self,
@@ -2382,7 +2613,10 @@ class GeminiNarrationService:
             return SkillCheckPlanResult(raw_text=raw_text)
 
         return _filter_unwarranted_planned_skill_checks(
-            parse_skill_check_plan_response(raw_text),
+            _prefer_clearly_relevant_known_skill(
+                parse_skill_check_plan_response(raw_text),
+                context_packet,
+            ),
             context_packet,
         )
 
@@ -2601,11 +2835,10 @@ def _build_xml_skill_check_plan_prompt(context_packet: dict[str, Any]) -> str:
             ),
             _xml_text_section(
                 "constraints",
-                "Return checks=[] for routine or low-stakes actions. Request a "
-                "check only when current uncertainty, opposition, hidden information, "
-                "danger, scarcity, time pressure, or meaningful consequences make "
-                "failure matter. Prefer known skills and exact container DC metadata. "
-                "Do not narrate or roll. relevant_tags must use only available tags.",
+                "Use skill_rules and the supplied scene, skills, containers, and "
+                "relevant lore. Return only checks needed before narration and the "
+                "smallest set of available relevant_tags. Python performs all rolls "
+                "and validation; do not narrate.",
             ),
             _xml_json_section("available_tags", tag_rundown),
             _xml_packet_sections(planning_packet),
@@ -2657,64 +2890,12 @@ def _build_xml_story_prompt(context_packet: dict[str, Any]) -> str:
             ),
             _xml_text_section(
                 "critical_constraints",
-                "Use only supplied state as confirmed fact. Preserve hidden GM secrets "
-                "and NPC knowledge boundaries. Never invent player-character dialogue, "
-                "choices, or unrequested actions. Resolve the submitted action rather "
-                "than restating it. Complete immediate NPC and world responses now: "
-                "when the player asks an NPC to answer, explain, reply, or tell their "
-                "story, narrate the information that NPC can presently provide instead "
-                "of stopping just before the reply. Suggest only warranted events and checks. Reuse "
-                "stable NPC, item, secret, task, location, and miscellaneous lore "
-                "identities. Never use "
-                "banned terms, close spellings, hyphenation variants, obvious reskins, "
-                "or bare category-label proper nouns for newly invented names. Every "
-                "generated string value must use printable ASCII English characters "
-                "only. Transliterate accented Latin letters to their unaccented English "
-                "equivalents and never emit foreign scripts, IPA, phoneme strings, or "
-                "pronunciation annotations. Do not return pronunciation_map. "
-                "For every newly defined inventory or crafting item, ascii_art must "
-                "be an original 3-12 line fixed-width drawing of the recognizable "
-                "item shape. A bracketed item name such as [Camera], a caption, or "
-                "any other single-line label is invalid and is not ASCII art. "
-                "For local multi-voice TTS, return one speaker_cues entry for every "
-                "contiguous span of non-narrator spoken dialogue. anchor_text must "
-                "copy the complete exact dialogue span, including its outer double "
-                "quotation marks, from one unique place in response. Use the exact "
-                "canonical npc_id as speaker_id for a real NPC, including an NPC "
-                "created by this response; otherwise use one stable lower_snake_case "
-                "speaker identity. Reuse a speaker_id for the same person and use "
-                "different IDs for different speakers. Choose voice_profile only from "
-                "established audible traits; use neutral when unspecified. Do not add "
-                "speaker cues for narrator prose or invent player-character dialogue.",
-            ),
-            _xml_text_section(
-                "gm_secret_knowledge_boundary",
-                "A GM secret must be unknown to both the player and the Player "
-                "Character. Never create secret memory from the Player Character's "
-                "own conscious actions, firsthand observations, retained memories, "
-                "known possessions, or deliberately hidden or stored items unless "
-                "established state explicitly provides a credible knowledge barrier "
-                "such as amnesia, memory alteration, unconsciousness, or deception. "
-                "A reveal_condition cannot be a skill check or search that makes the "
-                "Player Character rediscover their own knowing act. If the Player "
-                "Character knows a fact, keep it in player-visible narrative or "
-                "appropriate public state rather than SecretUpsertedEvent.",
-            ),
-            _xml_text_section(
-                "miscellaneous_world_memory",
-                "state.miscellaneous.entries is uncapped, authoritative world canon "
-                "and is included on every turn. Use every entry for continuity even "
-                "when it is not obviously related to the current command. Suggest "
-                "MiscellaneousUpsertedEvent when this response establishes or changes "
-                "a durable non-secret creature, species, culture, faction, religion, "
-                "law, historical event, phenomenon, custom, or other concept that does "
-                "not fit an NPC, Location, Item, active task, or GM secret. Reuse the "
-                "same misc_id for updates and send the complete current record. Never "
-                "duplicate information that belongs in a more specific table. Use "
-                "category Creature for each non-NPC creature or monster the Player "
-                "learns about, and put only player-known facts in details because "
-                "Creature records appear in the player-visible Bestiary; use "
-                "SecretUpsertedEvent instead for hidden truth.",
+                "Use only supplied state as confirmed fact. Follow the applicable "
+                "rules in the context packet and response_contract. Python owns "
+                "durable state, validation, event application, and final output "
+                "sanitization. Complete the submitted action and any immediate NPC "
+                "answer; do not invent player-character dialogue, decisions, or "
+                "unrequested actions.",
             ),
             _xml_text_section(
                 "conversation_mode",
@@ -2743,25 +2924,15 @@ def _build_xml_story_prompt(context_packet: dict[str, Any]) -> str:
                     },
                     {
                         "situation": "Player receives one ordinary item",
-                        "output": {"response": "The courier hands over the sealed letter.", "suggested_actions": ["Inspect the seal.", "Ask who sent it.", "Put the letter away."], "events": [{"type": "InventoryItemAddedEvent", "payload": {"item_name": "Sealed Letter", "item_type": "Document", "description": "A folded letter closed with a red wax seal.", "ascii_art": " ______\n/_____/|\n| seal|/", "amount": 1, "quantity_unit": "each", "storage_location": "actively_carried", "value_base_units": 1}}], "out_of_game": False},
+                        "output": {"response": "The courier hands over the sealed letter.", "suggested_actions": ["Inspect the seal.", "Ask who sent it.", "Put the letter away."], "events": [{"type": "InventoryItemAddedEvent", "payload": {"item_name": "Sealed Letter", "item_type": "Document", "description": "A folded letter closed with a red wax seal.", "amount": 1, "quantity_unit": "each", "storage_location": "actively_carried", "value_base_units": 1}}], "out_of_game": False},
                     },
                 ],
             ),
             _xml_text_section(
                 "output_format",
-                "Return exactly one JSON object matching the configured schema. "
-                "response must be non-empty; suggested_actions and events must be "
-                "arrays; out_of_game must exactly match conversation_mode. For an in-game response, "
-                "events must end with exactly one StatusUpdatedEvent whose payload "
-                "contains location, minutes_passed, and weather; use AUTO only when "
-                "the narration keeps the current value unchanged. If the narration "
-                "introduces rain, snow, fog, or any other current weather different "
-                "from state.scene.weather, set weather to that actual condition rather "
-                "than AUTO. Every returned string must contain printable ASCII English "
-                "characters only; do not return pronunciation_map or phonetic markup. "
-                "speaker_cues must be an array, empty when no non-narrator character "
-                "speaks, with every anchor copied exactly from response. "
-                "No surrounding Markdown.",
+                "Return exactly one JSON object matching the configured schema, with "
+                "no surrounding Markdown. Follow response_contract and the supplied "
+                "state rules for all fields and events.",
             ),
             _xml_text_section(
                 "task",
@@ -2777,10 +2948,74 @@ def _build_xml_story_prompt(context_packet: dict[str, Any]) -> str:
     )
 
 
+_STORY_STATE_TAGS: dict[str, set[str]] = {
+    "travel": {"travel", "exploration", "scene"},
+    "inventory": {"inventory", "alchemy", "crafting", "reagent", "recipe", "combat", "merchant"},
+    "item_catalog": {"inventory", "alchemy", "crafting", "reagent", "recipe", "combat", "merchant"},
+    "currency": {"currency", "merchant"},
+    "combat": {"combat"},
+    "alchemy": {"alchemy", "crafting", "reagent", "recipe"},
+    "skills": {"skill", "uncertainty", "combat", "crafting", "exploration"},
+    "magic": {"magic", "spell"},
+    "active_tasks": {"task", "quest"},
+    "calendar_events": {"time", "events", "quest"},
+    "audio": {"music"},
+}
+
+
+def _project_story_state(context_packet: dict[str, Any]) -> dict[str, Any]:
+    """Builds the minimal state projection needed by the story prompt."""
+
+    source = context_packet.get("state", {})
+    if not isinstance(source, dict):
+        return {}
+    selection = context_packet.get("selection", {})
+    raw_tags = selection.get("tags", []) if isinstance(selection, dict) else []
+    tags = {str(tag).casefold() for tag in raw_tags if str(tag).strip()}
+    projected: dict[str, Any] = {}
+    for key in ("adventure_title", "player", "player_ai_preferences", "scene", "world_profile"):
+        if key in source:
+            projected[key] = source[key]
+    for key, required_tags in _STORY_STATE_TAGS.items():
+        value = source.get(key)
+        if key == "combat" and isinstance(value, dict) and value.get("active"):
+            projected[key] = value
+        elif tags.intersection(required_tags) and value not in (None, "", [], {}):
+            projected[key] = value
+
+    for key in ("npcs", "party", "gm_secrets", "bestiary"):
+        value = source.get(key)
+        if not isinstance(value, dict):
+            continue
+        if key == "gm_secrets" and value.get("active"):
+            projected[key] = value
+        elif key in {"npcs", "party", "bestiary"} and value.get("relevant", value.get("members", value.get("entries", []))):
+            projected[key] = value
+
+    miscellaneous = source.get("miscellaneous")
+    if isinstance(miscellaneous, dict):
+        entries = miscellaneous.get("entries", [])
+        if isinstance(entries, list):
+            if tags.intersection({"world", "lore", "events"}):
+                selected_entries = entries[:20]
+            else:
+                command_tokens = set(re.findall(r"[a-z0-9]+", str(context_packet.get("player_command", "")).casefold()))
+                selected_entries = [
+                    entry for entry in entries
+                    if isinstance(entry, dict)
+                    and command_tokens.intersection(set(re.findall(r"[a-z0-9]+", str(entry.get("name", "")).casefold())))
+                ][:20]
+            if selected_entries:
+                projected["miscellaneous"] = {**miscellaneous, "entries": selected_entries}
+
+    return projected
+
+
 def _story_prompt_packet(context_packet: dict[str, Any]) -> dict[str, Any]:
-    """Returns the story packet with only currently relevant optional contracts."""
+    """Returns a prompt-only projection with relevant contracts and state."""
 
     packet = dict(context_packet)
+    projected_state = _project_story_state(context_packet)
     contract = context_packet.get("response_contract", {})
     selection = context_packet.get("selection", {})
     selected_tags = {
@@ -2793,7 +3028,7 @@ def _story_prompt_packet(context_packet: dict[str, Any]) -> dict[str, Any]:
     always = {
         "response", "suggested_actions", "events", "status_event", "skill_checks",
         "player_ai_preferences", "creative_ideas", "conversation_mode", "out_of_game", "event_shape",
-        "known_event_types", "miscellaneous_memory", "speaker_cues",
+        "known_event_types", "speaker_cues",
     }
     tags_by_contract = {
         "calendar_time": {"time", "events"},
@@ -2815,10 +3050,19 @@ def _story_prompt_packet(context_packet: dict[str, Any]) -> dict[str, Any]:
         if key in always
         or bool(tags_by_contract.get(key, set()) & selected_tags)
     }
+    if "miscellaneous" in projected_state and "miscellaneous_memory" in contract:
+        filtered_contract["miscellaneous_memory"] = contract["miscellaneous_memory"]
+    if "bestiary" in projected_state and "bestiary_memory" in contract:
+        filtered_contract["bestiary_memory"] = contract["bestiary_memory"]
     filtered_contract["known_event_types"] = list(
         _story_event_type_names(context_packet)
     )
     packet["response_contract"] = filtered_contract
+    packet["state"] = projected_state
+    # Reference sections duplicate the rules authored by context_builder.py;
+    # retain them in the internal packet for diagnostics, but do not serialize
+    # them into the model prompt.
+    packet.pop("reference_sections", None)
     return packet
 
 
@@ -2846,8 +3090,14 @@ def _build_xml_new_game_prompt(setup_packet: dict[str, Any]) -> str:
                 "different finalized value; do not copy or cosmetically edit it. This "
                 "includes the requested start location, suggestion-mode location names "
                 "and descriptions, and suggestion-mode NPC descriptions. Exact-mode "
-                "values must remain unchanged. Maintain "
-                "source_index links and finalized names consistent. Use canonical "
+                "values must remain unchanged. Maintain source_index links and "
+                "finalized names consistently. "
+                "For any finalized character appearance, location description, item "
+                "description, or NPC public_description, include concise concrete "
+                "visual traits sufficient to depict the subject, using only facts "
+                "visible to the player. Do not add image fields, prompts, filenames, "
+                "URLs, or encoded image data; the application derives cached images "
+                "from the ordinary finalized fields after saving. Use canonical "
                 "setup.character.pronouns exactly; never infer others. Never use "
                 "banned terms, close "
                 "variants, reskins, or bare category-label proper nouns for NPC names, "
@@ -2857,13 +3107,17 @@ def _build_xml_new_game_prompt(setup_packet: dict[str, Any]) -> str:
                 "generated string value must use printable ASCII English characters "
                 "only. Transliterate accented Latin letters to unaccented English and "
                 "never emit foreign scripts, IPA, phoneme strings, pronunciation "
-                "annotations, or pronunciation_map. For local multi-voice TTS, return "
-                "speaker_cues for every contiguous non-narrator spoken span in "
+                "annotations, or pronunciation_map. For visible speaker chat bubbles "
+                "and local multi-voice TTS, return "
+                "one opening_cues record with kind speaker for every contiguous "
+                "non-narrator spoken span in "
                 "introductory_message. Copy each complete dialogue span including "
                 "outer double quotation marks into a unique anchor_text. Use the "
-                "exact NpcUpsertedEvent npc_id as speaker_id for an actual NPC, reuse "
+                "exact starting_npcs npc_id as speaker_id for an actual NPC, reuse "
                 "the same ID for the same person, and use distinct stable "
-                "lower_snake_case IDs for incidental speakers. Ground voice_profile "
+                "lower_snake_case IDs for incidental speakers. speaker_name is a "
+                "visible bubble label, so use the known name or a concise player-safe "
+                "description when the name is unknown. Ground voice_profile "
                 "in established audible traits and use neutral when unspecified. Do "
                 "not cue narrator prose or player-character dialogue. If the setup includes "
                 "opening_scene_request, treat it as optional player-authored guidance "
@@ -2902,16 +3156,20 @@ def _build_xml_new_game_prompt(setup_packet: dict[str, Any]) -> str:
             _xml_text_section(
                 "miscellaneous_world_memory",
                 "Return non-secret starting canon that does not fit locations, NPCs, "
-                "items, tasks, or GM secrets in the top-level miscellaneous array. "
-                "Use it for original creatures or species, cultures, factions, "
+                "items, tasks, creatures, or GM secrets in the top-level miscellaneous "
+                "array. Use it for species, cultures, factions, "
                 "religions, laws, historical events, phenomena, customs, and other "
                 "durable concepts introduced by the finalized world or opening scene. "
-                "Use category Creature for each non-NPC creature or monster known to "
-                "the Player, with only player-known facts in details; those records "
-                "populate the player-visible Bestiary. "
                 "Use stable misc_id values and complete records. Do not duplicate "
                 "information that belongs in another structured field; return an "
                 "empty array when no miscellaneous starting canon is established.",
+            ),
+            _xml_text_section(
+                "bestiary_memory",
+                "Return starting player-known non-NPC creatures in the top-level "
+                "bestiary array. Use stable creature_id values and complete details "
+                "containing only facts known to the Player or Player Character. "
+                "Return an empty array when no starting creature lore is established.",
             ),
             _xml_text_section(
                 "storage_rule",
@@ -2951,14 +3209,15 @@ def _build_xml_new_game_prompt(setup_packet: dict[str, Any]) -> str:
                 "schema, with no surrounding Markdown. Complete every required field. "
                 "Every returned string must contain printable ASCII English characters "
                 "only; do not return pronunciation_map or phonetic markup. "
-                "speaker_cues must be an array and must be empty when only the "
-                "narrator speaks.",
+                "opening_cues must contain no kind=speaker records when only the "
+                "narrator speaks. Use empty strings in cue fields that do not apply "
+                "to that kind.",
             ),
             _xml_text_section(
                 "task",
                 "Based on all setup sections above, synthesize the complete initial "
                 "world, finalized character state, known locations, opening scene, "
-                "and permitted setup events. Validate names and cross-references before returning.",
+                "and permitted setup records. Validate names and cross-references before returning.",
             ),
         ]
     )
@@ -2977,64 +3236,6 @@ def build_skill_check_plan_prompt(context_packet: dict[str, Any]) -> str:
 
     return _build_xml_skill_check_plan_prompt(context_packet)
 
-    planning_packet = _skill_check_planning_packet(context_packet)
-    packet_json = json.dumps(planning_packet, indent=2)
-    tag_rundown = "\n".join(
-        f"- {tag}: {description}."
-        for tag, description in CONTEXT_TAG_DESCRIPTIONS.items()
-    )
-
-    return (
-        "You are a game master deciding whether the player's latest action "
-        "needs one or more skill checks before narration is written.\n"
-        "Return one JSON object and no surrounding Markdown.\n\n"
-        "Rules:\n"
-        "- Return checks as an array. Use [] when no check is needed.\n"
-        "- Choose only checks needed to resolve meaningful uncertainty in the "
-        "latest player_command. Use [] for ordinary actions where no meaningful "
-        "stakes, opposition, hidden information, scarcity, danger, or time pressure "
-        "is present in this scene.\n"
-        "- Do not request a check merely because an action could theoretically "
-        "vary in quality or take extra time. Request a check only when failure or "
-        "partial success would create a meaningful consequence right now.\n"
-        "- Foraging, harvesting, searching, researching, identifying, crafting "
-        "experiments, persuasion, stealth, and combat need checks only "
-        "when the current command has actual uncertainty, opposition, risk, hidden "
-        "information, resource pressure, or meaningful consequences.\n"
-        "- Named skill use is not automatically a check if the command is otherwise "
-        "routine or low-stakes.\n"
-        "- Routine movement, paying a known price, receiving ordinary goods, "
-        "eating, drinking, and casual conversation do not need checks unless the "
-        "player adds a contested, risky, hidden, time-sensitive, or deceptive goal.\n"
-        "- Examples needing []: walk to the market; return to the tavern; buy a "
-        "listed meal at its known price; greet the bartender; wait by the fountain.\n"
-        "- Examples needing checks: sneak past guards; search for a hidden door; "
-        "haggle under pressure; pick a lock; identify a strange poison; rush to "
-        "arrive before a deadline.\n"
-        "- If the command tries to inspect or open a listed container, use its "
-        "container metadata exactly. Request its trap_notice_skill/trap_notice_dc "
-        "when noticing the trap is uncertain, trap_disarm_skill/trap_disarm_dc when "
-        "disarming it, and lockpick_skill/lockpick_dc when picking its lock. Do not "
-        "invent a generic check or substitute a different DC.\n"
-        "- Prefer an existing known skill_name when one fits. If no existing skill "
-        "fits, use a clear new skill_name.\n"
-        "- Include difficulty or dc when the action's risk is clear. Use reason "
-        "to briefly explain why the check is needed.\n"
-        "- Also return relevant_tags: the small list of rule categories that need "
-        "extra guidance for the full narration request. Include only categories "
-        "that materially apply; use [] when no special category applies.\n"
-        "- Choose relevant_tags only from the exact names below. For example, a "
-        "risky search for a recipe might return [\"exploration\", \"recipe\", "
-        "\"skill\", \"uncertainty\"].\n"
-        "- Do not narrate the outcome. Do not roll. The Python application rolls.\n\n"
-        "Available context tags:\n"
-        f"{tag_rundown}\n\n"
-        "Response shape:\n"
-        "{\"checks\": [...], \"relevant_tags\": [\"tag_name\", ...]}\n\n"
-        "Planning packet:\n"
-        f"{packet_json}"
-    )
-
 
 def build_gemini_story_prompt(context_packet: dict[str, Any]) -> str:
     """
@@ -3049,383 +3250,6 @@ def build_gemini_story_prompt(context_packet: dict[str, Any]) -> str:
 
     return _build_xml_story_prompt(context_packet)
 
-    packet_json = json.dumps(context_packet, indent=2)
-    banned_terms = _banned_terms_from_context(context_packet)
-    banned_terms_text = ", ".join(banned_terms) if banned_terms else "(none provided)"
-    ai_preferences = ai_mode_preferences_from_context_packet(context_packet)
-    mode_guidance = build_ai_mode_prompt_guidance(context_packet)
-    content_rule = _story_content_rule(ai_preferences)
-
-    return (
-        "You are the AI narrator for AI Adventure.\n"
-        "Use only the structured context packet below as confirmed adventure state.\n"
-        "The Python application is the source of truth for state. You may suggest "
-        "events, but do not claim that durable state changed unless an event is "
-        "suggested for validation.\n\n"
-        f"{mode_guidance}\n\n"
-        "NPC knowledge boundary:\n"
-        "- The narrator can see the full context packet, but NPCs cannot.\n"
-        "- NPCs must not reference private player state such as exact inventory, "
-        "currency, flags, quests, hidden history, recent off-screen actions, or "
-        "inner thoughts unless they observed it, were told it, or have explicit "
-        "NPC knowledge in state.npcs.relevant.\n"
-        "- NPCs may infer from visible behavior, but uncertain inferences must sound "
-        "uncertain. For example, a bartender may notice careful coin-counting, but "
-        "must not know that a coin is the player's last coin unless the player says "
-        "so or the bartender saw the purse emptied.\n"
-        "- When introducing a meaningful new NPC, suggest NpcUpsertedEvent in events "
-        "with the NPC's internal name, player-visible display_name, internal role, "
-        "location, public description, player_facing_information, knowledge_scope, "
-        "and known_facts. display_name is the name shown in the NPCs tab; use a "
-        "generic label such as 'Shady Character' when the player has not learned "
-        "the NPC's actual name or role. role is for AI memory and should not be "
-        "treated as the player-facing summary. location must be a meaningful "
-        "player-known place, usually the current scene location where the NPC was "
-        "encountered; do not leave it blank. known_facts should list what this NPC "
-        "personally knows; if nothing private is established yet, use a clear "
-        "public/observable fact instead of omitting the field.\n"
-        "- Before creating an NPC, inspect state.npcs.relevant. If the person is "
-        "already listed there, reuse that exact npc_id/internal identifier and "
-        "update the existing profile instead of inventing a second identifier. "
-        "A different wording of the same role at the same location is not a new NPC.\n"
-        "- The events array may contain multiple events with the same type. If the "
-        "current turn introduces multiple distinct meaningful NPCs, suggest one "
-        "NpcUpsertedEvent for each of them instead of only the first one.\n"
-        "- NpcUpsertedEvent.player_facing_information is shown directly in the NPCs "
-        "tab under Notes. Write it as player-known information about a person, not "
-        "as a mechanical service role. Never put secret identities, hidden motives, "
-        "mystery solutions, private plans, or GM-only facts in "
-        "player_facing_information. Store hidden NPC or mystery information with "
-        "SecretUpsertedEvent instead of a player-visible event field.\n\n"
-        "Private GM secret memory:\n"
-        "- state.gm_secrets.active contains authoritative hidden truths that the AI "
-        "must remember across turns. Use those truths for continuity, clues, NPC "
-        "behavior, off-screen plans, and mystery logic without stating them in "
-        "player-facing narration before the player earns or discovers them.\n"
-        "- A GM secret must be unknown to both the player and the Player Character. "
-        "Never turn the Player Character's own conscious actions, firsthand "
-        "observations, memories, known possessions, or deliberately hidden or stored "
-        "items into secret memory unless established state explicitly supplies a "
-        "credible knowledge barrier such as amnesia, memory alteration, "
-        "unconsciousness, or deception. Never use a skill check or search to make the "
-        "Player Character rediscover their own knowing act.\n"
-        "- Suggest SecretUpsertedEvent when a durable hidden fact is created or "
-        "materially changes. Reuse its stable secret_id and send the full current "
-        "record. Use status='active' while hidden, 'revealed' once the player learns "
-        "it, and 'retired' when it is no longer true or useful.\n"
-        "- When a secret becomes revealed, also suggest the appropriate player-known "
-        "NpcUpsertedEvent, LocationUpsertedEvent, ActiveTaskUpsertedEvent, "
-        "FlagSetEvent, item/material event, or other supported public event so "
-        "the learned fact continues to exist outside private secret memory.\n"
-        "- Never copy active secret details into response, suggested_actions, "
-        "player_facing_information, public_description, travel fields, "
-        "tasks, or other player-visible fields unless the current turn reveals them.\n\n"
-        "Creative naming boundary (hard requirement):\n"
-        "- This is a highest-priority output rule, not optional style guidance.\n"
-        "- If the context packet includes creative_ideas, treat those examples as "
-        "high-priority style seeds for newly invented names and setting details.\n"
-        "- Prefer creative_ideas examples or close stylistic relatives over broad "
-        "training-data fantasy defaults, especially for NPCs, settlements, taverns, "
-        "factions, religions, regions, ingredients, species, food, and drinks.\n"
-        "- Never use creative_ideas.banned_terms, close spelling variants, "
-        "hyphenation variants, or obvious reskins for newly invented proper nouns. "
-        "Banned terms may appear only when already established in saved state or "
-        "explicitly provided by the player.\n\n"
-        "- Before returning JSON, scan every string key and value you wrote. If any "
-        "newly invented name contains a banned term or close variant, replace it "
-        "with a fresh non-banned name before responding.\n\n"
-        f"- {GENERIC_PROPER_NOUN_PLACEHOLDER_RULE}\n\n"
-        f"Exact banned proper nouns for newly invented content: {banned_terms_text}\n\n"
-        "Return one JSON object and no surrounding Markdown. The API response "
-        "schema defines the required top-level fields.\n\n"
-        "Rules:\n"
-        "- response must be a non-empty string.\n"
-        f"- {content_rule}\n"
-        "- Spoken dialogue must use double quotation marks around the speaker's "
-        "full spoken sentence or paragraph. Do not use single quotation marks as "
-        "the outer boundary of dialogue. Use single quotation marks only when an "
-        "already-double-quoted speaker mentions a named item, title, shop, place, "
-        "phrase, nickname, inscription, or other quoted specific inside that "
-        "dialogue.\n"
-        "- The response field may use light Markdown for player-facing prose: "
-        "italics for inner thoughts, sensory impressions, emphasis, or quiet "
-        "self-reflection; bold for the first mention of important NPCs, locations, "
-        "factions, quests, or items; and headings or bullet lists for longer "
-        "summaries. Do not use Markdown tables, code fences, HTML, or Markdown "
-        "that hides text from the player.\n"
-        "- Use state.player_ai_preferences.narration_tense_label and "
-        "state.player_ai_preferences.narration_style_label for the response "
-        "field. Limited narration stays within the player character's observed "
-        "or reasonably inferred experience. Omniscient narration may use a "
-        "broader narrative camera, but it must not reveal secrets, hidden state, "
-        "mystery solutions, or NPC-private facts, and NPCs still obey the NPC "
-        "knowledge boundary.\n"
-        "- Resolve the player's submitted action in the narration. Do not end by "
-        "merely restating the action, intent, or search target. For example, if "
-        "the player opens a book to search for clues, describe what the book "
-        "contains, what they notice, what blocks them, or why the result remains "
-        "uncertain.\n"
-        "- Do not speak for the player character. Do not invent player dialogue, "
-        "questions, promises, purchases, attacks, or choices that the player did "
-        "not explicitly provide. NPCs may speak, react, refuse, answer, or ask "
-        "questions, but the player character's next words and decisions belong "
-        "to the player.\n"
-        "- The response field must not include 'What do you do now?' or any "
-        "tense/person-specific end-of-turn prompt. The Python application "
-        "displays that prompt after your response when appropriate, based on "
-        "narration tense and style.\n"
-        "- Do not end the response with a player-character action or player-"
-        "character dialogue as though the player still needs to finish the same "
-        "thought. End on the world's response, a resolved immediate outcome, a "
-        "clear obstacle, an NPC reaction, or a concrete new detail.\n"
-        "- If context_packet.continuation_request.active is true, continue the "
-        "latest story response as though it had been longer originally. Do not "
-        "treat this as a new player action, do not invent a new player decision, "
-        "and do not advance time or add durable events unless the previous "
-        "response already clearly described a current-turn state change that "
-        "needs an event.\n"
-        "- suggested_actions must be a list, even when empty.\n"
-        "- events must be a list, even when empty.\n"
-        "- events may include multiple entries of the same event type when multiple "
-        "distinct state changes happen in the same turn.\n"
-        "- If suggesting events, use the event_shape, known_event_types, and selected event contracts from the packet.\n"
-        "- Every in-game response must include exactly one final StatusUpdatedEvent. Its payload must always contain all three required fields: location, minutes_passed, and weather. Use location='AUTO' when the player remains in the current location, weather='AUTO' only when the narration preserves the current weather, and minutes_passed='AUTO' only when the engine should keep time unchanged (or 0 when no meaningful time passed). If the narration introduces rain, snow, fog, or any other different current weather, set weather to that actual condition instead of AUTO or the old weather. Never emit a partial StatusUpdatedEvent with only minutes_passed, only location, or only weather.\n"
-        "- For actions with meaningful uncertainty, opposition, hidden information, "
-        "danger, resource pressure, time pressure, or real consequences, suggest "
-        "SkillCheckRequestedEvent before any final outcome event. Do not request "
-        "a check merely because an action could theoretically vary in quality or "
-        "take extra time; use checks only when failure or partial success would "
-        "matter in the current scene. Do not use SkillXpAddedEvent as a substitute "
-        "for a warranted check. skill_name may be a generalized capability absent "
-        "from state.skills.known_skills; for an unknown skill, also include a clear "
-        "skill_description so Python can create it at level 1 before rolling.\n"
-        "- Routine movement, paying a known price, receiving ordinary goods, "
-        "eating, drinking, and casual conversation are not skill checks unless "
-        "the player adds a contested, risky, hidden, time-sensitive, or "
-        "deceptive goal.\n"
-        "- state.magic is authoritative. Never cast a spell for the player unless "
-        "the current player command explicitly authorizes that cast. For an authorized "
-        "typed casting command, suggest PlayerSpellCastEvent with the exact spell_id "
-        "from state.magic.known_spells, the chosen cast_tier, and player_authorized=true. "
-        "Never calculate, narrate, or set remaining mana or slots; Python validates and "
-        "consumes the resource. Narrative mode has no consumable resource, Mana mode uses "
-        "the catalog mana_cost, and Tiered mode consumes one slot at the cast tier except "
-        "for tier 0. Use CharacterSpellLearnedEvent only when the player actually gains a "
-        "usable spell, and include its complete definition. Use SpellCatalogUpsertedEvent "
-        "for established spells the player does not learn. Use MagicEffectUpsertedEvent "
-        "only for an ongoing effect actually established by the current narration. When "
-        "state.magic.progression is present, treat its summary, recent meaningful "
-        "advancements, and milestones as authoritative. Suggest "
-        "MagicAdvancementRecordedEvent only when this response establishes meaningful "
-        "magical development through a consequential cast, substantive training or study, "
-        "a discovery, or a story milestone. Never award it for routine repetition or an "
-        "event from an earlier turn. For category=meaningful_cast, first include the exact "
-        "authorized PlayerSpellCastEvent in this response and copy its spell_id. This "
-        "advancement record does not itself change Mana, slots, tiers, or known spells.\n"
-        "- state.travel is the authoritative player-known travel map. Its x_miles "
-        "and y_miles coordinates use a shared map measured in miles; do not invent "
-        "a conflicting distance for known locations. When the player learns a new "
-        "meaningful location, suggest LocationUpsertedEvent with all player-known "
-        "description, map coordinates, terrain, travel_multiplier, and travel_notes. "
-        "Put player-known local culture, religion, economy, factions, laws, and "
-        "landmarks for that place into the location description or travel_notes. "
-        "Use NpcUpsertedEvent for people the player can recognize or remember. "
-        "Use TravelModeChangedEvent when a horse, "
-        "vehicle, group, injury, or other sustained circumstance meaningfully "
-        "changes the player's travel speed.\n"
-        "- When context_packet.travel_request.active is true, treat its distance "
-        "and estimated_minutes as logistics for an attempted journey, not a "
-        "guaranteed teleport. Narrate the beginning, progress, interruption, delay, "
-        "detour, or arrival that follows from the scene. Suggest StatusUpdatedEvent "
-        "only when the player actually reaches a new location, set discover_location "
-        "true only when it is newly discovered, and report the time that truly passed.\n"
-        "- If state.skills.resolved_checks_this_turn is non-empty, those are "
-        "the authoritative skill-check results for this player_command. Do not "
-        "request duplicate SkillCheckRequestedEvent entries for those skills. "
-        "Narrate the action from the resolved outcomes: low failed rolls should "
-        "produce real setbacks, costs, missed information, danger, or slower "
-        "progress; ordinary failures should fail or partly succeed with a clear "
-        "complication; ordinary successes should make real progress; very high "
-        "rolls or totals that beat the DC by 5 or more should produce a notably "
-        "cleaner, faster, richer, or more advantageous result. Do not mention "
-        "dice, raw roll numbers, totals, DCs, or game mechanics in the story.\n"
-        "- Every InventoryItemAddedEvent payload must include value_base_units "
-        "as an integer of at least 1.\n"
-        "- Every InventoryItemAddedEvent must include original ascii_art for the "
-        "item: 3-12 fixed-width lines, no Markdown code fence, and no line over "
-        "40 characters. A bracketed item name such as [Camera], a caption, or any "
-        "other single-line label is invalid and is not ASCII art. Do not "
-        "double-escape line breaks or put visible backslash-n "
-        "text in the drawing. When reusing state.item_catalog.items, copy its existing "
-        "ascii_art instead of redrawing the item.\n"
-        "- Every InventoryItemAddedEvent must also include quantity_unit and "
-        "storage_location. quantity_unit states what the amount measures, such "
-        "as each, grams, mL, bottle, or vial. For recipe ingredients, the matching "
-        "inventory item's quantity_unit must equal measure_unit. Use "
-        "InventoryItemModifiedEvent with quantity_unit to correct an existing "
-        "ingredient stack whose stored unit is wrong. Preserve item_uuid whenever "
-        "the item already exists in state.item_catalog.items. "
-        "as each, bottle, vial, gram, kilogram, liter, or meter. Use exactly "
-        "home for items stored at the player's Home and actively_carried for "
-        "items currently carried by the Player Character. storage_location is a "
-        "free-text storage label and must not be treated as a Travel-tab location.\n"
-        "- Classify inventory by the finished item's present primary function, not "
-        "by its origin or packaging. Ingredient, Reagent, Material, and Crafting "
-        "Item are inputs that can be consumed by recipes. A ready-to-use poison or "
-        "toxin is Poison, including one stored in a vial; the vial does not make "
-        "the mixture an Ingredient or Container. Reserve Ingredient or Reagent for "
-        "raw inputs such as venom glands, toxic herbs, or extracts that still need "
-        "processing.\n"
-        "- For weapons, set item_type='Weapon' and include weapon_hands "
-        "('one-handed' or 'two-handed') plus damage as a dice expression such "
-        "as 1d6, 1d8, or 2d6. Any player weapon must have average damage "
-        "strictly higher than the player's unarmed base damage of 1d4; do "
-        "not create player weapons with damage of 1d4 or anything weaker. "
-        "Use at least 1d6 for ordinary one-handed weapons and at least 1d10 "
-        "for ordinary two-handed weapons unless a stronger fitting expression "
-        "is appropriate. Ranged weapons may also include attack_range_feet, "
-        "ammunition_type_required, clip_size, and "
-        "bullets_per_attack. Ammunition inventory items use "
-        "item_type='Ammunition' and matching ammunition_type metadata. "
-        "For armor or shields, set item_type='Armor', "
-        "include covers_body_parts, and include armor_rating as the armor bonus "
-        "that item contributes. Use category/item_type values of Weapon and "
-        "Armor clearly so the Character sheet can equip them.\n"
-        "- state.item_catalog.items is the master list of known item definitions. "
-        "Before inventing an item, look there and prefer a fitting existing "
-        "definition for ordinary loot, purchases, supplies, equipment, and recipe "
-        "results. Create a new definition only when no catalog item reasonably fits. "
-        "Use it to remember item descriptions and ASCII art after items leave inventory, but "
-        "only state.inventory.items are current possessions. Each catalog entry's "
-        "metadata.item_uuid is its stable internal identity: preserve and reuse it "
-        "when referring to the same item, even if its player-facing name changes. "
-        "Do not invent duplicate item definitions merely because wording differs. "
-        "ReagentDiscoveredEvent also creates or updates a catalog definition, so it "
-        "must include ascii_art and should preserve the matching item_uuid.\n"
-        "- Containers are inventory items with item_type='Container' and a required "
-        "container metadata object. When the player acquires a closed pouch, purse, "
-        "chest, box, bag, or similar object, add only that container. Store its exact "
-        "hidden currency and item contents, open/taken flags, locked/trapped flags, "
-        "notice/disarm/lockpick skills and DCs, and both failure consequences in the "
-        "container metadata. Do not reveal, award, or independently emit the stored "
-        "currency/items while it is closed.\n"
-        "- Use ContainerOpenedEvent only when the player actually opens the named "
-        "container and all required resolved lock/trap checks succeeded. Opening does "
-        "not itself transfer contents. Use ContainerContentsTakenEvent only after the "
-        "container is open and the player explicitly takes its contents. Python then "
-        "transfers the exact stored contents once. Never accompany either container "
-        "event with CurrencyChangedEvent or InventoryItemAddedEvent for those contents.\n"
-        "- If a situation becomes an actual fight, suggest CombatStartedEvent "
-        "with concrete enemies, optional allied combatants, health, armor_rating, "
-        "to_hit_bonus, initiative_bonus, personality, weapon/ammunition/clip fields, damage "
-        "dice, and loot. Use empty ammunition_type_required and zero clip fields "
-        "for weapons that do not consume ammunition. The application rolls "
-        "initiative, adds to_hit_bonus to d20 attacks, tracks reloading, calculates "
-        "each team's Threat Levels from health, armor, and damage, and uses those "
-        "percentages for every non-intelligent NPC's target selection. Intelligent "
-        "NPCs instead choose targets tactically. "
-        "Do not narrate attack rolls, turn-by-turn combat, "
-        "damage totals, deaths, victory, defeat, or loot recovery after combat "
-        "starts. The Python application handles combat deterministically in the "
-        "Combat tab and blocks Story input until combat is resolved.\n"
-        "- When a structured record has separate Location and Description fields, "
-        "keep them complementary: Description should explain what the thing is, "
-        "looks like, does, or means, while Location should contain where it is "
-        "found or situated. Do not repeat the location in the description unless "
-        "the location itself is an essential part of the object's identity.\n"
-        "- ReagentDiscoveredEvent records Crafting tab knowledge for useful "
-        "items/materials only and uses name, category, description, generalized "
-        "location, uses, rarity, notes, and value_base_units. location must list "
-        "broad environments or source areas such as 'Forests, Caves', never a "
-        "specific established Travel-tab location. Use Container for vials, bottles, jars, and similar "
-        "vessels. If the player physically collects, harvests, picks up, or "
-        "stores that item/material, also suggest InventoryItemAddedEvent for "
-        "the same item/material. The uses list is for generalized symptoms or "
-        "effects, such as sleep aid or pain relief, rather than detailed recipes "
-        "or procedures. notes must end with exactly one sentence containing "
-        "'Rarity: Common', 'Rarity: Uncommon', 'Rarity: Rare', or 'Rarity: Very Rare'. "
-        "Price each entry in "
-        "value_base_units using the world's economy; Rare and Very Rare items must "
-        "be materially more valuable than comparable Common items unless the world "
-        "context explicitly supplies a reason otherwise.\n"
-        "- RecipeDiscoveredEvent ingredients must be structured entries using "
-        "item names from state.item_catalog.items in the reagent_name field. "
-        "Use the matching catalog metadata.item_uuid to identify which definition "
-        "the name refers to; reagent_name remains the required player-facing field. "
-        "Set measure_unit to the same unit as that item's inventory quantity_unit; "
-        "quantity times measure_amount is the total amount consumed per crafted result. "
-        "Only items with category "
-        f"{CRAFTING_INGREDIENT_CATEGORY_NAMES} may be used as recipe ingredients. "
-        "If the finished product must physically be stored in a bottle, vial, jar, "
-        "flask, pouch, or similar vessel, include one suitable Container-category "
-        "item as a consumed ingredient for each finished product. "
-        "Include quantity, measure_amount, and a finite measure_unit from the listed "
-        "common measurement units. Liquids such as water must use a concrete volume "
-        "unit such as mL, L, tsp, tbsp, or cups; never use each or vague units such "
-        "as pinch or handful for an uncountable substance. "
-         "Include value_base_units as the recipe result's current or reasonably "
-         "estimated value in the baseline currency unit. Recipe notes must be "
-         "self-contained rather than relying on the recipe name or result text: "
-         "state the intended purpose/effect, expected strength or outcome, onset, "
-         "duration, and important use conditions; say unknown or not applicable "
-         "when a detail is not established.\n"
-        "- If the narration says the player physically gains, collects, harvests, "
-        "finds and keeps, or fills a basket/container with usable items, also "
-        "suggest InventoryItemAddedEvent for those items. Do not describe a "
-        "successful bounty, haul, stash, brimming basket, or collected specimens "
-        "without adding inventory.\n"
-        "- Currency is stored as one integer, state.currency.balance_base_units, "
-        "which is loaded from game_state/currency.balance, not as coin items in "
-        "inventory. For a completed purchase, sale, fee, reward, refund, or other "
-        "money movement, suggest CurrencyChangedEvent with payload.base_unit_amount "
-        "as the one net money change. Never use net_base_unit_amount. If the "
-        "player buys an item, also suggest the InventoryItemAddedEvent for that "
-        "item; do not create coin inventory items for payment or change. In "
-        "player-facing response text and suggested_actions, do not write awkward "
-        "phrases like '35 copper coins worth of silver' or mention base units. "
-        "Use the world's denomination names and break amounts into the largest "
-        "natural denominations, such as '3 Silver Coins and 5 Copper Coins' when "
-        "35 baseline units equals that breakdown.\n"
-        "- ActiveTaskUpsertedEvent is shown directly in the Active Tasks tab. Fill "
-        "only category, status, description, requester, location, reward, due_date, "
-        "and due_elapsed_minutes with useful player-facing values. Do not add "
-        "notes, Notes, or any other extra active-task fields. Every new task must "
-        "have a complete description explaining what must be done, all currently "
-        "known relevant people and places, and how the Player can tell the task is "
-        "complete. Include only player-known facts. An update may omit description "
-        "only when the existing description remains complete and unchanged. "
-        "If state contains a task with a blank or incomplete description, repair it "
-        "with ActiveTaskUpsertedEvent as soon as that task is relevant. "
-        "Use requester='Self' "
-        "for personal goals, reward='N/A' when nobody is paying or trading for "
-        "the task, due_date='N/A' and due_elapsed_minutes=-1 when no deadline is "
-        "known, and location as the relevant place for doing, picking up, "
-        "completing, or turning in the task. For any real deadline, due_date must "
-        "be an exact player-facing date and time, not vague prose, and "
-        "due_elapsed_minutes must be the absolute in-world elapsed minute for "
-        "that deadline. Use 'Unknown' only when a value exists but is genuinely "
-        "unclear.\n"
-        "- Use CalendarEventUpsertedEvent for meaningful dated events the player "
-        "should see on the Calendar: festivals, holidays, appointments, promised "
-        "completion dates, deliveries, deadlines, eclipses, ceremonies, and similar "
-        "milestones. Whenever the narration establishes or reveals a specific date "
-        "or time for such an event, emit the calendar event in that same turn. Use a "
-        "stable lower_snake_case event_id so later turns can edit it. Use recurrence "
-        "yearly for annual observances and none for one-time events; duration_days "
-        "covers consecutive days. Set time_of_day_minutes to the exact local minute "
-        "after midnight for timed events such as an eclipse, appointment, deadline, "
-        "or ceremony; use -1 only for an all-day event or when no exact time is known. "
-        "Use CalendarEventDeletedEvent only to cancel a "
-        "stored event. Do not recreate an unchanged yearly event each year.\n"
-        "- Follow the selected Response Length mode. Within that mode, scale detail "
-        "to the importance, risk, and consequences of the action, and address every "
-        "part of the player's query without padding.\n"
-        "When creating items, ensure that you give a quantifiable amount and an explicit quantity_unit for the item, rather than using phrases such as \"a pile of [ore/apples/etc.]\".\n"
-        "- Do not invent hidden state, inventory, recipes, or flags as confirmed facts.\n\n"
-        "Context packet:\n"
-        f"{packet_json}"
-    )
-
 
 def build_gemini_new_game_prompt(setup_packet: dict[str, Any]) -> str:
     """
@@ -3438,378 +3262,7 @@ def build_gemini_new_game_prompt(setup_packet: dict[str, Any]) -> str:
         Prompt text.
     """
 
-    packet_json = json.dumps(setup_packet, indent=2)
     return _build_xml_new_game_prompt(setup_packet)
-
-    banned_terms = _banned_terms_from_context(setup_packet)
-    banned_terms_text = ", ".join(banned_terms) if banned_terms else "(none provided)"
-    ai_preferences = ai_mode_preferences_from_context_packet(setup_packet)
-    mode_guidance = build_ai_mode_prompt_guidance(setup_packet)
-    content_rule = _story_content_rule(ai_preferences)
-
-    return (
-        "You are creating the initial world setup for AI Adventure.\n"
-        "Use only the structured setup packet below as confirmed setup input. "
-        "Synthesize the player's choices into a coherent playable world.\n\n"
-        f"{mode_guidance}\n\n"
-        "Creative naming boundary (hard requirement):\n"
-        "- This is a highest-priority output rule, not optional style guidance.\n"
-        "- Never use creative_ideas.banned_terms, close spelling variants, "
-        "hyphenation variants, or obvious reskins for newly invented proper nouns.\n"
-        "- This includes the player character name, NPC names, locations, taverns, "
-        "regions, factions, religions, shops, guilds, landmarks, items, skills, "
-        "calendar names, and event payload names.\n"
-        "- Before returning JSON, scan every string key and value you wrote. If any "
-        "newly invented name contains a banned term or close variant, replace it "
-        "with a fresh non-banned name before responding.\n"
-        "- Banned terms may appear only when explicitly provided by the player as "
-        "confirmed setup input.\n\n"
-        f"Exact banned proper nouns for newly invented content: {banned_terms_text}\n\n"
-        "Requirements:\n"
-        "- Return one JSON object and no surrounding Markdown.\n"
-        "- If the setup packet includes fields_requiring_ai_invention, treat those "
-        "fields as blank/default placeholders rather than confirmed facts. Invent "
-        "coherent specifics for them, while preserving any custom player-provided "
-        "values that are not listed there.\n"
-        "- If the setup packet includes creative_ideas, treat them as high-priority "
-        "style seeds for invented names and setting details. Strongly prefer these "
-        "examples or close stylistic relatives over broad training-data fantasy "
-        "defaults, while adapting them so the new game feels distinct.\n"
-        "- Never use creative_ideas.banned_terms, close spelling variants, "
-        "hyphenation variants, or obvious reskins for newly invented proper nouns.\n"
-        f"- {GENERIC_PROPER_NOUN_PLACEHOLDER_RULE}\n"
-        f"- {content_rule}\n"
-        "- If the setup packet includes character_generation_guidance, follow its "
-        "gender_presentation_hint when inventing blank/default player character "
-        "fields, but never conflict with canonical_pronouns. setup.character.pronouns "
-        "is canonical: use it exactly and never infer replacements from the name, "
-        "appearance, voice, backstory, invented details, or genre. A blank/default "
-        "player character does not imply male. Vary names, appearance, and backstory, "
-        "and use creative_ideas.player_character_name_examples as a balanced name "
-        "pool when useful.\n"
-        "- If setup.specified_genre is blank/default, choose a specific genre or "
-        "premise and return it as selected_genre. Do not default to fantasy; "
-        "genre_generation_guidance.genre_hint is available as inspiration. If the "
-        "player provided setup.specified_genre, preserve it as selected_genre.\n"
-        "- Treat the player character's class, profession, backstory, and skills as "
-        "facts about the player character, not as instructions that the entire "
-        "world must share the same theme. Use them to shape the character, "
-        "starting inventory, personal contacts, and immediate opportunities. Do "
-        "not make the city's politics, religions, economy, factions, locations, "
-        "NPCs, conflicts, and mysteries all revolve around the character's "
-        "specialty unless setup.game_style, setup.world_context, or "
-        "setup.specified_genre explicitly requests that focus. For example, a "
-        "merchant character can live in a city whose religion is about storms, "
-        "ancestry, law, harvests, stars, or anything else coherent; the economy "
-        "can matter without every institution being coin-themed.\n"
-        "- world_summary must follow the selected Response Length mode while still "
-        "covering the basics of the world or city, prominent NPCs, locations of "
-        "interest, religions, and economy. It may use light Markdown headings, "
-        "bold names, italics, and bullet lists when that improves readability.\n"
-        "- locations must be a player-known array for the Travel tab. Include the "
-        "finalized starting location at x_miles=0 and y_miles=0, then add only "
-        "the other places the player character would plausibly know at setup. "
-        "There is no minimum or maximum number of other locations. "
-        "Use setup.starting_locations as structured player-requested starting "
-        "Travel-tab locations; do not parse starting locations out of ordinary "
-        "setup prose or plaintext fields. For each setup.starting_locations row, "
-        "include one corresponding entry in locations and set source_index to that "
-        "row's zero-based index. Use source_index=-1 only for extra locations. "
-        "Fill blank name or "
-        "description fields with fitting specifics. If location_mode is exact, "
-        "copy name and description into the locations entry unchanged, while "
-        "still filling terrain, coordinates, travel_multiplier, and route notes. "
-        "If location_mode is suggestion, treat name and description as inspiration "
-        "and put the finalized player-facing values in the locations entry. Once "
-        "you finalize a suggested location name, use that finalized name consistently "
-        "in every other returned field, including descriptions, travel_notes, "
-        "NPC details, tasks, secrets, and opening "
-        "prose; never reuse the superseded setup placeholder or suggestion name. "
-        "If is_sublocation is true and parent_location is set, treat the location "
-        "as existing inside that parent location; reflect that relationship in "
-        "the returned location description and travel_notes without creating a "
-        "separate hidden route. "
-        "For an unknown "
-        "crash-landing, isolated survival, amnesia, or new-arrival premise, the "
-        "starting location may be the only known location. For a ranger, courier, "
-        "trader, local resident, or well-traveled character, include every "
-        "important place they would reasonably know, even six or more. Coordinates "
-        "are relative map miles, not GPS coordinates. Give each returned location "
-        "a concise player-known description, terrain, a positive travel_multiplier "
-        "(below 1 slows travel), and practical route notes. Put player-known local "
-        "religion, culture, economy, factions, laws, customs, landmarks, and "
-        "practical context for a place in its description or travel_notes. Do not "
-        "include hidden routes, secrets, GM-only facts, or names of unknown worlds, "
-        "planets, regions, or settlements unless the player character would know "
-        "those names.\n"
-        "- introductory_message must be player-facing narration for the first "
-        "scene at start_location and must end with setup_packet.turn_prompt.\n"
-        "- If setup.opening_scene_request is non-empty, use it as player-authored "
-        "guidance for the situation, mood, event, or hook of the first scene at "
-        "start_location. Honor its intent when coherent, but transform it into "
-        "finalized in-world prose; do not copy the request verbatim or expose "
-        "meta-instructions. Keep it consistent with the finalized location, "
-        "character, world, and player knowledge.\n"
-        "- suggested_actions must contain three or four short opening-scene "
-        "actions the player can take next. Keep them concrete, immediate, and "
-        "consistent with the introductory_message.\n"
-        "- introductory_message may use light Markdown for player-facing prose: "
-        "italics for inner thoughts or sensory emphasis, and bold for the first "
-        "mention of important NPCs, locations, factions, or items. Do not use "
-        "Markdown tables, code fences, or HTML.\n"
-        "- introductory_message and other player-facing setup prose must use "
-        "setup.narration.tense_label and setup.narration.style_label. Do not "
-        "fall back to second-person wording unless the selected style is "
-        "Second-Person. First-person styles should use I/me/my; third-person "
-        "styles should use the player character's name or exact canonical "
-        "setup.character.pronouns instead of "
-        "you/your. Limited styles stay within the player character's observed "
-        "or reasonably inferred experience. Omniscient styles may use a broader "
-        "narrative camera, but must not reveal secrets, hidden state, mystery "
-        "solutions, or NPC-private facts.\n"
-        "- When setup_packet.current_calendar is present, introductory_message must "
-        "match it unless you intentionally return starting_calendar to change the "
-        "starting date, season, or time. When setup.calendar.ai_generated is true, "
-        "current_calendar is deliberately absent: invent calendar_settings and "
-        "starting_calendar first, then make introductory_message match those generated "
-        "values. introductory_message must match setup_packet.current_weather unless "
-        "you return weather to change it. If introductory_message or the actual "
-        "start_location description establishes rain, drizzle, snow, fog, or another "
-        "current condition, the top-level weather field must name that condition and "
-        "must not retain Clear or another contradictory default.\n"
-        "- start_location must be the actual named location where the player starts. "
-        "If setup.start_location is blank/default, choose any coherent starting "
-        "location for the selected genre and character. The player does not need "
-        "to start in a tavern; a frozen sea, deserted island, ruined store, crime "
-        "scene, crashed ship, wilderness trail, city checkpoint, or similar premise "
-        "is valid when it fits. Use the same start_location consistently in "
-        "introductory_message and events. Keep start_location short and broad: "
-        "use the room, building, street, district, ship, campsite, or landmark "
-        "name only. Put scenic details such as floor, view, nearby landmarks, "
-        "weather, and exact position in introductory_message instead. Example: "
-        "use \"Y/N's Office\", not \"Y/N's Office, high up near the penthouse, "
-        "overlooking the Hudson River\". If setup.start_location_mode is exact, "
-        "return setup.start_location unchanged as start_location and use that "
-        "same exact location name in introductory_message, locations, and events. "
-        "If setup.start_location_mode is suggestion, treat setup.start_location "
-        "as inspiration and you may replace it with a more specific fitting "
-        "location.\n"
-        "- If setup.calendar.ai_generated is true, invent calendar_settings that "
-        "fit the selected world, genre, culture, climate, and playstyle. Use "
-        "clear day names, month names, season names, season weather hints, and "
-        "a time_display value. Keep the calendar playable: days_per_week 1-14, "
-        "weeks_per_month 1-12, months_per_year 1-24, and seasons_per_year 1-12. "
-        "Do not copy the default Gregorian calendar. Never use Monday, Tuesday, "
-        "Wednesday, Thursday, Friday, Saturday, or Sunday as any day name. Do not "
-        "use January-through-December month names, Spring/Summer/Autumn/Winter as the full "
-        "season list, generic Month 1/Month 2 placeholder names, or generic "
-        "fantasy/artisan defaults when AI generation is requested. For futuristic, "
-        "space, cyberpunk, or science-fiction settings, use calendar names that "
-        "fit that premise, such as orbital, colonial, corporate, astronomical, "
-        "technical, station, mission, or local alien-cultural terms, not hearth, "
-        "market, lantern, harvest, or village-craft naming. "
-        "If setup.calendar.ai_generated is false, return calendar_settings as an "
-        "empty object and use the provided calendar.\n"
-        "- character must finalize the player character profile. If character name, "
-        "appearance, backstory, or notes are blank/default placeholders, replace "
-        "them with coherent player-facing details suitable for the world. Preserve "
-        "explicit custom player input exactly. For each character field, if the "
-        "corresponding setup.character value is not blank/default, copy that field "
-        "unchanged in character and use that exact identity in world_summary, "
-        "introductory_message, and events. Do not rename, partially rename, "
-        "embellish, paraphrase, or reinterpret a player-provided character name, "
-        "appearance, backstory, or notes field.\n"
-        "- skills must contain every starting skill with name, description, and level. "
-        "Return exactly the skill slots present in setup.skills, preserving every "
-        "slot's level; when setup.skills is empty, return an empty skills array. "
-        "Skill levels range from 1 through 5, and 5 is the absolute maximum. Never "
-        "create a prerequisite, progression target, or gm_secrets reveal_condition "
-        "that requires a skill level above 5. If setup.skills[N].name is nonblank, "
-        "copy that exact skill name unchanged "
-        "in skills[N].name. Do not rename, embellish, specialize, hyphenate, or "
-        "reinterpret player-provided skill names. If only the description is blank, "
-        "fill the description for that exact named skill. Only invent a skill name "
-        "for a setup skill whose name is blank/default/placeholder. "
-        "Skill names must be generalized gameplay capabilities useful across many "
-        "checks, not one-off lore phrases, proper nouns, tiny item-maintenance "
-        "tasks, or narrow setting trivia. Put local flavor, culture, equipment, "
-        "and backstory specifics in the description. Good shapes include "
-        "Weather-Reading, Arcana, Navigation, Tinkering, Stealth, Investigation, "
-        "Medicine, Performance, Persuasion, Survival, Melee, and Lore (Specific "
-        "Domain). Convert specific lore skills to parenthetical domain names, such "
-        "as Lore (Syndicate), Lore (Flijosha), or Lore (Merchant Law), rather than "
-        "Syndicate Lore or Flijosha Observance. "
-        "Never return placeholder descriptions such as 'Player-selected level 1 "
-        "starting skill.'\n"
-        "- starting_items must contain at least five total tracked possessions "
-        "and has no maximum item count. Include any player-requested items, then "
-        "invent enough additional concrete items that naturally fit the finalized "
-        "character, genre, starting location, weather, and economy to reach the "
-        "minimum. Return the finalized inventory in the starting_items field; "
-        "do not use the alias starting_inventory. "
-        "Weapon starter items should include weapon_hands, damage, attack_skill, "
-        "and attack_range_feet. A weapon must be mechanically worthwhile: its "
-        "average damage must be strictly higher than the player's unarmed base "
-        "damage of 1d4. Do not return starter weapons with damage of 1d4 or "
-        "anything weaker. Use at least 1d6 for ordinary one-handed weapons and "
-        "at least 1d10 for ordinary two-handed weapons unless the weapon has a "
-        "higher fitting damage expression. Guns and other ammunition weapons should also "
-        "include ammunition_type_required, clip_size, and bullets_per_attack, "
-        "plus a compatible Ammunition starter item with matching "
-        "ammunition_type. Armor should include covers_body_parts and armor_rating. "
-        "Preserve "
-        "any player-provided setup.starter_items entries whose requires_ai_invention "
-        "field is false. If a player-provided setup starter item is already a "
-        "Weapon or Armor, keep its mechanical fields instead of downgrading it "
-        "to a generic item. Set source_index to the zero-based setup.starter_items "
-        "index for items based on a setup starter-item entry, and -1 for extra "
-        "invented items. "
-        "If a setup.starter_items entry has requires_ai_invention=true or "
-        "item_request text, treat it as a player-authored item concept and "
-        "convert it into the number of concrete, setting-appropriate tracked "
-        "items that best fits the concept rather than copying the request "
-        "verbatim. If setup.starter_items is blank, invent at least five items "
-        "that fit the finalized character backstory, finalized skills, selected "
-        "genre, starting location, weather, and economy. First identify the "
-        "activities, responsibilities, and goals that the player emphasizes in "
-        "the character description, backstory, notes, profession, and skills. "
-        "Prioritize concrete tools and supplies that enable those emphasized "
-        "activities before adding generic apparel, comfort items, or genre-standard "
-        "kit. Infer function from the whole character concept rather than matching "
-        "a fixed keyword list. Assign each item's category from its actual primary "
-        "function. A Container must primarily hold physical contents that can be "
-        "put in and taken out; an object that stores writing, records, instructions, "
-        "or information is not a Container merely because it stores information. "
-        "Do not include setup "
-                "bookkeeping words such as Starting, Starter, Initial, Amount, Quantity, "
-        "Count, or Total in item names. Generalize resource names to the actual "
-        "inventory item, such as Fuel instead of Starting Fuel Amount, Food instead "
-        "of Starting Food Amount, and Water instead of Starting Water Quantity. Put "
-        "quantities in quantity, not name. Each item must include "
-                "name, category, quantity, quantity_unit, description, value_base_units, "
-                "and source_index. quantity_unit is mandatory: use a concrete unit such "
-                "as each, bundle, bottle, vial, gram, kilogram, ounce, liter, or meter; "
-                "never leave it implicit. Classify physical objects by their primary "
-                "function: a journal, notebook, ledger, manual, or other book is Book "
-                "or Document, not Information. Information describes content, not a "
-                "physical inventory category.\n"
-        "- Assign storage_location for every starting item. This is a free-text "
-        "storage label and is not a Travel-tab location or map record. Use "
-        "actively_carried only for items the Player Character is actually carrying "
-        "at the start. Preserve item_request phrases such as 'in their house', "
-        "'in the car', 'at the workshop', or 'in the office' as concise storage "
-        "labels such as home, car, workshop, or detective office; do not silently "
-        "convert them to actively_carried.\n"
-        "- Do not create closed or hidden-content containers in starting_items. "
-        "The new-game schema intentionally keeps starter inventory flat for Gemini "
-        "compatibility. If the opening scene later awards a closed pouch, chest, "
-        "bag, case, or similar container, normal story turns can add it with "
-        "complete container metadata.\n"
-        "- known_crafting_items and known_crafting_recipes are player-known Crafting "
-        "tab knowledge, not physical inventory. Return empty arrays for a character "
-        "with no relevant training or discoveries. For an alchemist, cook, engineer, "
-        "herbalist, survivalist, medic, scientist, crafter, or other profession "
-        "that logically starts with practical making knowledge, return as many "
-        "useful known items/materials and recipes as fit the backstory. Every "
-        "known_crafting_items entry must include original ascii_art using 3-12 "
-        "fixed-width lines, no Markdown fence, and no line over 40 characters. Recipe "
-        "ingredients must use item names from known_crafting_items or other known "
-        "item catalog entries. Ingredient objects must use reagent_name, quantity, "
-        "measure_amount, and a finite measure_unit from the schema enum. Do not use "
-        "vague units such as pinch or handful. Categorize vials, bottles, jars, and "
-        "similar vessels as Container. Every recipe must include value_base_units "
-        "as a reasonable estimated result value in the baseline currency unit. "
-        "Do not add those ingredients to "
-        "starting_items unless the player physically possesses them.\n"
-        "- If setup.currency_denominations is empty, currency_denominations must "
-        "contain at least one and at most four concrete denominations that fit "
-        "the selected genre, world, and economy. One denomination must have "
-        "value=1 as the baseline unit. Other values are exchange rates measured "
-        "in that baseline unit and do not need to be multiples or powers of 10. "
-        "For example, fantasy worlds may use copper/silver/gold-style coinage, "
-        "realistic modern worlds may use dollars, and futuristic or space worlds "
-        "may use credits. Use setup.economy_examples as common-price calibration "
-        "for ordinary goods when it is present. If setup.currency_denominations "
-        "already contains player-provided values, preserve them.\n"
-        "- setup.starting_wealth is authoritative. In basic mode, "
-        "starting_currency_balance_base_units must be a nonnegative starting-money "
-        "amount that follows setup.starting_wealth.guidance and fits the finalized "
-        "character, genre, economy, and setup.economy_examples. In advanced mode, "
-        "Python already calculated the exact balance from the player's denomination "
-        "and count rows; do not return or replace it. Starting wealth is stored as "
-        "one integer in game_state/currency.balance. Never create coin, purse, cash, "
-        "wallet, credit, or other spendable-money items in starting_items.\n"
-        "- The API response schema defines the required output fields and event "
-        "envelope. New-game events may only be NpcUpsertedEvent, "
-        "ActiveTaskUpsertedEvent, MusicChangedEvent, or "
-        "SoundEffectChangedEvent. Put hidden identities, "
-        "motives, mystery solutions, off-screen plans, and other GM-only starting "
-        "truths in the top-level gm_secrets array, not in player-facing fields "
-        "or the events array. The app stores those starting secrets as active. "
-        "Put established non-secret creatures, species, cultures, factions, laws, "
-        "history, phenomena, customs, and other concepts without a more specific "
-        "home in the top-level miscellaneous array. Use category Creature for each "
-        "non-NPC creature or monster known to the Player, and include only "
-        "player-known facts in details because these records populate the Bestiary. "
-        "Use the direct setup fields for locations, crafting knowledge, inventory, "
-        "currency, character, skills, calendar, and all other initial state that "
-        "has a direct field. Use type and payload for each event; "
-        "do not use event_type as the top-level event type key.\n"
-        "- Use only player-known information in player-facing event fields.\n"
-        "- setup.starting_task.mode controls whether the opening save starts with "
-        "an active quest. If it is none, do not create an initial "
-        "ActiveTaskUpsertedEvent unless another explicit setup field independently "
-        "requires one. If it is ai, create one fitting starting quest. If it is "
-        "custom, create exactly one ActiveTaskUpsertedEvent using the player's "
-        "provided task fields as anchors and filling any blank/default task fields "
-        "from the rest of the setup. Every new quest must have a complete "
-        "player-visible description explaining what must be done, all currently "
-        "known relevant people and places, and how the Player can recognize "
-        "completion. Include only player-known facts. Use category Quest unless "
-        "the player provided "
-        "a different category.\n"
-        "- Use NpcUpsertedEvent for prominent NPCs the player can know about at "
-        "setup. Use zero, one, or many NPC events according to setup.starting_npcs "
-        "and what the player character would actually know. A loner or stranger "
-        "in a new city can start with no known NPCs; a local, commander, teacher, "
-        "noble, merchant, or socially connected character can start with several. "
-        "Do not parse NPCs out of ordinary setup prose or plaintext fields. For "
-        "each setup.starting_npcs row, create one NpcUpsertedEvent and copy its "
-        "npc_id exactly into payload.npc_id. Set payload.party_member true exactly "
-        "when that npc_id appears in setup.starting_party_npc_ids, and false "
-        "otherwise. When location_source_index is nonnegative, payload.location "
-        "must use the finalized name of the corresponding setup.starting_locations "
-        "row, including when its suggestion-mode name changes. Fill blank "
-        "name, location, or description fields with fitting specifics. If "
-        "description_mode is exact, copy description into payload.public_description "
-        "unchanged; if description_mode is suggestion, use description as a guide "
-        "and put the finalized description in payload.public_description.\n"
-        "Use ActiveTaskUpsertedEvent for initial active obligations, including "
-        "classic quests with category Quest. Use "
-        "currency_denominations for initial generated money instead of "
-        "CurrencyDefinedEvent. Use CurrencyDefinedEvent only when a story event "
-        "establishes a new denomination after initial setup. If "
-        "setup_packet.audio.valid_music_tracks is non-empty, "
-        "use one MusicChangedEvent to choose fitting opening background music; "
-        "its filename must exactly match one listed track. When "
-        "setup_packet.audio.valid_sound_effect_tracks is non-empty, use a separate "
-        "SoundEffectChangedEvent for every specific narrated moment that genuinely "
-        "benefits from an appropriate listed sound; there is no fixed cue-count target, "
-        "and no cue should be forced when nothing fits. Each plays once, never loops, "
-        "and its filename must exactly match one listed sound-effect track, never "
-        "valid_music_tracks. For every event, copy anchor_text exactly from one unique "
-        "place in introductory_message and use position before or after to locate the "
-        "precise narration boundary. The API response "
-        "schema defines the required JSON fields.\n\n"
-        "Setup packet:\n"
-        f"{packet_json}"
-    )
-
-
-def _story_content_rule(ai_preferences: dict[str, Any]) -> str:
-    """Returns story prose guidance that agrees with the selected safety filters."""
-
-    return str(ai_preferences["model_content_rules"])
 
 
 def _structured_output_config(
@@ -3849,12 +3302,10 @@ def _structured_output_config(
 def _thinking_config(model: str, thinking_level: str) -> dict[str, Any]:
     """Returns a model-compatible Gemini thinking configuration."""
 
-    if str(model).strip().casefold().startswith("gemini-2.5"):
-        return {
-            "thinking_budget": 24576 if thinking_level == "high" else 1024,
-        }
-
-    return {"thinking_level": "high" if thinking_level == "high" else "minimal"}
+    return thinking_config_for_text_model(
+        model,
+        smarter=thinking_level == "high",
+    )
 
 
 def _content_safety_settings(
@@ -4186,6 +3637,26 @@ def _suggested_setup_terms(setup_packet: dict[str, Any]) -> tuple[str, ...]:
     return tuple(dict.fromkeys(terms))
 
 
+def _new_game_npc_payloads(data: dict[str, Any]) -> list[dict[str, Any]]:
+    """Reads direct new-game NPC records with legacy event-envelope fallback."""
+
+    direct_npcs = data.get("starting_npcs", [])
+    if isinstance(direct_npcs, list):
+        payloads = [npc for npc in direct_npcs if isinstance(npc, dict)]
+        if payloads or "starting_npcs" in data:
+            return payloads
+    events = data.get("events", [])
+    if not isinstance(events, list):
+        return []
+    return [
+        event["payload"]
+        for event in events
+        if isinstance(event, dict)
+        and event.get("type") == "NpcUpsertedEvent"
+        and isinstance(event.get("payload"), dict)
+    ]
+
+
 def _unfinalized_suggested_setup_terms(
     raw_text: str,
     setup_packet: dict[str, Any] | None,
@@ -4258,14 +3729,7 @@ def _unfinalized_suggested_setup_terms(
             unresolved.append(requested_description)
 
     raw_npcs = setup.get("starting_npcs", []) if isinstance(setup, dict) else []
-    events = data.get("events", [])
-    npc_payloads = [
-        event.get("payload", {})
-        for event in events
-        if isinstance(event, dict)
-        and event.get("type") == "NpcUpsertedEvent"
-        and isinstance(event.get("payload"), dict)
-    ] if isinstance(events, list) else []
+    npc_payloads = _new_game_npc_payloads(data)
     if isinstance(raw_npcs, list):
         for source_index, requested in enumerate(raw_npcs):
             if not isinstance(requested, dict):
@@ -4283,7 +3747,9 @@ def _unfinalized_suggested_setup_terms(
                     payload
                     for payload in npc_payloads
                     if requested_name
-                    and str(payload.get("display_name", "") or "").strip().casefold()
+                    and str(
+                        payload.get("name", payload.get("display_name", "")) or ""
+                    ).strip().casefold()
                     == requested_name.casefold()
                 ),
                 npc_payloads[source_index] if source_index < len(npc_payloads) else None,
@@ -4418,14 +3884,7 @@ def _unfinalized_suggested_setup_paths(
                 paths.append(f"locations[source_index={source_index}].description")
 
     raw_npcs = setup.get("starting_npcs", [])
-    returned_events = data.get("events", [])
-    npc_payloads = [
-        event.get("payload", {})
-        for event in returned_events
-        if isinstance(event, dict)
-        and event.get("type") == "NpcUpsertedEvent"
-        and isinstance(event.get("payload"), dict)
-    ] if isinstance(returned_events, list) else []
+    npc_payloads = _new_game_npc_payloads(data)
     if isinstance(raw_npcs, list):
         for source_index, requested in enumerate(raw_npcs):
             if not isinstance(requested, dict):
@@ -4456,7 +3915,7 @@ def _unfinalized_suggested_setup_paths(
                 finalized_description,
             ):
                 paths.append(
-                    f"events[NpcUpsertedEvent][{source_index}].payload.public_description"
+                    f"starting_npcs[{source_index}].public_description"
                 )
 
     raw_magic = setup.get("magic", {})
@@ -4631,7 +4090,6 @@ def _generate_new_game_response_with_quality_retry(
             contents=request_contents,
             config=request_config,
             request_label=request_label,
-            allow_schema_fallback=False,
         )
         candidate_text = str(getattr(response, "text", "") or "").strip()
         candidate_errors = _new_game_response_quality_errors(
@@ -4722,18 +4180,6 @@ def _new_game_response_quality_errors(
         for error in _json_schema_shape_errors(data, response_schema)
         if not error.endswith(" is not allowed")
     ]
-    for field_name in ("starting_items", "known_crafting_items"):
-        raw_items = data.get(field_name, [])
-        if not isinstance(raw_items, list):
-            continue
-        for index, raw_item in enumerate(raw_items):
-            if not isinstance(raw_item, dict):
-                continue
-            if not is_substantive_ascii_art(raw_item.get("ascii_art", "")):
-                errors.append(
-                    f"$.{field_name}[{index}].ascii_art must be a real 3-12 line "
-                    "drawing; a bracketed name or single-line label is invalid"
-                )
     return errors
 
 
@@ -5254,33 +4700,77 @@ def _skill_check_planning_packet(context_packet: dict[str, Any]) -> dict[str, An
             "progression": magic.get("progression", {}),
         }
 
+    containers = [
+        item
+        for item in inventory_items
+        if isinstance(item, dict)
+        and isinstance(item.get("metadata"), dict)
+        and str(item["metadata"].get("item_type", "")).casefold()
+        == "container"
+    ]
+    compact_skills = [
+        {
+            key: skill.get(key)
+            for key in ("name", "level", "xp", "description")
+            if key in skill
+        }
+        for skill in skills.get("known_skills", [])
+        if isinstance(skill, dict)
+    ]
+    compact_secrets = state.get("gm_secrets", {})
+    if isinstance(compact_secrets, dict):
+        compact_secrets = {
+            "active": [
+                {
+                    key: secret.get(key)
+                    for key in ("secret_id", "title", "details", "reveal_condition", "related_npc_ids", "related_locations")
+                    if key in secret
+                }
+                for secret in compact_secrets.get("active", [])
+                if isinstance(secret, dict)
+            ]
+        }
+    else:
+        compact_secrets = {}
+    player = state.get("player", {})
+    if not isinstance(player, dict):
+        player = {}
     packet = {
         "packet_type": "skill_check_planning",
         "player_command": str(context_packet.get("player_command", "")).strip(),
         "scene": state.get("scene", {}) if isinstance(state.get("scene"), dict) else {},
-        "player": state.get("player", {}) if isinstance(state.get("player"), dict) else {},
-        "known_skills": skills.get("known_skills", []),
+        "player": {
+            key: player.get(key)
+            for key in ("name", "condition", "health_current", "health_max")
+            if key in player
+        },
+        "skill_rules": skills.get("rules", {}),
+        "container_rules": inventory.get("container_rule", CONTAINER_ACCESS_RULE),
+        "known_skills": compact_skills,
         "containers": [
-            item
-            for item in inventory_items
-            if isinstance(item, dict)
-            and isinstance(item.get("metadata"), dict)
-            and str(item["metadata"].get("item_type", "")).casefold()
-            == "container"
+            {
+                "name": item.get("name", ""),
+                "description": str(item.get("description", ""))[:500],
+                "metadata": item.get("metadata", {}),
+            }
+            for item in containers
         ],
-        "gm_secrets": (
-            state.get("gm_secrets", {})
-            if isinstance(state.get("gm_secrets"), dict)
-            else {}
-        ),
-        "miscellaneous": (
-            state.get("miscellaneous", {})
-            if isinstance(state.get("miscellaneous"), dict)
-            else {}
-        ),
-        "recent_checks": skills.get("recent_checks", []),
-        "recent_history": recent_history[-2:],
+        "immediately_unlockable_containers": [
+            str(item.get("name", "") or "").strip()
+            for item in containers
+            if str(item.get("name", "") or "").strip()
+            and has_immediate_container_unlock_method(
+                inventory_items,
+                str(item.get("name", "") or "").strip(),
+            )
+        ],
+        "gm_secrets": compact_secrets,
+        "recent_checks": skills.get("recent_checks", [])[-4:],
+        "recent_history": recent_history[-1:],
     }
+    bestiary = state.get("bestiary", {})
+    if isinstance(bestiary, dict) and bestiary.get("entries"):
+        packet["bestiary"] = bestiary
     if magic_planning_context:
         packet["magic"] = magic_planning_context
     return packet
@@ -5317,6 +4807,9 @@ def _context_packet_stats(
         "active_gm_secrets": _list_len(_nested_value(state, "gm_secrets", "active")),
         "miscellaneous_entries": _list_len(
             _nested_value(state, "miscellaneous", "entries")
+        ),
+        "bestiary_entries": _list_len(
+            _nested_value(state, "bestiary", "entries")
         ),
         "valid_music_tracks": _list_len(_nested_value(state, "audio", "valid_music_tracks")),
     }
@@ -5369,17 +4862,23 @@ def _filter_audio_events_for_catalogs(
     raw_audio = context_packet.get("audio")
     if not isinstance(raw_audio, dict) or not raw_audio:
         raw_audio = _state_subpacket(context_packet, "audio")
-    valid_music, valid_effects = distinct_audio_track_catalogs(
+    valid_music, valid_effects, valid_ambience = distinct_audio_track_catalogs_with_ambience(
         raw_audio.get("valid_music_tracks", []),
         raw_audio.get("valid_sound_effect_tracks", []),
+        raw_audio.get("valid_background_ambience_tracks", []),
     )
     music_by_key = {track.casefold(): track for track in valid_music}
     effects_by_key = {track.casefold(): track for track in valid_effects}
+    ambience_by_key = {track.casefold(): track for track in valid_ambience}
     filtered: list[dict[str, Any]] = []
 
     for event in events:
         event_type = str(event.get("type", "") or "").strip()
-        if event_type not in {"MusicChangedEvent", "SoundEffectChangedEvent"}:
+        if event_type not in {
+            "MusicChangedEvent",
+            "SoundEffectChangedEvent",
+            "BackgroundAmbienceChangedEvent",
+        }:
             filtered.append(event)
             continue
 
@@ -5400,10 +4899,25 @@ def _filter_audio_events_for_catalogs(
         ).strip()
         filename_key = filename.casefold()
 
-        catalog = music_by_key if event_type == "MusicChangedEvent" else effects_by_key
+        if event_type == "MusicChangedEvent":
+            catalog = music_by_key
+            catalog_label = "music"
+        elif event_type == "SoundEffectChangedEvent":
+            catalog = effects_by_key
+            catalog_label = "sound-effect"
+        else:
+            catalog = ambience_by_key
+            catalog_label = "background-ambience"
+            if filename_key in {"stop", "none", "off", "silence"}:
+                if filename != "STOP":
+                    event = dict(event)
+                    payload = dict(payload)
+                    payload["filename"] = "STOP"
+                    event["payload"] = payload
+                filtered.append(event)
+                continue
         canonical_filename = catalog.get(filename_key)
         if canonical_filename is None:
-            catalog_label = "music" if event_type == "MusicChangedEvent" else "sound-effect"
             LOGGER.warning(
                 "Dropped %s from Gemini %s because %r is not in the distinct %s catalog.",
                 event_type,
@@ -5712,6 +5226,80 @@ def _drop_unwarranted_skill_check_events(
         out_of_game=result.out_of_game,
         raw_text=result.raw_text,
     )
+
+
+def _prefer_clearly_relevant_known_skill(
+    result: SkillCheckPlanResult,
+    context_packet: dict[str, Any],
+) -> SkillCheckPlanResult:
+    """Corrects broad or invented planner skills for unambiguous known-skill cases."""
+
+    if not result.checks:
+        return result
+
+    command = str(context_packet.get("player_command", "") or "")
+    if not (
+        FORAGING_ACTION_RE.search(command)
+        and FORAGING_TARGET_RE.search(command)
+    ):
+        return result
+
+    known_skills = _known_skills_from_context(context_packet)
+    foraging_name = known_skills.get("foraging")
+    if not foraging_name:
+        return result
+
+    corrected_checks: list[dict[str, Any]] = []
+    corrected_names: list[str] = []
+    seen_names: set[str] = set()
+    for check in result.checks:
+        check_name = str(check.get("skill_name", "") or "").strip()
+        folded_name = check_name.casefold()
+        should_correct = (
+            folded_name not in known_skills
+            or folded_name in GENERIC_SEARCH_SKILL_NAMES
+        )
+        corrected_check = dict(check)
+        if should_correct and folded_name != "foraging":
+            corrected_check["skill_name"] = foraging_name
+            corrected_names.append(check_name)
+
+        final_name = str(corrected_check.get("skill_name", "") or "").casefold()
+        if final_name in seen_names:
+            continue
+        corrected_checks.append(corrected_check)
+        seen_names.add(final_name)
+
+    if not corrected_names:
+        return result
+
+    LOGGER.warning(
+        "Corrected Gemini planned skill check(s) %s to %s because the player is "
+        "locating or gathering wild plants/reagents and that known skill is the "
+        "direct fit.",
+        corrected_names,
+        foraging_name,
+    )
+    return SkillCheckPlanResult(
+        checks=corrected_checks,
+        relevant_tags=result.relevant_tags,
+        raw_text=result.raw_text,
+    )
+
+
+def _known_skills_from_context(context_packet: dict[str, Any]) -> dict[str, str]:
+    state = context_packet.get("state", {})
+    skills = state.get("skills", {}) if isinstance(state, dict) else {}
+    known_skills = skills.get("known_skills", []) if isinstance(skills, dict) else []
+    if not isinstance(known_skills, list):
+        return {}
+
+    return {
+        name.casefold(): name
+        for skill in known_skills
+        if isinstance(skill, dict)
+        and (name := str(skill.get("name", "") or "").strip())
+    }
 
 
 def _drop_unauthorized_player_spell_cast_events(
@@ -6118,12 +5706,14 @@ def _enforce_container_reward_flow(
             result.narrative_text,
         ]
     )
-    closed_container_names = _closed_container_names_from_context(context_packet)
-    accesses_closed_container = (
+    inaccessible_container_names = _inaccessible_container_names_from_context(
+        context_packet
+    )
+    accesses_inaccessible_container = (
         _text_indicates_unopened_container(current_turn_text)
         and any(
             name.casefold() in current_turn_text.casefold()
-            for name in closed_container_names
+            for name in inaccessible_container_names
         )
     )
     adds_closed_container = any(
@@ -6135,7 +5725,7 @@ def _enforce_container_reward_flow(
         for event in result.suggested_events
     )
     protects_closed_contents = (
-        accesses_closed_container
+        accesses_inaccessible_container
         or adds_closed_container
         or takes_contents
     )
@@ -6194,10 +5784,10 @@ def _enforce_container_reward_flow(
     )
 
 
-def _closed_container_names_from_context(
+def _inaccessible_container_names_from_context(
     context_packet: dict[str, Any],
 ) -> set[str]:
-    """Reads the names of unopened inventory containers from story state."""
+    """Reads closed containers that cannot be opened immediately from story state."""
 
     state = context_packet.get("state", {})
     inventory = state.get("inventory", {}) if isinstance(state, dict) else {}
@@ -6214,15 +5804,24 @@ def _closed_container_names_from_context(
         metadata = item.get("metadata", {})
         container = metadata.get("container", {}) if isinstance(metadata, dict) else {}
 
-        if (
+        if not (
             isinstance(container, dict)
             and str(metadata.get("item_type", "")).casefold() == "container"
             and container.get("is_open") is not True
         ):
-            name = str(item.get("name", "") or "").strip()
+            continue
 
-            if name:
-                names.add(name)
+        name = str(item.get("name", "") or "").strip()
+        if not name:
+            continue
+
+        is_trapped = container.get("is_trapped") is True
+        is_locked_without_access = (
+            container.get("is_locked") is True
+            and not has_immediate_container_unlock_method(items, name)
+        )
+        if is_trapped or is_locked_without_access:
+            names.add(name)
 
     return names
 
@@ -6415,7 +6014,6 @@ def _ensure_inventory_for_collected_reagents(
                 "item_name": name,
                 "item_uuid": str(payload.get("item_uuid", "") or ""),
                 "description": _reagent_inventory_description(payload),
-                "ascii_art": str(payload.get("ascii_art", "") or ""),
                 "amount": 1,
                 "quantity_unit": "each",
                 "storage_location": "actively_carried",
@@ -6720,7 +6318,7 @@ def parse_gemini_new_game_response(
     guarded_raw_text = json.dumps(data, ensure_ascii=False)
 
     response_schema = (
-        build_new_game_response_schema(setup_packet)
+        build_new_game_response_schema(setup_packet, for_api=False)
         if isinstance(setup_packet, dict)
         else NEW_GAME_RESPONSE_JSON_SCHEMA
     )
@@ -6745,6 +6343,7 @@ def parse_gemini_new_game_response(
     locations = _parse_new_game_locations(data.get("locations"), start_location)
     gm_secrets = _parse_new_game_gm_secrets(data.get("gm_secrets"))
     miscellaneous = _parse_new_game_miscellaneous(data.get("miscellaneous"))
+    bestiary = _parse_new_game_bestiary(data.get("bestiary"))
     introductory_message = str(
         data.get("introductory_message", data.get("response", ""))
     ).strip()
@@ -6804,6 +6403,80 @@ def parse_gemini_new_game_response(
         LOGGER.warning("Gemini new-game events was not a list. Ignoring it.")
         raw_events = []
 
+    raw_starting_npcs = data.get("starting_npcs", [])
+    if isinstance(raw_starting_npcs, list):
+        raw_events.extend(
+            {
+                "type": "NpcUpsertedEvent",
+                "payload": dict(npc),
+            }
+            for npc in raw_starting_npcs
+            if isinstance(npc, dict)
+        )
+    raw_starting_task = data.get("starting_task")
+    if isinstance(raw_starting_task, dict) and raw_starting_task:
+        raw_events.append(
+            {
+                "type": "ActiveTaskUpsertedEvent",
+                "payload": dict(raw_starting_task),
+            }
+        )
+
+    raw_opening_cues = data.get("opening_cues", [])
+    if not isinstance(raw_opening_cues, list):
+        raw_opening_cues = []
+    music_cues = [
+        cue for cue in raw_opening_cues
+        if isinstance(cue, dict) and cue.get("kind") == "music"
+    ]
+    starting_music = str(
+        (
+            music_cues[0].get("filename", "")
+            if music_cues
+            else data.get("starting_music", "")
+        )
+        or ""
+    ).strip()
+    if starting_music:
+        raw_events.append(
+            {
+                "type": "MusicChangedEvent",
+                "payload": {"filename": starting_music},
+            }
+        )
+    raw_sound_effects = [
+        cue for cue in raw_opening_cues
+        if isinstance(cue, dict) and cue.get("kind") == "sound_effect"
+    ] or data.get("starting_sound_effects", [])
+    if isinstance(raw_sound_effects, list):
+        raw_events.extend(
+            {
+                "type": "SoundEffectChangedEvent",
+                "payload": dict(cue),
+            }
+            for cue in raw_sound_effects
+            if isinstance(cue, dict)
+        )
+    starting_background_ambience = str(
+        next(
+            (
+                cue.get("filename", "")
+                for cue in raw_opening_cues
+                if isinstance(cue, dict)
+                and cue.get("kind") == "background_ambience"
+            ),
+            data.get("starting_background_ambience", ""),
+        )
+        or ""
+    ).strip()
+    if starting_background_ambience:
+        raw_events.append(
+            {
+                "type": "BackgroundAmbienceChangedEvent",
+                "payload": {"filename": starting_background_ambience},
+            }
+        )
+
     suggested_events = [
         event for event in raw_events if isinstance(event, dict)
     ]
@@ -6823,7 +6496,11 @@ def parse_gemini_new_game_response(
         response_label="new-game response",
     )
     speaker_cues = _extract_narration_speaker_cues(
-        data.get("speaker_cues", []),
+        [
+            cue for cue in raw_opening_cues
+            if isinstance(cue, dict) and cue.get("kind") == "speaker"
+        ]
+        or data.get("speaker_cues", []),
         str(data.get("introductory_message", data.get("response", ""))).strip(),
         response_label="new-game response",
     )
@@ -6844,6 +6521,7 @@ def parse_gemini_new_game_response(
         locations=locations,
         gm_secrets=gm_secrets,
         miscellaneous=miscellaneous,
+        bestiary=bestiary,
         finalized_character=finalized_character,
         finalized_skills=finalized_skills,
         finalized_starting_spells=finalized_starting_spells,
@@ -7049,6 +6727,10 @@ def _parse_new_game_miscellaneous(raw_entries: Any) -> list[dict[str, Any]]:
         details = str(raw_entry.get("details", "")).strip()
         normalized_id = misc_id.casefold()
 
+        if category.casefold() in {
+            "creature", "creatures", "monster", "monsters", "beast", "beasts",
+        }:
+            continue
         if not misc_id or not name or not details or normalized_id in seen_ids:
             continue
 
@@ -7065,13 +6747,51 @@ def _parse_new_game_miscellaneous(raw_entries: Any) -> list[dict[str, Any]]:
     return entries
 
 
+def _parse_new_game_bestiary(raw_entries: Any) -> list[dict[str, Any]]:
+    """Parses player-known starting creatures from new-game synthesis."""
+
+    if not isinstance(raw_entries, list):
+        return []
+    entries: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    for raw_entry in raw_entries:
+        if not isinstance(raw_entry, dict):
+            continue
+        creature_id = str(raw_entry.get("creature_id", "")).strip()
+        name = str(raw_entry.get("name", "")).strip()
+        details = str(raw_entry.get("details", "")).strip()
+        if not creature_id or not name or not details or creature_id.casefold() in seen_ids:
+            continue
+        seen_ids.add(creature_id.casefold())
+        entries.append({"creature_id": creature_id, "name": name, "details": details})
+    return entries
+
+
 def _parse_new_game_locations(
     raw_locations: Any,
     start_location: str,
 ) -> list[dict[str, Any]]:
     """Parses player-known location metadata and anchors the starting map origin."""
 
-    locations = normalize_known_locations(raw_locations)
+    relationship_aware_locations: Any = raw_locations
+    if isinstance(raw_locations, list):
+        relationship_aware_locations = []
+        for raw_location in raw_locations:
+            if not isinstance(raw_location, dict):
+                relationship_aware_locations.append(raw_location)
+                continue
+            location = dict(raw_location)
+            parent_location = str(location.get("parent_location", "") or "").strip()
+            if bool(location.get("is_sublocation")) and parent_location:
+                relationship_note = f"Located within {parent_location}."
+                travel_notes = str(location.get("travel_notes", "") or "").strip()
+                if relationship_note.casefold() not in travel_notes.casefold():
+                    location["travel_notes"] = " ".join(
+                        value for value in (travel_notes, relationship_note) if value
+                    )
+            relationship_aware_locations.append(location)
+
+    locations = normalize_known_locations(relationship_aware_locations)
     source_indexes_by_name: dict[str, int] = {}
     if isinstance(raw_locations, list):
         for raw_location in raw_locations:
@@ -7326,11 +7046,6 @@ def _parse_new_game_starter_items(raw_items: Any) -> list[dict[str, Any]]:
                     raw_item.get("storage_location", "actively_carried")
                 ),
                 "description": str(raw_item.get("description", "")).strip(),
-                "ascii_art": ensure_substantive_ascii_art(
-                    raw_item.get("ascii_art", ""),
-                    item_name=name,
-                    category=_normalize_starter_item_category(raw_item),
-                ),
                 "value_base_units": max(0, value_base_units),
                 "source_index": _parse_optional_source_index(raw_item),
                 **{
@@ -7399,11 +7114,6 @@ def _parse_new_game_crafting_items(raw_items: Any) -> list[dict[str, Any]]:
                 "name": name,
                 "category": category,
                 "description": str(raw_item.get("description", "")).strip(),
-                "ascii_art": ensure_substantive_ascii_art(
-                    raw_item.get("ascii_art", ""),
-                    item_name=name,
-                    category=category,
-                ),
                 "location": str(raw_item.get("location", "")).strip(),
                 "uses": uses,
                 "rarity": normalize_crafting_item_rarity(raw_item.get("rarity")),

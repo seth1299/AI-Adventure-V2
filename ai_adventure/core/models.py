@@ -115,7 +115,6 @@ class ItemCatalogEntry:
     category: str = ""
     description: str = ""
     value_base_units: int = 0
-    ascii_art: str = ""
     metadata: dict[str, Any] = field(default_factory=dict)
     first_seen_at: str = ""
     updated_at: str = ""

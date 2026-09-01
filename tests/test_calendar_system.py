@@ -45,6 +45,21 @@ class CalendarSystemTests(unittest.TestCase):
         self.assertEqual(snapshot["day_of_month"], 1)
         self.assertEqual(snapshot["time_label"], "Evening")
 
+    def test_resolves_authoritative_partial_start_date_without_month(self) -> None:
+        current_minute = resolve_starting_calendar_minute(
+            {
+                "year": 3,
+                "day_of_month": 6,
+                "time_of_day_minutes": 13 * 60 + 45,
+            }
+        )
+        snapshot = build_calendar_snapshot(current_minute)
+
+        self.assertEqual(snapshot["year"], 3)
+        self.assertEqual(snapshot["month_number"], 1)
+        self.assertEqual(snapshot["day_of_month"], 6)
+        self.assertEqual(snapshot["time_of_day_minutes"], 13 * 60 + 45)
+
     def test_normalizes_custom_calendar_settings(self) -> None:
         settings = normalize_calendar_settings(
             {

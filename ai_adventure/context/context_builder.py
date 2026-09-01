@@ -8,7 +8,7 @@ from ai_adventure.alchemy.ingredients import (
     CRAFTING_INGREDIENT_CATEGORY_NAMES,
 )
 from ai_adventure.ai.modes import ai_mode_preferences_from_settings
-from ai_adventure.audio.catalog import distinct_audio_track_catalogs
+from ai_adventure.audio.catalog import distinct_audio_track_catalogs_with_ambience
 from ai_adventure.context.creative_ideas import CreativeIdeasLibrary
 from ai_adventure.context.models import ContextLibrary
 from ai_adventure.context.naming import GENERIC_PROPER_NOUN_PLACEHOLDER_RULE
@@ -32,6 +32,13 @@ MAX_CONTEXT_LIST_ITEMS = 40
 MAX_INVENTORY_CONTEXT_ITEMS = 50
 MAX_CRAFTING_CONTEXT_ENTRIES = 40
 MAX_ACTIVE_TASK_CONTEXT_ITEMS = 40
+MAX_BESTIARY_CONTEXT_ENTRIES = 12
+
+CONTAINER_ACCESS_RULE = (
+    "Container metadata is authoritative hidden state. Opening an unlocked container, "
+    "or using an unambiguous key or equivalent access item for a locked container, is "
+    "routine; otherwise required lock or trap checks must succeed before opening."
+)
 
 
 KEYWORD_TAGS: dict[str, set[str]] = {
@@ -232,9 +239,12 @@ class AiContextBuilder:
         party_members: list[dict[str, Any]] | None = None,
         gm_secrets: list[dict[str, Any]] | None = None,
         miscellaneous: list[dict[str, Any]] | None = None,
+        bestiary: list[dict[str, Any]] | None = None,
         valid_music_tracks: list[str] | None = None,
         current_music: str | None = None,
         valid_sound_effect_tracks: list[str] | None = None,
+        valid_background_ambience_tracks: list[str] | None = None,
+        current_background_ambience: str | None = None,
         resolved_skill_checks: list[dict[str, Any]] | None = None,
         planner_context_tags: list[str] | None = None,
     ) -> dict[str, Any]:
@@ -248,7 +258,8 @@ class AiContextBuilder:
             relevant_npcs: NPC memory profiles likely relevant this turn.
             party_members: Current party records joined to canonical NPC profiles.
             gm_secrets: Active private GM-memory records for every turn.
-            miscellaneous: Every general world-lore record, always sent uncapped.
+            miscellaneous: General world-lore records, sent uncapped.
+            bestiary: Player-known creature records, included only when relevant.
             valid_music_tracks: Playable background music filenames.
             current_music: Currently selected background music filename.
             valid_sound_effect_tracks: Playable one-shot sound-effect filenames.
@@ -279,9 +290,14 @@ class AiContextBuilder:
         selected_tags.add("story")
         if clean_conversation_mode == "out_of_game":
             selected_tags.add("out_of_game")
-        clean_music_tracks, clean_sound_effect_tracks = distinct_audio_track_catalogs(
+        (
+            clean_music_tracks,
+            clean_sound_effect_tracks,
+            clean_background_ambience_tracks,
+        ) = distinct_audio_track_catalogs_with_ambience(
             valid_music_tracks,
             valid_sound_effect_tracks,
+            valid_background_ambience_tracks,
         )
         clean_current_music = str(
             current_music
@@ -292,7 +308,16 @@ class AiContextBuilder:
             track.casefold() for track in clean_music_tracks
         }:
             clean_current_music = ""
-        if clean_music_tracks or clean_sound_effect_tracks:
+        clean_current_background_ambience = str(
+            current_background_ambience
+            or state.settings.values.get("audio.current_background_ambience", "")
+            or ""
+        ).strip()
+        if clean_current_background_ambience.casefold() not in {
+            track.casefold() for track in clean_background_ambience_tracks
+        }:
+            clean_current_background_ambience = ""
+        if clean_music_tracks or clean_sound_effect_tracks or clean_background_ambience_tracks:
             selected_tags.add("music")
 
         reference_sections = self.library.select_sections(
@@ -304,6 +329,8 @@ class AiContextBuilder:
             disabled_audio_event_types.add("MusicChangedEvent")
         if not clean_sound_effect_tracks:
             disabled_audio_event_types.add("SoundEffectChangedEvent")
+        if not clean_background_ambience_tracks:
+            disabled_audio_event_types.add("BackgroundAmbienceChangedEvent")
         reference_sections = [
             section
             for section in reference_sections
@@ -359,6 +386,10 @@ class AiContextBuilder:
             for entry in (miscellaneous or [])
             if isinstance(entry, dict)
         ]
+        clean_bestiary = _select_relevant_bestiary_entries(
+            bestiary or [],
+            clean_command,
+        )
         notes_share_with_ai = _coerce_bool(
             state.settings.values.get("notes.share_with_ai", False),
             default=False,
@@ -368,6 +399,15 @@ class AiContextBuilder:
         if notes_share_with_ai:
             note_entries = note_entries_for_ai(
                 normalize_note_entries(state.settings.values.get("notes.entries", []))
+            )
+        if clean_background_ambience_tracks:
+            audio_transition_rules.append(
+                "Use BackgroundAmbienceChangedEvent to start or replace a quiet, "
+                "persistent environmental loop when the scene warrants it. filename "
+                "must exactly match state.audio.valid_background_ambience_tracks. "
+                "Use filename STOP when the current ambience no longer fits and no "
+                "replacement is appropriate. This is separate from music and one-shot "
+                "sound effects."
             )
             note_entries = [
                 {
@@ -430,6 +470,8 @@ class AiContextBuilder:
                     "equipment": state.player.equipment,
                 },
                 "player_ai_preferences": {
+                    "text_model": ai_mode_preferences["text_model"],
+                    "text_model_label": ai_mode_preferences["text_model_label"],
                     "additional_context": _compact_text(
                         state.settings.values.get("ai.additional_context", "")
                     ),
@@ -565,17 +607,12 @@ class AiContextBuilder:
                         for item in state.inventory.items[:MAX_INVENTORY_CONTEXT_ITEMS]
                     ],
                     "container_rule": (
-                        "Container metadata is authoritative hidden state. Classify "
-                        "an item as a Container only when its primary function is "
-                        "holding physical contents that can be put in and taken out. "
-                        "Items that store writing, records, instructions, or "
-                        "information are not Containers merely because they store "
-                        "information. Never "
-                        "reveal or award a closed container's contents. Use "
-                        "ContainerOpenedEvent only after required lock/trap checks "
-                        "succeed, then ContainerContentsTakenEvent only when the "
-                        "player explicitly takes the contents. Python transfers "
-                        "the exact stored currency/items once."
+                        CONTAINER_ACCESS_RULE + " "
+                        "Never reveal or award a closed container's contents. Use "
+                        "ContainerOpenedEvent for access, then "
+                        "ContainerContentsTakenEvent only when the player explicitly "
+                        "takes the contents. Python transfers the exact stored "
+                        "currency/items once."
                     ),
                     "category_rule": (
                         "Classify inventory by the finished item's present primary "
@@ -593,7 +630,6 @@ class AiContextBuilder:
                             "category": item.category,
                             "description": _compact_text(item.description),
                             "value_base_units": item.value_base_units,
-                            "ascii_art": item.ascii_art,
                             "metadata": _compact_context_value(item.metadata),
                         }
                         for item in state.item_catalog.items
@@ -612,18 +648,11 @@ class AiContextBuilder:
                         "Travel-tab locations; use actively_carried only when the "
                         "Player Character is carrying it. "
                             "Use item_catalog to remember descriptions, categories, "
-                            "values, and ASCII art for previously seen items. Each item also "
+                            "values for previously seen items. Each item also "
                             "has database_id, a globally unique database identity, and "
                             "metadata.item_uuid, a stable item identity; "
                             "reuse it for the same item and do not split one item "
                             "into duplicate definitions because of name variations."
-                        ),
-                        "ascii_art_rule": (
-                            "New item definitions require an original 3-12 line "
-                            "fixed-width drawing of the recognizable item shape. A "
-                            "bracketed item name such as [Camera], a caption, or any "
-                            "other single-line label is invalid and is not ASCII art. "
-                            "Reuse valid existing catalog art exactly."
                         ),
                     },
                 },
@@ -767,8 +796,12 @@ class AiContextBuilder:
                             "that requires a skill level above 5."
                         ),
                         "unknown_skill_rule": (
-                            "skill_name may identify a generalized capability absent "
-                            "from known_skills. When it does, include skill_description "
+                            "Choose the most directly relevant known skill, not merely "
+                            "a plausible broad skill. Locating or gathering wild plants, "
+                            "herbs, or reagents uses known Foraging rather than "
+                            "Investigation or Perception. skill_name may identify a "
+                            "generalized capability absent from known_skills only when "
+                            "no known skill fits. When it does, include skill_description "
                             "so Python can create the new skill at level 1 before rolling."
                         ),
                         "uncertain_action_rule": (
@@ -936,6 +969,8 @@ class AiContextBuilder:
                     "current_music": clean_current_music,
                     "valid_music_tracks": clean_music_tracks,
                     "valid_sound_effect_tracks": clean_sound_effect_tracks,
+                    "current_background_ambience": clean_current_background_ambience,
+                    "valid_background_ambience_tracks": clean_background_ambience_tracks,
                     "rules": {
                         "music_change_rule": (
                             "When scene mood, location, danger level, or environment "
@@ -958,6 +993,12 @@ class AiContextBuilder:
                             "cue-count target; omit cues when no listed sound fits. The "
                             "app replays each saved cue at that same boundary."
                         ),
+                        "background_ambience_rule": (
+                            "BackgroundAmbienceChangedEvent controls a quiet persistent "
+                            "environmental loop independent of music. filename must "
+                            "exactly match valid_background_ambience_tracks, or be STOP "
+                            "when ambience should end without replacement."
+                        ),
                         "english_text_rule": (
                             "Every generated string value must use printable ASCII "
                             "English characters only. Transliterate accented Latin "
@@ -974,9 +1015,11 @@ class AiContextBuilder:
                             "and reuse it on later turns; use distinct stable "
                             "lower_snake_case IDs for other speakers. Choose only a "
                             "broad established voice_profile and use neutral when "
-                            "unspecified. Python selects and durably remembers the "
-                            "installed voice ID. Do not cue narrator prose or the "
-                            "Player Character."
+                            "unspecified. speaker_name is the visible chat-bubble label: "
+                            "use the known name or a concise player-safe description "
+                            "when the name is unknown. Python splits the response into "
+                            "same-turn bubbles and durably remembers the installed "
+                            "voice ID. Do not cue narrator prose or the Player Character."
                         ),
                     },
                 },
@@ -1039,7 +1082,12 @@ class AiContextBuilder:
                         "party_member=true, and the changed party fields. Use "
                         "party_member=false to remove someone from the party without "
                         "deleting their NPC profile. Keep health, armor class, status, "
-                        "combat style, and skills consistent with narrated outcomes."
+                        "combat style, and skills consistent with narrated outcomes. "
+                        "Party equipment is stored in party.members.inventory and "
+                        "party.members.equipment; use the existing inventory events "
+                        "with owner_npc_id set to the exact party member npc_id to "
+                        "add, remove, modify, or mark an item equipped. Do not put "
+                        "party-member items in the Player Character inventory."
                     ),
                 },
                 "gm_secrets": {
@@ -1073,7 +1121,8 @@ class AiContextBuilder:
                 "miscellaneous": {
                     "visibility": (
                         "Established non-secret world canon. This entire section is "
-                        "included on every turn without relevance filtering or a cap."
+                        "included as general continuity context. Creature records "
+                        "belong in state.bestiary instead."
                     ),
                     "rules": {
                         "continuity": (
@@ -1087,17 +1136,23 @@ class AiContextBuilder:
                         ),
                         "scope": (
                             "Use this only for durable concepts without a more specific "
-                            "home, such as original creatures or species, cultures, "
+                            "home, such as cultures, "
                             "factions, religions, laws, historical events, phenomena, "
                             "or customs. Do not duplicate NPCs, locations, items, tasks, "
-                            "or hidden GM secrets. Use category Creature for every "
-                            "non-NPC creature or monster the Player learns about; its "
-                            "details must contain only facts known to the Player or "
-                            "Player Character because Creature records populate the "
-                            "player-visible Bestiary."
+                            "or hidden GM secrets. Do not use this for creatures."
                         ),
                     },
                     "entries": clean_miscellaneous,
+                },
+                "bestiary": {
+                    "visibility": "Player-known creature lore only.",
+                    "relevance": (
+                        "Python includes this section only when the current command "
+                        "mentions a known creature or explicitly asks about creatures "
+                        "or the Bestiary. Treat included entries as authoritative "
+                        "player-known facts."
+                    ),
+                    "entries": clean_bestiary,
                 },
             },
             "rulebooks": {},
@@ -1144,14 +1199,16 @@ class AiContextBuilder:
                     "scripts, or inline pronunciation markup."
                 ),
                 "speaker_cues": (
-                    "TTS-only array covering every contiguous non-narrator spoken "
-                    "span in response. Each record must contain anchor_text copied "
-                    "exactly with outer double quotes, speaker_id, speaker_name, and "
-                    "voice_profile. Use the exact canonical npc_id for an NPC, reuse "
-                    "one ID for the same speaker, and use different IDs for different "
-                    "speakers. Return [] when only the narrator speaks or for "
-                    "out_of_game. Python owns final installed voice assignment and "
-                    "persistence."
+                    "Array covering every contiguous non-narrator spoken span in "
+                    "response for visible speaker bubbles and multi-voice TTS. Each "
+                    "record must contain anchor_text copied exactly with outer double "
+                    "quotes, speaker_id, speaker_name, and voice_profile. speaker_name "
+                    "is the visible bubble label: use the known name or a concise "
+                    "player-safe description when the name is unknown. Use the exact "
+                    "canonical npc_id for an NPC, reuse one ID for the same speaker, "
+                    "and use different IDs for different speakers. Return [] when only "
+                    "the narrator speaks or for out_of_game. Python owns bubble "
+                    "splitting, final installed voice assignment, and persistence."
                 ),
                 "conversation_mode": (
                     "conversation_mode is selected explicitly by the player in the UI "
@@ -1180,6 +1237,10 @@ class AiContextBuilder:
                     "or difficulty only for actions with meaningful uncertainty, "
                     "opposition, hidden information, danger, resource pressure, time "
                     "pressure, or consequences in the current scene. "
+                    "Choose the most directly relevant known skill. Locating or "
+                    "gathering wild plants, herbs, or reagents uses known Foraging "
+                    "rather than Investigation or Perception; create a new skill "
+                    "only when no known skill fits. "
                     "When state.skills.resolved_checks_this_turn is non-empty, those "
                     "checks are already resolved for the current player command; "
                     "narrate the outcome from those results and do not request "
@@ -1254,7 +1315,7 @@ class AiContextBuilder:
                     "Use state.item_catalog.items as the master list of remembered "
                     "item definitions. Before inventing an item, reuse a fitting "
                     "existing catalog definition whenever one can serve the story. "
-                    "It preserves descriptions, categories, values, ASCII art, "
+                "It preserves descriptions, categories, and values, "
                     "and metadata.item_uuid stable internal identities; reuse the same "
                     "item_uuid for the same item even when its display name changes. "
                     "It also preserves equipment metadata after items leave inventory. "
@@ -1297,7 +1358,8 @@ class AiContextBuilder:
                     "player-visible and must not include secrets or undiscovered names. "
                     "role, location, public_description, knowledge_scope, and known_facts "
                     "are required NPC memory fields; do not add unsupported fields such "
-                    "as disposition. "
+                    "as disposition. Make public_description concise, concrete, and "
+                    "visually depictable using only player-observable traits. "
                     "Before creating an NPC, inspect state.npcs.relevant. If the same "
                     "person is already listed, reuse that existing npc_id/internal "
                     "identifier and update the one profile; do not create a second "
@@ -1308,6 +1370,13 @@ class AiContextBuilder:
                     "party_health_max, party_armor_class, party_combat_style, and "
                     "party_skills when those visible details change. Use "
                     "party_member=false to remove membership without deleting the NPC."
+                ),
+                "generated_visuals": (
+                    "Write new inventory descriptions, location descriptions, and NPC "
+                    "public_description values with concise concrete player-visible "
+                    "visual traits. Do not output image prompts, filenames, URLs, "
+                    "base64, or extra image fields. The application separately derives "
+                    "and reuses cached images from finalized ordinary state."
                 ),
                 "secret_memory": (
                     "Use state.gm_secrets.active as authoritative AI-only hidden "
@@ -1331,18 +1400,22 @@ class AiContextBuilder:
                     "Set status to retired when the record is no longer true or useful."
                 ),
                 "miscellaneous_memory": (
-                    "state.miscellaneous.entries contains every miscellaneous canon "
-                    "record and is always present without relevance filtering or a "
-                    "count cap. Treat every entry as authoritative. Suggest "
+                    "state.miscellaneous.entries contains general canon. Treat every "
+                    "included entry as authoritative. Suggest "
                     "MiscellaneousUpsertedEvent with a stable misc_id, name, category, "
                     "and complete details when a durable non-secret creature, species, "
                     "culture, faction, religion, law, historical event, phenomenon, "
                     "custom, or other concept is established or changed and no more "
                     "specific state table fits. Reuse the same misc_id for updates. "
-                    "Use category Creature for every non-NPC creature or monster the "
-                    "Player learns about and include only player-known facts in its "
-                    "details; these records populate the player-visible Bestiary. "
+                    "Never use this for creatures; use BestiaryEntryUpsertedEvent. "
                     "Never duplicate NPC, Location, Item, task, or GM-secret records."
+                ),
+                "bestiary_memory": (
+                    "state.bestiary.entries contains only player-known creatures and "
+                    "is present only when Python determines the command is relevant. "
+                    "Suggest BestiaryEntryUpsertedEvent when a durable non-NPC creature "
+                    "is learned or its public details change. Reuse creature_id and "
+                    "include only facts known to the Player or Player Character."
                 ),
                 "currency_transactions": (
                     "The player's money is state.currency.balance, also shown as "
@@ -1405,6 +1478,7 @@ class AiContextBuilder:
                     "CurrencyDefinedEvent",
                     "MusicChangedEvent",
                     "SoundEffectChangedEvent",
+                    "BackgroundAmbienceChangedEvent",
                     "FlagSetEvent",
                     "LocationUpsertedEvent",
                     "TravelModeChangedEvent",
@@ -1419,9 +1493,17 @@ class AiContextBuilder:
                     "NpcKnowledgeAddedEvent",
                     "SecretUpsertedEvent",
                     "MiscellaneousUpsertedEvent",
+                    "BestiaryEntryUpsertedEvent",
                 ],
             },
         }
+        if not clean_bestiary and not (
+            set(re.findall(r"[a-z0-9]+", clean_command.casefold()))
+            & _BESTIARY_REQUEST_TERMS
+        ):
+            state_packet = packet.get("state")
+            if isinstance(state_packet, dict):
+                state_packet.pop("bestiary", None)
         known_event_types = packet["response_contract"]["known_event_types"]
         packet["response_contract"]["known_event_types"] = [
             event_type
@@ -1506,6 +1588,9 @@ def _npc_context_profile(npc: dict[str, Any]) -> dict[str, Any]:
         "location",
         "public_description",
         "player_facing_information",
+        "gender_identity",
+        "age",
+        "species",
         "knowledge_scope",
         "known_facts",
         "created_at",
@@ -1657,12 +1742,17 @@ def _party_context_profile(member: dict[str, Any]) -> dict[str, Any]:
         "location",
         "description",
         "notes",
+        "gender_identity",
+        "age",
+        "species",
         "status",
         "health_current",
         "health_max",
         "armor_class",
         "combat_style",
         "skills",
+        "inventory",
+        "equipment",
     }
     return {
         key: _compact_context_value(value)
@@ -1700,6 +1790,48 @@ def _miscellaneous_context_record(entry: dict[str, Any]) -> dict[str, Any]:
         "name": str(entry.get("name", "")).strip(),
         "category": str(entry.get("category", "")).strip(),
         "details": str(entry.get("details", "")).strip(),
+    }
+
+
+_BESTIARY_REQUEST_TERMS = {
+    "bestiary", "creature", "creatures", "monster", "monsters", "beast",
+    "beasts", "species", "identify", "identified", "anatomy", "track",
+    "tracks", "hunt", "hunting", "hunted",
+}
+
+
+def _select_relevant_bestiary_entries(
+    entries: list[dict[str, Any]],
+    player_command: str,
+) -> list[dict[str, Any]]:
+    """Selects a small deterministic subset of creature lore for this turn."""
+
+    command_tokens = set(re.findall(r"[a-z0-9]+", player_command.casefold()))
+    explicit_request = bool(command_tokens & _BESTIARY_REQUEST_TERMS)
+    selected: list[dict[str, Any]] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        name_tokens = set(re.findall(r"[a-z0-9]+", str(entry.get("name", "")).casefold()))
+        name_stems = {token.rstrip("s") for token in name_tokens if len(token) >= 3}
+        named_match = bool(command_tokens & name_tokens) or bool(
+            {token.rstrip("s") for token in command_tokens if len(token) >= 3}
+            & name_stems
+        )
+        if named_match or (explicit_request and len(selected) < MAX_BESTIARY_CONTEXT_ENTRIES):
+            selected.append(_bestiary_context_record(entry))
+        if len(selected) >= MAX_BESTIARY_CONTEXT_ENTRIES:
+            break
+    return selected
+
+
+def _bestiary_context_record(entry: dict[str, Any]) -> dict[str, Any]:
+    """Returns the compact public fields used for conditional Bestiary context."""
+
+    return {
+        "creature_id": str(entry.get("creature_id", "")).strip(),
+        "name": str(entry.get("name", "")).strip(),
+        "details": _compact_text(entry.get("details", "")),
     }
 
 
