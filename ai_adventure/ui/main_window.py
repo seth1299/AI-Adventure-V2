@@ -138,7 +138,30 @@ from ai_adventure.ai.image_styles import (
 )
 from ai_adventure.inventory_sorting import sort_inventory_items
 from ai_adventure.ui.story_bubbles import split_story_bubble_segments
-from ai_adventure.visual_assets import (
+from ai_adventure.ui.screens.main_menu import MainMenuScreen as _ExtractedMainMenuScreen
+from ai_adventure.ui.workers.gemini import (
+    GeminiNewGameWorker as _ExtractedGeminiNewGameWorker,
+    GeminiSkillCheckPlanWorker as _ExtractedGeminiSkillCheckPlanWorker,
+    GeminiStoryWorker as _ExtractedGeminiStoryWorker,
+    GeminiVisualAssetWorker as _ExtractedGeminiVisualAssetWorker,
+)
+from ai_adventure.application.asset_generation_service import AssetGenerationService
+from ai_adventure.application.audio_preferences_service import AudioPreferencesService
+from ai_adventure.application.new_game_service import NewGameService
+from ai_adventure.application.save_game_service import SaveGameService
+from ai_adventure.application.story_turn_service import StoryTurnService
+from ai_adventure.domain.rules.values import (
+    bool_setting as domain_bool_setting,
+    clamped_int as domain_clamped_int,
+    safe_int as domain_safe_int,
+)
+from ai_adventure.domain.services.state_projection import refresh_calendar_time_projection
+from ai_adventure.ui.widgets.inputs import (
+    NoWheelComboBox as _ExtractedNoWheelComboBox,
+    NoWheelSpinBox as _ExtractedNoWheelSpinBox,
+)
+from ai_adventure.ui.dialogues import TTSSettingsDialog as _ExtractedTTSSettingsDialog
+from ai_adventure.infrastructure.images import (
     DEFAULT_IMAGE_LIMIT,
     GeminiVisualAssetService,
     VisualAssetRequest,
@@ -228,7 +251,7 @@ class NarrationPlayerProtocol(Protocol):
 
 
 if is_ai_enabled():
-    from ai_adventure.ai.gemini_service import (
+    from ai_adventure.infrastructure.gemini import (
         GeminiConfigurationError,
         GeminiNarrationService,
         GeminiRequestError,
@@ -246,8 +269,8 @@ else:
 
 
 if not is_playtesting_build():
-    from ai_adventure.audio.narration import NarrationPlayer as _NarrationPlayerClass
-    from ai_adventure.audio.sound_manager import (
+    from ai_adventure.infrastructure.audio import NarrationPlayer as _NarrationPlayerClass
+    from ai_adventure.infrastructure.audio import (
         SoundManager as _SoundManagerClass,
         prepare_background_ambience_directory,
         prepare_sound_directory,
@@ -350,8 +373,8 @@ from ai_adventure.locations import (
     normalize_known_locations,
 )
 from ai_adventure.magic import MAGIC_CASTING_MODE_LABELS, MAGIC_CASTING_MODES
-from ai_adventure.core.state_manager import StateManager
-from ai_adventure.events.event_applier import EventApplier
+from ai_adventure.domain.events import EventApplier
+from ai_adventure.domain.services.state_manager import StateManager
 from ai_adventure.new_game_setup import (
     CHARACTER_PRONOUN_OPTIONS,
     DEFAULT_CHARACTER_PRONOUNS,
@@ -386,7 +409,7 @@ from ai_adventure.new_game_templates import (
     save_new_game_template,
     template_setup_has_changes,
 )
-from ai_adventure.persistence.save_repository import (
+from ai_adventure.infrastructure.sqlite import (
     DuplicateSaveTitleError,
     SaveFileOperationError,
     SaveRepository,
@@ -410,6 +433,11 @@ class _NoWheelSpinBox(QSpinBox):
 
     def wheelEvent(self, event: Any) -> None:
         event.ignore()
+
+
+# Compatibility aliases; callers can migrate to ui.widgets.inputs directly.
+_NoWheelComboBox = _ExtractedNoWheelComboBox
+_NoWheelSpinBox = _ExtractedNoWheelSpinBox
 
 
 GM_THINKING_FRAMES = (
@@ -1128,9 +1156,11 @@ class _VisualAssetCoordinator(QObject):
             1,
             10_000,
         )
-        for request in build_visual_asset_requests(repository):
+        for request in AssetGenerationService.requests_for(repository):
             relative_filename = save_relative_image_filename(repository, request)
-            target_path = self.images_dir / relative_filename
+            target_path = AssetGenerationService.target_path(
+                repository, request, self.images_dir
+            )
             record = repository.ensure_visual_asset(
                 asset_id=request.asset_id,
                 subject_type=request.subject_type,
@@ -1151,7 +1181,7 @@ class _VisualAssetCoordinator(QObject):
                 continue
             if request.asset_id in self._queued_asset_ids:
                 continue
-            reusable = find_reusable_inventory_asset(
+            reusable = AssetGenerationService.find_local_reuse(
                 images_dir=self.images_dir,
                 saves_dir=self.images_dir.parent / "saves",
                 repository=repository,
@@ -1328,6 +1358,15 @@ class _VisualAssetCoordinator(QObject):
                 self._finish_initial_batch_if_ready(repository)
 
 
+# Keep worker names available to existing callers while the implementations
+# move into the dedicated UI worker package.  The coordinator above resolves
+# the visual worker at runtime, so it also uses the extracted implementation.
+_GeminiStoryWorker = _ExtractedGeminiStoryWorker
+_GeminiSkillCheckPlanWorker = _ExtractedGeminiSkillCheckPlanWorker
+_GeminiNewGameWorker = _ExtractedGeminiNewGameWorker
+_GeminiVisualAssetWorker = _ExtractedGeminiVisualAssetWorker
+
+
 def _create_narration_player(app_paths: AppPaths) -> NarrationPlayerProtocol | None:
     """Creates the narration player only when TTS support is enabled."""
 
@@ -1370,6 +1409,7 @@ class MainWindow(QMainWindow):
         super().__init__()
 
         self.app_paths = app_paths
+        self.save_game_service = SaveGameService(self.app_paths.saves_dir)
         self.active_repository: SaveRepository | None = None
         self._new_game_thread: QThread | None = None
         self._new_game_worker: QObject | None = None
@@ -1383,6 +1423,10 @@ class MainWindow(QMainWindow):
             self.app_paths.app_settings_path,
             fallback_theme=self._latest_saved_theme(),
             tts_enabled=self.tts_enabled,
+        )
+        self.new_game_service = NewGameService(
+            tts_enabled=self.tts_enabled,
+            audio_defaults=self.app_settings["audio"],
         )
         self.menu_theme = _normalize_theme_name(self.app_settings["theme"])
         self.sound_manager = (
@@ -1408,8 +1452,9 @@ class MainWindow(QMainWindow):
         self.stack = QStackedWidget()
         self.setCentralWidget(self.stack)
 
-        self.main_menu = MainMenuScreen(
+        self.main_menu = _ExtractedMainMenuScreen(
             saves_dir=self.app_paths.saves_dir,
+            save_service=self.save_game_service,
             on_new_game=self.start_new_game_wizard,
             on_load_game=self.load_game_from_path,
             on_settings=self.open_main_menu_settings,
@@ -1546,10 +1591,12 @@ class MainWindow(QMainWindow):
     def _start_new_playtest(self) -> None:
         """Creates an isolated save without invoking setup generation or Gemini."""
 
-        suggested_title = _next_available_save_title(
-            self.app_paths.saves_dir,
-            "Combat Playtest",
+        save_service = getattr(
+            self,
+            "save_game_service",
+            SaveGameService(self.app_paths.saves_dir),
         )
+        suggested_title = save_service.next_available_title("Combat Playtest")
         title, accepted = QInputDialog.getText(
             self,
             "New Playtest",
@@ -1572,10 +1619,12 @@ class MainWindow(QMainWindow):
             return
 
         try:
-            repository = SaveRepository.create_new_save(
-                self.app_paths.saves_dir,
-                clean_title,
+            save_service = getattr(
+                self,
+                "save_game_service",
+                SaveGameService(self.app_paths.saves_dir),
             )
+            repository = save_service.create(clean_title)
         except DuplicateSaveTitleError as error:
             QMessageBox.warning(self, "Playtest Name Already Exists", str(error))
             return
@@ -1829,13 +1878,19 @@ class MainWindow(QMainWindow):
         """Creates a new save from normalized setup and opens the shell."""
 
         clean_setup = self._normalize_new_game_setup_for_runtime(clean_setup)
-
-        repository = SaveRepository.create_new_save(
-            self.app_paths.saves_dir,
-            clean_setup["title"],
-            setup=clean_setup,
+        new_game_service = getattr(
+            self,
+            "new_game_service",
+            NewGameService(
+                tts_enabled=getattr(self, "tts_enabled", True),
+                audio_defaults=getattr(self, "app_settings", {}).get("audio", {}),
+            ),
         )
-        repository.set_setting("theme", self.menu_theme)
+        repository = new_game_service.create_repository(
+            self.app_paths.saves_dir,
+            clean_setup,
+            theme=self.menu_theme,
+        )
 
         effective_template_name = template_save_name
         if effective_template_name is None and auto_save_template_if_available:
@@ -1872,7 +1927,7 @@ class MainWindow(QMainWindow):
         """Starts initial world synthesis without blocking the Qt UI thread."""
 
         try:
-            setup_packet = build_new_game_setup_packet(
+            setup_packet = NewGameService.build_setup_packet(
                 setup,
                 valid_music_tracks=(
                     self.sound_manager.get_valid_track_names()
@@ -1993,17 +2048,18 @@ class MainWindow(QMainWindow):
     ) -> None:
         """Writes a local opening after Gemini could not initialize a new game."""
 
-        self._apply_fallback_currency_if_needed(repository, setup)
-        repository.set_world_summary(fallback_world_summary(setup))
-        repository.append_history(
-            "story",
-            (
-                "Gemini is temporarily unavailable, so this new game opened "
-                "with a local fallback. Your save is safe; try another action "
-                "shortly."
-                if temporary_failure
-                else fallback_introductory_message(setup)
+        new_game_service = getattr(
+            self,
+            "new_game_service",
+            NewGameService(
+                tts_enabled=getattr(self, "tts_enabled", True),
+                audio_defaults=getattr(self, "app_settings", {}).get("audio", {}),
             ),
+        )
+        new_game_service.apply_fallback(
+            repository,
+            setup,
+            temporary_failure=temporary_failure,
         )
 
     def _apply_new_game_generation_result(
@@ -2111,26 +2167,15 @@ class MainWindow(QMainWindow):
     def _normalize_new_game_setup_for_runtime(self, setup: dict[str, Any]) -> dict[str, Any]:
         """Normalizes setup and disables narrator settings when TTS is unavailable."""
 
-        raw_setup = dict(setup) if isinstance(setup, dict) else {}
-        audio = dict(self.app_settings["audio"])
-
-        if isinstance(raw_setup.get("audio"), dict):
-            audio.update(raw_setup["audio"])
-
-        raw_setup["audio"] = audio
-        clean_setup = normalize_new_game_setup(raw_setup)
-
-        if self.tts_enabled:
-            return clean_setup
-
-        audio = dict(clean_setup["audio"])
-        audio.update(normalize_tts_audio_fields(audio, tts_enabled=False))
-        audio["tts_voice"] = DEFAULT_NARRATOR_VOICE
-        audio["tts_voice_mode"] = "preset"
-
-        clean_setup = dict(clean_setup)
-        clean_setup["audio"] = audio
-        return clean_setup
+        new_game_service = getattr(
+            self,
+            "new_game_service",
+            NewGameService(
+                tts_enabled=getattr(self, "tts_enabled", True),
+                audio_defaults=getattr(self, "app_settings", {}).get("audio", {}),
+            ),
+        )
+        return new_game_service.normalize_setup(setup)
 
     def _apply_new_game_ai_state(
         self,
@@ -2375,17 +2420,15 @@ class MainWindow(QMainWindow):
     ) -> None:
         """Stores a neutral currency when AI generation cannot run."""
 
-        if setup.get("currency_denominations"):
-            return
-
-        repository.set_currency_denominations(FALLBACK_CURRENCY_DENOMINATIONS)
-        repository.set_setting(
-            "currency.description",
-            describe_currency_denominations(
-                FALLBACK_CURRENCY_DENOMINATIONS,
-                fallback_denominations=[],
+        new_game_service = getattr(
+            self,
+            "new_game_service",
+            NewGameService(
+                tts_enabled=getattr(self, "tts_enabled", True),
+                audio_defaults=getattr(self, "app_settings", {}).get("audio", {}),
             ),
         )
+        new_game_service.apply_fallback_currency(repository, setup)
 
     def load_game_from_path(self, db_path: Path) -> None:
         """
@@ -2402,7 +2445,12 @@ class MainWindow(QMainWindow):
             return
 
         try:
-            repository = SaveRepository(db_path)
+            save_service = getattr(
+                self,
+                "save_game_service",
+                SaveGameService(self.app_paths.saves_dir),
+            )
+            repository = save_service.load(db_path)
         except Exception:
             LOGGER.exception("Failed to load save from %s.", db_path)
             QMessageBox.critical(self, "Load Failed", "Could not load that save.")
@@ -2557,20 +2605,12 @@ class MainWindow(QMainWindow):
     def _latest_saved_theme(self) -> str:
         """Reads the most recent save's theme for the Main Menu."""
 
-        for summary in SaveRepository.list_saves(self.app_paths.saves_dir):
-            try:
-                theme = SaveRepository.read_save_setting(
-                    summary.db_path,
-                    "theme",
-                    "Light",
-                )
-            except Exception:
-                LOGGER.exception("Failed to read theme from save: %s", summary.db_path)
-                continue
-
-            return _normalize_theme_name(theme)
-
-        return "Light"
+        save_service = getattr(
+            self,
+            "save_game_service",
+            SaveGameService(self.app_paths.saves_dir),
+        )
+        return _normalize_theme_name(save_service.latest_theme())
 
 
 class CustomVoiceDialog(QDialog):
@@ -3292,6 +3332,11 @@ class TTSSettingsDialog(QDialog):
         """Returns whether the custom voice library changed while open."""
 
         return self.tts_settings_widget.custom_voice_library_changed
+
+
+# Preserve the existing import path while the dialogue implementation lives
+# in ui.dialogues.
+TTSSettingsDialog = _ExtractedTTSSettingsDialog
 
 
 class ContentCategoryComboBox(_NoWheelComboBox):
@@ -4189,6 +4234,11 @@ class MainMenuScreen(QWidget):
         return f"{summary.title} - {modified}"
 
 
+# Keep the historical import path stable while the screen moves into its own
+# module.  Existing extensions and tests can continue importing it from here.
+MainMenuScreen = _ExtractedMainMenuScreen
+
+
 class NewGameTemplateManagerDialog(QDialog):
     """Main-menu dialog for creating and editing reusable new-game templates."""
 
@@ -4677,7 +4727,8 @@ class NewGameTemplateManagerDialog(QDialog):
     def _stop_audio_previews(self) -> None:
         if self.sound_manager is not None:
             self.sound_manager.stop_music()
-            self.sound_manager.stop_background_ambience()
+            if hasattr(self.sound_manager, "stop_background_ambience"):
+                self.sound_manager.stop_background_ambience()
 
     def _build_locations_tab(self) -> QWidget:
         """Builds the template starting locations tab."""
@@ -9368,7 +9419,8 @@ class NewGameWizard(QWizard):
     def _stop_audio_previews(self) -> None:
         if self.sound_manager is not None:
             self.sound_manager.stop_music()
-            self.sound_manager.stop_background_ambience()
+            if hasattr(self.sound_manager, "stop_background_ambience"):
+                self.sound_manager.stop_background_ambience()
 
     def _build_tts_page(self) -> None:
         """Builds the dedicated starting TTS preferences page."""
@@ -11533,13 +11585,12 @@ class StoryScreen(RepositoryBackedWidget):
 
         self._pending_message_id = repository.create_message_id()
         self._pending_regeneration_request = None
-        repository.append_history(
-            "player_oog" if clean_mode == "out_of_game" else "player",
+        StoryTurnService.record_player_action(
+            repository,
             player_text,
-            message_id=repository.create_message_id(),
+            message_id=self._pending_message_id,
+            conversation_mode=clean_mode,
         )
-        if clean_mode == "live_game":
-            repository.capture_message_snapshot(self._pending_message_id)
         self.player_input.clear()
         self._pending_skill_check_event_results = []
         self._pending_travel_request = travel_request
@@ -11609,52 +11660,13 @@ class StoryScreen(RepositoryBackedWidget):
     ) -> dict[str, Any]:
         """Builds the Gemini story context packet for the current save."""
 
-        state = StateManager(repository).load_state()
-        relevant_npcs = repository.list_relevant_npcs(
-            location=state.world.location,
-            query_text=player_text,
-        )
-        party_members = repository.list_party_members()
-        gm_secrets = repository.list_gm_secrets(active_only=True)
-        miscellaneous = repository.list_miscellaneous()
-        bestiary = repository.list_bestiary_entries()
-        valid_music_tracks = (
-            self.sound_manager.get_valid_track_names()
-            if self.sound_manager is not None
-            else []
-        )
-        valid_sound_effect_tracks = (
-            self.sound_manager.get_valid_sound_effect_names()
-            if self.sound_manager is not None
-            else []
-        )
-        valid_background_ambience_tracks = (
-            getattr(
-                self.sound_manager,
-                "get_valid_background_ambience_names",
-                lambda: [],
-            )()
-            if self.sound_manager is not None
-            else []
-        )
-        return AiContextBuilder.from_default_library().build_story_context(
-            state,
-            player_command=player_text,
+        return StoryTurnService.build_context_packet(
+            repository,
+            player_text=player_text,
             conversation_mode=conversation_mode,
-            relevant_npcs=relevant_npcs,
-            party_members=party_members,
-            gm_secrets=gm_secrets,
-            miscellaneous=miscellaneous,
-            bestiary=bestiary,
-            valid_music_tracks=valid_music_tracks,
-            current_music=str(repository.get_setting("audio.current_music", "")),
-            valid_sound_effect_tracks=valid_sound_effect_tracks,
-            valid_background_ambience_tracks=valid_background_ambience_tracks,
-            current_background_ambience=str(
-                repository.get_setting("audio.current_background_ambience", "")
-            ),
             resolved_skill_checks=resolved_skill_checks,
             planner_context_tags=planner_context_tags,
+            sound_manager=self.sound_manager,
         )
 
     def _start_skill_check_planning_request(self, context_packet: dict[str, Any]) -> None:
@@ -11697,25 +11709,13 @@ class StoryScreen(RepositoryBackedWidget):
             self._set_waiting_for_gm(False)
             return
 
-        planned_checks = [
-            check
-            for check in getattr(plan_result, "checks", [])
-            if isinstance(check, dict) and str(check.get("skill_name", "")).strip()
-        ]
-        check_events = [
-            {
-                "type": "SkillCheckRequestedEvent",
-                "payload": check,
-            }
-            for check in planned_checks
-        ]
+        check_events = StoryTurnService.skill_plan_events(plan_result)
 
         if check_events:
-            self._pending_skill_check_event_results = EventApplier(
+            self._pending_skill_check_event_results = StoryTurnService.apply_suggested_events(
                 repository,
                 message_id=self._pending_message_id,
-            ).apply_events(
-                check_events
+                suggested_events=check_events,
             )
             LOGGER.info(
                 "Applied %s pre-narration skill check(s).",
@@ -11777,49 +11777,20 @@ class StoryScreen(RepositoryBackedWidget):
             return
 
         is_out_of_game = self._pending_conversation_mode == "out_of_game"
-        pronunciation_map = merge_pronunciation_maps(
-            repository.get_setting("tts.pronunciation_map", {}),
-            getattr(result, "pronunciation_map", {}),
-        )
-        player_name_pronunciation = repository.get_setting(
-            "player.name_pronunciation",
-            "",
-        )
-        if player_name_pronunciation:
-            pronunciation_map = set_authoritative_pronunciation(
-                pronunciation_map,
-                repository.get_setting("player_name", ""),
-                player_name_pronunciation,
-            )
-        repository.set_setting("tts.pronunciation_map", pronunciation_map)
-        message_id = self._pending_message_id or (
-            repository.create_message_id() if repository is not None else ""
-        )
-        speaker_cues = (
-            []
-            if is_out_of_game
-            else _resolve_speaker_cues_for_repository(
-                repository,
-                self.narration_player,
-                getattr(result, "speaker_cues", []),
-            )
-        )
-        repository.append_history(
-            "story_oog" if is_out_of_game else "story",
-            result.narrative_text,
+        message_id = self._pending_message_id or repository.create_message_id()
+        commit_result = StoryTurnService.commit_response(
+            repository,
+            result,
             message_id=message_id,
-            sound_effect_cues=result.sound_effect_cues,
-            speaker_cues=speaker_cues,
+            conversation_mode=self._pending_conversation_mode,
+            prior_event_results=self._pending_skill_check_event_results,
+            available_voice_ids=list(
+                _narrator_voice_options(self.narration_player).values()
+            ),
         )
-
-        if result.suggested_events and not is_out_of_game:
-            event_results = EventApplier(
-                repository,
-                message_id=message_id,
-            ).apply_events(
-                result.suggested_events,
-                prior_results=self._pending_skill_check_event_results,
-            )
+        speaker_cues = commit_result.speaker_cues
+        if commit_result.event_results:
+            event_results = commit_result.event_results
             applied_count = sum(
                 1 for event_result in event_results if event_result.status == "applied"
             )
@@ -11870,13 +11841,14 @@ class StoryScreen(RepositoryBackedWidget):
         self._pending_regeneration_request = None
 
         if repository is not None:
-            repository.append_history(
-                "story_oog" if is_out_of_game else "story",
-                (
+            StoryTurnService.record_failure(
+                repository,
+                message_id=message_id,
+                conversation_mode="out_of_game" if is_out_of_game else "live_game",
+                message=(
                     "No Gemini API key is configured yet. "
                     "This action was recorded successfully."
                 ),
-                message_id=message_id,
             )
 
         self._set_waiting_for_gm(False)
@@ -11898,13 +11870,14 @@ class StoryScreen(RepositoryBackedWidget):
         self._pending_regeneration_request = None
 
         if repository is not None:
-            repository.append_history(
-                "story_oog" if is_out_of_game else "story",
-                (
+            StoryTurnService.record_failure(
+                repository,
+                message_id=message_id,
+                conversation_mode="out_of_game" if is_out_of_game else "live_game",
+                message=(
                     "Gemini is temporarily unavailable. Your action was recorded "
                     "and your save is safe; please try again shortly."
                 ),
-                message_id=message_id,
             )
 
         self._set_waiting_for_gm(False)
@@ -19291,12 +19264,7 @@ class SettingsScreen(RepositoryBackedWidget):
 def _refresh_repository_calendar_time(repository: SaveRepository) -> None:
     """Recomputes the saved display time from current calendar settings."""
 
-    current_minute = repository.get_current_calendar_minute()
-    calendar_snapshot = build_calendar_snapshot(
-        current_minute,
-        repository.get_calendar_settings(),
-    )
-    repository.set_state_value("time", calendar_snapshot["display_label"])
+    refresh_calendar_time_projection(repository)
 
 
 def _apply_audio_settings_to_managers(
@@ -19306,6 +19274,13 @@ def _apply_audio_settings_to_managers(
     narration_player: NarrationPlayerProtocol | None,
 ) -> None:
     """Applies saved music, one-shot effect, and narrator settings to managers."""
+
+    AudioPreferencesService.apply(
+        repository,
+        sound_manager=sound_manager,
+        narration_player=narration_player,
+    )
+    return
 
     music_enabled = _bool_setting(repository.get_setting("audio.music_enabled", True), True)
     sound_effects_enabled = _bool_setting(
@@ -19573,21 +19548,7 @@ def _application_uses_dark_theme() -> bool:
 def _next_available_save_title(saves_dir: Path, requested_title: str) -> str:
     """Returns the first non-conflicting player-facing save title."""
 
-    base_title = str(requested_title or "").strip() or "New Adventure"
-
-    if not SaveRepository.save_title_exists(saves_dir, base_title):
-        return base_title
-
-    base_title, existing_suffix = _split_save_title_suffix(base_title)
-    suffix = max(2, existing_suffix + 1)
-
-    while True:
-        candidate = f"{base_title} {suffix}"
-
-        if not SaveRepository.save_title_exists(saves_dir, candidate):
-            return candidate
-
-        suffix += 1
+    return SaveGameService(saves_dir).next_available_title(requested_title)
 
 
 def _split_save_title_suffix(title: str) -> tuple[str, int]:
@@ -21179,30 +21140,13 @@ def _remove_table_row_by_button(table: QTableWidget, button: QPushButton) -> int
 def _bool_setting(value: Any, default: bool) -> bool:
     """Reads a flexible boolean setting."""
 
-    if isinstance(value, bool):
-        return value
-
-    if isinstance(value, str):
-        normalized = value.strip().casefold()
-
-        if normalized in {"true", "1", "yes", "on"}:
-            return True
-
-        if normalized in {"false", "0", "no", "off"}:
-            return False
-
-    return default
+    return domain_bool_setting(value, default)
 
 
 def _clamped_int(value: Any, default: int, minimum: int, maximum: int) -> int:
     """Returns an integer clamped to the provided range."""
 
-    try:
-        parsed_value = int(value)
-    except (TypeError, ValueError):
-        parsed_value = default
-
-    return max(minimum, min(maximum, parsed_value))
+    return domain_clamped_int(value, default, minimum, maximum)
 
 
 def _final_start_location_for_save(setup: dict[str, Any], result: Any) -> str:
@@ -22087,10 +22031,7 @@ def _set_markdown_text(text_edit: QTextEdit, markdown_text: str) -> None:
 def _safe_int(value, default: int) -> int:
     """Converts a value to int with a fallback."""
 
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return default
+    return domain_safe_int(value, default)
 
 
 def _split_list(raw_text: str) -> list[str]:
