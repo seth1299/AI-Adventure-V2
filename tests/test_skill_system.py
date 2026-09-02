@@ -9,15 +9,21 @@ from ai_adventure.context.context_builder import AiContextBuilder, infer_context
 from ai_adventure.core.state_manager import StateManager
 from ai_adventure.events.event_applier import EventApplier
 from ai_adventure.persistence.save_repository import SaveRepository
-from ai_adventure.skills.rules import bonus_for_level, dc_for_difficulty, level_for_xp
+from ai_adventure.skills.rules import (
+    XP_THRESHOLDS_BY_LEVEL,
+    bonus_for_level,
+    dc_for_difficulty,
+    level_for_xp,
+)
 
 
 class SkillSystemTests(unittest.TestCase):
     def test_skill_rule_math_is_simple_and_predictable(self) -> None:
         self.assertEqual(bonus_for_level(1), 2)
         self.assertEqual(bonus_for_level(5), 10)
-        self.assertEqual(level_for_xp(1, 9), 1)
-        self.assertEqual(level_for_xp(1, 10), 2)
+        level_two_threshold = XP_THRESHOLDS_BY_LEVEL[2]
+        self.assertEqual(level_for_xp(1, level_two_threshold - 1), 1)
+        self.assertEqual(level_for_xp(1, level_two_threshold), 2)
         self.assertEqual(level_for_xp(2, 70), 5)
         self.assertEqual(dc_for_difficulty("easy"), 10)
         self.assertEqual(dc_for_difficulty("hard"), 18)
