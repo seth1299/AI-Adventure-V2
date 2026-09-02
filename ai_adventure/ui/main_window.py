@@ -595,7 +595,7 @@ class MainWindow(QMainWindow):
             )
         except Exception:
             LOGGER.exception("Failed to build the Gemini new-game request.")
-            self._apply_new_game_fallback(repository, setup)
+            self.new_game_service.apply_fallback(repository, setup)
             self._complete_new_game_generation(repository)
             return
 
@@ -640,10 +640,18 @@ class MainWindow(QMainWindow):
             return
 
         try:
-            self._apply_new_game_generation_result(repository, setup, result)
+            available_voice_ids = list(
+                _narrator_voice_options(self.narration_player).values()
+            )
+            self.new_game_service.commit_generated_world(
+                repository,
+                setup,
+                result,
+                available_voice_ids=available_voice_ids,
+            )
         except Exception:
             LOGGER.exception("Failed to apply Gemini new-game synthesis.")
-            self._apply_new_game_fallback(repository, setup)
+            self.new_game_service.apply_fallback(repository, setup)
         finally:
             self._complete_new_game_generation(repository)
 
@@ -675,7 +683,7 @@ class MainWindow(QMainWindow):
             return
 
         try:
-            self._apply_new_game_fallback(
+            self.new_game_service.apply_fallback(
                 repository,
                 setup,
                 temporary_failure=temporary_failure,
@@ -712,48 +720,16 @@ class MainWindow(QMainWindow):
         setup: dict[str, Any],
         result: Any,
     ) -> None:
-        """Persists one completed Gemini new-game result."""
+        """Compatibility adapter for callers that still use the old method."""
 
-        LOGGER.debug(f"INITIAL NEW GAME GEMINI PROMPT: \n\n{result}")
-        self._apply_new_game_ai_state(repository, setup, result)
-        repository.set_world_summary(
-            _preserve_player_character_text(
-                result.world_summary,
-                setup,
-                result.finalized_character,
-            )
-        )
-        introductory_message = _preserve_player_character_text(
-            _introductory_message_for_save(setup, result),
-            setup,
-            result.finalized_character,
-        )
-        speaker_cues = _resolve_speaker_cues_for_repository(
+        self.new_game_service.commit_generated_world(
             repository,
-            self.narration_player,
-            getattr(result, "speaker_cues", []),
+            setup,
+            result,
+            available_voice_ids=list(
+                _narrator_voice_options(self.narration_player).values()
+            ),
         )
-        message_id = repository.append_history(
-            "story",
-            introductory_message,
-            sound_effect_cues=result.sound_effect_cues,
-            speaker_cues=speaker_cues,
-        )
-
-        if result.suggested_events:
-            event_results = EventApplier(
-                repository,
-                message_id=message_id,
-            ).apply_events(result.suggested_events)
-            applied_count = sum(
-                1 for event_result in event_results if event_result.status == "applied"
-            )
-            skipped_count = len(event_results) - applied_count
-            LOGGER.info(
-                "Applied %s new-game event(s); skipped %s.",
-                applied_count,
-                skipped_count,
-            )
 
     def _complete_new_game_generation(self, repository: SaveRepository) -> None:
         """Refreshes the active game and prepares its opening visual batch."""
@@ -820,242 +796,6 @@ class MainWindow(QMainWindow):
             ),
         )
         return new_game_service.normalize_setup(setup)
-
-    def _apply_new_game_ai_state(
-        self,
-        repository: SaveRepository,
-        setup: dict[str, Any],
-        result,
-    ) -> None:
-        """Persists AI-finalized new-game character, skills, and start location."""
-
-        start_location = _final_start_location_for_save(setup, result)
-
-        if start_location:
-            repository.set_state_value("location", start_location)
-
-        finalized_location_aliases: dict[str, str] = {}
-        if getattr(result, "locations", None):
-            travel_locations = _travel_locations_for_save(
-                result.locations,
-                setup,
-                result,
-            )
-            finalized_location_aliases = _finalized_location_aliases(
-                travel_locations,
-                setup,
-            )
-            repository.set_travel_locations(
-                _replace_location_aliases_in_travel_locations(
-                    travel_locations,
-                    finalized_location_aliases,
-                )
-            )
-
-        repository.ensure_travel_locations()
-
-        for secret in getattr(result, "gm_secrets", []):
-            repository.upsert_gm_secret(
-                secret_id=str(secret.get("secret_id", "")),
-                title=str(secret.get("title", "")),
-                details=str(secret.get("details", "")),
-                reveal_condition=str(secret.get("reveal_condition", "")),
-                related_npc_ids=list(secret.get("related_npc_ids", [])),
-                related_locations=list(secret.get("related_locations", [])),
-                status=str(secret.get("status", "active")),
-            )
-
-        for entry in getattr(result, "miscellaneous", []):
-            repository.upsert_miscellaneous(
-                misc_id=str(entry.get("misc_id", "")),
-                name=str(entry.get("name", "")),
-                category=str(entry.get("category", "")),
-                details=str(entry.get("details", "")),
-            )
-
-        for entry in getattr(result, "bestiary", []):
-            repository.upsert_bestiary_entry(
-                creature_id=str(entry.get("creature_id", "")),
-                name=str(entry.get("name", "")),
-                details=str(entry.get("details", "")),
-            )
-
-        setup_calendar = setup.get("calendar", {})
-        if (
-            isinstance(setup_calendar, dict)
-            and bool(setup_calendar.get("ai_generated", False))
-        ):
-            repository.set_calendar_settings(
-                ai_generated_calendar_settings_or_fallback(
-                    getattr(result, "calendar_settings", {}),
-                    genre_hint=_new_game_calendar_genre_hint(setup, result),
-                )
-            )
-
-        setup_starting_calendar = setup.get("starting_calendar", {})
-        result_starting_calendar = merge_authoritative_starting_calendar(
-            result.starting_calendar,
-            setup_starting_calendar,
-        )
-
-        if result_starting_calendar:
-            current_minute = resolve_starting_calendar_minute(
-                result_starting_calendar,
-                repository.get_calendar_settings(),
-                default_current_minute=DEFAULT_START_ELAPSED_MINUTES,
-            )
-            calendar_snapshot = build_calendar_snapshot(
-                current_minute,
-                repository.get_calendar_settings(),
-            )
-            repository.set_current_calendar_minute(current_minute)
-            repository.set_state_value("time", calendar_snapshot["display_label"])
-
-        authoritative_starting_weather = str(
-            setup.get("starting_weather", "") or ""
-        ).strip()
-        if authoritative_starting_weather:
-            repository.set_state_value("weather", authoritative_starting_weather)
-        elif result.start_weather:
-            repository.set_state_value("weather", result.start_weather)
-
-        starting_wealth = setup.get("starting_wealth", {})
-        starting_wealth_mode = (
-            str(starting_wealth.get("mode", "basic")).strip().casefold()
-            if isinstance(starting_wealth, dict)
-            else "basic"
-        )
-        if (
-            starting_wealth_mode == "basic"
-            and result.finalized_starting_currency_balance_base_units is not None
-        ):
-            repository.set_state_value(
-                "currency.balance",
-                str(result.finalized_starting_currency_balance_base_units),
-            )
-
-        if not setup.get("currency_denominations"):
-            if result.finalized_currency_denominations:
-                repository.set_currency_denominations(result.finalized_currency_denominations)
-                repository.set_setting(
-                    "currency.description",
-                    result.finalized_currency_description
-                    or describe_currency_denominations(
-                        result.finalized_currency_denominations,
-                        fallback_denominations=[],
-                    ),
-                )
-            else:
-                LOGGER.warning("AI new-game setup omitted generated currency denominations.")
-                self._apply_fallback_currency_if_needed(repository, setup)
-
-        if result.selected_genre:
-            repository.set_setting("world.genre", result.selected_genre)
-            repository.set_setting(
-                "ai.additional_context",
-                _append_ai_context_line(
-                    str(repository.get_setting("ai.additional_context", "")),
-                    f"Selected genre: {result.selected_genre}",
-                ),
-            )
-
-        character = _preserved_player_character_fields(
-            setup,
-            result.finalized_character,
-        )
-
-        if character:
-            if character.get("name"):
-                repository.set_setting("player_name", character["name"])
-            if character.get("name_pronunciation"):
-                repository.set_setting(
-                    "player.name_pronunciation",
-                    character["name_pronunciation"],
-                )
-            if character.get("pronouns"):
-                repository.set_setting("player.pronouns", character["pronouns"])
-            if character.get("appearance"):
-                repository.set_setting("player.appearance", character["appearance"])
-            if character.get("backstory"):
-                repository.set_setting("player.backstory", character["backstory"])
-            if character.get("notes"):
-                repository.set_setting("player.notes", character["notes"])
-
-        pronunciation_map = merge_pronunciation_maps(
-            setup.get("pronunciation_map", {}),
-            getattr(result, "pronunciation_map", {}),
-        )
-        setup_character = setup.get("character", {})
-        if isinstance(setup_character, dict) and setup_character.get(
-            "name_pronunciation"
-        ):
-            pronunciation_map = set_authoritative_pronunciation(
-                pronunciation_map,
-                setup_character.get("name", ""),
-                setup_character.get("name_pronunciation", ""),
-            )
-        repository.set_setting("tts.pronunciation_map", pronunciation_map)
-
-        finalized_skills = (
-            []
-            if setup.get("skill_preset") == "blank"
-            else _finalized_skills_for_save(
-                result.finalized_skills,
-                setup.get("skills", []),
-            )
-        )
-
-        if finalized_skills:
-            repository.replace_skills(finalized_skills)
-        elif result.finalized_skills:
-            LOGGER.warning(
-                "Skipped AI-finalized skills because they did not match the starting skill plan."
-            )
-
-        magic_setup = setup.get("magic", {})
-        if not isinstance(magic_setup, dict):
-            magic_setup = {}
-        starting_spell_requests = magic_setup.get("starting_spell_requests", [])
-        if not isinstance(starting_spell_requests, list):
-            starting_spell_requests = []
-        if (
-            bool(magic_setup.get("enabled", False))
-            and str(magic_setup.get("starting_spells_mode", "basic")).casefold()
-            == "basic"
-            and starting_spell_requests
-        ):
-            finalized_starting_spells = [
-                spell
-                for spell in getattr(result, "finalized_starting_spells", [])
-                if isinstance(spell, dict)
-                and 0
-                <= _safe_int(spell.get("source_index"), -1)
-                < len(starting_spell_requests)
-            ]
-            learned_spells = repository.learn_starting_spells(
-                finalized_starting_spells,
-                source="Gemini New Game",
-            )
-            if len(learned_spells) != len(starting_spell_requests):
-                LOGGER.warning(
-                    "Gemini finalized %s of %s requested starting spell(s).",
-                    len(learned_spells),
-                    len(starting_spell_requests),
-                )
-
-        finalized_starter_items = _starter_items_for_save(
-            result.finalized_starter_items,
-            setup,
-        )
-
-        if finalized_starter_items:
-            repository.replace_inventory_items(finalized_starter_items)
-
-        _apply_new_game_crafting_knowledge(
-            repository,
-            result,
-            location_aliases=finalized_location_aliases,
-        )
 
     def _apply_fallback_currency_if_needed(
         self,
