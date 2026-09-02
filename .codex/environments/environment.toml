@@ -5,5 +5,7 @@ name = "AI-Adventure-V2"
 [setup]
 script = '''
 C:\Users\sethg\OneDrive\Desktop\Main_Folder\Applications\AI-Adventure-V2\.venv\Scripts\python.exe -m venv .venv
-& C:\Users\sethg\OneDrive\Desktop\Main_Folder\Applications\AI-Adventure-V2\.venv\Scripts\python.exe -m pip install --upgrade pip
-& C:\Users\sethg\OneDrive\Desktop\Main_Folder\Applications\AI-Adventure-V2\.venv\Scripts\python.exe -m pip install -r requirements.txt'''
+
+C:\Users\sethg\OneDrive\Desktop\Main_Folder\Applications\AI-Adventure-V2\.venv\Scripts\python.exe -m pip install --upgrade pip
+
+C:\Users\sethg\OneDrive\Desktop\Main_Folder\Applications\AI-Adventure-V2\.venv\Scripts\python.exe -m pip install -r C:\Users\sethg\OneDrive\Desktop\Main_Folder\Applications\AI-Adventure-V2\requirements.txt'''
