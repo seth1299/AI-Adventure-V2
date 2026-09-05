@@ -295,6 +295,12 @@ class EventApplier:
             if event_type == "NpcUpsertedEvent":
                 return self._apply_npc_upserted(event_type, payload)
 
+            if event_type == "MerchantStockUpsertedEvent":
+                return self._apply_merchant_stock_upserted(event_type, payload)
+
+            if event_type == "MerchantBuyOfferUpsertedEvent":
+                return self._apply_merchant_buy_offer_upserted(event_type, payload)
+
             if event_type == "NpcKnowledgeAddedEvent":
                 return self._apply_npc_knowledge_added(event_type, payload)
 
@@ -1922,6 +1928,14 @@ class EventApplier:
         if npc is None:
             return _invalid(event_type, payload, "NPC could not be stored.")
 
+        merchant_profile = payload.get("merchant_profile")
+        if isinstance(merchant_profile, dict):
+            self.repository.upsert_merchant_profile(
+                str(npc["npc_id"]),
+                can_sell=bool(merchant_profile.get("can_sell", False)),
+                can_buy=bool(merchant_profile.get("can_buy", False)),
+            )
+
         has_party_fields = any(
             key in payload
             for key in (
@@ -1985,6 +1999,53 @@ class EventApplier:
             f"Stored NPC profile: {npc['name']}.",
             {**payload, "npc_id": npc["npc_id"]},
         )
+
+    def _merchant_catalog_id(self, payload: dict[str, Any]) -> str | None:
+        name = _first_text(payload, "item_name", "name")
+        if not name:
+            return None
+        self.repository.upsert_item_catalog_entry(
+            name=name,
+            category=_first_text(payload, "item_type", "category") or "Item",
+            description=_first_text(payload, "description"),
+            value_base_units=max(0, _safe_int(payload.get("value_base_units"), default=0) or 0),
+        )
+        for item in self.repository.list_item_catalog():
+            if str(item.get("name", "")).casefold() == name.casefold():
+                return str(item.get("id", ""))
+        return None
+
+    def _apply_merchant_stock_upserted(self, event_type: str, payload: dict[str, Any]) -> AppliedEventResult:
+        npc_id = _first_text(payload, "npc_id")
+        item_id = self._merchant_catalog_id(payload)
+        if not npc_id or not item_id:
+            return _invalid(event_type, payload, "Merchant NPC and item name are required.")
+        if self.repository.get_npc(npc_id) is None:
+            return _invalid(event_type, payload, "Merchant NPC does not exist.")
+        self.repository.upsert_merchant_profile(npc_id, can_sell=True, can_buy=True)
+        stock = self.repository.upsert_merchant_stock(
+            npc_id=npc_id, item_id=item_id,
+            stock_id=_first_text(payload, "stock_id"),
+            quantity=max(0, _safe_int(payload.get("quantity"), default=0) or 0),
+            unit_price_base_units=max(0, _safe_int(payload.get("unit_price_base_units"), default=0) or 0),
+        )
+        return AppliedEventResult(event_type, "applied", f"Updated merchant stock: {stock['item_name']}." if stock else "Merchant stock updated.", {**payload, "stock_id": stock["stock_id"] if stock else ""})
+
+    def _apply_merchant_buy_offer_upserted(self, event_type: str, payload: dict[str, Any]) -> AppliedEventResult:
+        npc_id = _first_text(payload, "npc_id")
+        item_id = self._merchant_catalog_id(payload)
+        if not npc_id or not item_id:
+            return _invalid(event_type, payload, "Merchant NPC and item name are required.")
+        if self.repository.get_npc(npc_id) is None:
+            return _invalid(event_type, payload, "Merchant NPC does not exist.")
+        self.repository.upsert_merchant_profile(npc_id, can_sell=True, can_buy=True)
+        offer = self.repository.upsert_merchant_buy_offer(
+            npc_id=npc_id, item_id=item_id,
+            offer_id=_first_text(payload, "offer_id"),
+            unit_price_base_units=max(0, _safe_int(payload.get("unit_price_base_units"), default=0) or 0),
+            max_quantity=max(0, _safe_int(payload.get("max_quantity"), default=0) or 0),
+        )
+        return AppliedEventResult(event_type, "applied", f"Updated merchant buy offer: {offer['item_name']}." if offer else "Merchant offer updated.", {**payload, "offer_id": offer["offer_id"] if offer else ""})
 
     def _apply_npc_knowledge_added(
         self,

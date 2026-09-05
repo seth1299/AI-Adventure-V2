@@ -81,6 +81,9 @@ class _VisualRepository:
             }
         ][:limit]
 
+    def list_bestiary_entries(self):
+        return []
+
 
 class VisualAssetTests(unittest.TestCase):
     def test_image_service_uses_image_only_model_request(self) -> None:
@@ -172,6 +175,83 @@ class VisualAssetTests(unittest.TestCase):
         self.assertEqual(by_subject[("location", "glass market")].message_ids, ("turn-1",))
         self.assertEqual(by_subject[("inventory", "ripe banana")].message_ids, ("turn-1",))
         self.assertEqual(by_subject[("npc", "dock_warden")].message_ids, ("turn-2",))
+
+    def test_requests_include_player_known_bestiary_creatures(self) -> None:
+        class _BestiaryRepository(_VisualRepository):
+            def list_bestiary_entries(self):
+                return [
+                    {
+                        "creature_id": "mist_strider",
+                        "name": "Mist-Strider",
+                        "details": "A tall six-legged creature with translucent fur.",
+                    }
+                ]
+
+            def list_mechanical_events(self):
+                return [
+                    *super().list_mechanical_events(),
+                    {
+                        "event_type": "BestiaryEntryUpsertedEvent",
+                        "payload": {
+                            "creature_id": "mist_strider",
+                            "name": "Mist-Strider",
+                        },
+                        "status": "applied",
+                        "message_id": "turn-3",
+                    },
+                ]
+
+        requests = build_visual_asset_requests(_BestiaryRepository())
+        creature = next(request for request in requests if request.subject_type == "bestiary")
+
+        self.assertEqual(creature.subject_key, "mist_strider")
+        self.assertEqual(creature.message_ids, ("turn-3",))
+        self.assertEqual(creature.aspect_ratio, "1:1")
+        self.assertIn("single non-human creature illustration", creature.prompt)
+
+    def test_image_prompt_passes_banned_terms_and_exact_map_labels(self) -> None:
+        class _MapRepository(_VisualRepository):
+            def ensure_travel_locations(self):
+                return [
+                    {
+                        "name": "Riverbend City",
+                        "description": "A river city.",
+                        "x_miles": 0,
+                        "y_miles": 0,
+                    },
+                    {
+                        "name": "Dark Forest",
+                        "description": "A forest east of the city.",
+                        "x_miles": 8,
+                        "y_miles": 0,
+                    },
+                    {"name": "Oakhaven", "description": "A forbidden example."},
+                ]
+
+            def list_inventory_items(self):
+                return [
+                    {
+                        "name": "Basic Regional Map",
+                        "category": "Document",
+                        "description": (
+                            "A hand-inked parchment map showing Riverbend City and "
+                            "surrounding roads and forests."
+                        ),
+                    }
+                ]
+
+        request = next(
+            request
+            for request in build_visual_asset_requests(_MapRepository())
+            if request.subject_type == "inventory"
+        )
+
+        self.assertIn("Alden", request.prompt)
+        self.assertIn('"Riverbend City"', request.prompt)
+        self.assertNotIn('"Oakhaven"', request.prompt)
+        self.assertIn("do not add, rename, or imply any other place", request.prompt)
+        self.assertIn("x_miles increases eastward (right)", request.prompt)
+        self.assertIn('"Dark Forest" is east of "Riverbend City".', request.prompt)
 
     def test_filename_is_descriptive_bounded_and_versioned(self) -> None:
         request = VisualAssetRequest(

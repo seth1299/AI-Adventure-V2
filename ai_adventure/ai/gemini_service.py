@@ -176,6 +176,8 @@ KNOWN_EVENT_TYPE_NAMES = [
     "ReagentDiscoveredEvent",
     "CurrencyChangedEvent",
     "CurrencyDefinedEvent",
+    "MerchantStockUpsertedEvent",
+    "MerchantBuyOfferUpsertedEvent",
     "MusicChangedEvent",
     "SoundEffectChangedEvent",
     "BackgroundAmbienceChangedEvent",
@@ -955,6 +957,36 @@ EVENT_RESPONSE_SCHEMA: dict[str, Any] = {
             ["name", "base_unit_value"],
         ),
         _event_response_schema(
+            "MerchantStockUpsertedEvent",
+            {
+                "npc_id": {"type": "string"},
+                "stock_id": {"type": "string"},
+                "item_name": {"type": "string"},
+                "item_type": {"type": "string"},
+                "description": {"type": "string"},
+                "value_base_units": {"type": "integer", "minimum": 0},
+                "quantity": {"type": "integer", "minimum": 0},
+                "unit_price_base_units": {"type": "integer", "minimum": 0},
+            },
+            ["npc_id", "item_name", "quantity", "unit_price_base_units"],
+            description="Updates deterministic stock; never performs a player transaction.",
+        ),
+        _event_response_schema(
+            "MerchantBuyOfferUpsertedEvent",
+            {
+                "npc_id": {"type": "string"},
+                "offer_id": {"type": "string"},
+                "item_name": {"type": "string"},
+                "item_type": {"type": "string"},
+                "description": {"type": "string"},
+                "value_base_units": {"type": "integer", "minimum": 0},
+                "unit_price_base_units": {"type": "integer", "minimum": 0},
+                "max_quantity": {"type": "integer", "minimum": 0},
+            },
+            ["npc_id", "item_name", "unit_price_base_units", "max_quantity"],
+            description="Commits a deterministic offer for items the merchant buys.",
+        ),
+        _event_response_schema(
             "MusicChangedEvent",
             {"filename": {"type": "string"}},
             ["filename"],
@@ -1184,6 +1216,15 @@ EVENT_RESPONSE_SCHEMA: dict[str, Any] = {
                 "party_armor_class": {"type": "integer", "minimum": -1},
                 "party_combat_style": {"type": "string"},
                 "party_skills": STRING_LIST_SCHEMA,
+                "merchant_profile": {
+                    "type": "object",
+                    "properties": {
+                        "can_sell": {"type": "boolean"},
+                        "can_buy": {"type": "boolean"},
+                    },
+                    "required": ["can_sell", "can_buy"],
+                    "additionalProperties": False,
+                },
             },
             [
                 "display_name",
@@ -1506,11 +1547,8 @@ STORY_EVENT_TYPE_NAMES_BY_CONTEXT_TAG: dict[str, tuple[str, ...]] = {
         "MagicEffectUpsertedEvent",
     ),
     "merchant": (
-        "InventoryItemAddedEvent",
-        "InventoryItemRemovedEvent",
-        "InventoryItemModifiedEvent",
-        "CurrencyChangedEvent",
-        "CurrencyDefinedEvent",
+        "MerchantStockUpsertedEvent",
+        "MerchantBuyOfferUpsertedEvent",
     ),
     "music": (
         "MusicChangedEvent",
@@ -2903,8 +2941,11 @@ def _build_xml_story_prompt(context_packet: dict[str, Any]) -> str:
                     f"The player explicitly selected {conversation_mode}. This UI "
                     "selection is authoritative; never infer a different mode from "
                     "the message wording. In out_of_game mode, answer the player "
-                    "directly, set out_of_game=true, and return empty suggested_actions "
-                    "and events so no turn or durable state can change. In live_game "
+                    "directly, set out_of_game=true, and normally return empty "
+                    "suggested_actions and events so no turn or durable state can change. "
+                    "If out_of_game_correction=true, audit the supplied recent history, "
+                    "event log, and current state; return only a justified inventory "
+                    "correction event. In live_game "
                     "mode, set out_of_game=false and treat the message as an in-world action."
                 ),
             ),
@@ -2953,6 +2994,7 @@ _STORY_STATE_TAGS: dict[str, set[str]] = {
     "inventory": {"inventory", "alchemy", "crafting", "reagent", "recipe", "combat", "merchant"},
     "item_catalog": {"inventory", "alchemy", "crafting", "reagent", "recipe", "combat", "merchant"},
     "currency": {"currency", "merchant"},
+    "merchant": {"merchant"},
     "combat": {"combat"},
     "alchemy": {"alchemy", "crafting", "reagent", "recipe"},
     "skills": {"skill", "uncertainty", "combat", "crafting", "exploration"},
@@ -2983,11 +3025,13 @@ def _project_story_state(context_packet: dict[str, Any]) -> dict[str, Any]:
         elif tags.intersection(required_tags) and value not in (None, "", [], {}):
             projected[key] = value
 
-    for key in ("npcs", "party", "gm_secrets", "bestiary"):
+    for key in ("npcs", "party", "gm_secrets", "bestiary", "merchant"):
         value = source.get(key)
         if not isinstance(value, dict):
             continue
         if key == "gm_secrets" and value.get("active"):
+            projected[key] = value
+        elif key in {"merchant", "event_audit"} and value:
             projected[key] = value
         elif key in {"npcs", "party", "bestiary"} and value.get("relevant", value.get("members", value.get("entries", []))):
             projected[key] = value
@@ -5449,7 +5493,13 @@ def parse_gemini_story_response(
     )
     if explicit_out_of_game:
         suggested_actions = []
-        suggested_events = []
+        if not bool(context_packet.get("out_of_game_correction", False)):
+            suggested_events = []
+        else:
+            suggested_events = [
+                event for event in suggested_events
+                if str(event.get("type", "")).strip() == "InventoryItemAddedEvent"
+            ]
         sound_effect_cues = []
         speaker_cues = []
     event_types = [
@@ -5576,10 +5626,16 @@ def _enforce_explicit_conversation_mode(
     """Makes the UI-selected conversation mode authoritative over model inference."""
 
     is_out_of_game = context_packet.get("conversation_mode") == "out_of_game"
+    correction_mode = bool(context_packet.get("out_of_game_correction", False))
+    allowed_correction_events = [
+        event for event in result.suggested_events
+        if str(event.get("type", "")).strip() == "InventoryItemAddedEvent"
+    ]
+    permitted_events = allowed_correction_events if correction_mode else []
     if (
         result.out_of_game == is_out_of_game
         and (not is_out_of_game or not result.suggested_actions)
-        and (not is_out_of_game or not result.suggested_events)
+        and (not is_out_of_game or result.suggested_events == permitted_events)
         and (not is_out_of_game or not result.sound_effect_cues)
         and (not is_out_of_game or not result.speaker_cues)
     ):
@@ -5602,7 +5658,7 @@ def _enforce_explicit_conversation_mode(
     return AiNarrationResult(
         narrative_text=result.narrative_text,
         suggested_actions=[] if is_out_of_game else result.suggested_actions,
-        suggested_events=[] if is_out_of_game else result.suggested_events,
+        suggested_events=permitted_events if is_out_of_game else result.suggested_events,
         sound_effect_cues=[] if is_out_of_game else result.sound_effect_cues,
         speaker_cues=[] if is_out_of_game else result.speaker_cues,
         pronunciation_map=result.pronunciation_map,

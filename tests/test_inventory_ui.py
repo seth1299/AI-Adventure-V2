@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMessageBox,
     QPlainTextEdit,
+    QProgressBar,
     QPushButton,
     QSizePolicy,
     QTabWidget,
@@ -36,6 +37,7 @@ from PySide6.QtWidgets import (
 
 from ai_adventure.persistence.save_repository import SaveRepository
 from ai_adventure.new_game_setup import normalize_new_game_setup
+from ai_adventure.ui.screens.notes import NotesScreen
 from ai_adventure.new_game_templates import (
     load_new_game_templates,
     save_new_game_template,
@@ -280,6 +282,16 @@ class InventoryUiTests(unittest.TestCase):
         self.assertIn("next iteration", wizard.text_model_description.text())
         self.assertIn("professional-grade", wizard.image_model_description.text())
         self.assertIn("visible brushwork", wizard.image_style_description.text())
+        text_bars = wizard.text_model_ratings.findChildren(QProgressBar)
+        image_bars = wizard.image_model_ratings.findChildren(QProgressBar)
+        self.assertEqual(
+            [bar.format() for bar in text_bars],
+            ["Cost: 4/5", "Intelligence: 5/5", "Speed: 3/5"],
+        )
+        self.assertEqual(
+            [bar.format() for bar in image_bars],
+            ["Cost: 5/5", "Quality: 5/5", "Speed: 2/5"],
+        )
         self.assertFalse(wizard.image_model_combo.isEnabled())
         self.assertFalse(wizard.image_style_combo.isEnabled())
         setup = wizard.build_setup()
@@ -1964,6 +1976,41 @@ class InventoryUiTests(unittest.TestCase):
             self.assertIn("towering animal", visible_details)
             self.assertNotIn("built beneath", visible_details)
             self.assertEqual(screen.findChildren(QPushButton), [])
+            screen.close()
+
+    def test_notes_default_to_markdown_preview_and_edit_on_demand(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = SaveRepository.create_new_save(Path(temp_dir), "Notes UI")
+            repository.set_note_entries(
+                [
+                    {
+                        "entry_id": "note-1",
+                        "heading": "Field clue",
+                        "body": "**A marked door**\n\n- Check the hinges",
+                        "tags": ["Clues"],
+                    }
+                ]
+            )
+
+            screen = NotesScreen()
+            screen.set_repository(repository)
+            self.app.processEvents()
+
+            self.assertIs(screen.entry_pages.currentWidget(), screen.entry_preview)
+            self.assertTrue(screen.entry_preview.isReadOnly())
+            self.assertIn("A marked door", screen.entry_preview.toPlainText())
+            self.assertEqual(screen.edit_note_button.text(), "Edit note")
+
+            screen.edit_note_button.click()
+            self.assertIs(screen.entry_pages.currentWidget(), screen.entry_editor)
+            self.assertEqual(screen.entry_body_input.toPlainText(), "**A marked door**\n\n- Check the hinges")
+            self.assertEqual(screen.edit_note_button.text(), "View note")
+
+            screen.entry_body_input.setPlainText("**Updated clue**")
+            screen.edit_note_button.click()
+            self.assertIs(screen.entry_pages.currentWidget(), screen.entry_preview)
+            self.assertIn("Updated clue", screen.entry_preview.toPlainText())
+            screen._autosave_timer.stop()
             screen.close()
 
     def test_game_shell_registers_bestiary_tab(self) -> None:

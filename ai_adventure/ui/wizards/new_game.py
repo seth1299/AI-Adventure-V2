@@ -1093,6 +1093,8 @@ class NewGameWizard(QWizard):
         self.text_model_description.setText(str(text_model["description"]))
         self.image_model_description.setText(str(image_model["description"]))
         self.image_style_description.setText(str(image_style["description"]))
+        self._update_model_rating_bars(self.text_model_ratings, text_model, False)
+        self._update_model_rating_bars(self.image_model_ratings, image_model, True)
         self.model_tone_description.setText(str(modes["model_tone_description"]))
         self.response_length_description.setText(
             str(modes["response_length_description"])
@@ -1115,14 +1117,56 @@ class NewGameWizard(QWizard):
         title: str,
         control: QWidget,
         description: QLabel,
+        details: QWidget | None = None,
     ) -> QWidget:
         field = QWidget()
         layout = QVBoxLayout(field)
         layout.setContentsMargins(0, 3, 0, 6)
         layout.addWidget(QLabel(title))
         layout.addWidget(control)
+        if details is not None:
+            layout.addWidget(details)
         layout.addWidget(description)
         return field
+
+    @staticmethod
+    def _model_rating_bars() -> QWidget:
+        """Creates the comparative rating bars shown under a model selector."""
+
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        layout.setContentsMargins(0, 2, 0, 2)
+        layout.setSpacing(2)
+        for key in ("cost_rating", "intelligence_rating", "speed_rating"):
+            bar = QProgressBar()
+            bar.setObjectName(f"model_{key}")
+            bar.setRange(0, 5)
+            bar.setValue(0)
+            bar.setTextVisible(True)
+            bar.setFixedHeight(17)
+            layout.addWidget(bar)
+        return widget
+
+    @staticmethod
+    def _update_model_rating_bars(
+        widget: QWidget,
+        metadata: Any,
+        image_model: bool,
+    ) -> None:
+        """Updates bars, using Quality instead of Intelligence for images."""
+
+        labels = (
+            ("Cost", "cost_rating"),
+            (
+                "Quality" if image_model else "Intelligence",
+                "quality_rating" if image_model else "intelligence_rating",
+            ),
+            ("Speed", "speed_rating"),
+        )
+        for bar, (label, key) in zip(widget.findChildren(QProgressBar), labels):
+            value = max(0, min(5, int(metadata.get(key, 0))))
+            bar.setValue(value)
+            bar.setFormat(f"{label}: {value}/5")
 
     def _build_adventure_page(self) -> None:
         """Builds the adventure/world setup page."""
@@ -2291,6 +2335,7 @@ class NewGameWizard(QWizard):
         self.text_model_description = QLabel()
         self.text_model_description.setWordWrap(True)
         self.text_model_description.setStyleSheet(description_style)
+        self.text_model_ratings = self._model_rating_bars()
 
         self.smarter_ai_checkbox = QCheckBox(
             'Do you want the A.I. to be "Smarter"?'
@@ -2320,6 +2365,7 @@ class NewGameWizard(QWizard):
         self.image_model_description = QLabel()
         self.image_model_description.setWordWrap(True)
         self.image_model_description.setStyleSheet(description_style)
+        self.image_model_ratings = self._model_rating_bars()
 
         self.image_style_combo = _NoWheelComboBox(page)
         AISettingsDialog._add_mode_options(self.image_style_combo, IMAGE_STYLE_OPTIONS)
@@ -2347,6 +2393,7 @@ class NewGameWizard(QWizard):
                 "Text Model",
                 self.text_model_combo,
                 self.text_model_description,
+                self.text_model_ratings,
             )
         )
         model_layout.addWidget(self.smarter_ai_checkbox)
@@ -2357,6 +2404,7 @@ class NewGameWizard(QWizard):
                 "Image Model",
                 self.image_model_combo,
                 self.image_model_description,
+                self.image_model_ratings,
             )
         )
         model_layout.addWidget(

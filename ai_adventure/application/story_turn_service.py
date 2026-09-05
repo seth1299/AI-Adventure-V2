@@ -76,6 +76,16 @@ class StoryTurnService:
             if sound_manager is not None
             else []
         )
+        correction_request = (
+            conversation_mode == "out_of_game"
+            and any(
+                phrase in player_text.casefold()
+                for phrase in (
+                    "missing", "not in my inventory", "don't see", "didn't receive",
+                    "did not receive", "double-check", "double check", "correct my inventory",
+                )
+            )
+        )
         return AiContextBuilder.from_default_library().build_story_context(
             state,
             player_command=player_text,
@@ -94,6 +104,14 @@ class StoryTurnService:
             ),
             resolved_skill_checks=resolved_skill_checks,
             planner_context_tags=planner_context_tags,
+            merchant=(lambda npc_id: {
+                "active_npc_id": npc_id,
+                "profile": repository.get_merchant_profile(npc_id) if npc_id else None,
+                "stock": repository.list_merchant_stock(npc_id) if npc_id else [],
+                "buy_offers": repository.list_merchant_buy_offers(npc_id) if npc_id else [],
+            })(repository.get_active_merchant_npc_id()),
+            out_of_game_correction=correction_request,
+            mechanical_events=repository.list_mechanical_events()[-40:],
         )
 
     @staticmethod
@@ -241,11 +259,17 @@ class StoryTurnService:
         )
 
         event_results: list[AppliedEventResult] = []
-        if not is_out_of_game and result.suggested_events:
+        correction_events = [
+            event for event in result.suggested_events
+            if isinstance(event, dict)
+            and str(event.get("type", "")).strip() == "InventoryItemAddedEvent"
+        ]
+        events_to_apply = result.suggested_events if not is_out_of_game else correction_events
+        if events_to_apply:
             event_results = StoryTurnService.apply_suggested_events(
                 repository,
                 message_id=clean_message_id,
-                suggested_events=result.suggested_events,
+                suggested_events=events_to_apply,
                 prior_results=prior_event_results,
             )
         return StoryTurnCommitResult(

@@ -30,6 +30,10 @@ from ai_adventure.ai.image_styles import (
     normalize_image_style,
 )
 from ai_adventure.ai.model_catalog import DEFAULT_IMAGE_MODEL, normalize_image_model
+from ai_adventure.context.creative_guardrails import (
+    default_banned_creative_terms,
+    find_banned_creative_terms,
+)
 
 
 LOGGER = logging.getLogger(__name__)
@@ -53,6 +57,8 @@ class VisualAssetRepository(Protocol):
 
     def list_player_visible_npcs(self, limit: int = 50) -> list[dict[str, Any]]: ...
 
+    def list_bestiary_entries(self) -> list[dict[str, Any]]: ...
+
 
 @dataclass(frozen=True)
 class VisualAssetRequest:
@@ -65,6 +71,8 @@ class VisualAssetRequest:
     world_context: str = ""
     message_ids: tuple[str, ...] = ()
     image_style: str = DEFAULT_IMAGE_STYLE
+    text_instructions: str = ""
+    banned_terms: tuple[str, ...] = ()
 
     @property
     def descriptor_hash(self) -> str:
@@ -139,16 +147,28 @@ class VisualAssetRequest:
                 "or supporting surface is acceptable, but it must not compete with or obscure "
                 "the item."
             ),
+            "bestiary": (
+                "Create a single non-human creature illustration based only on the "
+                "player-known description. Show the creature as the only foreground "
+                "subject, with no extra creatures, people, character portraits, text, "
+                "labels, or invented hidden anatomy. Make its silhouette, scale, "
+                "coloration, texture, and distinctive traits easy to recognize."
+            ),
         }[self.subject_type]
         style = image_style_metadata(self.image_style)
+        banned_terms = self.banned_terms or default_banned_creative_terms()
+        banned_text = ", ".join(banned_terms) or "None"
+        text_instructions = self.text_instructions or (
+            "No readable text is permitted because the subject does not call for it."
+        )
         return (
             "Generate one cohesive image for AI Adventure. "
             f"Selected visual style: {style['value']} ({style['label']}). "
             f"Style direction: {style['prompt']} "
             f"{subject_instruction} Use a coherent centered composition suitable for a compact "
-            "desktop game UI. Do not add words, captions, labels, signatures, watermarks, UI "
-            "frames, split panels, unrelated duplicate subjects, or extraneous foreground "
-            "characters. Only depict player-visible information; do not invent hidden identities "
+            "desktop game UI. Do not add unapproved words, captions, labels, signatures, "
+            "watermarks, UI frames, split panels, unrelated duplicate subjects, or extraneous "
+            "foreground characters. Only depict player-visible information; do not invent hidden identities "
             "or secret facts. Make the selected style feel intentional and specific rather than "
             "like a generic AI image. Unless the selected style explicitly calls for one of these "
             "traits, avoid excessive drop shadows, perfect symmetry, unnaturally perfect lighting, "
@@ -158,6 +178,10 @@ class VisualAssetRequest:
             "texture, materials, and lighting.\n\n"
             f"Subject name: {self.display_name}\n"
             f"Player-visible description: {self.description}\n"
+            "Text and label instructions (follow exactly; never invent readable text):\n"
+            f"{text_instructions}\n"
+            "Forbidden words and names: do not render any of these exact terms, close "
+            f"spelling variants, hyphenation variants, or reskins: {banned_text}\n"
             "World context for visual consistency (honor this when relevant, especially "
             "historical era, technology level, architecture, clothing, vehicles, and "
             "materials; do not default to modern designs when the context establishes an "
@@ -220,13 +244,18 @@ class GeminiVisualAssetService:
 def build_visual_asset_requests(
     repository: VisualAssetRepository,
 ) -> list[VisualAssetRequest]:
-    """Builds deduplicated requests from the four durable player-visible surfaces."""
+    """Builds deduplicated requests from all durable player-visible image surfaces."""
 
     event_messages = _visual_event_message_ids(repository.list_mechanical_events())
     opening_story_message_id = _first_story_message_id(repository.list_history())
     world_context = _visible_world_context(repository)
     image_style = normalize_image_style(
         repository.get_setting("images.style", DEFAULT_IMAGE_STYLE)
+    )
+    banned_terms = default_banned_creative_terms()
+    known_location_positions = _known_location_positions(
+        repository,
+        banned_terms=banned_terms,
     )
     requests: list[VisualAssetRequest] = []
 
@@ -247,6 +276,7 @@ def build_visual_asset_requests(
                 world_context=world_context,
                 message_ids=(opening_story_message_id,) if opening_story_message_id else (),
                 image_style=image_style,
+                banned_terms=banned_terms,
             )
         )
 
@@ -268,6 +298,7 @@ def build_visual_asset_requests(
                     or event_messages.get(("location", name.casefold()), ())
                 ),
                 image_style=image_style,
+                banned_terms=banned_terms,
             )
         )
 
@@ -296,6 +327,12 @@ def build_visual_asset_requests(
                     or event_messages.get(("inventory", name.casefold()), ())
                 ),
                 image_style=image_style,
+                text_instructions=_text_instructions_for_subject(
+                    name,
+                    description,
+                    known_location_positions,
+                ),
+                banned_terms=banned_terms,
             )
         )
 
@@ -316,6 +353,31 @@ def build_visual_asset_requests(
                 world_context=world_context,
                 message_ids=tuple(event_messages.get(("npc", npc_id), ())),
                 image_style=image_style,
+                banned_terms=banned_terms,
+            )
+        )
+
+    for creature in getattr(repository, "list_bestiary_entries", lambda: [])():
+        creature_id = str(creature.get("creature_id", "") or "").strip().casefold()
+        display_name = str(creature.get("name", "") or "").strip()
+        description = str(creature.get("details", "") or "").strip()
+        if not creature_id:
+            creature_id = display_name.casefold()
+        if not creature_id or not display_name or not description:
+            continue
+        requests.append(
+            VisualAssetRequest(
+                subject_type="bestiary",
+                subject_key=creature_id,
+                display_name=display_name,
+                description=description,
+                world_context=world_context,
+                message_ids=tuple(
+                    event_messages.get(("bestiary", creature_id), ())
+                    or event_messages.get(("bestiary", display_name.casefold()), ())
+                ),
+                image_style=image_style,
+                banned_terms=banned_terms,
             )
         )
 
@@ -323,6 +385,118 @@ def build_visual_asset_requests(
     for request in requests:
         deduplicated[request.asset_id] = request
     return list(deduplicated.values())
+
+
+_TEXT_BEARING_HINTS = (
+    "book",
+    "chart",
+    "document",
+    "engraving",
+    "inscription",
+    "journal",
+    "label",
+    "letter",
+    "map",
+    "note",
+    "parchment",
+    "scroll",
+    "sign",
+    "text",
+    "writing",
+)
+
+
+def _known_location_positions(
+    repository: VisualAssetRepository,
+    *,
+    banned_terms: tuple[str, ...],
+) -> tuple[tuple[str, float | None, float | None], ...]:
+    """Returns safe Travel-tab names and coordinates for exact map labels."""
+
+    locations: list[tuple[str, float | None, float | None]] = []
+    for location in repository.ensure_travel_locations():
+        name = " ".join(str(location.get("name", "") or "").split()).strip()
+        if (
+            name
+            and not find_banned_creative_terms(name, terms=banned_terms)
+            and name.casefold() not in {existing[0].casefold() for existing in locations}
+        ):
+            locations.append(
+                (
+                    name,
+                    _optional_float(location.get("x_miles")),
+                    _optional_float(location.get("y_miles")),
+                )
+            )
+    return tuple(locations)
+
+
+def _text_instructions_for_subject(
+    display_name: str,
+    description: str,
+    known_location_positions: tuple[tuple[str, float | None, float | None], ...],
+) -> str:
+    """Builds strict exact-label rules for subjects that visibly carry writing."""
+
+    combined = f"{display_name} {description}".casefold()
+    if not any(hint in combined for hint in _TEXT_BEARING_HINTS):
+        return "No readable text is permitted because the subject does not call for it."
+
+    approved = [
+        display_name.strip(),
+        *(name for name, _x, _y in known_location_positions),
+    ]
+    unique_approved = list(dict.fromkeys(name for name in approved if name))
+    labels = ", ".join(f'"{name}"' for name in unique_approved)
+    coordinate_lines = [
+        f'"{name}": x_miles={x:g}, y_miles={y:g}'
+        for name, x, y in known_location_positions
+        if x is not None and y is not None
+    ]
+    relation_lines: list[str] = []
+    for index, (left_name, left_x, left_y) in enumerate(known_location_positions):
+        if left_x is None or left_y is None:
+            continue
+        for right_name, right_x, right_y in known_location_positions[index + 1 :]:
+            if right_x is None or right_y is None:
+                continue
+            horizontal = "east" if right_x > left_x else "west" if right_x < left_x else "same longitude as"
+            vertical = "north of" if right_y > left_y else "south of" if right_y < left_y else "same latitude as"
+            if horizontal.startswith("same"):
+                relation_lines.append(f'"{right_name}" is {vertical} "{left_name}".')
+            elif vertical.startswith("same"):
+                relation_lines.append(f'"{right_name}" is {horizontal} of "{left_name}".')
+            else:
+                relation_lines.append(
+                    f'"{right_name}" is {vertical.replace(" of", "")} and '
+                    f'{horizontal} of "{left_name}".'
+                )
+    directional_rules = (
+        "Use a north-facing compass rose with north at the top: x_miles increases "
+        "eastward (right) and y_miles increases northward (up). Preserve these exact "
+        "coordinates and pairwise relationships; never mirror, rotate, or rearrange "
+        "the map.\n"
+        + ("Coordinate anchors: " + "; ".join(coordinate_lines) + "\n" if coordinate_lines else "")
+        + ("Directional relationships: " + " ".join(relation_lines) if relation_lines else "")
+    )
+    return (
+        "This subject may contain readable writing only when it is visually appropriate. "
+        f"If text is shown, use only these exact labels, copied literally: {labels}. "
+        "For a map, label only these established Travel-tab locations; do not add, "
+        "rename, or imply any other place. Do not use decorative pseudo-writing, random "
+        "letters, or invented labels. "
+        f"{directional_rules}"
+    )
+
+
+def _optional_float(value: Any) -> float | None:
+    """Returns a finite coordinate when the saved value is numeric."""
+
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number == number and abs(number) != float("inf") else None
 
 
 def save_relative_image_filename(repository: Any, request: VisualAssetRequest) -> str:
@@ -620,6 +794,10 @@ def _visual_event_message_ids(
         elif event_type == "NpcUpsertedEvent":
             npc_id = str(payload.get("npc_id", "") or "").strip().casefold()
             subjects = [("npc", npc_id)] if npc_id else []
+        elif event_type == "BestiaryEntryUpsertedEvent":
+            creature_id = str(payload.get("creature_id", "") or "").strip().casefold()
+            name = str(payload.get("name", "") or "").strip().casefold()
+            subjects = [("bestiary", key) for key in (creature_id, name) if key]
         if not subjects:
             continue
         for subject in subjects:

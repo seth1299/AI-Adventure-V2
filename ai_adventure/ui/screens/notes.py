@@ -12,6 +12,7 @@ class NotesScreen(RepositoryBackedWidget):
 
         self._loading_notes = False
         self._saving_notes = False
+        self._editing_note = False
         self._autosave_timer = QTimer(self)
         self._autosave_timer.setSingleShot(True)
         self._autosave_timer.setInterval(900)
@@ -23,6 +24,8 @@ class NotesScreen(RepositoryBackedWidget):
         self.add_entry_button.clicked.connect(self._add_note_entry)
         self.delete_entry_button = QPushButton("Delete entry")
         self.delete_entry_button.clicked.connect(self._delete_selected_entry)
+        self.edit_note_button = QPushButton("Edit note")
+        self.edit_note_button.clicked.connect(self._toggle_note_editor)
 
         self.entry_tree = QTreeWidget()
         self.entry_tree.setHeaderHidden(True)
@@ -67,10 +70,19 @@ class NotesScreen(RepositoryBackedWidget):
         editor_layout.addWidget(self.entry_tags_input)
         editor = QWidget()
         editor.setLayout(editor_layout)
+        self.entry_editor = editor
+
+        self.entry_preview = QTextEdit()
+        self.entry_preview.setReadOnly(True)
+        self.entry_preview.setAcceptRichText(False)
+        self.entry_preview.setPlaceholderText("Select a note to view it.")
+        self.entry_pages = QStackedWidget()
+        self.entry_pages.addWidget(self.entry_preview)
+        self.entry_pages.addWidget(self.entry_editor)
 
         entries_layout = QHBoxLayout()
         entries_layout.addWidget(self.entry_tree, 1)
-        entries_layout.addWidget(editor, 3)
+        entries_layout.addWidget(self.entry_pages, 3)
 
         self.share_with_ai_checkbox = QCheckBox("Send these notes to the AI")
         self.share_with_ai_checkbox.toggled.connect(
@@ -82,6 +94,7 @@ class NotesScreen(RepositoryBackedWidget):
         button_layout = QHBoxLayout()
         button_layout.addWidget(self.add_entry_button)
         button_layout.addWidget(self.delete_entry_button)
+        button_layout.addWidget(self.edit_note_button)
         button_layout.addStretch()
         layout.addLayout(button_layout)
         layout.addLayout(entries_layout)
@@ -207,6 +220,7 @@ class NotesScreen(RepositoryBackedWidget):
         entry = {"entry_id": str(uuid.uuid4()), "heading": heading, "body": "", "tags": []}
         self._note_entries.insert(0, entry)
         self._refresh_entry_list(selected_entry_id=entry["entry_id"])
+        self._set_note_mode(True)
         self.entry_body_input.setFocus()
         self._schedule_notes_autosave()
 
@@ -286,9 +300,46 @@ class NotesScreen(RepositoryBackedWidget):
         )
 
     def _show_selected_entry(self, current: Any, _previous: Any) -> None:
-        """Loads the selected entry into the editable fields."""
+        """Shows the selected entry in rendered Markdown view by default."""
 
         self._set_editor_entry(self._selected_entry() if current is not None else None)
+
+    def _toggle_note_editor(self) -> None:
+        """Toggles between rendered Markdown view and the existing note editor."""
+
+        entry = self._selected_entry()
+        if entry is None:
+            return
+        self._set_note_mode(not self._editing_note)
+        if self._editing_note:
+            self.entry_body_input.setFocus()
+
+    def _set_note_mode(self, editing: bool) -> None:
+        """Selects the note page and keeps the edit control state in sync."""
+
+        entry = self._selected_entry()
+        has_entry = entry is not None
+        self._editing_note = bool(editing and has_entry)
+        if not self._editing_note:
+            self._set_note_preview(entry)
+        self.entry_pages.setCurrentWidget(
+            self.entry_editor if self._editing_note else self.entry_preview
+        )
+        self.edit_note_button.setEnabled(has_entry)
+        self.edit_note_button.setText("View note" if self._editing_note else "Edit note")
+
+    def _set_note_preview(self, entry: dict[str, Any] | None) -> None:
+        """Renders one selected note's Markdown in the read-only preview."""
+
+        if entry is None:
+            self.entry_preview.clear()
+            return
+        heading = str(entry.get("heading", "") or "").strip()
+        body = str(entry.get("body", "") or "")
+        sections = [f"# {heading}"] if heading else []
+        if body:
+            sections.append(body)
+        _set_markdown_text(self.entry_preview, "\n\n".join(sections))
 
     def _set_editor_entry(self, entry: dict[str, Any] | None) -> None:
         previous_loading = self._loading_notes
@@ -304,8 +355,10 @@ class NotesScreen(RepositoryBackedWidget):
             self.entry_heading_input.setText(entry["heading"] if entry else "")
             self.entry_body_input.setPlainText(entry["body"] if entry else "")
             self.entry_tags_input.setText(", ".join(entry["tags"]) if entry else "")
+            self._set_note_preview(entry)
         finally:
             self._loading_notes = previous_loading
+        self._set_note_mode(False)
 
     def _entry_editor_changed(self) -> None:
         """Copies editor changes into the selected structured entry."""
@@ -322,7 +375,10 @@ class NotesScreen(RepositoryBackedWidget):
         entry["tags"] = new_tags
         selected_id = entry["entry_id"]
         if tags_changed:
+            was_editing = self._editing_note
             self._refresh_entry_list(selected_entry_id=selected_id)
+            if was_editing:
+                self._set_note_mode(True)
         else:
             label = entry["heading"].strip() or "Untitled note"
             for group_index in range(self.entry_tree.topLevelItemCount()):
@@ -353,4 +409,7 @@ class NotesScreen(RepositoryBackedWidget):
 
         entry = self._selected_entry()
         if entry is not None:
+            was_editing = self._editing_note
             self._refresh_entry_list(selected_entry_id=entry["entry_id"])
+            if was_editing:
+                self._set_note_mode(True)

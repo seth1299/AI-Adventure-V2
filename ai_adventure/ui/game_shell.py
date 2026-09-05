@@ -3,6 +3,7 @@ from __future__ import annotations
 from ai_adventure.ui.common import *  # noqa: F401,F403
 from ai_adventure.ui.dialogues import *  # noqa: F401,F403
 from ai_adventure.ui.screens.combat import CombatScreen
+from ai_adventure.ui.screens.merchant import MerchantScreen
 from ai_adventure.ui.workers.visual_assets import _VisualAssetCoordinator
 from ai_adventure.ui.screens.alchemy import *  # noqa: F401,F403
 from ai_adventure.ui.screens.bestiary import *  # noqa: F401,F403
@@ -194,6 +195,7 @@ class GameShell(QWidget):
         self.inventory_screen = InventoryScreen(
             playtesting_tools=self.playtesting_tools,
         )
+        self.merchant_screen = MerchantScreen()
         self.combat_screen = CombatScreen(
             playtesting_tools=self.playtesting_tools,
         )
@@ -228,6 +230,7 @@ class GameShell(QWidget):
             self.bestiary_screen,
             self.calendar_screen,
             self.inventory_screen,
+            self.merchant_screen,
             self.combat_screen,
             self.npcs_screen,
             self.party_screen,
@@ -248,6 +251,7 @@ class GameShell(QWidget):
                 ("character", self.character_screen, "Character", True),
                 ("calendar", self.calendar_screen, "Calendar", True),
                 ("inventory", self.inventory_screen, "Inventory", True),
+                ("merchant", self.merchant_screen, "Merchant", True),
                 ("magic", self.magic_screen, "Magic", True),
                 ("combat", self.combat_screen, "Combat", True),
                 ("party", self.party_screen, "Party", True),
@@ -261,6 +265,7 @@ class GameShell(QWidget):
                 ("bestiary", self.bestiary_screen, "Bestiary", True),
                 ("calendar", self.calendar_screen, "Calendar", True),
                 ("inventory", self.inventory_screen, "Inventory", True),
+                ("merchant", self.merchant_screen, "Merchant", True),
                 ("combat", self.combat_screen, "Combat", True),
                 ("party", self.party_screen, "Party", True),
                 ("npcs", self.npcs_screen, "NPCs", True),
@@ -549,7 +554,7 @@ class GameShell(QWidget):
         self.visual_asset_coordinator.scan(repository)
 
     def _hide_empty_starting_tabs(self, repository: SaveRepository) -> None:
-        """Hides empty NPC, Party, and Magic tabs for a newly created game."""
+        """Hides tabs that the new-game configuration says are initially irrelevant."""
 
         setup = repository.get_setting("new_game.setup", {})
         if not isinstance(setup, dict):
@@ -561,6 +566,13 @@ class GameShell(QWidget):
             magic = {}
         requested_spells = magic.get("starting_spell_requests", [])
         starting_spells = magic.get("starting_spells", [])
+        combat = setup.get("combat", {})
+        if not isinstance(combat, dict):
+            combat = {}
+        combat_focus = str(
+            combat.get("focus", repository.get_setting("combat.focus", "balanced"))
+            or "balanced"
+        ).strip().casefold()
         should_hide = {
             "npcs": not repository.list_player_visible_npcs()
             and not (isinstance(starting_npcs, list) and starting_npcs),
@@ -569,6 +581,7 @@ class GameShell(QWidget):
             "magic": not repository.list_character_spells()
             and not (isinstance(requested_spells, list) and requested_spells)
             and not (isinstance(starting_spells, list) and starting_spells),
+            "combat": combat_focus == "low" and not repository.is_combat_active(),
         }
         for tab_key, hidden in should_hide.items():
             if not hidden:
@@ -613,10 +626,22 @@ class GameShell(QWidget):
         repository = self.repository
         if repository is None:
             return
+        setup = repository.get_setting("new_game.setup", {})
+        if not isinstance(setup, dict):
+            setup = {}
+        magic = setup.get("magic", {})
+        if not isinstance(magic, dict):
+            magic = {}
+        world_contains_magic = bool(magic.get("world_contains_magic", True))
+        combat = setup.get("combat", {})
+        if not isinstance(combat, dict):
+            combat = {}
+        combat_focus = str(combat.get("focus", "balanced") or "balanced").casefold()
         has_content = {
             "npcs": bool(repository.list_player_visible_npcs()),
             "party": bool(repository.list_party_members()),
-            "magic": bool(repository.list_character_spells()),
+            "magic": world_contains_magic and bool(repository.list_character_spells()),
+            "combat": combat_focus == "low" and repository.is_combat_active(),
         }
         for tab_key in list(self._smart_hidden_tabs):
             if has_content.get(tab_key, False):

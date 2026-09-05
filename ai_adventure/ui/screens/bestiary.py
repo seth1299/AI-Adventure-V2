@@ -15,6 +15,10 @@ class BestiaryScreen(RepositoryBackedWidget):
             self._display_selected_creature
         )
 
+        self.creature_image_label = QLabel()
+        self.creature_image_label.setObjectName("bestiaryGeneratedImage")
+        self.creature_image_label.setMargin(4)
+
         self.details_output = QTextEdit()
         self.details_output.setReadOnly(True)
 
@@ -23,6 +27,11 @@ class BestiaryScreen(RepositoryBackedWidget):
         list_layout.addWidget(self.creature_list)
 
         details_layout = QVBoxLayout()
+        details_layout.addWidget(
+            self.creature_image_label,
+            0,
+            Qt.AlignmentFlag.AlignHCenter,
+        )
         details_layout.addWidget(self.details_output)
 
         layout = QHBoxLayout()
@@ -40,6 +49,8 @@ class BestiaryScreen(RepositoryBackedWidget):
 
         if repository is None:
             self.creature_list.blockSignals(False)
+            self.creature_image_label.clear()
+            self.creature_image_label.hide()
             self.details_output.clear()
             return
 
@@ -59,6 +70,8 @@ class BestiaryScreen(RepositoryBackedWidget):
         self.creature_list.blockSignals(False)
 
         if self.creature_list.count() == 0:
+            self.creature_image_label.clear()
+            self.creature_image_label.hide()
             self.details_output.setPlainText(
                 "No creatures have been learned about yet."
             )
@@ -91,16 +104,36 @@ class BestiaryScreen(RepositoryBackedWidget):
 
         current_item = self.creature_list.currentItem()
         if current_item is None:
+            self.creature_image_label.clear()
+            self.creature_image_label.hide()
             self.details_output.clear()
             return
 
         raw_creature = current_item.data(Qt.ItemDataRole.UserRole)
         if not isinstance(raw_creature, dict):
+            self.creature_image_label.clear()
+            self.creature_image_label.hide()
             self.details_output.clear()
             return
 
         name = str(raw_creature.get("name", "")).strip()
         details = str(raw_creature.get("details", "")).strip()
+        repository = self.repository()
+        creature_key = str(
+            raw_creature.get("creature_id", "") or name
+        ).strip().casefold()
+        asset = (
+            repository.get_visual_asset("bestiary", creature_key)
+            if repository is not None and creature_key
+            else None
+        )
+        _set_generated_image(
+            self.creature_image_label,
+            self.visual_asset_path(asset),
+            maximum_width=384,
+            maximum_height=384,
+            accessible_name=f"Generated image of {name or 'creature'}",
+        )
         sections = [f"# {name}"] if name else []
         if details:
             sections.append(details)

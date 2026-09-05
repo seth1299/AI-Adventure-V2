@@ -1162,6 +1162,14 @@ class StoryScreen(RepositoryBackedWidget):
             ),
         )
         speaker_cues = commit_result.speaker_cues
+        if not is_out_of_game:
+            merchant_npc_id = ""
+            for cue in speaker_cues:
+                speaker_id = str(cue.get("speaker_id", "") or "").strip()
+                if speaker_id and repository.get_merchant_profile(speaker_id):
+                    merchant_npc_id = speaker_id
+                    break
+            repository.set_active_merchant_npc(merchant_npc_id or None)
         if commit_result.event_results:
             event_results = commit_result.event_results
             applied_count = sum(

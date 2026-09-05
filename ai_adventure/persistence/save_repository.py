@@ -2630,6 +2630,194 @@ class SaveRepository:
 
         return _npc_row_to_dict(row)
 
+    def set_active_merchant_npc(self, npc_id: str | None) -> None:
+        """Sets the transient NPC whose merchant interface is currently open."""
+
+        self.set_setting("merchant.active_npc_id", str(npc_id or "").strip())
+
+    def get_active_merchant_npc_id(self) -> str:
+        """Returns the current merchant conversation target, if any."""
+
+        return str(self.get_setting("merchant.active_npc_id", "") or "").strip()
+
+    def upsert_merchant_profile(
+        self, npc_id: str, *, can_sell: bool = True, can_buy: bool = True
+    ) -> dict[str, Any] | None:
+        """Creates or updates one NPC's merchant capabilities."""
+
+        clean_id = str(npc_id).strip()
+        if not clean_id or self.get_npc(clean_id) is None:
+            return None
+        timestamp = datetime.now().isoformat(timespec="seconds")
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO merchant_profiles (npc_id, can_sell, can_buy, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(npc_id) DO UPDATE SET
+                    can_sell = excluded.can_sell, can_buy = excluded.can_buy,
+                    updated_at = excluded.updated_at
+                """,
+                (clean_id, int(can_sell), int(can_buy), timestamp, timestamp),
+            )
+        return self.get_merchant_profile(clean_id)
+
+    def get_merchant_profile(self, npc_id: str) -> dict[str, Any] | None:
+        """Reads one merchant capability profile."""
+
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT npc_id, can_sell, can_buy FROM merchant_profiles WHERE npc_id = ?",
+                (str(npc_id).strip(),),
+            ).fetchone()
+        if row is None:
+            return None
+        return {"npc_id": row["npc_id"], "can_sell": bool(row["can_sell"]), "can_buy": bool(row["can_buy"])}
+
+    def upsert_merchant_stock(
+        self, *, npc_id: str, item_id: str, quantity: int, unit_price_base_units: int,
+        stock_id: str = "", item_name: str = ""
+    ) -> dict[str, Any] | None:
+        """Stores one deterministic item listing using a catalog item ID."""
+
+        clean_npc = str(npc_id).strip()
+        clean_item = str(item_id).strip()
+        quantity = max(0, int(quantity))
+        price = max(0, int(unit_price_base_units))
+        with self._connect() as connection:
+            npc = connection.execute("SELECT 1 FROM npcs WHERE npc_id = ?", (clean_npc,)).fetchone()
+            item = connection.execute("SELECT name FROM item_catalog WHERE id = ?", (clean_item,)).fetchone()
+            if npc is None or item is None:
+                return None
+            clean_name = str(item_name).strip() or str(item["name"])
+            clean_stock = str(stock_id).strip() or f"stock_{uuid.uuid4().hex}"
+            timestamp = datetime.now().isoformat(timespec="seconds")
+            connection.execute(
+                """
+                INSERT INTO merchant_stock
+                    (stock_id, npc_id, item_id, item_name, quantity, unit_price_base_units, active, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)
+                ON CONFLICT(stock_id) DO UPDATE SET
+                    npc_id=excluded.npc_id, item_id=excluded.item_id, item_name=excluded.item_name,
+                    quantity=excluded.quantity, unit_price_base_units=excluded.unit_price_base_units,
+                    active=1, updated_at=excluded.updated_at
+                """,
+                (clean_stock, clean_npc, clean_item, clean_name, quantity, price, timestamp, timestamp),
+            )
+            row = connection.execute(
+                "SELECT stock_id, npc_id, item_id, item_name, quantity, unit_price_base_units, active FROM merchant_stock WHERE stock_id = ?",
+                (clean_stock,),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def list_merchant_stock(self, npc_id: str) -> list[dict[str, Any]]:
+        """Lists active deterministic goods offered by an NPC."""
+
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT stock_id, npc_id, item_id, item_name, quantity, unit_price_base_units, active FROM merchant_stock WHERE npc_id = ? AND active = 1 ORDER BY item_name COLLATE NOCASE",
+                (str(npc_id).strip(),),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def list_merchant_buy_offers(self, npc_id: str) -> list[dict[str, Any]]:
+        """Lists active committed offers for items the NPC buys from the player."""
+
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT offer_id, npc_id, item_id, item_name, unit_price_base_units, max_quantity, active FROM merchant_buy_offers WHERE npc_id = ? AND active = 1 ORDER BY item_name COLLATE NOCASE",
+                (str(npc_id).strip(),),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def upsert_merchant_buy_offer(
+        self, *, npc_id: str, item_id: str, unit_price_base_units: int,
+        max_quantity: int = 0, offer_id: str = "", item_name: str = ""
+    ) -> dict[str, Any] | None:
+        """Commits a validated offer before it is shown in the Merchant tab."""
+
+        clean_npc, clean_item = str(npc_id).strip(), str(item_id).strip()
+        with self._connect() as connection:
+            npc = connection.execute("SELECT 1 FROM npcs WHERE npc_id = ?", (clean_npc,)).fetchone()
+            item = connection.execute("SELECT name FROM item_catalog WHERE id = ?", (clean_item,)).fetchone()
+            if npc is None or item is None:
+                return None
+            clean_offer = str(offer_id).strip() or f"offer_{uuid.uuid4().hex}"
+            timestamp = datetime.now().isoformat(timespec="seconds")
+            connection.execute(
+                """
+                INSERT INTO merchant_buy_offers
+                    (offer_id, npc_id, item_id, item_name, unit_price_base_units, max_quantity, active, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)
+                ON CONFLICT(offer_id) DO UPDATE SET
+                    npc_id=excluded.npc_id, item_id=excluded.item_id, item_name=excluded.item_name,
+                    unit_price_base_units=excluded.unit_price_base_units, max_quantity=excluded.max_quantity,
+                    active=1, updated_at=excluded.updated_at
+                """,
+                (clean_offer, clean_npc, clean_item, str(item_name).strip() or str(item["name"]),
+                 max(0, int(unit_price_base_units)), max(0, int(max_quantity)), timestamp, timestamp),
+            )
+            row = connection.execute("SELECT * FROM merchant_buy_offers WHERE offer_id = ?", (clean_offer,)).fetchone()
+        return dict(row) if row is not None else None
+
+    def execute_merchant_transaction(
+        self, *, transaction_id: str, npc_id: str, direction: str,
+        reference_id: str, quantity: int
+    ) -> dict[str, Any]:
+        """Atomically applies one player buy or sell transaction."""
+
+        direction = str(direction).strip().casefold()
+        if direction not in {"buy", "sell"} or quantity <= 0:
+            raise ValueError("Invalid merchant transaction.")
+        with self._connect() as connection:
+            existing = connection.execute("SELECT * FROM merchant_transactions WHERE transaction_id = ?", (transaction_id,)).fetchone()
+            if existing is not None:
+                return dict(existing)
+            table = "merchant_stock" if direction == "buy" else "merchant_buy_offers"
+            id_column = "stock_id" if direction == "buy" else "offer_id"
+            row = connection.execute(f"SELECT * FROM {table} WHERE {id_column} = ? AND npc_id = ? AND active = 1", (reference_id, npc_id)).fetchone()
+            if row is None:
+                raise ValueError("That merchant offer is no longer available.")
+            if direction == "buy":
+                if int(row["quantity"]) < quantity:
+                    raise ValueError("The merchant does not have enough stock.")
+                item = connection.execute("SELECT * FROM item_catalog WHERE id = ?", (row["item_id"],)).fetchone()
+                if item is None:
+                    raise ValueError("The catalog item no longer exists.")
+                total = int(row["unit_price_base_units"]) * quantity
+                balance = int(self._state_value_from_connection(connection, "currency.balance", "0") or 0)
+                if balance < total:
+                    raise ValueError("You do not have enough currency.")
+                metadata = _decode_json_dict(item["metadata_json"], "merchant item metadata")
+                metadata["item_uuid"] = str(uuid.uuid4())
+                connection.execute("UPDATE merchant_stock SET quantity = quantity - ?, updated_at = ? WHERE stock_id = ?", (quantity, datetime.now().isoformat(timespec="seconds"), reference_id))
+                connection.execute("INSERT INTO game_state (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", ("currency.balance", str(balance - total)))
+                connection.execute("INSERT INTO inventory_items (name, category, quantity, storage_location, description, value_base_units, metadata_json) VALUES (?, ?, ?, 'actively_carried', ?, ?, ?)", (item["name"], item["category"], quantity, item["description"], item["value_base_units"], _encode_json_dict(metadata)))
+                item_name = str(item["name"])
+            else:
+                inventory = connection.execute("SELECT * FROM inventory_items WHERE name = ? COLLATE NOCASE ORDER BY id LIMIT 1", (row["item_name"],)).fetchone()
+                if inventory is None or int(inventory["quantity"]) < quantity:
+                    raise ValueError("You do not have enough of that item.")
+                total = int(row["unit_price_base_units"]) * quantity
+                balance = int(self._state_value_from_connection(connection, "currency.balance", "0") or 0)
+                new_quantity = int(inventory["quantity"]) - quantity
+                if new_quantity:
+                    connection.execute("UPDATE inventory_items SET quantity = ? WHERE id = ?", (new_quantity, inventory["id"]))
+                else:
+                    connection.execute("DELETE FROM inventory_items WHERE id = ?", (inventory["id"],))
+                connection.execute("INSERT INTO game_state (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", ("currency.balance", str(balance + total)))
+                item_name = str(inventory["name"])
+            timestamp = datetime.now().isoformat(timespec="seconds")
+            connection.execute("INSERT INTO merchant_transactions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (transaction_id, npc_id, direction, reference_id, str(row["item_id"]), item_name, quantity, int(row["unit_price_base_units"]), total, timestamp))
+            result = connection.execute("SELECT * FROM merchant_transactions WHERE transaction_id = ?", (transaction_id,)).fetchone()
+        self.append_history("merchant", f"Merchant {direction}: {quantity} x {item_name} for {total} base currency units.")
+        return dict(result)
+
+    @staticmethod
+    def _state_value_from_connection(connection: sqlite3.Connection, key: str, default: str = "") -> str:
+        row = connection.execute("SELECT value FROM game_state WHERE key = ?", (key,)).fetchone()
+        return str(row["value"]) if row is not None else default
+
     def get_npc_by_name(self, name: str) -> dict[str, Any] | None:
         """
         Reads one NPC by exact internal or display name.
@@ -5247,6 +5435,58 @@ class SaveRepository:
                     disposition TEXT NOT NULL DEFAULT '',
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS merchant_profiles (
+                    npc_id TEXT PRIMARY KEY,
+                    can_sell INTEGER NOT NULL DEFAULT 0,
+                    can_buy INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY (npc_id) REFERENCES npcs(npc_id) ON DELETE CASCADE
+                );
+
+                CREATE TABLE IF NOT EXISTS merchant_stock (
+                    stock_id TEXT PRIMARY KEY,
+                    npc_id TEXT NOT NULL,
+                    item_id TEXT NOT NULL,
+                    item_name TEXT NOT NULL,
+                    quantity INTEGER NOT NULL DEFAULT 0,
+                    unit_price_base_units INTEGER NOT NULL DEFAULT 0,
+                    active INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY (npc_id) REFERENCES npcs(npc_id) ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_merchant_stock_npc
+                ON merchant_stock(npc_id, active, item_name COLLATE NOCASE);
+
+                CREATE TABLE IF NOT EXISTS merchant_buy_offers (
+                    offer_id TEXT PRIMARY KEY,
+                    npc_id TEXT NOT NULL,
+                    item_id TEXT NOT NULL,
+                    item_name TEXT NOT NULL,
+                    unit_price_base_units INTEGER NOT NULL DEFAULT 0,
+                    max_quantity INTEGER NOT NULL DEFAULT 0,
+                    active INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY (npc_id) REFERENCES npcs(npc_id) ON DELETE CASCADE
+                );
+
+                CREATE TABLE IF NOT EXISTS merchant_transactions (
+                    transaction_id TEXT PRIMARY KEY,
+                    npc_id TEXT NOT NULL,
+                    direction TEXT NOT NULL,
+                    reference_id TEXT NOT NULL,
+                    item_id TEXT NOT NULL,
+                    item_name TEXT NOT NULL,
+                    quantity INTEGER NOT NULL,
+                    unit_price_base_units INTEGER NOT NULL,
+                    total_base_units INTEGER NOT NULL,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY (npc_id) REFERENCES npcs(npc_id) ON DELETE CASCADE
                 );
 
                 CREATE TABLE IF NOT EXISTS party_members (

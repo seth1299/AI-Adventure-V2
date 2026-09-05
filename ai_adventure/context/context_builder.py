@@ -247,6 +247,9 @@ class AiContextBuilder:
         current_background_ambience: str | None = None,
         resolved_skill_checks: list[dict[str, Any]] | None = None,
         planner_context_tags: list[str] | None = None,
+        merchant: dict[str, Any] | None = None,
+        out_of_game_correction: bool = False,
+        mechanical_events: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         """
         Builds the context packet for one story turn.
@@ -264,6 +267,10 @@ class AiContextBuilder:
             current_music: Currently selected background music filename.
             valid_sound_effect_tracks: Playable one-shot sound-effect filenames.
             resolved_skill_checks: Skill checks already resolved for this command.
+            merchant: Authoritative active-merchant profile and offers.
+            out_of_game_correction: Whether this out-of-game request may propose
+                narrowly scoped inventory corrections.
+            mechanical_events: Recent saved event-application results for audits.
             planner_context_tags: Validated tags selected by the pre-narration
                 planner. ``None`` falls back to keyword inference.
 
@@ -447,6 +454,7 @@ class AiContextBuilder:
             "packet_type": "story_turn",
             "player_command": clean_command,
             "conversation_mode": clean_conversation_mode,
+            "out_of_game_correction": bool(out_of_game_correction),
             "selection": {
                 "tags": sorted(selected_tags),
                 "max_history_entries": self.max_history_entries,
@@ -1072,6 +1080,16 @@ class AiContextBuilder:
                     },
                     "relevant": clean_relevant_npcs,
                 },
+                "merchant": merchant or {"active_npc_id": "", "profile": None, "stock": [], "buy_offers": []},
+                "event_audit": {
+                    "recent_mechanical_events": [
+                        dict(event) for event in (mechanical_events or [])[-40:]
+                    ],
+                    "rules": (
+                        "This is an audit trail, not a source of new facts. Compare it "
+                        "with current saved inventory before suggesting a correction."
+                    ),
+                },
                 "party": {
                     "members": clean_party_members,
                     "rules": (
@@ -1216,7 +1234,13 @@ class AiContextBuilder:
                     "or request directly, return out_of_game=true, suggested_actions=[], "
                     "and events=[]; do not advance time, turns, status, combat, skills, "
                     "inventory, tasks, NPC memory, secrets, miscellaneous canon, "
-                    "music, or any durable state. "
+                    "music, or any durable state unless out_of_game_correction is true. "
+                    "When out_of_game_correction is true, you may suggest only a narrowly "
+                    "supported InventoryItemAddedEvent correction after auditing the "
+                    "recent history, mechanical event log, and current inventory. "
+                    "Do not add an item merely because the player expected it; add it only "
+                    "when the saved log and narration establish that it was awarded and "
+                    "the current inventory is missing it. "
                     "For live_game, return out_of_game=false and resolve the message as "
                     "an in-world action. Never infer or override the mode from wording."
                 ),
@@ -1432,6 +1456,14 @@ class AiContextBuilder:
                     "Currency stored inside a container is not spendable money and "
                     "must not use CurrencyChangedEvent; Python adds it only when an "
                     "open container receives ContainerContentsTakenEvent."
+                ),
+                "merchant_transactions": (
+                    "state.merchant is authoritative for the active merchant's stock and "
+                    "committed offers. Never invent a price, availability, quantity, or "
+                    "completed purchase/sale in prose. The Merchant tab and Python-owned "
+                    "transaction service perform all actual inventory and currency changes. "
+                    "Gemini may narrate a greeting, explain a sold-out item, or propose a "
+                    "new offer, but any offer must be committed before the player can use it."
                 ),
                 (
                     "combat_handoff" if strict_combat else "narrative_combat"

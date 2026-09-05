@@ -31,6 +31,7 @@ class InventoryLocationPanel(QGroupBox):
         self._items = [dict(item) for item in items]
         self._on_item_clicked = on_item_clicked
         self._on_sort_changed = on_sort_changed
+        self._secondary_sort_field_preference = str(secondary_sort_field or "")
         self.item_buttons: list[QPushButton] = []
         self.group_separators: list[QFrame] = []
         layout = QVBoxLayout()
@@ -99,6 +100,10 @@ class InventoryLocationPanel(QGroupBox):
     def _sorting_changed(self, _index: int) -> None:
         """Applies this location's independent sort selection immediately."""
 
+        if self.sender() is self.secondary_sort_field_combo:
+            self._secondary_sort_field_preference = str(
+                self.secondary_sort_field_combo.currentData() or ""
+            )
         sort_field = str(self.sort_field_combo.currentData() or "name")
         sort_descending = bool(self.sort_direction_combo.currentData())
         secondary_sort_field = str(
@@ -118,7 +123,21 @@ class InventoryLocationPanel(QGroupBox):
         self._render_items()
 
     def _sync_secondary_sort_controls(self) -> None:
-        """Enables secondary direction only when a secondary field is selected."""
+        """Keeps secondary choices distinct from the primary sort field."""
+
+        primary_sort_field = str(self.sort_field_combo.currentData() or "name")
+        current_secondary = self._secondary_sort_field_preference
+        if current_secondary == primary_sort_field:
+            current_secondary = ""
+
+        self.secondary_sort_field_combo.blockSignals(True)
+        self.secondary_sort_field_combo.clear()
+        self.secondary_sort_field_combo.addItem("None", "")
+        for label, value in self.SORT_OPTIONS:
+            if value != primary_sort_field:
+                self.secondary_sort_field_combo.addItem(label, value)
+        _set_combo_to_data(self.secondary_sort_field_combo, current_secondary)
+        self.secondary_sort_field_combo.blockSignals(False)
 
         has_secondary_sort = bool(self.secondary_sort_field_combo.currentData())
         self.secondary_sort_direction_combo.setEnabled(has_secondary_sort)
