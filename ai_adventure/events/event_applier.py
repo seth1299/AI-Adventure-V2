@@ -259,6 +259,9 @@ class EventApplier:
             if event_type == "ReagentDiscoveredEvent":
                 return self._apply_reagent_discovered(event_type, payload)
 
+            if event_type == "CraftingProcessRequestedEvent":
+                return self._apply_crafting_process_requested(event_type, payload)
+
             if event_type == "CurrencyChangedEvent":
                 return self._apply_currency_changed(event_type, payload)
 
@@ -1417,6 +1420,12 @@ class EventApplier:
             name=name,
             ingredients=ingredients,
             result=_first_text(payload, "result", "description"),
+            result_item_uuid=_first_text(payload, "result_item_uuid"),
+            result_item_name=_first_text(payload, "result_item_name", "result"),
+            skill_name=_first_text(payload, "skill_name") or "Crafting",
+            stages=payload.get("stages", []),
+            required_tool_item_uuids=_as_string_list(payload.get("required_tool_item_uuids", [])),
+            required_tool_item_names=_as_string_list(payload.get("required_tool_item_names", [])),
             notes=_first_text(payload, "notes"),
             value_base_units=max(
                 0,
@@ -1429,6 +1438,26 @@ class EventApplier:
             "applied",
             f"Discovered recipe: {name}.",
             payload,
+        )
+
+    def _apply_crafting_process_requested(
+        self,
+        event_type: str,
+        payload: dict[str, Any],
+    ) -> AppliedEventResult:
+        """Advances a recipe through the deterministic crafting service."""
+
+        recipe_id = _first_text(payload, "recipe_id")
+        if not recipe_id:
+            return _invalid(event_type, payload, "Recipe database id is required.")
+        quantity = max(1, _first_int(payload, 1, "quantity", "amount"))
+        result = self.repository.craft_recipe(recipe_id, quantity=quantity)
+        status = str(result.get("status", "rejected"))
+        return AppliedEventResult(
+            event_type,
+            "applied" if status in {"active", "passive", "ready", "completed"} else "skipped",
+            str(result.get("message", "Crafting request was rejected.")),
+            {**payload, "crafting_status": status},
         )
 
     def _apply_reagent_discovered(

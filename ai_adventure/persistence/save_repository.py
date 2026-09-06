@@ -18,6 +18,12 @@ from ai_adventure.alchemy.ingredients import (
     normalize_crafting_item_notes,
     normalize_recipe_ingredients,
 )
+from ai_adventure.crafting import (
+    DEFAULT_CRAFTING_SKILL,
+    evaluate_recipe_craftability,
+    normalize_recipe_plan,
+    recipe_estimated_time,
+)
 from ai_adventure.ai.modes import (
     default_ai_mode_settings,
     normalize_ai_mode_preferences,
@@ -730,10 +736,23 @@ class SaveRepository:
         )
         clean_metadata["quantity_unit"] = _inventory_quantity_unit(raw_metadata)
         clean_metadata["storage_location"] = _inventory_storage_location(raw_metadata)
-        clean_metadata["item_uuid"] = str(raw_metadata.get("item_uuid", "")).strip() or str(uuid.uuid4())
-        metadata_json = _encode_json_dict(clean_metadata)
 
         with self._connect() as connection:
+            item_uuid = str(raw_metadata.get("item_uuid", "")).strip()
+            if not item_uuid:
+                catalog_row = connection.execute(
+                    "SELECT metadata_json FROM item_catalog WHERE name = ? COLLATE NOCASE "
+                    "ORDER BY id ASC LIMIT 1",
+                    (clean_name,),
+                ).fetchone()
+                if catalog_row is not None:
+                    item_uuid = str(
+                        _decode_json_dict(
+                            catalog_row["metadata_json"], "item catalog metadata"
+                        ).get("item_uuid", "")
+                    ).strip()
+            clean_metadata["item_uuid"] = item_uuid or str(uuid.uuid4())
+            metadata_json = _encode_json_dict(clean_metadata)
             rows = connection.execute(
                 """
                 SELECT id, category, quantity, storage_location, description, value_base_units, metadata_json
@@ -1298,6 +1317,17 @@ class SaveRepository:
                 ORDER BY name COLLATE NOCASE
                 """
             ).fetchall()
+            catalog_rows = connection.execute(
+                "SELECT name, metadata_json FROM item_catalog"
+            ).fetchall()
+            catalog_uuids = {
+                str(row["name"]).casefold(): str(
+                    _decode_json_dict(row["metadata_json"], "item catalog metadata").get(
+                        "item_uuid", ""
+                    )
+                ).strip()
+                for row in catalog_rows
+            }
 
         reagents: list[dict[str, Any]] = []
 
@@ -1315,6 +1345,10 @@ class SaveRepository:
                         row["notes"], row["rarity"]
                     ),
                     "value_base_units": max(0, int(row["value_base_units"] or 0)),
+                    "item_uuid": catalog_uuids.get(str(row["name"]).casefold(), ""),
+                    "metadata": {
+                        "item_uuid": catalog_uuids.get(str(row["name"]).casefold(), "")
+                    },
                     "discovered_at": row["discovered_at"],
                 }
             )
@@ -1329,6 +1363,12 @@ class SaveRepository:
         result: str,
         notes: str = "",
         value_base_units: int = 0,
+        result_item_uuid: str = "",
+        result_item_name: str = "",
+        skill_name: str = DEFAULT_CRAFTING_SKILL,
+        stages: list[dict[str, Any]] | None = None,
+        required_tool_item_uuids: list[str] | None = None,
+        required_tool_item_names: list[str] | None = None,
     ) -> None:
         """
         Adds or updates a discovered crafting recipe.
@@ -1367,6 +1407,123 @@ class SaveRepository:
                 )
                 if item_uuid:
                     ingredient["item_uuid"] = item_uuid
+
+            catalog_by_uuid = {
+                str(
+                    _decode_json_dict(row["metadata_json"], "item catalog metadata").get(
+                        "item_uuid", ""
+                    )
+                ).strip(): str(row["name"])
+                for row in catalog_rows
+            }
+            clean_tool_ids = list(
+                dict.fromkeys(
+                    str(item).strip()
+                    for item in (required_tool_item_uuids or [])
+                    if str(item).strip()
+                )
+            )
+            clean_tool_names = list(
+                dict.fromkeys(
+                    str(item).strip()
+                    for item in (required_tool_item_names or [])
+                    if str(item).strip()
+                )
+            )
+            for tool_name in clean_tool_names:
+                tool_uuid = catalog_uuids.get(tool_name.casefold(), "")
+                if tool_uuid and tool_uuid not in clean_tool_ids:
+                    clean_tool_ids.append(tool_uuid)
+
+            clean_result_name = result_item_name.strip() or result.strip()
+            clean_result_uuid = result_item_uuid.strip()
+            if not clean_result_uuid and clean_result_name:
+                clean_result_uuid = catalog_uuids.get(clean_result_name.casefold(), "")
+            if not clean_result_uuid and clean_result_name:
+                _upsert_item_catalog_entry(
+                    connection,
+                    name=clean_result_name,
+                    category="Consumable",
+                    description=notes.strip() or f"Made by crafting {clean_name}.",
+                    value_base_units=clean_value,
+                )
+                result_row = connection.execute(
+                    "SELECT metadata_json FROM item_catalog WHERE name = ? COLLATE NOCASE",
+                    (clean_result_name,),
+                ).fetchone()
+                if result_row is not None:
+                    clean_result_uuid = str(
+                        _decode_json_dict(
+                            result_row["metadata_json"], "item catalog metadata"
+                        ).get("item_uuid", "")
+                    ).strip()
+            elif clean_result_uuid and clean_result_uuid not in catalog_by_uuid:
+                # Preserve a model-supplied deterministic result ID even when
+                # this recipe is the first place that introduces the result.
+                _upsert_item_catalog_entry(
+                    connection,
+                    name=clean_result_name,
+                    category="Consumable",
+                    description=notes.strip() or f"Made by crafting {clean_name}.",
+                    value_base_units=clean_value,
+                    metadata={"item_uuid": clean_result_uuid},
+                )
+            plan = normalize_recipe_plan(
+                {
+                    "skill_name": skill_name,
+                    "stages": stages or [],
+                    "required_tool_item_uuids": clean_tool_ids,
+                    "required_tool_item_names": clean_tool_names,
+                    "result_item_uuid": clean_result_uuid,
+                    "result_item_name": clean_result_name,
+                }
+            )
+            all_tool_names = clean_tool_names + [
+                str(tool_name).strip()
+                for stage in plan["stages"]
+                for tool_name in stage.get("required_tool_item_names", [])
+                if str(tool_name).strip()
+            ]
+            for tool_name in dict.fromkeys(all_tool_names):
+                tool_key = tool_name.casefold()
+                if not catalog_uuids.get(tool_key):
+                    # Reserve a catalog identity even before the player owns
+                    # the tool. Later inventory additions by name will reuse
+                    # this UUID, so a recipe discovered first remains usable.
+                    _upsert_item_catalog_entry(
+                        connection,
+                        name=tool_name,
+                        category="Tool",
+                        description=f"Required tool for crafting {clean_name}.",
+                    )
+                    tool_row = connection.execute(
+                        "SELECT metadata_json FROM item_catalog WHERE name = ? COLLATE NOCASE "
+                        "ORDER BY id ASC LIMIT 1",
+                        (tool_name,),
+                    ).fetchone()
+                    if tool_row is not None:
+                        catalog_uuids[tool_key] = str(
+                            _decode_json_dict(
+                                tool_row["metadata_json"], "item catalog metadata"
+                            ).get("item_uuid", "")
+                        ).strip()
+
+            for tool_name in clean_tool_names:
+                tool_uuid = catalog_uuids.get(tool_name.casefold(), "")
+                if tool_uuid and tool_uuid not in plan["required_tool_item_uuids"]:
+                    plan["required_tool_item_uuids"].append(tool_uuid)
+            # Tool names are accepted as a model-facing convenience, but the
+            # persisted plan must use catalog UUIDs for enforcement.  Resolve
+            # stage-local names here as well as recipe-wide names so a passive
+            # stage cannot accidentally become name-only and bypass identity
+            # matching.
+            for stage in plan["stages"]:
+                stage_tool_ids = list(stage.get("required_tool_item_uuids", []))
+                for tool_name in stage.get("required_tool_item_names", []):
+                    tool_uuid = catalog_uuids.get(str(tool_name).casefold(), "")
+                    if tool_uuid and tool_uuid not in stage_tool_ids:
+                        stage_tool_ids.append(tool_uuid)
+                stage["required_tool_item_uuids"] = stage_tool_ids
             connection.execute(
                 """
                 INSERT INTO crafting_recipes (
@@ -1375,14 +1532,16 @@ class SaveRepository:
                     result,
                     notes,
                     value_base_units,
+                    recipe_data_json,
                     discovered_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(name) DO UPDATE SET
                     ingredients_json = excluded.ingredients_json,
                     result = excluded.result,
                     notes = excluded.notes,
-                    value_base_units = excluded.value_base_units
+                    value_base_units = excluded.value_base_units,
+                    recipe_data_json = excluded.recipe_data_json
                 """,
                 (
                     clean_name,
@@ -1390,6 +1549,7 @@ class SaveRepository:
                     result.strip(),
                     notes.strip(),
                     clean_value,
+                    json.dumps(plan, ensure_ascii=False, sort_keys=True),
                     discovered_at,
                 ),
             )
@@ -1414,6 +1574,7 @@ class SaveRepository:
                     result,
                     notes,
                     value_base_units,
+                    recipe_data_json,
                     discovered_at
                 FROM crafting_recipes
                 ORDER BY name COLLATE NOCASE
@@ -1433,11 +1594,310 @@ class SaveRepository:
                     "result": row["result"],
                     "notes": row["notes"],
                     "value_base_units": row["value_base_units"],
+                    **normalize_recipe_plan(
+                        _decode_json_dict(row["recipe_data_json"], "recipe details")
+                    ),
                     "discovered_at": row["discovered_at"],
                 }
             )
 
         return recipes
+
+    def craft_recipe(self, recipe_id: str, *, quantity: int = 1) -> dict[str, Any]:
+        """Advances one deterministic crafting interaction for a recipe."""
+
+        clean_recipe_id = str(recipe_id or "").strip()
+        recipe = next(
+            (
+                item
+                for item in self.list_crafting_recipes()
+                if str(item.get("id", "")) == clean_recipe_id
+            ),
+            None,
+        )
+        if recipe is None:
+            return {"status": "rejected", "message": "That recipe is no longer known."}
+
+        requested_quantity = max(1, min(999, int(quantity or 1)))
+        processes = self.get_setting("crafting.processes", [])
+        if not isinstance(processes, list):
+            processes = []
+        process = next(
+            (
+                item
+                for item in processes
+                if isinstance(item, dict)
+                and str(item.get("recipe_id", "")) == clean_recipe_id
+            ),
+            None,
+        )
+        current_minute = self.get_current_calendar_minute()
+        skills = self.list_skills()
+        plan = normalize_recipe_plan(recipe)
+
+        if process is None:
+            availability = evaluate_recipe_craftability(
+                recipe,
+                self.list_inventory_items(),
+                quantity=requested_quantity,
+            )
+            if not availability["craftable"]:
+                return {
+                    "status": "rejected",
+                    "message": _crafting_availability_message(availability),
+                    "availability": availability,
+                }
+            if not plan["result_item_uuid"]:
+                return {
+                    "status": "rejected",
+                    "message": "This recipe has no deterministic result item ID.",
+                }
+            if not self._consume_crafting_ingredients(recipe, requested_quantity):
+                return {
+                    "status": "rejected",
+                    "message": "The required ingredients changed before crafting began.",
+                }
+            process = {
+                "recipe_id": clean_recipe_id,
+                "quantity": requested_quantity,
+                "stage_index": 0,
+                "active_work_completed": 0,
+                "passive_due_minute": None,
+            }
+            processes.append(process)
+
+        stage_index = max(0, int(process.get("stage_index", 0)))
+        stages = plan["stages"]
+        if stage_index >= len(stages):
+            processes.remove(process)
+            self.set_setting("crafting.processes", processes)
+            return self._finish_crafting_process(recipe, process)
+
+        stage = stages[stage_index]
+        if not self._tools_available(recipe, stage):
+            return {
+                "status": "blocked",
+                "message": (
+                    "Crafting is paused because a required tool or piece of "
+                    "equipment is unavailable."
+                ),
+                "recipe_id": clean_recipe_id,
+            }
+
+        if stage["kind"] == "passive":
+            due_minute = process.get("passive_due_minute")
+            if due_minute is None:
+                process["passive_due_minute"] = current_minute + int(
+                    stage.get("duration_minutes", 0)
+                )
+                self.set_setting("crafting.processes", processes)
+                return {
+                    "status": "passive",
+                    "message": (
+                        "Passive stage started; check back after "
+                        f"{stage.get('duration_minutes', 0)} minutes."
+                    ),
+                    "recipe_id": clean_recipe_id,
+                }
+            if current_minute < int(due_minute):
+                remaining = int(due_minute) - current_minute
+                return {
+                    "status": "passive",
+                    "message": (
+                        "Passive stage is still underway; about "
+                        f"{remaining} minutes remain."
+                    ),
+                    "recipe_id": clean_recipe_id,
+                }
+            process["stage_index"] = stage_index + 1
+            process["passive_due_minute"] = None
+            process["active_work_completed"] = 0
+            if process["stage_index"] >= len(stages):
+                processes.remove(process)
+                self.set_setting("crafting.processes", processes)
+                return self._finish_crafting_process(recipe, process)
+            self.set_setting("crafting.processes", processes)
+            return {
+                "status": "ready",
+                "message": "The passive crafting stage is complete; continue the next stage.",
+                "recipe_id": clean_recipe_id,
+            }
+
+        estimate = recipe_estimated_time(recipe, skills)
+        skill_level = int(estimate["skill_level"])
+        work_completed = int(process.get("active_work_completed", 0)) + max(1, skill_level)
+        work_required = max(1, int(stage.get("work_amount", 1))) * int(
+            process.get("quantity", 1)
+        )
+        process["active_work_completed"] = work_completed
+        if work_completed < work_required:
+            self.set_setting("crafting.processes", processes)
+            return {
+                "status": "active",
+                "message": (
+                    "Active work progressed (the remaining work amount is hidden "
+                    f"from the player; skill level {skill_level} contributed)."
+                ),
+                "recipe_id": clean_recipe_id,
+            }
+
+        process["stage_index"] = stage_index + 1
+        process["active_work_completed"] = 0
+        if (
+            process["stage_index"] < len(stages)
+            and stages[process["stage_index"]]["kind"] == "passive"
+        ):
+            next_stage = stages[process["stage_index"]]
+            if not self._tools_available(recipe, next_stage):
+                # The completed active work is still meaningful.  Persist the
+                # advanced stage before reporting the missing passive tool so
+                # the player can obtain it and resume instead of losing work.
+                self.set_setting("crafting.processes", processes)
+                return {
+                    "status": "blocked",
+                    "message": "The next passive stage requires a tool that is not available.",
+                    "recipe_id": clean_recipe_id,
+                }
+            process["passive_due_minute"] = current_minute + int(
+                next_stage.get("duration_minutes", 0)
+            )
+            self.set_setting("crafting.processes", processes)
+            return {
+                "status": "passive",
+                "message": "Active crafting is complete; the passive stage has begun.",
+                "recipe_id": clean_recipe_id,
+            }
+        if process["stage_index"] >= len(stages):
+            processes.remove(process)
+            self.set_setting("crafting.processes", processes)
+            return self._finish_crafting_process(recipe, process)
+        self.set_setting("crafting.processes", processes)
+        return {
+            "status": "ready",
+            "message": "The active crafting stage is complete; continue the next stage.",
+            "recipe_id": clean_recipe_id,
+        }
+
+    def _consume_crafting_ingredients(
+        self, recipe: dict[str, Any], quantity: int
+    ) -> bool:
+        """Atomically consumes recipe ingredients by stable item UUID and unit."""
+
+        requirements: list[tuple[str, int, str]] = []
+        for ingredient in normalize_recipe_ingredients(recipe.get("ingredients", [])):
+            identity = str(ingredient.get("item_uuid", "")).strip()
+            if not identity:
+                return False
+            amount = max(1, int(ingredient.get("quantity", 1))) * max(
+                1, int(ingredient.get("measure_amount", 1))
+            ) * quantity
+            requirements.append(
+                (identity, amount, str(ingredient.get("measure_unit", "each")))
+            )
+
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT id, quantity, metadata_json FROM inventory_items ORDER BY id ASC"
+            ).fetchall()
+            for identity, amount, unit in requirements:
+                matching = []
+                for row in rows:
+                    metadata = _decode_json_dict(
+                        row["metadata_json"], "inventory item metadata"
+                    )
+                    if str(metadata.get("item_uuid", "")).strip() != identity:
+                        continue
+                    if str(metadata.get("quantity_unit", "each")).casefold() != unit.casefold():
+                        return False
+                    matching.append(row)
+                if sum(int(row["quantity"]) for row in matching) < amount:
+                    return False
+
+            for identity, amount, _unit in requirements:
+                remaining = amount
+                for row in rows:
+                    if remaining <= 0:
+                        break
+                    metadata = _decode_json_dict(
+                        row["metadata_json"], "inventory item metadata"
+                    )
+                    if str(metadata.get("item_uuid", "")).strip() != identity:
+                        continue
+                    available = int(row["quantity"])
+                    consumed = min(available, remaining)
+                    if available == consumed:
+                        connection.execute(
+                            "DELETE FROM inventory_items WHERE id = ?", (row["id"],)
+                        )
+                    else:
+                        connection.execute(
+                            "UPDATE inventory_items SET quantity = ? WHERE id = ?",
+                            (available - consumed, row["id"]),
+                        )
+                    remaining -= consumed
+        self.set_player_equipment(self.get_setting("player.equipment", {}))
+        self.append_history(
+            "crafting", f"Consumed ingredients for {recipe.get('name', 'recipe')}."
+        )
+        return True
+
+    def _tools_available(self, recipe: dict[str, Any], stage: dict[str, Any]) -> bool:
+        """Checks recipe and current-stage tools by stable item UUID."""
+
+        plan = normalize_recipe_plan(recipe)
+        required = list(plan["required_tool_item_uuids"])
+        required.extend(str(item) for item in stage.get("required_tool_item_uuids", []))
+        # A tool name is display/context data only. If it was not resolved to
+        # a UUID when the recipe was stored, do not allow a prose name match
+        # to make the recipe appear craftable.
+        if len(plan["required_tool_item_uuids"]) < len(
+            plan["required_tool_item_names"]
+        ) or len(stage.get("required_tool_item_uuids", [])) < len(
+            stage.get("required_tool_item_names", [])
+        ):
+            return False
+        owned = {
+            str(item.get("metadata", {}).get("item_uuid", "")).strip()
+            for item in self.list_inventory_items()
+            if isinstance(item.get("metadata"), dict)
+            and int(item.get("quantity", 0) or 0) > 0
+        }
+        return all(item_id and item_id in owned for item_id in required)
+
+    def _finish_crafting_process(
+        self, recipe: dict[str, Any], process: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Adds the deterministic result item after all stages complete."""
+
+        result_uuid = str(recipe.get("result_item_uuid", "")).strip()
+        catalog = next(
+            (
+                item
+                for item in self.list_item_catalog()
+                if str(item.get("metadata", {}).get("item_uuid", "")).strip()
+                == result_uuid
+            ),
+            None,
+        )
+        if catalog is None:
+            return {
+                "status": "rejected",
+                "message": "The recipe result item is missing from the item catalog.",
+            }
+        count = max(1, int(process.get("quantity", 1)))
+        self.add_inventory_item(
+            name=str(catalog["name"]),
+            category=str(catalog.get("category", "Consumable")),
+            quantity=count,
+            description=str(catalog.get("description", "")),
+            value_base_units=max(0, int(catalog.get("value_base_units", 0) or 0)),
+            metadata={"item_uuid": result_uuid, "quantity_unit": "each"},
+        )
+        return {
+            "status": "completed",
+            "message": f"Crafted {count} × {catalog['name']}.",
+            "recipe_id": str(recipe.get("id", "")),
+        }
 
     def get_magic_configuration(self) -> dict[str, Any]:
         """Returns the normalized casting configuration for this save."""
@@ -5304,6 +5764,7 @@ class SaveRepository:
                     result TEXT NOT NULL DEFAULT '',
                     notes TEXT NOT NULL DEFAULT '',
                     value_base_units INTEGER NOT NULL DEFAULT 0,
+                    recipe_data_json TEXT NOT NULL DEFAULT '{}',
                     discovered_at TEXT NOT NULL
                 );
 
@@ -5637,6 +6098,12 @@ class SaveRepository:
                 "crafting_recipes",
                 "value_base_units",
                 "INTEGER NOT NULL DEFAULT 0",
+            )
+            _ensure_column(
+                connection,
+                "crafting_recipes",
+                "recipe_data_json",
+                "TEXT NOT NULL DEFAULT '{}'",
             )
             _ensure_column(
                 connection,
@@ -6753,6 +7220,26 @@ def _decode_json_dict(raw_json: Any, label: str) -> dict[str, Any]:
         return {}
 
     return value
+
+
+def _crafting_availability_message(availability: dict[str, Any]) -> str:
+    """Formats deterministic crafting requirements for a player-facing error."""
+
+    missing = [
+        str(item.get("name", "required ingredient"))
+        for item in availability.get("missing_ingredients", [])
+        if isinstance(item, dict)
+    ]
+    missing.extend(
+        str(item)
+        for item in availability.get("missing_tools", [])
+        if str(item).strip()
+    )
+    if missing:
+        return "Cannot craft yet; unavailable requirements: " + ", ".join(
+            dict.fromkeys(missing)
+        ) + "."
+    return "Cannot craft this recipe yet."
 
 
 def _decode_json_list(raw_json: Any, label: str) -> list[Any]:

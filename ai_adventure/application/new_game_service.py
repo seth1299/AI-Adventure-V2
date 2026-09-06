@@ -827,6 +827,34 @@ def _apply_new_game_crafting_knowledge(
             name=name,
             ingredients=ingredients,
             result=result_text,
+            result_item_uuid=str(raw_recipe.get("result_item_uuid", "") or "").strip(),
+            result_item_name=str(
+                raw_recipe.get("result_item_name", result_text) or result_text
+            ).strip(),
+            skill_name=str(raw_recipe.get("skill_name", "Crafting") or "Crafting").strip(),
+            stages=(
+                raw_recipe.get("stages", [])
+                if isinstance(raw_recipe.get("stages", []), list)
+                else []
+            ),
+            required_tool_item_uuids=(
+                [
+                    str(value).strip()
+                    for value in raw_recipe.get("required_tool_item_uuids", [])
+                    if str(value).strip()
+                ]
+                if isinstance(raw_recipe.get("required_tool_item_uuids", []), list)
+                else []
+            ),
+            required_tool_item_names=(
+                [
+                    str(value).strip()
+                    for value in raw_recipe.get("required_tool_item_names", [])
+                    if str(value).strip()
+                ]
+                if isinstance(raw_recipe.get("required_tool_item_names", []), list)
+                else []
+            ),
             notes=str(raw_recipe.get("notes", "") or "").strip(),
             value_base_units=max(0, _safe_int(raw_recipe.get("value_base_units", 0), 0)),
         )

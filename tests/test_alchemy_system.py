@@ -262,6 +262,109 @@ class AlchemySystemTests(unittest.TestCase):
             self.assertNotIn("quantity", prism)
             self.assertEqual(prism["description"], "A triangular glass prism.")
 
+    def test_deterministic_crafting_consumes_exact_ids_and_completes_passive_stage(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = SaveRepository.create_new_save(Path(temp_dir), "Crafting Flow")
+            repository.upsert_skill("Crafting", "Practical crafting skill.", 2)
+            repository.add_inventory_item(
+                "Dried Herb",
+                "Ingredient",
+                5,
+                "A measured herb.",
+                metadata={"item_uuid": "ingredient-dried-herb", "quantity_unit": "grams"},
+            )
+            repository.add_crafting_recipe(
+                name="Herbal Tonic",
+                ingredients=[
+                    {
+                        "reagent_name": "Dried Herb",
+                        "item_uuid": "ingredient-dried-herb",
+                        "quantity": 1,
+                        "measure_amount": 2,
+                        "measure_unit": "grams",
+                    }
+                ],
+                result="A restorative tonic.",
+                result_item_uuid="result-herbal-tonic",
+                result_item_name="Herbal Tonic",
+                stages=[
+                    {"kind": "active", "work_amount": 3},
+                    {
+                        "kind": "passive",
+                        "duration_minutes": 10,
+                        "required_tool_item_names": ["Drying Rack"],
+                    },
+                ],
+            )
+            recipe = repository.list_crafting_recipes()[0]
+
+            drying_rack = next(
+                item for item in repository.list_item_catalog() if item["name"] == "Drying Rack"
+            )
+            repository.add_inventory_item(
+                "Drying Rack",
+                "Tool",
+                1,
+                "A rack for passive drying.",
+            )
+            self.assertEqual(
+                recipe["stages"][1]["required_tool_item_uuids"],
+                [drying_rack["metadata"]["item_uuid"]],
+            )
+            self.assertEqual(recipe["result_item_uuid"], "result-herbal-tonic")
+            repository.set_current_calendar_minute(100)
+
+            self.assertEqual(repository.craft_recipe(str(recipe["id"]))["status"], "active")
+            self.assertEqual(repository.craft_recipe(str(recipe["id"]))["status"], "passive")
+            self.assertEqual(
+                next(
+                    item
+                    for item in repository.list_inventory_items()
+                    if item["name"] == "Dried Herb"
+                )["quantity"],
+                3,
+            )
+
+            repository.set_current_calendar_minute(110)
+            result = repository.craft_recipe(str(recipe["id"]))
+            self.assertEqual(result["status"], "completed")
+            tonic = next(
+                item for item in repository.list_inventory_items() if item["name"] == "Herbal Tonic"
+            )
+            self.assertEqual(tonic["metadata"]["item_uuid"], "result-herbal-tonic")
+
+    def test_deterministic_crafting_rejects_missing_tool_before_consuming_ingredients(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = SaveRepository.create_new_save(Path(temp_dir), "Crafting Tool Test")
+            repository.add_inventory_item(
+                "Dried Herb",
+                "Ingredient",
+                2,
+                "A measured herb.",
+                metadata={"item_uuid": "ingredient-dried-herb", "quantity_unit": "grams"},
+            )
+            repository.add_crafting_recipe(
+                name="Rack Tonic",
+                ingredients=[
+                    {
+                        "reagent_name": "Dried Herb",
+                        "item_uuid": "ingredient-dried-herb",
+                        "quantity": 1,
+                        "measure_amount": 2,
+                        "measure_unit": "grams",
+                    }
+                ],
+                result="A tonic.",
+                result_item_uuid="result-rack-tonic",
+                required_tool_item_uuids=["tool-missing"],
+            )
+            recipe = repository.list_crafting_recipes()[0]
+
+            result = repository.craft_recipe(str(recipe["id"]))
+
+            self.assertEqual(result["status"], "rejected")
+            self.assertEqual(repository.list_inventory_items()[0]["quantity"], 2)
+
 
 if __name__ == "__main__":
     unittest.main()

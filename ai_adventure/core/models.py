@@ -199,6 +199,7 @@ class ReagentKnowledge:
     rarity: str = "Common"
     notes: str = ""
     value_base_units: int = 0
+    item_uuid: str = ""
     discovered_at: str = ""
 
     def to_dict(self) -> dict[str, Any]:
@@ -233,6 +234,12 @@ class RecipeKnowledge:
     result: str = ""
     notes: str = ""
     value_base_units: int = 0
+    skill_name: str = "Crafting"
+    stages: list[dict[str, Any]] = field(default_factory=list)
+    required_tool_item_uuids: list[str] = field(default_factory=list)
+    required_tool_item_names: list[str] = field(default_factory=list)
+    result_item_uuid: str = ""
+    result_item_name: str = ""
     discovered_at: str = ""
 
     def to_dict(self) -> dict[str, Any]:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from ai_adventure.ui.common import *  # noqa: F401,F403
 from ai_adventure.ui.dialogues import *  # noqa: F401,F403
+from ai_adventure.crafting import evaluate_recipe_craftability, recipe_estimated_time
 
 
 class AlchemyNotebookScreen(RepositoryBackedWidget):
@@ -127,9 +128,9 @@ class AlchemyNotebookScreen(RepositoryBackedWidget):
     def _setup_recipes_tab(self) -> None:
         """Builds the structured recipe discovery tab."""
 
-        self.recipe_table = _AppTableWidget(0, 4)
+        self.recipe_table = _AppTableWidget(0, 5)
         self.recipe_table.setHorizontalHeaderLabels(
-            ["Name", "Ingredients", "Estimated Value", "Notes"]
+            ["Name", "Ingredients", "Estimated Value", "Notes", "Estimated Time"]
         )
         self.recipe_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         _enable_table_sorting(self.recipe_table, self._sort_recipes_by_column)
@@ -137,7 +138,7 @@ class AlchemyNotebookScreen(RepositoryBackedWidget):
             self._recipe_sort_column,
             self._recipe_sort_order,
         )
-        _configure_wrapping_table(self.recipe_table, {1, 3})
+        _configure_wrapping_table(self.recipe_table, {1, 3, 4})
         self.recipe_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.recipe_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
         _allow_selected_row_deselection(self.recipe_table)
@@ -148,6 +149,9 @@ class AlchemyNotebookScreen(RepositoryBackedWidget):
         )
         self.recipe_craftability_label.setWordWrap(True)
         self.recipe_craftability_label.setObjectName("recipeCraftabilityLabel")
+        self.recipe_craft_button = QPushButton("Craft / Continue Selected Recipe")
+        self.recipe_craft_button.setEnabled(False)
+        self.recipe_craft_button.clicked.connect(self._craft_selected_recipe)
 
         self.recipe_name_input = QLineEdit()
         self.recipe_name_input.setPlaceholderText("Recipe name")
@@ -254,6 +258,7 @@ class AlchemyNotebookScreen(RepositoryBackedWidget):
         layout = QVBoxLayout()
         layout.addWidget(form_widget)
         layout.addWidget(self.recipe_craftability_label)
+        layout.addWidget(self.recipe_craft_button)
         layout.addWidget(self.recipe_table)
 
         wrapper = QWidget()
@@ -348,6 +353,18 @@ class AlchemyNotebookScreen(RepositoryBackedWidget):
                 ),
             )
             self.recipe_table.setItem(row_index, 3, _table_item(str(recipe.get("notes", ""))))
+            estimate = recipe_estimated_time(recipe, repository.list_skills())
+            self.recipe_table.setItem(
+                row_index,
+                4,
+                _table_item(
+                    _format_crafting_time(
+                        int(estimate["active_minutes"]),
+                        int(estimate["passive_minutes"]),
+                    ),
+                    int(estimate["active_minutes"]) + int(estimate["passive_minutes"]),
+                ),
+            )
 
         _resize_wrapping_table_rows(self.recipe_table)
         self._update_recipe_craftability()
@@ -361,58 +378,54 @@ class AlchemyNotebookScreen(RepositoryBackedWidget):
             self.recipe_craftability_label.setText(
                 "Select a recipe to see what you can craft."
             )
+            self.recipe_craft_button.setEnabled(False)
             return
 
         recipe = self._recipe_rows[row_index]
-        inventory: dict[str, tuple[int, str]] = {}
-        for item in repository.list_inventory_items():
-            name = str(item.get("name", "")).strip().casefold()
-            metadata = item.get("metadata", {}) if isinstance(item.get("metadata"), dict) else {}
-            key = str(metadata.get("item_uuid", "")).strip() or name
-            unit = str(item.get("quantity_unit", "each") or "each").strip()
-            previous_quantity, _previous_unit = inventory.get(key, (0, unit))
-            inventory[key] = (
-                previous_quantity + max(0, _safe_int(item.get("quantity", 0), 0)),
-                unit,
-            )
-
-        details: list[str] = []
-        craftable = None
-        limiting: list[str] = []
-        for ingredient in normalize_recipe_ingredients(recipe.get("ingredients", [])):
-            name = str(ingredient.get("reagent_name", "")).strip()
-            key = str(ingredient.get("item_uuid", "")).strip() or name.casefold()
-            recipe_unit = str(ingredient.get("measure_unit", "each") or "each")
-            required = max(1, _safe_int(ingredient.get("quantity", 1), 1)) * max(
-                1, _safe_int(ingredient.get("measure_amount", 1), 1)
-            )
-            owned, inventory_unit = inventory.get(key, (0, recipe_unit))
-            if inventory_unit.casefold() != recipe_unit.casefold():
-                craftable = 0
-                limiting.append(name)
-                details.append(
-                    f"{name}: {owned} {inventory_unit} owned / "
-                    f"{required} {recipe_unit} required (unit mismatch)"
-                )
-                continue
-            possible = owned // required
-            craftable = possible if craftable is None else min(craftable, possible)
-            if possible == craftable:
-                limiting.append(name)
-            details.append(
-                f"{name}: {owned} {inventory_unit} owned / "
-                f"{required} {recipe_unit} per item"
-            )
-
-        if craftable is None:
-            self.recipe_craftability_label.setText("This recipe has no ingredients.")
-            return
-        limit_text = ", ".join(limiting) if limiting else "none"
-        self.recipe_craftability_label.setText(
-            f"Can currently craft: {craftable} × {recipe.get('name', 'item')}\n"
-            f"Ingredients:\n  • " + "\n  • ".join(details) + "\n"
-            f"Limiting reagent: {limit_text}"
+        availability = evaluate_recipe_craftability(
+            recipe, repository.list_inventory_items()
         )
+        estimate = recipe_estimated_time(recipe, repository.list_skills())
+        processes = repository.get_setting("crafting.processes", [])
+        active_process = next(
+            (
+                item
+                for item in processes
+                if isinstance(item, dict)
+                and str(item.get("recipe_id", "")) == str(recipe.get("id", ""))
+            ),
+            None,
+        ) if isinstance(processes, list) else None
+        missing = [
+            str(item.get("name", "required ingredient"))
+            for item in availability["missing_ingredients"]
+        ] + [str(item) for item in availability["missing_tools"]]
+        status = (
+            "A process is already underway; continue it below."
+            if active_process
+            else "Ready to begin." if availability["craftable"]
+            else "Unavailable until the missing requirements are obtained."
+        )
+        missing_text = f"\nMissing: {', '.join(dict.fromkeys(missing))}." if missing else ""
+        self.recipe_craftability_label.setText(
+            f"{recipe.get('name', 'item')} — {status}\n"
+            f"Estimated time: {_format_crafting_time(int(estimate['active_minutes']), int(estimate['passive_minutes']))}"
+            f"{missing_text}"
+        )
+        self.recipe_craft_button.setEnabled(bool(active_process or availability["craftable"]))
+
+    def _craft_selected_recipe(self) -> None:
+        """Advances the selected recipe through the deterministic crafting service."""
+
+        repository = self.repository()
+        row_index = self.recipe_table.currentRow()
+        if repository is None or row_index < 0 or row_index >= len(self._recipe_rows):
+            return
+        recipe = self._recipe_rows[row_index]
+        result = repository.craft_recipe(str(recipe.get("id", "")))
+        self.recipe_craftability_label.setText(str(result.get("message", "Crafting updated.")))
+        self.refresh()
+        self.notify_repository_changed()
 
     def _save_reagent(self) -> None:
         """Adds or updates a known crafting item/material."""
@@ -779,4 +792,20 @@ class AlchemyNotebookScreen(RepositoryBackedWidget):
         if self._recipe_sort_column == 3:
             return str(recipe.get("notes", "")).casefold(), name
 
+        if self._recipe_sort_column == 4:
+            estimate = recipe_estimated_time(recipe, [])
+            total_minutes = int(estimate["active_minutes"]) + int(
+                estimate["passive_minutes"]
+            )
+            return str(total_minutes).zfill(12), name
+
         return name, name
+
+
+def _format_crafting_time(active_minutes: int, passive_minutes: int) -> str:
+    """Formats separate active and passive recipe estimates for the table."""
+
+    active = f"Active: {max(0, active_minutes)} min"
+    if passive_minutes <= 0:
+        return active
+    return f"{active}\nPassive: {passive_minutes} min"

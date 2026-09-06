@@ -245,6 +245,11 @@ class StateManager:
                     rarity=_read_string(row, "rarity", "Common"),
                     notes=_read_string(row, "notes", ""),
                     value_base_units=_read_int(row, "value_base_units", 0),
+                    item_uuid=_read_string(
+                        row.get("metadata", {}) if isinstance(row.get("metadata"), dict) else {},
+                        "item_uuid",
+                        "",
+                    ),
                     discovered_at=_read_string(row, "discovered_at", ""),
                 )
             )
@@ -267,6 +272,19 @@ class StateManager:
                     result=_read_string(row, "result", ""),
                     notes=_read_string(row, "notes", ""),
                     value_base_units=_read_int(row, "value_base_units", 0),
+                    skill_name=_read_string(row, "skill_name", "Crafting"),
+                    stages=[
+                        dict(stage)
+                        for stage in _read_dict_list(row, "stages")
+                    ],
+                    required_tool_item_uuids=_read_string_list(
+                        row, "required_tool_item_uuids"
+                    ),
+                    required_tool_item_names=_read_string_list(
+                        row, "required_tool_item_names"
+                    ),
+                    result_item_uuid=_read_string(row, "result_item_uuid", ""),
+                    result_item_name=_read_string(row, "result_item_name", ""),
                     discovered_at=_read_string(row, "discovered_at", ""),
                 )
             )

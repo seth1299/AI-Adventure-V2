@@ -846,6 +846,13 @@ def build_new_game_setup_packet(
                 "self-contained notes stating its intended purpose/effect, expected "
                 "strength or outcome, onset, duration, and important use conditions; "
                 "say unknown or not applicable when a detail is not established. "
+                "Each recipe must also include a result_item_name, skill_name, and "
+                "one or more deterministic stages. An active stage uses a hidden "
+                "positive work_amount and optional estimated_minutes; a passive "
+                "stage uses duration_minutes. Include required_tool_item_uuids and "
+                "required_tool_item_names arrays for recipe-wide or stage-specific "
+                "tools. Use exact item UUIDs copied from known catalog entries; "
+                "Python is authoritative for generating missing result IDs. "
                 "value_base_units as a reasonable estimated result value in the "
                 "world's baseline currency unit."
             ),

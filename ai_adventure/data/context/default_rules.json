@@ -760,11 +760,12 @@
       "priority": 60,
       "content": {
         "rules": [
-          "If the player crafts a known recipe and has the required ingredients, suggest InventoryItemRemovedEvent for consumed ingredients and InventoryItemAddedEvent for the crafted item.",
-          "If the player lacks ingredients, narrate the failed attempt and list the missing items. Do not suggest InventoryItemAddedEvent.",
+          "Crafting is deterministic and application-managed. For a known recipe, suggest CraftingProcessRequestedEvent with the exact recipe_id from state.alchemy.crafting_status only when craftable_now is true. Never invent a recipe id, item id, tool, ingredient, work amount, or completion result.",
+          "Python validates required tools and ingredients by stable item UUID, consumes inputs once when the process begins, advances hidden active work using the relevant Player Skill level, tracks passive stages against the in-game calendar, and adds the catalogued result only after every stage completes.",
+          "If the player lacks ingredients or tools, narrate the failed attempt and list the missing items. Do not suggest CraftingProcessRequestedEvent or any replacement inventory events.",
           "If the player experiments without a recipe, judge the attempt logically.",
-          "If an experiment succeeds, suggest the relevant SkillUpsertedEvent if needed, then RecipeDiscoveredEvent, then InventoryItemAddedEvent for the product.",
-          "If a blueprint, pattern, scroll, mold, or other design object is consumed during crafting, suggest InventoryItemRemovedEvent for that object."
+          "If an experiment succeeds, suggest the relevant SkillUpsertedEvent if needed, then RecipeDiscoveredEvent with deterministic stages and item UUID references. Do not also resolve the craft in prose or with manual inventory add/remove events.",
+          "If a blueprint, pattern, scroll, mold, or other design object is a recipe ingredient, include it as a deterministic ingredient item UUID."
         ]
       }
     },

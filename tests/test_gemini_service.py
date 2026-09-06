@@ -40,6 +40,7 @@ from ai_adventure.ai.gemini_service import (
     parse_gemini_story_response,
     _drop_unwarranted_skill_check_events,
     _enforce_explicit_conversation_mode,
+    _filter_unsupported_crafting_suggestions,
     _filter_unwarranted_planned_skill_checks,
     _generate_new_game_response_with_quality_retry,
     _prefer_clearly_relevant_known_skill,
@@ -454,6 +455,44 @@ class GeminiServiceTests(unittest.TestCase):
         self.assertTrue(result.out_of_game)
         self.assertEqual(result.suggested_actions, [])
         self.assertEqual(result.suggested_events, [])
+
+    def test_unavailable_crafting_suggestions_are_removed_by_recipe_name(self) -> None:
+        result = _filter_unsupported_crafting_suggestions(
+            AiNarrationResult(
+                narrative_text="The workbench is ready. What do you do now?",
+                suggested_actions=[
+                    "Brew Herbal Tonic.",
+                    "Brew Clear Tea.",
+                    "Inspect the workbench.",
+                ],
+                suggested_events=[],
+                out_of_game=False,
+            ),
+            {
+                "state": {
+                    "alchemy": {
+                        "crafting_status": [
+                            {
+                                "recipe_name": "Herbal Tonic",
+                                "result_item_name": "Herbal Tonic",
+                                "craftable_now": False,
+                            },
+                            {
+                                "recipe_name": "Clear Tea",
+                                "result_item_name": "Clear Tea",
+                                "craftable_now": True,
+                            },
+                        ]
+                    }
+                }
+            },
+        )
+
+        self.assertEqual(
+            result.suggested_actions,
+            ["Brew Clear Tea.", "Inspect the workbench."],
+        )
+        self.assertNotIn("Brew Herbal Tonic.", result.narrative_text)
 
     def test_story_parser_uses_explicit_mode_instead_of_model_flag(self) -> None:
         result = parse_gemini_story_response(

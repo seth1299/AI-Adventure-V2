@@ -1940,7 +1940,7 @@ class InventoryUiTests(unittest.TestCase):
 
         self.assertEqual(
             headers,
-            ["Name", "Ingredients", "Estimated Value", "Notes"],
+            ["Name", "Ingredients", "Estimated Value", "Notes", "Estimated Time"],
         )
         self.assertNotIn("Result", headers)
 

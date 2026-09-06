@@ -20,6 +20,7 @@ from ai_adventure.combat import (
     normalize_combat_state,
 )
 from ai_adventure.currency import format_currency_amount
+from ai_adventure.crafting import evaluate_recipe_craftability, recipe_estimated_time
 from ai_adventure.core.models import AdventureState
 from ai_adventure.notes import note_entries_for_ai, normalize_note_entries
 from ai_adventure.narration_preferences import normalize_narration_preferences
@@ -755,6 +756,12 @@ class AiContextBuilder:
                             :MAX_CRAFTING_CONTEXT_ENTRIES
                         ]
                     ],
+                    "crafting_status": _crafting_status_context(
+                        state.alchemy.known_recipes,
+                        state.inventory.items,
+                        state.skills.skills,
+                        state.settings.values.get("crafting.processes", []),
+                    ),
                     "rules": {
                         "reagent_fields": (
                               "Crafting items/materials use name, category, description, "
@@ -789,6 +796,16 @@ class AiContextBuilder:
                             "state.alchemy.known_reagents stores crafting knowledge, "
                             "but item_catalog categories decide whether an item can "
                             "be chosen as a recipe ingredient."
+                        ),
+                        "deterministic_crafting_rule": (
+                            "Crafting is application-managed. Suggest a crafting action "
+                            "only for a recipe whose crafting_status.craftable_now is true, "
+                            "and identify it using the exact recipe_id. Never suggest a "
+                            "recipe with missing ingredients or tools. Python consumes "
+                            "ingredients by item UUID, advances hidden active work using "
+                            "the matching skill, starts passive stages, and creates the "
+                            "result only when every stage is complete. Do not invent or "
+                            "change work amounts, time, item IDs, or tool requirements."
                         ),
                         "common_measurement_units": list(COMMON_MEASUREMENT_UNITS),
                     },
@@ -1504,6 +1521,7 @@ class AiContextBuilder:
                     "ContainerOpenedEvent",
                     "ContainerContentsTakenEvent",
                     "CombatStartedEvent",
+                    "CraftingProcessRequestedEvent",
                     "RecipeDiscoveredEvent",
                     "ReagentDiscoveredEvent",
                     "CurrencyChangedEvent",
@@ -1912,6 +1930,63 @@ def _compact_context_value(value: Any) -> Any:
         return _compact_mapping(value)
 
     return value
+
+
+def _crafting_status_context(
+    recipes: list[Any],
+    inventory_items: list[Any],
+    skills: list[Any],
+    raw_processes: Any,
+) -> list[dict[str, Any]]:
+    """Builds the model-facing deterministic crafting eligibility snapshot."""
+
+    def as_dict(value: Any) -> dict[str, Any]:
+        if isinstance(value, dict):
+            return dict(value)
+        to_dict = getattr(value, "to_dict", None)
+        converted = to_dict() if callable(to_dict) else {}
+        return converted if isinstance(converted, dict) else {}
+
+    inventory = [as_dict(item) for item in inventory_items]
+    skill_rows = [as_dict(skill) for skill in skills]
+    processes = {
+        str(item.get("recipe_id", "")).strip(): item
+        for item in (raw_processes if isinstance(raw_processes, list) else [])
+        if isinstance(item, dict) and str(item.get("recipe_id", "")).strip()
+    }
+    statuses: list[dict[str, Any]] = []
+    for raw_recipe in recipes[:MAX_CRAFTING_CONTEXT_ENTRIES]:
+        recipe = as_dict(raw_recipe)
+        recipe_id = str(recipe.get("id", "")).strip()
+        if not recipe_id:
+            continue
+        availability = evaluate_recipe_craftability(recipe, inventory)
+        estimate = recipe_estimated_time(recipe, skill_rows)
+        process = processes.get(recipe_id)
+        statuses.append(
+            {
+                "recipe_id": recipe_id,
+                "recipe_name": str(recipe.get("name", "")).strip(),
+                "result_item_name": str(
+                    recipe.get("result_item_name", recipe.get("result", ""))
+                ).strip(),
+                "craftable_now": bool(availability["craftable"] or process),
+                "craftable_quantity": availability["craftable_quantity"],
+                "missing_ingredients": availability["missing_ingredients"],
+                "missing_tools": availability["missing_tools"],
+                "skill_name": estimate["skill_name"],
+                "skill_level": estimate["skill_level"],
+                "estimated_active_minutes": estimate["active_minutes"],
+                "estimated_passive_minutes": estimate["passive_minutes"],
+                "required_tool_item_uuids": recipe.get("required_tool_item_uuids", []),
+                "result_item_uuid": recipe.get("result_item_uuid", ""),
+                "process_state": (
+                    "active" if process and process.get("passive_due_minute") is None else
+                    "passive" if process else "not_started"
+                ),
+            }
+        )
+    return statuses
 
 
 def _coerce_bool(value: Any, *, default: bool = False) -> bool:

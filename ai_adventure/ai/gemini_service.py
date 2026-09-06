@@ -172,6 +172,7 @@ KNOWN_EVENT_TYPE_NAMES = [
     "ContainerOpenedEvent",
     "ContainerContentsTakenEvent",
     "CombatStartedEvent",
+    "CraftingProcessRequestedEvent",
     "RecipeDiscoveredEvent",
     "ReagentDiscoveredEvent",
     "CurrencyChangedEvent",
@@ -341,6 +342,30 @@ NONEMPTY_RECIPE_INGREDIENT_LIST_SCHEMA: dict[str, Any] = {
     "items": RECIPE_INGREDIENT_SCHEMA,
     "minItems": 1,
 }
+CRAFTING_STAGE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "stage_id": {"type": "string"},
+        "kind": {"type": "string", "enum": ["active", "passive"]},
+        "work_amount": {"type": "integer", "minimum": 1},
+        "estimated_minutes": {"type": "integer", "minimum": 0},
+        "duration_minutes": {"type": "integer", "minimum": 0},
+        "required_tool_item_uuids": {"type": "array", "items": {"type": "string"}},
+        "required_tool_item_names": {"type": "array", "items": {"type": "string"}},
+        "label": {"type": "string"},
+    },
+    "required": [
+        "stage_id",
+        "kind",
+        "work_amount",
+        "estimated_minutes",
+        "duration_minutes",
+        "required_tool_item_uuids",
+        "required_tool_item_names",
+        "label",
+    ],
+    "additionalProperties": False,
+}
 NEW_GAME_CRAFTING_ITEM_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
@@ -380,6 +405,11 @@ NEW_GAME_CRAFTING_RECIPE_SCHEMA: dict[str, Any] = {
         "name": {"type": "string"},
         "ingredients": NONEMPTY_RECIPE_INGREDIENT_LIST_SCHEMA,
         "result": {"type": "string"},
+        "result_item_name": {"type": "string"},
+        "skill_name": {"type": "string"},
+        "stages": {"type": "array", "items": CRAFTING_STAGE_SCHEMA, "minItems": 1},
+        "required_tool_item_uuids": {"type": "array", "items": {"type": "string"}},
+        "required_tool_item_names": {"type": "array", "items": {"type": "string"}},
         "notes": {
             "type": "string",
             "description": (
@@ -391,7 +421,11 @@ NEW_GAME_CRAFTING_RECIPE_SCHEMA: dict[str, Any] = {
         },
         "value_base_units": {"type": "integer", "minimum": 0},
     },
-    "required": ["name", "ingredients", "result", "notes", "value_base_units"],
+    "required": [
+        "name", "ingredients", "result", "result_item_name", "skill_name",
+        "stages", "required_tool_item_uuids", "required_tool_item_names",
+        "notes", "value_base_units",
+    ],
     "additionalProperties": False,
 }
 INT_OR_AUTO_SCHEMA: dict[str, Any] = {
@@ -840,6 +874,11 @@ EVENT_RESPONSE_SCHEMA: dict[str, Any] = {
                 "name": {"type": "string"},
                 "ingredients": NONEMPTY_RECIPE_INGREDIENT_LIST_SCHEMA,
                 "result": {"type": "string"},
+                "result_item_name": {"type": "string"},
+                "skill_name": {"type": "string"},
+                "stages": {"type": "array", "items": CRAFTING_STAGE_SCHEMA, "minItems": 1},
+                "required_tool_item_uuids": {"type": "array", "items": {"type": "string"}},
+                "required_tool_item_names": {"type": "array", "items": {"type": "string"}},
                 "notes": {
                     "type": "string",
                     "description": (
@@ -851,7 +890,27 @@ EVENT_RESPONSE_SCHEMA: dict[str, Any] = {
                 },
                 "value_base_units": {"type": "integer", "minimum": 0},
             },
-            ["name", "ingredients", "result", "notes", "value_base_units"],
+            [
+                "name", "ingredients", "result", "result_item_name", "skill_name",
+                "stages", "required_tool_item_uuids", "required_tool_item_names",
+                "notes", "value_base_units",
+            ],
+        ),
+        _event_response_schema(
+            "CraftingProcessRequestedEvent",
+            {
+                "recipe_id": {
+                    "type": "string",
+                    "description": "The exact database id of a known recipe.",
+                },
+                "quantity": {"type": "integer", "minimum": 1, "maximum": 999},
+            },
+            ["recipe_id", "quantity"],
+            description=(
+                "Requests one deterministic crafting interaction. Python validates "
+                "all requirements, consumes inputs once, advances hidden work, and "
+                "creates the result only after every stage completes."
+            ),
         ),
         _event_response_schema(
             "CalendarEventUpsertedEvent",
@@ -1480,6 +1539,7 @@ STORY_EVENT_TYPE_NAMES_BY_CONTEXT_TAG: dict[str, tuple[str, ...]] = {
         "InventoryItemModifiedEvent",
         "RecipeDiscoveredEvent",
         "ReagentDiscoveredEvent",
+        "CraftingProcessRequestedEvent",
     ),
     "character": ("SkillUpsertedEvent", "FlagSetEvent"),
     "combat": (
@@ -1495,6 +1555,7 @@ STORY_EVENT_TYPE_NAMES_BY_CONTEXT_TAG: dict[str, tuple[str, ...]] = {
         "InventoryItemModifiedEvent",
         "RecipeDiscoveredEvent",
         "ReagentDiscoveredEvent",
+        "CraftingProcessRequestedEvent",
     ),
     "crime": (
         "InventoryItemAddedEvent",
@@ -1575,6 +1636,7 @@ STORY_EVENT_TYPE_NAMES_BY_CONTEXT_TAG: dict[str, tuple[str, ...]] = {
         "InventoryItemModifiedEvent",
         "RecipeDiscoveredEvent",
         "ReagentDiscoveredEvent",
+        "CraftingProcessRequestedEvent",
     ),
     "scene": ("LocationUpsertedEvent", "NpcUpsertedEvent"),
     "skill": (
@@ -2645,6 +2707,7 @@ class GeminiNarrationService:
         result = _drop_unwarranted_skill_check_events(result, context_packet)
         result = _drop_duplicate_resolved_skill_check_events(result, context_packet)
         result = _drop_unauthorized_player_spell_cast_events(result, context_packet)
+        result = _filter_unsupported_crafting_suggestions(result, context_packet)
         result = _ensure_in_game_suggested_actions(result, context_packet)
         result = _ensure_status_event_for_in_game_response(result, context_packet)
         result = _enforce_container_reward_flow(result, context_packet)
@@ -5967,6 +6030,70 @@ def _ensure_in_game_suggested_actions(
     )
 
 
+def _filter_unsupported_crafting_suggestions(
+    result: AiNarrationResult,
+    context_packet: dict[str, Any],
+) -> AiNarrationResult:
+    """Removes recipe suggestions that Python says are not currently possible."""
+
+    if result.out_of_game or not result.suggested_actions:
+        return result
+    alchemy = context_packet.get("state", {}).get("alchemy", {})
+    statuses = alchemy.get("crafting_status", []) if isinstance(alchemy, dict) else []
+    if not isinstance(statuses, list):
+        return result
+
+    unavailable = {
+        label
+        for item in statuses
+        if isinstance(item, dict)
+        and not bool(item.get("craftable_now", False))
+        for label in (
+            str(item.get("recipe_name", "")).strip().casefold(),
+            str(item.get("result_item_name", "")).strip().casefold(),
+        )
+    }
+    unavailable.discard("")
+    crafting_verb = re.compile(
+        r"\b(?:craft|brew|forge|make|prepare|create)\b", re.IGNORECASE
+    )
+    has_available_recipe = any(
+        isinstance(item, dict) and bool(item.get("craftable_now", False))
+        for item in statuses
+    )
+    if not unavailable and has_available_recipe:
+        return result
+    filtered_actions: list[str] = []
+    for action in result.suggested_actions:
+        if not crafting_verb.search(action):
+            filtered_actions.append(action)
+            continue
+        if any(label in action.casefold() for label in unavailable):
+            continue
+        if has_available_recipe:
+            filtered_actions.append(action)
+    if filtered_actions == result.suggested_actions:
+        return result
+    LOGGER.info(
+        "Removed %s unavailable crafting suggestion(s) from Gemini response.",
+        len(result.suggested_actions) - len(filtered_actions),
+    )
+    question = _turn_prompt_from_context_packet(context_packet)
+    base_text = result.narrative_text
+    question_index = base_text.rfind(question)
+    if question_index >= 0:
+        base_text = base_text[: question_index + len(question)]
+    return replace(
+        result,
+        narrative_text=_format_visible_response(
+            base_text,
+            filtered_actions,
+            turn_prompt=question,
+        ),
+        suggested_actions=filtered_actions,
+    )
+
+
 def _enforce_explicit_conversation_mode(
     result: AiNarrationResult,
     context_packet: dict[str, Any],
@@ -7640,6 +7767,25 @@ def _parse_new_game_crafting_recipes(raw_recipes: Any) -> list[dict[str, Any]]:
                 "name": name,
                 "ingredients": ingredients,
                 "result": result,
+                "result_item_name": str(
+                    raw_recipe.get("result_item_name", result)
+                ).strip()
+                or result,
+                "skill_name": str(
+                    raw_recipe.get("skill_name", "Crafting")
+                ).strip()
+                or "Crafting",
+                "stages": raw_recipe.get("stages", []),
+                "required_tool_item_uuids": [
+                    str(value).strip()
+                    for value in raw_recipe.get("required_tool_item_uuids", [])
+                    if str(value).strip()
+                ],
+                "required_tool_item_names": [
+                    str(value).strip()
+                    for value in raw_recipe.get("required_tool_item_names", [])
+                    if str(value).strip()
+                ],
                 "notes": str(raw_recipe.get("notes", "")).strip(),
                 "value_base_units": max(
                     0,
