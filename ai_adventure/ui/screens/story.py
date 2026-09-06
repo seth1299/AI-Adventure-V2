@@ -595,7 +595,7 @@ class StoryScreen(RepositoryBackedWidget):
         message.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
         message.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         message.setStyleSheet("background: transparent; border: none; padding: 0;")
-        _set_markdown_text(message, content)
+        _set_markdown_text(message, content, preserve_blank_lines=True)
         message.document().setDocumentMargin(0)
 
         def resize_message(*_args: Any) -> None:

@@ -123,6 +123,9 @@ class NewGameService:
                 ),
             )
         repository.set_world_summary(fallback_world_summary(setup))
+        fallback_items = _starter_items_for_save([], setup)
+        if fallback_items:
+            repository.replace_inventory_items(fallback_items)
         repository.append_history(
             "story",
             (
@@ -178,6 +181,9 @@ class NewGameService:
             api_key_path=api_key_path,
             **({"model": model} if model else {}),  # type: ignore[call-arg]
         )
+        staged_generator = getattr(service, "generate_new_game_world_staged", None)
+        if callable(staged_generator):
+            return staged_generator(setup_packet)
         return service.generate_new_game_world(setup_packet)
 
     @staticmethod
@@ -483,8 +489,13 @@ class NewGameService:
             getattr(result, "finalized_starter_items", []),
             setup,
         )
-        if finalized_starter_items:
-            repository.replace_inventory_items(finalized_starter_items)
+        repository.replace_inventory_items(finalized_starter_items)
+
+        LOGGER.info(
+            "Committed new-game starting state: inventory_items=%s, skills=%s.",
+            len(repository.list_inventory_items()),
+            len(repository.list_skills()),
+        )
 
         _apply_new_game_crafting_knowledge(
             repository,
@@ -951,7 +962,11 @@ def _starter_items_for_save(
     setup_items = setup.get("starter_items", [])
     if not isinstance(setup_items, list):
         setup_items = []
-    completed_items = [dict(item) for item in ai_items if isinstance(item, dict)]
+    completed_items = [
+        dict(item)
+        for item in (ai_items if isinstance(ai_items, list) else [])
+        if isinstance(item, dict) and str(item.get("name", "")).strip()
+    ]
     for item in completed_items:
         source_index = _optional_int(item.get("source_index"))
         if source_index is None or not (0 <= source_index < len(setup_items)):

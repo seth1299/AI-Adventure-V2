@@ -250,8 +250,24 @@ class VisualAssetTests(unittest.TestCase):
         self.assertIn('"Riverbend City"', request.prompt)
         self.assertNotIn('"Oakhaven"', request.prompt)
         self.assertIn("do not add, rename, or imply any other place", request.prompt)
-        self.assertIn("x_miles increases eastward (right)", request.prompt)
+        self.assertIn("east is right, west is left, north is up, and south is down", request.prompt)
+        self.assertIn("Never render coordinates, coordinate pairs", request.prompt)
+        self.assertNotIn("x_miles=", request.prompt)
         self.assertIn('"Dark Forest" is east of "Riverbend City".', request.prompt)
+
+    def test_non_text_subject_names_are_explicitly_metadata(self) -> None:
+        request = VisualAssetRequest(
+            subject_type="inventory",
+            subject_key="everyday_attire",
+            display_name="Everyday Attire",
+            description="A cream linen shirt and brown skirt.",
+        )
+
+        self.assertIn(
+            "The supplied subject name and description are metadata for the artist",
+            request.prompt,
+        )
+        self.assertIn("Do not copy them into the image as text", request.prompt)
 
     def test_filename_is_descriptive_bounded_and_versioned(self) -> None:
         request = VisualAssetRequest(
@@ -555,6 +571,29 @@ class VisualAssetTests(unittest.TestCase):
             self.assertEqual(ready["filename"], request.filename)
             linked = repository.list_visual_assets_for_message("turn-1")
             self.assertEqual([asset["asset_id"] for asset in linked], [request.asset_id])
+
+    def test_repository_accepts_bestiary_visual_assets(self) -> None:
+        request = VisualAssetRequest(
+            subject_type="bestiary",
+            subject_key="mist_strider",
+            display_name="Mist-Strider",
+            description="A tall six-legged creature with translucent fur.",
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = SaveRepository.create_new_save(Path(temp_dir), "Images")
+            record = repository.ensure_visual_asset(
+                asset_id=request.asset_id,
+                subject_type=request.subject_type,
+                subject_key=request.subject_key,
+                display_name=request.display_name,
+                descriptor_hash=request.descriptor_hash,
+                filename=request.filename,
+                prompt=request.prompt,
+                model="gemini-3.1-flash-lite-image",
+            )
+
+            self.assertEqual(record["subject_type"], "bestiary")
+            self.assertEqual(record["subject_key"], "mist_strider")
 
 
 if __name__ == "__main__":

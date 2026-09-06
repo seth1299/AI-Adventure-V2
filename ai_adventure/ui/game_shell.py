@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+
 from ai_adventure.ui.common import *  # noqa: F401,F403
 from ai_adventure.ui.dialogues import *  # noqa: F401,F403
 from ai_adventure.ui.screens.combat import CombatScreen
@@ -20,6 +22,9 @@ from ai_adventure.ui.screens.skills import *  # noqa: F401,F403
 from ai_adventure.ui.screens.story import *  # noqa: F401,F403
 from ai_adventure.ui.screens.tasks import *  # noqa: F401,F403
 from ai_adventure.ui.screens.travel import *  # noqa: F401,F403
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 class _DetachableTabBar(QTabBar):
@@ -517,12 +522,18 @@ class GameShell(QWidget):
         repository: SaveRepository | None,
         *,
         initially_hide_empty_tabs: bool = False,
+        defer_music_playback: bool = False,
+        defer_visual_scan: bool = False,
     ) -> None:
         """
         Sets the active save repository for every screen.
 
         Args:
             repository: Active save repository, or None when returning to menu.
+            defer_music_playback: Keeps the saved music stopped until the caller
+                explicitly reveals the opening message.
+            defer_visual_scan: Keeps visual-asset discovery deferred until the
+                caller has committed any generated world entities.
         """
 
         self._restore_all_smart_hidden_tabs()
@@ -550,8 +561,27 @@ class GameShell(QWidget):
             tab_key: _screen_content_signature(screen)
             for tab_key, (screen, _label, _closable) in self._tab_specs.items()
         }
-        self._apply_audio_settings()
+        self._apply_audio_settings(start_music=not defer_music_playback)
+        if repository is not None and not defer_visual_scan:
+            LOGGER.info(
+                "Scheduling visual asset scan after repository page bind: %s.",
+                repository.db_path,
+            )
+            QTimer.singleShot(
+                100,
+                lambda repository=repository: self._scan_visual_assets_if_active(
+                    repository
+                ),
+            )
+
+    def _scan_visual_assets_if_active(self, repository: SaveRepository) -> None:
+        """Runs the visual scan only after the active save page is available."""
+
+        if self.repository is not repository:
+            return
+        LOGGER.info("Starting deferred visual asset scan: %s.", repository.db_path)
         self.visual_asset_coordinator.scan(repository)
+        LOGGER.info("Finished deferred visual asset scan: %s.", repository.db_path)
 
     def _hide_empty_starting_tabs(self, repository: SaveRepository) -> None:
         """Hides tabs that the new-game configuration says are initially irrelevant."""
@@ -652,6 +682,7 @@ class GameShell(QWidget):
         self,
         *,
         exclude: set[RepositoryBackedWidget] | None = None,
+        scan_visual_assets: bool = True,
     ) -> None:
         """Refreshes tabs from saved data while preserving each screen's local state."""
 
@@ -678,7 +709,8 @@ class GameShell(QWidget):
             ):
                 self._mark_tab_changed(tab_key)
         self._reveal_populated_smart_hidden_tabs()
-        self.visual_asset_coordinator.scan(self.repository)
+        if scan_visual_assets:
+            self.visual_asset_coordinator.scan(self.repository)
 
     @Slot()
     def _handle_visual_assets_changed(self) -> None:
@@ -720,7 +752,7 @@ class GameShell(QWidget):
 
         return self.story_screen.submit_travel_request(destination, player_context)
 
-    def _apply_audio_settings(self) -> None:
+    def _apply_audio_settings(self, *, start_music: bool = True) -> None:
         """Applies saved audio settings to the active audio managers."""
 
         if self.repository is None:
@@ -735,6 +767,7 @@ class GameShell(QWidget):
             self.repository,
             sound_manager=self.sound_manager,
             narration_player=self.narration_player,
+            start_music=start_music,
         )
 
     def _sample_narrator_voice(

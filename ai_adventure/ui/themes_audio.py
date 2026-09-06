@@ -169,6 +169,7 @@ def _apply_audio_settings_to_managers(
     *,
     sound_manager: SoundManagerProtocol | None,
     narration_player: NarrationPlayerProtocol | None,
+    start_music: bool = True,
 ) -> None:
     """Applies saved music, one-shot effect, and narrator settings to managers."""
 
@@ -176,6 +177,7 @@ def _apply_audio_settings_to_managers(
         repository,
         sound_manager=sound_manager,
         narration_player=narration_player,
+        start_music=start_music,
     )
     return
 

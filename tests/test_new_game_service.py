@@ -10,6 +10,33 @@ from ai_adventure.new_game_setup import normalize_new_game_setup
 
 
 class NewGameServiceTests(unittest.TestCase):
+    def test_commit_generated_world_guarantees_starting_inventory(self) -> None:
+        setup = normalize_new_game_setup({"title": "Inventory Guarantee"})
+        result = SimpleNamespace(
+            world_summary="A quiet beginning.",
+            introductory_message="The adventure begins.",
+            finalized_character={},
+            start_location="",
+            start_weather="",
+            finalized_starter_items=[{"description": "not a complete item"}],
+            finalized_skills=[],
+            suggested_events=[],
+            speaker_cues=[],
+            sound_effect_cues=[],
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = NewGameService.create_repository(
+                Path(temp_dir),
+                setup,
+            )
+            NewGameService.commit_generated_world(repository, setup, result)
+
+            inventory = repository.list_inventory_items()
+
+            self.assertGreaterEqual(len(inventory), 5)
+            self.assertTrue(all(str(item["name"]).strip() for item in inventory))
+
     def test_commit_generated_world_persists_opening_and_player_identity(self) -> None:
         setup = normalize_new_game_setup(
             {

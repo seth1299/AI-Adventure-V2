@@ -28,11 +28,18 @@ class _VisualAssetCoordinator(QObject):
         self._worker: QObject | None = None
         self._initial_batch_repositories: set[str] = set()
         self._initial_batch_repository_objects: dict[str, SaveRepository] = {}
+        LOGGER.info(
+            "Visual asset coordinator initialized: enabled=%s, images_dir=%s, "
+            "api_key_path=%s.",
+            self.enabled,
+            self.images_dir,
+            self.api_key_path,
+        )
         if self.enabled:
             self.images_dir.mkdir(parents=True, exist_ok=True)
 
     def begin_initial_batch(self, repository: SaveRepository) -> None:
-        """Defers the opening-scene reveal until this save's first images settle."""
+        """Queues the first finalized visual assets for this save."""
 
         self._initial_batch_repositories.add(str(repository.db_path))
         self._initial_batch_repository_objects[str(repository.db_path)] = repository
@@ -100,9 +107,22 @@ class _VisualAssetCoordinator(QObject):
     def scan(self, repository: SaveRepository | None) -> None:
         """Registers cache hits and queues missing current entity images."""
 
-        if repository is None or not self.enabled:
+        if repository is None:
             return
-        if not _bool_setting(repository.get_setting("images.enabled", True), True):
+        if not self.enabled:
+            LOGGER.info(
+                "Visual asset scan skipped: coordinator disabled for %s.",
+                repository.db_path,
+            )
+            return
+        images_enabled = _bool_setting(
+            repository.get_setting("images.enabled", True), True
+        )
+        if not images_enabled:
+            LOGGER.info(
+                "Visual asset scan skipped: images.enabled=false for %s.",
+                repository.db_path,
+            )
             return
 
         has_api_key = bool(read_api_key(self.api_key_path))
@@ -115,28 +135,58 @@ class _VisualAssetCoordinator(QObject):
             1,
             10_000,
         )
-        for request in AssetGenerationService.requests_for(repository):
+        requests = AssetGenerationService.requests_for(repository)
+        queued_count = 0
+        reused_count = 0
+        ready_count = 0
+        skipped_record_count = 0
+        skipped_key_count = 0
+        for request in requests:
             relative_filename = save_relative_image_filename(repository, request)
             target_path = AssetGenerationService.target_path(
                 repository, request, self.images_dir
             )
-            record = repository.ensure_visual_asset(
-                asset_id=request.asset_id,
-                subject_type=request.subject_type,
-                subject_key=request.subject_key,
-                display_name=request.display_name,
-                descriptor_hash=request.descriptor_hash,
-                filename=relative_filename,
-                prompt=request.prompt,
-                model=model,
-                message_ids=request.message_ids,
-                ready=target_path.is_file(),
-            )
-            if (
-                target_path.is_file()
-                or record.get("status") != "queued"
-                or not has_api_key
-            ):
+            try:
+                record = repository.ensure_visual_asset(
+                    asset_id=request.asset_id,
+                    subject_type=request.subject_type,
+                    subject_key=request.subject_key,
+                    display_name=request.display_name,
+                    descriptor_hash=request.descriptor_hash,
+                    filename=relative_filename,
+                    prompt=request.prompt,
+                    model=model,
+                    message_ids=request.message_ids,
+                    ready=target_path.is_file(),
+                )
+            except ValueError as error:
+                # A newly added entity type should not prevent the rest of a
+                # save's visual batch from completing.  The repository owns
+                # the canonical allowlist; this guard keeps an invalid or
+                # future request from stranding the initial-generation modal.
+                LOGGER.warning(
+                    "Skipping invalid visual asset request: subject=%s/%s "
+                    "asset_id=%s error=%s.",
+                    request.subject_type,
+                    request.display_name,
+                    request.asset_id,
+                    error,
+                )
+                continue
+            if target_path.is_file():
+                ready_count += 1
+                continue
+            if record.get("status") != "queued":
+                skipped_record_count += 1
+                LOGGER.debug(
+                    "Visual asset not queued: subject=%s/%s status=%s.",
+                    request.subject_type,
+                    request.display_name,
+                    record.get("status"),
+                )
+                continue
+            if not has_api_key:
+                skipped_key_count += 1
                 continue
             if request.asset_id in self._queued_asset_ids:
                 continue
@@ -156,6 +206,7 @@ class _VisualAssetCoordinator(QObject):
                         width=int(reusable.get("width", 0)),
                         height=int(reusable.get("height", 0)),
                     )
+                    reused_count += 1
                     LOGGER.info(
                         "Reused visual asset %s for %s from another save (score %.1f).",
                         request.filename,
@@ -171,6 +222,25 @@ class _VisualAssetCoordinator(QObject):
                     )
             self._queue.append((repository, request, model, limit))
             self._queued_asset_ids.add(request.asset_id)
+            queued_count += 1
+        LOGGER.info(
+            "Visual asset scan summary: save=%s enabled=%s api_key=%s model=%s "
+            "limit=%s generated=%s discovered=%s ready=%s reused=%s queued=%s "
+            "skipped_record=%s skipped_missing_key=%s queue_total=%s.",
+            repository.db_path,
+            images_enabled,
+            has_api_key,
+            model,
+            limit,
+            repository.visual_asset_generation_count(),
+            len(requests),
+            ready_count,
+            reused_count,
+            queued_count,
+            skipped_record_count,
+            skipped_key_count,
+            len(self._queue),
+        )
         self._start_next()
         self._finish_initial_batch_if_ready(repository)
 

@@ -36,8 +36,10 @@ from PySide6.QtWidgets import (
 )
 
 from ai_adventure.persistence.save_repository import SaveRepository
+from ai_adventure.app.app_paths import AppPaths
 from ai_adventure.new_game_setup import normalize_new_game_setup
 from ai_adventure.ui.screens.notes import NotesScreen
+from ai_adventure.ui.screens.skills import SkillsScreen
 from ai_adventure.new_game_templates import (
     load_new_game_templates,
     save_new_game_template,
@@ -45,6 +47,7 @@ from ai_adventure.new_game_templates import (
 from ai_adventure.ui.main_window import (
     _DetachedTabWindow,
     _GeminiNewGameWorker,
+    _NewGameGenerationProgressDialog,
     AISettingsDialog,
     AlchemyNotebookScreen,
     BestiaryScreen,
@@ -145,6 +148,88 @@ class InventoryUiTests(unittest.TestCase):
         self.assertEqual(len(request_threads), 1)
         self.assertIsNot(request_threads[0], self.app.thread())
 
+    def test_load_game_selects_game_shell_after_binding_repository(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths = AppPaths(
+                app_data_dir=root,
+                saves_dir=root / "saves",
+                logs_dir=root / "logs",
+                log_file=root / "logs" / "ai_adventure.log",
+                local_app_data_dir=root,
+            )
+            paths.saves_dir.mkdir()
+            window = MainWindow(paths)
+            self.addCleanup(window.close)
+
+            repository = SaveRepository.create_new_save(
+                paths.saves_dir,
+                "Load Transition Test",
+            )
+            window.load_game_from_path(repository.db_path)
+            repository.add_inventory_item("Post-bind Item", "Tool", 1, "x")
+            repository.upsert_skill("Post-bind Skill", "x", 1)
+            refresh_loop = QEventLoop()
+            QTimer.singleShot(200, refresh_loop.quit)
+            refresh_loop.exec()
+
+            self.assertIs(window.stack.currentWidget(), window.game_shell)
+            self.assertIsNotNone(window.active_repository)
+            self.assertEqual(
+                len(window.game_shell.inventory_screen._inventory_items),
+                len(repository.list_inventory_items()),
+            )
+            self.assertEqual(
+                window.game_shell.skills_screen.skills_table.rowCount(),
+                len(repository.list_skills()),
+            )
+
+    def test_new_game_generation_progress_dialog_is_non_dismissible_and_staged(self) -> None:
+        dialog = _NewGameGenerationProgressDialog()
+        self.assertTrue(dialog.isModal())
+        self.assertFalse(bool(dialog.windowFlags() & Qt.WindowType.WindowCloseButtonHint))
+        self.assertFalse(bool(dialog.windowFlags() & Qt.WindowType.WindowMinimizeButtonHint))
+
+        dialog.show()
+        self.app.processEvents()
+        dialog.close()
+        self.app.processEvents()
+        self.assertTrue(dialog.isVisible())
+
+        dialog.update_phase("setup_compilation")
+        dialog.update_phase("world_skeleton")
+        dialog.update_phase("targeted_repairs")
+        self.assertEqual(dialog.progress_bar.value(), 27)
+        self.assertIn("World Skeleton", dialog.stage_label.text())
+
+        dialog.finish()
+        self.app.processEvents()
+        self.assertFalse(dialog.isVisible())
+
+    def test_new_game_generation_progress_dialog_eta_ticks_down_between_phases(self) -> None:
+        dialog = _NewGameGenerationProgressDialog()
+        dialog._sequence_index = 4
+        dialog._stage_durations = [10.0, 10.0]
+        dialog._last_stage_time = 100.0
+
+        with patch("ai_adventure.ui.main_window.monotonic", side_effect=[100.0, 101.0]):
+            dialog._update_eta()
+            first_estimate = dialog.eta_label.text()
+            dialog._update_eta()
+            second_estimate = dialog.eta_label.text()
+
+        self.assertEqual(dialog._eta_timer.interval(), 1000)
+        self.assertIn("about 50 seconds", first_estimate)
+        self.assertIn("about 49 seconds", second_estimate)
+        self.assertNotEqual(first_estimate, second_estimate)
+
+        dialog.show()
+        self.app.processEvents()
+        self.assertTrue(dialog._eta_timer.isActive())
+        dialog.finish()
+        self.app.processEvents()
+        self.assertFalse(dialog._eta_timer.isActive())
+
     def test_new_game_saves_unused_template_before_gemini_generation(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
@@ -169,6 +254,7 @@ class InventoryUiTests(unittest.TestCase):
             )
             window._normalize_new_game_setup_for_runtime = normalize_new_game_setup
             window.open_repository = Mock()
+            window._show_new_game_progress_dialog = Mock()
 
             def start_generation(_repository: object, _setup: object) -> None:
                 observed_template_names.extend(
@@ -1091,6 +1177,80 @@ class InventoryUiTests(unittest.TestCase):
 
         screen.close()
 
+    def test_skills_table_renders_xp_as_a_progress_bar(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = SaveRepository.create_new_save(Path(temp_dir), "Skill Bar Test")
+            repository.upsert_skill("Foraging", "Finding useful materials.", 1)
+            repository.add_skill_xp("Foraging", 4)
+
+            screen = SkillsScreen()
+            screen.set_repository(repository)
+            screen.show()
+            self.app.processEvents()
+
+            row_index = -1
+            for row in range(screen.skills_table.rowCount()):
+                skill_item = screen.skills_table.item(row, 0)
+                if skill_item is not None and skill_item.text() == "Foraging":
+                    row_index = row
+                    break
+            self.assertGreaterEqual(row_index, 0)
+            progress_bar = screen.skills_table.cellWidget(row_index, 2)
+            self.assertIsInstance(progress_bar, QProgressBar)
+            assert isinstance(progress_bar, QProgressBar)
+            self.assertEqual(progress_bar.value(), 50)
+            self.assertEqual(progress_bar.format(), "50%")
+            self.assertIsNone(screen.skills_table.item(row_index, 2))
+            self.assertIn("4 / 8", progress_bar.toolTip())
+
+            screen.close()
+
+    def test_completed_story_preserves_prose_spacing_and_compact_actions(self) -> None:
+        screen = StoryScreen()
+        screen._render_conversation(
+            [
+                (
+                    "ai",
+                    "live_game",
+                    "First paragraph.\n\nSecond paragraph.\n\n"
+                    "What do you do now?\n"
+                    "- Take the northern road.\n"
+                    "- Check the market.",
+                    1,
+                )
+            ]
+        )
+        screen.show()
+        self.app.processEvents()
+
+        bubble = screen.findChild(QWidget, "conversationBubble")
+        self.assertIsNotNone(bubble)
+        assert bubble is not None
+        message = bubble.findChild(QTextEdit)
+        self.assertIsNotNone(message)
+        assert message is not None
+
+        blocks = []
+        block = message.document().begin()
+        while block.isValid():
+            blocks.append(block)
+            block = block.next()
+
+        self.assertEqual([block.text() for block in blocks], [
+            "First paragraph.",
+            "Second paragraph.",
+            "What do you do now?",
+            "Take the northern road.",
+            "Check the market.",
+        ])
+        self.assertGreater(blocks[0].blockFormat().bottomMargin(), 0)
+        self.assertGreater(blocks[1].blockFormat().bottomMargin(), 0)
+        self.assertEqual(blocks[2].blockFormat().bottomMargin(), 0)
+        self.assertEqual(blocks[3].blockFormat().bottomMargin(), 0)
+        self.assertTrue(blocks[3].textList() is not None)
+
+        screen.close()
+
     def test_live_game_ai_headers_number_turns_without_counting_out_of_game(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             repository = SaveRepository.create_new_save(Path(temp_dir), "Turn Header Test")
@@ -1409,6 +1569,7 @@ class InventoryUiTests(unittest.TestCase):
         class FakeSoundManager:
             def __init__(self) -> None:
                 self.music_played = ""
+                self.music_stopped = 0
                 self.effect_played = ""
                 self.ambience_played = ""
 
@@ -1471,7 +1632,7 @@ class InventoryUiTests(unittest.TestCase):
                 pass
 
             def stop_music(self, *, clear_current: bool = True) -> None:
-                pass
+                self.music_stopped += 1
 
             def stop_sound_effect(self, *, clear_current: bool = True) -> None:
                 pass
@@ -1494,6 +1655,16 @@ class InventoryUiTests(unittest.TestCase):
             self.assertEqual(manager.music_played, "Slow Jazz.mp3")
             self.assertEqual(manager.effect_played, "")
             self.assertEqual(manager.ambience_played, "Quiet Rain.ogg")
+
+            manager.music_played = ""
+            _apply_audio_settings_to_managers(
+                repository,
+                sound_manager=manager,
+                narration_player=None,
+                start_music=False,
+            )
+            self.assertEqual(manager.music_played, "")
+            self.assertGreaterEqual(manager.music_stopped, 1)
 
     def test_latest_story_can_use_progressive_narration_with_pronunciations(self) -> None:
         class FakeNarrationPlayer:

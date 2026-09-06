@@ -39,6 +39,7 @@ class AudioPreferencesService:
         *,
         sound_manager: Any = None,
         narration_player: Any = None,
+        start_music: bool = True,
     ) -> None:
         get = repository.get_setting
         music_enabled = bool_setting(get("audio.music_enabled", True), True)
@@ -59,7 +60,7 @@ class AudioPreferencesService:
             if hasattr(sound_manager, "set_background_ambience_enabled"):
                 sound_manager.set_background_ambience_enabled(ambience_enabled)
             current_music = str(get("audio.current_music", "") or "").strip()
-            if music_enabled and current_music:
+            if start_music and music_enabled and current_music:
                 sound_manager.play_music(current_music)
             else:
                 sound_manager.stop_music(clear_current=False)

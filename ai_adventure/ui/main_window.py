@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+from math import ceil
+from time import monotonic
 
 from ai_adventure.ui.common import *  # noqa: F401,F403
 from ai_adventure.ui.dialogues import *  # noqa: F401,F403
@@ -37,6 +39,162 @@ _ExtractedMainMenuScreen = MainMenuScreen
 LOGGER = logging.getLogger(__name__)
 
 
+class _NewGameGenerationProgressDialog(QDialog):
+    """Application-modal progress display for staged new-game generation."""
+
+    _SEQUENCE = (
+        "setup_compilation",
+        "world_skeleton",
+        "world_repair",
+        "entities_mechanics",
+        "entities_repair",
+        "opening_prose",
+        "opening_repair",
+        "final_commit",
+        "initial_visuals",
+    )
+    _PROGRESS = {
+        "setup_compilation": 3,
+        "world_skeleton": 15,
+        "world_repair": 27,
+        "entities_mechanics": 42,
+        "entities_repair": 57,
+        "opening_prose": 72,
+        "opening_repair": 84,
+        "final_commit": 96,
+        "initial_visuals": 99,
+    }
+    _LABELS = {
+        "setup_compilation": "Preparing the generation plan...",
+        "world_skeleton": "Generating the World Skeleton...",
+        "world_repair": "Checking the World Skeleton...",
+        "entities_mechanics": "Generating Entities and Mechanics...",
+        "entities_repair": "Checking Entities and Mechanics...",
+        "opening_prose": "Writing the Opening Prose...",
+        "opening_repair": "Checking the Opening Prose...",
+        "final_commit": "Finalizing the new adventure...",
+        "initial_visuals": "Generating the initial world images...",
+    }
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._allow_close = False
+        self._repair_count = 0
+        self._sequence_index = -1
+        self._last_stage_time = monotonic()
+        self._stage_durations: list[float] = []
+        self._eta_timer = QTimer(self)
+        self._eta_timer.setInterval(1000)
+        self._eta_timer.timeout.connect(self._update_eta)
+
+        self.setWindowTitle("Creating New Adventure")
+        self.setWindowModality(Qt.WindowModality.ApplicationModal)
+        self.setModal(True)
+        self.setWindowFlags(
+            Qt.WindowType.Dialog
+            | Qt.WindowType.CustomizeWindowHint
+            | Qt.WindowType.WindowTitleHint
+        )
+        self.setFixedSize(520, 175)
+
+        title = QLabel("Gemini is creating your new adventure.")
+        title.setStyleSheet("font-size: 15px; font-weight: bold;")
+        title.setWordWrap(True)
+        self.stage_label = QLabel(self._LABELS["setup_compilation"])
+        self.stage_label.setWordWrap(True)
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setTextVisible(True)
+        self.eta_label = QLabel("Estimated time remaining: calculating...")
+        self.eta_label.setWordWrap(True)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(22, 18, 22, 18)
+        layout.setSpacing(10)
+        layout.addWidget(title)
+        layout.addWidget(self.stage_label)
+        layout.addWidget(self.progress_bar)
+        layout.addWidget(self.eta_label)
+
+    def showEvent(self, event: Any) -> None:
+        super().showEvent(event)
+        self._eta_timer.start()
+        self._update_eta()
+
+    def update_phase(self, phase: str) -> None:
+        """Advances the display to the next worker-reported generation phase."""
+
+        if phase == "targeted_repairs":
+            self._repair_count += 1
+            repair_names = ("world_repair", "entities_repair", "opening_repair")
+            stage = repair_names[min(self._repair_count - 1, len(repair_names) - 1)]
+        else:
+            stage = phase
+        if stage not in self._PROGRESS:
+            return
+
+        sequence_index = self._SEQUENCE.index(stage)
+        if sequence_index > self._sequence_index:
+            now = monotonic()
+            if self._sequence_index >= 0:
+                self._stage_durations.append(now - self._last_stage_time)
+            self._last_stage_time = now
+            self._sequence_index = sequence_index
+
+        self.stage_label.setText(self._LABELS[stage])
+        self.progress_bar.setValue(self._PROGRESS[stage])
+        self._update_eta()
+
+    def finish(self) -> None:
+        """Marks the opening as ready and closes the modal programmatically."""
+
+        self._eta_timer.stop()
+        self.progress_bar.setValue(100)
+        self.stage_label.setText("Opening message ready.")
+        self.eta_label.setText("Generation complete.")
+        self._allow_close = True
+        QDialog.close(self)
+
+    def set_visual_generation_pending(self) -> None:
+        """Shows that finalized world images are still being generated."""
+
+        self.update_phase("initial_visuals")
+
+    def _update_eta(self) -> None:
+        if len(self._stage_durations) < 2:
+            self.eta_label.setText("Estimated time remaining: calculating...")
+            return
+        average_duration = sum(self._stage_durations) / len(self._stage_durations)
+        remaining_stages = max(0, len(self._SEQUENCE) - self._sequence_index)
+        elapsed_current_stage = max(0.0, monotonic() - self._last_stage_time)
+        remaining_seconds = max(
+            0.0, average_duration * remaining_stages - elapsed_current_stage
+        )
+        if remaining_seconds < 1:
+            estimate = "under 1 second"
+        elif remaining_seconds < 60:
+            estimate = f"about {ceil(remaining_seconds)} seconds"
+        else:
+            estimate = f"about {remaining_seconds / 60:.1f} minutes"
+        self.eta_label.setText(f"Estimated time remaining: {estimate}")
+
+    def closeEvent(self, event: Any) -> None:
+        """Prevents the player from dismissing generation in progress."""
+
+        if self._allow_close:
+            self._eta_timer.stop()
+            super().closeEvent(event)
+        else:
+            event.ignore()
+
+    def reject(self) -> None:
+        """Ignores Escape and other user-triggered dialog rejection."""
+
+        if self._allow_close:
+            super().reject()
+
+
 class MainWindow(QMainWindow):
     """
     Main application window.
@@ -59,7 +217,7 @@ class MainWindow(QMainWindow):
         self._new_game_worker: QObject | None = None
         self._pending_new_game_repository: SaveRepository | None = None
         self._pending_new_game_setup: dict[str, Any] | None = None
-        self._waiting_for_initial_visuals: SaveRepository | None = None
+        self._new_game_progress_dialog: _NewGameGenerationProgressDialog | None = None
         self.playtesting_build = is_playtesting_build()
         self.ai_enabled = is_ai_enabled()
         self.tts_enabled = is_tts_enabled()
@@ -561,7 +719,20 @@ class MainWindow(QMainWindow):
 
         self.game_shell.story_screen.set_initial_generation_pending(True)
         self.game_shell.menu_button.setEnabled(False)
+        self._show_new_game_progress_dialog()
         self._start_new_game_generation(repository, clean_setup)
+
+    def _show_new_game_progress_dialog(self) -> None:
+        """Shows the non-dismissible modal used during staged generation."""
+
+        existing = self._new_game_progress_dialog
+        if existing is not None:
+            existing.finish()
+        dialog = _NewGameGenerationProgressDialog(self)
+        self._new_game_progress_dialog = dialog
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
 
     def _start_new_game_generation(
         self,
@@ -608,6 +779,7 @@ class MainWindow(QMainWindow):
 
         thread.started.connect(worker.run)
         worker.completed.connect(self._handle_new_game_generation_result)
+        worker.phase_changed.connect(self._handle_new_game_generation_phase)
         worker.configuration_error.connect(
             self._handle_new_game_generation_configuration_error
         )
@@ -654,6 +826,23 @@ class MainWindow(QMainWindow):
             self.new_game_service.apply_fallback(repository, setup)
         finally:
             self._complete_new_game_generation(repository)
+
+    @Slot(str)
+    def _handle_new_game_generation_phase(self, phase: str) -> None:
+        """Shows the active staged-generation phase in the disabled menu button."""
+
+        labels = {
+            "setup_compilation": "Preparing new game...",
+            "world_skeleton": "Generating world map...",
+            "entities_mechanics": "Generating entities and mechanics...",
+            "opening_prose": "Writing opening scene...",
+            "targeted_repairs": "Checking generated content...",
+            "final_commit": "Finalizing new game...",
+        }
+        self.game_shell.menu_button.setText(labels.get(phase, "Generating new game..."))
+        dialog = self._new_game_progress_dialog
+        if isinstance(dialog, _NewGameGenerationProgressDialog):
+            dialog.update_phase(phase)
 
     @Slot(str)
     def _handle_new_game_generation_configuration_error(self, _message: str) -> None:
@@ -736,39 +925,99 @@ class MainWindow(QMainWindow):
 
         self._pending_new_game_repository = None
         self._pending_new_game_setup = None
-        self.game_shell.menu_button.setEnabled(True)
 
-        if self.active_repository is not repository:
-            return
-
-        _apply_audio_settings_to_managers(
-            repository,
-            sound_manager=self.sound_manager,
-            narration_player=self.narration_player,
+        active_repository = self.active_repository
+        is_active = self._repository_matches_active(repository)
+        LOGGER.info(
+            "Completing new-game generation: repository=%s, active_repository=%s, "
+            "same_object=%s, same_db_path=%s, inventory_items=%s, skills=%s.",
+            repository.db_path,
+            active_repository.db_path if active_repository is not None else None,
+            active_repository is repository,
+            is_active,
+            len(repository.list_inventory_items()),
+            len(repository.list_skills()),
         )
-        self._waiting_for_initial_visuals = repository
-        self.game_shell.visual_asset_coordinator.begin_initial_batch(repository)
-        self.game_shell.refresh_screens()
-
-    def _reveal_initial_story(self, repository: SaveRepository) -> None:
-        """Shows and narrates the opening only after initial images are settled."""
-
-        if self.active_repository is not repository:
+        if not is_active:
+            self.game_shell.menu_button.setEnabled(True)
+            self.game_shell.menu_button.setText("Main Menu")
+            dialog = self._new_game_progress_dialog
+            self._new_game_progress_dialog = None
+            if isinstance(dialog, _NewGameGenerationProgressDialog):
+                dialog.finish()
             return
+
+        # Keep the opening hidden until every finalized initial visual request
+        # has reached a terminal state. This prevents the pre-generation
+        # placeholder location from winning the first image scan and ensures
+        # the first visible screen is complete.
+        dialog = self._new_game_progress_dialog
+        if isinstance(dialog, _NewGameGenerationProgressDialog):
+            dialog.set_visual_generation_pending()
+        try:
+            self.game_shell.visual_asset_coordinator.begin_initial_batch(repository)
+        except Exception:
+            LOGGER.exception("Initial visual asset batch could not be started.")
+            self._finish_initial_visual_generation(repository)
+
+    def _repository_matches_active(self, repository: SaveRepository) -> bool:
+        """Matches saves by identity or canonical path across repository wrappers."""
+
+        active_repository = self.active_repository
+        if active_repository is repository:
+            return True
+        if active_repository is None:
+            return False
+        return Path(active_repository.db_path).resolve() == Path(repository.db_path).resolve()
+
+    def _reveal_initial_story(self, repository: SaveRepository) -> bool:
+        """Shows and narrates the committed opening after initial images settle."""
+
+        if not self._repository_matches_active(repository):
+            return False
 
         self.game_shell.story_screen.set_initial_generation_pending(False)
-        self.game_shell.story_screen.narrate_latest_story(
+        return self.game_shell.story_screen.narrate_latest_story(
             reveal_progressively=True,
         )
 
+    def _finish_initial_visual_generation(self, repository: SaveRepository) -> None:
+        """Reveals the completed new game and releases its progress modal."""
+
+        if not self._repository_matches_active(repository):
+            return
+        try:
+            self._reveal_initial_story(repository)
+        except Exception:
+            LOGGER.exception("Could not reveal the opening after new-game generation.")
+        finally:
+            # Always release the modal and menu lock, even if a screen refresh
+            # or a narration/voice integration fails during finalization.
+            self.game_shell.menu_button.setEnabled(True)
+            self.game_shell.menu_button.setText("Main Menu")
+            dialog = self._new_game_progress_dialog
+            self._new_game_progress_dialog = None
+            if isinstance(dialog, _NewGameGenerationProgressDialog):
+                dialog.finish()
+
+        try:
+            # The initial coordinator already reconciled every request. Avoid
+            # a second scan here, which could repeat a malformed-request error
+            # after the user-visible generation has otherwise completed.
+            self.game_shell.refresh_screens(scan_visual_assets=False)
+        except Exception:
+            LOGGER.exception("Could not refresh screens after new-game generation.")
+
     @Slot(object)
     def _handle_initial_visuals_ready(self, repository: SaveRepository) -> None:
-        """Reveals the opening scene once its initial image batch is complete."""
+        """Reveals the opening after the initial visual batch settles."""
 
-        if self._waiting_for_initial_visuals is not repository:
-            return
-        self._waiting_for_initial_visuals = None
-        self._reveal_initial_story(repository)
+        if self._repository_matches_active(repository):
+            LOGGER.info(
+                "Initial visual asset batch finished; revealing opening for %s.",
+                repository.db_path,
+            )
+            self._finish_initial_visual_generation(repository)
 
     @Slot()
     def _clear_new_game_worker(
@@ -822,7 +1071,20 @@ class MainWindow(QMainWindow):
             db_path: Path to the save database.
         """
 
-        if not db_path.exists():
+        resolved_path = Path(db_path).expanduser().resolve()
+        LOGGER.info(
+            "Load Game requested: path=%s, exists=%s, is_file=%s, current_page=%s, "
+            "stack_index=%s.",
+            resolved_path,
+            resolved_path.exists(),
+            resolved_path.is_file(),
+            type(self.stack.currentWidget()).__name__
+            if self.stack.currentWidget() is not None
+            else None,
+            self.stack.currentIndex(),
+        )
+
+        if not resolved_path.exists():
             LOGGER.error("Attempted to load missing save database: %s", db_path)
             QMessageBox.warning(self, "Load Failed", "That save file no longer exists.")
             self.main_menu.refresh_saves()
@@ -834,13 +1096,35 @@ class MainWindow(QMainWindow):
                 "save_game_service",
                 SaveGameService(self.app_paths.saves_dir),
             )
-            repository = save_service.load(db_path)
+            LOGGER.info(
+                "Opening save repository through %s: %s.",
+                type(save_service).__name__,
+                resolved_path,
+            )
+            repository = save_service.load(resolved_path)
+            LOGGER.info(
+                "Save repository loaded: db_path=%s, inventory_items=%s, skills=%s.",
+                repository.db_path,
+                len(repository.list_inventory_items()),
+                len(repository.list_skills()),
+            )
         except Exception:
-            LOGGER.exception("Failed to load save from %s.", db_path)
+            LOGGER.exception("Failed to load save from %s.", resolved_path)
             QMessageBox.critical(self, "Load Failed", "Could not load that save.")
             return
 
+        LOGGER.info("Passing loaded repository to open_repository: %s.", repository.db_path)
         self.open_repository(repository)
+        LOGGER.info(
+            "Load Game completed: active_repository=%s, current_page=%s, stack_index=%s, "
+            "game_shell_visible=%s.",
+            self.active_repository is repository,
+            type(self.stack.currentWidget()).__name__
+            if self.stack.currentWidget() is not None
+            else None,
+            self.stack.currentIndex(),
+            self.game_shell.isVisible(),
+        )
 
     def open_repository(
         self,
@@ -855,10 +1139,22 @@ class MainWindow(QMainWindow):
             repository: Loaded save repository.
         """
 
+        LOGGER.info(
+            "Opening repository: db_path=%s, new_game=%s, previous_page=%s, "
+            "previous_stack_index=%s.",
+            repository.db_path,
+            new_game,
+            type(self.stack.currentWidget()).__name__
+            if self.stack.currentWidget() is not None
+            else None,
+            self.stack.currentIndex(),
+        )
         self.active_repository = repository
         self.game_shell.set_repository(
             repository,
             initially_hide_empty_tabs=new_game,
+            defer_music_playback=new_game and self.ai_enabled,
+            defer_visual_scan=new_game and self.ai_enabled,
         )
         self.game_shell.story_screen.set_initial_generation_pending(
             new_game and self.ai_enabled
@@ -866,10 +1162,58 @@ class MainWindow(QMainWindow):
         self._apply_active_theme()
         self.stack.setCurrentWidget(self.game_shell)
 
+        # Keep the load/new-game boundary explicit.  Audio preferences are
+        # applied while binding the repository, so a successful music change
+        # must never be mistaken for the page transition itself.
+        if self.stack.currentWidget() is not self.game_shell:
+            LOGGER.error(
+                "Repository opened but the game shell was not selected; forcing "
+                "the loaded-save page."
+            )
+            self.stack.setCurrentWidget(self.game_shell)
+
+        LOGGER.info(
+            "Bound save data to game shell: inventory_items=%s, skills=%s.",
+            len(repository.list_inventory_items()),
+            len(repository.list_skills()),
+        )
+        # A new-game commit or another queued repository notification can finish
+        # between the initial screen binding and the first paint. Refresh once
+        # on the next event-loop turn so data written at that boundary is visible
+        # without requiring the player to change tabs.
+        QTimer.singleShot(
+            0,
+            lambda repository=repository: self._refresh_open_repository(repository),
+        )
+
         title = repository.get_meta("title", default="AI Adventure")
         self.setWindowTitle(f"{self.application_name} - {title}")
 
-        LOGGER.info("Opened save: %s", repository.db_path)
+        LOGGER.info(
+            "Opened save: %s; current_page=%s, stack_index=%s, shell_visible=%s.",
+            repository.db_path,
+            type(self.stack.currentWidget()).__name__
+            if self.stack.currentWidget() is not None
+            else None,
+            self.stack.currentIndex(),
+            self.game_shell.isVisible(),
+        )
+
+    def _refresh_open_repository(self, repository: SaveRepository) -> None:
+        """Refreshes a still-active repository after its initial UI bind."""
+
+        if (
+            self.active_repository is repository
+            and self.stack.currentWidget() is self.game_shell
+        ):
+            LOGGER.info(
+                "Running post-bind repository refresh: db_path=%s, inventory_items=%s, "
+                "skills=%s.",
+                repository.db_path,
+                len(repository.list_inventory_items()),
+                len(repository.list_skills()),
+            )
+            self.game_shell.refresh_screens(scan_visual_assets=False)
 
     def return_to_menu(self) -> None:
         """Returns to the Main Menu."""

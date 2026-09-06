@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Callable, TypeVar, cast
 
 from PySide6.QtCore import QObject, QSize, Qt, QTime, QTimer
-from PySide6.QtGui import QPixmap
+from PySide6.QtGui import QPixmap, QTextCursor
 from PySide6.QtWidgets import (
     QAbstractSpinBox, QCheckBox, QComboBox, QFormLayout, QGroupBox, QLabel,
     QListWidget, QLineEdit, QPlainTextEdit, QPushButton, QScrollArea, QSlider,
@@ -352,14 +352,57 @@ def _add_combo_options(combo: QComboBox, options: dict[str, str]) -> None:
         combo.addItem(label, value)
 
 
-def _set_markdown_text(text_edit: QTextEdit, markdown_text: str) -> None:
-    """Sets read-only body text as Markdown when the Qt runtime supports it."""
+def _set_markdown_text(
+    text_edit: QTextEdit,
+    markdown_text: str,
+    *,
+    preserve_blank_lines: bool = False,
+) -> None:
+    """Sets read-only body text as Markdown when the Qt runtime supports it.
+
+    ``QTextDocument.setMarkdown`` intentionally collapses runs of blank lines
+    into one paragraph break.  Story prose uses blank lines as a deliberate
+    readability cue, so callers can request equivalent block spacing after the
+    Markdown has been parsed without sacrificing headings, emphasis, or lists.
+    """
 
     if hasattr(text_edit, "setMarkdown"):
         text_edit.setMarkdown(str(markdown_text or ""))
+        if preserve_blank_lines:
+            _preserve_markdown_blank_lines(text_edit)
         return
 
     text_edit.setPlainText(str(markdown_text or ""))
+
+
+def _preserve_markdown_blank_lines(text_edit: QTextEdit) -> None:
+    """Restores visible blank-line spacing between Markdown prose blocks."""
+
+    block = text_edit.document().begin()
+    while block.isValid():
+        cursor = QTextCursor(block)
+        # Keep the paragraph separator out of the selection. Qt otherwise
+        # applies the next block's format to the preceding paragraph as well.
+        cursor.setPosition(block.position())
+        cursor.movePosition(
+            QTextCursor.MoveOperation.EndOfBlock,
+            QTextCursor.MoveMode.KeepAnchor,
+        )
+        block_format = cursor.blockFormat()
+        is_list_item = block.textList() is not None
+        next_block_is_list = (
+            block.next().isValid() and block.next().textList() is not None
+        )
+
+        # A list item is already visually grouped with its neighboring items.
+        # The question immediately before the action list also uses one line
+        # break, while prose paragraphs use the larger intentional separation.
+        block_format.setTopMargin(0)
+        block_format.setBottomMargin(
+            0 if is_list_item or next_block_is_list else 12
+        )
+        cursor.setBlockFormat(block_format)
+        block = block.next()
 
 
 def _safe_int(value, default: int) -> int:

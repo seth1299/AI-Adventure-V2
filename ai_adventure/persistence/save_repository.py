@@ -4101,7 +4101,8 @@ class SaveRepository:
         clean_filename = filename_path.as_posix()
         if (
             not clean_asset_id
-            or clean_subject_type not in {"player", "location", "inventory", "npc"}
+            or clean_subject_type
+            not in {"player", "location", "inventory", "npc", "bestiary"}
             or not clean_subject_key
             or not clean_filename
             or filename_path.is_absolute()

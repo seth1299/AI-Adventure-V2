@@ -159,7 +159,9 @@ class VisualAssetRequest:
         banned_terms = self.banned_terms or default_banned_creative_terms()
         banned_text = ", ".join(banned_terms) or "None"
         text_instructions = self.text_instructions or (
-            "No readable text is permitted because the subject does not call for it."
+            "No readable text is permitted because the subject does not call for it. "
+            "The supplied subject name and description are metadata for the artist, "
+            "not words to render in the image."
         )
         return (
             "Generate one cohesive image for AI Adventure. "
@@ -178,6 +180,9 @@ class VisualAssetRequest:
             "texture, materials, and lighting.\n\n"
             f"Subject name: {self.display_name}\n"
             f"Player-visible description: {self.description}\n"
+            "The Subject name and Player-visible description above are metadata only. "
+            "Do not copy them into the image as text unless the exact-label rules below "
+            "explicitly authorize that specific label.\n"
             "Text and label instructions (follow exactly; never invent readable text):\n"
             f"{text_instructions}\n"
             "Forbidden words and names: do not render any of these exact terms, close "
@@ -440,7 +445,10 @@ def _text_instructions_for_subject(
 
     combined = f"{display_name} {description}".casefold()
     if not any(hint in combined for hint in _TEXT_BEARING_HINTS):
-        return "No readable text is permitted because the subject does not call for it."
+        return (
+            "No readable text is permitted because the subject does not call for it. "
+            "The subject name is metadata only and must not be rendered."
+        )
 
     approved = [
         display_name.strip(),
@@ -448,11 +456,6 @@ def _text_instructions_for_subject(
     ]
     unique_approved = list(dict.fromkeys(name for name in approved if name))
     labels = ", ".join(f'"{name}"' for name in unique_approved)
-    coordinate_lines = [
-        f'"{name}": x_miles={x:g}, y_miles={y:g}'
-        for name, x, y in known_location_positions
-        if x is not None and y is not None
-    ]
     relation_lines: list[str] = []
     for index, (left_name, left_x, left_y) in enumerate(known_location_positions):
         if left_x is None or left_y is None:
@@ -472,11 +475,11 @@ def _text_instructions_for_subject(
                     f'{horizontal} of "{left_name}".'
                 )
     directional_rules = (
-        "Use a north-facing compass rose with north at the top: x_miles increases "
-        "eastward (right) and y_miles increases northward (up). Preserve these exact "
-        "coordinates and pairwise relationships; never mirror, rotate, or rearrange "
-        "the map.\n"
-        + ("Coordinate anchors: " + "; ".join(coordinate_lines) + "\n" if coordinate_lines else "")
+        "Use a north-facing compass rose with north at the top. Place locations using "
+        "only the directional relationships below: east is right, west is left, north "
+        "is up, and south is down. Preserve those relationships; never mirror, rotate, "
+        "or rearrange the map. Never render coordinates, coordinate pairs, numeric "
+        "anchors, internal IDs, or other hidden map metadata anywhere in the image.\n"
         + ("Directional relationships: " + " ".join(relation_lines) if relation_lines else "")
     )
     return (

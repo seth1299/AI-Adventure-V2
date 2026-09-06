@@ -116,9 +116,10 @@ class GeminiSkillCheckPlanWorker(QObject):
 
 
 class GeminiNewGameWorker(QObject):
-    """Runs one Gemini new-game request away from the Qt UI thread."""
+    """Runs staged Gemini new-game generation away from the Qt UI thread."""
 
     completed = Signal(object)
+    phase_changed = Signal(str)
     configuration_error = Signal(str)
     request_failed = Signal(str)
     failed = Signal()
@@ -134,10 +135,19 @@ class GeminiNewGameWorker(QObject):
         try:
             if GeminiNarrationService is None:
                 raise GeminiConfigurationError("AI generation is disabled in this build.")
-            result = GeminiNarrationService(
+            service = GeminiNarrationService(
                 api_key_path=self._api_key_path,
                 model=_text_model_from_ai_packet(self._setup_packet),
-            ).generate_new_game_world(self._setup_packet)
+            )
+            staged_generator = getattr(service, "generate_new_game_world_staged", None)
+            if callable(staged_generator):
+                result = staged_generator(
+                    self._setup_packet,
+                    progress_callback=self.phase_changed.emit,
+                )
+            else:
+                # Keeps lightweight test doubles and older integrations usable.
+                result = service.generate_new_game_world(self._setup_packet)
         except GeminiConfigurationError as error:
             LOGGER.warning("Gemini new-game synthesis skipped: %s", error)
             self.configuration_error.emit(str(error))

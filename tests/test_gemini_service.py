@@ -28,6 +28,8 @@ from ai_adventure.ai.gemini_service import (
     GeminiSettings,
     build_skill_check_plan_prompt,
     build_gemini_new_game_prompt,
+    build_gemini_new_game_phase_prompt,
+    build_new_game_phase_schema,
     build_new_game_response_schema,
     build_story_response_schema,
     build_gemini_story_prompt,
@@ -3260,6 +3262,146 @@ class GeminiServiceTests(unittest.TestCase):
         self.assertNotIn("events", schema["properties"])
         self.assertIn('"required_output_fields"', call["contents"])
         self.assertNotIn('"character_generation"', call["contents"])
+
+    def test_staged_new_game_generation_uses_three_canonical_phases(self) -> None:
+        packet = self._completed_new_game_packet(start_location_mode="exact")
+        world_response = {
+            "world_summary": "A compact city of steep roofs and narrow alleys.",
+            "locations": [],
+            "weather": "Clear",
+            "starting_currency_balance_base_units": 20,
+        }
+        entities_response = {
+            "gm_secrets": [],
+            "miscellaneous": [],
+            "bestiary": [],
+            "starting_items": [
+                {
+                    "name": f"Useful Item {index}",
+                    "category": "Tool",
+                    "quantity": 1,
+                    "quantity_unit": "each",
+                    "storage_location": "actively_carried",
+                    "description": "A useful personal item.",
+                    "value_base_units": index + 1,
+                    "source_index": -1,
+                }
+                for index in range(5)
+            ],
+            "known_crafting_items": [],
+            "known_crafting_recipes": [],
+        }
+        opening_response = {
+            "introductory_message": "Morning light reaches the loft.",
+            "suggested_actions": ["Look outside.", "Check your gear.", "Leave quietly."],
+            "opening_cues": [],
+        }
+        fake_client_class = self._install_fake_genai_client(
+            [
+                json.dumps(world_response),
+                json.dumps(entities_response),
+                json.dumps(opening_response),
+            ]
+        )
+        progress: list[str] = []
+
+        try:
+            result = GeminiNarrationService(
+                GeminiSettings(api_key="test-key", model="gemini-3.5-flash-lite")
+            ).generate_new_game_world_staged(
+                packet,
+                progress_callback=progress.append,
+            )
+        finally:
+            self._remove_fake_genai_client()
+
+        calls = fake_client_class.last_client.models.calls
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(
+            progress,
+            [
+                "setup_compilation",
+                "world_skeleton",
+                "targeted_repairs",
+                "entities_mechanics",
+                "targeted_repairs",
+                "opening_prose",
+                "targeted_repairs",
+                "final_commit",
+            ],
+        )
+        self.assertEqual(result.world_summary, world_response["world_summary"])
+        self.assertEqual(
+            result.finalized_starter_items[0]["name"],
+            "Useful Item 0",
+        )
+        self.assertIn(opening_response["introductory_message"], result.introductory_message)
+        self.assertIn("world_skeleton", calls[0]["contents"])
+        self.assertIn("entities_mechanics", calls[1]["contents"])
+        self.assertIn("opening_prose", calls[2]["contents"])
+        self.assertIn("approved_state", calls[1]["contents"])
+        self.assertIn("approved_state", calls[2]["contents"])
+
+    def test_new_game_phase_prompt_requires_directionally_consistent_map(self) -> None:
+        prompt = build_gemini_new_game_phase_prompt(
+            {"packet_type": "new_game_setup", "setup": {}},
+            "world_skeleton",
+        )
+
+        self.assertIn("north-facing compass", prompt)
+        self.assertIn("east is right and west is left", prompt)
+        self.assertIn("Return no NPCs, creatures, items, secrets, or opening prose", prompt)
+        schema = build_new_game_phase_schema(
+            {"packet_type": "new_game_setup", "setup": {}},
+            "world_skeleton",
+        )
+        self.assertEqual(
+            set(schema["properties"]),
+            {
+                "selected_genre",
+                "world_summary",
+                "locations",
+                "start_location",
+                "weather",
+                "currency_denominations",
+                "currency_description",
+                "starting_currency_balance_base_units",
+            },
+        )
+
+    def test_staged_opening_does_not_validate_suggestions_in_prose(self) -> None:
+        packet = {
+            "packet_type": "new_game_setup",
+            "setup": {
+                "start_location": "Suggested City",
+                "start_location_mode": "suggestion",
+                "starting_locations": [
+                    {
+                        "name": "Suggested City",
+                        "description": "A city of canals and clock towers.",
+                        "location_mode": "suggestion",
+                    }
+                ],
+            },
+        }
+        opening = json.dumps(
+            {
+                "introductory_message": (
+                    "You arrive in Suggested City beneath the clock towers."
+                ),
+                "suggested_actions": [],
+                "opening_cues": [],
+            }
+        )
+
+        self.assertEqual(
+            _unfinalized_suggested_setup_paths(
+                opening,
+                packet,
+                suggestion_scopes=set(),
+            ),
+            [],
+        )
 
     def test_new_game_retries_incomplete_response_without_output_cap(self) -> None:
         packet = self._completed_new_game_packet(start_location_mode="exact")
