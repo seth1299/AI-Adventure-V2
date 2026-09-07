@@ -18,10 +18,10 @@ class TravelScreen(RepositoryBackedWidget):
         self.location_list = QListWidget()
         self.location_list.currentItemChanged.connect(self._display_selected_location)
 
-        self.details_output = QTextEdit()
-        self.details_output.setReadOnly(True)
+        self.details_output = MarkdownDisplay()
+        self.details_output.setObjectName("travelLocationDetails")
 
-        self.location_image_label = QLabel()
+        self.location_image_label = ClickableImageLabel()
         self.location_image_label.setObjectName("travelLocationImage")
         self.location_image_label.hide()
 
@@ -93,7 +93,7 @@ class TravelScreen(RepositoryBackedWidget):
 
         if self.location_list.count() == 0:
             self.location_image_label.hide()
-            self.details_output.setPlainText("No locations are known yet.")
+            _set_markdown_text(self.details_output, "No locations are known yet.")
             self.travel_button.setEnabled(False)
             return
 

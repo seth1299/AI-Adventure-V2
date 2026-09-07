@@ -9,7 +9,7 @@ from ai_adventure.infrastructure.sqlite import SaveRepository
 from ai_adventure.infrastructure.images import (
     VisualAssetRequest,
     build_visual_asset_requests,
-    find_reusable_inventory_asset,
+    find_reusable_visual_asset,
     save_relative_image_filename,
 )
 
@@ -37,7 +37,7 @@ class AssetGenerationService:
         repository: SaveRepository,
         request: VisualAssetRequest,
     ) -> dict[str, Any] | None:
-        return find_reusable_inventory_asset(
+        return find_reusable_visual_asset(
             images_dir=images_dir,
             saves_dir=saves_dir,
             repository=repository,

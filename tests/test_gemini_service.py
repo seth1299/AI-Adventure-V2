@@ -260,12 +260,25 @@ class GeminiServiceTests(unittest.TestCase):
         npc_payload = schema["properties"]["starting_npcs"]["items"]
         self.assertEqual(
             npc_payload["required"],
-            ["npc_id", "name", "location", "public_description", "party_member"],
+            [
+                "npc_id",
+                "name",
+                "location",
+                "public_description",
+                "player_facing_information",
+                "party_member",
+                "gender_identity",
+                "age",
+                "species",
+            ],
         )
         self.assertNotIn("display_name", npc_payload["required"])
         self.assertIn("party_combat_style", npc_payload["properties"])
         self.assertIn("party_skills", npc_payload["properties"])
         self.assertIn("gender_identity", npc_payload["properties"])
+        self.assertIn("player_facing_information", npc_payload["properties"])
+        self.assertIn("age", npc_payload["properties"])
+        self.assertIn("species", npc_payload["properties"])
         self.assertIn("starting_npcs", schema["required"])
         self.assertIn("starting_task", schema["required"])
         self.assertNotIn("events", schema["properties"])
@@ -602,6 +615,7 @@ class GeminiServiceTests(unittest.TestCase):
                 "Main City",
                 "A large politically divided city.",
                 "Overarching Region",
+                "Guild Contact",
                 "The player's discreet guild contact.",
             ),
         )
@@ -611,6 +625,7 @@ class GeminiServiceTests(unittest.TestCase):
                 "The Rusty Dagger Inn",
                 "Main City",
                 "A large politically divided city.",
+                "Guild Contact",
                 "The player's discreet guild contact.",
             ],
         )
@@ -620,6 +635,7 @@ class GeminiServiceTests(unittest.TestCase):
                 "start_location",
                 "locations[source_index=0].name",
                 "locations[source_index=0].description",
+                "starting_npcs[0].name",
                 "starting_npcs[0].public_description",
             ],
         )
@@ -1034,6 +1050,30 @@ class GeminiServiceTests(unittest.TestCase):
         self.assertIn("MusicChangedEvent", event_types)
         self.assertNotIn("SoundEffectChangedEvent", event_types)
 
+    def test_story_schema_always_allows_meaningful_npc_memory_events(self) -> None:
+        schema = build_story_response_schema(
+            {
+                "selection": {"tags": ["inventory"]},
+                "state": {
+                    "audio": {
+                        "valid_music_tracks": [],
+                        "valid_sound_effect_tracks": [],
+                        "valid_background_ambience_tracks": [],
+                    }
+                },
+            }
+        )
+        event_schema = schema["properties"]["events"]["items"]
+        branches = event_schema.get("anyOf", [event_schema])
+        event_types = {
+            branch["properties"]["type"]["enum"][0]
+            for branch in branches
+        }
+
+        self.assertIn("NpcUpsertedEvent", event_types)
+        self.assertIn("NpcKnowledgeAddedEvent", event_types)
+        self.assertIn("InventoryItemAddedEvent", event_types)
+
     def test_narrative_combat_schema_omits_combat_started_event(self) -> None:
         schema = build_story_response_schema(
             {
@@ -1295,6 +1335,36 @@ class GeminiServiceTests(unittest.TestCase):
 
         self.assertEqual(result.speaker_cues[0]["speaker_id"], "captain_orin")
         self.assertEqual(result.speaker_cues[0]["voice_profile"], "deep_masculine")
+
+    def test_new_game_parser_extracts_optional_starting_notes(self) -> None:
+        result = parse_gemini_new_game_response(
+            json.dumps(
+                {
+                    "world_summary": "A settlement facing an outbreak.",
+                    "introductory_message": "The day begins.",
+                    "starting_notes": [
+                        {
+                            "heading": "Outbreak Symptoms",
+                            "body": "Fever and confusion are commonly reported first.",
+                            "tags": ["survival", "Survival"],
+                        },
+                        {"heading": "", "body": "", "tags": []},
+                    ],
+                }
+            )
+        )
+
+        self.assertEqual(
+            result.starting_notes,
+            [
+                {
+                    "entry_id": "starting_note_1",
+                    "heading": "Outbreak Symptoms",
+                    "body": "Fever and confusion are commonly reported first.",
+                    "tags": ["survival"],
+                }
+            ],
+        )
 
     def test_new_game_starter_items_preserve_free_text_storage_location(self) -> None:
         item_schema = NEW_GAME_RESPONSE_JSON_SCHEMA["properties"]["starting_items"]["items"]
@@ -2982,6 +3052,18 @@ class GeminiServiceTests(unittest.TestCase):
         self.assertIn(
             "rediscover something they knowingly did",
             secret_schema["properties"]["reveal_condition"]["description"],
+        )
+        starting_notes_schema = NEW_GAME_RESPONSE_JSON_SCHEMA["properties"][
+            "starting_notes"
+        ]
+        self.assertNotIn("starting_notes", NEW_GAME_RESPONSE_JSON_SCHEMA["required"])
+        self.assertEqual(
+            starting_notes_schema["items"]["required"],
+            ["heading", "body", "tags"],
+        )
+        self.assertIn(
+            "Player Character",
+            starting_notes_schema["description"],
         )
         self.assertIn(
             "$.status is not allowed",

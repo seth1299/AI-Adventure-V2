@@ -424,6 +424,9 @@ class NewGameService:
             if value:
                 repository.set_setting(setting_key, value)
 
+        starting_notes = getattr(result, "starting_notes", [])
+        repository.set_note_entries(starting_notes)
+
         pronunciation_map = merge_pronunciation_maps(
             setup.get("pronunciation_map", {}),
             getattr(result, "pronunciation_map", {}),
@@ -492,9 +495,11 @@ class NewGameService:
         repository.replace_inventory_items(finalized_starter_items)
 
         LOGGER.info(
-            "Committed new-game starting state: inventory_items=%s, skills=%s.",
+            "Committed new-game starting state: inventory_items=%s, skills=%s, "
+            "starting_notes=%s.",
             len(repository.list_inventory_items()),
             len(repository.list_skills()),
+            len(repository.get_note_entries()),
         )
 
         _apply_new_game_crafting_knowledge(

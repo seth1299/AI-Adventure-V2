@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import queue
+import logging
 import sys
 import threading
 import types
@@ -46,10 +47,30 @@ from ai_adventure.audio.tts.tts_manager import (
     KokoroOnnxTTSEngine,
     PyKokoroTTSEngine,
     TTSRequest,
+    _BenignPhonemizerWarningFilter,
 )
 
 
 class AudioTests(unittest.TestCase):
+    def test_phonemizer_filter_suppresses_only_known_summary_warning(self) -> None:
+        warning_filter = _BenignPhonemizerWarningFilter()
+        benign = logging.LogRecord(
+            "phonemizer", logging.WARNING, __file__, 1,
+            "words count mismatch on 200.0% of the lines (2/1)", (), None,
+        )
+        other_summary = logging.LogRecord(
+            "phonemizer", logging.WARNING, __file__, 1,
+            "words count mismatch on 100% of the lines (1/1)", (), None,
+        )
+        other = logging.LogRecord(
+            "phonemizer", logging.WARNING, __file__, 1,
+            "words count mismatch on line 1 (expected 2 words but get 1)", (), None,
+        )
+
+        self.assertFalse(warning_filter.filter(benign))
+        self.assertFalse(warning_filter.filter(other_summary))
+        self.assertTrue(warning_filter.filter(other))
+
     def test_speaker_voice_assignments_are_distinct_and_durable(self) -> None:
         cues = [
             {
@@ -283,6 +304,18 @@ class AudioTests(unittest.TestCase):
 
         self.assertIn("seven in the morning", plain_text)
         self.assertIn("six oh five in the evening", plain_text)
+
+    def test_sanitize_tts_text_pronounces_leading_decimal_calibers(self) -> None:
+        text = sanitize_tts_text("She carries a .38 Special beside a 3.8 vial.")
+
+        self.assertIn("point thirty eight Special", text)
+        self.assertIn("3.8 vial", text)
+
+    def test_sanitize_tts_text_does_not_speak_markdown_escape_backslashes(self) -> None:
+        text = sanitize_tts_text(r'Vera said: \"I saw \*someone\* near the door.\"')
+
+        self.assertNotIn("\\", text)
+        self.assertIn('"I saw someone near the door."', text)
 
     def test_normalize_tts_time_text_handles_midnight_noon_and_minutes(self) -> None:
         text = normalize_tts_time_text(

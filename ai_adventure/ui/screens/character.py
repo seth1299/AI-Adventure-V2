@@ -147,7 +147,7 @@ class CharacterScreen(RepositoryBackedWidget):
 
         self.portrait_group = QGroupBox("Portrait")
         portrait_layout = QVBoxLayout()
-        self.portrait_label = QLabel()
+        self.portrait_label = ClickableImageLabel()
         self.portrait_label.setMinimumWidth(220)
         portrait_layout.addWidget(self.portrait_label, 0, Qt.AlignmentFlag.AlignHCenter)
         self.portrait_group.setLayout(portrait_layout)

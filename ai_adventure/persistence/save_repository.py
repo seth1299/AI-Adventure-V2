@@ -32,7 +32,7 @@ from ai_adventure.ai.model_catalog import (
     DEFAULT_IMAGE_MODEL,
     normalize_image_preferences,
 )
-from ai_adventure.ai.image_styles import DEFAULT_IMAGE_STYLE
+from ai_adventure.ai.image_styles import DEFAULT_IMAGE_STYLE, normalize_image_style
 from ai_adventure.calendar_system import (
     DEFAULT_CALENDAR_SETTINGS,
     DEFAULT_START_ELAPSED_MINUTES,
@@ -4365,9 +4365,10 @@ class SaveRepository:
                     content,
                     sound_effect_cues_json,
                     speaker_cues_json,
+                    hidden,
                     created_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, 0, ?)
                 """,
                 (
                     resolved_message_id,
@@ -4477,7 +4478,7 @@ class SaveRepository:
             rows = connection.execute(
                 """
                 SELECT id, message_id, kind, content, sound_effect_cues_json,
-                       speaker_cues_json, created_at
+                       speaker_cues_json, hidden, created_at
                 FROM history_entries
                 ORDER BY id ASC
                 """
@@ -4486,6 +4487,7 @@ class SaveRepository:
         history: list[dict[str, Any]] = []
         for row in rows:
             entry = dict(row)
+            entry["hidden"] = bool(entry.get("hidden", 0))
             entry["content"] = sanitize_english_text(entry.get("content", ""))
             try:
                 raw_cues = json.loads(str(entry.pop("sound_effect_cues_json", "[]")))
@@ -4538,6 +4540,16 @@ class SaveRepository:
             history.append(entry)
         return history
 
+    def set_history_entry_hidden(self, history_entry_id: int, hidden: bool) -> bool:
+        """Hides or restores one conversation entry without deleting its history."""
+
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "UPDATE history_entries SET hidden = ? WHERE id = ?",
+                (1 if hidden else 0, int(history_entry_id)),
+            )
+            return cursor.rowcount > 0
+
     def ensure_visual_asset(
         self,
         *,
@@ -4551,6 +4563,9 @@ class SaveRepository:
         model: str,
         message_ids: tuple[str, ...] | list[str] = (),
         ready: bool = False,
+        image_style: str = "",
+        visual_description: str = "",
+        resolution_tier: str = "",
     ) -> dict[str, Any]:
         """Creates one versioned visual-asset record and links related messages."""
 
@@ -4572,20 +4587,32 @@ class SaveRepository:
 
         timestamp = datetime.now().isoformat(timespec="seconds")
         requested_status = "ready" if ready else "queued"
+        raw_image_style = str(image_style or "").strip()
+        clean_image_style = (
+            normalize_image_style(raw_image_style) if raw_image_style else ""
+        )
+        clean_visual_description = " ".join(
+            str(visual_description or "").split()
+        ).strip()
+        clean_resolution_tier = str(resolution_tier or "").strip().upper()
         with self._connect() as connection:
             connection.execute(
                 """
                 INSERT INTO visual_assets (
                     asset_id, subject_type, subject_key, display_name,
-                    descriptor_hash, filename, prompt, model, status,
-                    error_message, width, height, created_at, updated_at
+                    descriptor_hash, filename, prompt, model, image_style,
+                    visual_description, resolution_tier, status, error_message,
+                    width, height, created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, '', 0, 0, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', 0, 0, ?, ?)
                 ON CONFLICT(asset_id) DO UPDATE SET
                     display_name = excluded.display_name,
                     filename = excluded.filename,
                     prompt = excluded.prompt,
                     model = excluded.model,
+                    image_style = excluded.image_style,
+                    visual_description = excluded.visual_description,
+                    resolution_tier = excluded.resolution_tier,
                     status = CASE
                         WHEN visual_assets.status = 'ready' THEN 'ready'
                         WHEN excluded.status = 'ready' THEN 'ready'
@@ -4602,6 +4629,9 @@ class SaveRepository:
                     clean_filename,
                     str(prompt or "").strip(),
                     str(model or "").strip(),
+                    clean_image_style,
+                    clean_visual_description,
+                    clean_resolution_tier,
                     requested_status,
                     timestamp,
                     timestamp,
@@ -5992,6 +6022,7 @@ class SaveRepository:
                     content TEXT NOT NULL,
                     sound_effect_cues_json TEXT NOT NULL DEFAULT '[]',
                     speaker_cues_json TEXT NOT NULL DEFAULT '[]',
+                    hidden INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL
                 );
 
@@ -6025,6 +6056,9 @@ class SaveRepository:
                     filename TEXT NOT NULL,
                     prompt TEXT NOT NULL,
                     model TEXT NOT NULL,
+                    image_style TEXT NOT NULL DEFAULT '',
+                    visual_description TEXT NOT NULL DEFAULT '',
+                    resolution_tier TEXT NOT NULL DEFAULT '',
                     status TEXT NOT NULL DEFAULT 'queued',
                     error_message TEXT NOT NULL DEFAULT '',
                     width INTEGER NOT NULL DEFAULT 0,
@@ -6062,6 +6096,30 @@ class SaveRepository:
                 "visual_assets",
                 "generation_requested",
                 "INTEGER NOT NULL DEFAULT 0",
+            )
+            _ensure_column(
+                connection,
+                "visual_assets",
+                "image_style",
+                "TEXT NOT NULL DEFAULT ''",
+            )
+            _ensure_column(
+                connection,
+                "visual_assets",
+                "visual_description",
+                "TEXT NOT NULL DEFAULT ''",
+            )
+            _ensure_column(
+                connection,
+                "visual_assets",
+                "resolution_tier",
+                "TEXT NOT NULL DEFAULT ''",
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_visual_assets_reuse
+                ON visual_assets(subject_type, image_style, resolution_tier, status)
+                """
             )
             _ensure_column(
                 connection,
@@ -6152,6 +6210,12 @@ class SaveRepository:
                 "history_entries",
                 "speaker_cues_json",
                 "TEXT NOT NULL DEFAULT '[]'",
+            )
+            _ensure_column(
+                connection,
+                "history_entries",
+                "hidden",
+                "INTEGER NOT NULL DEFAULT 0",
             )
             _ensure_column(
                 connection,

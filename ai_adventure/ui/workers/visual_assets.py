@@ -156,6 +156,9 @@ class _VisualAssetCoordinator(QObject):
                     filename=relative_filename,
                     prompt=request.prompt,
                     model=model,
+                    image_style=request.image_style,
+                    visual_description=request.description,
+                    resolution_tier=request.image_size,
                     message_ids=request.message_ids,
                     ready=target_path.is_file(),
                 )
@@ -313,13 +316,14 @@ class _VisualAssetCoordinator(QObject):
         image_bytes: bytes,
         _mime_type: str,
     ) -> None:
-        """Downscales and records one completed generated image."""
+        """Normalizes and records one completed generated image."""
 
         try:
-            width, height = save_scaled_jpeg(
+            width, height = save_scaled_png(
                 image_bytes,
                 self.images_dir
                 / save_relative_image_filename(repository, request),
+                max_pixels=request.maximum_pixels,
             )
         except Exception as error:
             LOGGER.warning("Failed to save generated image %s: %s", request.filename, error)

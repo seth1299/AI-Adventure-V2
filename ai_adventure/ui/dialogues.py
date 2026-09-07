@@ -3489,8 +3489,7 @@ class CalendarDayEventsDialog(QDialog):
 
         self.event_list = QListWidget()
         self.event_list.currentItemChanged.connect(self._show_selected_event)
-        self.details_output = QTextEdit()
-        self.details_output.setReadOnly(True)
+        self.details_output = MarkdownDisplay()
 
         self.edit_button = QPushButton("Edit Personal Event")
         self.edit_button.clicked.connect(self._edit_selected_event)
@@ -3572,7 +3571,7 @@ class CalendarDayEventsDialog(QDialog):
             sections.append(description)
         if details and details != description:
             sections.append(details)
-        self.details_output.setPlainText("\n\n".join(sections))
+        _set_markdown_text(self.details_output, "\n\n".join(sections))
 
     def _edit_selected_event(self) -> None:
         """Edits only a player-authored event."""
@@ -3718,14 +3717,13 @@ class CalendarSettingsDialog(QDialog):
 
 
 class InventoryItemDetailsDialog(QDialog):
-    """Application-modal view of one inventory item's player-facing details."""
+    """Resizable, modeless view of one inventory item's player-facing details."""
 
     def __init__(
         self,
         *,
         item: dict[str, Any],
         catalog_entry: dict[str, Any] | None,
-        denominations: list[dict[str, Any]],
         image_path: Path | None = None,
         show_structured_details: bool = False,
         parent: QWidget | None = None,
@@ -3738,44 +3736,40 @@ class InventoryItemDetailsDialog(QDialog):
             quantity,
             quantity_unit,
         )
-        self.setWindowTitle(name)
-        self.setModal(True)
-        self.setWindowModality(Qt.WindowModality.ApplicationModal)
-        self.setMinimumSize(520, 520 if show_structured_details else 440)
+        self.setModal(False)
+        self.setWindowModality(Qt.WindowModality.NonModal)
+        self.setWindowFlags(
+            self.windowFlags()
+            | Qt.WindowType.WindowMinimizeButtonHint
+            | Qt.WindowType.WindowMaximizeButtonHint
+        )
+        self.setMinimumSize(300, 420)
         self.setSizeGripEnabled(True)
 
         title = QLabel(name)
         title.setObjectName("inventoryItemDetailTitle")
         title.setStyleSheet("font-size: 20px; font-weight: 700;")
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
-        storage_location = _inventory_location_label(
-            item.get("storage_location", "actively_carried")
+        quantity_suffix = (
+            f" ({_inventory_quantity_display(quantity, quantity_unit)})"
+            if quantity != 1
+            else ""
         )
+        title.setText(f"{name}{quantity_suffix}")
+        self.setWindowTitle(title.text())
         summary = QFormLayout()
-        summary.addRow("Category:", _selectable_label(item.get("category", "")))
-        summary.addRow(
-            "Quantity:",
-            _selectable_label(_inventory_quantity_display(quantity, quantity_unit)),
-        )
-        summary.addRow("Stored at:", _selectable_label(storage_location))
-        summary.addRow(
-            "Value:",
-            _selectable_label(
-                format_currency_amount(
-                    max(0, _safe_int(item.get("value_base_units", 0), 0)),
-                    denominations,
-                )
-            ),
-        )
         if any(item_is_valid_for_slot(item, slot) for slot in EQUIPMENT_SLOTS):
             summary.addRow(
                 "Equipped:",
                 _selectable_label("Yes" if item.get("equipped") else "No"),
             )
 
-        description = QTextEdit()
-        description.setReadOnly(True)
-        description.setPlainText(str(item.get("description", "")) or "No description.")
+        description = MarkdownDisplay()
+        _set_markdown_text(
+            description,
+            str(item.get("description", "")) or "No description.",
+        )
         description.setMaximumHeight(100)
 
         metadata_view: QPlainTextEdit | None = None
@@ -3809,7 +3803,7 @@ class InventoryItemDetailsDialog(QDialog):
 
         layout = QVBoxLayout()
         layout.addWidget(title)
-        generated_image = QLabel()
+        generated_image = ClickableImageLabel()
         generated_image.setObjectName("inventoryGeneratedImage")
         if _set_generated_image(
             generated_image,
@@ -3819,7 +3813,8 @@ class InventoryItemDetailsDialog(QDialog):
             accessible_name=f"Generated image of {name}",
         ):
             layout.addWidget(generated_image, 0, Qt.AlignmentFlag.AlignHCenter)
-        layout.addLayout(summary)
+        if summary.rowCount():
+            layout.addLayout(summary)
         layout.addWidget(QLabel("Description"))
         layout.addWidget(description)
         if metadata_view is not None:
@@ -3831,8 +3826,16 @@ class InventoryItemDetailsDialog(QDialog):
             layout.addLayout(catalog_form)
         layout.addWidget(buttons)
         self.setLayout(layout)
+        image_pixmap = generated_image.pixmap()
+        image_width = (
+            image_pixmap.width()
+            if image_pixmap is not None and not image_pixmap.isNull()
+            else 0
+        )
+        initial_width = image_width + 24 if image_width else 420
+        initial_width = max(300, initial_width)
         self.resize(
-            560,
+            initial_width,
             580 if show_structured_details else 500,
         )
 
@@ -3878,18 +3881,20 @@ class NpcDetailsDialog(QDialog):
             _selectable_label(npc.get("species", "") or "Not specified"),
         )
 
-        description = QTextEdit()
+        description = MarkdownDisplay()
         description.setObjectName("npcDetailDescription")
-        description.setReadOnly(True)
-        description.setPlainText(
-            str(npc.get("description", "") or "No description recorded.")
+        _set_markdown_text(
+            description,
+            str(npc.get("description", "") or "No description recorded."),
         )
         description.setMinimumHeight(100)
 
-        notes = QTextEdit()
+        notes = MarkdownDisplay()
         notes.setObjectName("npcDetailNotes")
-        notes.setReadOnly(True)
-        notes.setPlainText(str(npc.get("notes", "") or "No notes recorded."))
+        _set_markdown_text(
+            notes,
+            str(npc.get("notes", "") or "No notes recorded."),
+        )
         notes.setMinimumHeight(100)
 
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
@@ -3897,7 +3902,7 @@ class NpcDetailsDialog(QDialog):
 
         layout = QVBoxLayout()
         layout.addWidget(title)
-        generated_image = QLabel()
+        generated_image = ClickableImageLabel()
         generated_image.setObjectName("npcGeneratedDetailImage")
         if _set_generated_image(
             generated_image,

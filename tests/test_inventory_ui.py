@@ -378,6 +378,10 @@ class InventoryUiTests(unittest.TestCase):
             [bar.format() for bar in image_bars],
             ["Cost: 5/5", "Quality: 5/5", "Speed: 2/5"],
         )
+        self.assertIn("#d9534f", text_bars[0].styleSheet())
+        self.assertIn("#d9534f", image_bars[0].styleSheet())
+        self.assertIn("#2eaf62", image_bars[1].styleSheet())
+        self.assertIn("#d9534f", image_bars[2].styleSheet())
         self.assertFalse(wizard.image_model_combo.isEnabled())
         self.assertFalse(wizard.image_style_combo.isEnabled())
         setup = wizard.build_setup()
@@ -1442,6 +1446,7 @@ class InventoryUiTests(unittest.TestCase):
                 speaker_cues=[speaker_cue],
             )
             repository.append_history("player", "I follow.")
+            repository.append_history("player_oog", "What is the name of this town?")
 
             images_dir = root / "images"
             images_dir.mkdir(parents=True)
@@ -1478,6 +1483,41 @@ class InventoryUiTests(unittest.TestCase):
                 {portrait.accessibleName() for portrait in portraits},
                 {"Profile picture of Mira", "Profile picture of You"},
             )
+            screen.close()
+
+    def test_hidden_conversation_messages_are_omitted_and_can_be_restored(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = SaveRepository.create_new_save(Path(temp_dir), "Hidden UI Test")
+            repository.append_history("story", "The first visible scene.")
+            repository.append_history("story", "The scene the player hid.")
+            hidden_id = int(repository.list_history()[-1]["id"])
+            repository.append_history("story", "The later visible scene.")
+            repository.set_history_entry_hidden(hidden_id, True)
+
+            screen = StoryScreen()
+            screen.set_repository(repository)
+            screen.show()
+            self.app.processEvents()
+
+            rendered_text = "\n".join(
+                message.toPlainText()
+                for message in screen.findChildren(QTextEdit)
+            )
+            self.assertIn("The first visible scene.", rendered_text)
+            self.assertNotIn("The scene the player hid.", rendered_text)
+            self.assertIn("The later visible scene.", rendered_text)
+            self.assertTrue(screen.view_hidden_messages_button.isVisible())
+            self.assertIn("(1)", screen.view_hidden_messages_button.text())
+
+            repository.set_history_entry_hidden(hidden_id, False)
+            screen.refresh()
+            self.app.processEvents()
+            rendered_text = "\n".join(
+                message.toPlainText()
+                for message in screen.findChildren(QTextEdit)
+            )
+            self.assertIn("The scene the player hid.", rendered_text)
+            self.assertFalse(screen.view_hidden_messages_button.isVisible())
             screen.close()
 
     def test_named_speaker_bubble_reads_only_its_saved_voice_passage(self) -> None:
@@ -2317,7 +2357,7 @@ class InventoryUiTests(unittest.TestCase):
             )
             shell.close()
 
-    def test_inventory_uses_location_panels_and_modal_details(self) -> None:
+    def test_inventory_uses_location_panels_and_modeless_details(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             repository = SaveRepository.create_new_save(Path(temp_dir), "Inventory UI Test")
             repository.add_inventory_item(
@@ -2363,28 +2403,40 @@ class InventoryUiTests(unittest.TestCase):
             dialog = InventoryItemDetailsDialog(
                 item=compass,
                 catalog_entry=catalog_entry,
-                denominations=screen._denominations,
                 parent=screen,
             )
-            self.assertTrue(dialog.isModal())
+            self.assertFalse(dialog.isModal())
             self.assertEqual(
                 dialog.windowModality(),
-                Qt.WindowModality.ApplicationModal,
+                Qt.WindowModality.NonModal,
             )
             self.assertIsNone(dialog.findChild(QPlainTextEdit, "inventoryAsciiArt"))
             dialog_labels = [label.text() for label in dialog.findChildren(QLabel)]
             self.assertNotIn("Item Art", dialog_labels)
             self.assertNotIn("Equipped:", dialog_labels)
+            self.assertNotIn("Category:", dialog_labels)
+            self.assertNotIn("Quantity:", dialog_labels)
+            self.assertNotIn("Stored at:", dialog_labels)
+            self.assertNotIn("Value:", dialog_labels)
             self.assertIsNone(
                 dialog.findChild(QPlainTextEdit, "inventoryStructuredDetails")
             )
             self.assertIsNone(
                 dialog.findChild(QLabel, "inventoryStructuredDetailsLabel")
             )
+            stack_dialog = InventoryItemDetailsDialog(
+                item=screen._inventory_items["notebook"],
+                catalog_entry=None,
+                parent=screen,
+            )
+            stack_title = stack_dialog.findChild(QLabel, "inventoryItemDetailTitle")
+            self.assertIsNotNone(stack_title)
+            assert stack_title is not None
+            self.assertEqual(stack_title.text(), "Notebooks (x2)")
+            stack_dialog.close()
             playtesting_dialog = InventoryItemDetailsDialog(
                 item=compass,
                 catalog_entry=catalog_entry,
-                denominations=screen._denominations,
                 show_structured_details=True,
                 parent=screen,
             )
@@ -2397,6 +2449,16 @@ class InventoryUiTests(unittest.TestCase):
             self.assertIn("item_uuid", structured_details.toPlainText())
             playtesting_dialog.close()
             dialog.close()
+
+            screen._open_item_details(compass)
+            self.app.processEvents()
+            self.assertEqual(len(screen._item_detail_dialogs), 1)
+            popout = next(iter(screen._item_detail_dialogs.values()))
+            self.assertTrue(popout.isVisible())
+            self.assertFalse(popout.isModal())
+            popout.close()
+            self.app.processEvents()
+            self.assertEqual(screen._item_detail_dialogs, {})
             screen.close()
 
     def test_npc_rows_open_resizable_player_visible_details(self) -> None:
@@ -2474,9 +2536,15 @@ class InventoryUiTests(unittest.TestCase):
         )
         button_texts = [button.text() for button in panel.item_buttons]
 
-        self.assertIn("Steel Dagger\nx1  ·  Weapon", button_texts)
-        self.assertIn("Healing Potions\nx3  ·  Consumable", button_texts)
-        self.assertIn("Food Rations\nx3 days  ·  Consumable", button_texts)
+        self.assertIn("Steel Dagger\n0 Copper Pieces  ·  Weapon", button_texts)
+        self.assertIn(
+            "Healing Potions\nx3  ·  0 Copper Pieces  ·  Consumable",
+            button_texts,
+        )
+        self.assertIn(
+            "Food Rations\nx3 days  ·  0 Copper Pieces  ·  Consumable",
+            button_texts,
+        )
 
         panel.close()
 

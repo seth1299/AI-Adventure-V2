@@ -432,12 +432,21 @@ def sanitize_tts_text(text: str) -> str:
 def prepare_ssmd_tts_text(text: str) -> str:
     """Adds supported SSMD normalization and pause markers."""
 
-    clean_text = str(text or "").strip()
+    clean_text = _remove_markdown_escape_backslashes(str(text or "")).strip()
 
     if not clean_text:
         return ""
 
     return apply_ssmd_say_as_tags(apply_structural_pause_markers(clean_text)).strip()
+
+
+def _remove_markdown_escape_backslashes(text: str) -> str:
+    """Removes Markdown escape markers that should never be spoken aloud."""
+
+    # ``sanitize_narration_display_text`` may already have removed the escaped
+    # punctuation (for example ``\*word\*`` becomes ``\word\``), so at this
+    # stage every remaining backslash is presentation syntax rather than prose.
+    return str(text or "").replace("\\", "")
 
 
 def sanitize_narration_display_text(text: str) -> str:

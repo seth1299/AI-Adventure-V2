@@ -556,6 +556,10 @@ class ContextBuilderTests(unittest.TestCase):
             packet["state"]["audio"]["rules"]["background_ambience_rule"],
         )
         self.assertIn(
+            "Rain to Clear",
+            packet["state"]["audio"]["rules"]["background_ambience_rule"],
+        )
+        self.assertIn(
             "short one-shot narration cue",
             packet["state"]["audio"]["rules"]["sound_effect_rule"],
         )
@@ -757,6 +761,14 @@ class ContextBuilderTests(unittest.TestCase):
         self.assertIn("multiple entries", packet["response_contract"]["events"])
         self.assertIn(
             "one NpcUpsertedEvent per distinct meaningful NPC",
+            packet["response_contract"]["npc_memory"],
+        )
+        self.assertIn(
+            "same response as the introduction",
+            packet["response_contract"]["npc_memory"],
+        )
+        self.assertIn(
+            "passing extras",
             packet["response_contract"]["npc_memory"],
         )
         self.assertIn("known_facts", packet["response_contract"]["npc_memory"])

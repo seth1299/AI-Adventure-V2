@@ -15,12 +15,12 @@ class BestiaryScreen(RepositoryBackedWidget):
             self._display_selected_creature
         )
 
-        self.creature_image_label = QLabel()
+        self.creature_image_label = ClickableImageLabel()
         self.creature_image_label.setObjectName("bestiaryGeneratedImage")
         self.creature_image_label.setMargin(4)
 
-        self.details_output = QTextEdit()
-        self.details_output.setReadOnly(True)
+        self.details_output = MarkdownDisplay()
+        self.details_output.setObjectName("bestiaryCreatureDetails")
 
         list_layout = QVBoxLayout()
         list_layout.addWidget(QLabel("Known Creatures"))
@@ -72,8 +72,9 @@ class BestiaryScreen(RepositoryBackedWidget):
         if self.creature_list.count() == 0:
             self.creature_image_label.clear()
             self.creature_image_label.hide()
-            self.details_output.setPlainText(
-                "No creatures have been learned about yet."
+            _set_markdown_text(
+                self.details_output,
+                "No creatures have been learned about yet.",
             )
             return
 

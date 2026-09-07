@@ -87,6 +87,43 @@ class NewGameServiceTests(unittest.TestCase):
                 "Mara Stone arrives at The Harbor.",
             )
 
+    def test_commit_generated_world_persists_optional_starting_notes(self) -> None:
+        setup = normalize_new_game_setup({"title": "Starting Notes"})
+        result = SimpleNamespace(
+            world_summary="A world with a dangerous outbreak.",
+            introductory_message="The adventure begins.",
+            finalized_character={},
+            finalized_starter_items=[],
+            finalized_skills=[],
+            starting_notes=[
+                {
+                    "entry_id": "starting_note_1",
+                    "heading": "Known Symptoms",
+                    "body": "Fever and confusion are early warning signs.",
+                    "tags": ["Survival"],
+                }
+            ],
+            suggested_events=[],
+            speaker_cues=[],
+            sound_effect_cues=[],
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = NewGameService.create_repository(Path(temp_dir), setup)
+            NewGameService.commit_generated_world(repository, setup, result)
+
+            self.assertEqual(
+                repository.get_note_entries(),
+                [
+                    {
+                        "entry_id": "starting_note_1",
+                        "heading": "Known Symptoms",
+                        "body": "Fever and confusion are early warning signs.",
+                        "tags": ["Survival"],
+                    }
+                ],
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

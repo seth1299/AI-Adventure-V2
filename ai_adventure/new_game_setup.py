@@ -621,6 +621,13 @@ def build_new_game_setup_packet(
                 "setup.starting_locations row, including when its suggestion-mode "
                 "name changes. Fill blank "
                 "name, location, or description fields with fitting specifics. "
+                "Suggestion-mode NPC names are placeholders: replace them with fresh "
+                "proper names; preserve names only for exact-mode rows. Every NPC "
+                "must include non-empty gender_identity, age, species, and "
+                "player_facing_information. Keep public_description (observable "
+                "appearance, role, or behavior) distinct from "
+                "player_facing_information (concise player-known facts); never copy "
+                "either field or use 'Not specified'. "
                 "If description_mode is exact, copy description into "
                 "public_description unchanged; if description_mode is "
                 "suggestion, use description only as inspiration and write a "
@@ -999,6 +1006,18 @@ def build_new_game_setup_packet(
                 "means Gemini describes and resolves fights in story prose without "
                 "CombatStartedEvent or the deterministic Combat tab."
             ),
+            "starting_notes": (
+                "Optionally return one or more concise player-facing notes only when "
+                "the Player Character would benefit from keeping important starting "
+                "information that does not belong in character, locations, NPCs, "
+                "Bestiary, inventory, crafting, or another structured section. For "
+                "example, a zombie-survival premise may warrant a note about known "
+                "virus symptoms or practical survival rules when the character would "
+                "already know them. Each note must have heading, body, and tags. Do "
+                "not duplicate information represented elsewhere, do not reveal GM "
+                "secrets or hidden future information, and return an empty array when "
+                "no starting note is beneficial."
+            ),
             "creative_ideas": (
                 "Treat creative_ideas as high-priority style seeds when inventing "
                 "names, locations, cultures, religions, foods, drinks, species, "
@@ -1029,6 +1048,16 @@ def build_new_game_setup_packet(
             "source_index_rule": (
                 "Use the zero-based setup.starter_items index for items based on "
                 "a setup starter-item entry and -1 only for extra invented items."
+            ),
+        },
+        "starting_notes_contract": {
+            "output_field": "starting_notes",
+            "optional": True,
+            "rules": (
+                "Return [] or omit the field when no player-known reference note is "
+                "useful. Notes are player-visible and should contain only concise "
+                "facts the Player Character knows at the start; never include GM "
+                "secrets, hidden motives, mystery solutions, or future information."
             ),
         },
         "starting_task_contract": {

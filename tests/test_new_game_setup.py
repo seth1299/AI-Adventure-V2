@@ -1322,6 +1322,12 @@ class NewGameSetupTests(unittest.TestCase):
             "At least 5 finalized starting items are required; there is no maximum starting item count.",
         )
         self.assertEqual(packet["starter_inventory_contract"]["output_field"], "starting_items")
+        self.assertTrue(packet["starting_notes_contract"]["optional"])
+        self.assertEqual(
+            packet["starting_notes_contract"]["output_field"],
+            "starting_notes",
+        )
+        self.assertIn("return an empty array", packet["requirements"]["starting_notes"])
         self.assertIn("creative_ideas", packet)
         self.assertIn("character_generation_guidance", packet)
         self.assertEqual(
@@ -1542,6 +1548,9 @@ class NewGameSetupTests(unittest.TestCase):
         self.assertIn("setup.starting_npcs", packet["requirements"]["events"])
         self.assertIn("public_description", packet["requirements"]["events"])
         self.assertIn("materially different", packet["requirements"]["events"])
+        self.assertIn("fresh proper names", packet["requirements"]["events"])
+        self.assertIn("gender_identity, age, species", packet["requirements"]["events"])
+        self.assertIn("player_facing_information", packet["requirements"]["events"])
         self.assertIn("suggested or incomplete starting NPCs", packet["fields_requiring_ai_invention"])
         self.assertIn("Do not parse NPCs out of ordinary setup prose", packet["requirements"]["events"])
         self.assertNotIn(

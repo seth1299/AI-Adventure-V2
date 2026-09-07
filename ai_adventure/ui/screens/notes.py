@@ -72,9 +72,7 @@ class NotesScreen(RepositoryBackedWidget):
         editor.setLayout(editor_layout)
         self.entry_editor = editor
 
-        self.entry_preview = QTextEdit()
-        self.entry_preview.setReadOnly(True)
-        self.entry_preview.setAcceptRichText(False)
+        self.entry_preview = MarkdownDisplay()
         self.entry_preview.setPlaceholderText("Select a note to view it.")
         self.entry_pages = QStackedWidget()
         self.entry_pages.addWidget(self.entry_preview)

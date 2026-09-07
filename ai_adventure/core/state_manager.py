@@ -441,6 +441,7 @@ class StateManager:
                         for cue in row.get("speaker_cues", [])
                         if isinstance(cue, dict)
                     ],
+                    hidden=bool(row.get("hidden", False)),
                     created_at=_read_string(row, "created_at", ""),
                 )
             )

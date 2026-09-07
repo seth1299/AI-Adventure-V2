@@ -274,6 +274,7 @@ class HistoryEntry:
     content: str = ""
     sound_effect_cues: list[dict[str, str]] = field(default_factory=list)
     speaker_cues: list[dict[str, str]] = field(default_factory=list)
+    hidden: bool = False
     created_at: str = ""
 
     def to_dict(self) -> dict[str, Any]:

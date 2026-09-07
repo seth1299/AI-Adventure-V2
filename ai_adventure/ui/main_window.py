@@ -1297,10 +1297,9 @@ class MainWindow(QMainWindow):
 
             if not audio["music_enabled"]:
                 self.sound_manager.stop_music(clear_current=False)
-            if (
-                not audio["background_ambience_enabled"]
-                and hasattr(self.sound_manager, "stop_background_ambience")
-            ):
+            # Background ambience belongs to the active save's scene. It must not
+            # continue looping while the app is showing the save-independent menu.
+            if hasattr(self.sound_manager, "stop_background_ambience"):
                 self.sound_manager.stop_background_ambience(clear_current=False)
 
         if self.narration_player is not None:

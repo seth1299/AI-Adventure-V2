@@ -8,12 +8,14 @@ import sys
 from pathlib import Path
 from typing import Any, Callable, TypeVar, cast
 
-from PySide6.QtCore import QObject, QSize, Qt, QTime, QTimer
-from PySide6.QtGui import QPixmap, QTextCursor
+from PySide6.QtCore import QObject, QSize, Qt, QTime, QTimer, Signal
+from PySide6.QtGui import QImageReader, QPixmap, QTextCursor, QWheelEvent
 from PySide6.QtWidgets import (
-    QAbstractSpinBox, QCheckBox, QComboBox, QFormLayout, QGroupBox, QLabel,
-    QListWidget, QLineEdit, QPlainTextEdit, QPushButton, QScrollArea, QSlider,
-    QSpinBox, QTableWidget, QTextEdit, QTimeEdit, QVBoxLayout, QWidget,
+    QAbstractSpinBox, QCheckBox, QComboBox, QDialog, QFormLayout, QGraphicsPixmapItem,
+    QGraphicsScene, QGraphicsView, QGroupBox, QHBoxLayout, QLabel, QListWidget,
+    QLineEdit, QPlainTextEdit, QPushButton, QScrollArea, QSlider, QSpinBox,
+    QTableWidget, QTextBrowser, QTextEdit, QTimeEdit, QVBoxLayout, QWidget,
+    QFrame,
 )
 
 from ai_adventure.app.app_paths import AppPaths
@@ -42,6 +44,179 @@ class _NoWheelSpinBox(QSpinBox):
 
     def wheelEvent(self, event: Any) -> None:
         event.ignore()
+
+
+class ClickableImageLabel(QLabel):
+    """Small image preview that opens the original asset in a viewer when clicked."""
+
+    clicked = Signal()
+
+    def mousePressEvent(self, event: Any) -> None:
+        pixmap = self.pixmap()
+        if (
+            event.button() == Qt.MouseButton.LeftButton
+            and pixmap is not None
+            and not pixmap.isNull()
+        ):
+            self.clicked.emit()
+        super().mousePressEvent(event)
+
+
+class MarkdownDisplay(QTextBrowser):
+    """Borderless, read-only Markdown content for player-facing detail panels."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setReadOnly(True)
+        self.setFrameShape(QFrame.Shape.NoFrame)
+        self.setStyleSheet("background: transparent; border: none; padding: 0;")
+        self.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+            | Qt.TextInteractionFlag.LinksAccessibleByMouse
+        )
+        self.document().setDocumentMargin(0)
+
+
+class _ImageViewerGraphicsView(QGraphicsView):
+    """Graphics view whose mouse wheel is an intuitive image zoom control."""
+
+    zoomed = Signal(float)
+
+    def wheelEvent(self, event: QWheelEvent) -> None:
+        delta = event.angleDelta().y()
+        if delta:
+            self.scale(1.25 if delta > 0 else 0.8, 1.25 if delta > 0 else 0.8)
+            self.zoomed.emit(self.transform().m11())
+            event.accept()
+            return
+        super().wheelEvent(event)
+
+
+class ImageViewerDialog(QDialog):
+    """Resizable viewer for generated images with fit, zoom, and pan support."""
+
+    def __init__(
+        self,
+        *,
+        pixmap: QPixmap,
+        title: str = "Image",
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(title or "Image")
+        self.setModal(True)
+        self.setWindowModality(Qt.WindowModality.ApplicationModal)
+        self.setWindowFlags(
+            self.windowFlags()
+            | Qt.WindowType.WindowMinimizeButtonHint
+            | Qt.WindowType.WindowMaximizeButtonHint
+        )
+        self.setMinimumSize(520, 420)
+        self.setSizeGripEnabled(True)
+
+        self._pixmap = pixmap
+        self._scene = QGraphicsScene(self)
+        self._image_item: QGraphicsPixmapItem | None = None
+        if not pixmap.isNull():
+            self._image_item = self._scene.addPixmap(pixmap)
+
+        self._view = _ImageViewerGraphicsView(self._scene)
+        self._view.setObjectName("imageViewerGraphicsView")
+        self._view.setBackgroundBrush(Qt.GlobalColor.black)
+        self._view.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
+        self._view.setTransformationAnchor(
+            QGraphicsView.ViewportAnchor.AnchorUnderMouse
+        )
+        self._view.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorViewCenter)
+        self._view.zoomed.connect(lambda _zoom: self._update_zoom_label())
+        self._view.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded
+        )
+        self._view.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+
+        self._zoom_label = QLabel("100%")
+        zoom_out = QPushButton("−")
+        zoom_out.setToolTip("Zoom out")
+        zoom_out.clicked.connect(lambda: self._zoom_by(0.8))
+        zoom_in = QPushButton("+")
+        zoom_in.setToolTip("Zoom in")
+        zoom_in.clicked.connect(lambda: self._zoom_by(1.25))
+        fit_button = QPushButton("Fit")
+        fit_button.setToolTip("Fit the image in the viewer")
+        fit_button.clicked.connect(self._fit_image)
+        actual_button = QPushButton("100%")
+        actual_button.setToolTip("Show the image at its original size")
+        actual_button.clicked.connect(self._show_actual_size)
+        close_button = QPushButton("Close")
+        close_button.clicked.connect(self.accept)
+
+        controls = QHBoxLayout()
+        controls.addWidget(zoom_out)
+        controls.addWidget(zoom_in)
+        controls.addWidget(fit_button)
+        controls.addWidget(actual_button)
+        controls.addWidget(self._zoom_label)
+        controls.addStretch()
+        controls.addWidget(close_button)
+
+        layout = QVBoxLayout()
+        layout.addWidget(self._view, 1)
+        layout.addLayout(controls)
+        self.setLayout(layout)
+        self.resize(900, 700)
+        QTimer.singleShot(0, self._fit_image)
+
+    def _zoom_by(self, factor: float) -> None:
+        """Zooms around the current view anchor."""
+
+        if self._image_item is None:
+            return
+        self._view.scale(factor, factor)
+        self._update_zoom_label()
+
+    def _fit_image(self) -> None:
+        """Fits the complete image within the available viewer area."""
+
+        if self._image_item is None:
+            return
+        self._view.resetTransform()
+        self._view.fitInView(
+            self._image_item,
+            Qt.AspectRatioMode.KeepAspectRatio,
+        )
+        self._update_zoom_label()
+
+    def _show_actual_size(self) -> None:
+        """Displays the image at its native pixel size."""
+
+        if self._image_item is None:
+            return
+        self._view.resetTransform()
+        self._view.centerOn(self._image_item)
+        self._update_zoom_label()
+
+    def _update_zoom_label(self) -> None:
+        """Updates the approximate zoom percentage shown beside the controls."""
+
+        transform = self._view.transform()
+        self._zoom_label.setText(f"{transform.m11() * 100:.0f}%")
+
+
+def _open_image_viewer(label: ClickableImageLabel) -> None:
+    """Opens a clickable preview's original image in the shared viewer."""
+
+    image_path = str(label.property("imageViewerPath") or "").strip()
+    if not image_path:
+        return
+    pixmap = QPixmap(image_path)
+    if pixmap.isNull():
+        return
+    dialog = ImageViewerDialog(
+        pixmap=pixmap,
+        title=str(label.property("imageViewerTitle") or "Image"),
+        parent=label.window(),
+    )
+    dialog.exec()
 
 
 
@@ -160,27 +335,46 @@ def _set_generated_image(
     maximum_height: int,
     accessible_name: str = "Generated image",
 ) -> bool:
-    """Loads and scales one cached image without distorting its aspect ratio."""
+    """Lazily decodes a scaled preview without loading the full image."""
 
     if path is None:
         label.clear()
         label.hide()
         return False
-    pixmap = QPixmap(str(path))
-    if pixmap.isNull():
+    reader = QImageReader(str(path))
+    reader.setAutoTransform(True)
+    source_size = reader.size()
+    if source_size.isValid() and not source_size.isEmpty():
+        scale = min(
+            1.0,
+            max(64, maximum_width) / source_size.width(),
+            max(64, maximum_height) / source_size.height(),
+        )
+        reader.setScaledSize(
+            QSize(
+                max(1, round(source_size.width() * scale)),
+                max(1, round(source_size.height() * scale)),
+            )
+        )
+    image = reader.read()
+    if image.isNull():
         label.clear()
         label.hide()
         return False
-    scaled = pixmap.scaled(
-        max(64, maximum_width),
-        max(64, maximum_height),
-        Qt.AspectRatioMode.KeepAspectRatio,
-        Qt.TransformationMode.SmoothTransformation,
-    )
+    scaled = QPixmap.fromImage(image)
     label.setPixmap(scaled)
     label.setAlignment(Qt.AlignmentFlag.AlignCenter)
     label.setAccessibleName(accessible_name)
-    label.setToolTip(accessible_name)
+    label.setProperty("imageViewerPath", str(path))
+    label.setProperty("imageViewerTitle", accessible_name)
+    if isinstance(label, ClickableImageLabel):
+        label.setCursor(Qt.CursorShape.PointingHandCursor)
+        label.setToolTip(f"{accessible_name} — click to enlarge")
+        if not bool(label.property("imageViewerConnected")):
+            label.clicked.connect(lambda label=label: _open_image_viewer(label))
+            label.setProperty("imageViewerConnected", True)
+    else:
+        label.setToolTip(accessible_name)
     label.show()
     return True
 
@@ -598,6 +792,9 @@ __all__ = [
     "_NoWheelComboBox",
     "_NoWheelSpinBox",
     "RepositoryBackedWidget",
+    "ClickableImageLabel",
+    "MarkdownDisplay",
+    "ImageViewerDialog",
     "_set_generated_image",
     "_screen_content_signature",
     "_text_model_from_ai_packet",

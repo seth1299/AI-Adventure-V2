@@ -22,6 +22,7 @@ from ai_adventure.alchemy.ingredients import (
 from ai_adventure.app.api_key_store import read_api_key
 from ai_adventure.app.app_paths import AppPaths
 from ai_adventure.item_categories import normalize_inventory_category
+from ai_adventure.notes import normalize_note_entries
 from ai_adventure.ai.modes import (
     ALL_CONTENT_HARM_CATEGORIES,
     ai_mode_preferences_from_context_packet,
@@ -1092,7 +1093,12 @@ EVENT_RESPONSE_SCHEMA: dict[str, Any] = {
                 }
             },
             ["filename"],
-            description="Starts, changes, or stops a quiet persistent ambience loop.",
+            description=(
+                "Starts, changes, or stops a quiet persistent ambience loop. "
+                "When a StatusUpdatedEvent changes weather, re-evaluate the current "
+                "ambience in the same response; stop or replace weather-specific "
+                "ambience that no longer fits."
+            ),
         ),
         _event_response_schema(
             "FlagSetEvent",
@@ -1361,12 +1367,36 @@ NEW_GAME_NPC_EVENT_RESPONSE_SCHEMA: dict[str, Any] = _event_response_schema(
             "type": "string",
             "description": "Exact stable npc_id copied from setup.starting_npcs.",
         },
-        "name": {"type": "string"},
-        "location": {"type": "string"},
-        "public_description": {"type": "string"},
-        "gender_identity": {"type": "string"},
-        "age": {"type": "string"},
-        "species": {"type": "string"},
+        "name": {"type": "string", "minLength": 1},
+        "location": {"type": "string", "minLength": 1},
+        "public_description": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Brief observable appearance, role, or behavior.",
+        },
+        "player_facing_information": {
+            "type": "string",
+            "minLength": 1,
+            "description": (
+                "Additional concise player-known profile notes. Keep these distinct "
+                "from the observable public_description."
+            ),
+        },
+        "gender_identity": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Player-known gender identity; never leave blank or use Not specified.",
+        },
+        "age": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Player-known age or approximate age; never leave blank or use Not specified.",
+        },
+        "species": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Player-known species; never leave blank or use Not specified.",
+        },
         "party_member": {
             "type": "boolean",
             "description": (
@@ -1386,7 +1416,11 @@ NEW_GAME_NPC_EVENT_RESPONSE_SCHEMA: dict[str, Any] = _event_response_schema(
         "name",
         "location",
         "public_description",
+        "player_facing_information",
         "party_member",
+        "gender_identity",
+        "age",
+        "species",
     ],
 )
 NEW_GAME_EVENT_RESPONSE_SCHEMA: dict[str, Any] = {
@@ -1510,7 +1544,13 @@ STORY_RESPONSE_JSON_SCHEMA: dict[str, Any] = {
         },
         "events": {
             "type": "array",
-            "description": "Structured event suggestions. Empty when no state change is proposed.",
+            "description": (
+                "Structured event suggestions. Empty when no state change is proposed. "
+                "For every newly introduced named or materially important NPC the "
+                "player can recognize or remember, include one NpcUpsertedEvent in "
+                "this same response; do not create profiles for unnamed background "
+                "people or passing extras."
+            ),
             "items": EVENT_RESPONSE_SCHEMA,
         },
         "out_of_game": {
@@ -1530,6 +1570,8 @@ STORY_RESPONSE_JSON_SCHEMA: dict[str, Any] = {
 STORY_BASE_EVENT_TYPE_NAMES: tuple[str, ...] = (
     "StatusUpdatedEvent",
     "SkillCheckRequestedEvent",
+    "NpcUpsertedEvent",
+    "NpcKnowledgeAddedEvent",
     "MiscellaneousUpsertedEvent",
 )
 STORY_EVENT_TYPE_NAMES_BY_CONTEXT_TAG: dict[str, tuple[str, ...]] = {
@@ -1797,6 +1839,31 @@ NEW_GAME_RESPONSE_JSON_SCHEMA: dict[str, Any] = {
             "type": "array",
             "description": "Player-known creatures established at the start of the adventure.",
             "items": BESTIARY_RECORD_SCHEMA,
+        },
+        "starting_notes": {
+            "type": "array",
+            "maxItems": 12,
+            "description": (
+                "Optional player-facing notes containing useful starting information "
+                "that does not belong in another structured section. Omit this field "
+                "or return an empty array when no note would benefit the Player. "
+                "Include only information known by the Player Character; never put "
+                "GM secrets or hidden future information here."
+            ),
+            "items": {
+                "type": "object",
+                "properties": {
+                    "heading": {"type": "string", "minLength": 1, "maxLength": 120},
+                    "body": {"type": "string", "minLength": 1, "maxLength": 5000},
+                    "tags": {
+                        "type": "array",
+                        "maxItems": 8,
+                        "items": {"type": "string", "maxLength": 80},
+                    },
+                },
+                "required": ["heading", "body", "tags"],
+                "additionalProperties": False,
+            },
         },
         "start_location": {"type": "string"},
         "calendar_settings": {
@@ -2569,6 +2636,7 @@ class AiWorldSetupResult:
     gm_secrets: list[dict[str, Any]] = field(default_factory=list)
     miscellaneous: list[dict[str, Any]] = field(default_factory=list)
     bestiary: list[dict[str, Any]] = field(default_factory=list)
+    starting_notes: list[dict[str, Any]] = field(default_factory=list)
     finalized_character: dict[str, str] = field(default_factory=dict)
     finalized_skills: list[dict[str, Any]] = field(default_factory=list)
     finalized_starting_spells: list[dict[str, Any]] = field(default_factory=list)
@@ -3382,9 +3450,9 @@ def _build_xml_new_game_prompt(setup_packet: dict[str, Any]) -> str:
                 "nonblank field governed by a suggestion mode must become a materially "
                 "different finalized value; do not copy or cosmetically edit it. This "
                 "includes the requested start location, suggestion-mode location names "
-                "and descriptions, and suggestion-mode NPC descriptions. Exact-mode "
-                "values must remain unchanged. Maintain source_index links and "
-                "finalized names consistently. "
+                 "and descriptions, and suggestion-mode NPC names and descriptions. Exact-mode "
+                 "values must remain unchanged. Maintain source_index links and "
+                 "finalized names consistently. "
                 "For any finalized character appearance, location description, item "
                 "description, or NPC public_description, include concise concrete "
                 "visual traits sufficient to depict the subject, using only facts "
@@ -3923,6 +3991,10 @@ def _repair_gemini_suggested_setup_fields(
             "object.\n\n"
             f"Affected JSON paths: {', '.join(paths)}\n"
             "The affected paths are validation targets, not terms to quote or repeat.\n\n"
+            "For a starting_npcs name path, replace a suggestion-mode placeholder with "
+            "a fresh, fitting proper name; only exact-mode names may be preserved. "
+            "For starting_npcs profile fields, provide complete player-known values "
+            "and keep public_description distinct from player_facing_information.\n\n"
             "JSON to repair:\n"
             f"{candidate_text}"
         )
@@ -4055,6 +4127,9 @@ def _suggested_setup_terms(setup_packet: dict[str, Any]) -> tuple[str, ...]:
                 continue
             if str(raw_npc.get("description_mode", "suggestion")).casefold() == "exact":
                 continue
+            name = str(raw_npc.get("name", "") or "").strip()
+            if name:
+                terms.append(name)
             description = str(raw_npc.get("description", "") or "").strip()
             if description:
                 terms.append(description)
@@ -4178,29 +4253,44 @@ def _unfinalized_suggested_setup_terms(
             requested_description = str(
                 requested.get("description", "") or ""
             ).strip()
-            if not requested_description:
-                continue
             requested_name = str(requested.get("name", "") or "").strip()
+            if not requested_name and not requested_description:
+                continue
             match = next(
                 (
                     payload
                     for payload in npc_payloads
                     if requested_name
                     and str(
-                        payload.get("name", payload.get("display_name", "")) or ""
+                        payload.get("name") or payload.get("display_name") or ""
                     ).strip().casefold()
                     == requested_name.casefold()
                 ),
                 npc_payloads[source_index] if source_index < len(npc_payloads) else None,
             )
+            finalized_name = (
+                str(
+                    match.get("name") or match.get("display_name") or ""
+                ).strip()
+                if isinstance(match, dict)
+                else ""
+            )
+            if requested_name and (
+                not finalized_name
+                or _suggestion_text_is_unchanged(requested_name, finalized_name)
+            ):
+                unresolved.append(requested_name)
             finalized_description = (
                 str(match.get("public_description", "") or "").strip()
                 if isinstance(match, dict)
                 else ""
             )
-            if not finalized_description or _suggestion_text_is_unchanged(
-                requested_description,
-                finalized_description,
+            if requested_description and (
+                not finalized_description
+                or _suggestion_text_is_unchanged(
+                    requested_description,
+                    finalized_description,
+                )
             ):
                 unresolved.append(requested_description)
 
@@ -4350,19 +4440,36 @@ def _unfinalized_suggested_setup_paths(
                     payload
                     for payload in npc_payloads
                     if requested_name
-                    and str(payload.get("display_name", "") or "").strip().casefold()
+                    and str(
+                        payload.get("name") or payload.get("display_name") or ""
+                    ).strip().casefold()
                     == requested_name.casefold()
                 ),
                 npc_payloads[source_index] if source_index < len(npc_payloads) else None,
             )
+            finalized_name = (
+                str(
+                    match.get("name") or match.get("display_name") or ""
+                ).strip()
+                if isinstance(match, dict)
+                else ""
+            )
+            if requested_name and (
+                not finalized_name
+                or _suggestion_text_is_unchanged(requested_name, finalized_name)
+            ):
+                paths.append(f"starting_npcs[{source_index}].name")
             finalized_description = (
                 str(match.get("public_description", "") or "").strip()
                 if isinstance(match, dict)
                 else ""
             )
-            if not finalized_description or _suggestion_text_is_unchanged(
-                requested_description,
-                finalized_description,
+            if requested_description and (
+                not finalized_description
+                or _suggestion_text_is_unchanged(
+                    requested_description,
+                    finalized_description,
+                )
             ):
                 paths.append(
                     f"starting_npcs[{source_index}].public_description"
@@ -6957,6 +7064,7 @@ def parse_gemini_new_game_response(
     gm_secrets = _parse_new_game_gm_secrets(data.get("gm_secrets"))
     miscellaneous = _parse_new_game_miscellaneous(data.get("miscellaneous"))
     bestiary = _parse_new_game_bestiary(data.get("bestiary"))
+    starting_notes = _parse_new_game_starting_notes(data.get("starting_notes"))
     introductory_message = str(
         data.get("introductory_message", data.get("response", ""))
     ).strip()
@@ -7135,6 +7243,7 @@ def parse_gemini_new_game_response(
         gm_secrets=gm_secrets,
         miscellaneous=miscellaneous,
         bestiary=bestiary,
+        starting_notes=starting_notes,
         finalized_character=finalized_character,
         finalized_skills=finalized_skills,
         finalized_starting_spells=finalized_starting_spells,
@@ -7262,6 +7371,32 @@ def _parse_new_game_character(raw_character: Any) -> dict[str, str]:
             character[key] = value
 
     return character
+
+
+def _parse_new_game_starting_notes(raw_entries: Any) -> list[dict[str, Any]]:
+    """Parses optional player-facing notes from new-game synthesis."""
+
+    if not isinstance(raw_entries, list):
+        return []
+
+    entries: list[dict[str, Any]] = []
+    for index, raw_entry in enumerate(raw_entries[:12], start=1):
+        if not isinstance(raw_entry, dict):
+            continue
+        heading = str(raw_entry.get("heading", "")).strip()
+        body = str(raw_entry.get("body", "")).strip()
+        if not heading and not body:
+            continue
+        entries.append(
+            {
+                "entry_id": f"starting_note_{index}",
+                "heading": heading or "Starting Note",
+                "body": body,
+                "tags": raw_entry.get("tags", []),
+            }
+        )
+
+    return normalize_note_entries(entries)
 
 
 def _parse_new_game_gm_secrets(raw_secrets: Any) -> list[dict[str, Any]]:
@@ -8096,6 +8231,13 @@ def _json_schema_shape_errors(
 
         if isinstance(enum, list) and value not in enum:
             errors.append(f"{path} expected one of {enum}")
+
+        min_length = schema.get("minLength")
+        max_length = schema.get("maxLength")
+        if isinstance(min_length, int) and len(value) < min_length:
+            errors.append(f"{path} expected at least {min_length} character(s)")
+        if isinstance(max_length, int) and len(value) > max_length:
+            errors.append(f"{path} expected at most {max_length} character(s)")
 
     return errors
 

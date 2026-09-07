@@ -23,6 +23,7 @@ from ai_adventure.visual_assets import (
     find_reusable_inventory_asset,
     save_relative_image_filename,
     descriptive_image_stem,
+    save_scaled_png,
     save_scaled_jpeg,
 )
 
@@ -150,7 +151,8 @@ class VisualAssetTests(unittest.TestCase):
         self.assertEqual(captured["model"], "gemini-3.1-flash-lite-image")
         config = cast(Any, captured["config"])
         self.assertEqual(config.values["response_modalities"], ["IMAGE"])
-        self.assertEqual(config.values["image_config"].values["aspect_ratio"], "16:9")
+        self.assertEqual(config.values["image_config"].values["aspect_ratio"], "1:1")
+        self.assertEqual(config.values["image_config"].values["image_size"], "1K")
 
     def test_new_game_contract_mentions_visual_quality_without_image_schema_fields(self) -> None:
         prompt = build_gemini_new_game_prompt(
@@ -175,6 +177,8 @@ class VisualAssetTests(unittest.TestCase):
         self.assertEqual(by_subject[("location", "glass market")].message_ids, ("turn-1",))
         self.assertEqual(by_subject[("inventory", "ripe banana")].message_ids, ("turn-1",))
         self.assertEqual(by_subject[("npc", "dock_warden")].message_ids, ("turn-2",))
+        self.assertEqual(by_subject[("location", "glass market")].maximum_pixels, 1024)
+        self.assertEqual(by_subject[("inventory", "ripe banana")].maximum_pixels, 1024)
 
     def test_requests_include_player_known_bestiary_creatures(self) -> None:
         class _BestiaryRepository(_VisualRepository):
@@ -277,7 +281,7 @@ class VisualAssetTests(unittest.TestCase):
             description="A yellow banana.",
         )
 
-        self.assertRegex(request.filename, r"^inventory_ripe_banana_market_special_[0-9a-f]{8}\.jpg$")
+        self.assertRegex(request.filename, r"^ripe_banana_market_special_[0-9a-f]{8}\.png$")
         self.assertLessEqual(len(request.filename), 77)
         self.assertEqual(descriptive_image_stem("***"), "generated_image")
 
@@ -394,9 +398,9 @@ class VisualAssetTests(unittest.TestCase):
         self.assertEqual(by_type["inventory"].subject_key, "item_abc123")
         self.assertEqual(
             save_relative_image_filename(_IdentifiedRepository(), by_type["inventory"]),
-            "example_save/inventory_canvas_backpack_"
+            "example_save/inventory/canvas_backpack_"
             + by_type["inventory"].descriptor_hash[:8]
-            + ".jpg",
+            + ".png",
         )
 
     def test_fuzzy_reuse_finds_a_compatible_inventory_image_in_another_save(self) -> None:
@@ -414,7 +418,7 @@ class VisualAssetTests(unittest.TestCase):
             source_filename = save_relative_image_filename(source_repository, source_request)
             source_path = root / "images" / source_filename
             source_path.parent.mkdir(parents=True)
-            Image.new("RGB", (32, 32), (10, 20, 30)).save(source_path, format="JPEG")
+            Image.new("RGB", (1024, 1024), (10, 20, 30)).save(source_path, format="PNG")
             source_repository.ensure_visual_asset(
                 asset_id=source_request.asset_id,
                 subject_type=source_request.subject_type,
@@ -422,8 +426,11 @@ class VisualAssetTests(unittest.TestCase):
                 display_name=source_request.display_name,
                 descriptor_hash=source_request.descriptor_hash,
                 filename=source_filename,
-                prompt=source_request.prompt,
+                prompt="The filename and prompt must not be used for reuse decisions.",
                 model="test",
+                image_style=source_request.image_style,
+                visual_description=source_request.description,
+                resolution_tier=source_request.image_size,
                 ready=True,
             )
 
@@ -527,6 +534,64 @@ class VisualAssetTests(unittest.TestCase):
                 self.assertEqual(saved.format, "JPEG")
                 self.assertEqual(saved.mode, "RGB")
                 self.assertEqual(saved.size, (width, height))
+
+    def test_scaled_cache_is_a_1k_rgb_png(self) -> None:
+        source = Image.new("RGBA", (1200, 800), (240, 220, 30, 255))
+        image_bytes = BytesIO()
+        source.save(image_bytes, format="PNG")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            target = Path(temp_dir) / "location.png"
+            width, height = save_scaled_png(
+                image_bytes.getvalue(),
+                target,
+                max_pixels=1024,
+            )
+            self.assertEqual((width, height), (1024, 683))
+            with Image.open(target) as saved:
+                self.assertEqual(saved.format, "PNG")
+                self.assertEqual(saved.mode, "RGB")
+                self.assertEqual(saved.size, (width, height))
+
+    def test_repository_persists_structured_visual_asset_metadata(self) -> None:
+        request = VisualAssetRequest(
+            subject_type="location",
+            subject_key="glass_market",
+            display_name="Glass Market",
+            description="Blue awnings over wet stone.",
+            image_style="watercolor",
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = SaveRepository.create_new_save(Path(temp_dir), "Metadata")
+            record = repository.ensure_visual_asset(
+                asset_id=request.asset_id,
+                subject_type=request.subject_type,
+                subject_key=request.subject_key,
+                display_name=request.display_name,
+                descriptor_hash=request.descriptor_hash,
+                filename=save_relative_image_filename(repository, request),
+                prompt="Prompt text is not the reuse metadata source.",
+                model="test",
+                image_style=request.image_style,
+                visual_description=request.description,
+                resolution_tier=request.image_size,
+            )
+
+            self.assertEqual(record["image_style"], "watercolor")
+            self.assertEqual(record["visual_description"], request.description)
+            self.assertEqual(record["resolution_tier"], "1K")
+
+    def test_map_named_inventory_assets_use_the_1k_image_tier(self) -> None:
+        request = VisualAssetRequest(
+            subject_type="inventory",
+            subject_key="regional_map",
+            display_name="Regional Map",
+            description="A hand-inked map of the surrounding settlements.",
+        )
+
+        self.assertFalse(request.is_large_format)
+        self.assertEqual(request.image_size, "1K")
+        self.assertEqual(request.maximum_pixels, 1024)
 
     def test_repository_tracks_reuse_messages_failures_and_paid_attempts(self) -> None:
         request = VisualAssetRequest(

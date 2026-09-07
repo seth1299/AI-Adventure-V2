@@ -1167,6 +1167,27 @@ class NewGameWizard(QWizard):
             value = max(0, min(5, int(metadata.get(key, 0))))
             bar.setValue(value)
             bar.setFormat(f"{label}: {value}/5")
+            bar.setStyleSheet(
+                "QProgressBar::chunk { background-color: "
+                f"{NewGameWizard._rating_bar_color(value, key == 'cost_rating')}; }}"
+            )
+
+    @staticmethod
+    def _rating_bar_color(value: int, inverted: bool = False) -> str:
+        """Returns a traffic-light color for a 1-to-5 model rating."""
+
+        rating = max(0, min(5, int(value)))
+        if inverted:
+            if rating <= 2:
+                return "#2eaf62"
+            if rating == 3:
+                return "#d9a441"
+            return "#d9534f"
+        if rating >= 4:
+            return "#2eaf62"
+        if rating == 3:
+            return "#d9a441"
+        return "#d9534f"
 
     def _build_adventure_page(self) -> None:
         """Builds the adventure/world setup page."""

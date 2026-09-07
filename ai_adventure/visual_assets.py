@@ -25,7 +25,6 @@ except ImportError:  # pragma: no cover - the packaged build includes RapidFuzz.
 from ai_adventure.app.api_key_store import read_api_key
 from ai_adventure.ai.image_styles import (
     DEFAULT_IMAGE_STYLE,
-    KNOWN_IMAGE_STYLES,
     image_style_metadata,
     normalize_image_style,
 )
@@ -40,6 +39,18 @@ LOGGER = logging.getLogger(__name__)
 
 DEFAULT_IMAGE_LIMIT = 100
 DISPLAY_IMAGE_MAX_PIXELS = 384
+STANDARD_IMAGE_MAX_PIXELS = 1024
+# Compatibility alias for callers that used the retired location/map tier.
+# All Gemini image requests now use the 1K tier.
+LARGE_IMAGE_MAX_PIXELS = STANDARD_IMAGE_MAX_PIXELS
+IMAGE_OUTPUT_MIME_TYPE = "image/png"
+ASSET_DIRECTORY_BY_SUBJECT_TYPE = {
+    "player": "characters",
+    "location": "locations",
+    "inventory": "inventory",
+    "npc": "npcs",
+    "bestiary": "bestiary",
+}
 
 
 class VisualAssetRepository(Protocol):
@@ -101,16 +112,41 @@ class VisualAssetRequest:
 
         if self.subject_type in {"player", "npc"}:
             return "4:5"
-        if self.subject_type == "location":
-            return "16:9"
         return "1:1"
+
+    @property
+    def is_large_format(self) -> bool:
+        """Compatibility flag for the retired larger location/map tier."""
+
+        return False
+
+    @property
+    def image_size(self) -> str:
+        """Returns Gemini's native image-size tier for every generated asset."""
+
+        return "1K"
+
+    @property
+    def maximum_pixels(self) -> int:
+        """Returns the target longest edge retained in the local PNG cache."""
+
+        return STANDARD_IMAGE_MAX_PIXELS
+
+    @property
+    def directory_name(self) -> str:
+        """Returns the stable player-facing asset category directory."""
+
+        return ASSET_DIRECTORY_BY_SUBJECT_TYPE.get(
+            self.subject_type,
+            self.subject_type,
+        )
 
     @property
     def filename(self) -> str:
         """Returns a descriptive, bounded, collision-resistant cache filename."""
 
         stem = descriptive_image_stem(self.display_name)
-        return f"{self.subject_type}_{stem}_{self.descriptor_hash[:8]}.jpg"
+        return f"{stem}_{self.descriptor_hash[:8]}.png"
 
     @property
     def prompt(self) -> str:
@@ -228,7 +264,10 @@ class GeminiVisualAssetService:
             contents=request.prompt,
             config=types.GenerateContentConfig(
                 response_modalities=["IMAGE"],
-                image_config=types.ImageConfig(aspect_ratio=request.aspect_ratio),
+                image_config=types.ImageConfig(
+                    aspect_ratio=request.aspect_ratio,
+                    image_size=request.image_size,
+                ),
             ),
         )
         for part in getattr(response, "parts", []) or []:
@@ -506,29 +545,32 @@ def save_relative_image_filename(repository: Any, request: VisualAssetRequest) -
     """Returns the save-grouped relative filename stored in visual-asset records."""
 
     save_name = descriptive_image_stem(repository.db_path.parent.name, maximum_length=96)
-    return f"{save_name}/{request.filename}"
+    return f"{save_name}/{request.directory_name}/{request.filename}"
 
 
-def find_reusable_inventory_asset(
+def find_reusable_visual_asset(
     *,
     images_dir: Path,
     saves_dir: Path,
     repository: Any,
     request: VisualAssetRequest,
 ) -> dict[str, Any] | None:
-    """Finds a conservative cross-save item-image match by name and description.
+    """Finds a conservative cross-save match using structured asset metadata.
 
-    Exact entity IDs are handled by the normal asset ID first. This fallback is
-    intentionally limited to inventory items and only considers ready assets
-    recorded by another save; it never searches the web or uses an image's
-    pixels to infer identity.
+    Exact entity IDs are preferred, then a high-confidence name/description
+    match may be reused. Art style, subject category, and resolution tier are
+    hard compatibility gates. Filename text and prompt parsing are deliberately
+    excluded from the decision; filenames are only used after a database record
+    has already been selected.
     """
 
-    if request.subject_type != "inventory" or not saves_dir.is_dir():
+    if not saves_dir.is_dir():
         return None
 
     target_description = " ".join(request.description.split()).casefold()
     target_name = " ".join(request.display_name.split()).casefold()
+    target_style = normalize_image_style(request.image_style)
+    target_resolution = request.image_size
     current_db = Path(repository.db_path).resolve()
     best: dict[str, Any] | None = None
 
@@ -541,10 +583,17 @@ def find_reusable_inventory_asset(
                 connection.row_factory = sqlite3.Row
                 rows = connection.execute(
                     """
-                    SELECT display_name, filename, prompt, width, height
+                    SELECT asset_id, subject_type, subject_key, display_name,
+                           visual_description, filename, image_style,
+                           resolution_tier, width, height
                     FROM visual_assets
-                    WHERE subject_type = 'inventory' AND status = 'ready'
+                    WHERE subject_type = ?
+                      AND status = 'ready'
+                      AND image_style = ?
+                      AND resolution_tier = ?
                     """
+                    ,
+                    (request.subject_type.casefold(), target_style, target_resolution),
                 ).fetchall()
             finally:
                 connection.close()
@@ -553,66 +602,100 @@ def find_reusable_inventory_asset(
             continue
 
         for row in rows:
-            candidate_name = " ".join(str(row["display_name"] or "").split()).casefold()
-            name_score = token_set_ratio(target_name, candidate_name)
-            if name_score < 86:
-                continue
-            candidate_prompt = str(row["prompt"] or "")
-            if _image_style_from_prompt(candidate_prompt) != normalize_image_style(
-                request.image_style
-            ):
-                continue
-            description_match = re.search(
-                r"Player-visible description:\s*(.*?)(?:\nWorld context|$)",
-                candidate_prompt,
-                flags=re.IGNORECASE | re.DOTALL,
-            )
-            candidate_description = " ".join(
-                (description_match.group(1) if description_match else candidate_prompt).split()
+            candidate_name = " ".join(
+                str(row["display_name"] or "").split()
             ).casefold()
-            description_score = token_set_ratio(target_description, candidate_description)
-            if not (
-                name_score >= 94 and description_score >= 48
-                or name_score >= 86 and description_score >= 62
-            ):
+            candidate_description = " ".join(
+                str(row["visual_description"] or "").split()
+            ).casefold()
+            if not candidate_name or not candidate_description:
+                continue
+            if str(row["image_style"] or "").strip().casefold() != target_style:
+                continue
+            if str(row["resolution_tier"] or "").strip().upper() != target_resolution:
                 continue
 
             stored_filename = Path(str(row["filename"] or ""))
-            source_candidates = (
-                images_dir / stored_filename,
-                images_dir / candidate_db.parent.name / stored_filename.name,
-                images_dir / stored_filename.name,
-            )
-            source_path = next((path for path in source_candidates if path.is_file()), None)
-            if source_path is None:
+            if (
+                stored_filename.is_absolute()
+                or ".." in stored_filename.parts
+                or stored_filename.suffix.casefold() != ".png"
+            ):
                 continue
+            source_path = images_dir / stored_filename
+            dimensions = _image_dimensions_for_resolution(
+                source_path,
+                minimum_longest_edge=request.maximum_pixels,
+            )
+            if dimensions is None:
+                continue
+
+            if str(row["asset_id"] or "") == request.asset_id:
+                return {
+                    "source_path": source_path,
+                    "display_name": str(row["display_name"] or ""),
+                    "width": dimensions[0],
+                    "height": dimensions[1],
+                    "score": 100.0,
+                }
+
+            name_score = token_set_ratio(target_name, candidate_name)
+            if name_score < 82:
+                continue
+            description_score = token_set_ratio(target_description, candidate_description)
+            if not (
+                name_score >= 90 and description_score >= 40
+                or name_score >= 82 and description_score >= 56
+            ):
+                continue
+
             score = (name_score * 0.65) + (description_score * 0.35)
             if best is None or score > float(best["score"]):
                 best = {
                     "source_path": source_path,
                     "display_name": str(row["display_name"] or ""),
-                    "width": int(row["width"] or 0),
-                    "height": int(row["height"] or 0),
+                    "width": dimensions[0],
+                    "height": dimensions[1],
                     "score": score,
                 }
 
     return best
 
 
-def _image_style_from_prompt(prompt: str) -> str:
-    """Returns the style identity stored in a generated-asset prompt."""
+def find_reusable_inventory_asset(
+    *,
+    images_dir: Path,
+    saves_dir: Path,
+    repository: Any,
+    request: VisualAssetRequest,
+) -> dict[str, Any] | None:
+    """Compatibility alias for callers using the former inventory-only name."""
 
-    style_match = re.search(
-        r"Selected visual style:\s*([a-z0-9_]+)\s*\(",
-        prompt,
-        flags=re.IGNORECASE,
+    return find_reusable_visual_asset(
+        images_dir=images_dir,
+        saves_dir=saves_dir,
+        repository=repository,
+        request=request,
     )
-    if style_match:
-        value = style_match.group(1).casefold()
-        return value if value in KNOWN_IMAGE_STYLES else ""
-    if "semi-realistic digital game illustration" in prompt.casefold():
-        return DEFAULT_IMAGE_STYLE
-    return ""
+
+
+def _image_dimensions_for_resolution(
+    path: Path,
+    *,
+    minimum_longest_edge: int,
+) -> tuple[int, int] | None:
+    """Returns dimensions for a reusable PNG when it meets the requested tier."""
+
+    try:
+        with Image.open(path) as image:
+            dimensions = (int(image.width), int(image.height))
+            return (
+                dimensions
+                if max(dimensions) >= max(64, int(minimum_longest_edge))
+                else None
+            )
+    except (OSError, ValueError):
+        return None
 
 
 def _item_visual_description(
@@ -732,13 +815,46 @@ def _visible_world_context(repository: VisualAssetRepository) -> str:
     return "\n".join(parts)
 
 
+def save_scaled_png(
+    image_bytes: bytes,
+    target_path: Path,
+    *,
+    max_pixels: int = STANDARD_IMAGE_MAX_PIXELS,
+) -> tuple[int, int]:
+    """Writes a forward-compatible RGB PNG and returns the final dimensions.
+
+    ``max_pixels`` is the retained longest edge, not the preview size.  The
+    image is allowed to scale up so a provider response that is smaller than
+    the requested tier still receives a consistent on-disk contract.  Native
+    Gemini 1K/2K responses should already match the requested tier, so this is
+    primarily a defensive fallback.
+    """
+
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    with Image.open(BytesIO(image_bytes)) as source:
+        image = source.convert("RGB")
+        target_longest_edge = max(64, int(max_pixels))
+        source_longest_edge = max(image.size)
+        if source_longest_edge != target_longest_edge:
+            scale = target_longest_edge / source_longest_edge
+            image = image.resize(
+                (
+                    max(1, round(image.width * scale)),
+                    max(1, round(image.height * scale)),
+                ),
+                Image.Resampling.LANCZOS,
+            )
+        image.save(target_path, format="PNG", optimize=True)
+        return image.size
+
+
 def save_scaled_jpeg(
     image_bytes: bytes,
     target_path: Path,
     *,
     max_pixels: int = DISPLAY_IMAGE_MAX_PIXELS,
 ) -> tuple[int, int]:
-    """Writes a compact RGB JPEG and returns the final dimensions."""
+    """Legacy JPEG helper retained for callers outside the asset pipeline."""
 
     target_path.parent.mkdir(parents=True, exist_ok=True)
     with Image.open(BytesIO(image_bytes)) as source:
