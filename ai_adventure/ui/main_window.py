@@ -6,6 +6,7 @@ from time import monotonic
 
 from ai_adventure.ui.common import *  # noqa: F401,F403
 from ai_adventure.ui.dialogues import *  # noqa: F401,F403
+from ai_adventure.ui.image_sources import NewGameImageSourceDialog
 from ai_adventure.ui.game_shell import *  # noqa: F401,F403
 from ai_adventure.ui.game_shell import _DetachedTabWindow
 from ai_adventure.ui.screens.main_menu import MainMenuScreen
@@ -218,6 +219,7 @@ class MainWindow(QMainWindow):
         self._pending_new_game_repository: SaveRepository | None = None
         self._pending_new_game_setup: dict[str, Any] | None = None
         self._new_game_progress_dialog: _NewGameGenerationProgressDialog | None = None
+        self._new_game_image_source_dialog: NewGameImageSourceDialog | None = None
         self.playtesting_build = is_playtesting_build()
         self.ai_enabled = is_ai_enabled()
         self.tts_enabled = is_tts_enabled()
@@ -948,16 +950,66 @@ class MainWindow(QMainWindow):
             return
 
         # Keep the opening hidden until every finalized initial visual request
-        # has reached a terminal state. This prevents the pre-generation
-        # placeholder location from winning the first image scan and ensures
-        # the first visible screen is complete.
+        # has an explicit player-selected source. This prevents a new game
+        # from starting paid image requests before the player chooses them.
         dialog = self._new_game_progress_dialog
         if isinstance(dialog, _NewGameGenerationProgressDialog):
-            dialog.set_visual_generation_pending()
+            dialog.finish()
         try:
-            self.game_shell.visual_asset_coordinator.begin_initial_batch(repository)
+            requests = self.game_shell.visual_asset_coordinator.prepare_initial_batch(
+                repository
+            )
         except Exception:
-            LOGGER.exception("Initial visual asset batch could not be started.")
+            LOGGER.exception("Initial visual asset source selection could not start.")
+            self.game_shell.visual_asset_coordinator.finish_initial_batch(repository)
+            self._finish_initial_visual_generation(repository)
+            return
+
+        if not requests:
+            self.game_shell.visual_asset_coordinator.finish_initial_batch(repository)
+            self._finish_initial_visual_generation(repository)
+            return
+
+        self._show_new_game_image_source_dialog(repository, requests)
+
+    def _show_new_game_image_source_dialog(
+        self,
+        repository: SaveRepository,
+        requests: list[VisualAssetRequest],
+    ) -> None:
+        """Shows per-subject image choices after the initial world is finalized."""
+
+        coordinator = self.game_shell.visual_asset_coordinator
+        dialog = NewGameImageSourceDialog(
+            requests,
+            choose_file=lambda request, source_path: coordinator.upload_initial_image(
+                repository,
+                request,
+                source_path,
+            ),
+            create_image=lambda request: coordinator.create_initial_image(
+                repository,
+                request,
+            ),
+            skip_image=lambda request: coordinator.skip_initial_image(
+                repository,
+                request,
+            ),
+            parent=self,
+        )
+        self._new_game_image_source_dialog = dialog
+        coordinator.asset_status_changed.connect(dialog.set_asset_status)
+        try:
+            result = dialog.exec()
+        finally:
+            try:
+                coordinator.asset_status_changed.disconnect(dialog.set_asset_status)
+            except (RuntimeError, TypeError):
+                pass
+            self._new_game_image_source_dialog = None
+
+        if result == QDialog.DialogCode.Accepted:
+            coordinator.finish_initial_batch(repository)
             self._finish_initial_visual_generation(repository)
 
     def _repository_matches_active(self, repository: SaveRepository) -> bool:

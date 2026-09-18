@@ -194,13 +194,13 @@ class InventoryLocationPanel(QGroupBox):
                 unit,
             )
             display_quantity = _inventory_quantity_display(quantity, unit)
+            if quantity != 1:
+                display_name = f"{display_name} ({display_quantity})"
             value = format_currency_amount(
                 max(0, _safe_int(item.get("value_base_units", 0), 0)),
                 self._denominations,
             )
             details = [value, category]
-            if quantity != 1:
-                details.insert(0, display_quantity)
             button = QPushButton(f"{display_name}\n{'  ·  '.join(details)}")
             button.setObjectName("inventoryItemButton")
             button.setMinimumHeight(52)

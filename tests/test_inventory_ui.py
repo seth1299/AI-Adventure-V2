@@ -2538,11 +2538,11 @@ class InventoryUiTests(unittest.TestCase):
 
         self.assertIn("Steel Dagger\n0 Copper Pieces  ·  Weapon", button_texts)
         self.assertIn(
-            "Healing Potions\nx3  ·  0 Copper Pieces  ·  Consumable",
+            "Healing Potions (x3)\n0 Copper Pieces  ·  Consumable",
             button_texts,
         )
         self.assertIn(
-            "Food Rations\nx3 days  ·  0 Copper Pieces  ·  Consumable",
+            "Food Rations (x3 days)\n0 Copper Pieces  ·  Consumable",
             button_texts,
         )
 
@@ -2615,7 +2615,11 @@ class InventoryUiTests(unittest.TestCase):
             ]
             self.assertLess(
                 carried_names.index("Amber Lens"),
-                carried_names.index("Copper Buckles"),
+                next(
+                    index
+                    for index, name in enumerate(carried_names)
+                    if name.startswith("Copper Buckles")
+                ),
             )
             self.assertTrue(home_panel.item_buttons[0].text().startswith("Zinc Plate"))
             self.assertEqual(home_panel.sort_direction_combo.currentData(), False)

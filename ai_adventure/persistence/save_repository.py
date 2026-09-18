@@ -826,13 +826,17 @@ class SaveRepository:
                     ),
                 )
 
-            _upsert_item_catalog_entry(
+            catalog_id = _upsert_item_catalog_entry(
                 connection,
                 name=clean_name,
                 category=category,
                 description=description,
                 value_base_units=clean_value,
                 metadata=clean_metadata,
+            )
+            connection.execute(
+                "UPDATE inventory_items SET id = ? WHERE name = ? COLLATE NOCASE AND id != ?",
+                (catalog_id, clean_name, catalog_id),
             )
 
         self.append_history("inventory", f"Added {quantity} x {clean_name}.")
@@ -931,9 +935,21 @@ class SaveRepository:
 
         with self._connect() as connection:
             connection.execute("DELETE FROM inventory_items")
+            catalog_ids = {
+                str(item["name"]).casefold(): _upsert_item_catalog_entry(
+                    connection,
+                    name=item["name"],
+                    category=item["category"],
+                    description=item["description"],
+                    value_base_units=item["value_base_units"],
+                    metadata=item["metadata"],
+                )
+                for item in clean_items
+            }
             connection.executemany(
                 """
                 INSERT INTO inventory_items (
+                    id,
                     name,
                     category,
                     quantity,
@@ -942,10 +958,11 @@ class SaveRepository:
                     value_base_units,
                     metadata_json
                 )
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
                     (
+                        catalog_ids[item["name"].casefold()],
                         item["name"],
                         item["category"],
                         item["quantity"],
@@ -957,16 +974,6 @@ class SaveRepository:
                     for item in clean_items
                 ],
             )
-            for item in clean_items:
-                _upsert_item_catalog_entry(
-                    connection,
-                    name=item["name"],
-                    category=item["category"],
-                    description=item["description"],
-                    value_base_units=item["value_base_units"],
-                    metadata=item["metadata"],
-                )
-
         self.set_player_equipment(self.get_setting("player.equipment", {}))
         self.append_history("inventory", "Starting inventory finalized.")
 
@@ -2774,7 +2781,7 @@ class SaveRepository:
                 """
                 SELECT knowledge_scope_json, known_facts_json
                 FROM npcs
-                WHERE npc_id = ?
+                WHERE id = ?
                 """,
                 (clean_npc_id,),
             ).fetchone()
@@ -2789,7 +2796,7 @@ class SaveRepository:
                 )
 
                 if matching_npc is not None:
-                    clean_npc_id = str(matching_npc["npc_id"])
+                    clean_npc_id = str(matching_npc["id"])
                     clean_name = str(matching_npc["name"]) or clean_name
                     existing = matching_npc
 
@@ -2807,14 +2814,14 @@ class SaveRepository:
                     known_facts or [],
                 )
                 created_at = connection.execute(
-                    "SELECT created_at FROM npcs WHERE npc_id = ?",
+                    "SELECT created_at FROM npcs WHERE id = ?",
                     (clean_npc_id,),
                 ).fetchone()["created_at"]
 
             connection.execute(
                 """
                 INSERT INTO npcs (
-                    npc_id,
+                    id,
                     name,
                     display_name,
                     role,
@@ -2831,7 +2838,7 @@ class SaveRepository:
                     updated_at
                 )
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(npc_id) DO UPDATE SET
+                ON CONFLICT(id) DO UPDATE SET
                     name = excluded.name,
                     display_name = CASE
                         WHEN ? != '' THEN excluded.display_name
@@ -2915,7 +2922,6 @@ class SaveRepository:
             """
             SELECT
                 id,
-                npc_id,
                 name,
                 display_name,
                 role,
@@ -2957,7 +2963,7 @@ class SaveRepository:
             key=lambda item: (
                 item[0],
                 str(item[1]["updated_at"]),
-                str(item[1]["npc_id"]),
+                str(item[1]["id"]),
             ),
             reverse=True,
         )
@@ -2975,7 +2981,7 @@ class SaveRepository:
             "Resolved NPC upsert %r at %r to existing npc_id %r.",
             name,
             location,
-            scored_rows[0][1]["npc_id"],
+            scored_rows[0][1]["id"],
         )
         return scored_rows[0][1]
 
@@ -3064,7 +3070,6 @@ class SaveRepository:
                 """
                 SELECT
                     id,
-                    npc_id,
                     name,
                     display_name,
                     role,
@@ -3080,7 +3085,7 @@ class SaveRepository:
                     created_at,
                     updated_at
                 FROM npcs
-                WHERE npc_id = ?
+                WHERE id = ?
                 """,
                 (clean_npc_id,),
             ).fetchone()
@@ -3145,7 +3150,7 @@ class SaveRepository:
         quantity = max(0, int(quantity))
         price = max(0, int(unit_price_base_units))
         with self._connect() as connection:
-            npc = connection.execute("SELECT 1 FROM npcs WHERE npc_id = ?", (clean_npc,)).fetchone()
+            npc = connection.execute("SELECT 1 FROM npcs WHERE id = ?", (clean_npc,)).fetchone()
             item = connection.execute("SELECT name FROM item_catalog WHERE id = ?", (clean_item,)).fetchone()
             if npc is None or item is None:
                 return None
@@ -3198,7 +3203,7 @@ class SaveRepository:
 
         clean_npc, clean_item = str(npc_id).strip(), str(item_id).strip()
         with self._connect() as connection:
-            npc = connection.execute("SELECT 1 FROM npcs WHERE npc_id = ?", (clean_npc,)).fetchone()
+            npc = connection.execute("SELECT 1 FROM npcs WHERE id = ?", (clean_npc,)).fetchone()
             item = connection.execute("SELECT name FROM item_catalog WHERE id = ?", (clean_item,)).fetchone()
             if npc is None or item is None:
                 return None
@@ -3299,7 +3304,6 @@ class SaveRepository:
                 """
                 SELECT
                     id,
-                    npc_id,
                     name,
                     display_name,
                     role,
@@ -3343,7 +3347,6 @@ class SaveRepository:
                 """
                 SELECT
                     id,
-                    npc_id,
                     name,
                     display_name,
                     role,
@@ -3391,7 +3394,7 @@ class SaveRepository:
 
             visible_npcs.append(
                 {
-                    "npc_id": npc["npc_id"],
+                    "id": npc["id"],
                     "display_name": (
                         npc.get("display_name")
                         or npc.get("name")
@@ -3542,7 +3545,7 @@ class SaveRepository:
                     n.created_at,
                     n.updated_at
                 FROM party_members AS p
-                JOIN npcs AS n ON n.npc_id = p.npc_id
+                JOIN npcs AS n ON n.id = p.npc_id
                 ORDER BY n.display_name COLLATE NOCASE, n.name COLLATE NOCASE
                 """
             ).fetchall()
@@ -4565,6 +4568,7 @@ class SaveRepository:
         ready: bool = False,
         image_style: str = "",
         visual_description: str = "",
+        basic_name: str = "",
         resolution_tier: str = "",
     ) -> dict[str, Any]:
         """Creates one versioned visual-asset record and links related messages."""
@@ -4594,6 +4598,7 @@ class SaveRepository:
         clean_visual_description = " ".join(
             str(visual_description or "").split()
         ).strip()
+        clean_basic_name = " ".join(str(basic_name or "").split()).strip()[:120]
         clean_resolution_tier = str(resolution_tier or "").strip().upper()
         with self._connect() as connection:
             connection.execute(
@@ -4601,10 +4606,10 @@ class SaveRepository:
                 INSERT INTO visual_assets (
                     asset_id, subject_type, subject_key, display_name,
                     descriptor_hash, filename, prompt, model, image_style,
-                    visual_description, resolution_tier, status, error_message,
+                    visual_description, basic_name, resolution_tier, status, error_message,
                     width, height, created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', 0, 0, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', 0, 0, ?, ?)
                 ON CONFLICT(asset_id) DO UPDATE SET
                     display_name = excluded.display_name,
                     filename = excluded.filename,
@@ -4612,6 +4617,7 @@ class SaveRepository:
                     model = excluded.model,
                     image_style = excluded.image_style,
                     visual_description = excluded.visual_description,
+                    basic_name = excluded.basic_name,
                     resolution_tier = excluded.resolution_tier,
                     status = CASE
                         WHEN visual_assets.status = 'ready' THEN 'ready'
@@ -4631,6 +4637,7 @@ class SaveRepository:
                     str(model or "").strip(),
                     clean_image_style,
                     clean_visual_description,
+                    clean_basic_name,
                     clean_resolution_tier,
                     requested_status,
                     timestamp,
@@ -4666,7 +4673,7 @@ class SaveRepository:
         """Updates one image generation record after worker completion."""
 
         clean_status = str(status or "").strip().casefold()
-        if clean_status not in {"queued", "generating", "ready", "failed"}:
+        if clean_status not in {"queued", "generating", "ready", "failed", "skipped"}:
             raise ValueError(f"Unsupported visual asset status: {status}")
         with self._connect() as connection:
             connection.execute(
@@ -5757,7 +5764,7 @@ class SaveRepository:
                     description TEXT NOT NULL DEFAULT '',
                     value_base_units INTEGER NOT NULL DEFAULT 0,
                     metadata_json TEXT NOT NULL DEFAULT '{}',
-                    FOREIGN KEY (npc_id) REFERENCES npcs(npc_id) ON DELETE CASCADE
+                    FOREIGN KEY (npc_id) REFERENCES npcs(id) ON DELETE CASCADE
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_party_inventory_owner
@@ -5911,8 +5918,7 @@ class SaveRepository:
                 );
 
                 CREATE TABLE IF NOT EXISTS npcs (
-                    id TEXT PRIMARY KEY NOT NULL DEFAULT ('rec_' || lower(hex(randomblob(16)))),
-                    npc_id TEXT NOT NULL UNIQUE,
+                    id TEXT PRIMARY KEY NOT NULL,
                     name TEXT NOT NULL,
                     display_name TEXT NOT NULL DEFAULT '',
                     role TEXT NOT NULL DEFAULT '',
@@ -5935,7 +5941,7 @@ class SaveRepository:
                     can_buy INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
-                    FOREIGN KEY (npc_id) REFERENCES npcs(npc_id) ON DELETE CASCADE
+                    FOREIGN KEY (npc_id) REFERENCES npcs(id) ON DELETE CASCADE
                 );
 
                 CREATE TABLE IF NOT EXISTS merchant_stock (
@@ -5948,7 +5954,7 @@ class SaveRepository:
                     active INTEGER NOT NULL DEFAULT 1,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
-                    FOREIGN KEY (npc_id) REFERENCES npcs(npc_id) ON DELETE CASCADE
+                    FOREIGN KEY (npc_id) REFERENCES npcs(id) ON DELETE CASCADE
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_merchant_stock_npc
@@ -5964,7 +5970,7 @@ class SaveRepository:
                     active INTEGER NOT NULL DEFAULT 1,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
-                    FOREIGN KEY (npc_id) REFERENCES npcs(npc_id) ON DELETE CASCADE
+                    FOREIGN KEY (npc_id) REFERENCES npcs(id) ON DELETE CASCADE
                 );
 
                 CREATE TABLE IF NOT EXISTS merchant_transactions (
@@ -5978,7 +5984,7 @@ class SaveRepository:
                     unit_price_base_units INTEGER NOT NULL,
                     total_base_units INTEGER NOT NULL,
                     created_at TEXT NOT NULL,
-                    FOREIGN KEY (npc_id) REFERENCES npcs(npc_id) ON DELETE CASCADE
+                    FOREIGN KEY (npc_id) REFERENCES npcs(id) ON DELETE CASCADE
                 );
 
                 CREATE TABLE IF NOT EXISTS party_members (
@@ -5991,7 +5997,7 @@ class SaveRepository:
                     skills_json TEXT NOT NULL DEFAULT '[]',
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
-                    FOREIGN KEY (npc_id) REFERENCES npcs(npc_id) ON DELETE CASCADE
+                    FOREIGN KEY (npc_id) REFERENCES npcs(id) ON DELETE CASCADE
                 );
 
                 CREATE TABLE IF NOT EXISTS gm_secrets (
@@ -6058,6 +6064,7 @@ class SaveRepository:
                     model TEXT NOT NULL,
                     image_style TEXT NOT NULL DEFAULT '',
                     visual_description TEXT NOT NULL DEFAULT '',
+                    basic_name TEXT NOT NULL DEFAULT '',
                     resolution_tier TEXT NOT NULL DEFAULT '',
                     status TEXT NOT NULL DEFAULT 'queued',
                     error_message TEXT NOT NULL DEFAULT '',
@@ -6107,6 +6114,12 @@ class SaveRepository:
                 connection,
                 "visual_assets",
                 "visual_description",
+                "TEXT NOT NULL DEFAULT ''",
+            )
+            _ensure_column(
+                connection,
+                "visual_assets",
+                "basic_name",
                 "TEXT NOT NULL DEFAULT ''",
             )
             _ensure_column(
@@ -6854,13 +6867,13 @@ def _upsert_item_catalog_entry(
     description: str = "",
     value_base_units: int = 0,
     metadata: Any | None = None,
-) -> None:
+) -> str:
     """Adds or updates the durable item definition catalog."""
 
     clean_name = name.strip()
 
     if not clean_name:
-        return
+        return ""
 
     clean_category = category.strip()
     clean_description = description.strip()
@@ -6913,7 +6926,12 @@ def _upsert_item_catalog_entry(
                 now,
             ),
         )
-        return
+        return str(
+            connection.execute(
+                "SELECT id FROM item_catalog WHERE name = ? COLLATE NOCASE",
+                (clean_name,),
+            ).fetchone()["id"]
+        )
 
     existing_metadata = _decode_json_dict(
         row["metadata_json"],
@@ -6946,6 +6964,7 @@ def _upsert_item_catalog_entry(
             row["id"],
         ),
     )
+    return str(row["id"])
 
 
 def _inventory_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
@@ -7002,12 +7021,21 @@ def _item_catalog_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
     }
 
 
+class _NpcIdentityDict(dict[str, Any]):
+    """NPC records expose only ``id`` while tolerating legacy in-process reads."""
+
+    def __getitem__(self, key: str) -> Any:
+        return super().__getitem__("id" if key == "npc_id" else key)
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return super().get("id" if key == "npc_id" else key, default)
+
+
 def _npc_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
     """Converts an NPC database row to a plain dictionary."""
 
-    return {
+    return _NpcIdentityDict({
         "id": row["id"],
-        "npc_id": row["npc_id"],
         "name": row["name"],
         "display_name": row["display_name"],
         "role": row["role"],
@@ -7025,7 +7053,7 @@ def _npc_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
         "disposition": row["disposition"],
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
-    }
+    })
 
 
 def _party_member_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:

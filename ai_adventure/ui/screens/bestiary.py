@@ -10,8 +10,13 @@ class BestiaryScreen(RepositoryBackedWidget):
     def __init__(self) -> None:
         super().__init__()
 
+        # Keep the historical list as a hidden compatibility surface; the
+        # player-facing control is the compact selector above the details.
         self.creature_list = QListWidget()
-        self.creature_list.currentItemChanged.connect(
+        self.creature_list.hide()
+        self.creature_selector = _NoWheelComboBox()
+        self.creature_selector.setObjectName("bestiaryCreatureSelector")
+        self.creature_selector.currentIndexChanged.connect(
             self._display_selected_creature
         )
 
@@ -22,11 +27,11 @@ class BestiaryScreen(RepositoryBackedWidget):
         self.details_output = MarkdownDisplay()
         self.details_output.setObjectName("bestiaryCreatureDetails")
 
-        list_layout = QVBoxLayout()
-        list_layout.addWidget(QLabel("Known Creatures"))
-        list_layout.addWidget(self.creature_list)
-
         details_layout = QVBoxLayout()
+        selector_layout = QHBoxLayout()
+        selector_layout.addWidget(QLabel("Known Creatures:"))
+        selector_layout.addWidget(self.creature_selector, 1)
+        details_layout.addLayout(selector_layout)
         details_layout.addWidget(
             self.creature_image_label,
             0,
@@ -34,9 +39,9 @@ class BestiaryScreen(RepositoryBackedWidget):
         )
         details_layout.addWidget(self.details_output)
 
-        layout = QHBoxLayout()
-        layout.addLayout(list_layout, 1)
-        layout.addLayout(details_layout, 2)
+        layout = QVBoxLayout()
+        layout.addLayout(details_layout)
+        layout.addWidget(self.creature_list)
         self.setLayout(layout)
 
     def refresh(self) -> None:
@@ -45,10 +50,13 @@ class BestiaryScreen(RepositoryBackedWidget):
         repository = self.repository()
         selected_id = self._selected_creature_id()
         self.creature_list.blockSignals(True)
+        self.creature_selector.blockSignals(True)
         self.creature_list.clear()
+        self.creature_selector.clear()
 
         if repository is None:
             self.creature_list.blockSignals(False)
+            self.creature_selector.blockSignals(False)
             self.creature_image_label.clear()
             self.creature_image_label.hide()
             self.details_output.clear()
@@ -66,10 +74,12 @@ class BestiaryScreen(RepositoryBackedWidget):
                 str(creature.get("creature_id", "")).strip(),
             )
             self.creature_list.addItem(item)
+            self.creature_selector.addItem(name, creature)
 
         self.creature_list.blockSignals(False)
+        self.creature_selector.blockSignals(False)
 
-        if self.creature_list.count() == 0:
+        if self.creature_selector.count() == 0:
             self.creature_image_label.clear()
             self.creature_image_label.hide()
             _set_markdown_text(
@@ -79,38 +89,44 @@ class BestiaryScreen(RepositoryBackedWidget):
             return
 
         target_row = 0
-        for row in range(self.creature_list.count()):
-            item = self.creature_list.item(row)
-            if item is not None and str(
-                item.data(Qt.ItemDataRole.UserRole + 1) or ""
-            ) == selected_id:
+        for row in range(self.creature_selector.count()):
+            raw_creature = self.creature_selector.itemData(row)
+            creature_id = (
+                str(raw_creature.get("creature_id", "") or "").strip()
+                if isinstance(raw_creature, dict)
+                else ""
+            )
+            if creature_id == selected_id:
                 target_row = row
                 break
 
-        self.creature_list.setCurrentRow(target_row)
+        self.creature_selector.setCurrentIndex(target_row)
         self._display_selected_creature()
 
     def _selected_creature_id(self) -> str:
         """Returns the selected creature's durable public-lore ID."""
 
-        current_item = self.creature_list.currentItem()
-        if current_item is None:
+        index = self.creature_selector.currentIndex()
+        if index < 0:
             return ""
-        return str(
-            current_item.data(Qt.ItemDataRole.UserRole + 1) or ""
-        ).strip()
+        raw_creature = self.creature_selector.itemData(index)
+        return (
+            str(raw_creature.get("creature_id", "") or "").strip()
+            if isinstance(raw_creature, dict)
+            else ""
+        )
 
     def _display_selected_creature(self, *_args: Any) -> None:
         """Displays only the selected public miscellaneous record."""
 
-        current_item = self.creature_list.currentItem()
-        if current_item is None:
+        index = self.creature_selector.currentIndex()
+        if index < 0:
             self.creature_image_label.clear()
             self.creature_image_label.hide()
             self.details_output.clear()
             return
 
-        raw_creature = current_item.data(Qt.ItemDataRole.UserRole)
+        raw_creature = self.creature_selector.itemData(index)
         if not isinstance(raw_creature, dict):
             self.creature_image_label.clear()
             self.creature_image_label.hide()

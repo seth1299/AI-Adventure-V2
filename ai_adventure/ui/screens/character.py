@@ -1,4 +1,5 @@
 from __future__ import annotations
+from typing import cast
 
 from ai_adventure.ui.common import *  # noqa: F401,F403
 from ai_adventure.ui.dialogues import *  # noqa: F401,F403
@@ -20,7 +21,9 @@ class CharacterScreen(RepositoryBackedWidget):
         self.tts_enabled = bool(tts_enabled)
         self._loading_character = False
         self._saving_character = False
+        self._editing_profile = False
         self._last_saved_character_payload: dict[str, Any] | None = None
+        self._profile_markdown_target: QTextEdit | None = None
         self.name_input = QLineEdit()
         self.name_input.editingFinished.connect(self._save_character)
         self.name_pronunciation_input = QLineEdit()
@@ -83,6 +86,7 @@ class CharacterScreen(RepositoryBackedWidget):
             self.backstory_input,
             self.notes_input,
         ]:
+            text_edit.setAcceptRichText(False)
             text_edit.installEventFilter(self)
 
         self.appearance_input.setPlaceholderText("Visible traits, clothing, manner, scars, voice...")
@@ -123,6 +127,7 @@ class CharacterScreen(RepositoryBackedWidget):
         identity_layout.addRow("Backstory:", self.backstory_input)
         identity_layout.addRow("Notes:", self.notes_input)
         identity_group.setLayout(identity_layout)
+        self._profile_markdown_target = self.backstory_input
 
         self.stats_group = QGroupBox("Vitals")
         stats_layout = QFormLayout()
@@ -153,23 +158,229 @@ class CharacterScreen(RepositoryBackedWidget):
         self.portrait_group.setLayout(portrait_layout)
         self.portrait_group.hide()
 
-        left_layout = QVBoxLayout()
-        left_layout.addWidget(self.portrait_group)
-        left_layout.addWidget(self.condition_group)
-        left_layout.addWidget(self.stats_group)
-        left_layout.addWidget(self.equipment_group)
-        left_layout.addStretch()
+        self.profile_title_label = QLabel()
+        self.profile_title_label.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+        self.profile_title_label.setStyleSheet("font-size: 24px; font-weight: 700;")
 
-        right_layout = QVBoxLayout()
-        right_layout.addWidget(identity_group)
+        self.profile_pronouns_label = QLabel()
+        self.profile_pronunciation_label = QLabel()
+        self.profile_pronouns_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        self.profile_pronunciation_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        profile_identity_layout = QFormLayout()
+        profile_identity_layout.addRow("Pronouns:", self.profile_pronouns_label)
+        profile_identity_layout.addRow(
+            "Name Pronunciation:", self.profile_pronunciation_label
+        )
+        self.profile_identity_display = QWidget()
+        self.profile_identity_display.setLayout(profile_identity_layout)
 
-        sheet_layout = QHBoxLayout()
-        sheet_layout.addLayout(left_layout)
-        sheet_layout.addLayout(right_layout, stretch=1)
+        self.profile_appearance_display = MarkdownDisplay()
+        self.profile_backstory_display = MarkdownDisplay()
+        self.profile_notes_display = MarkdownDisplay()
+        for display in (
+            self.profile_appearance_display,
+            self.profile_backstory_display,
+            self.profile_notes_display,
+        ):
+            display.setMinimumHeight(52)
+            display.setSizePolicy(
+                QSizePolicy.Policy.Expanding,
+                QSizePolicy.Policy.MinimumExpanding,
+            )
+
+        self.profile_appearance_group = QGroupBox("Appearance")
+        appearance_layout = QVBoxLayout()
+        appearance_layout.addWidget(self.profile_appearance_display)
+        self.profile_appearance_group.setLayout(appearance_layout)
+        self.profile_backstory_group = QGroupBox("Backstory")
+        backstory_layout = QVBoxLayout()
+        backstory_layout.addWidget(self.profile_backstory_display)
+        self.profile_backstory_group.setLayout(backstory_layout)
+        self.profile_notes_group = QGroupBox("Notes")
+        notes_layout = QVBoxLayout()
+        notes_layout.addWidget(self.profile_notes_display)
+        self.profile_notes_group.setLayout(notes_layout)
+
+        read_profile_layout = QVBoxLayout()
+        read_profile_layout.addWidget(self.profile_identity_display)
+        read_profile_layout.addWidget(self.profile_appearance_group)
+        read_profile_layout.addWidget(self.profile_backstory_group)
+        read_profile_layout.addWidget(self.profile_notes_group)
+        read_profile_layout.addStretch()
+        self.read_profile_page = QWidget()
+        self.read_profile_page.setLayout(read_profile_layout)
+
+        markdown_toolbar = QHBoxLayout()
+        self._profile_markdown_buttons: list[QPushButton] = []
+        self._add_profile_markdown_button(markdown_toolbar, "B", "Bold", "bold")
+        self._add_profile_markdown_button(markdown_toolbar, "I", "Italic", "italic")
+        self._add_profile_markdown_button(markdown_toolbar, "U", "Underline", "underline")
+        self._add_profile_markdown_button(markdown_toolbar, "• List", "Bulleted list", "bullet")
+        self._add_profile_markdown_button(markdown_toolbar, "1. List", "Numbered list", "numbered")
+        self._add_profile_markdown_button(markdown_toolbar, "H", "Heading", "heading")
+        self._add_profile_markdown_button(markdown_toolbar, "Quote", "Block quote", "quote")
+        self._add_profile_markdown_button(markdown_toolbar, "Code", "Inline code", "code")
+        markdown_toolbar.addStretch()
+        editor_layout = QVBoxLayout()
+        editor_layout.addLayout(markdown_toolbar)
+        editor_layout.addWidget(identity_group)
+        self.edit_profile_page = QWidget()
+        self.edit_profile_page.setLayout(editor_layout)
+
+        self.profile_pages = QStackedWidget()
+        self.profile_pages.addWidget(self.read_profile_page)
+        self.profile_pages.addWidget(self.edit_profile_page)
+
+        self.edit_profile_button = QPushButton("Edit Profile")
+        self.edit_profile_button.clicked.connect(self._toggle_profile_editor)
+
+        header_layout = QVBoxLayout()
+        header_layout.addWidget(self.profile_title_label)
+        header_layout.addWidget(self.portrait_group, 0, Qt.AlignmentFlag.AlignHCenter)
+        header_layout.addWidget(self.condition_group)
+        header_layout.addWidget(self.profile_pages)
+
+        secondary_layout = QHBoxLayout()
+        secondary_layout.addWidget(self.stats_group)
+        secondary_layout.addWidget(self.equipment_group)
+
+        sheet_layout = QVBoxLayout()
+        sheet_layout.addLayout(header_layout)
+        sheet_layout.addLayout(secondary_layout)
+        edit_button_layout = QHBoxLayout()
+        edit_button_layout.addStretch()
+        edit_button_layout.addWidget(self.edit_profile_button)
+        sheet_layout.addLayout(edit_button_layout)
 
         self.setLayout(sheet_layout)
         self._set_pronouns(DEFAULT_CHARACTER_PRONOUNS)
         self._sync_contextual_controls(None)
+        self._set_profile_editing(False)
+
+    def _add_profile_markdown_button(
+        self,
+        layout: QHBoxLayout,
+        label: str,
+        tooltip: str,
+        action: str,
+    ) -> None:
+        """Adds a portable-Markdown formatting control for profile editors."""
+
+        button = QPushButton(label)
+        button.setToolTip(tooltip)
+        button.setMaximumWidth(78)
+        button.clicked.connect(
+            lambda _checked=False, name=action: self._apply_profile_markdown(name)
+        )
+        if action == "bold":
+            button.setShortcut("Ctrl+B")
+        elif action == "italic":
+            button.setShortcut("Ctrl+I")
+        elif action == "underline":
+            button.setShortcut("Ctrl+U")
+        layout.addWidget(button)
+        self._profile_markdown_buttons.append(button)
+
+    def _apply_profile_markdown(self, action: str) -> None:
+        """Applies portable Markdown to the active profile text editor."""
+
+        editor = self._profile_markdown_target
+        if editor is None:
+            return
+
+        cursor = editor.textCursor()
+        start = cursor.selectionStart()
+        end = cursor.selectionEnd()
+        text = editor.toPlainText()
+        wrappers = {
+            "bold": ("**", "**", "bold text"),
+            "italic": ("*", "*", "italic text"),
+            "underline": ("<u>", "</u>", "underlined text"),
+            "code": ("`", "`", "code"),
+        }
+        if action in wrappers:
+            prefix, suffix, placeholder = wrappers[action]
+            updated, selection_start, selection_end = wrap_markdown_text(
+                text,
+                start,
+                end,
+                prefix,
+                suffix,
+                placeholder=placeholder,
+            )
+        else:
+            cursor.setPosition(start)
+            cursor.movePosition(QTextCursor.MoveOperation.StartOfBlock)
+            block_start = cursor.position()
+            cursor.setPosition(end)
+            cursor.movePosition(QTextCursor.MoveOperation.EndOfBlock)
+            block_end = cursor.position()
+            selected_lines = text[block_start:block_end]
+            if action == "numbered":
+                replacement = prefix_markdown_lines(selected_lines, "", numbered=True)
+            else:
+                prefixes = {"bullet": "- ", "heading": "## ", "quote": "> "}
+                replacement = prefix_markdown_lines(selected_lines, prefixes[action])
+            updated = text[:block_start] + replacement + text[block_end:]
+            selection_start = block_start
+            selection_end = block_start + len(replacement)
+
+        editor.setPlainText(updated)
+        cursor = editor.textCursor()
+        cursor.setPosition(selection_start)
+        cursor.setPosition(selection_end, QTextCursor.MoveMode.KeepAnchor)
+        editor.setTextCursor(cursor)
+        editor.setFocus()
+
+    def _toggle_profile_editor(self) -> None:
+        """Toggles the read-only profile view and its Markdown editors."""
+
+        self._set_profile_editing(not self._editing_profile)
+        if self._editing_profile:
+            self.name_input.setFocus()
+
+    def _set_profile_editing(self, editing: bool) -> None:
+        """Selects the profile page and keeps the bottom action descriptive."""
+
+        self._editing_profile = bool(editing)
+        self.profile_pages.setCurrentWidget(
+            self.edit_profile_page if self._editing_profile else self.read_profile_page
+        )
+        self.edit_profile_button.setText(
+            "View Profile" if self._editing_profile else "Edit Profile"
+        )
+
+        enabled = self._editing_profile
+        for button in self._profile_markdown_buttons:
+            button.setEnabled(enabled)
+
+    def _sync_profile_preview(self, *, has_portrait: bool) -> None:
+        """Copies the current profile values into the read-only Markdown view."""
+
+        self.profile_title_label.setText(self.name_input.text().strip() or "Unnamed Character")
+        self.profile_pronouns_label.setText(self._pronouns_from_controls() or "Not specified")
+        pronunciation = self.name_pronunciation_input.text().strip()
+        self.profile_pronunciation_label.setText(pronunciation or "Not specified")
+        _set_markdown_text(
+            self.profile_appearance_display,
+            self.appearance_input.toPlainText(),
+            preserve_blank_lines=True,
+        )
+        _set_markdown_text(
+            self.profile_backstory_display,
+            self.backstory_input.toPlainText(),
+            preserve_blank_lines=True,
+        )
+        _set_markdown_text(
+            self.profile_notes_display,
+            self.notes_input.toPlainText(),
+            preserve_blank_lines=True,
+        )
+        self.profile_appearance_group.setVisible(not has_portrait)
 
     def _handle_pronouns_changed(self, _index: int = -1) -> None:
         """Shows custom pronoun entry when needed and saves the selection."""
@@ -227,7 +438,9 @@ class CharacterScreen(RepositoryBackedWidget):
                 )
             )
         )
-        self.condition_group.setVisible(narrative_combat)
+        # Status is part of the profile summary in every game mode.  The
+        # combat-specific stats and equipment controls remain contextual.
+        self.condition_group.setVisible(True)
         self.stats_group.setVisible(not narrative_combat)
         self.equipment_group.setVisible(not narrative_combat)
         self.name_pronunciation_label.setVisible(narrator_enabled)
@@ -255,6 +468,8 @@ class CharacterScreen(RepositoryBackedWidget):
                 self._sync_equipment_summary()
                 self.condition_label.setText("Healthy")
                 self._sync_contextual_controls(None)
+                self._sync_profile_preview(has_portrait=False)
+                self._set_profile_editing(False)
                 return
 
             state = StateManager(repository).load_state()
@@ -286,16 +501,17 @@ class CharacterScreen(RepositoryBackedWidget):
                 "player",
                 repository.get_player_id(),
             )
-            self.portrait_group.setVisible(
-                _set_generated_image(
-                    self.portrait_label,
-                    self.visual_asset_path(portrait_asset),
-                    maximum_width=280,
-                    maximum_height=340,
-                    accessible_name=f"Generated portrait of {state.player.name}",
-                )
+            has_portrait = _set_generated_image(
+                self.portrait_label,
+                self.visual_asset_path(portrait_asset),
+                maximum_width=280,
+                maximum_height=340,
+                accessible_name=f"Generated portrait of {state.player.name}",
             )
+            self.portrait_group.setVisible(has_portrait)
             self._sync_contextual_controls(repository)
+            self._sync_profile_preview(has_portrait=has_portrait)
+            self._set_profile_editing(False)
         finally:
             self._loading_character = False
             self._last_saved_character_payload = (
@@ -305,14 +521,17 @@ class CharacterScreen(RepositoryBackedWidget):
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:
         """Autosaves multi-line character fields when focus leaves them."""
 
+        profile_editors = (
+            self.appearance_input,
+            self.backstory_input,
+            self.notes_input,
+        )
+        if event.type() == QEvent.Type.FocusIn and watched in profile_editors:
+            self._profile_markdown_target = cast(QTextEdit, watched)
+
         if (
             event.type() == QEvent.Type.FocusOut
-            and watched
-            in (
-                self.appearance_input,
-                self.backstory_input,
-                self.notes_input,
-            )
+            and watched in profile_editors
         ):
             QTimer.singleShot(0, self._save_character)
 
@@ -438,6 +657,9 @@ class CharacterScreen(RepositoryBackedWidget):
             self._saving_character = False
 
         self._sync_equipment_summary()
+        self._sync_profile_preview(
+            has_portrait=self.portrait_group.isVisible(),
+        )
         self.notify_repository_changed()
 
     def _populate_equipment_combos(

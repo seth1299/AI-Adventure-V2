@@ -507,6 +507,10 @@ class EventApplier:
             "base_unit_value",
             "value",
         )
+        metadata = dict(payload)
+        new_basic_name = _first_text(payload, "new_basic_name")
+        if new_basic_name and new_basic_name.casefold() not in {"same", "skip"}:
+            metadata["basic_name"] = new_basic_name
 
         if owner_npc_id:
             self.repository.modify_party_inventory_item(
@@ -517,7 +521,7 @@ class EventApplier:
                 description=_first_text(payload, "new_description", "description"),
                 quantity=quantity,
                 value_base_units=value_base_units,
-                metadata=payload,
+                metadata=metadata,
             )
         else:
             self.repository.modify_inventory_item(
@@ -527,7 +531,7 @@ class EventApplier:
                 description=_first_text(payload, "new_description", "description"),
                 quantity=quantity,
                 value_base_units=value_base_units,
-                metadata=payload,
+                metadata=metadata,
             )
 
         return AppliedEventResult(

@@ -2374,7 +2374,7 @@ class NewGameWizard(QWizard):
         smarter_note.setStyleSheet(description_style)
 
         self.generated_images_enabled_checkbox = QCheckBox(
-            "Generate images for characters, locations, NPCs, and inventory items"
+            "Offer image-source choices for characters, locations, NPCs, and items"
         )
         self.generated_images_enabled_checkbox.setChecked(True)
         self.image_model_combo = _NoWheelComboBox(page)
@@ -2870,6 +2870,28 @@ class NewGameWizard(QWizard):
                 "tab. Python controls initiative, attacks, damage, victory, and loot."
             )
         self.combat_resolution_explanation.setText(explanation)
+        self._sync_inventory_combat_sections()
+
+    def _is_narrative_combat(self) -> bool:
+        """Returns whether Gemini, rather than deterministic Combat, resolves fights."""
+
+        return (
+            str(self.combat_resolution_mode_combo.currentData() or "strict")
+            == "narrative"
+        )
+
+    def _sync_inventory_combat_sections(self) -> None:
+        """Hides deterministic weapon/armor editors for narrative combat."""
+
+        sections = getattr(self, "_inventory_combat_sections", None)
+        if not isinstance(sections, dict):
+            return
+
+        show_deterministic_sections = not self._is_narrative_combat()
+        for widgets in sections.values():
+            for widget in widgets:
+                if widget is not None:
+                    widget.setVisible(show_deterministic_sections)
 
     def _build_inventory_currency_page(self) -> None:
         """Builds the starter inventory and currency page."""
@@ -3122,10 +3144,18 @@ class NewGameWizard(QWizard):
             )
         basic_inventory_layout.addRow("Items:", self.starter_item_suggestions_table)
         basic_inventory_layout.addRow("", _button_row(add_item_suggestion_button))
+        basic_weapon_button_row = _button_row(add_weapon_suggestion_button)
+        basic_armor_button_row = _button_row(add_armor_suggestion_button)
         basic_inventory_layout.addRow("Weapons:", self.starter_weapon_suggestions_table)
-        basic_inventory_layout.addRow("", _button_row(add_weapon_suggestion_button))
+        basic_inventory_layout.addRow("", basic_weapon_button_row)
         basic_inventory_layout.addRow("Armor:", self.starter_armor_suggestions_table)
-        basic_inventory_layout.addRow("", _button_row(add_armor_suggestion_button))
+        basic_inventory_layout.addRow("", basic_armor_button_row)
+        basic_weapon_label = basic_inventory_layout.labelForField(
+            self.starter_weapon_suggestions_table
+        )
+        basic_armor_label = basic_inventory_layout.labelForField(
+            self.starter_armor_suggestions_table
+        )
         basic_inventory_widget = QWidget()
         basic_inventory_widget.setLayout(basic_inventory_layout)
 
@@ -3133,10 +3163,18 @@ class NewGameWizard(QWizard):
         _configure_responsive_form(advanced_inventory_layout)
         advanced_inventory_layout.addRow("Items:", self.starter_items_table)
         advanced_inventory_layout.addRow("", _button_row(add_item_button))
+        advanced_weapon_button_row = _button_row(add_weapon_button)
+        advanced_armor_button_row = _button_row(add_armor_button)
         advanced_inventory_layout.addRow("Weapons:", self.starter_weapons_table)
-        advanced_inventory_layout.addRow("", _button_row(add_weapon_button))
+        advanced_inventory_layout.addRow("", advanced_weapon_button_row)
         advanced_inventory_layout.addRow("Armor:", self.starter_armor_table)
-        advanced_inventory_layout.addRow("", _button_row(add_armor_button))
+        advanced_inventory_layout.addRow("", advanced_armor_button_row)
+        advanced_weapon_label = advanced_inventory_layout.labelForField(
+            self.starter_weapons_table
+        )
+        advanced_armor_label = advanced_inventory_layout.labelForField(
+            self.starter_armor_table
+        )
         advanced_inventory_widget = QWidget()
         advanced_inventory_widget.setLayout(advanced_inventory_layout)
 
@@ -3146,6 +3184,30 @@ class NewGameWizard(QWizard):
         self.starter_inventory_mode_buttons.idClicked.connect(
             self.starter_inventory_mode_stack.setCurrentIndex
         )
+
+        self._inventory_combat_sections = {
+            "weapons": [
+                self.starter_weapon_suggestions_table,
+                add_weapon_suggestion_button,
+                basic_weapon_button_row,
+                basic_weapon_label,
+                self.starter_weapons_table,
+                add_weapon_button,
+                advanced_weapon_button_row,
+                advanced_weapon_label,
+            ],
+            "armor": [
+                self.starter_armor_suggestions_table,
+                add_armor_suggestion_button,
+                basic_armor_button_row,
+                basic_armor_label,
+                self.starter_armor_table,
+                add_armor_button,
+                advanced_armor_button_row,
+                advanced_armor_label,
+            ],
+        }
+        self._sync_inventory_combat_sections()
 
         layout = QFormLayout()
         _configure_responsive_form(layout)
@@ -3441,23 +3503,29 @@ class NewGameWizard(QWizard):
         """Reads starter item rows from the wizard table."""
 
         if self._starter_inventory_mode() == "advanced":
-            return [
-                *_starter_items_from_table(self.starter_items_table),
-                *_starter_weapons_from_table(self.starter_weapons_table),
-                *_starter_armor_from_table(self.starter_armor_table),
-            ]
+            items = _starter_items_from_table(self.starter_items_table)
+            if not self._is_narrative_combat():
+                items.extend(_starter_weapons_from_table(self.starter_weapons_table))
+                items.extend(_starter_armor_from_table(self.starter_armor_table))
+            return items
 
-        return [
+        items = [
             *_starter_suggestions_from_table(
                 self.starter_item_suggestions_table, "Item"
             ),
-            *_starter_suggestions_from_table(
-                self.starter_weapon_suggestions_table, "Weapon"
-            ),
-            *_starter_suggestions_from_table(
-                self.starter_armor_suggestions_table, "Armor"
-            ),
         ]
+        if not self._is_narrative_combat():
+            items.extend(
+                _starter_suggestions_from_table(
+                    self.starter_weapon_suggestions_table, "Weapon"
+                )
+            )
+            items.extend(
+                _starter_suggestions_from_table(
+                    self.starter_armor_suggestions_table, "Armor"
+                )
+            )
+        return items
 
     def _starter_inventory_mode(self) -> str:
         """Returns the selected Basic/Advanced starter-equipment mode."""

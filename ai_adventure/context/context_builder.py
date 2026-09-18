@@ -348,11 +348,14 @@ class AiContextBuilder:
         audio_transition_rules: list[str] = []
         if clean_music_tracks:
             audio_transition_rules.append(
-                "When StatusUpdatedEvent.location changes to a substantially different "
-                "environment type, compare state.audio.current_music to "
-                "state.audio.valid_music_tracks. If a listed track clearly better "
-                "matches the new environment or mood, include MusicChangedEvent "
-                "before the final StatusUpdatedEvent."
+                "MusicChangedEvent is optional, not required whenever the scene or "
+                "location changes. Compare state.audio.current_music with every entry "
+                "in state.audio.valid_music_tracks and include MusicChangedEvent "
+                "before the final StatusUpdatedEvent only when a listed replacement "
+                "is clearly a better fit for the new environment or mood. If none of "
+                "the available tracks is clearly better, omit the event and leave the "
+                "current track playing; never change music merely because the scene "
+                "changed."
             )
         if clean_sound_effect_tracks:
             audio_transition_rules.append(
@@ -998,14 +1001,19 @@ class AiContextBuilder:
                     "valid_background_ambience_tracks": clean_background_ambience_tracks,
                     "rules": {
                         "music_change_rule": (
-                            "When scene mood, location, danger level, or environment "
-                            "changes enough that the current track no longer fits, "
-                            "suggest MusicChangedEvent."
+                            "MusicChangedEvent is optional. When scene mood, location, "
+                            "danger level, or environment changes, compare the current "
+                            "track with every entry in valid_music_tracks. Suggest the "
+                            "event only when a listed replacement is clearly a better "
+                            "fit; if none is clearly better, omit it and keep the "
+                            "current music playing. Do not change tracks merely because "
+                            "the scene changed."
                         ),
                         "filename_rule": (
                             "MusicChangedEvent.filename must exactly match one entry "
                             "from valid_music_tracks. If valid_music_tracks is empty, "
-                            "do not suggest MusicChangedEvent."
+                            "or no available track is clearly a better fit than the "
+                            "current track, do not suggest MusicChangedEvent."
                         ),
                         "sound_effect_rule": (
                             "SoundEffectChangedEvent is a short one-shot narration cue, "
@@ -1040,6 +1048,9 @@ class AiContextBuilder:
                             "Return speaker_cues for every exact contiguous span of "
                             "non-narrator dialogue in response. Copy the complete span, "
                             "including outer double quotation marks, into a unique "
+                            "anchor_text copied verbatim from response. Never use "
+                            "placeholder text such as [X], [Y], ellipses, or a "
+                            "paraphrase as anchor_text. "
                             "anchor_text. Use an actual NPC's exact npc_id as speaker_id "
                             "and reuse it on later turns; use distinct stable "
                             "lower_snake_case IDs for other speakers. Choose only a "
@@ -1365,9 +1376,13 @@ class AiContextBuilder:
                     "item definitions. Before inventing an item, reuse a fitting "
                     "existing catalog definition whenever one can serve the story. "
                 "It preserves descriptions, categories, and values, "
-                    "and metadata.item_uuid stable internal identities; reuse the same "
-                    "item_uuid for the same item even when its display name changes. "
-                    "It also preserves equipment metadata after items leave inventory. "
+                     "and metadata.item_uuid stable internal identities; reuse the same "
+                     "item_uuid for the same item even when its display name changes. "
+                     "For every new item, also provide basic_name: a short generic item-family "
+                     "name with color, material, size, condition, craftsmanship, and other "
+                     "flavor adjectives removed. Use the same basic_name for equivalent items "
+                     "such as Wide Brimmed Fedora, Grey Felt Fedora, and Fedora. "
+                     "It also preserves equipment metadata after items leave inventory. "
                     "Use Weapon metadata for weapon_hands, damage dice, attack range, "
                     "and optional ammunition_type_required, clip_size, and "
                     "bullets_per_attack. Ammunition items use matching "

@@ -79,6 +79,7 @@ class VisualAssetRequest:
     subject_key: str
     display_name: str
     description: str
+    basic_name: str = ""
     world_context: str = ""
     message_ids: tuple[str, ...] = ()
     image_style: str = DEFAULT_IMAGE_STYLE
@@ -199,6 +200,11 @@ class VisualAssetRequest:
             "The supplied subject name and description are metadata for the artist, "
             "not words to render in the image."
         )
+        basic_identity = (
+            f"Generic item family for reuse matching: {self.basic_name}\n"
+            if self.subject_type == "inventory" and self.basic_name.strip()
+            else ""
+        )
         return (
             "Generate one cohesive image for AI Adventure. "
             f"Selected visual style: {style['value']} ({style['label']}). "
@@ -215,6 +221,7 @@ class VisualAssetRequest:
             "surfaces. Preserve believable variation, small imperfections, and style-appropriate "
             "texture, materials, and lighting.\n\n"
             f"Subject name: {self.display_name}\n"
+            f"{basic_identity}"
             f"Player-visible description: {self.description}\n"
             "The Subject name and Player-visible description above are metadata only. "
             "Do not copy them into the image as text unless the exact-label rules below "
@@ -359,12 +366,14 @@ def build_visual_asset_requests(
             else ""
         ).strip()
         subject_key = item_uuid or name.casefold()
+        basic_name = _item_basic_name(item, item_catalog, fallback=name)
         requests.append(
             VisualAssetRequest(
                 subject_type="inventory",
                 subject_key=subject_key,
                 display_name=name,
                 description=f"{category}. {description}",
+                basic_name=basic_name,
                 world_context=world_context,
                 message_ids=tuple(
                     event_messages.get(("inventory", subject_key), ())
@@ -569,6 +578,10 @@ def find_reusable_visual_asset(
 
     target_description = " ".join(request.description.split()).casefold()
     target_name = " ".join(request.display_name.split()).casefold()
+    target_basic_name = _normalized_basic_name(
+        request.basic_name,
+        fallback=request.display_name,
+    )
     target_style = normalize_image_style(request.image_style)
     target_resolution = request.image_size
     current_db = Path(repository.db_path).resolve()
@@ -581,20 +594,38 @@ def find_reusable_visual_asset(
             connection = sqlite3.connect(candidate_db)
             try:
                 connection.row_factory = sqlite3.Row
-                rows = connection.execute(
-                    """
-                    SELECT asset_id, subject_type, subject_key, display_name,
-                           visual_description, filename, image_style,
-                           resolution_tier, width, height
-                    FROM visual_assets
-                    WHERE subject_type = ?
-                      AND status = 'ready'
-                      AND image_style = ?
-                      AND resolution_tier = ?
-                    """
-                    ,
-                    (request.subject_type.casefold(), target_style, target_resolution),
-                ).fetchall()
+                try:
+                    rows = connection.execute(
+                        """
+                        SELECT asset_id, subject_type, subject_key, display_name,
+                               visual_description, basic_name, filename, image_style,
+                               resolution_tier, width, height
+                        FROM visual_assets
+                        WHERE subject_type = ?
+                          AND status = 'ready'
+                          AND image_style = ?
+                          AND resolution_tier = ?
+                        """
+                        ,
+                        (request.subject_type.casefold(), target_style, target_resolution),
+                    ).fetchall()
+                except sqlite3.OperationalError as error:
+                    if "no such column: basic_name" not in str(error).casefold():
+                        raise
+                    rows = connection.execute(
+                        """
+                        SELECT asset_id, subject_type, subject_key, display_name,
+                               visual_description, filename, image_style,
+                               resolution_tier, width, height
+                        FROM visual_assets
+                        WHERE subject_type = ?
+                          AND status = 'ready'
+                          AND image_style = ?
+                          AND resolution_tier = ?
+                        """
+                        ,
+                        (request.subject_type.casefold(), target_style, target_resolution),
+                    ).fetchall()
             finally:
                 connection.close()
         except (OSError, sqlite3.Error):
@@ -608,6 +639,10 @@ def find_reusable_visual_asset(
             candidate_description = " ".join(
                 str(row["visual_description"] or "").split()
             ).casefold()
+            candidate_basic_name = _normalized_basic_name(
+                row["basic_name"] if "basic_name" in row.keys() else "",
+                fallback=str(row["display_name"] or ""),
+            )
             if not candidate_name or not candidate_description:
                 continue
             if str(row["image_style"] or "").strip().casefold() != target_style:
@@ -640,16 +675,18 @@ def find_reusable_visual_asset(
                 }
 
             name_score = token_set_ratio(target_name, candidate_name)
-            if name_score < 82:
-                continue
+            basic_name_score = token_set_ratio(target_basic_name, candidate_basic_name)
             description_score = token_set_ratio(target_description, candidate_description)
-            if not (
-                name_score >= 90 and description_score >= 40
-                or name_score >= 82 and description_score >= 56
-            ):
+            basic_identity_match = basic_name_score >= 92 and description_score >= 40
+            relaxed_name_match = name_score >= 75 and description_score >= 50
+            if not (basic_identity_match or relaxed_name_match):
                 continue
 
-            score = (name_score * 0.65) + (description_score * 0.35)
+            score = (
+                (basic_name_score * 0.45) + (description_score * 0.55)
+                if basic_identity_match
+                else (name_score * 0.65) + (description_score * 0.35)
+            )
             if best is None or score > float(best["score"]):
                 best = {
                     "source_path": source_path,
@@ -740,6 +777,55 @@ def _item_visual_description(
             parts.append(f"{key.replace('_', ' ').title()}: {text}")
 
     return " ".join(parts)
+
+
+def _item_basic_name(
+    item: dict[str, Any],
+    item_catalog: dict[str, dict[str, Any]],
+    *,
+    fallback: str,
+) -> str:
+    """Returns Gemini's generic item-family identity for reuse matching."""
+
+    name = str(item.get("name", "") or "").strip()
+    metadata = item.get("metadata", {})
+    metadata = metadata if isinstance(metadata, dict) else {}
+    item_uuid = str(metadata.get("item_uuid", "") or "").strip()
+    catalog_entry = item_catalog.get(item_uuid) or item_catalog.get(name.casefold())
+    catalog_metadata = (
+        catalog_entry.get("metadata", {})
+        if isinstance(catalog_entry, dict)
+        else {}
+    )
+    if not isinstance(catalog_metadata, dict):
+        catalog_metadata = {}
+    return _normalized_basic_name(
+        metadata.get("basic_name")
+        or catalog_metadata.get("basic_name")
+        or (catalog_entry or {}).get("basic_name"),
+        fallback=fallback,
+    )
+
+
+def _normalized_basic_name(value: Any, *, fallback: str = "") -> str:
+    """Normalizes a generic item name, with an old-record fallback."""
+
+    clean = " ".join(str(value or "").split()).strip()
+    if clean:
+        return clean[:120]
+    clean_fallback = " ".join(str(fallback or "").split()).strip()
+    words = re.findall(r"[A-Za-z0-9]+(?:['’-][A-Za-z0-9]+)*", clean_fallback)
+    if not words:
+        return clean_fallback[:120]
+    last = words[-1]
+    folded = last.casefold()
+    if len(last) > 3 and folded.endswith("ies"):
+        last = last[:-3] + "y"
+    elif len(last) > 4 and folded.endswith(("ches", "shes", "xes", "zes", "ses")):
+        last = last[:-2]
+    elif len(last) > 3 and folded.endswith("s") and not folded.endswith("ss"):
+        last = last[:-1]
+    return last[:120]
 
 
 def _item_catalog_by_identity(

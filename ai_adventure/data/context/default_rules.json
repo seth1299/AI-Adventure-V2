@@ -508,6 +508,7 @@
           "Suggest InventoryItemAddedEvent every time the player receives a new item in the current turn, including completed purchases.",
           "`Item Type` becomes the inventory category.",
           "`Item Name` should be specific.",
+          "Every new item must also include `basic_name`: a short, stable generic item-family name for visual reuse matching. Remove color, material, size, condition, craftsmanship, and other flavor adjectives; for example, Wide Brimmed Fedora, Grey Felt Fedora, and Fedora should all use Fedora. Keep the actual in-game item name in `item_name`.",
           "`Description` should explain what the item is and include in structured event data important state information, such as what sort of ammunition is used for a bow or a gun. For a newly defined item, include concise concrete player-visible visual traits that can depict it consistently.",
           "`Amount` must be a positive integer.",
           "`ValueBaseUnits` is required for every InventoryItemAddedEvent and must be an integer of at least 1, measured in the baseline currency unit from state.currency.baseline_unit.",
@@ -566,6 +567,7 @@
           "target_name",
           "owner_npc_id",
           "new_name",
+          "new_basic_name",
           "new_category",
           "new_description",
           "new_amount",
@@ -588,6 +590,7 @@
         "rules": [
           "Suggest InventoryItemModifiedEvent when an existing item changes state, especially when the Player does a specific action to an item, such as storing an herb in a glass jar, or storing mushrooms out of the light.",
           "`TargetName` should match the current inventory item name as closely as possible.",
+          "When an item's generic family changes, update `new_basic_name` too; otherwise use SAME or SKIP for it.",
           "Use `SAME` or `SKIP` for fields that do not change.",
           "Example use cases for this event include in structured event data but are not limited to: partially eating food, repairing items, damaging items, marking documents, or changing item condition.",
           "`NewAmount` must be an integer, `SAME`, or `SKIP`.",
@@ -983,11 +986,11 @@
         ],
         "purpose": "Changes looping background music.",
         "rules": [
-          "Suggest MusicChangedEvent when the scene mood, location, danger level, or environment changes enough to justify new background music.",
-          "The filename must exactly match one of the valid sound files.",
+          "MusicChangedEvent is optional, not required whenever the scene or location changes. Compare the current track with all entries in state.audio.valid_music_tracks and emit the event only when a listed replacement is clearly a better fit for the new environment or mood. If none of the available tracks is clearly better, omit the event and leave the current track playing; never change music merely because the scene changed.",
+          "The filename must exactly match one entry in state.audio.valid_music_tracks.",
           "Valid background-music filenames are listed only in state.audio.valid_music_tracks. Never use a filename from state.audio.valid_sound_effect_tracks or state.audio.valid_background_ambience_tracks for MusicChangedEvent.",
           "Do not invent filenames.",
-          "Do not overuse this event for every minor action, however, do check and make sure that the currently playing music is appropriate for the location and the mood, even if the \"Location\" didn't actually change from one action to another. For example, if an ally suddenly turns traitor, you can start a fight song track, even if the Player is still in a \"Forest\" location."
+          "Do not overuse this event for every minor action, but do evaluate whether the currently playing music fits the location and mood, even if the \"Location\" did not change. This evaluation does not require a change: if no available track is a clearly better fit, keep the current music. For example, if an ally suddenly turns traitor, you can start a fight song track, even if the Player is still in a \"Forest\" location."
         ]
       }
     },

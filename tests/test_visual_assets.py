@@ -387,7 +387,10 @@ class VisualAssetTests(unittest.TestCase):
                         "name": "Canvas Backpack",
                         "category": "Container",
                         "description": "A worn canvas backpack.",
-                        "metadata": {"item_uuid": "item_abc123"},
+                        "metadata": {
+                            "item_uuid": "item_abc123",
+                            "basic_name": "Backpack",
+                        },
                     }
                 ]
 
@@ -396,6 +399,7 @@ class VisualAssetTests(unittest.TestCase):
         self.assertEqual(by_type["player"].subject_key, "player_abc123")
         self.assertEqual(by_type["location"].subject_key, "loc_abc123")
         self.assertEqual(by_type["inventory"].subject_key, "item_abc123")
+        self.assertEqual(by_type["inventory"].basic_name, "Backpack")
         self.assertEqual(
             save_relative_image_filename(_IdentifiedRepository(), by_type["inventory"]),
             "example_save/inventory/canvas_backpack_"
@@ -414,6 +418,7 @@ class VisualAssetTests(unittest.TestCase):
                 subject_key="source_item",
                 display_name="Canvas Backpack",
                 description="Container. A worn canvas backpack with leather straps.",
+                basic_name="Backpack",
             )
             source_filename = save_relative_image_filename(source_repository, source_request)
             source_path = root / "images" / source_filename
@@ -430,6 +435,7 @@ class VisualAssetTests(unittest.TestCase):
                 model="test",
                 image_style=source_request.image_style,
                 visual_description=source_request.description,
+                basic_name=source_request.basic_name,
                 resolution_tier=source_request.image_size,
                 ready=True,
             )
@@ -439,6 +445,7 @@ class VisualAssetTests(unittest.TestCase):
                 subject_key="target_item",
                 display_name="Leather Canvas Backpack",
                 description="Container. A worn canvas backpack with leather straps and a brass buckle.",
+                basic_name="Backpack",
             )
             reusable = find_reusable_inventory_asset(
                 images_dir=root / "images",
@@ -579,7 +586,57 @@ class VisualAssetTests(unittest.TestCase):
 
             self.assertEqual(record["image_style"], "watercolor")
             self.assertEqual(record["visual_description"], request.description)
+            self.assertEqual(record["basic_name"], "")
             self.assertEqual(record["resolution_tier"], "1K")
+
+    def test_basic_item_name_reuses_variants_with_different_display_adjectives(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            saves_dir = root / "saves"
+            source_repository = SaveRepository.create_new_save(saves_dir, "Source")
+            target_repository = SaveRepository.create_new_save(saves_dir, "Target")
+            source_request = VisualAssetRequest(
+                subject_type="inventory",
+                subject_key="source_fedora",
+                display_name="Grey Felt Fedora",
+                basic_name="Fedora",
+                description="Armor. A grey felt fedora with a black ribbon band.",
+            )
+            source_filename = save_relative_image_filename(source_repository, source_request)
+            source_path = root / "images" / source_filename
+            source_path.parent.mkdir(parents=True)
+            Image.new("RGB", (1024, 1024), (30, 30, 30)).save(source_path, format="PNG")
+            source_repository.ensure_visual_asset(
+                asset_id=source_request.asset_id,
+                subject_type=source_request.subject_type,
+                subject_key=source_request.subject_key,
+                display_name=source_request.display_name,
+                descriptor_hash=source_request.descriptor_hash,
+                filename=source_filename,
+                prompt="unused",
+                model="test",
+                image_style=source_request.image_style,
+                visual_description=source_request.description,
+                basic_name=source_request.basic_name,
+                resolution_tier=source_request.image_size,
+                ready=True,
+            )
+
+            target_request = VisualAssetRequest(
+                subject_type="inventory",
+                subject_key="target_fedora",
+                display_name="Wide Brimmed Fedora",
+                basic_name="Fedora",
+                description="Armor. A dark felt fedora with a black ribbon band.",
+            )
+            reusable = find_reusable_inventory_asset(
+                images_dir=root / "images",
+                saves_dir=saves_dir,
+                repository=target_repository,
+                request=target_request,
+            )
+
+            self.assertIsNotNone(reusable)
 
     def test_map_named_inventory_assets_use_the_1k_image_tier(self) -> None:
         request = VisualAssetRequest(
@@ -636,6 +693,33 @@ class VisualAssetTests(unittest.TestCase):
             self.assertEqual(ready["filename"], request.filename)
             linked = repository.list_visual_assets_for_message("turn-1")
             self.assertEqual([asset["asset_id"] for asset in linked], [request.asset_id])
+
+    def test_repository_persists_skipped_initial_image_without_retrying_it(self) -> None:
+        request = VisualAssetRequest(
+            subject_type="player",
+            subject_key="player_1",
+            display_name="Kit Vale",
+            description="A short scout in pale armor.",
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = SaveRepository.create_new_save(Path(temp_dir), "Skipped")
+            repository.ensure_visual_asset(
+                asset_id=request.asset_id,
+                subject_type=request.subject_type,
+                subject_key=request.subject_key,
+                display_name=request.display_name,
+                descriptor_hash=request.descriptor_hash,
+                filename=request.filename,
+                prompt=request.prompt,
+                model="test",
+            )
+            repository.set_visual_asset_status(request.asset_id, "skipped")
+
+            record = repository.get_visual_asset_by_id(request.asset_id)
+            self.assertIsNotNone(record)
+            assert record is not None
+            self.assertEqual(record["status"], "skipped")
+            self.assertEqual(repository.reset_failed_visual_assets(), 0)
 
     def test_repository_accepts_bestiary_visual_assets(self) -> None:
         request = VisualAssetRequest(

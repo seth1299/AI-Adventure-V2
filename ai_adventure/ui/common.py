@@ -46,6 +46,7 @@ from PySide6.QtWidgets import (
     QCompleter,
     QDialog,
     QDialogButtonBox,
+    QFileDialog,
     QFrame,
     QFormLayout,
     QGridLayout,

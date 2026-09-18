@@ -1086,6 +1086,7 @@ def _fallback_starter_item_from_setup(
         return None
     item = {
         "name": name,
+        "basic_name": str(raw_item.get("basic_name", name) or name).strip()[:120],
         "category": str(raw_item.get("category", "Item")).strip() or "Item",
         "quantity": max(1, _safe_int(raw_item.get("quantity"), 1)),
         "description": description
@@ -1139,6 +1140,7 @@ def _starter_inventory_top_up_item(
             continue
         return {
             "name": name,
+            "basic_name": name,
             "category": category,
             "description": description,
             "value_base_units": value_base_units,

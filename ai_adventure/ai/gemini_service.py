@@ -612,6 +612,15 @@ EVENT_RESPONSE_SCHEMA: dict[str, Any] = {
             {
                 "item_type": {"type": "string"},
                 "item_name": {"type": "string"},
+                "basic_name": {
+                    "type": "string",
+                    "description": (
+                        "Short generic item-family name used for visual reuse matching. "
+                        "Remove color, material, size, condition, craftsmanship, and other "
+                        "flavor adjectives; for example, Wide Brimmed Fedora, Grey Felt "
+                        "Fedora, and Fedora should all use Fedora."
+                    ),
+                },
                 "owner_npc_id": {
                     "type": "string",
                     "description": (
@@ -685,6 +694,10 @@ EVENT_RESPONSE_SCHEMA: dict[str, Any] = {
                     "description": "Exact npc_id of a current party member; omit for player inventory.",
                 },
                 "new_name": {"type": "string"},
+                "new_basic_name": {
+                    "type": "string",
+                    "description": "Replacement generic item-family name, or SAME/SKIP when unchanged.",
+                },
                 "new_category": {"type": "string"},
                 "new_description": {"type": "string"},
                 "new_amount": INT_OR_SKIP_SCHEMA,
@@ -1962,6 +1975,14 @@ NEW_GAME_RESPONSE_JSON_SCHEMA: dict[str, Any] = {
                 "type": "object",
                 "properties": {
                     "name": {"type": "string"},
+                    "basic_name": {
+                        "type": "string",
+                        "description": (
+                            "Short generic item-family name for visual reuse matching. "
+                            "Remove descriptive adjectives; e.g. Wide Brimmed Fedora and "
+                            "Grey Felt Fedora both use Fedora."
+                        ),
+                    },
                     "category": {
                         "type": "string",
                         "description": (
@@ -2283,6 +2304,14 @@ def build_new_game_response_schema(
         strip_additional_properties=True,
     )
     starter_item_schema = api_schema["properties"]["starting_items"]["items"]
+    # Keep the optional local-compatibility field in the provider contract, but
+    # require it from new Gemini responses so future visual assets get the
+    # generic item-family identity at creation time.
+    full_starter_item_schema = schema["properties"]["starting_items"]["items"]
+    starter_item_schema["properties"]["basic_name"] = copy.deepcopy(
+        full_starter_item_schema["properties"]["basic_name"]
+    )
+    starter_item_schema.setdefault("required", []).append("basic_name")
     starter_required_fields = set(starter_item_schema.get("required", []))
     starter_item_schema["properties"] = {
         field_name: field_schema
@@ -2358,10 +2387,14 @@ def build_new_game_phase_schema(
     }
     if not for_api:
         return schema
-    return _condense_response_schema_for_api(
+    api_schema = _condense_response_schema_for_api(
         schema,
         strip_additional_properties=True,
     )
+    if phase == "starter_inventory":
+        starter_item_schema = api_schema["properties"]["starting_items"]["items"]
+        starter_item_schema.setdefault("required", []).append("basic_name")
+    return api_schema
 
 
 def _condense_response_schema_for_api(
@@ -3473,7 +3506,9 @@ def _build_xml_new_game_prompt(setup_packet: dict[str, Any]) -> str:
                 "one opening_cues record with kind speaker for every contiguous "
                 "non-narrator spoken span in "
                 "introductory_message. Copy each complete dialogue span including "
-                "outer double quotation marks into a unique anchor_text. Use the "
+                "outer double quotation marks into a unique anchor_text. Never use "
+                "placeholder text such as [X], [Y], ellipses, or a paraphrase as "
+                "anchor_text: copy it verbatim from introductory_message. Use the "
                 "exact starting_npcs npc_id as speaker_id for an actual NPC, reuse "
                 "the same ID for the same person, and use distinct stable "
                 "lower_snake_case IDs for incidental speakers. speaker_name is a "
@@ -4737,6 +4772,7 @@ def _new_game_response_quality_errors(
         error
         for error in _json_schema_shape_errors(data, response_schema)
         if not error.endswith(" is not allowed")
+        and not error.endswith(".basic_name is required")
     ]
     return errors
 
@@ -5592,6 +5628,22 @@ def _extract_narration_speaker_cues(
             )
             continue
         if clean_narrative.count(anchor_text) != 1:
+            repaired_anchor = _repair_quoted_narration_anchor(
+                anchor_text,
+                clean_narrative,
+            )
+            if repaired_anchor:
+                anchor_text = repaired_anchor
+            else:
+                LOGGER.warning(
+                    "Dropped narration speaker cue for %r from Gemini %s because "
+                    "anchor %r does not appear exactly once.",
+                    speaker_id,
+                    response_label,
+                    anchor_text,
+                )
+                continue
+        if clean_narrative.count(anchor_text) != 1:
             LOGGER.warning(
                 "Dropped narration speaker cue for %r from Gemini %s because "
                 "anchor %r does not appear exactly once.",
@@ -5620,6 +5672,30 @@ def _extract_narration_speaker_cues(
         )
 
     return cues
+
+
+def _repair_quoted_narration_anchor(anchor_text: str, narrative_text: str) -> str:
+    """Repairs only punctuation omitted at a quoted dialogue boundary."""
+
+    if len(anchor_text) < 2 or anchor_text[0] != '"' or anchor_text[-1] != '"':
+        return ""
+
+    anchor_inner = anchor_text[1:-1]
+    normalized_anchor = re.sub(r"\s+", " ", anchor_inner).strip()
+    candidates: list[str] = []
+    for match in re.finditer(r'"[^"\n]*"', narrative_text):
+        candidate = match.group(0)
+        candidate_inner = candidate[1:-1]
+        normalized_candidate = re.sub(r"\s+", " ", candidate_inner).strip()
+        if normalized_candidate == normalized_anchor:
+            candidates.append(candidate)
+            continue
+        if normalized_candidate.startswith(normalized_anchor):
+            suffix = normalized_candidate[len(normalized_anchor):]
+            if suffix and re.fullmatch(r"[,;:.!?]+", suffix):
+                candidates.append(candidate)
+
+    return candidates[0] if len(candidates) == 1 else ""
 
 
 def parse_skill_check_plan_response(raw_text: str) -> SkillCheckPlanResult:
@@ -7787,6 +7863,7 @@ def _parse_new_game_starter_items(raw_items: Any) -> list[dict[str, Any]]:
         items.append(
             {
                 "name": name,
+                "basic_name": str(raw_item.get("basic_name", name) or name).strip()[:120],
                 "category": _normalize_starter_item_category(raw_item),
                 "quantity": max(1, quantity),
                 "quantity_unit": str(raw_item.get("quantity_unit", "each") or "each").strip() or "each",

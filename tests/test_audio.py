@@ -339,14 +339,25 @@ class AudioTests(unittest.TestCase):
 
         self.assertEqual(
             chunks[0].display_text,
-            "The bell rings at 7:00 A.M. What do you do now?",
+            "The bell rings at 7:00 A.M. ",
         )
         self.assertEqual(
             chunks[0].tts_text,
-            "The bell rings at [7:00 A.M.](as: time) What do you do now?",
+            "The bell rings at [7:00 A.M.](as: time)",
+        )
+        self.assertEqual(chunks[1].display_text, "What do you do now?")
+
+    def test_narration_chunks_reveal_one_sentence_at_a_time(self) -> None:
+        text = "First sentence. Second sentence! Is this the third?"
+
+        chunks = build_narration_chunks(text)
+
+        self.assertEqual(
+            [chunk.display_text for chunk in chunks],
+            ["First sentence. ", "Second sentence! ", "Is this the third?"],
         )
 
-    def test_player_merges_short_same_voice_paragraphs_for_gapless_playback(self) -> None:
+    def test_player_keeps_short_same_voice_sentences_separate_for_progressive_reveal(self) -> None:
         chunks = build_narration_chunks(
             "The bell rings.\n\nThe gates open.",
         )
@@ -354,9 +365,11 @@ class AudioTests(unittest.TestCase):
         merged = _merge_compatible_narration_chunks(chunks)
 
         self.assertEqual(len(chunks), 2)
-        self.assertEqual(len(merged), 1)
-        self.assertEqual(merged[0].display_text, "The bell rings.\n\nThe gates open.")
-        self.assertIn("...p", merged[0].tts_text)
+        self.assertEqual(len(merged), 2)
+        self.assertEqual(
+            [chunk.display_text for chunk in merged],
+            ["The bell rings.\n\n", "The gates open."],
+        )
 
     def test_narration_chunks_apply_pronunciation_only_to_spoken_text(self) -> None:
         text = "Ironpeak City wakes.\n\nThe market opens."
@@ -434,7 +447,7 @@ class AudioTests(unittest.TestCase):
         self.assertNotIn("is_phonemes", create_calls[0][1])
         self.assertEqual(len(writes), 1)
 
-    def test_narration_sound_cue_forces_exact_word_boundary(self) -> None:
+    def test_narration_sound_cue_uses_sentence_boundary(self) -> None:
         text = "The hammer falls. Sparks leap from the anvil."
         chunks = build_narration_chunks(
             text,
@@ -448,9 +461,9 @@ class AudioTests(unittest.TestCase):
         )
 
         self.assertEqual("".join(chunk.display_text for chunk in chunks), text)
-        self.assertEqual(chunks[0].display_text, "The hammer")
+        self.assertEqual(chunks[0].display_text, "The hammer falls. ")
         self.assertEqual(chunks[0].sound_effects_after, ("Hammer Strike.wav",))
-        self.assertEqual(chunks[1].display_text, " falls. Sparks leap from the anvil.")
+        self.assertEqual(chunks[1].display_text, "Sparks leap from the anvil.")
 
     def test_narration_chunks_switch_voice_only_for_exact_speaker_spans(self) -> None:
         text = 'Mira whispers, "Stay low." The watch passes. Orin says, "Now run."'
@@ -479,8 +492,9 @@ class AudioTests(unittest.TestCase):
             [(chunk.display_text, chunk.voice_id) for chunk in chunks],
             [
                 ("Mira whispers, ", ""),
-                ('"Stay low."', "af_bella"),
-                (" The watch passes. Orin says, ", ""),
+                ('"Stay low." ', "af_bella"),
+                ("The watch passes. ", ""),
+                ("Orin says, ", ""),
                 ('"Now run."', "am_onyx"),
             ],
         )

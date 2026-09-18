@@ -496,7 +496,9 @@ def build_narration_chunks(
     before_at: dict[int, list[str]] = {}
     after_at: dict[int, list[str]] = {}
     speaker_ranges: list[tuple[int, int, str]] = []
-    forced_offsets = {0, len(clean_text)}
+    natural_boundaries = _natural_sentence_boundary_offsets(clean_text)
+    forced_offsets = set(natural_boundaries)
+    forced_offsets.update({0, len(clean_text)})
 
     for raw_cue in sound_effect_cues or []:
         if not isinstance(raw_cue, dict):
@@ -515,10 +517,17 @@ def build_narration_chunks(
             )
             continue
         anchor_start = clean_text.index(anchor_text)
-        boundary = (
-            anchor_start if position == "before" else anchor_start + len(anchor_text)
+        sentence_start, sentence_end = _sentence_bounds_for_anchor(
+            anchor_start,
+            anchor_start + len(anchor_text),
+            natural_boundaries,
+            text_length=len(clean_text),
         )
-        forced_offsets.add(boundary)
+        # Keep the effect associated with its sentence rather than forcing a
+        # TTS/display break at an arbitrary word such as a comma.  The cue
+        # still runs in the requested before/after order, but the sentence is
+        # allowed to appear and be spoken as one natural unit.
+        boundary = sentence_start if position == "before" else sentence_end
         target = before_at if position == "before" else after_at
         target.setdefault(boundary, []).append(filename)
 
@@ -644,6 +653,76 @@ def _narration_chunk_ranges(
     return ranges
 
 
+_SENTENCE_ABBREVIATIONS = {
+    "dr",
+    "mr",
+    "mrs",
+    "ms",
+    "prof",
+    "sr",
+    "jr",
+    "st",
+    "e.g",
+    "i.e",
+}
+
+
+def _natural_sentence_boundary_offsets(text: str) -> set[int]:
+    """Returns offsets after natural sentence endings and paragraph breaks."""
+
+    clean_text = str(text or "")
+    boundaries: set[int] = {0, len(clean_text)}
+    boundaries.update(
+        match.end() for match in re.finditer(r"\n\s*\n+", clean_text)
+    )
+
+    for match in re.finditer(r"[.!?]+", clean_text):
+        punctuation_end = match.end()
+        next_character = punctuation_end
+        while next_character < len(clean_text) and clean_text[next_character] in (
+            '"\'\u201d\u2019\u00bb)]}'
+        ):
+            next_character += 1
+
+        if next_character < len(clean_text) and not clean_text[next_character].isspace():
+            # This excludes decimal points and the first periods in common
+            # abbreviations such as A.M. or e.g.
+            continue
+
+        if match.group().endswith("."):
+            preceding_token = clean_text[: match.start()].rsplit(None, 1)[-1]
+            preceding_token = preceding_token.lstrip('"\'\u201c\u2018([{')
+            if preceding_token.casefold() in _SENTENCE_ABBREVIATIONS:
+                continue
+
+        while next_character < len(clean_text) and clean_text[next_character].isspace():
+            next_character += 1
+        boundaries.add(next_character)
+
+    return boundaries
+
+
+def _sentence_bounds_for_anchor(
+    anchor_start: int,
+    anchor_end: int,
+    boundaries: set[int],
+    *,
+    text_length: int,
+) -> tuple[int, int]:
+    """Returns the natural sentence containing an audio cue anchor."""
+
+    ordered = sorted(boundary for boundary in boundaries if 0 <= boundary <= text_length)
+    sentence_start = max(
+        (boundary for boundary in ordered if boundary <= anchor_start),
+        default=0,
+    )
+    sentence_end = next(
+        (boundary for boundary in ordered if boundary >= anchor_end and boundary > sentence_start),
+        text_length,
+    )
+    return sentence_start, sentence_end
+
+
 def chunk_tts_text(text: str, *, max_length: int = MAX_CHUNK_LENGTH) -> list[str]:
     """Splits sanitized text into small ordered narration chunks."""
 
@@ -717,12 +796,12 @@ def _merge_compatible_narration_chunks(
     *,
     max_length: int = MAX_CHUNK_LENGTH,
 ) -> list[NarrationChunk]:
-    """Combines adjacent same-voice chunks when no cue needs the boundary.
+    """Combines only non-sentence fragments when no cue needs the boundary.
 
-    Paragraph boundaries are useful for display, but synthesizing every short
-    paragraph as a separate file creates avoidable model and file-playback
-    gaps.  Keep boundaries required by speaker or sound-effect cues, and keep
-    the display text byte-for-byte intact when merging the others.
+    Sentence boundaries are intentionally retained so progressive narration
+    reveals approximately one sentence at a time.  This helper still joins
+    fragments created when an unusually long sentence must be split by the
+    maximum synthesis length.
     """
 
     merged: list[NarrationChunk] = []
@@ -736,6 +815,7 @@ def _merge_compatible_narration_chunks(
             previous.voice_id == chunk.voice_id
             and not previous.sound_effects_after
             and not chunk.sound_effects_before
+            and not _ends_at_natural_sentence(previous.display_text)
             and len(previous.display_text) + len(chunk.display_text) <= max_length
         )
         if not can_merge:
@@ -751,3 +831,9 @@ def _merge_compatible_narration_chunks(
         )
 
     return merged
+
+
+def _ends_at_natural_sentence(text: str) -> bool:
+    """Returns whether text ends at a sentence-style punctuation boundary."""
+
+    return bool(re.search(r"[.!?]+[\"'\u201d\u2019\u00bb)]*\s*$", str(text or "")))
