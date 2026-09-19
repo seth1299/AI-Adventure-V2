@@ -240,6 +240,12 @@ class MainWindow(QMainWindow):
                 prepare_sound_directory(self.app_paths),
                 prepare_sound_effect_directory(self.app_paths),
                 prepare_background_ambience_directory(self.app_paths),
+                user_music_directory=self.app_paths.sounds_dir,
+                user_sound_effects_directory=self.app_paths.sound_effects_dir,
+                user_background_ambience_directory=self.app_paths.background_ambience_dir,
+                packaged_music_directory=self.app_paths.package_music_tracks_dir,
+                packaged_sound_effects_directory=self.app_paths.package_sound_effects_dir,
+                packaged_background_ambience_directory=self.app_paths.package_background_ambience_dir,
             )
         )
         self.narration_player = _create_narration_player(self.app_paths)
@@ -1296,7 +1302,7 @@ class MainWindow(QMainWindow):
             tts_enabled=self.tts_enabled,
         )
         save_app_settings(self.app_paths.app_settings_path, self.app_settings)
-        apply_application_theme(self.menu_theme)
+        apply_application_theme(self.menu_theme, self.app_settings["appearance"])
 
     def _apply_app_settings(self, settings: dict[str, Any], *, persist: bool) -> None:
         """Applies app-level settings used when no save is active."""
@@ -1311,7 +1317,7 @@ class MainWindow(QMainWindow):
         if persist:
             save_app_settings(self.app_paths.app_settings_path, self.app_settings)
 
-        apply_application_theme(self.menu_theme)
+        apply_application_theme(self.menu_theme, self.app_settings["appearance"])
         self._apply_menu_audio_settings()
 
     def _persist_app_tts_settings(self, audio_settings: dict[str, Any]) -> None:

@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Callable, Protocol
 
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QColor, QPalette
+from PySide6.QtGui import QColor, QFont, QPalette
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QHBoxLayout, QLabel, QPushButton, QSlider, QSpinBox,
     QWidget,
@@ -17,6 +17,10 @@ from PySide6.QtWidgets import (
 
 from ai_adventure.app.app_paths import AppPaths
 from ai_adventure.app.features import is_playtesting_build, is_tts_enabled
+from ai_adventure.app.user_settings import (
+    DEFAULT_UI_FONT_SIZE,
+    normalize_ui_appearance,
+)
 from ai_adventure.application.audio_preferences_service import AudioPreferencesService
 from ai_adventure.application.save_game_service import SaveGameService
 from ai_adventure.audio.pronunciation import apply_pronunciation_map
@@ -63,6 +67,11 @@ class SoundManagerProtocol(Protocol):
     def stop_music(self, *, clear_current: bool = True) -> None: ...
     def stop_sound_effect(self, *, clear_current: bool = True) -> None: ...
     def stop_background_ambience(self, *, clear_current: bool = True) -> None: ...
+    def import_audio_file(
+        self,
+        source_path: str | Path,
+        category: str,
+    ) -> tuple[bool, str]: ...
 
 class NarrationPlayerProtocol(Protocol):
     def set_enabled(self, enabled: bool) -> None: ...
@@ -107,8 +116,11 @@ else:
 
         return Path(app_paths.background_ambience_dir)
 
-def apply_application_theme(theme: str) -> None:
-    """Applies the selected app-wide theme to the active QApplication."""
+def apply_application_theme(
+    theme: str,
+    appearance: dict[str, Any] | None = None,
+) -> None:
+    """Applies the selected theme and text appearance to the active QApplication."""
 
     app = QApplication.instance()
 
@@ -120,15 +132,68 @@ def apply_application_theme(theme: str) -> None:
     if clean_theme == "Dark":
         app.setPalette(_dark_theme_palette())
         app.setStyleSheet(_dark_theme_stylesheet())
-        return
-
-    if clean_theme == "Light":
+    elif clean_theme == "Light":
         app.setPalette(_light_theme_palette())
         app.setStyleSheet(_light_theme_stylesheet())
-        return
+    else:
+        app.setPalette(_light_theme_palette())
+        app.setStyleSheet(_light_theme_stylesheet())
 
-    app.setPalette(_light_theme_palette())
-    app.setStyleSheet(_light_theme_stylesheet())
+    _apply_application_font(app, appearance)
+
+
+def _apply_application_font(
+    app: QApplication,
+    appearance: dict[str, Any] | None,
+) -> None:
+    """Applies a user font while retaining a reliable system-default reset."""
+
+    base_family = app.property("ai_adventure_base_font_family")
+    base_size = app.property("ai_adventure_base_font_size")
+    if not isinstance(base_family, str):
+        base_font = app.font()
+        base_family = base_font.family()
+        base_size = base_font.pointSize()
+        app.setProperty("ai_adventure_base_font_family", base_family)
+        app.setProperty("ai_adventure_base_font_size", base_size)
+
+    clean_appearance = normalize_ui_appearance(appearance or {})
+    font = QFont()
+    font.setFamily(clean_appearance["font_family"] or base_family)
+    font.setPointSize(int(clean_appearance["font_size"]))
+    app.setFont(font)
+    app.setProperty("ai_adventure_ui_font_family", clean_appearance["font_family"])
+    app.setProperty("ai_adventure_ui_font_size", int(clean_appearance["font_size"]))
+
+
+def _active_ui_font_scale() -> float:
+    """Returns the scale used by local stylesheets with explicit font sizes."""
+
+    app = QApplication.instance()
+    if isinstance(app, QApplication):
+        configured_size = app.property("ai_adventure_ui_font_size")
+        try:
+            return max(0.5, float(configured_size) / DEFAULT_UI_FONT_SIZE)
+        except (TypeError, ValueError):
+            pass
+    return 1.0
+
+
+def _scale_stylesheet_font_sizes(stylesheet: str, scale: float | None = None) -> str:
+    """Scales explicit pixel font sizes in a local stylesheet."""
+
+    active_scale = _active_ui_font_scale() if scale is None else max(0.5, float(scale))
+
+    def replace_size(match: re.Match[str]) -> str:
+        pixels = max(1, round(float(match.group("size")) * active_scale))
+        return f"{match.group('prefix')}{pixels}px"
+
+    return re.sub(
+        r"(?P<prefix>font-size\s*:\s*)(?P<size>\d+(?:\.\d+)?)px",
+        replace_size,
+        stylesheet,
+        flags=re.IGNORECASE,
+    )
 
 
 
@@ -759,6 +824,8 @@ __all__ = [
     "_invoke_sample_voice_callback",
     "_narrator_voice_options",
     "_custom_voice_display_text",
+    "_active_ui_font_scale",
+    "_scale_stylesheet_font_sizes",
     "_populate_narrator_voice_combo",
     "_NarrationPlayerClass",
     "_SoundManagerClass",

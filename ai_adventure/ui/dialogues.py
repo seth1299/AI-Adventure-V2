@@ -1180,13 +1180,38 @@ class MainMenuSettingsDialog(QDialog):
             tts_enabled=self.tts_enabled,
         )
         audio = clean_settings["audio"]
+        appearance = clean_settings["appearance"]
 
         self.setWindowTitle("Settings")
-        self.resize(500, 340)
+        self.resize(580, 460)
 
         self.theme_combo = QComboBox()
         self.theme_combo.addItems(["Light", "Dark"])
         self.theme_combo.setCurrentText(clean_settings["theme"])
+
+        self.font_family_combo = QComboBox()
+        self.font_family_combo.addItem("System Default", "")
+        installed_families = sorted(
+            {
+                str(family).strip()
+                for family in QFontDatabase.families()
+                if str(family).strip()
+            },
+            key=str.casefold,
+        )
+        for family in installed_families:
+            self.font_family_combo.addItem(family, family)
+        selected_family = str(appearance["font_family"] or "")
+        if selected_family and self.font_family_combo.findData(selected_family) < 0:
+            self.font_family_combo.addItem(selected_family, selected_family)
+        self.font_family_combo.setCurrentIndex(
+            max(0, self.font_family_combo.findData(selected_family))
+        )
+
+        self.font_size_spin = QSpinBox()
+        self.font_size_spin.setRange(MIN_UI_FONT_SIZE, MAX_UI_FONT_SIZE)
+        self.font_size_spin.setValue(int(appearance["font_size"]))
+        self.font_size_spin.setSuffix(" pt")
 
         self.music_enabled_checkbox = QCheckBox("Music enabled")
         self.music_enabled_checkbox.setChecked(bool(audio["music_enabled"]))
@@ -1242,6 +1267,8 @@ class MainMenuSettingsDialog(QDialog):
 
         form = QFormLayout()
         form.addRow("Theme Preference:", self.theme_combo)
+        form.addRow("Text Font:", self.font_family_combo)
+        form.addRow("Text Size:", self.font_size_spin)
 
         if self.music_enabled:
             form.addRow("Background Music:", self.music_enabled_checkbox)
@@ -1309,6 +1336,13 @@ class MainMenuSettingsDialog(QDialog):
         return normalize_app_settings(
             {
                 "theme": self.theme_combo.currentText(),
+                "appearance": {
+                    "font_family": _combo_current_data_text(
+                        self.font_family_combo,
+                        "",
+                    ),
+                    "font_size": self.font_size_spin.value(),
+                },
                 "audio": {
                     "music_enabled": self.music_enabled_checkbox.isChecked(),
                     "music_volume": self.music_volume_slider.value(),

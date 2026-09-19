@@ -270,6 +270,77 @@ class AudioTests(unittest.TestCase):
             else:
                 sys.modules["pygame"] = original_pygame
 
+    def test_user_audio_import_augments_packaged_catalogs(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            package_music = root / "package_music"
+            package_effects = root / "package_effects"
+            package_ambience = root / "package_ambience"
+            user_music = root / "user_music"
+            user_effects = root / "user_effects"
+            user_ambience = root / "user_ambience"
+            for directory in (
+                package_music,
+                package_effects,
+                package_ambience,
+                user_music,
+                user_effects,
+                user_ambience,
+            ):
+                directory.mkdir()
+            (package_music / "Packaged Theme.mp3").write_bytes(b"music")
+            (package_ambience / "Packaged Rain.ogg").write_bytes(b"ambience")
+            source = root / "My Custom Theme.wav"
+            source.write_bytes(b"custom music")
+
+            manager = SoundManager(
+                package_music,
+                package_effects,
+                package_ambience,
+                user_music_directory=user_music,
+                user_sound_effects_directory=user_effects,
+                user_background_ambience_directory=user_ambience,
+            )
+            success, filename = manager.import_audio_file(source, "music")
+
+            self.assertTrue(success)
+            self.assertEqual(filename, source.name)
+            self.assertTrue((user_music / source.name).exists())
+            self.assertEqual(
+                manager.get_valid_track_names(),
+                ["My Custom Theme.wav", "Packaged Theme.mp3"],
+            )
+
+            effect_source = root / "Custom Bell.ogg"
+            effect_source.write_bytes(b"custom effect")
+            effect_success, effect_name = manager.import_audio_file(
+                effect_source,
+                "sound_effects",
+            )
+            self.assertTrue(effect_success)
+            self.assertEqual(
+                manager.get_valid_sound_effect_names(),
+                [effect_name],
+            )
+
+            ambience_source = root / "Custom Wind.wav"
+            ambience_source.write_bytes(b"custom ambience")
+            ambience_success, ambience_name = manager.import_audio_file(
+                ambience_source,
+                "background_ambience",
+            )
+            self.assertTrue(ambience_success)
+            self.assertEqual(
+                manager.get_valid_background_ambience_names(),
+                [ambience_name, "Packaged Rain.ogg"],
+            )
+
+            invalid = root / "not-audio.txt"
+            invalid.write_text("not audio", encoding="utf-8")
+            success, message = manager.import_audio_file(invalid, "music")
+            self.assertFalse(success)
+            self.assertIn("MP3", message)
+
     def test_sanitize_tts_text_removes_embedded_events_and_action_suggestions(self) -> None:
         text = sanitize_tts_text(
             "The room falls quiet. "

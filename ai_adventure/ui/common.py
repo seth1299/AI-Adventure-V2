@@ -27,6 +27,7 @@ from PySide6.QtCore import (
 )
 from PySide6.QtGui import (
     QColor,
+    QFontDatabase,
     QIcon,
     QMouseEvent,
     QPalette,
@@ -108,8 +109,12 @@ from ai_adventure.app.features import (
     is_tts_enabled,
 )
 from ai_adventure.app.user_settings import (
+    DEFAULT_UI_FONT_SIZE,
+    MAX_UI_FONT_SIZE,
+    MIN_UI_FONT_SIZE,
     load_app_settings,
     normalize_app_settings,
+    normalize_ui_appearance,
     save_app_settings,
 )
 from ai_adventure.ai.modes import (
@@ -471,6 +476,7 @@ __all__ = [
     "QDialog",
     "QDialogButtonBox",
     "QEvent",
+    "QFontDatabase",
     "QFormLayout",
     "QFrame",
     "QGridLayout",
@@ -555,6 +561,9 @@ __all__ = [
     "THEME_NAMES",
     "UNRESOLVED_STATUS_TEXT",
     "VisualAssetRequest",
+    "DEFAULT_UI_FONT_SIZE",
+    "MAX_UI_FONT_SIZE",
+    "MIN_UI_FONT_SIZE",
     "XP_THRESHOLDS_BY_LEVEL",
     "_AppTableWidget",
     "_DeselectSelectedRowFilter",
@@ -580,6 +589,7 @@ __all__ = [
     "_append_starting_location_table_row",
     "_append_starting_npc_table_row",
     "_application_uses_dark_theme",
+    "_active_ui_font_scale",
     "_apply_audio_settings_to_managers",
     "_apply_new_game_crafting_knowledge",
     "_bool_setting",
@@ -644,6 +654,7 @@ __all__ = [
     "_row_for_cell_widget",
     "_safe_int",
     "_screen_content_signature",
+    "_scale_stylesheet_font_sizes",
     "_scrollable_widget",
     "_selectable_label",
     "_set_combo_to_data",
@@ -748,6 +759,7 @@ __all__ = [
     "next_living_index",
     "normalize_ai_mode_preferences",
     "normalize_app_settings",
+    "normalize_ui_appearance",
     "normalize_character_pronouns",
     "normalize_combat_preferences",
     "normalize_combat_state",

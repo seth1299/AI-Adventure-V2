@@ -639,7 +639,7 @@ class NewGameWizard(QWizard):
         for color_name, color_value in colors.items():
             stylesheet = stylesheet.replace(f'{{colors["{color_name}"]}}', color_value)
 
-        self.setStyleSheet(stylesheet)
+        self.setStyleSheet(_scale_stylesheet_font_sizes(stylesheet))
         self._wizard_subtitle_color = colors["placeholder"]
 
     def _schedule_page_heading_style(self, _page_id: int) -> None:
@@ -662,7 +662,8 @@ class NewGameWizard(QWizard):
             if not title_styled and label.text() == title:
                 label.setObjectName("newGameWizardPageTitle")
                 label.setStyleSheet(
-                    "font-size: 26px; font-weight: 700; padding: 8px 0 2px 0;"
+                    f"font-size: {round(26 * _active_ui_font_scale())}px; "
+                    "font-weight: 700; padding: 8px 0 2px 0;"
                 )
                 label.ensurePolished()
                 heading_width = max(320, self.width() - 100)
@@ -680,7 +681,8 @@ class NewGameWizard(QWizard):
             if not subtitle_styled and label.text() == subtitle:
                 label.setObjectName("newGameWizardPageSubtitle")
                 label.setStyleSheet(
-                    f"color: {self._wizard_subtitle_color}; font-size: 17px; "
+                    f"color: {self._wizard_subtitle_color}; font-size: "
+                    f"{round(17 * _active_ui_font_scale())}px; "
                     "padding: 0 0 10px 0;"
                 )
                 label.ensurePolished()
@@ -3320,9 +3322,38 @@ class NewGameWizard(QWizard):
             self._test_background_ambience_preview
         )
 
+        self.music_upload_button = QPushButton("Upload Music...")
+        self.music_upload_button.clicked.connect(
+            lambda _checked=False: self._upload_audio_file("music")
+        )
+        self.sound_effects_upload_button = QPushButton("Upload Sound Effect...")
+        self.sound_effects_upload_button.clicked.connect(
+            lambda _checked=False: self._upload_audio_file("sound_effects")
+        )
+        self.background_ambience_upload_button = QPushButton(
+            "Upload Background Ambience..."
+        )
+        self.background_ambience_upload_button.clicked.connect(
+            lambda _checked=False: self._upload_audio_file("background_ambience")
+        )
+        self.audio_upload_status_label = QLabel(
+            "Uploaded files are added to the audio catalog used by this adventure."
+        )
+        self.audio_upload_status_label.setWordWrap(True)
+        importer_available = callable(
+            getattr(self.sound_manager, "import_audio_file", None)
+        )
+        for button in (
+            self.music_upload_button,
+            self.sound_effects_upload_button,
+            self.background_ambience_upload_button,
+        ):
+            button.setEnabled(importer_available)
+
         layout = QFormLayout()
         _configure_responsive_form(layout)
         layout.addRow("Background Music:", self.music_enabled_checkbox)
+        layout.addRow("Music Library:", self.music_upload_button)
         layout.addRow("Music Volume:", _slider_row(self.music_volume_slider, self.music_volume_label))
         layout.addRow("Music Preview:", self.music_test_button)
         layout.addRow("Narration Sound Effects:", self.sound_effects_enabled_checkbox)
@@ -3334,6 +3365,7 @@ class NewGameWizard(QWizard):
             ),
         )
         layout.addRow("Sound Effects Preview:", self.sound_effects_test_button)
+        layout.addRow("Sound Effect Library:", self.sound_effects_upload_button)
         layout.addRow(
             "Background Ambience:",
             self.background_ambience_enabled_checkbox,
@@ -3346,10 +3378,37 @@ class NewGameWizard(QWizard):
             ),
         )
         layout.addRow("Ambience Preview:", self.background_ambience_test_button)
+        layout.addRow(
+            "Ambience Library:",
+            _button_row(
+                self.background_ambience_upload_button,
+                self.audio_upload_status_label,
+            ),
+        )
 
         page.setLayout(layout)
 
         self.addPage(page)
+
+    def _upload_audio_file(self, category: str) -> None:
+        """Imports one user-selected audio file into the shared runtime catalog."""
+
+        importer = getattr(self.sound_manager, "import_audio_file", None)
+        if not callable(importer):
+            return
+        file_path, _selected_filter = QFileDialog.getOpenFileName(
+            self,
+            "Choose Audio File",
+            "",
+            "Audio (*.mp3 *.ogg *.wav);;All Files (*)",
+        )
+        if not file_path:
+            return
+        success, result = importer(Path(file_path), category)
+        if success:
+            self.audio_upload_status_label.setText(f"Available in this game: {result}")
+        else:
+            QMessageBox.warning(self, "Audio Import Failed", result)
 
     def _test_music_preview(self) -> None:
         if self.sound_manager is None:

@@ -103,6 +103,10 @@ class SettingsScreen(RepositoryBackedWidget):
         self.music_track_combo.currentIndexChanged.connect(
             lambda _index: self._save_settings()
         )
+        self.music_upload_button = QPushButton("Upload Music...")
+        self.music_upload_button.clicked.connect(
+            lambda _checked=False: self._upload_audio_file("music")
+        )
 
         self.music_volume_slider = QSlider(Qt.Orientation.Horizontal)
         self.music_volume_slider.setRange(0, 100)
@@ -125,6 +129,12 @@ class SettingsScreen(RepositoryBackedWidget):
         self.sound_effects_volume_slider.valueChanged.connect(
             lambda value: self.sound_effects_volume_label.setText(f"{value}%")
         )
+        self.sound_effects_upload_button = QPushButton("Upload Sound Effect...")
+        self.sound_effects_upload_button.clicked.connect(
+            lambda _checked=False: self._upload_audio_file("sound_effects")
+        )
+        self.sound_effects_upload_status = QLabel("No new sound effect uploaded")
+        self.sound_effects_upload_status.setWordWrap(True)
         self.sound_effects_volume_slider.sliderReleased.connect(self._save_settings)
 
         self.background_ambience_enabled_checkbox = QCheckBox(
@@ -145,6 +155,21 @@ class SettingsScreen(RepositoryBackedWidget):
         self.background_ambience_track_combo.currentIndexChanged.connect(
             lambda _index: self._save_settings()
         )
+        self.background_ambience_upload_button = QPushButton(
+            "Upload Background Ambience..."
+        )
+        self.background_ambience_upload_button.clicked.connect(
+            lambda _checked=False: self._upload_audio_file("background_ambience")
+        )
+        audio_import_available = callable(
+            getattr(self.sound_manager, "import_audio_file", None)
+        )
+        for button in (
+            self.music_upload_button,
+            self.sound_effects_upload_button,
+            self.background_ambience_upload_button,
+        ):
+            button.setEnabled(audio_import_available)
         self.background_ambience_volume_slider = QSlider(Qt.Orientation.Horizontal)
         self.background_ambience_volume_slider.setRange(0, 100)
         self.background_ambience_volume_slider.setValue(15)
@@ -184,7 +209,10 @@ class SettingsScreen(RepositoryBackedWidget):
             layout.addRow("Failed Images:", self.retry_failed_images_button)
         if self.music_feature_enabled:
             layout.addRow("Background Music:", self.music_enabled_checkbox)
-            layout.addRow("Music Track:", self.music_track_combo)
+            layout.addRow(
+                "Music Track:",
+                _button_row(self.music_track_combo, self.music_upload_button),
+            )
             layout.addRow(
                 "Music Volume:",
                 _slider_row(self.music_volume_slider, self.music_volume_label),
@@ -198,10 +226,23 @@ class SettingsScreen(RepositoryBackedWidget):
                 ),
             )
             layout.addRow(
+                "Sound Effect Library:",
+                _button_row(
+                    self.sound_effects_upload_button,
+                    self.sound_effects_upload_status,
+                ),
+            )
+            layout.addRow(
                 "Background Ambience:",
                 self.background_ambience_enabled_checkbox,
             )
-            layout.addRow("Ambience Track:", self.background_ambience_track_combo)
+            layout.addRow(
+                "Ambience Track:",
+                _button_row(
+                    self.background_ambience_track_combo,
+                    self.background_ambience_upload_button,
+                ),
+            )
             layout.addRow(
                 "Ambience Volume:",
                 _slider_row(
@@ -250,6 +291,56 @@ class SettingsScreen(RepositoryBackedWidget):
             if clean_name:
                 combo.addItem(clean_name, clean_name)
         combo.setEnabled(True)
+
+    def _upload_audio_file(self, category: str) -> None:
+        """Imports one user-selected audio file and refreshes its live catalog."""
+
+        sound_manager = self.sound_manager
+        importer = getattr(sound_manager, "import_audio_file", None)
+        if not callable(importer):
+            QMessageBox.warning(
+                self,
+                "Audio Unavailable",
+                "User audio import is unavailable in this build.",
+            )
+            return
+
+        file_path, _selected_filter = QFileDialog.getOpenFileName(
+            self,
+            "Choose Audio File",
+            "",
+            "Audio (*.mp3 *.ogg *.wav);;All Files (*)",
+        )
+        if not file_path:
+            return
+
+        success, result = importer(Path(file_path), category)
+        if not success:
+            QMessageBox.warning(self, "Audio Import Failed", result)
+            return
+
+        if category == "music":
+            self.music_track_combo.blockSignals(True)
+            self._populate_audio_track_combo(
+                self.music_track_combo,
+                "get_valid_track_names",
+            )
+            self._set_audio_track_combo_value(self.music_track_combo, result)
+            self.music_track_combo.blockSignals(False)
+        elif category == "background_ambience":
+            self.background_ambience_track_combo.blockSignals(True)
+            self._populate_audio_track_combo(
+                self.background_ambience_track_combo,
+                "get_valid_background_ambience_names",
+            )
+            self._set_audio_track_combo_value(
+                self.background_ambience_track_combo,
+                result,
+            )
+            self.background_ambience_track_combo.blockSignals(False)
+        else:
+            self.sound_effects_upload_status.setText(f"Available: {result}")
+        self._save_settings()
 
     @staticmethod
     def _set_audio_track_combo_value(combo: QComboBox, value: Any) -> None:

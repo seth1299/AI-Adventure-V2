@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import shutil
 import zipfile
 from pathlib import Path
 from typing import Any
@@ -91,6 +92,13 @@ class SoundManager:
         sounds_directory: str | Path,
         sound_effects_directory: str | Path | None = None,
         background_ambience_directory: str | Path | None = None,
+        *,
+        user_music_directory: str | Path | None = None,
+        user_sound_effects_directory: str | Path | None = None,
+        user_background_ambience_directory: str | Path | None = None,
+        packaged_music_directory: str | Path | None = None,
+        packaged_sound_effects_directory: str | Path | None = None,
+        packaged_background_ambience_directory: str | Path | None = None,
     ) -> None:
         self.sounds_directory = Path(sounds_directory).expanduser()
         self.sound_effects_directory = (
@@ -102,6 +110,36 @@ class SoundManager:
             Path(background_ambience_directory).expanduser()
             if background_ambience_directory is not None
             else self.sounds_directory / "background_ambience_tracks"
+        )
+        self.user_music_directory = (
+            Path(user_music_directory).expanduser()
+            if user_music_directory is not None
+            else self.sounds_directory
+        )
+        self.user_sound_effects_directory = (
+            Path(user_sound_effects_directory).expanduser()
+            if user_sound_effects_directory is not None
+            else self.sound_effects_directory
+        )
+        self.user_background_ambience_directory = (
+            Path(user_background_ambience_directory).expanduser()
+            if user_background_ambience_directory is not None
+            else self.background_ambience_directory
+        )
+        self.packaged_music_directory = (
+            Path(packaged_music_directory).expanduser()
+            if packaged_music_directory is not None
+            else None
+        )
+        self.packaged_sound_effects_directory = (
+            Path(packaged_sound_effects_directory).expanduser()
+            if packaged_sound_effects_directory is not None
+            else None
+        )
+        self.packaged_background_ambience_directory = (
+            Path(packaged_background_ambience_directory).expanduser()
+            if packaged_background_ambience_directory is not None
+            else None
         )
         self.current_music: str | None = None
         self.current_background_ambience: str | None = None
@@ -147,12 +185,34 @@ class SoundManager:
     def refresh_tracks(self) -> None:
         """Refreshes the known playable track cache."""
 
-        self._music_track_cache = _audio_file_cache(self.sounds_directory)
+        self._music_track_cache = _audio_file_cache(
+            self._audio_directories(
+                self.user_music_directory,
+                self.sounds_directory,
+                *([self.packaged_music_directory] if self.packaged_music_directory else []),
+            )
+        )
         self._sound_effect_track_cache = _audio_file_cache(
-            self.sound_effects_directory,
+            self._audio_directories(
+                self.user_sound_effects_directory,
+                self.sound_effects_directory,
+                *(
+                    [self.packaged_sound_effects_directory]
+                    if self.packaged_sound_effects_directory
+                    else []
+                ),
+            ),
         )
         self._background_ambience_track_cache = _audio_file_cache(
-            self.background_ambience_directory,
+            self._audio_directories(
+                self.user_background_ambience_directory,
+                self.background_ambience_directory,
+                *(
+                    [self.packaged_background_ambience_directory]
+                    if self.packaged_background_ambience_directory
+                    else []
+                ),
+            ),
         )
         music_names, effect_names, ambience_names = distinct_audio_track_catalogs_with_ambience(
             (path.name for path in self._music_track_cache.values()),
@@ -177,6 +237,58 @@ class SoundManager:
             for key, path in self._background_ambience_track_cache.items()
             if key in ambience_keys
         }
+
+    @staticmethod
+    def _audio_directories(*directories: Path) -> tuple[Path, ...]:
+        """Returns unique audio directories in priority order."""
+
+        result: list[Path] = []
+        seen: set[str] = set()
+        for directory in directories:
+            clean_directory = Path(directory).expanduser()
+            key = str(clean_directory.resolve()).casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            result.append(clean_directory)
+        return tuple(result)
+
+    def import_audio_file(
+        self,
+        source_path: str | Path,
+        category: str,
+    ) -> tuple[bool, str]:
+        """Copies one supported user audio file into the managed catalog."""
+
+        source = Path(source_path).expanduser()
+        clean_category = str(category or "").strip().casefold()
+        target_directories = {
+            "music": self.user_music_directory,
+            "sound_effect": self.user_sound_effects_directory,
+            "sound_effects": self.user_sound_effects_directory,
+            "background_ambience": self.user_background_ambience_directory,
+            "ambience": self.user_background_ambience_directory,
+        }
+        target_directory = target_directories.get(clean_category)
+        if target_directory is None:
+            return False, "Unknown audio category."
+        if not source.is_file():
+            return False, "The selected audio file no longer exists."
+        if source.suffix.casefold() not in SUPPORTED_AUDIO_EXTENSIONS:
+            return False, "Choose an MP3, OGG, or WAV file."
+        try:
+            if source.stat().st_size <= 0:
+                return False, "The selected audio file is empty."
+            target_directory.mkdir(parents=True, exist_ok=True)
+            target_path = target_directory / source.name
+            if source.resolve() != target_path.resolve():
+                shutil.copy2(source, target_path)
+            self.refresh_tracks()
+        except (OSError, ValueError) as error:
+            LOGGER.warning("Could not import user audio %s: %s", source, error)
+            return False, f"Could not import that audio file: {error}"
+        LOGGER.info("Imported user %s audio: %s", clean_category, target_path.name)
+        return True, target_path.name
 
     def get_valid_track_names(self) -> list[str]:
         """Returns known playable audio filenames."""
@@ -484,21 +596,28 @@ def _contains_audio_files(directory: Path) -> bool:
         return False
 
 
-def _audio_file_cache(directory: Path) -> dict[str, Path]:
+def _audio_file_cache(directory: Path | tuple[Path, ...]) -> dict[str, Path]:
     """Returns supported audio files in one catalog directory."""
 
-    try:
-        if not directory.exists() or not directory.is_dir():
-            return {}
-        return {
-            file_path.name.casefold(): file_path
-            for file_path in directory.iterdir()
-            if file_path.is_file()
-            and file_path.suffix.casefold() in SUPPORTED_AUDIO_EXTENSIONS
-        }
-    except OSError as error:
-        LOGGER.warning("Failed to refresh audio directory %s: %s", directory, error)
-        return {}
+    directories = directory if isinstance(directory, tuple) else (directory,)
+    result: dict[str, Path] = {}
+    for current_directory in directories:
+        try:
+            if not current_directory.exists() or not current_directory.is_dir():
+                continue
+            for file_path in current_directory.iterdir():
+                if (
+                    file_path.is_file()
+                    and file_path.suffix.casefold() in SUPPORTED_AUDIO_EXTENSIONS
+                ):
+                    result.setdefault(file_path.name.casefold(), file_path)
+        except OSError as error:
+            LOGGER.warning(
+                "Failed to refresh audio directory %s: %s",
+                current_directory,
+                error,
+            )
+    return result
 
 
 def _extract_sounds_zip(zip_path: Path, target_directory: Path) -> None:

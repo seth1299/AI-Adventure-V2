@@ -10,6 +10,9 @@ from ai_adventure.audio.tts_settings import normalize_tts_audio_fields
 
 LOGGER = logging.getLogger(__name__)
 THEME_NAMES = {"Light", "Dark"}
+DEFAULT_UI_FONT_SIZE = 10
+MIN_UI_FONT_SIZE = 8
+MAX_UI_FONT_SIZE = 24
 
 
 def load_app_settings(
@@ -58,10 +61,33 @@ def normalize_app_settings(
 
     theme = _normalize_theme(raw_settings.get("theme"), fallback_theme=fallback_theme)
     audio = _normalize_audio(raw_settings.get("audio", {}), tts_enabled=tts_enabled)
+    appearance = normalize_ui_appearance(raw_settings.get("appearance", {}))
 
     return {
         "theme": theme,
         "audio": audio,
+        "appearance": appearance,
+    }
+
+
+def normalize_ui_appearance(raw_appearance: Any) -> dict[str, Any]:
+    """Returns normalized app-wide text appearance preferences."""
+
+    if not isinstance(raw_appearance, dict):
+        raw_appearance = {}
+
+    font_family = str(raw_appearance.get("font_family", "") or "").strip()
+    if font_family.casefold() == "system default":
+        font_family = ""
+
+    return {
+        "font_family": font_family,
+        "font_size": _clamped_int(
+            raw_appearance.get("font_size"),
+            DEFAULT_UI_FONT_SIZE,
+            MIN_UI_FONT_SIZE,
+            MAX_UI_FONT_SIZE,
+        ),
     }
 
 
