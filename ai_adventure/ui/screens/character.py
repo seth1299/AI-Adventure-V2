@@ -516,6 +516,9 @@ class CharacterScreen(RepositoryBackedWidget):
                 accessible_name=f"Generated portrait of {state.player.name}",
             )
             self.portrait_group.setVisible(True)
+            self.create_portrait_button.setVisible(
+                self.visual_asset_generation_enabled()
+            )
             self._sync_contextual_controls(repository)
             self._sync_profile_preview(has_portrait=has_portrait)
             self._set_profile_editing(False)

@@ -7,7 +7,7 @@ from ai_adventure.ai.image_styles import DEFAULT_IMAGE_STYLE, normalize_image_st
 
 
 # Curated from the stable (GA) entries on Google's Gemini API model pages.
-# Ratings are comparative five-point UI guidance, not exact pricing or benchmarks.
+# Ratings are comparative ten-point UI guidance, not exact pricing or benchmarks.
 # Preview, experimental, audio-only, embedding, and video-only models are excluded.
 MODEL_CATALOG_REVIEWED_DATE = "2026-08-31"
 
@@ -22,9 +22,9 @@ TEXT_MODEL_OPTIONS: tuple[dict[str, Any], ...] = (
             "Gemini 3.7 Flash is the next iteration in the Gemini 3 series of "
             "highly-capable, natively multimodal, reasoning models."
         ),
-        "cost_rating": 4,
-        "intelligence_rating": 5,
-        "speed_rating": 3,
+        "cost_rating": 8,
+        "intelligence_rating": 10,
+        "speed_rating": 6,
         "url": "https://ai.google.dev/gemini-api/docs/models/gemini-3.7-flash",
     },
     {
@@ -34,9 +34,9 @@ TEXT_MODEL_OPTIONS: tuple[dict[str, Any], ...] = (
             "Gemini 3.6 Flash provides sustained frontier-level intelligence "
             "optimized for real-world tasks at a higher speed and lower cost."
         ),
-        "cost_rating": 3,
-        "intelligence_rating": 4,
-        "speed_rating": 4,
+        "cost_rating": 6,
+        "intelligence_rating": 9,
+        "speed_rating": 8,
         "url": "https://ai.google.dev/gemini-api/docs/models/gemini-3.6-flash",
     },
     {
@@ -46,9 +46,9 @@ TEXT_MODEL_OPTIONS: tuple[dict[str, Any], ...] = (
             "Gemini 3.5 Flash provides sustained frontier-level intelligence "
             "optimized for real-world tasks at a higher speed and lower cost."
         ),
-        "cost_rating": 3,
-        "intelligence_rating": 4,
-        "speed_rating": 4,
+        "cost_rating": 6,
+        "intelligence_rating": 8,
+        "speed_rating": 8,
         "url": "https://ai.google.dev/gemini-api/docs/models/gemini-3.5-flash",
     },
     {
@@ -58,9 +58,9 @@ TEXT_MODEL_OPTIONS: tuple[dict[str, Any], ...] = (
             "Gemini 3.5 Flash-Lite is a low-latency, cost-effective multimodal "
             "model optimized for high-throughput, low-cost execution."
         ),
-        "cost_rating": 1,
-        "intelligence_rating": 2,
-        "speed_rating": 5,
+        "cost_rating": 4,
+        "intelligence_rating": 6,
+        "speed_rating": 9,
         "url": "https://ai.google.dev/gemini-api/docs/models/gemini-3.5-flash-lite",
     },
     {
@@ -70,9 +70,9 @@ TEXT_MODEL_OPTIONS: tuple[dict[str, Any], ...] = (
             "Gemini 3.1 Flash-Lite is a low-latency, cost-effective multimodal "
             "model optimized for high-frequency, lightweight tasks."
         ),
-        "cost_rating": 1,
-        "intelligence_rating": 2,
-        "speed_rating": 5,
+        "cost_rating": 3,
+        "intelligence_rating": 5,
+        "speed_rating": 9,
         "url": "https://ai.google.dev/gemini-api/docs/models/gemini-3.1-flash-lite",
     },
     {
@@ -82,9 +82,9 @@ TEXT_MODEL_OPTIONS: tuple[dict[str, Any], ...] = (
             "Our state-of-the-art thinking model, capable of reasoning over "
             "complex problems in code, math, and STEM."
         ),
-        "cost_rating": 5,
-        "intelligence_rating": 5,
-        "speed_rating": 2,
+        "cost_rating": 10,
+        "intelligence_rating": 9,
+        "speed_rating": 4,
         "url": "https://ai.google.dev/gemini-api/docs/models/gemini-2.5-pro",
     },
     {
@@ -94,9 +94,9 @@ TEXT_MODEL_OPTIONS: tuple[dict[str, Any], ...] = (
             "Our best model in terms of price-performance, offering well-rounded "
             "capabilities."
         ),
-        "cost_rating": 3,
-        "intelligence_rating": 3,
-        "speed_rating": 4,
+        "cost_rating": 5,
+        "intelligence_rating": 7,
+        "speed_rating": 8,
         "url": "https://ai.google.dev/gemini-api/docs/models/gemini-2.5-flash",
     },
     {
@@ -107,8 +107,8 @@ TEXT_MODEL_OPTIONS: tuple[dict[str, Any], ...] = (
             "performance for high-frequency, lightweight tasks."
         ),
         "cost_rating": 1,
-        "intelligence_rating": 2,
-        "speed_rating": 5,
+        "intelligence_rating": 4,
+        "speed_rating": 10,
         "url": "https://ai.google.dev/gemini-api/docs/models/gemini-2.5-flash-lite",
     },
 )
@@ -121,9 +121,9 @@ IMAGE_MODEL_OPTIONS: tuple[dict[str, Any], ...] = (
             "Nano Banana 2 provides high-quality image generation and "
             "conversational editing at a mainstream price point and low latency."
         ),
-        "cost_rating": 3,
-        "quality_rating": 4,
-        "speed_rating": 4,
+        "cost_rating": 6,
+        "quality_rating": 8,
+        "speed_rating": 8,
         "url": "https://ai.google.dev/gemini-api/docs/models/gemini-3.1-flash-image",
     },
     {
@@ -133,9 +133,9 @@ IMAGE_MODEL_OPTIONS: tuple[dict[str, Any], ...] = (
             "Nano Banana 2 Lite is the efficiency specialist, offering ultra-low "
             "latency and cost-effective image generation and editing."
         ),
-        "cost_rating": 1,
-        "quality_rating": 3,
-        "speed_rating": 5,
+        "cost_rating": 2,
+        "quality_rating": 6,
+        "speed_rating": 10,
         "url": (
             "https://ai.google.dev/gemini-api/docs/models/"
             "gemini-3.1-flash-lite-image"
@@ -148,9 +148,9 @@ IMAGE_MODEL_OPTIONS: tuple[dict[str, Any], ...] = (
             "Nano Banana Pro is a sophisticated reasoning-driven engine for "
             "professional-grade image editing and generation."
         ),
-        "cost_rating": 5,
-        "quality_rating": 5,
-        "speed_rating": 2,
+        "cost_rating": 10,
+        "quality_rating": 10,
+        "speed_rating": 4,
         "url": "https://ai.google.dev/gemini-api/docs/models/gemini-3-pro-image",
     },
     {
@@ -160,9 +160,9 @@ IMAGE_MODEL_OPTIONS: tuple[dict[str, Any], ...] = (
             "Our best engine for high-velocity visual creation, offering "
             "state-of-the-art speed and efficiency."
         ),
-        "cost_rating": 2,
-        "quality_rating": 3,
-        "speed_rating": 4,
+        "cost_rating": 4,
+        "quality_rating": 6,
+        "speed_rating": 8,
         "url": "https://ai.google.dev/gemini-api/docs/models/gemini-2.5-flash-image",
     },
 )

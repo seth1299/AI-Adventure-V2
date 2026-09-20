@@ -702,6 +702,16 @@ EVENT_RESPONSE_SCHEMA: dict[str, Any] = {
                 "new_description": {"type": "string"},
                 "new_amount": INT_OR_SKIP_SCHEMA,
                 "new_value_base_units": INT_OR_SKIP_SCHEMA,
+                "new_storage_location": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 120,
+                    "description": (
+                        "New free-text storage label for this existing item. Use this "
+                        "for moving an item between places; never remove and re-add "
+                        "the item, and preserve its existing item_uuid."
+                    ),
+                },
                 "item_uuid": {"type": "string"},
                 "quantity_unit": {"type": "string", "description": "Replacement unit measured by new_amount, such as each, grams, mL, bottle, or vial."},
                 "weapon_hands": {
@@ -3569,12 +3579,10 @@ def _build_xml_new_game_prompt(setup_packet: dict[str, Any]) -> str:
             ),
             _xml_text_section(
                 "storage_rule",
-                "Every finalized starting item must include storage_location. This is "
-                "a free-text storage label independent of Travel-tab locations. Use "
-                "actively_carried only when the Player Character is carrying the item; "
-                "otherwise preserve phrases such as in the house, in the car, at the "
-                "workshop, or in the office as concise labels such as home, car, "
-                "workshop, or detective office.",
+                "Every finalized starting item must include storage_location, a "
+                "free-text label independent of Travel-tab locations. Use "
+                "actively_carried only when carried; otherwise use concise labels "
+                "such as home, car, workshop, or office.",
             ),
             _xml_text_section("presentation", build_ai_mode_prompt_guidance(setup_packet)),
             _xml_json_section("banned_terms", banned_terms),

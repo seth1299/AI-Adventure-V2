@@ -67,6 +67,7 @@ class TravelScreen(RepositoryBackedWidget):
         """Reloads known locations while preserving the visible selection."""
 
         repository = self.repository()
+        self.create_image_button.setVisible(self.visual_asset_generation_enabled())
         current_location_name = ""
         selected_name = self._selected_location_name()
         self.location_list.blockSignals(True)

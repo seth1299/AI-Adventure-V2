@@ -323,6 +323,15 @@ class RepositoryBackedWidget(QWidget):
 
         return self._repository
 
+    def visual_asset_generation_enabled(self) -> bool:
+        """Returns whether this save should expose Gemini generation actions."""
+
+        repository = self.repository()
+        return bool(
+            repository is not None
+            and _bool_setting(repository.get_setting("images.enabled", True), True)
+        )
+
     def choose_visual_asset(self, subject_type: str, subject_key: str) -> bool:
         """Lets the player replace one entity image with a local file."""
 

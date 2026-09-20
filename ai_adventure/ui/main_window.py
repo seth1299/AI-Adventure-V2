@@ -340,6 +340,10 @@ class MainWindow(QMainWindow):
             api_key_path=self.app_paths.gemini_api_key_path,
             terms_acceptance_path=self.app_paths.gemini_terms_acceptance_path,
             sound_manager=self.sound_manager,
+            on_save_and_exit=lambda setup: self._save_new_game_wizard_progress(
+                setup,
+                suggested_name=loaded_template_name,
+            ),
         )
         loaded_template_baseline = (
             wizard.build_setup() if loaded_template_name else None
@@ -458,12 +462,14 @@ class MainWindow(QMainWindow):
             settings=self.app_settings,
             tts_enabled=self.tts_enabled,
             music_enabled=not self.playtesting_build,
+            sound_manager=self.sound_manager,
             voice_options=_narrator_voice_options(self.narration_player),
             on_sample_voice=self._play_narrator_sample,
             custom_voice_storage_path=self.app_paths.app_settings_path,
         )
 
         if dialog.exec() != QDialog.DialogCode.Accepted:
+            self._apply_app_settings(self.app_settings, persist=False)
             return
 
         self._apply_app_settings(dialog.build_settings(), persist=True)
@@ -481,6 +487,7 @@ class MainWindow(QMainWindow):
             on_sample_voice=self._play_narrator_sample,
             on_tts_settings_saved=self._persist_app_tts_settings,
             custom_voice_storage_path=self.app_paths.app_settings_path,
+            tts_enabled=self.tts_enabled,
         )
         dialog.exec()
 
@@ -627,6 +634,80 @@ class MainWindow(QMainWindow):
                 )
                 continue
             return clean_name
+
+    def _save_new_game_wizard_progress(
+        self,
+        setup: dict[str, Any],
+        *,
+        suggested_name: str | None = None,
+    ) -> bool:
+        """Prompts for a template name and saves the wizard's partial state."""
+
+        template_path = self.app_paths.new_game_templates_path
+        default_name = (
+            str(suggested_name or "").strip()
+            or str(setup.get("title", "") or "").strip()
+            or "New Game Draft"
+        )
+        while True:
+            template_name, accepted = QInputDialog.getText(
+                self,
+                "Save New Game Progress",
+                "Template name:",
+                QLineEdit.EchoMode.Normal,
+                default_name,
+            )
+            if not accepted:
+                return False
+            clean_name = template_name.strip()
+            if not clean_name:
+                QMessageBox.warning(
+                    self,
+                    "Missing Template Name",
+                    "Enter a template name before saving.",
+                )
+                continue
+
+            existing_names = {
+                template.name.casefold()
+                for template in load_new_game_templates(
+                    template_path,
+                    legacy_template_path=self.app_paths.legacy_new_game_template_path,
+                    normalize_setups=False,
+                )
+            }
+            if clean_name.casefold() in existing_names:
+                overwrite = QMessageBox.question(
+                    self,
+                    "Replace Existing Template?",
+                    f'A template named "{clean_name}" already exists. Replace it?',
+                    QMessageBox.StandardButton.Yes
+                    | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No,
+                )
+                if overwrite != QMessageBox.StandardButton.Yes:
+                    default_name = clean_name
+                    continue
+
+            if not save_new_game_template(
+                template_path,
+                setup,
+                template_name=clean_name,
+                normalize_setup=False,
+            ):
+                QMessageBox.warning(
+                    self,
+                    "Template Not Saved",
+                    "Could not save the current New Game progress.",
+                )
+                return False
+
+            QMessageBox.information(
+                self,
+                "New Game Progress Saved",
+                f'Your progress was saved as the template "{clean_name}".',
+            )
+            return True
 
     def _template_setup_with_available_title(
         self,
@@ -986,6 +1067,10 @@ class MainWindow(QMainWindow):
         """Shows per-subject image choices after the initial world is finalized."""
 
         coordinator = self.game_shell.visual_asset_coordinator
+        generation_enabled = _bool_setting(
+            repository.get_setting("images.enabled", True),
+            True,
+        )
         dialog = NewGameImageSourceDialog(
             requests,
             choose_file=lambda request, source_path: coordinator.upload_initial_image(
@@ -993,10 +1078,11 @@ class MainWindow(QMainWindow):
                 request,
                 source_path,
             ),
-            create_image=lambda request: coordinator.create_initial_image(
-                repository,
-                request,
-            ),
+            create_image=(
+                lambda request: coordinator.create_initial_image(repository, request)
+            )
+            if generation_enabled
+            else None,
             skip_image=lambda request: coordinator.skip_initial_image(
                 repository,
                 request,

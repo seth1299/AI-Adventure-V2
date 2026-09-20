@@ -211,6 +211,7 @@ class NewGameWizard(QWizard):
         api_key_path: Path | str | None = None,
         terms_acceptance_path: Path | str | None = None,
         sound_manager: SoundManagerProtocol | None = None,
+        on_save_and_exit: Callable[[dict[str, Any]], bool] | None = None,
     ) -> None:
         super().__init__(parent)
 
@@ -220,6 +221,7 @@ class NewGameWizard(QWizard):
         self.on_tts_settings_saved = on_tts_settings_saved
         self.custom_voice_storage_path = custom_voice_storage_path
         self.sound_manager = sound_manager
+        self.on_save_and_exit = on_save_and_exit
         self.api_key_path = (
             Path(api_key_path).expanduser().resolve()
             if api_key_path is not None
@@ -295,6 +297,8 @@ class NewGameWizard(QWizard):
         if self.tts_enabled:
             self._build_tts_page()
         self._build_calendar_page()
+        self._configure_tab_navigation()
+        self._configure_save_and_exit_button()
 
         self.currentIdChanged.connect(self._schedule_page_heading_style)
         self._style_current_page_headings()
@@ -302,6 +306,32 @@ class NewGameWizard(QWizard):
 
         if template_setup is not None:
             self.load_setup(template_setup)
+
+    def _configure_tab_navigation(self) -> None:
+        """Makes Tab traverse controls instead of indenting multiline editors."""
+
+        for editor_type in (QTextEdit, QPlainTextEdit):
+            for editor in self.findChildren(editor_type):
+                editor.setTabChangesFocus(True)
+
+    def _configure_save_and_exit_button(self) -> None:
+        """Adds the partial-template save action when persistence is available."""
+
+        if self.on_save_and_exit is None:
+            return
+        self.setOption(QWizard.WizardOption.HaveCustomButton1, True)
+        self.setButtonText(QWizard.WizardButton.CustomButton1, "Save + Exit")
+        self.customButtonClicked.connect(self._handle_custom_wizard_button)
+
+    def _handle_custom_wizard_button(self, button: Any) -> None:
+        """Saves the current form as a template before closing the wizard."""
+
+        button_value = getattr(button, "value", button)
+        if button_value != QWizard.WizardButton.CustomButton1.value:
+            return
+        callback = self.on_save_and_exit
+        if callback is not None and callback(self.build_template_setup()):
+            self.reject()
 
     def nextId(self) -> int:
         """Skips Party dynamically when the setup explicitly has no NPCs."""
@@ -701,6 +731,11 @@ class NewGameWizard(QWizard):
     def build_setup(self) -> dict[str, Any]:
         """Builds a normalized setup dictionary from wizard fields."""
 
+        return normalize_new_game_setup(self.build_template_setup())
+
+    def build_template_setup(self) -> dict[str, Any]:
+        """Builds a raw wizard-shaped setup suitable for a partial template."""
+
         self._new_game_ai_settings = self._new_game_ai_settings_from_controls()
         self._new_game_image_settings = self._new_game_image_settings_from_controls()
         calendar_type = self.calendar_type_combo.currentData() or "gregorian"
@@ -805,7 +840,7 @@ class NewGameWizard(QWizard):
             "world_context": self.world_context_input.toPlainText(),
         }
 
-        return normalize_new_game_setup(setup)
+        return setup
 
     def load_setup(self, setup: dict[str, Any]) -> None:
         """Populates wizard fields from a reusable setup template."""
@@ -1109,10 +1144,8 @@ class NewGameWizard(QWizard):
             + "."
         )
         enabled = self.generated_images_enabled_checkbox.isChecked()
-        self.image_model_combo.setEnabled(enabled)
-        self.image_model_description.setEnabled(enabled)
-        self.image_style_combo.setEnabled(enabled)
-        self.image_style_description.setEnabled(enabled)
+        self.image_model_field.setVisible(enabled)
+        self.image_style_field.setVisible(enabled)
 
     @staticmethod
     def _new_game_ai_choice_field(
@@ -1142,7 +1175,7 @@ class NewGameWizard(QWizard):
         for key in ("cost_rating", "intelligence_rating", "speed_rating"):
             bar = QProgressBar()
             bar.setObjectName(f"model_{key}")
-            bar.setRange(0, 5)
+            bar.setRange(0, 10)
             bar.setValue(0)
             bar.setTextVisible(True)
             bar.setFixedHeight(17)
@@ -1166,9 +1199,9 @@ class NewGameWizard(QWizard):
             ("Speed", "speed_rating"),
         )
         for bar, (label, key) in zip(widget.findChildren(QProgressBar), labels):
-            value = max(0, min(5, int(metadata.get(key, 0))))
+            value = max(0, min(10, int(metadata.get(key, 0))))
             bar.setValue(value)
-            bar.setFormat(f"{label}: {value}/5")
+            bar.setFormat(f"{label}: {value}/10")
             bar.setStyleSheet(
                 "QProgressBar::chunk { background-color: "
                 f"{NewGameWizard._rating_bar_color(value, key == 'cost_rating')}; }}"
@@ -1176,18 +1209,18 @@ class NewGameWizard(QWizard):
 
     @staticmethod
     def _rating_bar_color(value: int, inverted: bool = False) -> str:
-        """Returns a traffic-light color for a 1-to-5 model rating."""
+        """Returns a traffic-light color for a 1-to-10 model rating."""
 
-        rating = max(0, min(5, int(value)))
+        rating = max(0, min(10, int(value)))
         if inverted:
-            if rating <= 2:
+            if rating <= 4:
                 return "#2eaf62"
-            if rating == 3:
+            if rating <= 6:
                 return "#d9a441"
             return "#d9534f"
-        if rating >= 4:
+        if rating >= 7:
             return "#2eaf62"
-        if rating == 3:
+        if rating >= 5:
             return "#d9a441"
         return "#d9534f"
 
@@ -2376,9 +2409,13 @@ class NewGameWizard(QWizard):
         smarter_note.setStyleSheet(description_style)
 
         self.generated_images_enabled_checkbox = QCheckBox(
-            "Offer image-source choices for characters, locations, NPCs, and items"
+            "Allow Gemini to generate images (local image uploads remain available)"
         )
         self.generated_images_enabled_checkbox.setChecked(True)
+        self.generated_images_enabled_checkbox.setToolTip(
+            "When disabled, all Generate Image buttons are hidden. You can still "
+            "choose and upload your own image files."
+        )
         self.image_model_combo = _NoWheelComboBox(page)
         AISettingsDialog._add_mode_options(self.image_model_combo, IMAGE_MODEL_OPTIONS)
         _set_combo_to_data(
@@ -2407,10 +2444,17 @@ class NewGameWizard(QWizard):
         )
         catalog_note.setWordWrap(True)
         catalog_note.setStyleSheet(description_style)
+        rating_note = QLabel(
+            "Ratings use a comparative 10-point scale. Lower Cost is cheaper; "
+            "higher Intelligence, Quality, and Speed are better."
+        )
+        rating_note.setWordWrap(True)
+        rating_note.setStyleSheet(description_style)
 
         model_group = QGroupBox("Models")
         model_layout = QVBoxLayout(model_group)
         model_layout.addWidget(catalog_note)
+        model_layout.addWidget(rating_note)
         model_layout.addWidget(
             self._new_game_ai_choice_field(
                 "Text Model",
@@ -2422,21 +2466,19 @@ class NewGameWizard(QWizard):
         model_layout.addWidget(self.smarter_ai_checkbox)
         model_layout.addWidget(smarter_note)
         model_layout.addWidget(self.generated_images_enabled_checkbox)
-        model_layout.addWidget(
-            self._new_game_ai_choice_field(
-                "Image Model",
-                self.image_model_combo,
-                self.image_model_description,
-                self.image_model_ratings,
-            )
+        self.image_model_field = self._new_game_ai_choice_field(
+            "Image Model",
+            self.image_model_combo,
+            self.image_model_description,
+            self.image_model_ratings,
         )
-        model_layout.addWidget(
-            self._new_game_ai_choice_field(
-                "Image Style (applies to every generated image)",
-                self.image_style_combo,
-                self.image_style_description,
-            )
+        model_layout.addWidget(self.image_model_field)
+        self.image_style_field = self._new_game_ai_choice_field(
+            "Image Style (applies to every generated image)",
+            self.image_style_combo,
+            self.image_style_description,
         )
+        model_layout.addWidget(self.image_style_field)
 
         modes = normalize_ai_mode_preferences(self._new_game_ai_settings)
         self.model_tone_combo = _NoWheelComboBox(page)

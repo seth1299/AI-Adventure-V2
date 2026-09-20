@@ -62,12 +62,12 @@ class SettingsScreen(RepositoryBackedWidget):
         self.ai_settings_button.clicked.connect(self._open_ai_settings_dialog)
 
         self.generated_images_enabled_checkbox = QCheckBox(
-            "Generate and reuse portraits, locations, items, and NPC images"
+            "Allow Gemini to generate portraits, locations, items, and NPC images"
         )
         self.generated_images_enabled_checkbox.setChecked(True)
         self.generated_images_enabled_checkbox.setToolTip(
-            "New subjects may incur one Gemini image-generation charge; matching "
-            "descriptions reuse the existing cached image."
+            "When disabled, Generate Image buttons are hidden, but local image "
+            "uploads remain available."
         )
         self.generated_images_enabled_checkbox.toggled.connect(
             lambda _checked: self._save_settings()

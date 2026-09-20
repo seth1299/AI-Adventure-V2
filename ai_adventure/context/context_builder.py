@@ -661,10 +661,13 @@ class AiContextBuilder:
                         "Player Character is carrying it. "
                             "Use item_catalog to remember descriptions, categories, "
                             "values for previously seen items. Each item also "
-                            "has database_id, a globally unique database identity, and "
-                            "metadata.item_uuid, a stable item identity; "
-                            "reuse it for the same item and do not split one item "
-                            "into duplicate definitions because of name variations."
+                        "has database_id, a globally unique database identity, and "
+                        "metadata.item_uuid, a stable item identity; "
+                        "reuse it for the same item and do not split one item "
+                        "into duplicate definitions because of name variations. "
+                        "For storage moves, use InventoryItemModifiedEvent with the "
+                        "existing item_uuid and new_storage_location; only use a "
+                        "reachable destination."
                         ),
                     },
                 },

@@ -40,6 +40,7 @@ from ai_adventure.combat import (
 from ai_adventure.container_access import has_immediate_container_unlock_method
 from ai_adventure.currency import format_currency_amount
 from ai_adventure.locations import clean_player_location_name
+from ai_adventure.locations import calculate_travel_estimate, normalize_known_locations
 from ai_adventure.persistence.save_repository import GM_SECRET_STATUSES, SaveRepository
 from ai_adventure.skills.rules import bonus_for_level, dc_for_difficulty
 
@@ -508,6 +509,22 @@ class EventApplier:
             "value",
         )
         metadata = dict(payload)
+        new_storage_location = _first_text(
+            payload, "new_storage_location", "storage_location"
+        )
+        if new_storage_location:
+            if not _storage_location_is_accessible(
+                self.repository, new_storage_location
+            ):
+                return _invalid(
+                    event_type,
+                    payload,
+                    (
+                        f"Cannot move {target_name} to storage location "
+                        f"{new_storage_location!r} from the player's current location."
+                    ),
+                )
+            metadata["storage_location"] = new_storage_location
         new_basic_name = _first_text(payload, "new_basic_name")
         if new_basic_name and new_basic_name.casefold() not in {"same", "skip"}:
             metadata["basic_name"] = new_basic_name
@@ -2586,6 +2603,59 @@ def _current_player_location(repository: SaveRepository) -> str:
     """Returns the current player location for event defaulting."""
 
     return clean_player_location_name(repository.get_state_value("location", "")) or "Unknown"
+
+
+def _storage_location_is_accessible(
+    repository: SaveRepository,
+    destination: str,
+) -> bool:
+    """Checks that an item move does not target a known remote location.
+
+    Storage labels are intentionally free text, so an unregistered label such as
+    ``car`` may still describe a nearby object.  When a label resolves to a
+    player-known Travel location, however, it must be the current location (or
+    effectively co-located); this prevents remote actions such as putting an
+    item back at Home while the player is elsewhere.
+    """
+
+    target = clean_player_location_name(destination)
+    if not target or target.casefold() in {"actively_carried", "on_person"}:
+        return True
+
+    current = clean_player_location_name(
+        repository.get_state_value("location", "")
+    )
+    if current and target.casefold() == current.casefold():
+        return True
+
+    locations = normalize_known_locations(repository.get_travel_locations())
+    target_location = next(
+        (location for location in locations if location.name.casefold() == target.casefold()),
+        None,
+    )
+    current_location = next(
+        (location for location in locations if location.name.casefold() == current.casefold()),
+        None,
+    )
+    if target_location is not None:
+        if current_location is None:
+            return False
+        estimate = calculate_travel_estimate(
+            current_location,
+            target_location,
+            move_speed_mph=repository.get_setting("travel.move_speed_mph", 3.0),
+            travel_mode=repository.get_setting("travel.mode", "On Foot"),
+            speed_multiplier=repository.get_setting("travel.speed_multiplier", 1.0),
+        )
+        return estimate.distance_miles is not None and estimate.distance_miles <= 0.1
+
+    # Common home labels are meaningful even when an older save has no map row.
+    # Do not allow them from a plainly different current location.
+    home_label = target.casefold()
+    if home_label in {"home", "house", "at home", "display case at home"}:
+        return any(token in current.casefold() for token in ("home", "house"))
+
+    return True
 
 
 def _active_task_defaults(

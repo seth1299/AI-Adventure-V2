@@ -55,6 +55,7 @@ class BestiaryScreen(RepositoryBackedWidget):
         """Reloads learned creatures while preserving the visible selection."""
 
         repository = self.repository()
+        self.create_image_button.setVisible(self.visual_asset_generation_enabled())
         selected_id = self._selected_creature_id()
         self.creature_list.blockSignals(True)
         self.creature_selector.blockSignals(True)

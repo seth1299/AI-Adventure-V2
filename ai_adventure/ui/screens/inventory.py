@@ -568,9 +568,11 @@ class InventoryScreen(RepositoryBackedWidget):
             on_select_image=lambda: self.choose_visual_asset(
                 "inventory", image_subject_key
             ),
-            on_create_image=lambda: self.create_visual_asset(
-                "inventory", image_subject_key
-            ),
+            on_create_image=(
+                lambda: self.create_visual_asset("inventory", image_subject_key)
+            )
+            if self.visual_asset_generation_enabled()
+            else None,
             show_structured_details=self.playtesting_tools,
             parent=self,
         )

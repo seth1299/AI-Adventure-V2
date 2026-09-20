@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from PySide6.QtWidgets import QFileDialog
+
 from ai_adventure.ui.common import *  # noqa: F401,F403
 
 
@@ -1165,6 +1167,7 @@ class MainMenuSettingsDialog(QDialog):
         settings: dict[str, Any],
         tts_enabled: bool = True,
         music_enabled: bool = True,
+        sound_manager: SoundManagerProtocol | None = None,
         voice_options: dict[str, str] | None = None,
         on_sample_voice: SampleVoiceCallback | None = None,
         custom_voice_storage_path: Path | str | None = None,
@@ -1173,6 +1176,7 @@ class MainMenuSettingsDialog(QDialog):
 
         self.tts_enabled = bool(tts_enabled)
         self.music_enabled = bool(music_enabled)
+        self.sound_manager = sound_manager
         self.voice_options = voice_options or available_narrator_voices()
         self.on_sample_voice = on_sample_voice
         clean_settings = normalize_app_settings(
@@ -1212,9 +1216,20 @@ class MainMenuSettingsDialog(QDialog):
         self.font_size_spin.setRange(MIN_UI_FONT_SIZE, MAX_UI_FONT_SIZE)
         self.font_size_spin.setValue(int(appearance["font_size"]))
         self.font_size_spin.setSuffix(" pt")
+        self.font_family_combo.currentIndexChanged.connect(
+            lambda _index: self._preview_appearance()
+        )
+        self.font_size_spin.valueChanged.connect(
+            lambda _value: self._preview_appearance()
+        )
 
         self.music_enabled_checkbox = QCheckBox("Music enabled")
         self.music_enabled_checkbox.setChecked(bool(audio["music_enabled"]))
+        self.music_enabled_checkbox.toggled.connect(self._sync_audio_control_visibility)
+        self.music_upload_button = QPushButton("Upload Music...")
+        self.music_upload_button.clicked.connect(
+            lambda _checked=False: self._upload_audio_file("music")
+        )
 
         self.music_volume_slider = QSlider(Qt.Orientation.Horizontal)
         self.music_volume_slider.setRange(0, 100)
@@ -1223,10 +1238,20 @@ class MainMenuSettingsDialog(QDialog):
         self.music_volume_slider.valueChanged.connect(
             lambda value: self.music_volume_label.setText(f"{value}%")
         )
+        self.music_volume_control = _slider_row(
+            self.music_volume_slider, self.music_volume_label
+        )
 
         self.sound_effects_enabled_checkbox = QCheckBox("Sound effects enabled")
         self.sound_effects_enabled_checkbox.setChecked(
             bool(audio["sound_effects_enabled"])
+        )
+        self.sound_effects_enabled_checkbox.toggled.connect(
+            self._sync_audio_control_visibility
+        )
+        self.sound_effects_upload_button = QPushButton("Upload Sound Effects...")
+        self.sound_effects_upload_button.clicked.connect(
+            lambda _checked=False: self._upload_audio_file("sound_effects")
         )
         self.sound_effects_volume_slider = QSlider(Qt.Orientation.Horizontal)
         self.sound_effects_volume_slider.setRange(0, 100)
@@ -1237,6 +1262,9 @@ class MainMenuSettingsDialog(QDialog):
         self.sound_effects_volume_slider.valueChanged.connect(
             lambda value: self.sound_effects_volume_label.setText(f"{value}%")
         )
+        self.sound_effects_volume_control = _slider_row(
+            self.sound_effects_volume_slider, self.sound_effects_volume_label
+        )
 
         self.background_ambience_enabled_checkbox = QCheckBox(
             "Background ambience enabled"
@@ -1244,6 +1272,24 @@ class MainMenuSettingsDialog(QDialog):
         self.background_ambience_enabled_checkbox.setChecked(
             bool(audio["background_ambience_enabled"])
         )
+        self.background_ambience_enabled_checkbox.toggled.connect(
+            self._sync_audio_control_visibility
+        )
+        self.background_ambience_upload_button = QPushButton(
+            "Upload Background Ambience..."
+        )
+        self.background_ambience_upload_button.clicked.connect(
+            lambda _checked=False: self._upload_audio_file("background_ambience")
+        )
+        audio_import_available = callable(
+            getattr(self.sound_manager, "import_audio_file", None)
+        )
+        for button in (
+            self.music_upload_button,
+            self.sound_effects_upload_button,
+            self.background_ambience_upload_button,
+        ):
+            button.setEnabled(audio_import_available)
         self.background_ambience_volume_slider = QSlider(Qt.Orientation.Horizontal)
         self.background_ambience_volume_slider.setRange(0, 100)
         self.background_ambience_volume_slider.setValue(
@@ -1254,6 +1300,10 @@ class MainMenuSettingsDialog(QDialog):
         )
         self.background_ambience_volume_slider.valueChanged.connect(
             lambda value: self.background_ambience_volume_label.setText(f"{value}%")
+        )
+        self.background_ambience_volume_control = _slider_row(
+            self.background_ambience_volume_slider,
+            self.background_ambience_volume_label,
         )
 
         self.narrator_enabled_checkbox: QCheckBox | None = None
@@ -1266,35 +1316,33 @@ class MainMenuSettingsDialog(QDialog):
         self._custom_calendar_settings = dict(GREGORIAN_CALENDAR_SETTINGS)
 
         form = QFormLayout()
+        self._audio_form = form
         form.addRow("Theme Preference:", self.theme_combo)
         form.addRow("Text Font:", self.font_family_combo)
         form.addRow("Text Size:", self.font_size_spin)
 
         if self.music_enabled:
             form.addRow("Background Music:", self.music_enabled_checkbox)
+            form.addRow("Music Library:", self.music_upload_button)
             form.addRow(
                 "Music Volume:",
-                _slider_row(self.music_volume_slider, self.music_volume_label),
+                self.music_volume_control,
             )
             form.addRow("Narration Sound Effects:", self.sound_effects_enabled_checkbox)
+            form.addRow("Sound Effects Library:", self.sound_effects_upload_button)
             form.addRow(
                 "Sound Effects Volume:",
-                _slider_row(
-                    self.sound_effects_volume_slider,
-                    self.sound_effects_volume_label,
-                ),
+                self.sound_effects_volume_control,
             )
 
             form.addRow(
                 "Background Ambience:",
                 self.background_ambience_enabled_checkbox,
             )
+            form.addRow("Ambience Library:", self.background_ambience_upload_button)
             form.addRow(
                 "Ambience Volume:",
-                _slider_row(
-                    self.background_ambience_volume_slider,
-                    self.background_ambience_volume_label,
-                ),
+                self.background_ambience_volume_control,
             )
 
         if self.tts_enabled:
@@ -1329,6 +1377,8 @@ class MainMenuSettingsDialog(QDialog):
         layout.addStretch()
         layout.addLayout(button_row)
         self.setLayout(layout)
+        self._sync_audio_control_visibility()
+        self._preview_appearance()
 
     def build_settings(self) -> dict[str, Any]:
         """Builds normalized app-level settings from dialog fields."""
@@ -1418,6 +1468,59 @@ class MainMenuSettingsDialog(QDialog):
 
         return self.tts_settings_widget.build_audio_settings()
 
+    def _preview_appearance(self) -> None:
+        """Applies the selected font immediately while this dialog is open."""
+
+        apply_application_theme(
+            self.theme_combo.currentText(),
+            {
+                "font_family": _combo_current_data_text(self.font_family_combo, ""),
+                "font_size": self.font_size_spin.value(),
+            },
+        )
+
+    def _sync_audio_control_visibility(self, _checked: bool | None = None) -> None:
+        """Shows each volume control only while its feature is enabled."""
+
+        self._audio_form.setRowVisible(
+            self.music_volume_control,
+            self.music_enabled_checkbox.isChecked(),
+        )
+        self._audio_form.setRowVisible(
+            self.sound_effects_volume_control,
+            self.sound_effects_enabled_checkbox.isChecked(),
+        )
+        self._audio_form.setRowVisible(
+            self.background_ambience_volume_control,
+            self.background_ambience_enabled_checkbox.isChecked(),
+        )
+
+    def _upload_audio_file(self, category: str) -> None:
+        """Imports one user-selected audio file through the shared sound manager."""
+
+        importer = getattr(self.sound_manager, "import_audio_file", None)
+        if not callable(importer):
+            QMessageBox.warning(self, "Audio Unavailable", "Audio upload is unavailable.")
+            return
+        file_path, _selected_filter = QFileDialog.getOpenFileName(
+            self,
+            "Choose audio file",
+            "",
+            "Audio Files (*.wav *.mp3 *.ogg *.flac *.m4a);;All Files (*)",
+        )
+        if not file_path:
+            return
+        try:
+            success, result = importer(Path(file_path), category)
+        except Exception as error:
+            LOGGER.exception("Main-menu audio upload failed: category=%s", category)
+            QMessageBox.warning(self, "Audio Import Failed", str(error))
+            return
+        if not success:
+            QMessageBox.warning(self, "Audio Import Failed", str(result))
+            return
+        QMessageBox.information(self, "Audio Imported", f"Available as: {result}")
+
 
 class NewGameTemplateManagerDialog(QDialog):
     """Main-menu dialog for creating and editing reusable new-game templates."""
@@ -1434,13 +1537,19 @@ class NewGameTemplateManagerDialog(QDialog):
         on_sample_voice: SampleVoiceCallback | None = None,
         on_tts_settings_saved: Callable[[dict[str, Any]], None] | None = None,
         custom_voice_storage_path: Path | str | None = None,
+        tts_enabled: bool = True,
     ) -> None:
         super().__init__(parent)
 
         self.template_path = template_path
         self.legacy_template_path = legacy_template_path
         self.sound_manager = sound_manager
-        self.audio_defaults = normalize_tts_audio_fields(audio_defaults or {})
+        self.tts_enabled = bool(tts_enabled)
+        self.audio_defaults = normalize_tts_audio_fields(
+            audio_defaults or {},
+            tts_enabled=self.tts_enabled,
+        )
+
         self.voice_options = voice_options or available_narrator_voices()
         self.on_sample_voice = on_sample_voice
         self.on_tts_settings_saved = on_tts_settings_saved
@@ -1705,12 +1814,16 @@ class NewGameTemplateManagerDialog(QDialog):
         self.background_ambience_test_button.clicked.connect(
             self._test_background_ambience_preview
         )
-        self.template_tts_settings_widget = TTSSettingsWidget(
-            audio_settings=self.audio_defaults,
-            voice_options=self.voice_options,
-            on_sample_voice=self.on_sample_voice,
-            on_custom_voice_saved=self._handle_template_custom_voice_saved,
-            custom_voice_storage_path=self.custom_voice_storage_path,
+        self.template_tts_settings_widget = (
+            TTSSettingsWidget(
+                audio_settings=self.audio_defaults,
+                voice_options=self.voice_options,
+                on_sample_voice=self.on_sample_voice,
+                on_custom_voice_saved=self._handle_template_custom_voice_saved,
+                custom_voice_storage_path=self.custom_voice_storage_path,
+            )
+            if self.tts_enabled
+            else None
         )
 
         template_buttons = _button_row(new_button, duplicate_button, save_button, delete_button)
@@ -1854,7 +1967,8 @@ class NewGameTemplateManagerDialog(QDialog):
             ),
         )
         form.addRow("Ambience Preview:", self.background_ambience_test_button)
-        form.addRow("Narration / TTS:", self.template_tts_settings_widget)
+        if self.template_tts_settings_widget is not None:
+            form.addRow("Narration / TTS:", self.template_tts_settings_widget)
         tab = QWidget()
         tab.setLayout(form)
         return tab
@@ -2408,7 +2522,8 @@ class NewGameTemplateManagerDialog(QDialog):
             self.background_ambience_volume_label.setText(
                 f"{self.background_ambience_volume_slider.value()}%"
             )
-            self.template_tts_settings_widget.load_audio_settings(audio)
+            if self.template_tts_settings_widget is not None:
+                self.template_tts_settings_widget.load_audio_settings(audio)
             ai_settings = (
                 setup.get("ai_settings", {})
                 if isinstance(setup.get("ai_settings"), dict)
@@ -2572,6 +2687,14 @@ class NewGameTemplateManagerDialog(QDialog):
             setup["calendar"] = {**existing_calendar, "calendar_type": "custom"}
 
         setup["starting_task"] = self._template_starting_task_from_controls()
+        existing_audio = (
+            setup.get("audio", {}) if isinstance(setup.get("audio"), dict) else {}
+        )
+        tts_audio = (
+            self.template_tts_settings_widget.build_audio_settings()
+            if self.template_tts_settings_widget is not None
+            else normalize_tts_audio_fields(existing_audio, tts_enabled=False)
+        )
         setup["audio"] = {
             "music_enabled": self.music_enabled_checkbox.isChecked(),
             "music_volume": self.music_volume_slider.value(),
@@ -2583,7 +2706,7 @@ class NewGameTemplateManagerDialog(QDialog):
             "background_ambience_volume": (
                 self.background_ambience_volume_slider.value()
             ),
-            **self.template_tts_settings_widget.build_audio_settings(),
+            **tts_audio,
         }
         setup["ai_settings"] = dict(self._new_game_ai_settings)
 

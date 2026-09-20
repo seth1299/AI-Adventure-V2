@@ -14,12 +14,14 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QEventLoop, QThread, QTime, QTimer, Qt
 from PySide6.QtGui import QColor, QImage
+from PySide6.QtTest import QTest
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
     QDialog,
     QGridLayout,
     QHeaderView,
+    QInputDialog,
     QLabel,
     QLayoutItem,
     QLineEdit,
@@ -33,6 +35,7 @@ from PySide6.QtWidgets import (
     QTextEdit,
     QVBoxLayout,
     QWidget,
+    QWizard,
 )
 
 from ai_adventure.persistence.save_repository import SaveRepository
@@ -372,18 +375,37 @@ class InventoryUiTests(unittest.TestCase):
         image_bars = wizard.image_model_ratings.findChildren(QProgressBar)
         self.assertEqual(
             [bar.format() for bar in text_bars],
-            ["Cost: 4/5", "Intelligence: 5/5", "Speed: 3/5"],
+            ["Cost: 8/10", "Intelligence: 10/10", "Speed: 6/10"],
         )
         self.assertEqual(
             [bar.format() for bar in image_bars],
-            ["Cost: 5/5", "Quality: 5/5", "Speed: 2/5"],
+            ["Cost: 10/10", "Quality: 10/10", "Speed: 4/10"],
         )
         self.assertIn("#d9534f", text_bars[0].styleSheet())
         self.assertIn("#d9534f", image_bars[0].styleSheet())
         self.assertIn("#2eaf62", image_bars[1].styleSheet())
         self.assertIn("#d9534f", image_bars[2].styleSheet())
-        self.assertFalse(wizard.image_model_combo.isEnabled())
-        self.assertFalse(wizard.image_style_combo.isEnabled())
+        self.assertTrue(wizard.image_model_field.isHidden())
+        self.assertTrue(wizard.image_style_field.isHidden())
+
+        wizard.generated_images_enabled_checkbox.setChecked(True)
+        lite_25_index = wizard.text_model_combo.findData("gemini-2.5-flash-lite")
+        wizard.text_model_combo.setCurrentIndex(lite_25_index)
+        self.app.processEvents()
+        self.assertEqual(
+            [bar.format() for bar in text_bars],
+            ["Cost: 1/10", "Intelligence: 4/10", "Speed: 10/10"],
+        )
+        lite_35_index = wizard.text_model_combo.findData("gemini-3.5-flash-lite")
+        wizard.text_model_combo.setCurrentIndex(lite_35_index)
+        self.app.processEvents()
+        self.assertEqual(
+            [bar.format() for bar in text_bars],
+            ["Cost: 4/10", "Intelligence: 6/10", "Speed: 9/10"],
+        )
+
+        wizard.text_model_combo.setCurrentIndex(text_index)
+        wizard.generated_images_enabled_checkbox.setChecked(False)
         setup = wizard.build_setup()
         self.assertEqual(setup["ai_settings"]["text_model"], "gemini-3.7-flash")
         self.assertEqual(setup["ai_settings"]["model_intelligence"], "smarter")
@@ -400,6 +422,93 @@ class InventoryUiTests(unittest.TestCase):
             },
         )
         wizard.close()
+
+    def test_new_game_wizard_tab_moves_focus_out_of_multiline_fields(self) -> None:
+        wizard = NewGameWizard(tts_enabled=False)
+        wizard.show()
+        self.app.processEvents()
+
+        editors = [
+            *wizard.findChildren(QTextEdit),
+            *wizard.findChildren(QPlainTextEdit),
+        ]
+        self.assertTrue(editors)
+        self.assertTrue(all(editor.tabChangesFocus() for editor in editors))
+
+        wizard.game_style_input.setPlainText("No indentation expected")
+        wizard.game_style_input.setFocus()
+        self.app.processEvents()
+        self.assertTrue(wizard.game_style_input.hasFocus())
+
+        QTest.keyClick(wizard.game_style_input, Qt.Key.Key_Tab)
+        self.app.processEvents()
+
+        self.assertFalse(wizard.game_style_input.hasFocus())
+        self.assertEqual(
+            wizard.game_style_input.toPlainText(),
+            "No indentation expected",
+        )
+        wizard.close()
+
+    def test_new_game_wizard_save_and_exit_uses_raw_partial_template(self) -> None:
+        captured: list[dict[str, Any]] = []
+        wizard = NewGameWizard(
+            tts_enabled=False,
+            on_save_and_exit=lambda setup: captured.append(setup) or True,
+        )
+        wizard.title_input.setText("")
+        wizard.character_name_input.setText("Half-Finished Hero")
+        wizard.game_style_input.setPlainText("A work in progress")
+
+        button = wizard.button(QWizard.WizardButton.CustomButton1)
+        self.assertIsNotNone(button)
+        self.assertEqual(button.text(), "Save + Exit")
+        button.click()
+        self.app.processEvents()
+
+        self.assertEqual(len(captured), 1)
+        self.assertEqual(captured[0]["title"], "")
+        self.assertEqual(captured[0]["character"]["name"], "Half-Finished Hero")
+        self.assertEqual(captured[0]["game_style"], "A work in progress")
+        self.assertEqual(wizard.result(), QDialog.DialogCode.Rejected)
+        wizard.deleteLater()
+
+    def test_main_window_save_and_exit_persists_partial_template(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            window = SimpleNamespace(
+                app_paths=SimpleNamespace(
+                    new_game_templates_path=temp_path / "new_game_templates.json",
+                    legacy_new_game_template_path=temp_path / "legacy_template.json",
+                )
+            )
+            setup = {
+                "title": "",
+                "character": {"name": "Draft Hero"},
+                "game_style": "Unfinished mystery",
+            }
+
+            with (
+                patch.object(
+                    QInputDialog,
+                    "getText",
+                    return_value=("Mystery Draft", True),
+                ),
+                patch.object(QMessageBox, "information") as information,
+            ):
+                saved = MainWindow._save_new_game_wizard_progress(
+                    cast(MainWindow, window),
+                    setup,
+                )
+
+            self.assertTrue(saved)
+            stored = load_new_game_templates(
+                window.app_paths.new_game_templates_path,
+                normalize_setups=False,
+            )
+            self.assertEqual([template.name for template in stored], ["Mystery Draft"])
+            self.assertEqual(stored[0].setup, setup)
+            information.assert_called_once()
 
     def test_in_game_ai_settings_dialog_keeps_existing_mode_controls(self) -> None:
         dialog = AISettingsDialog()
@@ -537,6 +646,49 @@ class InventoryUiTests(unittest.TestCase):
             )
             self.assertEqual(saved_mystery.setup["specified_genre"], "Thriller")
             dialog.close()
+
+    def test_lightweight_template_manager_omits_tts_controls(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            dialog = NewGameTemplateManagerDialog(
+                template_path=Path(temp_dir) / "new_game_templates.json",
+                tts_enabled=False,
+            )
+
+            self.assertIsNone(dialog.template_tts_settings_widget)
+            self.assertNotIn(
+                "Narration / TTS:",
+                [label.text() for label in dialog.findChildren(QLabel)],
+            )
+            self.assertNotIn(
+                "Sample Voice",
+                [button.text() for button in dialog.findChildren(QPushButton)],
+            )
+            setup = dialog._build_setup_from_editor()
+            self.assertFalse(setup["audio"]["narrator_enabled"])
+            dialog.close()
+
+    def test_main_window_passes_lightweight_tts_capability_to_templates(self) -> None:
+        window = SimpleNamespace(
+            app_paths=SimpleNamespace(
+                new_game_templates_path=Path("templates.json"),
+                legacy_new_game_template_path=Path("legacy-template.json"),
+                app_settings_path=Path("app-settings.json"),
+            ),
+            sound_manager=None,
+            app_settings={"audio": {}},
+            narration_player=None,
+            tts_enabled=False,
+            _play_narrator_sample=Mock(),
+            _persist_app_tts_settings=Mock(),
+        )
+
+        with patch(
+            "ai_adventure.ui.main_window.NewGameTemplateManagerDialog"
+        ) as dialog_type:
+            MainWindow.open_new_game_templates(cast(MainWindow, window))
+
+        self.assertFalse(dialog_type.call_args.kwargs["tts_enabled"])
+        dialog_type.return_value.exec.assert_called_once_with()
 
     def test_new_game_wizard_calendar_settings_button_opens_dialog(self) -> None:
         wizard = NewGameWizard(tts_enabled=False)
@@ -2189,6 +2341,12 @@ class InventoryUiTests(unittest.TestCase):
             button_texts = [button.text() for button in screen.findChildren(QPushButton)]
             self.assertIn("Select Image...", button_texts)
             self.assertIn("Create new image for me", button_texts)
+
+            repository.set_setting("images.enabled", False)
+            screen.refresh()
+            self.app.processEvents()
+            self.assertFalse(screen.select_image_button.isHidden())
+            self.assertTrue(screen.create_image_button.isHidden())
             screen.close()
 
     def test_notes_default_to_markdown_preview_and_edit_on_demand(self) -> None:

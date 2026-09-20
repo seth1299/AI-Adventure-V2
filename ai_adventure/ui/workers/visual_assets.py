@@ -52,9 +52,7 @@ class _VisualAssetCoordinator(QObject):
     ) -> list[VisualAssetRequest]:
         """Registers initial assets without starting any paid image requests."""
 
-        if not self.enabled or not _bool_setting(
-            repository.get_setting("images.enabled", True), True
-        ):
+        if not self.enabled:
             return []
 
         repository_key = str(repository.db_path)
@@ -159,6 +157,8 @@ class _VisualAssetCoordinator(QObject):
 
         if not self.enabled:
             return False, "Image generation is disabled for this build."
+        if not _bool_setting(repository.get_setting("images.enabled", True), True):
+            return False, "Gemini image generation is disabled for this adventure."
         if not read_api_key(self.api_key_path):
             return False, "A Google Gemini API key is required to create this image."
         model = normalize_image_model(

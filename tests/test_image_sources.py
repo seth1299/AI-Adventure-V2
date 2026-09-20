@@ -5,7 +5,7 @@ import unittest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QLabel
 
 from ai_adventure.ui.image_sources import NewGameImageSourceDialog
 from ai_adventure.visual_assets import VisualAssetRequest
@@ -59,6 +59,27 @@ class NewGameImageSourceDialogTests(unittest.TestCase):
         dialog.set_asset_status(request.asset_id, "ready")
         self.assertTrue(dialog.continue_button.isEnabled())
         self.assertEqual(row[0].text(), "Image ready")
+        dialog.deleteLater()
+
+    def test_generation_button_is_omitted_when_generation_is_disabled(self) -> None:
+        request = VisualAssetRequest(
+            subject_type="npc",
+            subject_key="npc_1",
+            display_name="Mara",
+            description="A harbor pilot.",
+        )
+        dialog = NewGameImageSourceDialog(
+            [request],
+            choose_file=lambda _request, _path: (True, ""),
+            create_image=None,
+            skip_image=lambda _request: None,
+        )
+
+        row = dialog._rows[request.asset_id]
+        self.assertIsNone(row[2])
+        self.assertIn("Choose a local image", dialog.findChildren(QLabel)[1].text())
+        row[3].click()
+        self.assertTrue(dialog.continue_button.isEnabled())
         dialog.deleteLater()
 
 
