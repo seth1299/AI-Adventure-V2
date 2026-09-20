@@ -875,6 +875,7 @@ class AISettingsDialog(QDialog):
         parent: QWidget | None = None,
         *,
         settings: dict[str, Any] | None = None,
+        include_model_choices: bool = False,
     ) -> None:
         super().__init__(parent)
 
@@ -895,6 +896,20 @@ class AISettingsDialog(QDialog):
 
         self.setWindowTitle("A.I. Settings")
         self.resize(640, 720)
+
+        if include_model_choices:
+            self.text_model_combo = _NoWheelComboBox()
+            self._add_mode_options(self.text_model_combo, TEXT_MODEL_OPTIONS)
+            _set_combo_to_data(
+                self.text_model_combo,
+                normalize_text_model(raw_settings.get("text_model")),
+            )
+            self.image_model_combo = _NoWheelComboBox()
+            self._add_mode_options(self.image_model_combo, IMAGE_MODEL_OPTIONS)
+            _set_combo_to_data(
+                self.image_model_combo,
+                normalize_image_model(raw_settings.get("image_model")),
+            )
 
         self.model_intelligence_combo = _NoWheelComboBox()
         self._add_mode_options(
@@ -948,6 +963,12 @@ class AISettingsDialog(QDialog):
 
         behavior_group = QGroupBox("Model Modes")
         behavior_layout = QVBoxLayout()
+        if getattr(self, "text_model_combo", None) is not None:
+            behavior_layout.addWidget(QLabel("Text Model"))
+            behavior_layout.addWidget(self.text_model_combo)
+        if getattr(self, "image_model_combo", None) is not None:
+            behavior_layout.addWidget(QLabel("Image Model"))
+            behavior_layout.addWidget(self.image_model_combo)
         behavior_layout.addWidget(
             self._choice_field(
                 "Model Intelligence",
@@ -1070,7 +1091,7 @@ class AISettingsDialog(QDialog):
                 ),
             }
         )
-        return {
+        result = {
             "model_intelligence": modes["model_intelligence"],
             "model_tone": modes["model_tone"],
             "response_length": modes["response_length"],
@@ -1081,6 +1102,11 @@ class AISettingsDialog(QDialog):
                 self.additional_ai_context_input.toPlainText().strip()
             ),
         }
+        if getattr(self, "text_model_combo", None) is not None:
+            result["text_model"] = normalize_text_model(self.text_model_combo.currentData())
+        if getattr(self, "image_model_combo", None) is not None:
+            result["image_model"] = normalize_image_model(self.image_model_combo.currentData())
+        return result
 
     @staticmethod
     def _description_label(text: str = "") -> QLabel:
@@ -1747,6 +1773,46 @@ class NewGameTemplateManagerDialog(QDialog):
                 self.starter_armor_suggestions_table, "Armor"
             )
         )
+        self.starter_inventory_mode_combo = _NoWheelComboBox()
+        self.starter_inventory_mode_combo.addItem("Basic", "basic")
+        self.starter_inventory_mode_combo.addItem("Advanced", "advanced")
+        self.starter_inventory_mode_combo.currentIndexChanged.connect(
+            lambda _index: self._sync_template_inventory_controls()
+        )
+        self.combat_resolution_mode_combo = _NoWheelComboBox()
+        self.combat_resolution_mode_combo.addItem(
+            "Strict / App-Managed Combat", "strict"
+        )
+        self.combat_resolution_mode_combo.addItem(
+            "Narrative / Gemini-Managed Combat", "narrative"
+        )
+        self.combat_resolution_mode_combo.currentIndexChanged.connect(
+            lambda _index: self._sync_template_inventory_controls()
+        )
+        self.combat_focus_combo = _NoWheelComboBox()
+        for value, label in COMBAT_FOCUS_LABELS.items():
+            self.combat_focus_combo.addItem(label, value)
+        self.magic_enabled_checkbox = QCheckBox(
+            "The player character can cast spells at the start"
+        )
+        self.magic_no_world_checkbox = QCheckBox("This world does not contain magic")
+        self.magic_casting_mode_combo = _NoWheelComboBox()
+        for value, label in MAGIC_CASTING_MODE_LABELS.items():
+            self.magic_casting_mode_combo.addItem(label, value)
+        self.magic_tradition_input = QLineEdit()
+        self.magic_mana_input = QSpinBox()
+        self.magic_mana_input.setRange(1, 9999)
+        self.magic_starting_spells_mode_combo = _NoWheelComboBox()
+        self.magic_starting_spells_mode_combo.addItem("Basic", "basic")
+        self.magic_starting_spells_mode_combo.addItem("Advanced", "advanced")
+        self.magic_spell_requests_input = QTextEdit()
+        self.magic_spell_requests_input.setPlaceholderText(
+            "One plain-language starting spell idea per line"
+        )
+        self.magic_spells_input = QTextEdit()
+        self.magic_spells_input.setPlaceholderText(
+            "Advanced spell names/details, one per line"
+        )
         self.currency_table = _AppTableWidget(0, 4)
         self.currency_table.setHorizontalHeaderLabels(["Name", "Plural Name", "Base Value", "Remove"])
         _configure_inline_table(
@@ -1768,10 +1834,44 @@ class NewGameTemplateManagerDialog(QDialog):
             lambda: self._append_economy_example_row({})
         )
         self._legacy_currency_description = ""
+        self.starting_wealth_mode_combo = _NoWheelComboBox()
+        self.starting_wealth_mode_combo.addItem("Basic (A.I. decides amount)", "basic")
+        self.starting_wealth_mode_combo.addItem("Advanced (exact amounts)", "advanced")
+        self.starting_wealth_mode_combo.currentIndexChanged.connect(
+            lambda _index: self._sync_template_wealth_controls()
+        )
+        self.starting_wealth_guidance_input = QLineEdit()
+        self.starting_wealth_guidance_input.setPlaceholderText(
+            "Optional guidance for starting wealth"
+        )
+        self.starting_wealth_amounts_input = QLineEdit()
+        self.starting_wealth_amounts_input.setPlaceholderText(
+            "Advanced amounts, e.g. Gold=10, Silver=25"
+        )
         self.calendar_type_combo = _NoWheelComboBox()
         self.calendar_type_combo.addItem("Gregorian-style calendar", "gregorian")
         self.calendar_type_combo.addItem("AI-generated calendar", "ai_generated")
         self.calendar_type_combo.addItem("Keep/custom calendar", "custom")
+        self.calendar_generation_guidance_input = QTextEdit()
+        self.calendar_generation_guidance_input.setPlaceholderText(
+            "Optional guidance for an A.I.-generated calendar"
+        )
+        self.calendar_start_season_input = QLineEdit()
+        self.calendar_start_year_input = QSpinBox()
+        self.calendar_start_year_input.setRange(0, 9999)
+        self.calendar_start_month_input = QSpinBox()
+        self.calendar_start_month_input.setRange(0, 24)
+        self.calendar_start_day_input = QSpinBox()
+        self.calendar_start_day_input.setRange(0, 366)
+        self.calendar_start_weather_input = QLineEdit()
+        self.calendar_start_time_input = QTimeEdit()
+        self.calendar_start_time_checkbox = QCheckBox("Specify an exact starting time")
+        self.calendar_start_time_checkbox.toggled.connect(
+            lambda _checked: self._sync_template_calendar_controls()
+        )
+        self.calendar_type_combo.currentIndexChanged.connect(
+            lambda _index: self._sync_template_calendar_controls()
+        )
 
         self.starting_task_mode_combo = _NoWheelComboBox()
         self.starting_task_mode_combo.addItem("No starting quest", "none")
@@ -1779,6 +1879,10 @@ class NewGameTemplateManagerDialog(QDialog):
         self.starting_task_mode_combo.addItem("Use a custom starting quest", "custom")
         self.starting_task_mode_combo.currentIndexChanged.connect(
             lambda _index: self._sync_template_starting_task_controls()
+        )
+        self.starting_task_guidance_input = QTextEdit()
+        self.starting_task_guidance_input.setPlaceholderText(
+            "Optional guidance for the A.I. when creating the starting quest..."
         )
         self.starting_task_name_input = QLineEdit()
         self.starting_task_description_input = QTextEdit()
@@ -1857,7 +1961,10 @@ class NewGameTemplateManagerDialog(QDialog):
         tabs.addTab(_scrollable_widget(self._build_starting_task_tab()), "Starting Quest")
         tabs.addTab(_scrollable_widget(self._build_locations_tab()), "Locations")
         tabs.addTab(_scrollable_widget(self._build_npcs_tab()), "NPCs")
+        tabs.addTab(_scrollable_widget(self._build_party_tab()), "Party")
         tabs.addTab(_scrollable_widget(self._build_world_tab()), "Inventory & World")
+        tabs.addTab(_scrollable_widget(self._build_magic_tab()), "Magic")
+        tabs.addTab(_scrollable_widget(self._build_combat_tab()), "Combat")
         tabs.addTab(_scrollable_widget(self._build_audio_tab()), "Audio")
 
         close_button = QPushButton("Close")
@@ -1953,6 +2060,10 @@ class NewGameTemplateManagerDialog(QDialog):
         form = QFormLayout()
         form.addRow("Starting Quest:", self.starting_task_mode_combo)
         layout.addLayout(form)
+        self.starting_task_guidance_group = QGroupBox("Optional A.I. Quest Nudge")
+        guidance_layout = QVBoxLayout(self.starting_task_guidance_group)
+        guidance_layout.addWidget(self.starting_task_guidance_input)
+        layout.addWidget(self.starting_task_guidance_group)
         layout.addWidget(self.starting_task_custom_group)
         layout.addStretch()
         tab = QWidget()
@@ -2076,6 +2187,55 @@ class NewGameTemplateManagerDialog(QDialog):
         tab.setLayout(layout)
         return tab
 
+    def _build_party_tab(self) -> QWidget:
+        """Builds the starting-party identity editor."""
+
+        form = QFormLayout()
+        self.starting_party_ids_input = QLineEdit()
+        self.starting_party_ids_input.setPlaceholderText(
+            "Comma-separated NPC IDs from the NPCs tab"
+        )
+        form.addRow("Starting Party NPC IDs:", self.starting_party_ids_input)
+        note = QLabel(
+            "Party members reuse the exact NPC IDs defined on the NPCs tab."
+        )
+        note.setWordWrap(True)
+        form.addRow("", note)
+        tab = QWidget()
+        tab.setLayout(form)
+        return tab
+
+    def _build_magic_tab(self) -> QWidget:
+        """Builds the template's world-magic and starting-casting controls."""
+
+        form = QFormLayout()
+        form.addRow("World Magic:", self.magic_no_world_checkbox)
+        form.addRow("Player Can Cast:", self.magic_enabled_checkbox)
+        form.addRow("Casting Model:", self.magic_casting_mode_combo)
+        form.addRow("Tradition / Style:", self.magic_tradition_input)
+        form.addRow("Maximum Mana:", self.magic_mana_input)
+        form.addRow("Starting Spells:", self.magic_starting_spells_mode_combo)
+        form.addRow("Spell Ideas:", self.magic_spell_requests_input)
+        form.addRow("Exact Spells:", self.magic_spells_input)
+        tab = QWidget()
+        tab.setLayout(form)
+        return tab
+
+    def _build_combat_tab(self) -> QWidget:
+        """Builds combat focus and resolution preferences."""
+
+        form = QFormLayout()
+        form.addRow("Combat Focus:", self.combat_focus_combo)
+        form.addRow("Combat Resolution:", self.combat_resolution_mode_combo)
+        note = QLabel(
+            "Narrative / Gemini-managed combat hides deterministic weapon and armor editors."
+        )
+        note.setWordWrap(True)
+        form.addRow("", note)
+        tab = QWidget()
+        tab.setLayout(form)
+        return tab
+
     def _handle_template_no_starting_npcs_toggled(self, checked: bool) -> None:
         """Clears and disables template NPC rows when none are requested."""
 
@@ -2094,31 +2254,142 @@ class NewGameTemplateManagerDialog(QDialog):
         self.starting_npcs_table.setEnabled(allow_npcs)
         self.add_npc_button.setEnabled(allow_npcs)
 
+    def _sync_template_inventory_controls(self, _value: Any = None) -> None:
+        """Keeps Basic/Advanced and narrative-combat item sections aligned."""
+
+        advanced = self.starter_inventory_mode_combo.currentData() == "advanced"
+        narrative = self.combat_resolution_mode_combo.currentData() == "narrative"
+        for widget in (
+            self.starter_items_table,
+            self.starter_items_controls,
+        ):
+            if hasattr(self, "starter_items_controls"):
+                widget.setVisible(advanced)
+        for widget in (
+            self.starter_weapons_table,
+            self.starter_weapons_controls,
+            self.starter_weapon_suggestions_table,
+            self.add_weapon_suggestion_button,
+            self.starter_armor_table,
+            self.starter_armor_controls,
+            self.starter_armor_suggestions_table,
+            self.add_armor_suggestion_button,
+        ):
+            if hasattr(widget, "setVisible"):
+                widget.setVisible(advanced and not narrative)
+
+    def _sync_template_calendar_controls(self, _value: Any = None) -> None:
+        """Shows calendar-generation guidance only for AI-generated calendars."""
+
+        ai_generated = self.calendar_type_combo.currentData() == "ai_generated"
+        self.calendar_generation_guidance_input.setVisible(ai_generated)
+        self.calendar_start_time_input.setVisible(self.calendar_start_time_checkbox.isChecked())
+
+    def _sync_template_wealth_controls(self, _value: Any = None) -> None:
+        """Shows guidance for Basic wealth and exact amounts for Advanced wealth."""
+
+        advanced = self.starting_wealth_mode_combo.currentData() == "advanced"
+        self.starting_wealth_guidance_input.setVisible(not advanced)
+        self.starting_wealth_amounts_input.setVisible(advanced)
+
+    def _load_template_combat(self, raw_combat: Any) -> None:
+        combat = raw_combat if isinstance(raw_combat, dict) else {}
+        _set_combo_to_data(self.combat_focus_combo, combat.get("focus", "balanced"))
+        _set_combo_to_data(
+            self.combat_resolution_mode_combo,
+            combat.get("resolution_mode", "strict"),
+        )
+
+    def _load_template_magic(self, raw_magic: Any) -> None:
+        magic = raw_magic if isinstance(raw_magic, dict) else {}
+        self.magic_no_world_checkbox.setChecked(
+            not bool(magic.get("world_contains_magic", True))
+        )
+        self.magic_enabled_checkbox.setChecked(
+            bool(magic.get("player_magic_enabled", magic.get("enabled", False)))
+        )
+        _set_combo_to_data(
+            self.magic_casting_mode_combo,
+            magic.get("casting_mode", "narrative"),
+        )
+        self.magic_tradition_input.setText(str(magic.get("tradition", "") or ""))
+        self.magic_mana_input.setValue(max(1, _safe_int(magic.get("mana_maximum"), 10)))
+        _set_combo_to_data(
+            self.magic_starting_spells_mode_combo,
+            magic.get("starting_spells_mode", "basic"),
+        )
+        self.magic_spell_requests_input.setPlainText(
+            "\n".join(
+                str(request.get("description", request.get("name", "")) or "")
+                for request in magic.get("starting_spell_requests", [])
+                if isinstance(request, dict)
+            )
+        )
+        self.magic_spells_input.setPlainText(
+            "\n".join(
+                str(spell.get("name", "") or "")
+                for spell in magic.get("starting_spells", [])
+                if isinstance(spell, dict)
+            )
+        )
+
+    def _load_template_wealth(self, raw_wealth: Any) -> None:
+        wealth = raw_wealth if isinstance(raw_wealth, dict) else {}
+        _set_combo_to_data(self.starting_wealth_mode_combo, wealth.get("mode", "basic"))
+        self.starting_wealth_guidance_input.setText(
+            str(wealth.get("guidance", "") or "")
+        )
+        self.starting_wealth_amounts_input.setText(
+            ", ".join(
+                f"{amount.get('denomination_name', '')}={amount.get('quantity', 0)}"
+                for amount in wealth.get("amounts", [])
+                if isinstance(amount, dict)
+            )
+        )
+
     def _build_world_tab(self) -> QWidget:
         """Builds the world, items, economy, and calendar template tab."""
 
         form = QFormLayout()
         form.addRow("World Details:", self.world_context_input)
+        form.addRow("Starter Equipment Detail:", self.starter_inventory_mode_combo)
         form.addRow("Starter Items:", self.starter_items_table)
-        form.addRow("", _button_row(self.add_starter_item_button))
+        self.starter_items_controls = _button_row(self.add_starter_item_button)
+        form.addRow("", self.starter_items_controls)
         form.addRow("Item Suggestions:", self.starter_item_suggestions_table)
         form.addRow("", _button_row(self.add_item_suggestion_button))
         form.addRow("Starter Weapons:", self.starter_weapons_table)
-        form.addRow("", _button_row(self.add_starter_weapon_button))
+        self.starter_weapons_controls = _button_row(self.add_starter_weapon_button)
+        form.addRow("", self.starter_weapons_controls)
         form.addRow("Weapon Suggestions:", self.starter_weapon_suggestions_table)
         form.addRow("", _button_row(self.add_weapon_suggestion_button))
         form.addRow("Starter Armor:", self.starter_armor_table)
-        form.addRow("", _button_row(self.add_starter_armor_button))
+        self.starter_armor_controls = _button_row(self.add_starter_armor_button)
+        form.addRow("", self.starter_armor_controls)
         form.addRow("Armor Suggestions:", self.starter_armor_suggestions_table)
         form.addRow("", _button_row(self.add_armor_suggestion_button))
         form.addRow("Currencies:", self.currency_table)
         form.addRow("", _button_row(self.add_currency_button))
         form.addRow("Economy Notes:", self.economy_examples_table)
         form.addRow("", _button_row(self.add_economy_example_button))
+        form.addRow("Starting Wealth:", self.starting_wealth_mode_combo)
+        form.addRow("Wealth Guidance:", self.starting_wealth_guidance_input)
+        form.addRow("Exact Wealth:", self.starting_wealth_amounts_input)
         form.addRow("Calendar:", self.calendar_type_combo)
+        form.addRow("Calendar Guidance:", self.calendar_generation_guidance_input)
+        form.addRow("Starting Season:", self.calendar_start_season_input)
+        form.addRow("Starting Year:", self.calendar_start_year_input)
+        form.addRow("Starting Month:", self.calendar_start_month_input)
+        form.addRow("Starting Day:", self.calendar_start_day_input)
+        form.addRow("Starting Time:", self.calendar_start_time_checkbox)
+        form.addRow("Exact Time:", self.calendar_start_time_input)
+        form.addRow("Starting Weather:", self.calendar_start_weather_input)
 
         tab = QWidget()
         tab.setLayout(form)
+        self._sync_template_inventory_controls()
+        self._sync_template_wealth_controls()
+        self._sync_template_calendar_controls()
         return tab
 
     def _refresh_templates(self, *, selected_name: str | None = None) -> None:
@@ -2178,21 +2449,29 @@ class NewGameTemplateManagerDialog(QDialog):
             self,
             settings={
                 **self._new_game_ai_settings,
+                "image_model": self.active_setup.get("images", {}).get(
+                    "model", DEFAULT_IMAGE_MODEL
+                ) if isinstance(self.active_setup.get("images"), dict) else DEFAULT_IMAGE_MODEL,
                 "narration_tense": self.narration_tense_combo.currentData(),
                 "narration_style": self.narration_style_combo.currentData(),
             },
+            include_model_choices=True,
         )
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         settings = dialog.build_ai_settings()
-        current_text_model = normalize_text_model(
-            self._new_game_ai_settings.get("text_model")
-        )
         self._new_game_ai_settings = {
             key: value for key, value in settings.items()
-            if key not in {"narration_tense", "narration_style"}
+            if key not in {"narration_tense", "narration_style", "image_model"}
         }
-        self._new_game_ai_settings["text_model"] = current_text_model
+        self.active_setup["images"] = {
+            **(
+                self.active_setup.get("images", {})
+                if isinstance(self.active_setup.get("images"), dict)
+                else {}
+            ),
+            "model": normalize_image_model(settings.get("image_model")),
+        }
         _set_combo_to_data(self.narration_tense_combo, settings["narration_tense"])
         _set_combo_to_data(self.narration_style_combo, settings["narration_style"])
         self._refresh_template_ai_settings_summary()
@@ -2368,6 +2647,16 @@ class NewGameTemplateManagerDialog(QDialog):
             _set_combo_to_data(self.narration_style_combo, narration["style"])
             self.game_style_input.setPlainText(str(setup.get("game_style", "") or ""))
             self.world_context_input.setPlainText(str(setup.get("world_context", "") or ""))
+            self.starting_party_ids_input.setText(
+                ", ".join(
+                    str(value).strip()
+                    for value in setup.get("starting_party_npc_ids", [])
+                    if str(value).strip()
+                )
+            )
+            self._load_template_combat(setup.get("combat", {}))
+            self._load_template_magic(setup.get("magic", {}))
+            self._load_template_wealth(setup.get("starting_wealth", {}))
 
             locations = self._starting_locations_for_editor(
                 setup.get("starting_locations", [])
@@ -2498,6 +2787,23 @@ class NewGameTemplateManagerDialog(QDialog):
                 self.calendar_type_combo,
                 self._template_calendar_type(setup.get("calendar", {})),
             )
+            calendar = setup.get("calendar", {}) if isinstance(setup.get("calendar"), dict) else {}
+            self.calendar_generation_guidance_input.setPlainText(
+                str(calendar.get("generation_guidance", "") or "")
+            )
+            starting_calendar = setup.get("starting_calendar", {}) if isinstance(setup.get("starting_calendar"), dict) else {}
+            self.calendar_start_season_input.setText(str(starting_calendar.get("season_name", "") or ""))
+            self.calendar_start_year_input.setValue(max(0, _safe_int(starting_calendar.get("year"), 0)))
+            self.calendar_start_month_input.setValue(max(0, _safe_int(starting_calendar.get("month_number"), 0)))
+            self.calendar_start_day_input.setValue(max(0, _safe_int(starting_calendar.get("day_of_month"), 0)))
+            self.calendar_start_weather_input.setText(str(setup.get("starting_weather", "") or ""))
+            raw_minutes = _safe_int(starting_calendar.get("time_of_day_minutes"), -1)
+            self.calendar_start_time_checkbox.setChecked(raw_minutes >= 0)
+            if raw_minutes >= 0:
+                self.calendar_start_time_input.setTime(
+                    QTime(raw_minutes // 60 % 24, raw_minutes % 60)
+                )
+            self._sync_template_calendar_controls()
             self._load_template_starting_task(
                 setup.get("starting_task", setup.get("starting_quest", {}))
             )
@@ -2548,6 +2854,8 @@ class NewGameTemplateManagerDialog(QDialog):
             self._new_game_ai_settings["additional_context"] = str(
                 ai_settings.get("additional_context", "") or ""
             )
+            images = setup.get("images", {}) if isinstance(setup.get("images"), dict) else {}
+            self.active_setup["images"] = dict(images)
             self._refresh_template_ai_settings_summary()
         finally:
             self._loading_template_setup = False
@@ -2639,6 +2947,11 @@ class NewGameTemplateManagerDialog(QDialog):
         selected_start_location = self._selected_starting_location_for_setup()
         setup["starting_locations"] = self._starting_locations_from_table()
         setup["starting_npcs"] = self._starting_npcs_from_table()
+        setup["starting_party_npc_ids"] = [
+            value.strip()
+            for value in self.starting_party_ids_input.text().split(",")
+            if value.strip()
+        ]
         setup["no_starting_npcs"] = self.no_starting_npcs_checkbox.isChecked()
         setup["start_location"] = (
             selected_start_location.get("name") or self.start_location_input.text().strip()
@@ -2682,6 +2995,9 @@ class NewGameTemplateManagerDialog(QDialog):
                 self.starter_armor_suggestions_table, "Armor"
             ),
         ]
+        setup["starter_inventory_mode"] = str(
+            self.starter_inventory_mode_combo.currentData() or "basic"
+        )
         setup["currency_denominations"] = self._currency_denominations_from_table()
         setup["economy_examples"] = self._economy_examples_from_table()
         setup["currency_description"] = (
@@ -2692,7 +3008,11 @@ class NewGameTemplateManagerDialog(QDialog):
         calendar_type = str(self.calendar_type_combo.currentData() or "gregorian")
 
         if calendar_type == "ai_generated":
-            setup["calendar"] = {"calendar_type": "ai_generated", "ai_generated": True}
+            setup["calendar"] = {
+                "calendar_type": "ai_generated",
+                "ai_generated": True,
+                "generation_guidance": self.calendar_generation_guidance_input.toPlainText().strip(),
+            }
         elif calendar_type == "gregorian":
             setup["calendar"] = {"calendar_type": "gregorian", "ai_generated": False}
         else:
@@ -2702,6 +3022,64 @@ class NewGameTemplateManagerDialog(QDialog):
             setup["calendar"] = {**existing_calendar, "calendar_type": "custom"}
 
         setup["starting_task"] = self._template_starting_task_from_controls()
+        setup["starting_weather"] = self.calendar_start_weather_input.text().strip()
+        setup["combat"] = {
+            "focus": self.combat_focus_combo.currentData() or "balanced",
+            "resolution_mode": self.combat_resolution_mode_combo.currentData() or "strict",
+        }
+        setup["magic"] = {
+            "world_contains_magic": not self.magic_no_world_checkbox.isChecked(),
+            "player_magic_enabled": self.magic_enabled_checkbox.isChecked(),
+            "enabled": self.magic_enabled_checkbox.isChecked(),
+            "casting_mode": self.magic_casting_mode_combo.currentData() or "narrative",
+            "tradition": self.magic_tradition_input.text().strip(),
+            "mana_maximum": self.magic_mana_input.value(),
+            "starting_spells_mode": self.magic_starting_spells_mode_combo.currentData() or "basic",
+            "starting_spell_requests": [
+                {"description": line.strip()}
+                for line in self.magic_spell_requests_input.toPlainText().splitlines()
+                if line.strip()
+            ],
+            "starting_spells": [
+                {"name": line.strip()}
+                for line in self.magic_spells_input.toPlainText().splitlines()
+                if line.strip()
+            ],
+        }
+        amounts: list[dict[str, Any]] = []
+        for part in self.starting_wealth_amounts_input.text().split(","):
+            if "=" not in part:
+                continue
+            name, quantity = part.split("=", 1)
+            clean_quantity = _safe_int(quantity.strip(), 0)
+            if name.strip() and clean_quantity > 0:
+                amounts.append(
+                    {
+                        "denomination_name": name.strip(),
+                        "quantity": clean_quantity,
+                    }
+                )
+        setup["starting_wealth"] = {
+            "mode": self.starting_wealth_mode_combo.currentData() or "basic",
+            "guidance": self.starting_wealth_guidance_input.text().strip(),
+            "amounts": amounts,
+        }
+        setup["starting_calendar"] = {
+            key: value
+            for key, value in {
+                "season_name": self.calendar_start_season_input.text().strip(),
+                "year": self.calendar_start_year_input.value(),
+                "month_number": self.calendar_start_month_input.value(),
+                "day_of_month": self.calendar_start_day_input.value(),
+                "time_of_day_minutes": (
+                    self.calendar_start_time_input.time().hour() * 60
+                    + self.calendar_start_time_input.time().minute()
+                    if self.calendar_start_time_checkbox.isChecked()
+                    else -1
+                ),
+            }.items()
+            if value not in {"", 0, -1}
+        }
         existing_audio = (
             setup.get("audio", {}) if isinstance(setup.get("audio"), dict) else {}
         )
@@ -2854,13 +3232,19 @@ class NewGameTemplateManagerDialog(QDialog):
         return skills
 
     def _sync_template_starting_task_controls(self) -> None:
+        self.starting_task_guidance_group.setVisible(
+            self.starting_task_mode_combo.currentData() == "ai"
+        )
         self.starting_task_custom_group.setVisible(
             self.starting_task_mode_combo.currentData() == "custom"
         )
 
     def _template_starting_task_from_controls(self) -> dict[str, Any]:
         mode = str(self.starting_task_mode_combo.currentData() or "none")
-        task: dict[str, Any] = {"mode": mode}
+        task: dict[str, Any] = {
+            "mode": mode,
+            "guidance": self.starting_task_guidance_input.toPlainText().strip(),
+        }
         if mode == "custom":
             task["task"] = {
                 "name": self.starting_task_name_input.text().strip(),
@@ -2876,6 +3260,9 @@ class NewGameTemplateManagerDialog(QDialog):
         task_setup = starting_task if isinstance(starting_task, dict) else {}
         mode = str(task_setup.get("mode", "none") or "none")
         _set_combo_to_data(self.starting_task_mode_combo, mode)
+        self.starting_task_guidance_input.setPlainText(
+            str(task_setup.get("guidance", "") or "")
+        )
         task = task_setup.get("task", {}) if isinstance(task_setup.get("task"), dict) else {}
         self.starting_task_name_input.setText(str(task.get("name", "") or ""))
         self.starting_task_description_input.setPlainText(str(task.get("description", "") or ""))
