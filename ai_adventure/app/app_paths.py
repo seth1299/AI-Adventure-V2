@@ -212,7 +212,7 @@ class AppPaths:
         sounds_dir = app_data_dir / "sounds"
         images_dir = app_data_dir / "images"
         tts_output_dir = app_data_dir / "tts_cache"
-        log_file = logs_dir / "ai_adventure.log"
+        log_file = logs_dir / "ai_adventure.json"
 
         saves_dir.mkdir(parents=True, exist_ok=True)
         logs_dir.mkdir(parents=True, exist_ok=True)
