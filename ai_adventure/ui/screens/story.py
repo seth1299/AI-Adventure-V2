@@ -511,11 +511,16 @@ class StoryScreen(RepositoryBackedWidget):
         )
         header = QLabel(f"{speaker}  |  {mode_label}{turn_label}")
         header.setStyleSheet("font-size: 11px; font-weight: 700;")
+        narration_enabled = self.narration_player is not None and (
+            repository is None
+            or bool(repository.get_setting("audio.narrator_enabled", True))
+        )
         read_aloud_button = QPushButton("Read Aloud")
-        read_aloud_button.setEnabled(self.narration_player is not None)
+        read_aloud_button.setVisible(narration_enabled)
+        read_aloud_button.setEnabled(narration_enabled)
         read_aloud_button.setToolTip(
             "Play this bubble with its saved narrator or character voice. No AI request is sent."
-            if self.narration_player is not None
+            if narration_enabled
             else "Local narrator playback is unavailable in this build."
         )
         read_aloud_button.setStyleSheet(
@@ -539,7 +544,12 @@ class StoryScreen(RepositoryBackedWidget):
         header_row.setContentsMargins(0, 0, 0, 0)
         header_row.addWidget(header)
         header_row.addStretch()
-        header_row.addWidget(read_aloud_button)
+        if narration_enabled:
+            header_row.addWidget(read_aloud_button)
+        else:
+            # Preserve the historical header geometry without exposing a dead
+            # control in builds/settings where narration is unavailable.
+            header_row.addSpacing(82)
         hide_button = QPushButton("Hide")
         hide_button.setToolTip(
             "Remove this message from the Conversation tab without deleting it from history."

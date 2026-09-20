@@ -7,8 +7,9 @@ from unittest.mock import Mock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+from PySide6.QtCore import Qt
 from PySide6.QtGui import QFont, QPalette
-from PySide6.QtWidgets import QApplication, QDialog, QMessageBox, QFileDialog
+from PySide6.QtWidgets import QApplication, QDialog, QMessageBox, QFileDialog, QFrame
 
 from ai_adventure.app.user_settings import (
     DEFAULT_UI_FONT_SIZE,
@@ -72,6 +73,16 @@ class UiAppearanceTests(unittest.TestCase):
         self.assertEqual(settings["appearance"], {"font_family": "", "font_size": 16})
         dialog.deleteLater()
 
+    def test_font_family_choices_use_their_own_font_faces(self) -> None:
+        dialog = MainMenuSettingsDialog(settings={}, tts_enabled=False)
+        for index in range(dialog.font_family_combo.count()):
+            family = str(dialog.font_family_combo.itemData(index) or "").strip()
+            item_font = dialog.font_family_combo.itemData(index, Qt.ItemDataRole.FontRole)
+            self.assertIsNotNone(item_font)
+            if family:
+                self.assertEqual(item_font.family(), family)
+        dialog.close()
+
     def test_settings_dialog_hides_and_restores_audio_volume_rows(self) -> None:
         dialog = MainMenuSettingsDialog(
             settings={},
@@ -100,6 +111,55 @@ class UiAppearanceTests(unittest.TestCase):
             dialog._audio_form.isRowVisible(dialog.background_ambience_volume_control)
         )
         dialog.close()
+
+    def test_in_game_settings_hides_audio_children_with_parent_toggles(self) -> None:
+        from ai_adventure.ui.screens.settings import SettingsScreen
+
+        screen = SettingsScreen(music_enabled=True, tts_enabled=False)
+        self.assertTrue(screen._settings_form.isRowVisible(screen.music_track_control))
+        screen.music_enabled_checkbox.setChecked(False)
+        self.assertFalse(screen._settings_form.isRowVisible(screen.music_track_control))
+        self.assertFalse(screen._settings_form.isRowVisible(screen.music_volume_control))
+        screen.music_enabled_checkbox.setChecked(True)
+        self.assertTrue(screen._settings_form.isRowVisible(screen.music_track_control))
+        screen.sound_effects_enabled_checkbox.setChecked(False)
+        self.assertFalse(screen._settings_form.isRowVisible(screen.sound_effects_library_control))
+        screen.background_ambience_enabled_checkbox.setChecked(False)
+        self.assertFalse(screen._settings_form.isRowVisible(screen.background_ambience_track_control))
+        screen.deleteLater()
+
+    def test_in_game_settings_hides_image_children_and_exposes_model_combo(self) -> None:
+        from ai_adventure.ui.screens.settings import SettingsScreen
+
+        screen = SettingsScreen(music_enabled=False, tts_enabled=False)
+        self.assertIsNotNone(screen.generated_image_model_combo)
+        self.assertGreater(screen.generated_image_model_combo.count(), 0)
+        self.assertTrue(
+            screen._settings_form.isRowVisible(screen.generated_image_model_control)
+        )
+        screen.generated_images_enabled_checkbox.setChecked(False)
+        self.assertFalse(
+            screen._settings_form.isRowVisible(screen.generated_image_model_control)
+        )
+        self.assertFalse(
+            screen._settings_form.isRowVisible(screen.maximum_generated_images_control)
+        )
+        self.assertFalse(
+            screen._settings_form.isRowVisible(screen.failed_images_control)
+        )
+        screen.generated_images_enabled_checkbox.setChecked(True)
+        self.assertTrue(
+            screen._settings_form.isRowVisible(screen.generated_image_model_control)
+        )
+        screen.deleteLater()
+
+    def test_in_game_settings_separates_parent_sections_only(self) -> None:
+        from ai_adventure.ui.screens.settings import SettingsScreen
+
+        screen = SettingsScreen(music_enabled=True, tts_enabled=False)
+        separators = screen.findChildren(QFrame, "settingsSectionSeparator")
+        self.assertEqual(len(separators), 4)
+        screen.deleteLater()
 
     def test_settings_dialog_exposes_shared_audio_upload_buttons(self) -> None:
         imported: list[tuple[Path, str]] = []

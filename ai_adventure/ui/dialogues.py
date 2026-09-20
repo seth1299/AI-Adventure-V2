@@ -1216,11 +1216,15 @@ class MainMenuSettingsDialog(QDialog):
         self.font_size_spin.setRange(MIN_UI_FONT_SIZE, MAX_UI_FONT_SIZE)
         self.font_size_spin.setValue(int(appearance["font_size"]))
         self.font_size_spin.setSuffix(" pt")
+        self._apply_font_family_item_fonts()
         self.font_family_combo.currentIndexChanged.connect(
             lambda _index: self._preview_appearance()
         )
         self.font_size_spin.valueChanged.connect(
             lambda _value: self._preview_appearance()
+        )
+        self.font_size_spin.valueChanged.connect(
+            lambda _value: self._apply_font_family_item_fonts()
         )
 
         self.music_enabled_checkbox = QCheckBox("Music enabled")
@@ -1467,6 +1471,17 @@ class MainMenuSettingsDialog(QDialog):
             return normalize_tts_audio_fields({}, tts_enabled=False)
 
         return self.tts_settings_widget.build_audio_settings()
+
+    def _apply_font_family_item_fonts(self) -> None:
+        """Renders each font-family choice using that family, like Word."""
+
+        point_size = max(1, int(self.font_size_spin.value()))
+        default_family = QApplication.font().family()
+        for index in range(self.font_family_combo.count()):
+            family = str(self.font_family_combo.itemData(index) or "").strip()
+            font = QFont(family or default_family)
+            font.setPointSize(point_size)
+            self.font_family_combo.setItemData(index, font, Qt.ItemDataRole.FontRole)
 
     def _preview_appearance(self) -> None:
         """Applies the selected font immediately while this dialog is open."""

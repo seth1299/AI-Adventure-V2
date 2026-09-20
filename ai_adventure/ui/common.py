@@ -27,6 +27,7 @@ from PySide6.QtCore import (
 )
 from PySide6.QtGui import (
     QColor,
+    QFont,
     QFontDatabase,
     QIcon,
     QMouseEvent,
@@ -477,6 +478,7 @@ __all__ = [
     "QDialogButtonBox",
     "QEvent",
     "QFontDatabase",
+    "QFont",
     "QFormLayout",
     "QFrame",
     "QGridLayout",

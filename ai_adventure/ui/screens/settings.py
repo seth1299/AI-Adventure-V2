@@ -6,6 +6,16 @@ from ai_adventure.ui.common import *  # noqa: F401,F403
 from ai_adventure.ui.dialogues import *  # noqa: F401,F403
 
 
+def _add_settings_section_separator(form: QFormLayout) -> None:
+    """Adds a subtle horizontal rule between major settings sections."""
+
+    separator = QFrame()
+    separator.setFrameShape(QFrame.Shape.HLine)
+    separator.setFrameShadow(QFrame.Shadow.Sunken)
+    separator.setObjectName("settingsSectionSeparator")
+    form.addRow("", separator)
+
+
 class SettingsScreen(RepositoryBackedWidget):
     """Basic save-specific settings screen."""
 
@@ -70,6 +80,9 @@ class SettingsScreen(RepositoryBackedWidget):
             "uploads remain available."
         )
         self.generated_images_enabled_checkbox.toggled.connect(
+            self._sync_image_control_visibility
+        )
+        self.generated_images_enabled_checkbox.toggled.connect(
             lambda _checked: self._save_settings()
         )
         self.maximum_generated_images_input = QSpinBox()
@@ -82,9 +95,12 @@ class SettingsScreen(RepositoryBackedWidget):
         self.maximum_generated_images_input.valueChanged.connect(
             lambda _value: self._save_settings()
         )
-        self.generated_image_model_label = QLabel(DEFAULT_IMAGE_MODEL)
-        self.generated_image_model_label.setTextInteractionFlags(
-            Qt.TextInteractionFlag.TextSelectableByMouse
+        self.generated_image_model_combo = QComboBox()
+        AISettingsDialog._add_mode_options(
+            self.generated_image_model_combo, IMAGE_MODEL_OPTIONS
+        )
+        self.generated_image_model_combo.currentIndexChanged.connect(
+            lambda _index: self._save_settings()
         )
         self.retry_failed_images_button = QPushButton("Retry Failed Images")
         self.retry_failed_images_button.setToolTip(
@@ -94,6 +110,7 @@ class SettingsScreen(RepositoryBackedWidget):
 
         self.music_enabled_checkbox = QCheckBox("Music enabled")
         self.music_enabled_checkbox.setChecked(True)
+        self.music_enabled_checkbox.toggled.connect(self._sync_audio_control_visibility)
         self.music_enabled_checkbox.toggled.connect(lambda _checked: self._save_settings())
 
         self.music_track_combo = QComboBox()
@@ -121,6 +138,7 @@ class SettingsScreen(RepositoryBackedWidget):
 
         self.sound_effects_enabled_checkbox = QCheckBox("Sound effects enabled")
         self.sound_effects_enabled_checkbox.setChecked(True)
+        self.sound_effects_enabled_checkbox.toggled.connect(self._sync_audio_control_visibility)
         self.sound_effects_enabled_checkbox.toggled.connect(
             lambda _checked: self._save_settings()
         )
@@ -143,6 +161,7 @@ class SettingsScreen(RepositoryBackedWidget):
             "Background ambience enabled"
         )
         self.background_ambience_enabled_checkbox.setChecked(True)
+        self.background_ambience_enabled_checkbox.toggled.connect(self._sync_audio_control_visibility)
         self.background_ambience_enabled_checkbox.toggled.connect(
             lambda _checked: self._save_settings()
         )
@@ -201,69 +220,78 @@ class SettingsScreen(RepositoryBackedWidget):
         self.add_settings_currency_button.clicked.connect(self._add_settings_currency_row)
 
         layout = QFormLayout()
+        self._settings_form = layout
         layout.addRow("Theme Preference:", self.theme_combo)
         if self.ai_enabled:
+            _add_settings_section_separator(layout)
             layout.addRow("Artificial Intelligence:", self.ai_settings_button)
         if self.ai_enabled and not self.playtesting_tools:
+            _add_settings_section_separator(layout)
             layout.addRow("Generated Images:", self.generated_images_enabled_checkbox)
-            layout.addRow("Image Model:", self.generated_image_model_label)
-            layout.addRow("Generation Limit:", self.maximum_generated_images_input)
-            layout.addRow("Failed Images:", self.retry_failed_images_button)
+            self.generated_image_model_control = self.generated_image_model_combo
+            self.maximum_generated_images_control = self.maximum_generated_images_input
+            self.failed_images_control = self.retry_failed_images_button
+            layout.addRow("Image Model:", self.generated_image_model_control)
+            layout.addRow("Generation Limit:", self.maximum_generated_images_control)
+            layout.addRow("Failed Images:", self.failed_images_control)
         if self.music_feature_enabled:
+            _add_settings_section_separator(layout)
             layout.addRow("Background Music:", self.music_enabled_checkbox)
-            layout.addRow(
-                "Music Track:",
-                _button_row(self.music_track_combo, self.music_upload_button),
+            self.music_track_control = _button_row(
+                self.music_track_combo, self.music_upload_button
+            )
+            layout.addRow("Music Track:", self.music_track_control)
+            self.music_volume_control = _slider_row(
+                self.music_volume_slider, self.music_volume_label
             )
             layout.addRow(
                 "Music Volume:",
-                _slider_row(self.music_volume_slider, self.music_volume_label),
+                self.music_volume_control,
             )
+            _add_settings_section_separator(layout)
             layout.addRow("Narration Sound Effects:", self.sound_effects_enabled_checkbox)
-            layout.addRow(
-                "Sound Effects Volume:",
-                _slider_row(
-                    self.sound_effects_volume_slider,
-                    self.sound_effects_volume_label,
-                ),
+            self.sound_effects_volume_control = _slider_row(
+                self.sound_effects_volume_slider, self.sound_effects_volume_label
             )
-            layout.addRow(
-                "Sound Effect Library:",
-                _button_row(
-                    self.sound_effects_upload_button,
-                    self.sound_effects_upload_status,
-                ),
+            layout.addRow("Sound Effects Volume:", self.sound_effects_volume_control)
+            self.sound_effects_library_control = _button_row(
+                self.sound_effects_upload_button, self.sound_effects_upload_status
             )
+            layout.addRow("Sound Effect Library:", self.sound_effects_library_control)
             layout.addRow(
                 "Background Ambience:",
                 self.background_ambience_enabled_checkbox,
             )
-            layout.addRow(
-                "Ambience Track:",
-                _button_row(
-                    self.background_ambience_track_combo,
-                    self.background_ambience_upload_button,
-                ),
+            self.background_ambience_track_control = _button_row(
+                self.background_ambience_track_combo,
+                self.background_ambience_upload_button,
+            )
+            layout.addRow("Ambience Track:", self.background_ambience_track_control)
+            self.background_ambience_volume_control = _slider_row(
+                self.background_ambience_volume_slider,
+                self.background_ambience_volume_label,
             )
             layout.addRow(
                 "Ambience Volume:",
-                _slider_row(
-                    self.background_ambience_volume_slider,
-                    self.background_ambience_volume_label,
-                ),
+                self.background_ambience_volume_control,
             )
 
         if self.tts_settings_button is not None:
+            _add_settings_section_separator(layout)
             layout.addRow("Narration Audio:", self.tts_settings_button)
 
         if self.custom_voice_button is not None:
+            _add_settings_section_separator(layout)
             layout.addRow("Custom Voices:", self.custom_voice_button)
 
         if self.playtesting_tools:
+            _add_settings_section_separator(layout)
             layout.addRow("Currencies:", self.currency_rows_widget)
             layout.addRow("", self.add_settings_currency_button)
 
         self.setLayout(layout)
+        self._sync_image_control_visibility()
+        self._sync_audio_control_visibility()
 
     def _populate_audio_track_combo(
         self,
@@ -293,6 +321,36 @@ class SettingsScreen(RepositoryBackedWidget):
             if clean_name:
                 combo.addItem(clean_name, clean_name)
         combo.setEnabled(True)
+
+    def _sync_audio_control_visibility(self, _checked: bool | None = None) -> None:
+        """Shows audio child controls only while their parent feature is enabled."""
+
+        form = getattr(self, "_settings_form", None)
+        if form is None:
+            return
+        if hasattr(self, "music_track_control"):
+            music_visible = self.music_enabled_checkbox.isChecked()
+            form.setRowVisible(self.music_track_control, music_visible)
+            form.setRowVisible(self.music_volume_control, music_visible)
+        effects_visible = self.sound_effects_enabled_checkbox.isChecked()
+        if hasattr(self, "sound_effects_volume_control"):
+            form.setRowVisible(self.sound_effects_volume_control, effects_visible)
+            form.setRowVisible(self.sound_effects_library_control, effects_visible)
+        ambience_visible = self.background_ambience_enabled_checkbox.isChecked()
+        if hasattr(self, "background_ambience_track_control"):
+            form.setRowVisible(self.background_ambience_track_control, ambience_visible)
+            form.setRowVisible(self.background_ambience_volume_control, ambience_visible)
+
+    def _sync_image_control_visibility(self, _checked: bool | None = None) -> None:
+        """Shows image-generation settings only while generation is enabled."""
+
+        form = getattr(self, "_settings_form", None)
+        if form is None or not hasattr(self, "generated_image_model_control"):
+            return
+        visible = self.generated_images_enabled_checkbox.isChecked()
+        form.setRowVisible(self.generated_image_model_control, visible)
+        form.setRowVisible(self.maximum_generated_images_control, visible)
+        form.setRowVisible(self.failed_images_control, visible)
 
     def _upload_audio_file(self, category: str) -> None:
         """Imports one user-selected audio file and refreshes its live catalog."""
@@ -621,11 +679,11 @@ class SettingsScreen(RepositoryBackedWidget):
                     10_000,
                 )
             )
-            self.generated_image_model_label.setText(
-                str(
+            _set_combo_to_data(
+                self.generated_image_model_combo,
+                normalize_image_model(
                     repository.get_setting("images.model", DEFAULT_IMAGE_MODEL)
-                    or DEFAULT_IMAGE_MODEL
-                )
+                ),
             )
             self.retry_failed_images_button.setEnabled(True)
             self._set_audio_track_combo_value(
@@ -736,6 +794,10 @@ class SettingsScreen(RepositoryBackedWidget):
             repository.set_setting(
                 "images.maximum_generated",
                 self.maximum_generated_images_input.value(),
+            )
+            repository.set_setting(
+                "images.model",
+                normalize_image_model(self.generated_image_model_combo.currentData()),
             )
             repository.set_setting("audio.music_enabled", self.music_enabled_checkbox.isChecked())
             repository.set_setting("audio.music_volume", self.music_volume_slider.value())
