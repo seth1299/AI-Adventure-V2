@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from PySide6.QtWidgets import QFileDialog
+
 from ai_adventure.ui.common import *  # noqa: F401,F403
 from ai_adventure.ui.dialogues import *  # noqa: F401,F403
 
@@ -295,9 +297,15 @@ class SettingsScreen(RepositoryBackedWidget):
     def _upload_audio_file(self, category: str) -> None:
         """Imports one user-selected audio file and refreshes its live catalog."""
 
+        LOGGER.info("Audio upload requested from Settings: category=%s.", category)
         sound_manager = self.sound_manager
         importer = getattr(sound_manager, "import_audio_file", None)
         if not callable(importer):
+            LOGGER.warning(
+                "Audio upload unavailable from Settings: category=%s manager=%r.",
+                category,
+                type(sound_manager).__name__ if sound_manager is not None else None,
+            )
             QMessageBox.warning(
                 self,
                 "Audio Unavailable",
@@ -305,19 +313,50 @@ class SettingsScreen(RepositoryBackedWidget):
             )
             return
 
-        file_path, _selected_filter = QFileDialog.getOpenFileName(
-            self,
-            "Choose Audio File",
-            "",
-            "Audio (*.mp3 *.ogg *.wav);;All Files (*)",
-        )
+        dialog = QFileDialog(self, "Choose Audio File")
+        dialog.setFileMode(QFileDialog.FileMode.ExistingFile)
+        dialog.setNameFilters(["Audio (*.mp3 *.ogg *.wav)", "All Files (*)"])
+        dialog.setOption(QFileDialog.Option.DontUseNativeDialog, True)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            LOGGER.info("Audio upload cancelled from Settings: category=%s.", category)
+            return
+        selected_files = cast(list[str], dialog.selectedFiles())
+        file_path = selected_files[0] if selected_files else ""
         if not file_path:
+            LOGGER.info(
+                "Audio upload ended without a selected file: category=%s.", category
+            )
             return
 
-        success, result = importer(Path(file_path), category)
+        try:
+            success, result = importer(Path(file_path), category)
+        except Exception as error:
+            LOGGER.exception(
+                "Audio upload crashed in Settings: category=%s file=%s.",
+                category,
+                file_path,
+            )
+            QMessageBox.warning(
+                self,
+                "Audio Import Failed",
+                f"Could not import that audio file: {error}",
+            )
+            return
         if not success:
+            LOGGER.warning(
+                "Audio upload rejected in Settings: category=%s file=%s reason=%s.",
+                category,
+                file_path,
+                result,
+            )
             QMessageBox.warning(self, "Audio Import Failed", result)
             return
+
+        LOGGER.info(
+            "Audio upload completed in Settings: category=%s imported_name=%s.",
+            category,
+            result,
+        )
 
         if category == "music":
             self.music_track_combo.blockSignals(True)

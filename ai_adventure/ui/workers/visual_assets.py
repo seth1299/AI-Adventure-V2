@@ -138,6 +138,7 @@ class _VisualAssetCoordinator(QObject):
             self.asset_status_changed.emit(request.asset_id, "failed", str(error))
             return False, f"Could not use that image: {error}"
         self.asset_status_changed.emit(request.asset_id, "ready", "")
+        self.assets_changed.emit()
         return True, ""
 
     def skip_initial_image(

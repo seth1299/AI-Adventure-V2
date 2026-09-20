@@ -538,15 +538,15 @@ class InventoryScreen(RepositoryBackedWidget):
             self._load_selected_item(selected_name)
         catalog_entry = item.get("catalog_entry")
         repository = self.repository()
+        image_subject_key = str(
+            (item.get("metadata") or {}).get("item_uuid", "")
+            if isinstance(item.get("metadata"), dict)
+            else ""
+        ).strip() or selected_name.casefold()
         image_asset = (
             repository.get_visual_asset(
                 "inventory",
-                str(
-                    (item.get("metadata") or {}).get("item_uuid", "")
-                    if isinstance(item.get("metadata"), dict)
-                    else ""
-                ).strip()
-                or selected_name.casefold(),
+                image_subject_key,
             )
             if repository is not None and selected_name
             else None
@@ -565,6 +565,12 @@ class InventoryScreen(RepositoryBackedWidget):
             item=item,
             catalog_entry=catalog_entry if isinstance(catalog_entry, dict) else None,
             image_path=self.visual_asset_path(image_asset),
+            on_select_image=lambda: self.choose_visual_asset(
+                "inventory", image_subject_key
+            ),
+            on_create_image=lambda: self.create_visual_asset(
+                "inventory", image_subject_key
+            ),
             show_structured_details=self.playtesting_tools,
             parent=self,
         )

@@ -31,6 +31,10 @@ class TravelScreen(RepositoryBackedWidget):
         self.location_image_label = ClickableImageLabel()
         self.location_image_label.setObjectName("travelLocationImage")
         self.location_image_label.hide()
+        self.select_image_button = QPushButton("Select Image...")
+        self.select_image_button.clicked.connect(self._select_location_image)
+        self.create_image_button = QPushButton("Create new image for me")
+        self.create_image_button.clicked.connect(self._create_location_image)
 
         self.travel_context_input = QTextEdit()
         self.travel_context_input.setPlaceholderText("Optional details for the GM")
@@ -46,6 +50,9 @@ class TravelScreen(RepositoryBackedWidget):
         selector_layout.addWidget(self.location_selector, 1)
         details_layout.addLayout(selector_layout)
         details_layout.addWidget(self.location_image_label)
+        details_layout.addWidget(
+            _button_row(self.select_image_button, self.create_image_button)
+        )
         details_layout.addWidget(self.details_output)
         details_layout.addWidget(QLabel("Travel Context"))
         details_layout.addWidget(self.travel_context_input)
@@ -239,3 +246,17 @@ class TravelScreen(RepositoryBackedWidget):
             self.travel_context_input.toPlainText().strip(),
         ):
             self.travel_context_input.clear()
+
+    def _location_image_key(self) -> str:
+        location = self._selected_location_data() or {}
+        return str(location.get("location_id", "") or location.get("name", "")).strip()
+
+    def _select_location_image(self) -> None:
+        key = self._location_image_key()
+        if key:
+            self.choose_visual_asset("location", key)
+
+    def _create_location_image(self) -> None:
+        key = self._location_image_key()
+        if key:
+            self.create_visual_asset("location", key)

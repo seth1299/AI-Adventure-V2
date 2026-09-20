@@ -104,6 +104,8 @@ class NpcsScreen(RepositoryBackedWidget):
         dialog = NpcDetailsDialog(
             npc=npc,
             image_path=self.visual_asset_path(asset),
+            on_select_image=lambda: self.choose_visual_asset("npc", npc_id.casefold()),
+            on_create_image=lambda: self.create_visual_asset("npc", npc_id.casefold()),
             parent=self,
         )
         dialog.exec()

@@ -13,7 +13,7 @@ from PySide6.QtGui import QImageReader, QPixmap, QTextCursor, QWheelEvent
 from PySide6.QtWidgets import (
     QAbstractSpinBox, QCheckBox, QComboBox, QDialog, QFormLayout, QGraphicsPixmapItem,
     QGraphicsScene, QGraphicsView, QGroupBox, QHBoxLayout, QLabel, QListWidget,
-    QLineEdit, QPlainTextEdit, QPushButton, QScrollArea, QSlider, QSpinBox,
+    QFileDialog, QLineEdit, QMessageBox, QPlainTextEdit, QPushButton, QScrollArea, QSlider, QSpinBox,
     QTableWidget, QTextBrowser, QTextEdit, QTimeEdit, QVBoxLayout, QWidget,
     QFrame,
 )
@@ -276,6 +276,12 @@ class RepositoryBackedWidget(QWidget):
         self._repository: SaveRepository | None = None
         self._visual_assets_dir: Path | None = None
         self.on_repository_changed: Callable[["RepositoryBackedWidget"], None] | None = None
+        self.on_visual_asset_upload: (
+            Callable[[str, str, Path], tuple[bool, str]] | None
+        ) = None
+        self.on_visual_asset_generate: (
+            Callable[[str, str], tuple[bool, str]] | None
+        ) = None
 
     def set_visual_assets_dir(self, directory: Path | str) -> None:
         """Sets the device-local cache root used by image-bearing screens."""
@@ -316,6 +322,49 @@ class RepositoryBackedWidget(QWidget):
         """
 
         return self._repository
+
+    def choose_visual_asset(self, subject_type: str, subject_key: str) -> bool:
+        """Lets the player replace one entity image with a local file."""
+
+        if self.on_visual_asset_upload is None:
+            QMessageBox.warning(self, "Images Unavailable", "Image selection is unavailable.")
+            return False
+        dialog = QFileDialog(self, "Select Image")
+        dialog.setFileMode(QFileDialog.FileMode.ExistingFile)
+        dialog.setNameFilters(
+            ["Images (*.png *.jpg *.jpeg *.webp *.bmp)", "All Files (*)"]
+        )
+        dialog.setOption(QFileDialog.Option.DontUseNativeDialog, True)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return False
+        selected_files = dialog.selectedFiles()
+        if not selected_files:
+            return False
+        success, message = self.on_visual_asset_upload(
+            subject_type,
+            subject_key,
+            Path(selected_files[0]),
+        )
+        if not success:
+            QMessageBox.warning(self, "Image Selection Failed", message)
+        return success
+
+    def create_visual_asset(self, subject_type: str, subject_key: str) -> bool:
+        """Queues an explicit AI image request for one visible entity."""
+
+        if self.on_visual_asset_generate is None:
+            QMessageBox.warning(self, "Images Unavailable", "Image creation is unavailable.")
+            return False
+        success, message = self.on_visual_asset_generate(subject_type, subject_key)
+        if not success:
+            QMessageBox.warning(self, "Image Creation Failed", message)
+        else:
+            QMessageBox.information(
+                self,
+                "Image Creation Queued",
+                "The new image is being created. This view will refresh when it is ready.",
+            )
+        return success
 
     def refresh(self) -> None:
         """Refreshes screen data. Subclasses may override this."""

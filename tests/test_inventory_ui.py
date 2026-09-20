@@ -2186,7 +2186,9 @@ class InventoryUiTests(unittest.TestCase):
             visible_details = screen.details_output.toPlainText()
             self.assertIn("towering animal", visible_details)
             self.assertNotIn("built beneath", visible_details)
-            self.assertEqual(screen.findChildren(QPushButton), [])
+            button_texts = [button.text() for button in screen.findChildren(QPushButton)]
+            self.assertIn("Select Image...", button_texts)
+            self.assertIn("Create new image for me", button_texts)
             screen.close()
 
     def test_notes_default_to_markdown_preview_and_edit_on_demand(self) -> None:
@@ -2456,6 +2458,12 @@ class InventoryUiTests(unittest.TestCase):
             popout = next(iter(screen._item_detail_dialogs.values()))
             self.assertTrue(popout.isVisible())
             self.assertFalse(popout.isModal())
+            self.assertIsNotNone(
+                popout.findChild(QPushButton, "inventorySelectImageButton")
+            )
+            self.assertIsNotNone(
+                popout.findChild(QPushButton, "inventoryCreateImageButton")
+            )
             popout.close()
             self.app.processEvents()
             self.assertEqual(screen._item_detail_dialogs, {})

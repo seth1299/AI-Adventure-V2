@@ -250,6 +250,8 @@ class GameShell(QWidget):
         for screen in self.screens:
             screen.set_visual_assets_dir(self.generated_images_dir)
             screen.on_repository_changed = self._handle_screen_repository_changed
+            screen.on_visual_asset_upload = self._upload_visual_asset
+            screen.on_visual_asset_generate = self._generate_visual_asset
 
         visible_tabs = (
             [
@@ -307,6 +309,86 @@ class GameShell(QWidget):
         layout.addWidget(self.tabs)
 
         self.setLayout(layout)
+
+    def _visual_asset_request(
+        self, subject_type: str, subject_key: str
+    ) -> VisualAssetRequest | None:
+        """Finds the current canonical request for one visible subject."""
+
+        repository = self.repository
+        clean_type = str(subject_type or "").strip().casefold()
+        clean_key = str(subject_key or "").strip().casefold()
+        if repository is None or not clean_type or not clean_key:
+            return None
+        return next(
+            (
+                request
+                for request in AssetGenerationService.requests_for(repository)
+                if request.subject_type.casefold() == clean_type
+                and request.subject_key.casefold() == clean_key
+            ),
+            None,
+        )
+
+    def _prepare_visual_asset_request(
+        self, subject_type: str, subject_key: str
+    ) -> tuple[SaveRepository | None, VisualAssetRequest | None, str]:
+        """Ensures a current asset record before upload or generation."""
+
+        repository = self.repository
+        request = self._visual_asset_request(subject_type, subject_key)
+        if repository is None:
+            return None, None, "No adventure is currently loaded."
+        if request is None:
+            return repository, None, "That image subject is no longer available."
+        model = normalize_image_model(
+            repository.get_setting("images.model", DEFAULT_IMAGE_MODEL)
+        )
+        repository.ensure_visual_asset(
+            asset_id=request.asset_id,
+            subject_type=request.subject_type,
+            subject_key=request.subject_key,
+            display_name=request.display_name,
+            descriptor_hash=request.descriptor_hash,
+            filename=save_relative_image_filename(repository, request),
+            prompt=request.prompt,
+            model=model,
+            image_style=request.image_style,
+            visual_description=request.description,
+            basic_name=request.basic_name,
+            resolution_tier=request.image_size,
+            message_ids=request.message_ids,
+        )
+        return repository, request, ""
+
+    def _upload_visual_asset(
+        self, subject_type: str, subject_key: str, source_path: Path
+    ) -> tuple[bool, str]:
+        repository, request, message = self._prepare_visual_asset_request(
+            subject_type, subject_key
+        )
+        if repository is None or request is None:
+            return False, message
+        LOGGER.info(
+            "Player selected image for %s/%s from %s.",
+            subject_type,
+            subject_key,
+            source_path,
+        )
+        return self.visual_asset_coordinator.upload_initial_image(
+            repository, request, source_path
+        )
+
+    def _generate_visual_asset(
+        self, subject_type: str, subject_key: str
+    ) -> tuple[bool, str]:
+        repository, request, message = self._prepare_visual_asset_request(
+            subject_type, subject_key
+        )
+        if repository is None or request is None:
+            return False, message
+        LOGGER.info("Player requested a new image for %s/%s.", subject_type, subject_key)
+        return self.visual_asset_coordinator.create_initial_image(repository, request)
 
     def _register_tab(
         self,

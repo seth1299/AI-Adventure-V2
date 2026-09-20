@@ -155,6 +155,13 @@ class CharacterScreen(RepositoryBackedWidget):
         self.portrait_label = ClickableImageLabel()
         self.portrait_label.setMinimumWidth(220)
         portrait_layout.addWidget(self.portrait_label, 0, Qt.AlignmentFlag.AlignHCenter)
+        self.select_portrait_button = QPushButton("Select Image...")
+        self.select_portrait_button.clicked.connect(self._select_portrait_image)
+        self.create_portrait_button = QPushButton("Create new image for me")
+        self.create_portrait_button.clicked.connect(self._create_portrait_image)
+        portrait_layout.addWidget(
+            _button_row(self.select_portrait_button, self.create_portrait_button)
+        )
         self.portrait_group.setLayout(portrait_layout)
         self.portrait_group.hide()
 
@@ -508,7 +515,7 @@ class CharacterScreen(RepositoryBackedWidget):
                 maximum_height=340,
                 accessible_name=f"Generated portrait of {state.player.name}",
             )
-            self.portrait_group.setVisible(has_portrait)
+            self.portrait_group.setVisible(True)
             self._sync_contextual_controls(repository)
             self._sync_profile_preview(has_portrait=has_portrait)
             self._set_profile_editing(False)
@@ -517,6 +524,16 @@ class CharacterScreen(RepositoryBackedWidget):
             self._last_saved_character_payload = (
                 self._character_payload(repository) if repository is not None else None
             )
+
+    def _select_portrait_image(self) -> None:
+        repository = self.repository()
+        if repository is not None:
+            self.choose_visual_asset("player", repository.get_player_id())
+
+    def _create_portrait_image(self) -> None:
+        repository = self.repository()
+        if repository is not None:
+            self.create_visual_asset("player", repository.get_player_id())
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:
         """Autosaves multi-line character fields when focus leaves them."""

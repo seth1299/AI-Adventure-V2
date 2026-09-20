@@ -23,6 +23,10 @@ class BestiaryScreen(RepositoryBackedWidget):
         self.creature_image_label = ClickableImageLabel()
         self.creature_image_label.setObjectName("bestiaryGeneratedImage")
         self.creature_image_label.setMargin(4)
+        self.select_image_button = QPushButton("Select Image...")
+        self.select_image_button.clicked.connect(self._select_creature_image)
+        self.create_image_button = QPushButton("Create new image for me")
+        self.create_image_button.clicked.connect(self._create_creature_image)
 
         self.details_output = MarkdownDisplay()
         self.details_output.setObjectName("bestiaryCreatureDetails")
@@ -36,6 +40,9 @@ class BestiaryScreen(RepositoryBackedWidget):
             self.creature_image_label,
             0,
             Qt.AlignmentFlag.AlignHCenter,
+        )
+        details_layout.addWidget(
+            _button_row(self.select_image_button, self.create_image_button)
         )
         details_layout.addWidget(self.details_output)
 
@@ -155,3 +162,20 @@ class BestiaryScreen(RepositoryBackedWidget):
         if details:
             sections.append(details)
         _set_markdown_text(self.details_output, "\n\n".join(sections))
+
+    def _selected_creature_image_key(self) -> str:
+        index = self.creature_selector.currentIndex()
+        raw = self.creature_selector.itemData(index) if index >= 0 else None
+        if not isinstance(raw, dict):
+            return ""
+        return str(raw.get("creature_id", "") or raw.get("name", "")).strip().casefold()
+
+    def _select_creature_image(self) -> None:
+        key = self._selected_creature_image_key()
+        if key:
+            self.choose_visual_asset("bestiary", key)
+
+    def _create_creature_image(self) -> None:
+        key = self._selected_creature_image_key()
+        if key:
+            self.create_visual_asset("bestiary", key)

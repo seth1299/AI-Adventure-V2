@@ -3759,6 +3759,8 @@ class InventoryItemDetailsDialog(QDialog):
         item: dict[str, Any],
         catalog_entry: dict[str, Any] | None,
         image_path: Path | None = None,
+        on_select_image: Callable[[], Any] | None = None,
+        on_create_image: Callable[[], Any] | None = None,
         show_structured_details: bool = False,
         parent: QWidget | None = None,
     ) -> None:
@@ -3847,6 +3849,19 @@ class InventoryItemDetailsDialog(QDialog):
             accessible_name=f"Generated image of {name}",
         ):
             layout.addWidget(generated_image, 0, Qt.AlignmentFlag.AlignHCenter)
+        if on_select_image is not None or on_create_image is not None:
+            image_buttons = QHBoxLayout()
+            if on_select_image is not None:
+                select_image_button = QPushButton("Select Image...")
+                select_image_button.setObjectName("inventorySelectImageButton")
+                select_image_button.clicked.connect(on_select_image)
+                image_buttons.addWidget(select_image_button)
+            if on_create_image is not None:
+                create_image_button = QPushButton("Create new image for me")
+                create_image_button.setObjectName("inventoryCreateImageButton")
+                create_image_button.clicked.connect(on_create_image)
+                image_buttons.addWidget(create_image_button)
+            layout.addLayout(image_buttons)
         if summary.rowCount():
             layout.addLayout(summary)
         layout.addWidget(QLabel("Description"))
@@ -3882,6 +3897,8 @@ class NpcDetailsDialog(QDialog):
         *,
         npc: dict[str, Any],
         image_path: Path | None = None,
+        on_select_image: Callable[[], Any] | None = None,
+        on_create_image: Callable[[], Any] | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -3946,6 +3963,19 @@ class NpcDetailsDialog(QDialog):
             accessible_name=f"Generated portrait of {display_name}",
         ):
             layout.addWidget(generated_image, 0, Qt.AlignmentFlag.AlignHCenter)
+        if on_select_image is not None or on_create_image is not None:
+            image_buttons = QHBoxLayout()
+            if on_select_image is not None:
+                select_image_button = QPushButton("Select Image...")
+                select_image_button.setObjectName("npcSelectImageButton")
+                select_image_button.clicked.connect(on_select_image)
+                image_buttons.addWidget(select_image_button)
+            if on_create_image is not None:
+                create_image_button = QPushButton("Create new image for me")
+                create_image_button.setObjectName("npcCreateImageButton")
+                create_image_button.clicked.connect(on_create_image)
+                image_buttons.addWidget(create_image_button)
+            layout.addLayout(image_buttons)
         layout.addLayout(summary)
         layout.addWidget(QLabel("Description"))
         layout.addWidget(description, 1)
