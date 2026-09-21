@@ -85,6 +85,15 @@ class StoryScreen(RepositoryBackedWidget):
         self.conversation_scroll.setHorizontalScrollBarPolicy(
             Qt.ScrollBarPolicy.ScrollBarAlwaysOff
         )
+        # The conversation viewport must yield space to the player controls
+        # when a new response changes the content's preferred height. Without
+        # an explicit flexible region, fullscreen/maximized layouts can place
+        # the input row just below the visible window until the next resize.
+        self.conversation_scroll.setMinimumHeight(0)
+        self.conversation_scroll.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Expanding,
+        )
         self.conversation_contents = QWidget()
         self.conversation_layout = QVBoxLayout(self.conversation_contents)
         self.conversation_layout.setContentsMargins(12, 12, 12, 12)
@@ -133,7 +142,7 @@ class StoryScreen(RepositoryBackedWidget):
         location_image_row.addWidget(self.location_image_label)
         location_image_row.addStretch()
         layout.addLayout(location_image_row)
-        layout.addWidget(self.conversation_scroll)
+        layout.addWidget(self.conversation_scroll, 1)
         layout.addLayout(input_row)
 
         self.setLayout(layout)

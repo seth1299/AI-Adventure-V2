@@ -337,7 +337,7 @@ class GeminiServiceTests(unittest.TestCase):
         self.assertNotIn("damage", api_starter_item_schema["properties"])
         self.assertIn("damage", strict_starter_item_schema["properties"])
 
-    def test_new_game_location_parser_preserves_finalized_parent_relationship(self) -> None:
+    def test_new_game_location_parser_preserves_structured_parent_relationship(self) -> None:
         locations = _parse_new_game_locations(
             [
                 {
@@ -352,7 +352,9 @@ class GeminiServiceTests(unittest.TestCase):
             "Nexus Arena Lobby",
         )
 
-        self.assertIn("Located within Aegis Core City.", locations[0]["travel_notes"])
+        self.assertTrue(locations[0]["is_sublocation"])
+        self.assertEqual(locations[0]["parent_location"], "Aegis Core City")
+        self.assertEqual(locations[0]["travel_notes"], "Reached by teleporter.")
 
     def test_new_game_parser_converts_top_level_audio_contract_to_runtime_events(self) -> None:
         result = parse_gemini_new_game_response(
@@ -4174,10 +4176,21 @@ class GeminiServiceTests(unittest.TestCase):
                 "selection": {"tags": ["inventory"]},
                 "state": {
                     "player": {"name": "Kit"},
-                    "player_ai_preferences": {"narration_style": "present"},
+                    "player_ai_preferences": {
+                        "text_model": "internal-model-id",
+                        "narration_style": "present",
+                        "narration_style_label": "Limited",
+                        "additional_context": "Keep the tone grounded.",
+                    },
                     "scene": {"location": "Workshop"},
                     "world_profile": {"genre": "Mystery"},
                     "inventory": {"items": [{"name": "Key"}]},
+                    "merchant": {
+                        "active_npc_id": "",
+                        "profile": None,
+                        "stock": [],
+                        "buy_offers": [],
+                    },
                     "magic": {"known_spells": [{"name": "Spark"}]},
                     "active_tasks": {"tasks": [{"name": "Find the ledger"}]},
                     "miscellaneous": {"entries": [{"name": "Old faction"}]},
@@ -4190,7 +4203,37 @@ class GeminiServiceTests(unittest.TestCase):
         self.assertNotIn("magic", packet["state"])
         self.assertNotIn("active_tasks", packet["state"])
         self.assertNotIn("miscellaneous", packet["state"])
+        self.assertNotIn("merchant", packet["state"])
+        self.assertNotIn("text_model", packet["state"]["player_ai_preferences"])
+        self.assertIn(
+            "additional_context",
+            packet["state"]["player_ai_preferences"],
+        )
         self.assertNotIn("reference_sections", packet)
+
+    def test_story_prompt_includes_merchant_only_for_merchant_turns(self) -> None:
+        packet = _story_prompt_packet(
+            {
+                "packet_type": "story_turn",
+                "player_command": "Buy a lantern.",
+                "selection": {"tags": ["merchant"]},
+                "state": {
+                    "player": {"name": "Kit"},
+                    "player_ai_preferences": {},
+                    "scene": {"location": "Market"},
+                    "world_profile": {},
+                    "merchant": {
+                        "active_npc_id": "merchant_1",
+                        "profile": {"name": "Ada"},
+                        "stock": [{"name": "Lantern", "price": 4}],
+                        "buy_offers": [],
+                    },
+                },
+                "response_contract": {},
+            }
+        )
+
+        self.assertIn("merchant", packet["state"])
         """Legacy prose assertions retained here only as migration documentation.
         self.assertIn("response", prompt)
         self.assertIn("suggested_actions", prompt)
@@ -5001,9 +5044,9 @@ class GeminiServiceTests(unittest.TestCase):
         self.assertIn("not physical inventory", prompt)
         self.assertIn("alchemist, cook, engineer", prompt)
         """
-        self.assertEqual(
-            NEW_GAME_RESPONSE_JSON_SCHEMA["properties"]["starting_items"]["minItems"],
-            5,
+        self.assertNotIn(
+            "minItems",
+            NEW_GAME_RESPONSE_JSON_SCHEMA["properties"]["starting_items"],
         )
         starter_item_properties = NEW_GAME_RESPONSE_JSON_SCHEMA["properties"][
             "starting_items"
@@ -5032,6 +5075,8 @@ class GeminiServiceTests(unittest.TestCase):
         self.assertIn("convert it into the number of concrete", prompt)
         self.assertIn("Fuel instead of Starting Fuel Amount", prompt)
         self.assertIn("Put quantities in quantity, not name", prompt)
+        self.assertIn("must remain quantity-neutral", prompt)
+        self.assertIn("such as 'ten vials'", prompt)
         self.assertIn("currency_denominations must", prompt)
         self.assertIn("starting_currency_balance_base_units", prompt)
         self.assertIn("game_state/currency.balance", prompt)

@@ -237,6 +237,9 @@ class StoryTurnService:
                     "tts_voice_blend": repository.get_setting(
                         "audio.tts_voice_blend", {}
                     ),
+                    "player_tts_voice": repository.get_setting(
+                        "audio.player_tts_voice", "ai"
+                    ),
                 }
             )
             speaker_cues, assignments = assign_speaker_voices(
@@ -247,6 +250,15 @@ class StoryTurnService:
                     "audio.speaker_voice_assignments",
                     {},
                 ),
+                player_speaker_ids={
+                    "player",
+                    "player_character",
+                    str(repository.get_setting("player_name", "")).casefold(),
+                },
+                player_pronouns=repository.get_setting(
+                    "player.pronouns", "They/Them"
+                ),
+                player_voice=audio["player_tts_voice"],
             )
             repository.set_setting("audio.speaker_voice_assignments", assignments)
 

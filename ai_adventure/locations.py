@@ -31,6 +31,8 @@ class KnownLocation:
     terrain: str = ""
     travel_multiplier: float = 1.0
     travel_notes: str = ""
+    is_sublocation: bool = False
+    parent_location: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         """Returns JSON-serializable location data."""
@@ -100,6 +102,39 @@ def normalize_known_location(raw_location: Any) -> KnownLocation | None:
     if not name:
         return None
 
+    travel_notes = _clean_text(raw_location.get("travel_notes"))
+    parent_location = _clean_text(raw_location.get("parent_location"))
+    is_sublocation = bool(raw_location.get("is_sublocation")) and bool(parent_location)
+
+    # Older saves stored the relationship in route notes. Recover that legacy
+    # data once, while keeping the visible relationship out of prose.
+    if not parent_location:
+        legacy_match = re.search(
+            r"(?:^|\s)Located within\s+([^.!?]+)[.!]?",
+            travel_notes,
+            flags=re.IGNORECASE,
+        )
+        if legacy_match is not None:
+            parent_location = _clean_text(legacy_match.group(1))
+            is_sublocation = bool(parent_location)
+            travel_notes = _clean_text(
+                re.sub(
+                    r"(?:^|\s)Located within\s+[^.!?]+[.!]?",
+                    " ",
+                    travel_notes,
+                    flags=re.IGNORECASE,
+                )
+            )
+    elif "located within" in travel_notes.casefold():
+        travel_notes = _clean_text(
+            re.sub(
+                rf"(?:^|\s)Located within\s+{re.escape(parent_location)}[.!]?",
+                " ",
+                travel_notes,
+                flags=re.IGNORECASE,
+            )
+        )
+
     return KnownLocation(
         name=name,
         location_id=_clean_text(raw_location.get("location_id")),
@@ -113,7 +148,9 @@ def normalize_known_location(raw_location: Any) -> KnownLocation | None:
             minimum=0.1,
             maximum=3.0,
         ),
-        travel_notes=_clean_text(raw_location.get("travel_notes")),
+        travel_notes=travel_notes,
+        is_sublocation=is_sublocation,
+        parent_location=parent_location if is_sublocation else "",
     )
 
 
@@ -272,6 +309,8 @@ def _merge_locations(existing: KnownLocation, incoming: KnownLocation) -> KnownL
             else existing.travel_multiplier
         ),
         travel_notes=incoming.travel_notes or existing.travel_notes,
+        is_sublocation=incoming.is_sublocation or existing.is_sublocation,
+        parent_location=incoming.parent_location or existing.parent_location,
     )
 
 

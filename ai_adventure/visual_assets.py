@@ -174,6 +174,9 @@ class VisualAssetRequest:
             ),
             "inventory": (
                 "Create a clear inventory illustration of this one unique item by itself. "
+                "Depict exactly one representative item regardless of any inventory quantity; "
+                "never depict a stack, group, or repeated copies. Treat the supplied description "
+                "as generic item-trait metadata, not as a count or an image prompt. "
                 "The item is the only foreground subject: do not show a person, face, body, "
                 "hand, arm, or someone holding or using it. Make its materials, condition, "
                 "color, scale, and distinctive visible features easy to recognize. "
@@ -390,7 +393,7 @@ def build_visual_asset_requests(
         )
 
     for npc in repository.list_player_visible_npcs(limit=500):
-        npc_id = str(npc.get("npc_id", "") or "").strip().casefold()
+        npc_id = str(npc.get("npc_id") or npc.get("id") or "").strip().casefold()
         display_name = str(npc.get("display_name", "Unknown NPC") or "").strip()
         description = str(
             npc.get("description") or npc.get("notes") or ""

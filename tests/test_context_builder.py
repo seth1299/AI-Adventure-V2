@@ -900,11 +900,108 @@ class ContextBuilderTests(unittest.TestCase):
         self.assertEqual(len(packet["state"]["item_catalog"]["items"]), 70)
         self.assertEqual(len(packet["state"]["active_tasks"]["tasks"]), 40)
         self.assertEqual(len(packet["recent_history"]), 8)
-        self.assertLessEqual(
-            len(packet["state"]["inventory"]["items"][0]["description"]),
-            1200,
-        )
+        self.assertNotIn("description", packet["state"]["inventory"]["items"][0])
+        self.assertNotIn("description", packet["state"]["item_catalog"]["items"][0])
         self.assertLessEqual(len(packet["recent_history"][0]["content"]), 1200)
+
+    def test_item_details_are_targeted_to_explicitly_named_items(self) -> None:
+        crate_metadata = {
+            "item_type": "Container",
+            "basic_name": "Crate",
+            "item_uuid": "crate-uuid",
+            "quantity_unit": "each",
+            "storage_location": "actively_carried",
+            "container": {
+                "is_open": False,
+                "is_locked": True,
+                "is_trapped": False,
+                "contents": {
+                    "currency_base_units": 25,
+                    "items": [{"name": "Hidden Ledger", "quantity": 1}],
+                },
+            },
+        }
+        state = AdventureState(
+            metadata=AdventureMetadata(title="Targeted Details"),
+            inventory=InventoryState(
+                items=[
+                    InventoryItem(
+                        name="Wooden Crate",
+                        category="Container",
+                        description="A rough pine crate with iron corner bands.",
+                        value_base_units=8,
+                        metadata=crate_metadata,
+                    ),
+                    InventoryItem(
+                        name="Brass Lantern",
+                        category="Tool",
+                        description="A hooded brass lantern with a blue glass pane.",
+                        value_base_units=12,
+                        metadata={
+                            "item_type": "Tool",
+                            "basic_name": "Lantern",
+                            "item_uuid": "lantern-uuid",
+                        },
+                    ),
+                ]
+            ),
+            item_catalog=ItemCatalogState(
+                items=[
+                    ItemCatalogEntry(
+                        name="Wooden Crate",
+                        category="Container",
+                        description="A rough pine crate with iron corner bands.",
+                        value_base_units=8,
+                        metadata=crate_metadata,
+                    ),
+                    ItemCatalogEntry(
+                        name="Brass Lantern",
+                        category="Tool",
+                        description="A hooded brass lantern with a blue glass pane.",
+                        value_base_units=12,
+                        metadata={
+                            "item_type": "Tool",
+                            "basic_name": "Lantern",
+                            "item_uuid": "lantern-uuid",
+                        },
+                    ),
+                ]
+            ),
+        )
+
+        routine_packet = AiContextBuilder.from_default_library().build_story_context(
+            state,
+            player_command="Walk toward the market.",
+        )
+        routine_inventory = routine_packet["state"]["inventory"]["items"]
+        routine_catalog = routine_packet["state"]["item_catalog"]["items"]
+        self.assertNotIn("description", routine_inventory[0])
+        self.assertNotIn("value_base_units", routine_inventory[0])
+        self.assertNotIn("description", routine_catalog[0])
+        self.assertEqual(routine_inventory[0]["metadata"]["item_uuid"], "crate-uuid")
+        self.assertEqual(routine_inventory[0]["quantity"], 1)
+
+        targeted_packet = AiContextBuilder.from_default_library().build_story_context(
+            state,
+            player_command="Inspect the Wooden Crate.",
+        )
+        self.assertIn("inventory", targeted_packet["selection"]["tags"])
+        targeted_inventory = targeted_packet["state"]["inventory"]["items"]
+        targeted_catalog = targeted_packet["state"]["item_catalog"]["items"]
+        self.assertEqual(
+            targeted_inventory[0]["description"],
+            "A rough pine crate with iron corner bands.",
+        )
+        self.assertEqual(targeted_inventory[0]["value_base_units"], 8)
+        self.assertIn("is_locked", targeted_inventory[0]["metadata"]["container"])
+        self.assertNotIn("contents", targeted_inventory[0]["metadata"]["container"])
+        self.assertIn("description", targeted_catalog[0])
+        self.assertNotIn("description", targeted_inventory[1])
+        self.assertNotIn("description", targeted_catalog[1])
+        self.assertEqual(
+            targeted_packet["state"]["inventory"]["detailed_item_names"],
+            ["wooden crate"],
+        )
 
     def test_miscellaneous_context_is_always_present_and_uncapped(self) -> None:
         entries = [

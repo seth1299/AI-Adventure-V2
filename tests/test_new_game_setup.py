@@ -1300,8 +1300,8 @@ class NewGameSetupTests(unittest.TestCase):
         self.assertIn("bestiary", packet["requirements"])
         self.assertIn("creature_id", packet["requirements"]["bestiary"])
         self.assertIn("item_request", packet["requirements"]["starter_inventory"])
-        self.assertIn("at least five", packet["requirements"]["starter_inventory"])
-        self.assertIn("has no maximum count", packet["requirements"]["starter_inventory"])
+        self.assertIn("There is no fixed minimum", packet["requirements"]["starter_inventory"])
+        self.assertIn("never invent filler merely to reach five", packet["requirements"]["starter_inventory"])
         self.assertIn("starting_items", packet["requirements"]["starter_inventory"])
         self.assertIn(
             "Prioritize concrete tools and supplies",
@@ -1316,10 +1316,10 @@ class NewGameSetupTests(unittest.TestCase):
         self.assertIn("Put quantities in quantity, not name", packet["requirements"]["starter_inventory"])
         self.assertNotIn("ascii_art", packet["requirements"]["starter_inventory"])
         self.assertEqual(packet["starter_inventory_contract"]["requested_item_count"], 0)
-        self.assertEqual(packet["starter_inventory_contract"]["minimum_finalized_item_count"], 5)
+        self.assertEqual(packet["starter_inventory_contract"]["minimum_finalized_item_count"], 0)
         self.assertEqual(
             packet["starter_inventory_contract"]["count_rule"],
-            "At least 5 finalized starting items are required; there is no maximum starting item count.",
+            "There is no fixed starting-item count. Preserve all supplied starter items, do not add filler to reach five, and allow an empty starting_items array when none were supplied.",
         )
         self.assertEqual(packet["starter_inventory_contract"]["output_field"], "starting_items")
         self.assertTrue(packet["starting_notes_contract"]["optional"])
@@ -1503,10 +1503,10 @@ class NewGameSetupTests(unittest.TestCase):
         self.assertEqual(packet["starter_inventory_contract"]["requested_item_count"], 12)
         self.assertEqual(
             packet["starter_inventory_contract"]["count_rule"],
-            "At least 5 finalized starting items are required; there is no maximum starting item count.",
+            "There is no fixed starting-item count. Preserve all supplied starter items, do not add filler to reach five, and allow an empty starting_items array when none were supplied.",
         )
         self.assertIn(
-            "has no maximum count",
+                "there is no maximum count",
             packet["requirements"]["starter_inventory"],
         )
         self.assertEqual(len(packet["setup"]["starter_items"]), 12)

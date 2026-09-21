@@ -69,6 +69,17 @@ VOICE_IDS_BY_PROFILE: dict[str, tuple[str, ...]] = {
 }
 
 
+def voice_profile_for_pronouns(pronouns: Any) -> str:
+    """Returns the conservative voice profile implied by player pronouns."""
+
+    clean_pronouns = str(pronouns or "").strip().casefold()
+    if "she" in clean_pronouns or "her" in clean_pronouns:
+        return "feminine"
+    if "he" in clean_pronouns or "him" in clean_pronouns:
+        return "masculine"
+    return "neutral"
+
+
 def available_narrator_voices() -> dict[str, str]:
     """Returns display-name-to-engine voice mappings."""
 
@@ -93,6 +104,9 @@ def assign_speaker_voices(
     narrator_voice: str,
     available_voice_ids: Any,
     existing_assignments: Any = None,
+    player_speaker_ids: Any = None,
+    player_pronouns: Any = None,
+    player_voice: Any = "ai",
 ) -> tuple[list[dict[str, str]], dict[str, str]]:
     """Resolves durable, distinct installed voices for anchored speakers."""
 
@@ -123,6 +137,14 @@ def assign_speaker_voices(
     }
     used_voice_ids = set(assignments.values())
     clean_narrator_voice = str(narrator_voice or "").strip()
+    player_ids = {
+        str(speaker_id or "").strip().casefold()
+        for speaker_id in (player_speaker_ids if isinstance(player_speaker_ids, (list, tuple, set)) else [])
+        if str(speaker_id or "").strip()
+    }
+    player_ids.update({"player", "player_character"})
+    clean_player_voice = str(player_voice or "").strip()
+    player_profile = voice_profile_for_pronouns(player_pronouns)
     resolved: list[dict[str, str]] = []
 
     for raw_cue in speaker_cues if isinstance(speaker_cues, list) else []:
@@ -139,7 +161,17 @@ def assign_speaker_voices(
         if not anchor_text or not speaker_id:
             continue
 
+        is_player = speaker_id in player_ids
+        if is_player:
+            voice_profile = player_profile
+
         voice_id = assignments.get(speaker_id, "")
+        if is_player and clean_player_voice.casefold() != "ai":
+            selected_player_voice = normalize_narrator_voice(clean_player_voice)
+            if selected_player_voice in available:
+                voice_id = selected_player_voice
+        elif is_player and voice_id not in VOICE_IDS_BY_PROFILE[player_profile]:
+            voice_id = ""
         if not voice_id:
             profile_candidates = [
                 candidate

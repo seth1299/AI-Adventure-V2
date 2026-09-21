@@ -13,7 +13,7 @@ from unittest.mock import Mock, patch
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QEventLoop, QThread, QTime, QTimer, Qt
-from PySide6.QtGui import QColor, QImage
+from PySide6.QtGui import QColor, QImage, QPixmap
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import (
     QApplication,
@@ -43,6 +43,7 @@ from ai_adventure.app.app_paths import AppPaths
 from ai_adventure.new_game_setup import normalize_new_game_setup
 from ai_adventure.ui.screens.notes import NotesScreen
 from ai_adventure.ui.screens.skills import SkillsScreen
+from ai_adventure.ui.screens.travel import TravelScreen
 from ai_adventure.new_game_templates import (
     load_new_game_templates,
     save_new_game_template,
@@ -1407,6 +1408,48 @@ class InventoryUiTests(unittest.TestCase):
 
         screen.close()
 
+    def test_conversation_input_remains_visible_after_response_layout_growth(self) -> None:
+        screen = StoryScreen()
+        screen.resize(1000, 700)
+        screen._render_conversation(
+            [
+                (
+                    "ai",
+                    "live_game",
+                    "An opening response. " * 40,
+                    1,
+                )
+            ]
+        )
+        screen.show()
+        self.app.processEvents()
+
+        # A generated location image and a new response can both increase the
+        # content's preferred height while the window remains fullscreen.
+        screen.location_image_label.setPixmap(QPixmap(560, 280))
+        screen.location_image_label.show()
+        screen._render_conversation(
+            [
+                (
+                    "ai",
+                    "live_game",
+                    "An opening response. " * 40,
+                    1,
+                ),
+                (
+                    "ai",
+                    "live_game",
+                    "A newly generated response. " * 80,
+                    2,
+                ),
+            ]
+        )
+        self.app.processEvents()
+
+        self.assertTrue(screen.player_input.isVisible())
+        self.assertLessEqual(screen.player_input.geometry().bottom(), screen.height())
+        screen.close()
+
     def test_live_game_ai_headers_number_turns_without_counting_out_of_game(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             repository = SaveRepository.create_new_save(Path(temp_dir), "Turn Header Test")
@@ -2347,6 +2390,49 @@ class InventoryUiTests(unittest.TestCase):
             self.app.processEvents()
             self.assertFalse(screen.select_image_button.isHidden())
             self.assertTrue(screen.create_image_button.isHidden())
+            screen.close()
+
+    def test_travel_refresh_preserves_selected_location_after_visual_asset_update(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = SaveRepository.create_new_save(
+                Path(temp_dir),
+                "Travel Selection Persistence",
+            )
+            repository.set_state_value("location", "Oak Hollow")
+            repository.set_travel_locations(
+                [
+                    {
+                        "location_id": "oak_hollow",
+                        "name": "Oak Hollow",
+                        "description": "The current town.",
+                    },
+                    {
+                        "location_id": "moonlit_marsh",
+                        "name": "Moonlit Marsh",
+                        "description": "A distant wetland.",
+                        "is_sublocation": True,
+                        "parent_location": "Oak Hollow",
+                    },
+                ]
+            )
+
+            screen = TravelScreen()
+            screen.set_repository(repository)
+            self.app.processEvents()
+
+            self.assertEqual(screen._selected_location_name(), "Oak Hollow")
+            marsh_row = screen.location_selector.findText("Moonlit Marsh")
+            self.assertGreaterEqual(marsh_row, 0)
+            screen.location_selector.setCurrentIndex(marsh_row)
+            self.app.processEvents()
+
+            # GameShell calls refresh_screens() after an image upload or
+            # generation completes, which invokes this refresh method.
+            screen.refresh()
+            self.app.processEvents()
+
+            self.assertEqual(screen._selected_location_name(), "Moonlit Marsh")
+            self.assertIn("Sublocation of: Oak Hollow", screen.details_output.toPlainText())
             screen.close()
 
     def test_notes_default_to_markdown_preview_and_edit_on_demand(self) -> None:

@@ -321,19 +321,11 @@ class SoundManager:
     def set_music_volume(self, volume: float | int | None) -> None:
         """Sets background music volume as either 0.0-1.0 or 0-100."""
 
-        if volume is None:
+        parsed_volume = _normalized_volume(volume, label="music")
+        if parsed_volume is None:
             return
 
-        try:
-            parsed_volume = float(volume)
-        except (TypeError, ValueError):
-            LOGGER.warning("Invalid music volume value: %r", volume)
-            return
-
-        if parsed_volume > 1.0:
-            parsed_volume = parsed_volume / 100.0
-
-        self.music_volume = max(0.0, min(1.0, parsed_volume))
+        self.music_volume = parsed_volume
 
         if self._initialized and self._pygame is not None:
             self._pygame.mixer.music.set_volume(self.music_volume)
@@ -579,7 +571,11 @@ def _normalized_volume(value: float | int | None, *, label: str) -> float | None
     except (TypeError, ValueError):
         LOGGER.warning("Invalid %s volume value: %r", label, value)
         return None
-    if parsed_volume > 1.0:
+    # UI sliders provide integer percentages, so integer 1 means 1%, not
+    # normalized full volume. Fractional floats retain the 0.0-1.0 API form.
+    if isinstance(value, int) and not isinstance(value, bool):
+        parsed_volume /= 100.0
+    elif parsed_volume > 1.0:
         parsed_volume /= 100.0
     return max(0.0, min(1.0, parsed_volume))
 

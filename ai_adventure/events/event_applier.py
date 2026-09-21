@@ -1303,6 +1303,8 @@ class EventApplier:
             "terrain": _first_text(payload, "terrain"),
             "travel_multiplier": payload.get("travel_multiplier", 1.0),
             "travel_notes": _first_text(payload, "travel_notes", "route_notes"),
+            "is_sublocation": bool(payload.get("is_sublocation")),
+            "parent_location": _first_text(payload, "parent_location"),
         }
 
         if not self.repository.upsert_travel_location(location):

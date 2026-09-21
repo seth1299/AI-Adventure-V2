@@ -117,7 +117,10 @@ class TravelScreen(RepositoryBackedWidget):
             self.travel_button.setEnabled(False)
             return
 
-        target_name = current_location_name or selected_name
+        # A visual-asset upload refreshes this screen. Keep the location the
+        # player was viewing so they can verify the uploaded image; use the
+        # player's current location only for the initial selection.
+        target_name = selected_name or current_location_name
         target_row = 0
 
         for row in range(self.location_selector.count()):
@@ -191,6 +194,11 @@ class TravelScreen(RepositoryBackedWidget):
 
         travel_lines = [
             "## Travel",
+            *(
+                [f"**Sublocation of:** {destination.parent_location}"]
+                if destination.is_sublocation and destination.parent_location
+                else []
+            ),
             f"**From:** {state.world.location or 'Current location'}",
             f"**Distance:** {format_distance(estimate.distance_miles)}",
             f"**Estimated time:** {format_travel_time(estimate.estimated_minutes)}",

@@ -288,6 +288,19 @@ class AiContextBuilder:
             if planner_context_tags is None
             else _normalize_planner_context_tags(planner_context_tags)
         )
+        referenced_items = [
+            *state.inventory.items[:MAX_INVENTORY_CONTEXT_ITEMS],
+            *state.item_catalog.items,
+        ]
+        detailed_item_names = {
+            _item_context_identity(item)
+            for item in referenced_items
+            if _item_is_referenced(item, clean_command)
+        }
+        if detailed_item_names:
+            # Exploration verbs such as "inspect" do not otherwise select the
+            # inventory projection, but an explicit item name makes it relevant.
+            selected_tags.add("inventory")
         selected_tags.update(
             _hybrid_magic_relevance_tags(
                 state,
@@ -452,7 +465,6 @@ class AiContextBuilder:
             state.magic,
             include_progression="magic" in selected_tags or "spell" in selected_tags,
         )
-
         packet = {
             "schema_version": 1,
             "packet_type": "story_turn",
@@ -562,6 +574,8 @@ class AiContextBuilder:
                             "terrain": _compact_text(location.terrain),
                             "travel_multiplier": location.travel_multiplier,
                             "travel_notes": _compact_text(location.travel_notes),
+                            "is_sublocation": location.is_sublocation,
+                            "parent_location": _compact_text(location.parent_location),
                         }
                         for location in state.travel.locations
                     ],
@@ -606,18 +620,30 @@ class AiContextBuilder:
                 },
                 "inventory": {
                     "items": [
-                        {
-                            "database_id": item.id,
-                            "name": item.name,
-                            "category": item.category,
-                            "quantity": item.quantity,
-                            "equipped": item.equipped,
-                            "description": _compact_text(item.description),
-                            "value_base_units": item.value_base_units,
-                            "metadata": _compact_context_value(item.metadata),
-                        }
+                        _inventory_item_context(
+                            item,
+                            include_details=_item_context_identity(item)
+                            in detailed_item_names,
+                            include_metadata_details=_item_is_operationally_relevant(
+                                item,
+                                selected_tags=selected_tags,
+                                player_command=clean_command,
+                            ),
+                        )
                         for item in state.inventory.items[:MAX_INVENTORY_CONTEXT_ITEMS]
                     ],
+                    "detail_policy": (
+                        "Inventory rows are compact by default: use name, category, "
+                        "quantity, equipped state, storage location, quantity unit, "
+                        "and stable identity for routine turns. Descriptions, values, "
+                        "and detailed item metadata are included only for an item "
+                        "whose name or generic family name is explicitly relevant to "
+                        "the player's command, or when operational metadata is needed "
+                        "for combat or container access. If a field is absent, Python "
+                        "omitted it intentionally; do not infer that the item lacks a "
+                        "detail."
+                    ),
+                    "detailed_item_names": sorted(detailed_item_names),
                     "container_rule": (
                         CONTAINER_ACCESS_RULE + " "
                         "Never reveal or award a closed container's contents. Use "
@@ -636,16 +662,22 @@ class AiContextBuilder:
                 },
                 "item_catalog": {
                     "items": [
-                        {
-                            "database_id": item.id,
-                            "name": item.name,
-                            "category": item.category,
-                            "description": _compact_text(item.description),
-                            "value_base_units": item.value_base_units,
-                            "metadata": _compact_context_value(item.metadata),
-                        }
+                        _item_catalog_entry_context(
+                            item,
+                            include_details=_item_context_identity(item)
+                            in detailed_item_names,
+                        )
                         for item in state.item_catalog.items
                     ],
+                    "detail_policy": (
+                        "Catalog rows are compact by default because the catalog is a "
+                        "memory of item identities, not a transcript of every item's "
+                        "description. Descriptions, values, and detailed metadata are "
+                        "included only for an explicitly relevant item name or generic "
+                        "family name. Use the catalog name and category for ordinary "
+                        "item recognition, and do not invent a missing description."
+                    ),
+                    "detailed_item_names": sorted(detailed_item_names),
                     "rules": {
                         "purpose": (
                             "This is the durable master list of known item "
@@ -660,7 +692,8 @@ class AiContextBuilder:
                         "Travel-tab locations; use actively_carried only when the "
                         "Player Character is carrying it. "
                             "Use item_catalog to remember descriptions, categories, "
-                            "values for previously seen items. Each item also "
+                            "and values for previously seen items when a detailed "
+                            "record is supplied. Each item also "
                         "has database_id, a globally unique database identity, and "
                         "metadata.item_uuid, a stable item identity; "
                         "reuse it for the same item and do not split one item "
@@ -1058,11 +1091,14 @@ class AiContextBuilder:
                             "and reuse it on later turns; use distinct stable "
                             "lower_snake_case IDs for other speakers. Choose only a "
                             "broad established voice_profile and use neutral when "
-                            "unspecified. speaker_name is the visible chat-bubble label: "
+                            "unspecified. For Player Character dialogue, use the literal "
+                            "player_character ID and follow state.player.pronouns: She/Her "
+                            "feminine, He/Him masculine, and They/Them or custom pronouns "
+                            "neutral. speaker_name is the visible chat-bubble label: "
                             "use the known name or a concise player-safe description "
                             "when the name is unknown. Python splits the response into "
                             "same-turn bubbles and durably remembers the installed "
-                            "voice ID. Do not cue narrator prose or the Player Character."
+                            "voice ID. Do not cue narrator prose."
                         ),
                     },
                 },
@@ -1262,7 +1298,8 @@ class AiContextBuilder:
                     "quotes, speaker_id, speaker_name, and voice_profile. speaker_name "
                     "is the visible bubble label: use the known name or a concise "
                     "player-safe description when the name is unknown. Use the exact "
-                    "canonical npc_id for an NPC, reuse one ID for the same speaker, "
+                    "canonical npc_id for an NPC, player_character for Player Character "
+                    "dialogue, reuse one ID for the same speaker, "
                     "and use different IDs for different speakers. Return [] when only "
                     "the narrator speaks or for out_of_game. Python owns bubble "
                     "splitting, final installed voice assignment, and persistence."
@@ -1378,21 +1415,27 @@ class AiContextBuilder:
                     "Use state.item_catalog.items as the master list of remembered "
                     "item definitions. Before inventing an item, reuse a fitting "
                     "existing catalog definition whenever one can serve the story. "
-                "It preserves descriptions, categories, and values, "
-                     "and metadata.item_uuid stable internal identities; reuse the same "
-                     "item_uuid for the same item even when its display name changes. "
-                     "For every new item, also provide basic_name: a short generic item-family "
-                     "name with color, material, size, condition, craftsmanship, and other "
-                     "flavor adjectives removed. Use the same basic_name for equivalent items "
-                     "such as Wide Brimmed Fedora, Grey Felt Fedora, and Fedora. "
-                     "It also preserves equipment metadata after items leave inventory. "
+                    "Routine rows are intentionally compact and may omit descriptions, "
+                    "values, and detailed metadata. Those fields are authoritative only "
+                    "when a targeted item record includes them; do not assume an omitted "
+                    "field is empty. The catalog preserves metadata.item_uuid stable "
+                    "internal identities; reuse the same item_uuid for the same item even "
+                    "when its display name changes. For every new item, also provide "
+                    "basic_name: a short generic item-family name with color, material, "
+                    "size, condition, craftsmanship, and other flavor adjectives removed. "
+                    "Use the same basic_name for equivalent items such as Wide Brimmed "
+                    "Fedora, Grey Felt Fedora, and Fedora. It also preserves equipment "
+                    "metadata after items leave inventory. "
                     "Use Weapon metadata for weapon_hands, damage dice, attack range, "
                     "and optional ammunition_type_required, clip_size, and "
                     "bullets_per_attack. Ammunition items use matching "
                     "ammunition_type metadata. Use Armor "
                     "metadata for covers_body_parts and armor_rating. Container "
                     "metadata preserves exact hidden contents, open/taken state, "
-                    "locks, traps, check skills/DCs, and failure consequences. "
+                    "locks, traps, check skills/DCs, and failure consequences when the "
+                    "relevant container is targeted. Closed-container contents are "
+                    "never revealed by this context projection; use the container events "
+                    "and Python validation to open or transfer them. "
                     "Do not treat "
                     "catalog entries as possessions unless they also appear in "
                     "state.inventory.items. Recipe ingredients may only use "
@@ -1657,6 +1700,161 @@ def _normalize_planner_context_tags(tags: list[str]) -> set[str]:
         for tag in tags
         if isinstance(tag, str) and tag.strip().casefold() in PLANNABLE_CONTEXT_TAGS
     }
+
+
+def _item_context_identity(item: Any) -> str:
+    """Returns the normalized identity used for targeted item detail lookup."""
+
+    name = str(getattr(item, "name", "") or "").strip().casefold()
+    metadata = getattr(item, "metadata", {})
+    basic_name = (
+        str(metadata.get("basic_name", "") or "").strip().casefold()
+        if isinstance(metadata, dict)
+        else ""
+    )
+    return name or basic_name
+
+
+def _item_is_referenced(item: Any, player_command: str) -> bool:
+    """Returns whether the command explicitly names an item or item family."""
+
+    command = str(player_command or "").casefold()
+    if not command:
+        return False
+
+    candidates = [str(getattr(item, "name", "") or "").strip()]
+    metadata = getattr(item, "metadata", {})
+    if isinstance(metadata, dict):
+        candidates.append(str(metadata.get("basic_name", "") or "").strip())
+
+    for candidate in candidates:
+        normalized = " ".join(candidate.casefold().split())
+        if not normalized:
+            continue
+        if re.search(rf"(?<![a-z0-9]){re.escape(normalized)}(?![a-z0-9])", command):
+            return True
+    return False
+
+
+def _item_is_operationally_relevant(
+    item: Any,
+    *,
+    selected_tags: set[str],
+    player_command: str,
+) -> bool:
+    """Returns whether detailed metadata is needed for a current game operation."""
+
+    if "combat" in selected_tags and bool(getattr(item, "equipped", False)):
+        return True
+
+    metadata = getattr(item, "metadata", {})
+    item_type = str(metadata.get("item_type", "") if isinstance(metadata, dict) else "")
+    category = str(getattr(item, "category", "") or "")
+    is_container = item_type.casefold() == "container" or category.casefold() == "container"
+    if not is_container:
+        return False
+
+    command = str(player_command or "").casefold()
+    return bool(
+        re.search(
+            r"\b(?:open|unlock|lock|trap|trapped|inside|contents|empty|take|remove|"
+            r"collect|search)\b",
+            command,
+        )
+    )
+
+
+_COMPACT_ITEM_METADATA_KEYS = {
+    "item_uuid",
+    "item_type",
+    "basic_name",
+    "quantity_unit",
+    "storage_location",
+}
+
+
+def _item_metadata_context(
+    metadata: Any,
+    *,
+    include_details: bool,
+) -> dict[str, Any]:
+    """Returns identity metadata, optionally expanding relevant item details.
+
+    Closed-container contents remain excluded even from a targeted item record.
+    The model receives the container's access state and checks, but Python remains
+    the authority for revealing and transferring its stored contents.
+    """
+
+    if not isinstance(metadata, dict):
+        return {}
+
+    if not include_details:
+        return {
+            key: _compact_context_value(metadata[key])
+            for key in _COMPACT_ITEM_METADATA_KEYS
+            if key in metadata
+        }
+
+    compact = _compact_context_value(metadata)
+    if not isinstance(compact, dict):
+        return {}
+    container = compact.get("container")
+    if isinstance(container, dict) and container.get("is_open") is not True:
+        container = dict(container)
+        container.pop("contents", None)
+        compact["container"] = container
+    return compact
+
+
+def _inventory_item_context(
+    item: Any,
+    *,
+    include_details: bool,
+    include_metadata_details: bool = False,
+) -> dict[str, Any]:
+    """Builds the compact or targeted context representation of an inventory item."""
+
+    context = {
+        "database_id": getattr(item, "id", None),
+        "name": str(getattr(item, "name", "") or "").strip(),
+        "category": str(getattr(item, "category", "") or "").strip(),
+        "quantity": getattr(item, "quantity", 0),
+        "equipped": bool(getattr(item, "equipped", False)),
+        "metadata": _item_metadata_context(
+            getattr(item, "metadata", {}),
+            include_details=include_details or include_metadata_details,
+        ),
+    }
+    if include_details:
+        context.update(
+            {
+                "description": _compact_text(getattr(item, "description", "")),
+                "value_base_units": getattr(item, "value_base_units", 0),
+            }
+        )
+    return context
+
+
+def _item_catalog_entry_context(item: Any, *, include_details: bool) -> dict[str, Any]:
+    """Builds the compact or targeted context representation of a catalog item."""
+
+    context = {
+        "database_id": getattr(item, "id", None),
+        "name": str(getattr(item, "name", "") or "").strip(),
+        "category": str(getattr(item, "category", "") or "").strip(),
+        "metadata": _item_metadata_context(
+            getattr(item, "metadata", {}),
+            include_details=include_details,
+        ),
+    }
+    if include_details:
+        context.update(
+            {
+                "description": _compact_text(getattr(item, "description", "")),
+                "value_base_units": getattr(item, "value_base_units", 0),
+            }
+        )
+    return context
 
 
 def _npc_context_profile(npc: dict[str, Any]) -> dict[str, Any]:

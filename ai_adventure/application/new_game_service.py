@@ -30,7 +30,6 @@ from ai_adventure.infrastructure.sqlite import SaveRepository
 from ai_adventure.locations import normalize_known_locations
 from ai_adventure.new_game_setup import build_new_game_setup_packet
 from ai_adventure.new_game_setup import (
-    STARTER_INVENTORY_MIN_ITEMS,
     ai_generated_calendar_settings_or_fallback,
     fallback_introductory_message,
     fallback_world_summary,
@@ -224,6 +223,9 @@ class NewGameService:
                 "tts_voice_blend": repository.get_setting(
                     "audio.tts_voice_blend", {}
                 ),
+                "player_tts_voice": repository.get_setting(
+                    "audio.player_tts_voice", "ai"
+                ),
             }
         )
         speaker_cues, assignments = assign_speaker_voices(
@@ -233,6 +235,13 @@ class NewGameService:
             existing_assignments=repository.get_setting(
                 "audio.speaker_voice_assignments", {}
             ),
+            player_speaker_ids={
+                "player",
+                "player_character",
+                str(setup.get("character", {}).get("name", "")).casefold(),
+            },
+            player_pronouns=setup.get("character", {}).get("pronouns", "They/Them"),
+            player_voice=audio["player_tts_voice"],
         )
         repository.set_setting("audio.speaker_voice_assignments", assignments)
 
@@ -645,18 +654,12 @@ def _travel_locations_for_save(
             parent_location = str(
                 raw_requested_location.get("parent_location", "") or ""
             ).strip()
-            if bool(raw_requested_location.get("is_sublocation")) and parent_location:
-                relationship_note = f"Located within {parent_location}."
-                existing_notes = str(
-                    matched_location.get("travel_notes", "") or ""
-                ).strip()
-                if (
-                    "located within " not in existing_notes.casefold()
-                    and relationship_note.casefold() not in existing_notes.casefold()
-                ):
-                    matched_location["travel_notes"] = " ".join(
-                        value for value in [existing_notes, relationship_note] if value
-                    )
+            matched_location["is_sublocation"] = bool(
+                raw_requested_location.get("is_sublocation")
+            ) and bool(parent_location)
+            matched_location["parent_location"] = (
+                parent_location if matched_location["is_sublocation"] else ""
+            )
 
     requested_location = str(setup.get("start_location", "") or "").strip()
     ai_location = str(getattr(result, "start_location", "") or "").strip()
@@ -1034,10 +1037,6 @@ def _starter_items_for_save(
     for index, setup_item in enumerate(setup_items):
         if index in used_source_indexes or not isinstance(setup_item, dict):
             continue
-        if bool(setup_item.get("requires_ai_invention")) and len(
-            completed_items
-        ) >= STARTER_INVENTORY_MIN_ITEMS:
-            continue
         fallback_item = _fallback_starter_item_from_setup(
             setup_item, source_index=index
         )
@@ -1046,27 +1045,13 @@ def _starter_items_for_save(
         completed_items.append(fallback_item)
         seen_names.add(fallback_item["name"].casefold())
 
-    while len(completed_items) < STARTER_INVENTORY_MIN_ITEMS:
-        fallback_item = _starter_inventory_top_up_item(seen_names)
-        if fallback_item is None:
-            break
-        completed_items.append(fallback_item)
-        seen_names.add(fallback_item["name"].casefold())
-
     if len(completed_items) > original_completed_count:
         added_count = len(completed_items) - original_completed_count
-        if original_completed_count < STARTER_INVENTORY_MIN_ITEMS:
-            LOGGER.warning(
-                "Gemini returned fewer than %s complete starter item(s); added %s "
-                "fallback item(s) so the new save starts with enough inventory.",
-                STARTER_INVENTORY_MIN_ITEMS,
-                added_count,
-            )
-        else:
-            LOGGER.warning(
-                "Gemini omitted %s explicit starter item(s); preserved named setup item(s).",
-                added_count,
-            )
+        LOGGER.warning(
+            "Gemini omitted or partially finalized %s starter item(s); preserved "
+            "the corresponding setup item(s).",
+            added_count,
+        )
     return completed_items
 
 

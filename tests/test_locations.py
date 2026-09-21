@@ -77,6 +77,23 @@ class LocationTests(unittest.TestCase):
         self.assertEqual(locations[0].description, "A paved road.")
         self.assertEqual((locations[0].x_miles, locations[0].y_miles), (4.0, 2.0))
 
+    def test_normalize_known_locations_migrates_legacy_sublocation_notes(self) -> None:
+        locations = normalize_known_locations(
+            [
+                {
+                    "name": "Nexus Arena Lobby",
+                    "description": "A staging lobby.",
+                    "travel_notes": (
+                        "Reached by teleporter. Located within Aegis Core City."
+                    ),
+                }
+            ]
+        )
+
+        self.assertTrue(locations[0].is_sublocation)
+        self.assertEqual(locations[0].parent_location, "Aegis Core City")
+        self.assertEqual(locations[0].travel_notes, "Reached by teleporter.")
+
 
 if __name__ == "__main__":
     unittest.main()

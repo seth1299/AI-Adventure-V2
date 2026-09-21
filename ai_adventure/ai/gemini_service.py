@@ -57,7 +57,6 @@ from ai_adventure.audio.catalog import (
 )
 from ai_adventure.audio.voices import VOICE_PROFILE_OPTIONS
 from ai_adventure.locations import clean_player_location_name, normalize_known_locations
-from ai_adventure.new_game_setup import STARTER_INVENTORY_MIN_ITEMS
 from ai_adventure.skills.rules import MAX_SKILL_LEVEL
 from ai_adventure.text_sanitization import (
     sanitize_english_text,
@@ -1141,6 +1140,8 @@ EVENT_RESPONSE_SCHEMA: dict[str, Any] = {
                 "terrain": {"type": "string"},
                 "travel_multiplier": {"type": "number", "minimum": 0.1, "maximum": 3.0},
                 "travel_notes": {"type": "string"},
+                "is_sublocation": {"type": "boolean"},
+                "parent_location": {"type": "string"},
             },
             [
                 "name",
@@ -1465,9 +1466,9 @@ SPEAKER_CUE_RESPONSE_SCHEMA: dict[str, Any] = {
     "type": "array",
     "description": (
         "Exact non-narrator spoken spans used for visible speaker chat bubbles and "
-        "local multi-voice TTS. Return one entry for every contiguous NPC or other "
-        "non-player speaker passage; return an empty array when only the narrator "
-        "speaks."
+        "local multi-voice TTS. Return one entry for every contiguous NPC, Player "
+        "Character, or other non-narrator speaker passage; return an empty array "
+        "when only the narrator speaks."
     ),
     "maxItems": 40,
     "items": {
@@ -1483,7 +1484,8 @@ SPEAKER_CUE_RESPONSE_SCHEMA: dict[str, Any] = {
             "speaker_id": {
                 "type": "string",
                 "description": (
-                    "Exact canonical npc_id for an actual NPC; otherwise one stable "
+                    "Exact canonical npc_id for an actual NPC; use the literal "
+                    "player_character for the Player Character; otherwise one stable "
                     "lower_snake_case identity for the distinct incidental speaker."
                 ),
             },
@@ -1499,7 +1501,10 @@ SPEAKER_CUE_RESPONSE_SCHEMA: dict[str, Any] = {
                 "enum": list(VOICE_PROFILE_OPTIONS),
                 "description": (
                     "Broad audible delivery grounded in established speaker traits. "
-                    "Use neutral when no fitting profile is established."
+                    "For player_character, follow setup.character.pronouns: She/Her "
+                    "uses feminine, He/Him uses masculine, and They/Them or custom "
+                    "pronouns use neutral. Use neutral when no fitting profile is "
+                    "established."
                 ),
             },
         },
@@ -1813,15 +1818,23 @@ NEW_GAME_RESPONSE_JSON_SCHEMA: dict[str, Any] = {
                 "type": "object",
                 "properties": {
                     "name": {"type": "string"},
-                    "description": {"type": "string"},
+                    "description": {
+                        "type": "string",
+                        "description": (
+                            "Generic player-facing description of one representative "
+                            "item. Describe its form, materials, visible traits, and "
+                            "condition without mentioning the stack quantity, a count, "
+                            "plural batch, or image-generation instructions."
+                        ),
+                    },
                     "x_miles": {"type": "number"},
                     "y_miles": {"type": "number"},
                     "terrain": {"type": "string"},
                     "travel_multiplier": {"type": "number", "minimum": 0.1, "maximum": 3.0},
                     "travel_notes": {"type": "string"},
-                    "source_index": {"type": "integer", "minimum": -1},
                     "is_sublocation": {"type": "boolean"},
                     "parent_location": {"type": "string"},
+                    "source_index": {"type": "integer", "minimum": -1},
                 },
                 "required": [
                     "name",
@@ -1980,7 +1993,6 @@ NEW_GAME_RESPONSE_JSON_SCHEMA: dict[str, Any] = {
         },
         "starting_items": {
             "type": "array",
-            "minItems": STARTER_INVENTORY_MIN_ITEMS,
             "items": {
                 "type": "object",
                 "properties": {
@@ -3377,7 +3389,10 @@ def _project_story_state(context_packet: dict[str, Any]) -> dict[str, Any]:
     projected: dict[str, Any] = {}
     for key in ("adventure_title", "player", "player_ai_preferences", "scene", "world_profile"):
         if key in source:
-            projected[key] = source[key]
+            if key == "player_ai_preferences":
+                projected[key] = _story_player_preferences(source[key])
+            else:
+                projected[key] = source[key]
     for key, required_tags in _STORY_STATE_TAGS.items():
         value = source.get(key)
         if key == "combat" and isinstance(value, dict) and value.get("active"):
@@ -3391,7 +3406,7 @@ def _project_story_state(context_packet: dict[str, Any]) -> dict[str, Any]:
             continue
         if key == "gm_secrets" and value.get("active"):
             projected[key] = value
-        elif key in {"merchant", "event_audit"} and value:
+        elif key == "merchant" and "merchant" in tags and value:
             projected[key] = value
         elif key in {"npcs", "party", "bestiary"} and value.get("relevant", value.get("members", value.get("entries", []))):
             projected[key] = value
@@ -3413,6 +3428,29 @@ def _project_story_state(context_packet: dict[str, Any]) -> dict[str, Any]:
                 projected["miscellaneous"] = {**miscellaneous, "entries": selected_entries}
 
     return projected
+
+
+def _story_player_preferences(value: Any) -> dict[str, Any]:
+    """Keeps only preference fields not already rendered in the presentation block."""
+
+    if not isinstance(value, dict):
+        return {}
+    allowed_fields = (
+        "additional_context",
+        "narration_tense_label",
+        "narration_style_label",
+        "narration_style_rules",
+        "model_tone_label",
+        "model_tone_instruction",
+        "response_length_label",
+        "response_length_instruction",
+        "model_content_rules",
+    )
+    return {
+        key: value[key]
+        for key in allowed_fields
+        if key in value
+    }
 
 
 def _story_prompt_packet(context_packet: dict[str, Any]) -> dict[str, Any]:
@@ -3521,11 +3559,13 @@ def _build_xml_new_game_prompt(setup_packet: dict[str, Any]) -> str:
                 "anchor_text: copy it verbatim from introductory_message. Use the "
                 "exact starting_npcs npc_id as speaker_id for an actual NPC, reuse "
                 "the same ID for the same person, and use distinct stable "
-                "lower_snake_case IDs for incidental speakers. speaker_name is a "
+                "lower_snake_case IDs for incidental speakers. For Player Character "
+                "dialogue, use speaker_id player_character and follow setup.character.pronouns. "
+                "speaker_name is a "
                 "visible bubble label, so use the known name or a concise player-safe "
                 "description when the name is unknown. Ground voice_profile "
                 "in established audible traits and use neutral when unspecified. Do "
-                "not cue narrator prose or player-character dialogue. If the setup includes "
+                "not cue narrator prose. If the setup includes "
                 "opening_scene_request, treat it as optional player-authored guidance "
                 "for the first scene at the selected start_location: honor its intent "
                 "when coherent, but write finalized in-world narration instead of "
@@ -7613,14 +7653,6 @@ def _parse_new_game_locations(
                 relationship_aware_locations.append(raw_location)
                 continue
             location = dict(raw_location)
-            parent_location = str(location.get("parent_location", "") or "").strip()
-            if bool(location.get("is_sublocation")) and parent_location:
-                relationship_note = f"Located within {parent_location}."
-                travel_notes = str(location.get("travel_notes", "") or "").strip()
-                if relationship_note.casefold() not in travel_notes.casefold():
-                    location["travel_notes"] = " ".join(
-                        value for value in (travel_notes, relationship_note) if value
-                    )
             relationship_aware_locations.append(location)
 
     locations = normalize_known_locations(relationship_aware_locations)

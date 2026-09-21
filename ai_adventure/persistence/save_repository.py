@@ -181,6 +181,7 @@ class SaveRepository:
         repository.set_setting("audio.background_ambience_volume", 15)
         repository.set_setting("audio.tts_volume", 90)
         repository.set_setting("audio.tts_voice", DEFAULT_NARRATOR_VOICE)
+        repository.set_setting("audio.player_tts_voice", "ai")
         repository.set_setting("audio.tts_speed", 100)
         repository.set_setting("audio.tts_voice_mode", "preset")
         repository.set_setting(
@@ -316,6 +317,7 @@ class SaveRepository:
         )
         self.set_setting("audio.tts_volume", int(audio_settings["tts_volume"]))
         self.set_setting("audio.tts_voice", audio_settings["tts_voice"])
+        self.set_setting("audio.player_tts_voice", audio_settings["player_tts_voice"])
         self.set_setting("audio.tts_speed", int(audio_settings["tts_speed"]))
         self.set_setting("audio.tts_voice_mode", audio_settings["tts_voice_mode"])
         self.set_setting("audio.tts_voice_blend", audio_settings["tts_voice_blend"])

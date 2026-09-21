@@ -1171,14 +1171,16 @@ class NewGameWizard(QWizard):
         widget = QWidget()
         layout = QVBoxLayout(widget)
         layout.setContentsMargins(0, 2, 0, 2)
-        layout.setSpacing(2)
+        # Keep the rating rows readable when the application font is enlarged.
+        # A fixed 17 px height lets the format text overlap the neighboring row.
+        layout.setSpacing(6)
         for key in ("cost_rating", "intelligence_rating", "speed_rating"):
             bar = QProgressBar()
             bar.setObjectName(f"model_{key}")
             bar.setRange(0, 10)
             bar.setValue(0)
             bar.setTextVisible(True)
-            bar.setFixedHeight(17)
+            bar.setMinimumHeight(max(24, bar.fontMetrics().height() + 8))
             layout.addWidget(bar)
         return widget
 

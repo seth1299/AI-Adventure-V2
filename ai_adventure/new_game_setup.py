@@ -36,7 +36,9 @@ SKILL_PRESET_LEVEL_PLANS: dict[str, list[int]] = {
     "blank": [],
 }
 SKILL_LEVEL_PLAN = SKILL_PRESET_LEVEL_PLANS["professional"]
-STARTER_INVENTORY_MIN_ITEMS = 5
+# Kept as a compatibility constant for callers that import it. Starting
+# inventory may legitimately contain zero or any positive number of items.
+STARTER_INVENTORY_MIN_ITEMS = 0
 DEFAULT_STARTING_WEALTH_GUIDANCE = (
     "They should have enough money to cover a few meals."
 )
@@ -802,10 +804,15 @@ def build_new_game_setup_packet(
                 "travel_notes, NPC details, tasks, "
                 "secrets, and opening prose; never reuse the superseded setup "
                 "placeholder or suggestion name. "
-                "If is_sublocation is true and parent_location is set, treat the "
-                "location as existing inside that parent location; reflect that "
-                "relationship in the returned location description and travel_notes "
-                "without creating a separate hidden route. "
+                "If is_sublocation is true and parent_location is set, preserve "
+                "those structured fields and do not repeat the relationship in the "
+                "description or travel_notes; the application displays it separately. "
+                "For every non-exact generated location description, write at least "
+                "two complete player-facing sentences with concrete visual and "
+                "sensory details such as layout, scale, architecture, materials, "
+                "landmarks, activity, lighting, terrain, or weather. Make it useful "
+                "for an artist to understand the place, but write natural setting "
+                "prose rather than an image-generation prompt or keyword list. "
                 "For an unknown crash-landing, isolated survival, amnesia, or "
                 "new-arrival premise, it is valid for the only known location to "
                 "be the finalized starting location at x_miles=0 and y_miles=0. "
@@ -895,11 +902,10 @@ def build_new_game_setup_packet(
             ),
             "starter_inventory": (
                 "Return finalized inventory in the starting_items field, never in "
-                "starting_inventory. starting_items must contain at least five "
-                "total tracked possessions and has no maximum count. Include any "
-                "player-requested items, then invent enough additional concrete "
-                "items that fit the finalized character, genre, starting location, "
-                "weather, and opening situation to reach the minimum. "
+                "starting_inventory. There is no fixed minimum; there is no maximum count "
+                "of tracked possessions. Preserve every player-requested starter "
+                "item and never invent filler merely to reach five items. If no "
+                "starter items were supplied, return an empty starting_items array. "
                 "First identify the activities, responsibilities, and goals that "
                 "the player emphasizes in the character description, backstory, "
                 "notes, profession, and skills. Prioritize concrete tools and "
@@ -955,7 +961,12 @@ def build_new_game_setup_packet(
                 "state concrete visible traits beyond the name: form, approximate "
                 "size, color, material, texture, markings, condition, opacity or "
                 "translucency, and any visible changes under relevant conditions such "
-                "as sunlight, darkness, heat, or moisture. Never make the name alone "
+                "as sunlight, darkness, heat, or moisture. Descriptions describe one "
+                "representative item and must remain quantity-neutral: never mention "
+                "the item's stack count, number of copies, batch size, or wording such "
+                "as 'ten vials'. Put all quantity information only in quantity and "
+                "quantity_unit. Write ordinary item prose, not an image-generation "
+                "prompt, shot list, or keyword sequence. Never make the name alone "
                 "carry the item's visual identity."
             ),
             "currency_generation": (
@@ -1046,8 +1057,9 @@ def build_new_game_setup_packet(
             "requested_item_count": starter_item_count,
             "minimum_finalized_item_count": STARTER_INVENTORY_MIN_ITEMS,
             "count_rule": (
-                "At least 5 finalized starting items are required; there is no "
-                "maximum starting item count."
+                "There is no fixed starting-item count. Preserve all supplied "
+                "starter items, do not add filler to reach five, and allow an "
+                "empty starting_items array when none were supplied."
             ),
             "output_field": "starting_items",
             "alias_not_allowed": "starting_inventory",

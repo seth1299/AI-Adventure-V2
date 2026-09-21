@@ -81,6 +81,7 @@ class AudioPreferencesService:
                 "narrator_enabled": narrator_enabled,
                 "tts_volume": get("audio.tts_volume", 90),
                 "tts_voice": get("audio.tts_voice", DEFAULT_NARRATOR_VOICE),
+                "player_tts_voice": get("audio.player_tts_voice", "ai"),
                 "tts_speed": get("audio.tts_speed", DEFAULT_TTS_SPEED_PERCENT),
                 "tts_voice_mode": get("audio.tts_voice_mode", "preset"),
                 "tts_voice_blend": get("audio.tts_voice_blend", {}),

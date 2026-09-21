@@ -509,6 +509,18 @@ class VisualAssetTests(unittest.TestCase):
         self.assertIn("by itself", item_prompt)
         self.assertIn("do not show a person, face, body, hand, arm", item_prompt)
 
+    def test_inventory_image_prompt_uses_one_quantity_neutral_representative_item(self) -> None:
+        request = VisualAssetRequest(
+            subject_type="inventory",
+            subject_key="glass_vial",
+            display_name="Glass Vial",
+            description="A clear glass vial with a cork stopper.",
+        )
+
+        self.assertIn("exactly one representative item", request.prompt)
+        self.assertIn("never depict a stack, group, or repeated copies", request.prompt)
+        self.assertIn("generic item-trait metadata", request.prompt)
+
     def test_image_prompts_avoid_synthetic_visual_tells(self) -> None:
         prompt = VisualAssetRequest(
             subject_type="location",

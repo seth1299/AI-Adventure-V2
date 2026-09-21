@@ -45,14 +45,14 @@ class NpcsScreen(RepositoryBackedWidget):
             reverse=_sort_descending(self._sort_order),
         )
         self._npcs_by_id = {
-            str(npc.get("npc_id", "") or "").strip(): dict(npc)
+            self._npc_id(npc): dict(npc)
             for npc in npcs
-            if str(npc.get("npc_id", "") or "").strip()
+            if self._npc_id(npc)
         }
         self.table.setRowCount(len(npcs))
 
         for row_index, npc in enumerate(npcs):
-            npc_id = str(npc.get("npc_id", "") or "").strip()
+            npc_id = self._npc_id(npc)
             values = (
                 str(npc.get("display_name", "Unknown NPC")),
                 str(npc.get("location", "")),
@@ -67,7 +67,7 @@ class NpcsScreen(RepositoryBackedWidget):
             portrait.setMargin(4)
             asset = repository.get_visual_asset(
                 "npc",
-                str(npc.get("npc_id", "") or "").casefold(),
+                npc_id.casefold(),
             )
             if _set_generated_image(
                 portrait,
@@ -137,3 +137,9 @@ class NpcsScreen(RepositoryBackedWidget):
             return str(npc.get("notes", "")).casefold(), name
 
         return name, name
+
+    @staticmethod
+    def _npc_id(npc: dict[str, Any]) -> str:
+        """Returns the stable ID from either supported NPC record shape."""
+
+        return str(npc.get("npc_id") or npc.get("id") or "").strip()

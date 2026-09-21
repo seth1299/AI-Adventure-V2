@@ -347,6 +347,9 @@ def _resolve_speaker_cues_for_repository(
             "tts_voice_blend": repository.get_setting(
                 "audio.tts_voice_blend", {}
             ),
+            "player_tts_voice": repository.get_setting(
+                "audio.player_tts_voice", "ai"
+            ),
         }
     )
     voice_options = _narrator_voice_options(narration_player)
@@ -359,6 +362,13 @@ def _resolve_speaker_cues_for_repository(
         narrator_voice=active_voice_spec_from_audio(tts_audio),
         available_voice_ids=list(voice_options.values()),
         existing_assignments=existing_assignments,
+        player_speaker_ids={
+            "player",
+            "player_character",
+            str(repository.get_setting("player_name", "")).casefold(),
+        },
+        player_pronouns=repository.get_setting("player.pronouns", "They/Them"),
+        player_voice=tts_audio["player_tts_voice"],
     )
     if assignments != existing_assignments:
         repository.set_setting("audio.speaker_voice_assignments", assignments)

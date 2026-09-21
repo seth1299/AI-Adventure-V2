@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from PySide6.QtWidgets import QFileDialog
+
 from ai_adventure.ui.common import *  # noqa: F401,F403
 
 
@@ -135,15 +137,29 @@ class NewGameImageSourceDialog(QDialog):
     def _choose_file(self, request: VisualAssetRequest) -> None:
         """Prompts for and stores one player-selected image."""
 
-        file_path, _selected_filter = QFileDialog.getOpenFileName(
-            self,
-            f"Choose an image for {request.display_name}",
-            "",
-            "Images (*.png *.jpg *.jpeg *.webp *.bmp);;All Files (*)",
+        # Use Qt's editable file dialog so a complete path can be pasted into
+        # the location/file-name field. The native Windows picker exposes a
+        # breadcrumb address bar but does not reliably allow path editing.
+        dialog = QFileDialog(self, f"Choose an image for {request.display_name}")
+        dialog.setFileMode(QFileDialog.FileMode.ExistingFile)
+        dialog.setNameFilters(
+            ["Images (*.png *.jpg *.jpeg *.webp *.bmp)", "All Files (*)"]
         )
-        if not file_path:
+        dialog.setOption(QFileDialog.Option.DontUseNativeDialog, True)
+        dialog.setWindowModality(Qt.WindowModality.ApplicationModal)
+        dialog.setModal(True)
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+        if dialog.exec() != QDialog.DialogCode.Accepted:
             return
-        success, message = self._choose_file_callback(request, Path(file_path))
+        selected_files = dialog.selectedFiles()
+        if not selected_files:
+            return
+        success, message = self._choose_file_callback(
+            request,
+            Path(selected_files[0]),
+        )
         if success:
             self._set_resolved(request, "Using uploaded image")
         else:

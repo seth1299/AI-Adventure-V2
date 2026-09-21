@@ -1018,6 +1018,7 @@ class SettingsScreen(RepositoryBackedWidget):
                 "narrator_enabled": repository.get_setting("audio.narrator_enabled", True),
                 "tts_volume": repository.get_setting("audio.tts_volume", 90),
                 "tts_voice": repository.get_setting("audio.tts_voice", DEFAULT_NARRATOR_VOICE),
+                "player_tts_voice": repository.get_setting("audio.player_tts_voice", "ai"),
                 "tts_speed": repository.get_setting(
                     "audio.tts_speed",
                     DEFAULT_TTS_SPEED_PERCENT,
@@ -1052,6 +1053,7 @@ class SettingsScreen(RepositoryBackedWidget):
             repository.set_setting("audio.narrator_enabled", audio["narrator_enabled"])
             repository.set_setting("audio.tts_volume", audio["tts_volume"])
             repository.set_setting("audio.tts_voice", audio["tts_voice"])
+            repository.set_setting("audio.player_tts_voice", audio["player_tts_voice"])
             repository.set_setting("audio.tts_speed", audio["tts_speed"])
             repository.set_setting("audio.tts_voice_mode", audio["tts_voice_mode"])
             repository.set_setting("audio.tts_voice_blend", audio["tts_voice_blend"])

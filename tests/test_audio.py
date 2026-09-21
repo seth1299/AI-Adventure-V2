@@ -26,6 +26,7 @@ from ai_adventure.audio.ssmd import strip_ssmd_markup_for_plain_tts
 from ai_adventure.audio.tts_settings import (
     build_voice_blend_spec,
     merge_custom_voices,
+    normalize_tts_audio_fields,
     normalize_custom_voices,
     normalize_narrator_voice_spec,
     parse_voice_blend_spec,
@@ -52,6 +53,20 @@ from ai_adventure.audio.tts.tts_manager import (
 
 
 class AudioTests(unittest.TestCase):
+    def test_music_volume_normalizes_one_percent_without_full_volume_jump(self) -> None:
+        manager = SoundManager.__new__(SoundManager)
+        manager._initialized = False
+        manager._pygame = None
+
+        for requested, expected in (
+            (0, 0.0),
+            (1, 0.01),
+            (2, 0.02),
+            (100, 1.0),
+        ):
+            manager.set_music_volume(requested)
+            self.assertAlmostEqual(manager.music_volume, expected)
+
     def test_phonemizer_filter_suppresses_only_known_summary_warning(self) -> None:
         warning_filter = _BenignPhonemizerWarningFilter()
         benign = logging.LogRecord(
@@ -114,6 +129,53 @@ class AudioTests(unittest.TestCase):
         )
         self.assertEqual(replayed[0]["voice_id"], resolved[0]["voice_id"])
         self.assertEqual(replay_assignments, assignments)
+
+    def test_player_voice_assignment_honors_pronouns_when_ai_chooses(self) -> None:
+        cues = [{
+            "anchor_text": '"I will go."',
+            "speaker_id": "player_character",
+            "speaker_name": "Alex",
+            "voice_profile": "masculine",
+        }]
+
+        resolved, _assignments = assign_speaker_voices(
+            cues,
+            narrator_voice="am_echo",
+            available_voice_ids=["af_sarah", "af_bella", "am_echo", "am_onyx"],
+            player_pronouns="She/Her",
+            player_voice="ai",
+        )
+
+        self.assertEqual(resolved[0]["voice_profile"], "feminine")
+        self.assertIn(resolved[0]["voice_id"], {"af_sarah", "af_bella"})
+
+    def test_player_voice_assignment_accepts_explicit_voice(self) -> None:
+        cues = [{
+            "anchor_text": '"I will go."',
+            "speaker_id": "player",
+            "speaker_name": "Alex",
+            "voice_profile": "feminine",
+        }]
+
+        resolved, _assignments = assign_speaker_voices(
+            cues,
+            narrator_voice="af_sarah",
+            available_voice_ids=["af_sarah", "am_echo", "am_onyx"],
+            player_pronouns="She/Her",
+            player_voice="am_onyx",
+        )
+
+        self.assertEqual(resolved[0]["voice_id"], "am_onyx")
+
+    def test_player_voice_setting_defaults_to_pronoun_aware_ai(self) -> None:
+        audio = normalize_tts_audio_fields({})
+        self.assertEqual(audio["player_tts_voice"], "ai")
+        self.assertEqual(
+            normalize_tts_audio_fields({"player_tts_voice": "am_onyx"})[
+                "player_tts_voice"
+            ],
+            "am_onyx",
+        )
 
     def test_local_replay_forwards_sound_cues_to_narration(self) -> None:
         player = NarrationPlayer.__new__(NarrationPlayer)

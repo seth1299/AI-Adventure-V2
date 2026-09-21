@@ -31,7 +31,6 @@ from ai_adventure.combat import (
 from ai_adventure.currency import describe_currency_denominations, format_currency_amount
 from ai_adventure.new_game_setup import (
     GREGORIAN_CALENDAR_SETTINGS,
-    STARTER_INVENTORY_MIN_ITEMS,
     normalize_economy_examples,
 )
 from ai_adventure.ui.primitives import (

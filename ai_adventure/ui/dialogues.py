@@ -486,6 +486,18 @@ class TTSSettingsWidget(QWidget):
             voice_options=self.voice_options,
         )
 
+        self.player_voice_combo = _NoWheelComboBox()
+        _populate_narrator_voice_combo(
+            self.player_voice_combo,
+            DEFAULT_NARRATOR_VOICE,
+            voice_options=self.voice_options,
+        )
+        self.player_voice_combo.insertItem(
+            0,
+            "A.I. chooses (pronoun-aware)",
+            "ai",
+        )
+
         self.custom_voice_summary_label = QLabel("Current Blend")
         self.custom_voice_summary_label.setWordWrap(True)
         self.custom_voice_button = QPushButton("Custom Voices...")
@@ -508,6 +520,7 @@ class TTSSettingsWidget(QWidget):
         form.addRow("Speed:", self.tts_speed_row)
         form.addRow("Voice Source:", self.voice_mode_combo)
         form.addRow("Preset Voice:", self.preset_voice_combo)
+        form.addRow("Player Character Voice:", self.player_voice_combo)
         form.addRow("Custom Voice:", self.custom_voice_row)
         form.addRow("", self.voice_button_row)
         self.setLayout(form)
@@ -527,6 +540,7 @@ class TTSSettingsWidget(QWidget):
             self.tts_speed_slider.setValue(normalize_tts_speed_percent(audio["tts_speed"]))
             _set_combo_to_data(self.voice_mode_combo, audio["tts_voice_mode"])
             _set_combo_to_data(self.preset_voice_combo, audio["tts_voice"])
+            _set_combo_to_data(self.player_voice_combo, audio["player_tts_voice"])
         finally:
             self._loading_tts_settings = False
 
@@ -545,6 +559,7 @@ class TTSSettingsWidget(QWidget):
                 "tts_voice_mode": self.voice_mode_combo.currentData() or "preset",
                 "tts_voice_blend": self._current_blend(),
                 "tts_custom_voices": self.custom_voices,
+                "player_tts_voice": self.player_voice_combo.currentData() or "ai",
             }
         )
 
@@ -648,6 +663,7 @@ class TTSSettingsWidget(QWidget):
             widget.setEnabled(checked)
 
         self.preset_voice_combo.setEnabled(preset_visible)
+        self.player_voice_combo.setEnabled(checked)
         self.custom_voice_button.setEnabled(checked)
         self.sample_voice_button.setEnabled(checked and self.on_sample_voice is not None)
 
@@ -660,6 +676,7 @@ class TTSSettingsWidget(QWidget):
             self._set_form_field_visible(field, checked)
 
         self._set_form_field_visible(self.preset_voice_combo, preset_visible)
+        self._set_form_field_visible(self.player_voice_combo, checked)
         self._set_form_field_visible(self.custom_voice_row, custom_visible)
 
     def _set_form_field_visible(self, field: QWidget, visible: bool) -> None:

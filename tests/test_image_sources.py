@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import os
 import unittest
+from pathlib import Path
+from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtWidgets import QApplication, QLabel
+from PySide6.QtWidgets import QApplication, QDialog, QFileDialog, QLabel
 
 from ai_adventure.ui.image_sources import NewGameImageSourceDialog
 from ai_adventure.visual_assets import VisualAssetRequest
@@ -79,6 +81,70 @@ class NewGameImageSourceDialogTests(unittest.TestCase):
         self.assertIsNone(row[2])
         self.assertIn("Choose a local image", dialog.findChildren(QLabel)[1].text())
         row[3].click()
+        self.assertTrue(dialog.continue_button.isEnabled())
+        dialog.deleteLater()
+
+    def test_choose_file_button_opens_picker_and_forwards_selected_path(self) -> None:
+        request = VisualAssetRequest(
+            subject_type="player",
+            subject_key="player_1",
+            display_name="Kit Vale",
+            description="A scout in pale armor.",
+        )
+        selected_path = Path("C:/Images/kit.png")
+        chosen: list[tuple[VisualAssetRequest, Path]] = []
+
+        class FakeFileDialog:
+            FileMode = QFileDialog.FileMode
+            Option = QFileDialog.Option
+
+            def __init__(self, *_args: object, **_kwargs: object) -> None:
+                pass
+
+            def setFileMode(self, _mode: object) -> None:
+                pass
+
+            def setNameFilters(self, _filters: object) -> None:
+                pass
+
+            def setOption(self, _option: object, _enabled: bool) -> None:
+                pass
+
+            def setWindowModality(self, _modality: object) -> None:
+                pass
+
+            def setModal(self, _modal: bool) -> None:
+                pass
+
+            def show(self) -> None:
+                pass
+
+            def raise_(self) -> None:
+                pass
+
+            def activateWindow(self) -> None:
+                pass
+
+            def exec(self) -> int:
+                return int(QDialog.DialogCode.Accepted)
+
+            def selectedFiles(self) -> list[str]:
+                return [str(selected_path)]
+
+        dialog = NewGameImageSourceDialog(
+            [request],
+            choose_file=lambda current_request, path: (
+                chosen.append((current_request, path)) or (True, "")
+            ),
+            create_image=None,
+            skip_image=lambda _request: None,
+        )
+
+        with patch("ai_adventure.ui.image_sources.QFileDialog", FakeFileDialog):
+            dialog._rows[request.asset_id][1].click()
+
+        self.assertEqual(chosen, [(request, selected_path)])
+        self.assertEqual(dialog._rows[request.asset_id][0].text(), "Using uploaded image")
         self.assertTrue(dialog.continue_button.isEnabled())
         dialog.deleteLater()
 
