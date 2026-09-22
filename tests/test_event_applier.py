@@ -379,6 +379,50 @@ class EventApplierTests(unittest.TestCase):
             self.assertNotIn("Old Brass Light", {item["name"] for item in catalog})
             self.assertNotIn("ascii_art", catalog_lantern)
 
+    def test_inventory_item_added_canonicalizes_unique_container_shorthand(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = SaveRepository.create_new_save(
+                Path(temp_dir),
+                "Storage Identity Test",
+            )
+            repository.add_inventory_item(
+                "Woven Willow Foraging Basket",
+                "Container",
+                1,
+                "A sturdy willow basket.",
+                4,
+                metadata={
+                    "item_type": "Container",
+                    "storage_location": "actively_carried",
+                },
+            )
+
+            result = EventApplier(repository).apply_event(
+                {
+                    "type": "InventoryItemAddedEvent",
+                    "payload": {
+                        "item_type": "Material",
+                        "item_name": "Madder Root",
+                        "description": "Roots used to make red dye.",
+                        "amount": 2,
+                        "quantity_unit": "bundles",
+                        "storage_location": "basket",
+                        "value_base_units": 15,
+                    },
+                }
+            )
+
+            root = next(
+                item
+                for item in repository.list_inventory_items()
+                if item["name"] == "Madder Root"
+            )
+            self.assertEqual(result.status, "applied")
+            self.assertEqual(
+                root["storage_location"],
+                "Woven Willow Foraging Basket",
+            )
+
     def test_inventory_item_added_drops_legacy_art_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             repository = SaveRepository.create_new_save(

@@ -637,6 +637,9 @@ EVENT_RESPONSE_SCHEMA: dict[str, Any] = {
                     "maxLength": 120,
                     "description": (
                         "Free-text storage label independent of Travel-tab locations. "
+                        "When state.inventory.storage_locations contains the intended "
+                        "destination, copy that exact established label; never shorten, "
+                        "recapitalize, or paraphrase it. "
                         "Use actively_carried only when the Player Character is carrying "
                         "the item; otherwise use a concise label such as home, car, "
                         "workshop, or office."
@@ -708,7 +711,9 @@ EVENT_RESPONSE_SCHEMA: dict[str, Any] = {
                     "description": (
                         "New free-text storage label for this existing item. Use this "
                         "for moving an item between places; never remove and re-add "
-                        "the item, and preserve its existing item_uuid."
+                        "the item, and preserve its existing item_uuid. When "
+                        "state.inventory.storage_locations contains the destination, "
+                        "copy that exact established label."
                     ),
                 },
                 "item_uuid": {"type": "string"},
@@ -3427,7 +3432,36 @@ def _project_story_state(context_packet: dict[str, Any]) -> dict[str, Any]:
             if selected_entries:
                 projected["miscellaneous"] = {**miscellaneous, "entries": selected_entries}
 
-    return projected
+    return _without_repeated_state_guidance(projected)
+
+
+_STORY_STATE_GUIDANCE_KEYS = {
+    "rules",
+    "detail_policy",
+    "container_rule",
+    "category_rule",
+    "item_value_rule",
+    "transaction_rule",
+}
+
+
+def _without_repeated_state_guidance(value: Any) -> Any:
+    """Removes prose duplicated by the story response contract.
+
+    The complete internal packet retains this guidance for diagnostics and
+    non-story consumers. The story prompt needs authoritative state plus one
+    copy of the behavioral contract, not another copy nested in state values.
+    """
+
+    if isinstance(value, list):
+        return [_without_repeated_state_guidance(item) for item in value]
+    if not isinstance(value, dict):
+        return value
+    return {
+        key: _without_repeated_state_guidance(item)
+        for key, item in value.items()
+        if key not in _STORY_STATE_GUIDANCE_KEYS
+    }
 
 
 def _story_player_preferences(value: Any) -> dict[str, Any]:

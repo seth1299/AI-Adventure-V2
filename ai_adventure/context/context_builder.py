@@ -297,6 +297,7 @@ class AiContextBuilder:
             for item in referenced_items
             if _item_is_referenced(item, clean_command)
         }
+        storage_aliases = _inventory_storage_aliases(state.inventory.items)
         if detailed_item_names:
             # Exploration verbs such as "inspect" do not otherwise select the
             # inventory projection, but an explicit item name makes it relevant.
@@ -622,6 +623,7 @@ class AiContextBuilder:
                     "items": [
                         _inventory_item_context(
                             item,
+                            storage_aliases=storage_aliases,
                             include_details=_item_context_identity(item)
                             in detailed_item_names,
                             include_metadata_details=_item_is_operationally_relevant(
@@ -632,6 +634,9 @@ class AiContextBuilder:
                         )
                         for item in state.inventory.items[:MAX_INVENTORY_CONTEXT_ITEMS]
                     ],
+                    "storage_locations": _inventory_storage_locations(
+                        state.inventory.items
+                    ),
                     "detail_policy": (
                         "Inventory rows are compact by default: use name, category, "
                         "quantity, equipped state, storage location, quantity unit, "
@@ -700,7 +705,9 @@ class AiContextBuilder:
                         "into duplicate definitions because of name variations. "
                         "For storage moves, use InventoryItemModifiedEvent with the "
                         "existing item_uuid and new_storage_location; only use a "
-                        "reachable destination."
+                        "reachable destination. Copy an existing value from "
+                        "state.inventory.storage_locations exactly instead of "
+                        "shortening or paraphrasing it."
                         ),
                     },
                 },
@@ -1811,6 +1818,7 @@ def _inventory_item_context(
     *,
     include_details: bool,
     include_metadata_details: bool = False,
+    storage_aliases: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Builds the compact or targeted context representation of an inventory item."""
 
@@ -1825,6 +1833,12 @@ def _inventory_item_context(
             include_details=include_details or include_metadata_details,
         ),
     }
+    metadata = context.get("metadata")
+    if isinstance(metadata, dict) and storage_aliases:
+        location = str(metadata.get("storage_location", "") or "").strip()
+        canonical = storage_aliases.get(location.casefold())
+        if canonical:
+            metadata["storage_location"] = canonical
     if include_details:
         context.update(
             {
@@ -1833,6 +1847,74 @@ def _inventory_item_context(
             }
         )
     return context
+
+
+def _inventory_storage_locations(items: list[Any]) -> list[str]:
+    """Returns established storage labels and named inventory containers."""
+
+    aliases = _inventory_storage_aliases(items)
+    labels: dict[str, str] = {"actively_carried": "actively_carried"}
+    for item in items:
+        metadata = getattr(item, "metadata", {})
+        if isinstance(metadata, dict):
+            location = str(metadata.get("storage_location", "") or "").strip()
+            if location:
+                canonical = aliases.get(location.casefold(), location)
+                labels.setdefault(canonical.casefold(), canonical)
+        category = str(getattr(item, "category", "") or "").strip().casefold()
+        item_type = str(
+            metadata.get("item_type", "") if isinstance(metadata, dict) else ""
+        ).strip().casefold()
+        if category == "container" or item_type == "container":
+            name = str(getattr(item, "name", "") or "").strip()
+            if name:
+                labels.setdefault(name.casefold(), name)
+    return list(labels.values())
+
+
+def _inventory_storage_aliases(items: list[Any]) -> dict[str, str]:
+    """Maps unambiguous short storage labels to named inventory containers."""
+
+    containers = [
+        str(getattr(item, "name", "") or "").strip()
+        for item in items
+        if (
+            str(getattr(item, "category", "") or "").strip().casefold()
+            == "container"
+            or str(
+                (
+                    getattr(item, "metadata", {}).get("item_type", "")
+                    if isinstance(getattr(item, "metadata", {}), dict)
+                    else ""
+                )
+                or ""
+            ).strip().casefold()
+            == "container"
+        )
+        and str(getattr(item, "name", "") or "").strip()
+    ]
+    aliases: dict[str, str] = {}
+    for item in items:
+        metadata = getattr(item, "metadata", {})
+        if not isinstance(metadata, dict):
+            continue
+        location = str(metadata.get("storage_location", "") or "").strip()
+        key = _storage_context_key(location)
+        if not key or key in {"actively carried", "on person"}:
+            continue
+        matches = {
+            name
+            for name in containers
+            if _storage_context_key(name) == key
+            or _storage_context_key(name).endswith(f" {key}")
+        }
+        if len(matches) == 1:
+            aliases[location.casefold()] = next(iter(matches))
+    return aliases
+
+
+def _storage_context_key(value: str) -> str:
+    return " ".join(re.findall(r"[a-z0-9]+", value.casefold()))
 
 
 def _item_catalog_entry_context(item: Any, *, include_details: bool) -> dict[str, Any]:

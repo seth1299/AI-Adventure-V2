@@ -1002,6 +1002,10 @@ class ContextBuilderTests(unittest.TestCase):
             targeted_packet["state"]["inventory"]["detailed_item_names"],
             ["wooden crate"],
         )
+        self.assertEqual(
+            targeted_packet["state"]["inventory"]["storage_locations"],
+            ["actively_carried", "Wooden Crate"],
+        )
 
     def test_miscellaneous_context_is_always_present_and_uncapped(self) -> None:
         entries = [

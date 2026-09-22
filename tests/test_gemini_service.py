@@ -4184,7 +4184,12 @@ class GeminiServiceTests(unittest.TestCase):
                     },
                     "scene": {"location": "Workshop"},
                     "world_profile": {"genre": "Mystery"},
-                    "inventory": {"items": [{"name": "Key"}]},
+                    "inventory": {
+                        "items": [{"name": "Key"}],
+                        "storage_locations": ["actively_carried", "Key Basket"],
+                        "rules": {"duplicate": "Do not repeat this guidance."},
+                        "detail_policy": "Duplicate detail policy.",
+                    },
                     "merchant": {
                         "active_npc_id": "",
                         "profile": None,
@@ -4200,6 +4205,12 @@ class GeminiServiceTests(unittest.TestCase):
         )
 
         self.assertIn("inventory", packet["state"])
+        self.assertEqual(
+            packet["state"]["inventory"]["storage_locations"],
+            ["actively_carried", "Key Basket"],
+        )
+        self.assertNotIn("rules", packet["state"]["inventory"])
+        self.assertNotIn("detail_policy", packet["state"]["inventory"])
         self.assertNotIn("magic", packet["state"])
         self.assertNotIn("active_tasks", packet["state"])
         self.assertNotIn("miscellaneous", packet["state"])

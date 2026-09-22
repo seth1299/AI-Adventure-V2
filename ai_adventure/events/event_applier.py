@@ -373,6 +373,10 @@ class EventApplier:
         ) or _first_text(payload, "description", "desc")
         quantity_unit = _first_text(payload, "quantity_unit", "unit", "measure_unit") or "each"
         storage_location = _first_text(payload, "storage_location") or "actively_carried"
+        if not owner_npc_id:
+            storage_location = _canonical_inventory_storage_location(
+                self.repository, storage_location
+            )
         value_base_units = max(
             1,
             _first_int(
@@ -513,6 +517,10 @@ class EventApplier:
             payload, "new_storage_location", "storage_location"
         )
         if new_storage_location:
+            if not owner_npc_id:
+                new_storage_location = _canonical_inventory_storage_location(
+                    self.repository, new_storage_location
+                )
             if not _storage_location_is_accessible(
                 self.repository, new_storage_location
             ):
@@ -2658,6 +2666,61 @@ def _storage_location_is_accessible(
         return any(token in current.casefold() for token in ("home", "house"))
 
     return True
+
+
+def _canonical_inventory_storage_location(
+    repository: SaveRepository,
+    destination: str,
+) -> str:
+    """Reuses an established container/storage label for unambiguous shorthand."""
+
+    clean = " ".join(str(destination or "").split())
+    if not clean:
+        return "actively_carried"
+    if clean.casefold() in {"actively_carried", "on_person"}:
+        return clean.casefold()
+
+    items = repository.list_inventory_items()
+    named_containers: list[str] = []
+    stored_labels: list[str] = []
+    for item in items:
+        metadata = item.get("metadata", {})
+        if not isinstance(metadata, dict):
+            metadata = {}
+        location = str(item.get("storage_location", "") or "").strip()
+        if location and location.casefold() not in {"actively_carried", "on_person"}:
+            stored_labels.append(location)
+        category = str(item.get("category", "") or "").strip().casefold()
+        item_type = str(metadata.get("item_type", "") or "").strip().casefold()
+        if category == "container" or item_type == "container":
+            name = str(item.get("name", "") or "").strip()
+            if name:
+                named_containers.append(name)
+
+    target_key = _storage_label_key(clean)
+    suffix_matches = {
+        label
+        for label in named_containers
+        if _storage_label_key(label) == target_key
+        or _storage_label_key(label).endswith(f" {target_key}")
+    }
+    if len(suffix_matches) == 1:
+        return next(iter(suffix_matches))
+
+    exact_matches = {
+        label
+        for label in [*named_containers, *stored_labels]
+        if label.casefold() == clean.casefold()
+    }
+    if len(exact_matches) == 1:
+        return next(iter(exact_matches))
+    return clean
+
+
+def _storage_label_key(value: str) -> str:
+    """Normalizes a storage label for conservative identity matching."""
+
+    return " ".join(re.findall(r"[a-z0-9]+", value.casefold()))
 
 
 def _active_task_defaults(
