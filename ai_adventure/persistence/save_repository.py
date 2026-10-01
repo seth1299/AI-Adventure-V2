@@ -434,6 +434,7 @@ class SaveRepository:
 
         read_only_uri = f"{db_path.resolve().as_uri()}?mode=ro"
         connection = sqlite3.connect(read_only_uri, uri=True)
+        connection.execute("PRAGMA foreign_keys = ON")
         try:
             row = connection.execute(
                 "SELECT value FROM meta WHERE key = ?",
@@ -455,6 +456,7 @@ class SaveRepository:
 
         read_only_uri = f"{db_path.resolve().as_uri()}?mode=ro"
         connection = sqlite3.connect(read_only_uri, uri=True)
+        connection.execute("PRAGMA foreign_keys = ON")
         try:
             row = connection.execute(
                 "SELECT value_json FROM settings WHERE key = ?",
@@ -4433,7 +4435,7 @@ class SaveRepository:
                 ),
             )
 
-    def list_mechanical_events(self) -> list[dict[str, Any]]:
+    def list_mechanical_events(self, *, limit: int | None = None) -> list[dict[str, Any]]:
         """
         Reads mechanical event history.
 
@@ -4441,14 +4443,18 @@ class SaveRepository:
             List of mechanical event dictionaries.
         """
 
+        if limit is not None and limit < 0:
+            raise ValueError("Event limit must be non-negative.")
         with self._connect() as connection:
             rows = connection.execute(
                 """
                 SELECT id, message_id, event_type, payload_json, status, message, created_at
                 FROM mechanical_events
-                ORDER BY id ASC
-                """
+                """ + (" ORDER BY id DESC LIMIT ?" if limit is not None else " ORDER BY id ASC"),
+                (limit,) if limit is not None else (),
             ).fetchall()
+        if limit is not None:
+            rows.reverse()
 
         events: list[dict[str, Any]] = []
 
@@ -4473,23 +4479,34 @@ class SaveRepository:
 
         return events
 
-    def list_history(self) -> list[dict[str, Any]]:
+    def list_history(
+        self, *, limit: int | None = None, before_id: int | None = None,
+        after_id: int | None = None, kinds: tuple[str, ...] | None = None,
+        hidden: bool | None = None,
+    ) -> list[dict[str, Any]]:
         """
-        Reads the full adventure history.
+        Reads history chronologically; a limit selects the newest matching rows.
+
+        ID cursors are exclusive, allowing stable pages while new rows arrive.
 
         Returns:
             List of history entry dictionaries.
         """
 
+        if limit is not None and limit < 0:
+            raise ValueError("History limit must be non-negative.")
+        where, parameters = _history_query_filters(before_id, after_id, kinds, hidden)
         with self._connect() as connection:
             rows = connection.execute(
                 """
                 SELECT id, message_id, kind, content, sound_effect_cues_json,
                        speaker_cues_json, hidden, created_at
                 FROM history_entries
-                ORDER BY id ASC
-                """
+                """ + where + (" ORDER BY id DESC LIMIT ?" if limit is not None else " ORDER BY id ASC"),
+                (*parameters, limit) if limit is not None else parameters,
             ).fetchall()
+        if limit is not None:
+            rows.reverse()
 
         history: list[dict[str, Any]] = []
         for row in rows:
@@ -4546,6 +4563,17 @@ class SaveRepository:
             )
             history.append(entry)
         return history
+
+    def count_history(
+        self, *, before_id: int | None = None, after_id: int | None = None,
+        kinds: tuple[str, ...] | None = None, hidden: bool | None = None,
+    ) -> int:
+        """Count matching entries without fetching or decoding their contents."""
+        where, parameters = _history_query_filters(before_id, after_id, kinds, hidden)
+        with self._connect() as connection:
+            return int(connection.execute(
+                "SELECT COUNT(*) FROM history_entries" + where, parameters
+            ).fetchone()[0])
 
     def set_history_entry_hidden(self, history_entry_id: int, hidden: bool) -> bool:
         """Hides or restores one conversation entry without deleting its history."""
@@ -4874,35 +4902,37 @@ class SaveRepository:
             if not isinstance(snapshot, dict):
                 return False
 
-            connection.execute("PRAGMA foreign_keys = OFF")
-            try:
-                for table_name in snapshot:
-                    connection.execute(
-                        f"DELETE FROM {_quote_sql_identifier(table_name)}"
-                    )
+            # Restore the complete snapshot before checking relationships. The
+            # snapshot's alphabetical table order can put children before parents.
+            connection.execute("PRAGMA defer_foreign_keys = ON")
+            for table_name in snapshot:
+                connection.execute(
+                    f"DELETE FROM {_quote_sql_identifier(table_name)}"
+                )
 
-                for table_name, table_snapshot in snapshot.items():
-                    if not isinstance(table_snapshot, dict):
-                        continue
-                    columns = [
-                        str(column)
-                        for column in table_snapshot.get("columns", [])
-                    ]
-                    rows = table_snapshot.get("rows", [])
-                    if not columns or not isinstance(rows, list):
-                        continue
-                    quoted_table = _quote_sql_identifier(table_name)
-                    quoted_columns = ", ".join(
-                        _quote_sql_identifier(column) for column in columns
-                    )
-                    placeholders = ", ".join("?" for _ in columns)
-                    connection.executemany(
-                        f"INSERT INTO {quoted_table} ({quoted_columns}) "
-                        f"VALUES ({placeholders})",
-                        [tuple(row) for row in rows if isinstance(row, list)],
-                    )
-            finally:
-                connection.execute("PRAGMA foreign_keys = ON")
+            for table_name, table_snapshot in snapshot.items():
+                if not isinstance(table_snapshot, dict):
+                    continue
+                columns = [
+                    str(column)
+                    for column in table_snapshot.get("columns", [])
+                ]
+                rows = table_snapshot.get("rows", [])
+                if not columns or not isinstance(rows, list):
+                    continue
+                quoted_table = _quote_sql_identifier(table_name)
+                quoted_columns = ", ".join(
+                    _quote_sql_identifier(column) for column in columns
+                )
+                placeholders = ", ".join("?" for _ in columns)
+                connection.executemany(
+                    f"INSERT INTO {quoted_table} ({quoted_columns}) "
+                    f"VALUES ({placeholders})",
+                    [tuple(row) for row in rows if isinstance(row, list)],
+                )
+
+            if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
+                raise sqlite3.IntegrityError("Snapshot contains invalid record relationships.")
 
             connection.execute(
                 "DELETE FROM message_snapshots WHERE message_id = ?",
@@ -5730,6 +5760,7 @@ class SaveRepository:
         state.connection = connection
         state.rollback_only = False
         try:
+            connection.execute("PRAGMA foreign_keys = ON")
             connection.execute("BEGIN")
             yield connection
             if state.rollback_only:
@@ -5873,7 +5904,8 @@ class SaveRepository:
                     prepared INTEGER NOT NULL DEFAULT 1,
                     favorite INTEGER NOT NULL DEFAULT 0,
                     source TEXT NOT NULL DEFAULT '',
-                    learned_at TEXT NOT NULL
+                    learned_at TEXT NOT NULL,
+                    FOREIGN KEY (spell_id) REFERENCES spell_catalog(spell_id) ON DELETE CASCADE
                 );
 
                 CREATE TABLE IF NOT EXISTS magic_resource_pools (
@@ -5979,7 +6011,8 @@ class SaveRepository:
                     active INTEGER NOT NULL DEFAULT 1,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
-                    FOREIGN KEY (npc_id) REFERENCES npcs(id) ON DELETE CASCADE
+                    FOREIGN KEY (npc_id) REFERENCES npcs(id) ON DELETE CASCADE,
+                    FOREIGN KEY (item_id) REFERENCES item_catalog(id) ON DELETE CASCADE
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_merchant_stock_npc
@@ -5995,7 +6028,8 @@ class SaveRepository:
                     active INTEGER NOT NULL DEFAULT 1,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
-                    FOREIGN KEY (npc_id) REFERENCES npcs(id) ON DELETE CASCADE
+                    FOREIGN KEY (npc_id) REFERENCES npcs(id) ON DELETE CASCADE,
+                    FOREIGN KEY (item_id) REFERENCES item_catalog(id) ON DELETE CASCADE
                 );
 
                 CREATE TABLE IF NOT EXISTS merchant_transactions (
@@ -6066,6 +6100,9 @@ class SaveRepository:
                     message TEXT NOT NULL DEFAULT '',
                     created_at TEXT NOT NULL
                 );
+
+                CREATE INDEX IF NOT EXISTS idx_history_kind_id
+                ON history_entries(kind, id);
 
                 CREATE TABLE IF NOT EXISTS message_snapshots (
                     message_id TEXT PRIMARY KEY,
@@ -6724,8 +6761,8 @@ def _preferred_npc_profile(
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Picks the profile whose identifier looks more stable."""
 
-    first_id = str(first.get("npc_id", ""))
-    second_id = str(second.get("npc_id", ""))
+    first_id = str(first.get("id", ""))
+    second_id = str(second.get("id", ""))
 
     if len(second_id) < len(first_id):
         return second, first
@@ -7373,6 +7410,27 @@ def _decode_json_list(raw_json: Any, label: str) -> list[Any]:
         return []
 
     return values
+
+
+def _history_query_filters(
+    before_id: int | None, after_id: int | None,
+    kinds: tuple[str, ...] | None, hidden: bool | None,
+) -> tuple[str, tuple[Any, ...]]:
+    clauses: list[str] = []
+    parameters: list[Any] = []
+    if before_id is not None:
+        clauses.append("id < ?")
+        parameters.append(before_id)
+    if after_id is not None:
+        clauses.append("id > ?")
+        parameters.append(after_id)
+    if kinds is not None:
+        clauses.append("kind IN (" + ",".join("?" for _ in kinds) + ")" if kinds else "0")
+        parameters.extend(kinds)
+    if hidden is not None:
+        clauses.append("hidden = ?")
+        parameters.append(int(hidden))
+    return (" WHERE " + " AND ".join(clauses) if clauses else "", tuple(parameters))
 
 
 def _bounded_float(value: Any, *, default: float, minimum: float, maximum: float) -> float:

@@ -2217,7 +2217,7 @@ class EventApplierTests(unittest.TestCase):
                 connection.executemany(
                     """
                     INSERT INTO npcs (
-                        npc_id,
+                        id,
                         name,
                         display_name,
                         role,
@@ -2271,12 +2271,14 @@ class EventApplierTests(unittest.TestCase):
             )
 
             self.assertEqual(len(visible_npcs), 1)
+            self.assertEqual(visible_npcs[0]["id"], "copper_kettle_bartender")
             self.assertEqual(visible_npcs[0]["display_name"], "Bartender")
             self.assertIn("local rumors", visible_npcs[0]["notes"])
             self.assertEqual(len(relevant_npcs), 1)
-            self.assertEqual(relevant_npcs[0]["npc_id"], "copper_kettle_bartender")
+            self.assertEqual(relevant_npcs[0]["id"], "copper_kettle_bartender")
             self.assertIn("Local gossip", relevant_npcs[0]["knowledge_scope"])
             self.assertIn("Merchant trade", relevant_npcs[0]["knowledge_scope"])
+            self.assertEqual(len(repository.list_npcs()), 2)
 
     def test_records_mechanical_event_results(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

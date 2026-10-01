@@ -65,9 +65,12 @@ class StateManager:
 
         self.repository = repository
 
-    def load_state(self) -> AdventureState:
+    def load_state(self, *, history_limit: int | None = None) -> AdventureState:
         """
         Loads the complete adventure state from the active save.
+
+        history_limit bounds history reads; zero omits history entirely while
+        retaining the current authoritative game state.
 
         Returns:
             Composed adventure state.
@@ -146,7 +149,7 @@ class StateManager:
             skills=self._load_skills(),
             magic=self._load_magic(),
             active_tasks=self._load_active_tasks(),
-            history=self._load_history(),
+            history=self._load_history(limit=history_limit),
             settings=settings,
         )
 
@@ -419,12 +422,12 @@ class StateManager:
             ],
         )
 
-    def _load_history(self) -> HistoryState:
+    def _load_history(self, *, limit: int | None = None) -> HistoryState:
         """Loads typed history state."""
 
         entries: list[HistoryEntry] = []
 
-        for row in self.repository.list_history():
+        for row in ([] if limit == 0 else self.repository.list_history(limit=limit)):
             entries.append(
                 HistoryEntry(
                     id=_read_optional_int(row, "id"),

@@ -37,6 +37,7 @@ def main() -> int:
 
     exit_code = app.exec()
     logging.info("AI Adventure application exited with code %s.", exit_code)
+    logging.shutdown()
 
     return exit_code
 

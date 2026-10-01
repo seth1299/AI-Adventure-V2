@@ -52,7 +52,8 @@ class StoryTurnService:
     ) -> dict[str, Any]:
         """Builds the complete provider context for a story turn."""
 
-        state = StateManager(repository).load_state()
+        builder = AiContextBuilder.from_default_library()
+        state = StateManager(repository).load_state(history_limit=builder.max_history_entries)
         relevant_npcs = repository.list_relevant_npcs(
             location=state.world.location,
             query_text=player_text,
@@ -86,7 +87,7 @@ class StoryTurnService:
                 )
             )
         )
-        return AiContextBuilder.from_default_library().build_story_context(
+        return builder.build_story_context(
             state,
             player_command=player_text,
             conversation_mode=conversation_mode,
@@ -111,7 +112,7 @@ class StoryTurnService:
                 "buy_offers": repository.list_merchant_buy_offers(npc_id) if npc_id else [],
             })(repository.get_active_merchant_npc_id()),
             out_of_game_correction=correction_request,
-            mechanical_events=repository.list_mechanical_events()[-40:],
+            mechanical_events=repository.list_mechanical_events(limit=40),
         )
 
     @staticmethod

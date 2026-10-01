@@ -1,99 +1,67 @@
 from __future__ import annotations
 
-import json
 import logging
 from datetime import datetime
 from pathlib import Path
-from threading import RLock
 from uuid import uuid4
 
-
-def _human_timestamp(created: float) -> str:
-    """Format a log record timestamp in the compact style used by the log file."""
-
-    local_time = datetime.fromtimestamp(created)
-    meridiem = "A.M." if local_time.hour < 12 else "P.M."
-    hour = local_time.hour % 12 or 12
-    return f"{local_time.month}-{local_time.day}-{local_time:%y}, {hour}:{local_time:%M} {meridiem}"
+from ai_adventure.app.features import is_playtesting_build
 
 
-class HumanReadableJsonFormatter(logging.Formatter):
-    """Serialize a record into the human-readable fields stored in the JSON log."""
+_initialized_log_files: set[Path] = set()
+
+
+class HumanReadableLogFormatter(logging.Formatter):
+    """Format one record as labeled lines, followed by one blank line."""
 
     def format(self, record: logging.LogRecord) -> str:
-        payload = {
-            "message_id": uuid4().hex,
-            "timestamp": _human_timestamp(record.created),
-            "file_location": record.name,
-            "log_type": record.levelname,
-            "log_message": record.getMessage(),
-        }
-
+        timestamp = datetime.fromtimestamp(record.created).astimezone().isoformat(timespec="seconds")
+        lines = [
+            f"Severity: {record.levelname}",
+            f"File: {record.name} ({record.filename}:{record.lineno})",
+            f"Function: {record.funcName}",
+            f"Date/Time: {timestamp}",
+            f"Message ID: {uuid4().hex}",
+            f"Message: {record.getMessage().rstrip()}",
+        ]
         if record.exc_info:
-            payload["exception"] = self.formatException(record.exc_info)
+            lines.append("Exception:\n" + self.formatException(record.exc_info))
+        if record.stack_info:
+            lines.append("Stack:\n" + self.formatStack(record.stack_info))
+        return "\n".join(lines).rstrip() + "\n"
 
-        return json.dumps(payload, ensure_ascii=False)
 
+class ApplicationFileHandler(logging.FileHandler):
+    """Append records with standard logging locking and per-record flushing."""
 
-class JsonFileHandler(logging.Handler):
-    """Write all records to a single, valid, human-readable JSON document."""
-
-    def __init__(self, log_file: Path) -> None:
-        super().__init__()
-        self.log_file = log_file
-        self._records: list[dict[str, object]] = []
-        self._write_lock = RLock()
-
-    def emit(self, record: logging.LogRecord) -> None:
-        try:
-            formatted = self.format(record)
-            entry = json.loads(formatted)
-            with self._write_lock:
-                self._records.append(entry)
-                self._write_document()
-        except Exception:
-            self.handleError(record)
-
-    def _write_document(self) -> None:
-        self.log_file.parent.mkdir(parents=True, exist_ok=True)
-        self.log_file.write_text(
-            json.dumps({"messages": self._records}, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
-
-    def close(self) -> None:
-        with self._write_lock:
-            if self._records:
-                self._write_document()
-        super().close()
+    def _open(self):
+        Path(self.baseFilename).parent.mkdir(parents=True, exist_ok=True)
+        return super()._open()
 
 
 def configure_logging(log_file: Path) -> None:
+    """Reset the log once per process/path, then append throughout the run.
+
+    Reconfiguration replaces our handler without erasing the session.
+    DEBUG records are written only by the playtesting build.
     """
-    Configures application-wide logging.
-
-    Args:
-        log_file: File path where logs should be written.
-    """
-
-    if log_file.parent is not None:
-        log_file.parent.mkdir(parents=True, exist_ok=True)
-
+    log_file = Path(log_file).resolve()
+    log_file.parent.mkdir(parents=True, exist_ok=True)
     root_logger = logging.getLogger()
-    root_logger.setLevel(logging.INFO)
+    level = logging.DEBUG if is_playtesting_build() else logging.INFO
+    root_logger.setLevel(level)
+    for handler in root_logger.handlers[:]:
+        if isinstance(handler, ApplicationFileHandler):
+            root_logger.removeHandler(handler)
+            handler.close()
 
-    # Avoid duplicate handlers when restarting from an interactive environment.
-    for existing_handler in root_logger.handlers[:]:
-        root_logger.removeHandler(existing_handler)
-        if isinstance(existing_handler, JsonFileHandler):
-            existing_handler.close()
+    if log_file not in _initialized_log_files:
+        with log_file.open("w", encoding="utf-8"):
+            pass
+        _initialized_log_files.add(log_file)
 
-    file_handler = JsonFileHandler(log_file)
-    file_handler.setLevel(logging.DEBUG)
-
-    formatter = HumanReadableJsonFormatter()
-
-    file_handler.setFormatter(formatter)
-    root_logger.addHandler(file_handler)
-
+    handler = ApplicationFileHandler(log_file, mode="a", encoding="utf-8")
+    handler.setLevel(level)
+    handler.setFormatter(HumanReadableLogFormatter())
+    root_logger.addHandler(handler)
     logging.info("Logging configured. Log file: %s", log_file)

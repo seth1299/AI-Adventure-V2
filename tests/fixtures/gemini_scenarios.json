@@ -1,0 +1,69 @@
+{
+  "version": 1,
+  "scenarios": [
+    {
+      "id": "failed_check_not_rerolled", "context": {"player_command": "Pick the locked door.", "selection": {"tags": ["skill"]}, "state": {"skills": {"known_skills": [{"name": "Lockpicking"}], "resolved_checks_this_turn": [{"skill_name": "Lockpicking", "success": false}]}}},
+      "response": {"response": "The lock remains shut.", "suggested_actions": [], "events": [{"type": "SkillCheckRequestedEvent", "payload": {"skill_name": "Lockpicking", "difficulty": "hard"}}], "out_of_game": false},
+      "forbidden_events": ["SkillCheckRequestedEvent"]
+    },
+    {
+      "id": "ordinary_inventory_receipt", "context": {"player_command": "Accept the sealed letter.", "selection": {"tags": ["inventory"]}},
+      "response": {"response": "The courier hands over the sealed letter.", "suggested_actions": [], "events": [{"type": "InventoryItemAddedEvent", "payload": {"item_name": "Sealed Letter", "item_type": "Document", "description": "A folded letter with a red wax seal.", "amount": 1, "quantity_unit": "each", "storage_location": "actively_carried", "value_base_units": 1}}], "out_of_game": false},
+      "required_events": ["InventoryItemAddedEvent", "StatusUpdatedEvent"]
+    },
+    {
+      "id": "weather_narration_matches_state", "context": {"player_command": "Watch the sky.", "state": {"scene": {"location": "Market", "weather": "Clear"}}},
+      "response": {"response": "Rain falls over the market.", "suggested_actions": [], "events": [{"type": "StatusUpdatedEvent", "payload": {"location": "Market", "minutes_passed": 1, "weather": "AUTO"}}], "out_of_game": false},
+      "required_events": ["StatusUpdatedEvent"], "event_payloads": {"StatusUpdatedEvent": {"weather": "Rain"}}
+    },
+    {
+      "id": "routine_status", "context": {"player_command": "Look around.", "state": {"scene": {"location": "Market", "weather": "Clear"}}},
+      "response": {"response": "Stalls line the market.", "suggested_actions": [], "events": [], "out_of_game": false},
+      "required_events": ["StatusUpdatedEvent"]
+    },
+    {
+      "id": "out_of_game_no_mutation", "context": {"conversation_mode": "out_of_game", "player_command": "Explain the rules.", "selection": {"tags": ["currency"]}},
+      "response": {"response": "Coins pay for goods.", "suggested_actions": [], "events": [{"type": "CurrencyChangedEvent", "payload": {"base_unit_amount": 10}}], "out_of_game": false},
+      "forbidden_events": ["CurrencyChangedEvent", "StatusUpdatedEvent"], "out_of_game": true
+    },
+    {
+      "id": "unopened_container_no_reward", "context": {"player_command": "Open the Coin Pouch.", "selection": {"tags": ["inventory", "currency"]}, "state": {"inventory": {"items": [{"name": "Coin Pouch", "category": "Container", "metadata": {"item_type": "Container", "container": {"is_open": false, "contents_taken": false, "is_locked": true, "lockpick_dc": 16, "contents": {"currency_base_units": 30, "items": []}}}}]}}},
+      "response": {"response": "You open the Coin Pouch and see coins.", "suggested_actions": [], "events": [{"type": "CurrencyChangedEvent", "payload": {"base_unit_amount": 30}}], "out_of_game": false},
+      "forbidden_events": ["CurrencyChangedEvent"]
+    },
+    {
+      "id": "unexpected_event_rejected", "context": {"player_command": "Look around."},
+      "response": {"response": "You gain coins.", "suggested_actions": [], "events": [{"type": "CurrencyChangedEvent", "payload": {"base_unit_amount": 30}}], "out_of_game": false},
+      "reject": true
+    },
+    {
+      "id": "missing_envelope_field", "context": {},
+      "response": {"response": "Morning arrives.", "events": [], "out_of_game": false}, "reject": true
+    },
+    {
+      "id": "unknown_event_rejected", "context": {},
+      "response": {"response": "Morning arrives.", "suggested_actions": [], "events": [{"type": "DeleteSaveEvent", "payload": {}}], "out_of_game": false}, "reject": true
+    },
+    {
+      "id": "wrong_event_payload_type", "context": {},
+      "response": {"response": "Time passes.", "suggested_actions": [], "events": [{"type": "StatusUpdatedEvent", "payload": {"location": "Market", "minutes_passed": "ten", "weather": "Clear"}}], "out_of_game": false}, "reject": true
+    },
+    {
+      "id": "too_many_actions", "context": {},
+      "response": {"response": "Morning arrives.", "suggested_actions": ["A", "B", "C", "D", "E"], "events": [], "out_of_game": false}, "reject": true
+    },
+    {
+      "id": "invented_image_field", "context": {},
+      "response": {"response": "Morning arrives.", "suggested_actions": [], "events": [], "out_of_game": false, "image_prompt": "Generate a castle"}, "reject": true
+    },
+    {
+      "id": "malformed_json", "context": {}, "raw_response": "{\"response\":", "reject": true
+    },
+    {
+      "id": "duplicate_keys", "context": {}, "raw_response": "{\"response\":\"First\",\"response\":\"Second\",\"suggested_actions\":[],\"events\":[],\"out_of_game\":false}", "reject": true
+    },
+    {
+      "id": "non_finite_minutes", "context": {}, "raw_response": "{\"response\":\"Time passes\",\"suggested_actions\":[],\"events\":[{\"type\":\"StatusUpdatedEvent\",\"payload\":{\"location\":\"Market\",\"minutes_passed\":NaN,\"weather\":\"Clear\"}}],\"out_of_game\":false}", "reject": true
+    }
+  ]
+}

@@ -1520,7 +1520,7 @@ class GeminiServiceTests(unittest.TestCase):
         self.assertIn("concealed wire", call["contents"])
         self.assertIn("<available_tags>", call["contents"])
         self.assertIn('"relevant_tags"', call["contents"])
-        self.assertIn("Use skill_rules", call["contents"])
+        self.assertIn("Use skill_rules", call["config"]["system_instruction"])
 
     def test_parse_skill_check_plan_response_normalizes_checks(self) -> None:
         result = parse_skill_check_plan_response(
@@ -1939,6 +1939,7 @@ class GeminiServiceTests(unittest.TestCase):
             )
             result = service.generate_story_response(
                 {
+                    "selection": {"tags": ["skill", "inventory"]},
                     "packet_type": "story_turn",
                     "player_command": "Forage through the brush for useful herbs.",
                     "state": {
@@ -1995,6 +1996,7 @@ class GeminiServiceTests(unittest.TestCase):
             )
             result = service.generate_story_response(
                 {
+                    "selection": {"tags": ["skill", "inventory"]},
                     "packet_type": "story_turn",
                     "player_command": (
                         "I will mine some more of the vein and gather some of the "
@@ -2103,6 +2105,7 @@ class GeminiServiceTests(unittest.TestCase):
             )
             result = service.generate_story_response(
                 {
+                    "selection": {"tags": ['inventory', 'currency']},
                     "packet_type": "story_turn",
                     "player_command": "Open the Stolen Coin Pouch.",
                     "state": {
@@ -2149,7 +2152,6 @@ class GeminiServiceTests(unittest.TestCase):
                                 "item_type": "Food",
                                 "item_name": "Trail Rations",
                                 "description": "Dried meat and hardtack.",
-                                "ascii_art": "  ____\n /___/\n |___|",
                                 "amount": 1,
                                 "quantity_unit": "each",
                                 "storage_location": "actively_carried",
@@ -2167,6 +2169,7 @@ class GeminiServiceTests(unittest.TestCase):
                 GeminiSettings(api_key="test-key", model="gemini-2.5-flash")
             ).generate_story_response(
                 {
+                    "selection": {"tags": ['inventory']},
                     "packet_type": "story_turn",
                     "player_command": (
                         "Get my gear from my locked Storage Chest and pack food."
@@ -2252,7 +2255,6 @@ class GeminiServiceTests(unittest.TestCase):
                             "payload": {
                                 "name": "Rain Bindweed",
                                 "description": "A flexible medicinal vine.",
-                                "ascii_art": "  _\n /_\\",
                                 "location": "Forests",
                                 "uses": ["Brewing soothing draughts"],
                                 "rarity": "Common",
@@ -2267,7 +2269,6 @@ class GeminiServiceTests(unittest.TestCase):
                                 "item_type": "Ingredient",
                                 "item_name": "Rain Bindweed",
                                 "description": "A flexible medicinal vine.",
-                                "ascii_art": "  _\n /_\\",
                                 "amount": 2,
                                 "quantity_unit": "each",
                                 "storage_location": "actively_carried",
@@ -2285,6 +2286,7 @@ class GeminiServiceTests(unittest.TestCase):
                 GeminiSettings(api_key="test-key", model="gemini-2.5-flash")
             ).generate_story_response(
                 {
+                    "selection": {"tags": ['inventory', 'reagent']},
                     "packet_type": "story_turn",
                     "player_command": "Search the thicket for useful herbs.",
                     "state": {
@@ -2356,6 +2358,7 @@ class GeminiServiceTests(unittest.TestCase):
                 GeminiSettings(api_key="test-key", model="gemini-2.5-flash")
             ).generate_story_response(
                 {
+                    "selection": {"tags": ['inventory', 'currency']},
                     "packet_type": "story_turn",
                     "player_command": "Open the pouch and take everything inside.",
                     "state": {"inventory": {"items": []}},
@@ -2400,6 +2403,7 @@ class GeminiServiceTests(unittest.TestCase):
             )
             result = service.generate_story_response(
                 {
+                    "selection": {"tags": ["skill", "currency"]},
                     "packet_type": "story_turn",
                     "player_command": (
                         '"That would be lovely, thank you. Here is a silver piece." '
@@ -2573,7 +2577,6 @@ class GeminiServiceTests(unittest.TestCase):
                                 "name": "Blue Cave Salt",
                                 "category": "Reagent",
                                 "description": "Pale blue salt that cools and steadies.",
-                                "ascii_art": " .::.\n::::::\n '::'",
                                 "location": "Caves, Underground Pools",
                                 "uses": ["Sleep draughts"],
                                 "rarity": "Rare",
@@ -2601,6 +2604,7 @@ class GeminiServiceTests(unittest.TestCase):
             )
             result = service.generate_story_response(
                 {
+                    "selection": {"tags": ['reagent']},
                     "packet_type": "story_turn",
                     "player_command": "Search for reagents to collect.",
                     "state": {"skills": {"known_skills": [{"name": "Alchemy"}]}},
@@ -2660,6 +2664,7 @@ class GeminiServiceTests(unittest.TestCase):
             )
             result = service.generate_story_response(
                 {
+                    "selection": {"tags": ['skill']},
                     "packet_type": "story_turn",
                     "player_command": "Spend the next couple of in-game hours outside.",
                     "state": {"skills": {"known_skills": [{"name": "Foraging"}]}},
@@ -3255,7 +3260,7 @@ class GeminiServiceTests(unittest.TestCase):
                     "gm_secrets": [],
                     "locations": [],
                     "start_location": "Dawn Gate",
-                    "starting_calendar": {},
+
                     "weather": "Bright and cold.",
                     "character": {
                         "name": "Ari",
@@ -3263,12 +3268,14 @@ class GeminiServiceTests(unittest.TestCase):
                         "backstory": "A courier with too many sealed envelopes.",
                         "notes": "Keeps promises when possible.",
                     },
-                    "skills": [],
+
                     "starting_items": [
                         {
                             "name": f"Starter Item {index}",
                             "category": "Tool",
                             "quantity": 1,
+                            "quantity_unit": "each",
+                            "storage_location": "actively_carried",
                             "description": "Useful enough to keep.",
                             "value_base_units": index,
                             "source_index": -1,
@@ -3283,7 +3290,8 @@ class GeminiServiceTests(unittest.TestCase):
                     "currency_description": "Credits are stored on brass chits.",
                     "starting_currency_balance_base_units": 12,
                     "introductory_message": "The gate opens. What do you do now?",
-                    "events": [],
+                    "suggested_actions": [],
+
                 }
             )
         )
@@ -3320,10 +3328,10 @@ class GeminiServiceTests(unittest.TestCase):
                     "name": f"Useful Item {index}",
                     "category": "Tool",
                     "quantity": 1,
+                    "basic_name": "Tool",
                     "quantity_unit": "each",
                     "storage_location": "actively_carried",
                     "description": "A useful personal item.",
-                    "ascii_art": " ___\n|___|\n | |",
                     "value_base_units": index + 1,
                     "source_index": -1,
                 }
@@ -3631,19 +3639,20 @@ class GeminiServiceTests(unittest.TestCase):
                     model="gemini-3.1-flash-lite",
                 )
             )
-            service.generate_new_game_world(
-                {
-                    "packet_type": "new_game_setup",
-                    "player_ai_preferences": {
-                        "model_intelligence": "smarter",
-                        "model_tone": "quirky",
-                        "response_length": "super_brief",
-                        "allowed_content_categories": [
-                            "HARM_CATEGORY_DANGEROUS_CONTENT"
-                        ],
-                    },
-                }
-            )
+            with self.assertRaises(GeminiRequestError):
+                service.generate_new_game_world(
+                    {
+                        "packet_type": "new_game_setup",
+                        "player_ai_preferences": {
+                            "model_intelligence": "smarter",
+                            "model_tone": "quirky",
+                            "response_length": "super_brief",
+                            "allowed_content_categories": [
+                                "HARM_CATEGORY_DANGEROUS_CONTENT"
+                            ],
+                        },
+                    }
+                )
         finally:
             self._remove_fake_genai_client()
 
@@ -3674,7 +3683,6 @@ class GeminiServiceTests(unittest.TestCase):
             *,
             world_summary: str,
             start_location: str,
-            npc_name: str,
             item_name: str,
             intro: str,
         ) -> str:
@@ -3698,7 +3706,6 @@ class GeminiServiceTests(unittest.TestCase):
                     ],
                     "gm_secrets": [],
                     "start_location": start_location,
-                    "starting_calendar": {},
                     "weather": "Rain",
                     "character": {
                         "name": "Mara Vale",
@@ -3706,22 +3713,15 @@ class GeminiServiceTests(unittest.TestCase):
                         "backstory": f"Known for cases near {start_location}.",
                         "notes": "Keeps careful notes.",
                     },
-                    "skills": [
-                        {
-                            "name": "Investigation",
-                            "description": "Reading clues in crowded streets.",
-                            "level": 4,
-                        }
-                    ],
                     "starting_items": [
                         {
                             "name": item_name if index == 0 else f"Case Item {index}",
                             "category": "Tool",
                             "quantity": 1,
+                            "basic_name": "Tool",
                             "quantity_unit": "each",
                             "storage_location": "actively_carried",
                             "description": "Useful enough to keep.",
-                            "ascii_art": " ___\n|___|\n | |",
                             "value_base_units": index + 1,
                             "source_index": -1,
                         }
@@ -3740,21 +3740,6 @@ class GeminiServiceTests(unittest.TestCase):
                         "Question the desk clerk.",
                         "Step into the rain.",
                     ],
-                    "events": [
-                        {
-                            "type": "NpcUpsertedEvent",
-                            "payload": {
-                                "npc_id": "desk_clerk",
-                                "display_name": npc_name,
-                                "role": "Desk clerk",
-                                "location": start_location,
-                                "public_description": "A clerk with sharp eyes.",
-                                "player_facing_information": "Handles the morning desk.",
-                                "knowledge_scope": ["Station routine"],
-                                "known_facts": ["Rain delays the tram line."],
-                            },
-                        }
-                    ],
                 }
             )
 
@@ -3763,21 +3748,18 @@ class GeminiServiceTests(unittest.TestCase):
                 response_for(
                     world_summary="Oakhaven is a rain-heavy city.",
                     start_location="Oakhaven Office",
-                    npc_name="Mira Cross",
                     item_name="Oakhaven Casebook",
                     intro="Rain taps the Oakhaven office window. What do you do now?",
                 ),
                 response_for(
                     world_summary="Elias watches the Silas Vane district.",
                     start_location="Silas Vane Office",
-                    npc_name="Elias Vane",
                     item_name="Vane Casebook",
                     intro="Rain taps the Silas Vane office window. What do you do now?",
                 ),
                 response_for(
                     world_summary="Brassgate is a rain-heavy city.",
                     start_location="Brassgate Office",
-                    npc_name="Mira Cross",
                     item_name="Brassgate Casebook",
                     intro="Rain taps the Brassgate office window. What do you do now?",
                 ),
@@ -4066,7 +4048,7 @@ class GeminiServiceTests(unittest.TestCase):
                 self.configs.append(config)
                 if len(self.configs) == 1:
                     raise RuntimeError("400 INVALID_ARGUMENT: invalid argument")
-                return object()
+                return types.SimpleNamespace(text="{}")
 
         models = Models()
         result = _generate_content_with_retry(
@@ -5630,10 +5612,10 @@ class GeminiServiceTests(unittest.TestCase):
                     "name": f"Useful Item {index}",
                     "category": "Tool",
                     "quantity": 1,
+                    "basic_name": "Tool",
                     "quantity_unit": "each",
                     "storage_location": "actively_carried",
                     "description": "A useful personal item.",
-                    "ascii_art": " ___\n|___|\n | |",
                     "value_base_units": index + 1,
                     "source_index": -1,
                 }

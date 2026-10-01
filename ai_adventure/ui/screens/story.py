@@ -13,6 +13,8 @@ class StoryScreen(RepositoryBackedWidget):
 
     _narration_chunk_ready = Signal(int, str)
     _narration_complete = Signal(int)
+    HISTORY_PAGE_SIZE = 50
+    CONVERSATION_KINDS = ("player", "player_oog", "story", "story_oog")
 
     def __init__(
         self,
@@ -22,6 +24,8 @@ class StoryScreen(RepositoryBackedWidget):
         api_key_path: Path | str | None = None,
     ) -> None:
         super().__init__()
+        self._history_start_id: int | None = None
+        self._history_expanded = False
 
         self.sound_manager = sound_manager
         self.narration_player = narration_player
@@ -132,6 +136,10 @@ class StoryScreen(RepositoryBackedWidget):
 
         layout = QVBoxLayout()
         conversation_toolbar = QHBoxLayout()
+        self.load_older_messages_button = QPushButton("Load older messages")
+        self.load_older_messages_button.clicked.connect(self._load_older_messages)
+        self.load_older_messages_button.hide()
+        conversation_toolbar.addWidget(self.load_older_messages_button)
         conversation_toolbar.addWidget(self.view_hidden_messages_button)
         conversation_toolbar.addStretch()
         layout.addLayout(conversation_toolbar)
@@ -151,6 +159,8 @@ class StoryScreen(RepositoryBackedWidget):
         """Sets the active save and clears any stale narration reveal state."""
 
         self._clear_story_reveal_state()
+        self._history_start_id = None
+        self._history_expanded = False
         self._initial_generation_pending = False
         self._pending_travel_request = None
         self._pending_conversation_mode = "live_game"
@@ -186,6 +196,7 @@ class StoryScreen(RepositoryBackedWidget):
 
         if repository is None:
             self._clear_conversation_messages()
+            self.load_older_messages_button.hide()
             self.view_hidden_messages_button.hide()
             self._show_unresolved_status()
             self._combat_active = False
@@ -193,7 +204,7 @@ class StoryScreen(RepositoryBackedWidget):
             self._update_continue_button_state()
             return
 
-        state = StateManager(repository).load_state()
+        state = StateManager(repository).load_state(history_limit=0)
         self._combat_active = repository.is_combat_active()
         if self._initial_generation_pending:
             self._show_unresolved_status()
@@ -213,26 +224,33 @@ class StoryScreen(RepositoryBackedWidget):
             self._refresh_current_location_image(state.world.location)
 
         if self._initial_generation_pending:
+            self.load_older_messages_button.hide()
             self.view_hidden_messages_button.hide()
             self._render_conversation([])
             self._sync_story_input_state()
             self._update_continue_button_state()
             return
 
-        entries = repository.list_history()
-        hidden_count = sum(
-            1
-            for entry in entries
-            if bool(entry.get("hidden", False))
-            and str(entry.get("kind", "")).casefold()
-            in {"player", "player_oog", "story", "story_oog"}
+        entries = repository.list_history(
+            limit=None if self._history_expanded else self.HISTORY_PAGE_SIZE,
+            after_id=self._history_start_id - 1 if self._history_expanded and self._history_start_id is not None else None,
+            kinds=self.CONVERSATION_KINDS,
         )
+        if entries:
+            self._history_start_id = int(entries[0]["id"])
+        self.load_older_messages_button.setVisible(
+            self._history_start_id is not None
+            and repository.count_history(before_id=self._history_start_id, kinds=self.CONVERSATION_KINDS) > 0
+        )
+        hidden_count = repository.count_history(kinds=self.CONVERSATION_KINDS, hidden=True)
         self.view_hidden_messages_button.setText(
             f"View Hidden Messages ({hidden_count})"
         )
         self.view_hidden_messages_button.setVisible(hidden_count > 0)
         conversation_entries: list[tuple[Any, ...]] = []
-        live_turn_number = 0
+        live_turn_number = repository.count_history(
+            before_id=int(entries[0]["id"]), kinds=("story",)
+        ) if entries else 0
 
         for entry in entries:
             kind = str(entry.get("kind", "misc")).casefold()
@@ -316,6 +334,31 @@ class StoryScreen(RepositoryBackedWidget):
         self._sync_story_input_state()
         self._update_continue_button_state()
 
+    def _load_older_messages(self) -> None:
+        """Extend the visible history window by one stable ID-based page."""
+        repository = self.repository()
+        if repository is None or self._history_start_id is None:
+            return
+        page = repository.list_history(
+            limit=self.HISTORY_PAGE_SIZE, before_id=self._history_start_id,
+            kinds=self.CONVERSATION_KINDS,
+        )
+        if not page:
+            self.load_older_messages_button.hide()
+            return
+        bar = self.conversation_scroll.verticalScrollBar()
+        old_value, old_maximum = bar.value(), bar.maximum()
+        self._history_start_id = int(page[0]["id"])
+        self._history_expanded = True
+        self.refresh()
+        render_generation = self._conversation_render_generation
+
+        def restore_position() -> None:
+            if render_generation == self._conversation_render_generation:
+                bar.setValue(old_value + max(0, bar.maximum() - old_maximum))
+
+        QTimer.singleShot(0, restore_position)
+
     def _clear_conversation_messages(self) -> None:
         """Removes all rendered conversation bubbles while preserving the stretch."""
 
@@ -351,6 +394,8 @@ class StoryScreen(RepositoryBackedWidget):
         opening_live_history_id = -1
         for candidate in entries:
             if candidate[0] != "ai" or candidate[1] != "live_game":
+                continue
+            if len(candidate) > 5 and candidate[5] != 1:
                 continue
             opening_live_message_id = str(candidate[4]) if len(candidate) > 4 else ""
             opening_live_history_id = _safe_int(
@@ -706,13 +751,7 @@ class StoryScreen(RepositoryBackedWidget):
         if repository is None:
             return []
 
-        conversation_kinds = {"player", "player_oog", "story", "story_oog"}
-        return [
-            entry
-            for entry in repository.list_history()
-            if bool(entry.get("hidden", False))
-            and str(entry.get("kind", "")).casefold() in conversation_kinds
-        ]
+        return repository.list_history(kinds=self.CONVERSATION_KINDS, hidden=True)
 
     def _show_hidden_messages(self) -> None:
         """Shows hidden conversation entries and lets the player restore them."""
@@ -902,8 +941,7 @@ class StoryScreen(RepositoryBackedWidget):
             history_entry = next(
                 (
                     entry
-                    for entry in repository.list_history()
-                    if _safe_int(entry.get("id"), -1) == history_entry_id
+                    for entry in repository.list_history(limit=1, after_id=history_entry_id - 1, before_id=history_entry_id + 1)
                 ),
                 None,
             )
@@ -1072,7 +1110,7 @@ class StoryScreen(RepositoryBackedWidget):
         if repository is None or destination is None:
             return False
 
-        state = StateManager(repository).load_state()
+        state = StateManager(repository).load_state(history_limit=0)
         origin = normalize_known_location(
             repository.find_travel_location(state.world.location)
         )
@@ -1606,7 +1644,7 @@ class StoryScreen(RepositoryBackedWidget):
         if repository is None:
             return False
 
-        entries = repository.list_history()
+        entries = repository.list_history(limit=1, kinds=("story",))
 
         for entry in reversed(entries):
             if str(entry.get("kind", "")).casefold() == "story":
@@ -1804,7 +1842,7 @@ class StoryScreen(RepositoryBackedWidget):
         if repository is None:
             return None
 
-        for entry in reversed(repository.list_history()):
+        for entry in repository.list_history(limit=1, kinds=("story",)):
             if str(entry.get("kind", "")).casefold() == "story":
                 return entry
 
@@ -1817,7 +1855,7 @@ class StoryScreen(RepositoryBackedWidget):
         if repository is None:
             return None
 
-        for entry in reversed(repository.list_history()):
+        for entry in repository.list_history(limit=1, kinds=("story", "story_oog")):
             if str(entry.get("kind", "")).casefold() in {"story", "story_oog"}:
                 return entry
         return None
@@ -1829,7 +1867,7 @@ class StoryScreen(RepositoryBackedWidget):
         if repository is None:
             return ""
 
-        for entry in reversed(repository.list_history()):
+        for entry in repository.list_history(limit=1, before_id=history_id, kinds=("player",)):
             entry_id = _safe_int(entry.get("id"), -1)
             if entry_id >= history_id:
                 continue
@@ -1845,7 +1883,7 @@ class StoryScreen(RepositoryBackedWidget):
         if repository is None:
             return ""
 
-        for entry in reversed(repository.list_history()):
+        for entry in repository.list_history(limit=1, kinds=("player",)):
             if str(entry.get("kind", "")).casefold() == "player":
                 return str(entry.get("content", "")).strip()
 
