@@ -113,7 +113,11 @@ def normalize_item_metadata(
         else:
             item_type = clean_category or "Item"
 
-    clean_metadata: dict[str, Any] = {"item_type": item_type}
+    basic_name = " ".join(str(metadata.get("basic_name", "") or "").split()).strip()
+    clean_metadata: dict[str, Any] = {
+        "item_type": item_type,
+        "basic_name": basic_name[:120],
+    }
 
     if item_type == "Weapon":
         hands = _normalize_weapon_hands(metadata.get("weapon_hands"), folded)

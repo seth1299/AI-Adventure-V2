@@ -10,6 +10,8 @@ MIN_TTS_SPEED_PERCENT = 50
 MAX_TTS_SPEED_PERCENT = 200
 DEFAULT_TTS_SPEED_PERCENT = 100
 DEFAULT_TTS_VOICE_MODE = "preset"
+DEFAULT_PLAYER_TTS_VOICE = "ai"
+PLAYER_TTS_VOICE_AI = "ai"
 TTS_VOICE_MODES = {"preset", "blend"}
 DEFAULT_CUSTOM_VOICE_NAME = "Custom Voice"
 DEFAULT_BLEND_VOICE_A = DEFAULT_NARRATOR_VOICE
@@ -135,7 +137,19 @@ def normalize_tts_audio_fields(raw_audio: Any, *, tts_enabled: bool = True) -> d
         "tts_voice_mode": mode,
         "tts_voice_blend": voice_blend,
         "tts_custom_voices": custom_voices,
+        "player_tts_voice": normalize_player_tts_voice(
+            raw_audio.get("player_tts_voice")
+        ),
     }
+
+
+def normalize_player_tts_voice(value: Any) -> str:
+    """Returns a preset player voice or ``ai`` for pronoun-aware selection."""
+
+    clean_value = str(value or "").strip()
+    if clean_value.casefold() == PLAYER_TTS_VOICE_AI:
+        return PLAYER_TTS_VOICE_AI
+    return normalize_narrator_voice(clean_value) if clean_value else PLAYER_TTS_VOICE_AI
 
 
 def active_voice_spec_from_audio(audio: Any) -> str:

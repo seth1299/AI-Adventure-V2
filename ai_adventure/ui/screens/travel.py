@@ -15,15 +15,26 @@ class TravelScreen(RepositoryBackedWidget):
         super().__init__()
 
         self.on_travel_requested = on_travel_requested
+        # Keep the historical list as a hidden compatibility surface; the
+        # player-facing control is the compact selector above the details.
         self.location_list = QListWidget()
-        self.location_list.currentItemChanged.connect(self._display_selected_location)
+        self.location_list.hide()
+        self.location_selector = _NoWheelComboBox()
+        self.location_selector.setObjectName("travelLocationSelector")
+        self.location_selector.currentIndexChanged.connect(
+            self._display_selected_location
+        )
 
-        self.details_output = QTextEdit()
-        self.details_output.setReadOnly(True)
+        self.details_output = MarkdownDisplay()
+        self.details_output.setObjectName("travelLocationDetails")
 
-        self.location_image_label = QLabel()
+        self.location_image_label = ClickableImageLabel()
         self.location_image_label.setObjectName("travelLocationImage")
         self.location_image_label.hide()
+        self.select_image_button = QPushButton("Select Image...")
+        self.select_image_button.clicked.connect(self._select_location_image)
+        self.create_image_button = QPushButton("Create new image for me")
+        self.create_image_button.clicked.connect(self._create_location_image)
 
         self.travel_context_input = QTextEdit()
         self.travel_context_input.setPlaceholderText("Optional details for the GM")
@@ -33,33 +44,40 @@ class TravelScreen(RepositoryBackedWidget):
         self.travel_button.clicked.connect(self._request_travel)
         self.travel_button.setEnabled(False)
 
-        list_layout = QVBoxLayout()
-        list_layout.addWidget(QLabel("Known Locations"))
-        list_layout.addWidget(self.location_list)
-
         details_layout = QVBoxLayout()
+        selector_layout = QHBoxLayout()
+        selector_layout.addWidget(QLabel("Known Locations:"))
+        selector_layout.addWidget(self.location_selector, 1)
+        details_layout.addLayout(selector_layout)
         details_layout.addWidget(self.location_image_label)
+        details_layout.addWidget(
+            _button_row(self.select_image_button, self.create_image_button)
+        )
         details_layout.addWidget(self.details_output)
         details_layout.addWidget(QLabel("Travel Context"))
         details_layout.addWidget(self.travel_context_input)
         details_layout.addWidget(self.travel_button)
 
-        layout = QHBoxLayout()
-        layout.addLayout(list_layout, 1)
-        layout.addLayout(details_layout, 2)
+        layout = QVBoxLayout()
+        layout.addLayout(details_layout)
+        layout.addWidget(self.location_list)
         self.setLayout(layout)
 
     def refresh(self) -> None:
         """Reloads known locations while preserving the visible selection."""
 
         repository = self.repository()
+        self.create_image_button.setVisible(self.visual_asset_generation_enabled())
         current_location_name = ""
         selected_name = self._selected_location_name()
         self.location_list.blockSignals(True)
+        self.location_selector.blockSignals(True)
         self.location_list.clear()
+        self.location_selector.clear()
 
         if repository is None:
             self.location_list.blockSignals(False)
+            self.location_selector.blockSignals(False)
             self.location_image_label.hide()
             self.details_output.clear()
             self.travel_button.setEnabled(False)
@@ -88,24 +106,28 @@ class TravelScreen(RepositoryBackedWidget):
             )
             item.setData(Qt.ItemDataRole.UserRole + 1, name)
             self.location_list.addItem(item)
+            self.location_selector.addItem(display_name, location)
 
         self.location_list.blockSignals(False)
+        self.location_selector.blockSignals(False)
 
-        if self.location_list.count() == 0:
+        if self.location_selector.count() == 0:
             self.location_image_label.hide()
-            self.details_output.setPlainText("No locations are known yet.")
+            _set_markdown_text(self.details_output, "No locations are known yet.")
             self.travel_button.setEnabled(False)
             return
 
-        target_name = current_location_name or selected_name
+        # A visual-asset upload refreshes this screen. Keep the location the
+        # player was viewing so they can verify the uploaded image; use the
+        # player's current location only for the initial selection.
+        target_name = selected_name or current_location_name
         target_row = 0
 
-        for row in range(self.location_list.count()):
-            item = self.location_list.item(row)
-
+        for row in range(self.location_selector.count()):
+            raw_location = self.location_selector.itemData(row)
             item_name = (
-                str(item.data(Qt.ItemDataRole.UserRole + 1) or "")
-                if item is not None
+                str(raw_location.get("name", "") or "")
+                if isinstance(raw_location, dict)
                 else ""
             )
 
@@ -113,30 +135,31 @@ class TravelScreen(RepositoryBackedWidget):
                 target_row = row
                 break
 
-        self.location_list.setCurrentRow(target_row)
+        self.location_selector.setCurrentIndex(target_row)
         self._display_selected_location()
 
     def _selected_location_name(self) -> str:
         """Returns the currently selected location name, when any."""
 
-        current_item = self.location_list.currentItem()
-        if current_item is None:
+        index = self.location_selector.currentIndex()
+        if index < 0:
             return ""
 
-        return str(
-            current_item.data(Qt.ItemDataRole.UserRole + 1)
-            or current_item.text()
-        ).strip()
+        raw_location = self.location_selector.itemData(index)
+        return (
+            str(raw_location.get("name", "") or "").strip()
+            if isinstance(raw_location, dict)
+            else ""
+        )
 
     def _selected_location_data(self) -> dict[str, Any] | None:
         """Returns the selected location's persisted data."""
 
-        current_item = self.location_list.currentItem()
-
-        if current_item is None:
+        index = self.location_selector.currentIndex()
+        if index < 0:
             return None
 
-        raw_location = current_item.data(Qt.ItemDataRole.UserRole)
+        raw_location = self.location_selector.itemData(index)
         return dict(raw_location) if isinstance(raw_location, dict) else None
 
     def _display_selected_location(self, *_args: Any) -> None:
@@ -171,6 +194,11 @@ class TravelScreen(RepositoryBackedWidget):
 
         travel_lines = [
             "## Travel",
+            *(
+                [f"**Sublocation of:** {destination.parent_location}"]
+                if destination.is_sublocation and destination.parent_location
+                else []
+            ),
             f"**From:** {state.world.location or 'Current location'}",
             f"**Distance:** {format_distance(estimate.distance_miles)}",
             f"**Estimated time:** {format_travel_time(estimate.estimated_minutes)}",
@@ -227,3 +255,17 @@ class TravelScreen(RepositoryBackedWidget):
             self.travel_context_input.toPlainText().strip(),
         ):
             self.travel_context_input.clear()
+
+    def _location_image_key(self) -> str:
+        location = self._selected_location_data() or {}
+        return str(location.get("location_id", "") or location.get("name", "")).strip()
+
+    def _select_location_image(self) -> None:
+        key = self._location_image_key()
+        if key:
+            self.choose_visual_asset("location", key)
+
+    def _create_location_image(self) -> None:
+        key = self._location_image_key()
+        if key:
+            self.create_visual_asset("location", key)

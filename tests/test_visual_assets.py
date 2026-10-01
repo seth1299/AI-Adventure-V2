@@ -23,6 +23,7 @@ from ai_adventure.visual_assets import (
     find_reusable_inventory_asset,
     save_relative_image_filename,
     descriptive_image_stem,
+    save_scaled_png,
     save_scaled_jpeg,
 )
 
@@ -80,6 +81,9 @@ class _VisualRepository:
                 "notes": "Keeps order at the piers.",
             }
         ][:limit]
+
+    def list_bestiary_entries(self):
+        return []
 
 
 class VisualAssetTests(unittest.TestCase):
@@ -147,7 +151,8 @@ class VisualAssetTests(unittest.TestCase):
         self.assertEqual(captured["model"], "gemini-3.1-flash-lite-image")
         config = cast(Any, captured["config"])
         self.assertEqual(config.values["response_modalities"], ["IMAGE"])
-        self.assertEqual(config.values["image_config"].values["aspect_ratio"], "16:9")
+        self.assertEqual(config.values["image_config"].values["aspect_ratio"], "1:1")
+        self.assertEqual(config.values["image_config"].values["image_size"], "1K")
 
     def test_new_game_contract_mentions_visual_quality_without_image_schema_fields(self) -> None:
         prompt = build_gemini_new_game_prompt(
@@ -172,6 +177,101 @@ class VisualAssetTests(unittest.TestCase):
         self.assertEqual(by_subject[("location", "glass market")].message_ids, ("turn-1",))
         self.assertEqual(by_subject[("inventory", "ripe banana")].message_ids, ("turn-1",))
         self.assertEqual(by_subject[("npc", "dock_warden")].message_ids, ("turn-2",))
+        self.assertEqual(by_subject[("location", "glass market")].maximum_pixels, 1024)
+        self.assertEqual(by_subject[("inventory", "ripe banana")].maximum_pixels, 1024)
+
+    def test_requests_include_player_known_bestiary_creatures(self) -> None:
+        class _BestiaryRepository(_VisualRepository):
+            def list_bestiary_entries(self):
+                return [
+                    {
+                        "creature_id": "mist_strider",
+                        "name": "Mist-Strider",
+                        "details": "A tall six-legged creature with translucent fur.",
+                    }
+                ]
+
+            def list_mechanical_events(self):
+                return [
+                    *super().list_mechanical_events(),
+                    {
+                        "event_type": "BestiaryEntryUpsertedEvent",
+                        "payload": {
+                            "creature_id": "mist_strider",
+                            "name": "Mist-Strider",
+                        },
+                        "status": "applied",
+                        "message_id": "turn-3",
+                    },
+                ]
+
+        requests = build_visual_asset_requests(_BestiaryRepository())
+        creature = next(request for request in requests if request.subject_type == "bestiary")
+
+        self.assertEqual(creature.subject_key, "mist_strider")
+        self.assertEqual(creature.message_ids, ("turn-3",))
+        self.assertEqual(creature.aspect_ratio, "1:1")
+        self.assertIn("single non-human creature illustration", creature.prompt)
+
+    def test_image_prompt_passes_banned_terms_and_exact_map_labels(self) -> None:
+        class _MapRepository(_VisualRepository):
+            def ensure_travel_locations(self):
+                return [
+                    {
+                        "name": "Riverbend City",
+                        "description": "A river city.",
+                        "x_miles": 0,
+                        "y_miles": 0,
+                    },
+                    {
+                        "name": "Dark Forest",
+                        "description": "A forest east of the city.",
+                        "x_miles": 8,
+                        "y_miles": 0,
+                    },
+                    {"name": "Oakhaven", "description": "A forbidden example."},
+                ]
+
+            def list_inventory_items(self):
+                return [
+                    {
+                        "name": "Basic Regional Map",
+                        "category": "Document",
+                        "description": (
+                            "A hand-inked parchment map showing Riverbend City and "
+                            "surrounding roads and forests."
+                        ),
+                    }
+                ]
+
+        request = next(
+            request
+            for request in build_visual_asset_requests(_MapRepository())
+            if request.subject_type == "inventory"
+        )
+
+        self.assertIn("Alden", request.prompt)
+        self.assertIn('"Riverbend City"', request.prompt)
+        self.assertNotIn('"Oakhaven"', request.prompt)
+        self.assertIn("do not add, rename, or imply any other place", request.prompt)
+        self.assertIn("east is right, west is left, north is up, and south is down", request.prompt)
+        self.assertIn("Never render coordinates, coordinate pairs", request.prompt)
+        self.assertNotIn("x_miles=", request.prompt)
+        self.assertIn('"Dark Forest" is east of "Riverbend City".', request.prompt)
+
+    def test_non_text_subject_names_are_explicitly_metadata(self) -> None:
+        request = VisualAssetRequest(
+            subject_type="inventory",
+            subject_key="everyday_attire",
+            display_name="Everyday Attire",
+            description="A cream linen shirt and brown skirt.",
+        )
+
+        self.assertIn(
+            "The supplied subject name and description are metadata for the artist",
+            request.prompt,
+        )
+        self.assertIn("Do not copy them into the image as text", request.prompt)
 
     def test_filename_is_descriptive_bounded_and_versioned(self) -> None:
         request = VisualAssetRequest(
@@ -181,7 +281,7 @@ class VisualAssetTests(unittest.TestCase):
             description="A yellow banana.",
         )
 
-        self.assertRegex(request.filename, r"^inventory_ripe_banana_market_special_[0-9a-f]{8}\.jpg$")
+        self.assertRegex(request.filename, r"^ripe_banana_market_special_[0-9a-f]{8}\.png$")
         self.assertLessEqual(len(request.filename), 77)
         self.assertEqual(descriptive_image_stem("***"), "generated_image")
 
@@ -287,7 +387,10 @@ class VisualAssetTests(unittest.TestCase):
                         "name": "Canvas Backpack",
                         "category": "Container",
                         "description": "A worn canvas backpack.",
-                        "metadata": {"item_uuid": "item_abc123"},
+                        "metadata": {
+                            "item_uuid": "item_abc123",
+                            "basic_name": "Backpack",
+                        },
                     }
                 ]
 
@@ -296,11 +399,12 @@ class VisualAssetTests(unittest.TestCase):
         self.assertEqual(by_type["player"].subject_key, "player_abc123")
         self.assertEqual(by_type["location"].subject_key, "loc_abc123")
         self.assertEqual(by_type["inventory"].subject_key, "item_abc123")
+        self.assertEqual(by_type["inventory"].basic_name, "Backpack")
         self.assertEqual(
             save_relative_image_filename(_IdentifiedRepository(), by_type["inventory"]),
-            "example_save/inventory_canvas_backpack_"
+            "example_save/inventory/canvas_backpack_"
             + by_type["inventory"].descriptor_hash[:8]
-            + ".jpg",
+            + ".png",
         )
 
     def test_fuzzy_reuse_finds_a_compatible_inventory_image_in_another_save(self) -> None:
@@ -314,11 +418,12 @@ class VisualAssetTests(unittest.TestCase):
                 subject_key="source_item",
                 display_name="Canvas Backpack",
                 description="Container. A worn canvas backpack with leather straps.",
+                basic_name="Backpack",
             )
             source_filename = save_relative_image_filename(source_repository, source_request)
             source_path = root / "images" / source_filename
             source_path.parent.mkdir(parents=True)
-            Image.new("RGB", (32, 32), (10, 20, 30)).save(source_path, format="JPEG")
+            Image.new("RGB", (1024, 1024), (10, 20, 30)).save(source_path, format="PNG")
             source_repository.ensure_visual_asset(
                 asset_id=source_request.asset_id,
                 subject_type=source_request.subject_type,
@@ -326,8 +431,12 @@ class VisualAssetTests(unittest.TestCase):
                 display_name=source_request.display_name,
                 descriptor_hash=source_request.descriptor_hash,
                 filename=source_filename,
-                prompt=source_request.prompt,
+                prompt="The filename and prompt must not be used for reuse decisions.",
                 model="test",
+                image_style=source_request.image_style,
+                visual_description=source_request.description,
+                basic_name=source_request.basic_name,
+                resolution_tier=source_request.image_size,
                 ready=True,
             )
 
@@ -336,6 +445,7 @@ class VisualAssetTests(unittest.TestCase):
                 subject_key="target_item",
                 display_name="Leather Canvas Backpack",
                 description="Container. A worn canvas backpack with leather straps and a brass buckle.",
+                basic_name="Backpack",
             )
             reusable = find_reusable_inventory_asset(
                 images_dir=root / "images",
@@ -399,6 +509,18 @@ class VisualAssetTests(unittest.TestCase):
         self.assertIn("by itself", item_prompt)
         self.assertIn("do not show a person, face, body, hand, arm", item_prompt)
 
+    def test_inventory_image_prompt_uses_one_quantity_neutral_representative_item(self) -> None:
+        request = VisualAssetRequest(
+            subject_type="inventory",
+            subject_key="glass_vial",
+            display_name="Glass Vial",
+            description="A clear glass vial with a cork stopper.",
+        )
+
+        self.assertIn("exactly one representative item", request.prompt)
+        self.assertIn("never depict a stack, group, or repeated copies", request.prompt)
+        self.assertIn("generic item-trait metadata", request.prompt)
+
     def test_image_prompts_avoid_synthetic_visual_tells(self) -> None:
         prompt = VisualAssetRequest(
             subject_type="location",
@@ -431,6 +553,114 @@ class VisualAssetTests(unittest.TestCase):
                 self.assertEqual(saved.format, "JPEG")
                 self.assertEqual(saved.mode, "RGB")
                 self.assertEqual(saved.size, (width, height))
+
+    def test_scaled_cache_is_a_1k_rgb_png(self) -> None:
+        source = Image.new("RGBA", (1200, 800), (240, 220, 30, 255))
+        image_bytes = BytesIO()
+        source.save(image_bytes, format="PNG")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            target = Path(temp_dir) / "location.png"
+            width, height = save_scaled_png(
+                image_bytes.getvalue(),
+                target,
+                max_pixels=1024,
+            )
+            self.assertEqual((width, height), (1024, 683))
+            with Image.open(target) as saved:
+                self.assertEqual(saved.format, "PNG")
+                self.assertEqual(saved.mode, "RGB")
+                self.assertEqual(saved.size, (width, height))
+
+    def test_repository_persists_structured_visual_asset_metadata(self) -> None:
+        request = VisualAssetRequest(
+            subject_type="location",
+            subject_key="glass_market",
+            display_name="Glass Market",
+            description="Blue awnings over wet stone.",
+            image_style="watercolor",
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = SaveRepository.create_new_save(Path(temp_dir), "Metadata")
+            record = repository.ensure_visual_asset(
+                asset_id=request.asset_id,
+                subject_type=request.subject_type,
+                subject_key=request.subject_key,
+                display_name=request.display_name,
+                descriptor_hash=request.descriptor_hash,
+                filename=save_relative_image_filename(repository, request),
+                prompt="Prompt text is not the reuse metadata source.",
+                model="test",
+                image_style=request.image_style,
+                visual_description=request.description,
+                resolution_tier=request.image_size,
+            )
+
+            self.assertEqual(record["image_style"], "watercolor")
+            self.assertEqual(record["visual_description"], request.description)
+            self.assertEqual(record["basic_name"], "")
+            self.assertEqual(record["resolution_tier"], "1K")
+
+    def test_basic_item_name_reuses_variants_with_different_display_adjectives(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            saves_dir = root / "saves"
+            source_repository = SaveRepository.create_new_save(saves_dir, "Source")
+            target_repository = SaveRepository.create_new_save(saves_dir, "Target")
+            source_request = VisualAssetRequest(
+                subject_type="inventory",
+                subject_key="source_fedora",
+                display_name="Grey Felt Fedora",
+                basic_name="Fedora",
+                description="Armor. A grey felt fedora with a black ribbon band.",
+            )
+            source_filename = save_relative_image_filename(source_repository, source_request)
+            source_path = root / "images" / source_filename
+            source_path.parent.mkdir(parents=True)
+            Image.new("RGB", (1024, 1024), (30, 30, 30)).save(source_path, format="PNG")
+            source_repository.ensure_visual_asset(
+                asset_id=source_request.asset_id,
+                subject_type=source_request.subject_type,
+                subject_key=source_request.subject_key,
+                display_name=source_request.display_name,
+                descriptor_hash=source_request.descriptor_hash,
+                filename=source_filename,
+                prompt="unused",
+                model="test",
+                image_style=source_request.image_style,
+                visual_description=source_request.description,
+                basic_name=source_request.basic_name,
+                resolution_tier=source_request.image_size,
+                ready=True,
+            )
+
+            target_request = VisualAssetRequest(
+                subject_type="inventory",
+                subject_key="target_fedora",
+                display_name="Wide Brimmed Fedora",
+                basic_name="Fedora",
+                description="Armor. A dark felt fedora with a black ribbon band.",
+            )
+            reusable = find_reusable_inventory_asset(
+                images_dir=root / "images",
+                saves_dir=saves_dir,
+                repository=target_repository,
+                request=target_request,
+            )
+
+            self.assertIsNotNone(reusable)
+
+    def test_map_named_inventory_assets_use_the_1k_image_tier(self) -> None:
+        request = VisualAssetRequest(
+            subject_type="inventory",
+            subject_key="regional_map",
+            display_name="Regional Map",
+            description="A hand-inked map of the surrounding settlements.",
+        )
+
+        self.assertFalse(request.is_large_format)
+        self.assertEqual(request.image_size, "1K")
+        self.assertEqual(request.maximum_pixels, 1024)
 
     def test_repository_tracks_reuse_messages_failures_and_paid_attempts(self) -> None:
         request = VisualAssetRequest(
@@ -475,6 +705,56 @@ class VisualAssetTests(unittest.TestCase):
             self.assertEqual(ready["filename"], request.filename)
             linked = repository.list_visual_assets_for_message("turn-1")
             self.assertEqual([asset["asset_id"] for asset in linked], [request.asset_id])
+
+    def test_repository_persists_skipped_initial_image_without_retrying_it(self) -> None:
+        request = VisualAssetRequest(
+            subject_type="player",
+            subject_key="player_1",
+            display_name="Kit Vale",
+            description="A short scout in pale armor.",
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = SaveRepository.create_new_save(Path(temp_dir), "Skipped")
+            repository.ensure_visual_asset(
+                asset_id=request.asset_id,
+                subject_type=request.subject_type,
+                subject_key=request.subject_key,
+                display_name=request.display_name,
+                descriptor_hash=request.descriptor_hash,
+                filename=request.filename,
+                prompt=request.prompt,
+                model="test",
+            )
+            repository.set_visual_asset_status(request.asset_id, "skipped")
+
+            record = repository.get_visual_asset_by_id(request.asset_id)
+            self.assertIsNotNone(record)
+            assert record is not None
+            self.assertEqual(record["status"], "skipped")
+            self.assertEqual(repository.reset_failed_visual_assets(), 0)
+
+    def test_repository_accepts_bestiary_visual_assets(self) -> None:
+        request = VisualAssetRequest(
+            subject_type="bestiary",
+            subject_key="mist_strider",
+            display_name="Mist-Strider",
+            description="A tall six-legged creature with translucent fur.",
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = SaveRepository.create_new_save(Path(temp_dir), "Images")
+            record = repository.ensure_visual_asset(
+                asset_id=request.asset_id,
+                subject_type=request.subject_type,
+                subject_key=request.subject_key,
+                display_name=request.display_name,
+                descriptor_hash=request.descriptor_hash,
+                filename=request.filename,
+                prompt=request.prompt,
+                model="gemini-3.1-flash-lite-image",
+            )
+
+            self.assertEqual(record["subject_type"], "bestiary")
+            self.assertEqual(record["subject_key"], "mist_strider")
 
 
 if __name__ == "__main__":

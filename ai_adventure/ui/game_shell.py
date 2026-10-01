@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import logging
+
 from ai_adventure.ui.common import *  # noqa: F401,F403
 from ai_adventure.ui.dialogues import *  # noqa: F401,F403
 from ai_adventure.ui.screens.combat import CombatScreen
+from ai_adventure.ui.screens.merchant import MerchantScreen
 from ai_adventure.ui.workers.visual_assets import _VisualAssetCoordinator
 from ai_adventure.ui.screens.alchemy import *  # noqa: F401,F403
 from ai_adventure.ui.screens.bestiary import *  # noqa: F401,F403
@@ -19,6 +22,9 @@ from ai_adventure.ui.screens.skills import *  # noqa: F401,F403
 from ai_adventure.ui.screens.story import *  # noqa: F401,F403
 from ai_adventure.ui.screens.tasks import *  # noqa: F401,F403
 from ai_adventure.ui.screens.travel import *  # noqa: F401,F403
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 class _DetachableTabBar(QTabBar):
@@ -194,6 +200,7 @@ class GameShell(QWidget):
         self.inventory_screen = InventoryScreen(
             playtesting_tools=self.playtesting_tools,
         )
+        self.merchant_screen = MerchantScreen()
         self.combat_screen = CombatScreen(
             playtesting_tools=self.playtesting_tools,
         )
@@ -228,6 +235,7 @@ class GameShell(QWidget):
             self.bestiary_screen,
             self.calendar_screen,
             self.inventory_screen,
+            self.merchant_screen,
             self.combat_screen,
             self.npcs_screen,
             self.party_screen,
@@ -242,12 +250,15 @@ class GameShell(QWidget):
         for screen in self.screens:
             screen.set_visual_assets_dir(self.generated_images_dir)
             screen.on_repository_changed = self._handle_screen_repository_changed
+            screen.on_visual_asset_upload = self._upload_visual_asset
+            screen.on_visual_asset_generate = self._generate_visual_asset
 
         visible_tabs = (
             [
                 ("character", self.character_screen, "Character", True),
                 ("calendar", self.calendar_screen, "Calendar", True),
                 ("inventory", self.inventory_screen, "Inventory", True),
+                ("merchant", self.merchant_screen, "Merchant", True),
                 ("magic", self.magic_screen, "Magic", True),
                 ("combat", self.combat_screen, "Combat", True),
                 ("party", self.party_screen, "Party", True),
@@ -261,6 +272,7 @@ class GameShell(QWidget):
                 ("bestiary", self.bestiary_screen, "Bestiary", True),
                 ("calendar", self.calendar_screen, "Calendar", True),
                 ("inventory", self.inventory_screen, "Inventory", True),
+                ("merchant", self.merchant_screen, "Merchant", True),
                 ("combat", self.combat_screen, "Combat", True),
                 ("party", self.party_screen, "Party", True),
                 ("npcs", self.npcs_screen, "NPCs", True),
@@ -297,6 +309,86 @@ class GameShell(QWidget):
         layout.addWidget(self.tabs)
 
         self.setLayout(layout)
+
+    def _visual_asset_request(
+        self, subject_type: str, subject_key: str
+    ) -> VisualAssetRequest | None:
+        """Finds the current canonical request for one visible subject."""
+
+        repository = self.repository
+        clean_type = str(subject_type or "").strip().casefold()
+        clean_key = str(subject_key or "").strip().casefold()
+        if repository is None or not clean_type or not clean_key:
+            return None
+        return next(
+            (
+                request
+                for request in AssetGenerationService.requests_for(repository)
+                if request.subject_type.casefold() == clean_type
+                and request.subject_key.casefold() == clean_key
+            ),
+            None,
+        )
+
+    def _prepare_visual_asset_request(
+        self, subject_type: str, subject_key: str
+    ) -> tuple[SaveRepository | None, VisualAssetRequest | None, str]:
+        """Ensures a current asset record before upload or generation."""
+
+        repository = self.repository
+        request = self._visual_asset_request(subject_type, subject_key)
+        if repository is None:
+            return None, None, "No adventure is currently loaded."
+        if request is None:
+            return repository, None, "That image subject is no longer available."
+        model = normalize_image_model(
+            repository.get_setting("images.model", DEFAULT_IMAGE_MODEL)
+        )
+        repository.ensure_visual_asset(
+            asset_id=request.asset_id,
+            subject_type=request.subject_type,
+            subject_key=request.subject_key,
+            display_name=request.display_name,
+            descriptor_hash=request.descriptor_hash,
+            filename=save_relative_image_filename(repository, request),
+            prompt=request.prompt,
+            model=model,
+            image_style=request.image_style,
+            visual_description=request.description,
+            basic_name=request.basic_name,
+            resolution_tier=request.image_size,
+            message_ids=request.message_ids,
+        )
+        return repository, request, ""
+
+    def _upload_visual_asset(
+        self, subject_type: str, subject_key: str, source_path: Path
+    ) -> tuple[bool, str]:
+        repository, request, message = self._prepare_visual_asset_request(
+            subject_type, subject_key
+        )
+        if repository is None or request is None:
+            return False, message
+        LOGGER.info(
+            "Player selected image for %s/%s from %s.",
+            subject_type,
+            subject_key,
+            source_path,
+        )
+        return self.visual_asset_coordinator.upload_initial_image(
+            repository, request, source_path
+        )
+
+    def _generate_visual_asset(
+        self, subject_type: str, subject_key: str
+    ) -> tuple[bool, str]:
+        repository, request, message = self._prepare_visual_asset_request(
+            subject_type, subject_key
+        )
+        if repository is None or request is None:
+            return False, message
+        LOGGER.info("Player requested a new image for %s/%s.", subject_type, subject_key)
+        return self.visual_asset_coordinator.create_initial_image(repository, request)
 
     def _register_tab(
         self,
@@ -512,12 +604,18 @@ class GameShell(QWidget):
         repository: SaveRepository | None,
         *,
         initially_hide_empty_tabs: bool = False,
+        defer_music_playback: bool = False,
+        defer_visual_scan: bool = False,
     ) -> None:
         """
         Sets the active save repository for every screen.
 
         Args:
             repository: Active save repository, or None when returning to menu.
+            defer_music_playback: Keeps the saved music stopped until the caller
+                explicitly reveals the opening message.
+            defer_visual_scan: Keeps visual-asset discovery deferred until the
+                caller has committed any generated world entities.
         """
 
         self._restore_all_smart_hidden_tabs()
@@ -545,11 +643,30 @@ class GameShell(QWidget):
             tab_key: _screen_content_signature(screen)
             for tab_key, (screen, _label, _closable) in self._tab_specs.items()
         }
-        self._apply_audio_settings()
+        self._apply_audio_settings(start_music=not defer_music_playback)
+        if repository is not None and not defer_visual_scan:
+            LOGGER.info(
+                "Scheduling visual asset scan after repository page bind: %s.",
+                repository.db_path,
+            )
+            QTimer.singleShot(
+                100,
+                lambda repository=repository: self._scan_visual_assets_if_active(
+                    repository
+                ),
+            )
+
+    def _scan_visual_assets_if_active(self, repository: SaveRepository) -> None:
+        """Runs the visual scan only after the active save page is available."""
+
+        if self.repository is not repository:
+            return
+        LOGGER.info("Starting deferred visual asset scan: %s.", repository.db_path)
         self.visual_asset_coordinator.scan(repository)
+        LOGGER.info("Finished deferred visual asset scan: %s.", repository.db_path)
 
     def _hide_empty_starting_tabs(self, repository: SaveRepository) -> None:
-        """Hides empty NPC, Party, and Magic tabs for a newly created game."""
+        """Hides tabs that the new-game configuration says are initially irrelevant."""
 
         setup = repository.get_setting("new_game.setup", {})
         if not isinstance(setup, dict):
@@ -561,6 +678,13 @@ class GameShell(QWidget):
             magic = {}
         requested_spells = magic.get("starting_spell_requests", [])
         starting_spells = magic.get("starting_spells", [])
+        combat = setup.get("combat", {})
+        if not isinstance(combat, dict):
+            combat = {}
+        combat_focus = str(
+            combat.get("focus", repository.get_setting("combat.focus", "balanced"))
+            or "balanced"
+        ).strip().casefold()
         should_hide = {
             "npcs": not repository.list_player_visible_npcs()
             and not (isinstance(starting_npcs, list) and starting_npcs),
@@ -569,6 +693,7 @@ class GameShell(QWidget):
             "magic": not repository.list_character_spells()
             and not (isinstance(requested_spells, list) and requested_spells)
             and not (isinstance(starting_spells, list) and starting_spells),
+            "combat": combat_focus == "low" and not repository.is_combat_active(),
         }
         for tab_key, hidden in should_hide.items():
             if not hidden:
@@ -613,10 +738,22 @@ class GameShell(QWidget):
         repository = self.repository
         if repository is None:
             return
+        setup = repository.get_setting("new_game.setup", {})
+        if not isinstance(setup, dict):
+            setup = {}
+        magic = setup.get("magic", {})
+        if not isinstance(magic, dict):
+            magic = {}
+        world_contains_magic = bool(magic.get("world_contains_magic", True))
+        combat = setup.get("combat", {})
+        if not isinstance(combat, dict):
+            combat = {}
+        combat_focus = str(combat.get("focus", "balanced") or "balanced").casefold()
         has_content = {
             "npcs": bool(repository.list_player_visible_npcs()),
             "party": bool(repository.list_party_members()),
-            "magic": bool(repository.list_character_spells()),
+            "magic": world_contains_magic and bool(repository.list_character_spells()),
+            "combat": combat_focus == "low" and repository.is_combat_active(),
         }
         for tab_key in list(self._smart_hidden_tabs):
             if has_content.get(tab_key, False):
@@ -627,6 +764,7 @@ class GameShell(QWidget):
         self,
         *,
         exclude: set[RepositoryBackedWidget] | None = None,
+        scan_visual_assets: bool = True,
     ) -> None:
         """Refreshes tabs from saved data while preserving each screen's local state."""
 
@@ -653,7 +791,8 @@ class GameShell(QWidget):
             ):
                 self._mark_tab_changed(tab_key)
         self._reveal_populated_smart_hidden_tabs()
-        self.visual_asset_coordinator.scan(self.repository)
+        if scan_visual_assets:
+            self.visual_asset_coordinator.scan(self.repository)
 
     @Slot()
     def _handle_visual_assets_changed(self) -> None:
@@ -695,7 +834,7 @@ class GameShell(QWidget):
 
         return self.story_screen.submit_travel_request(destination, player_context)
 
-    def _apply_audio_settings(self) -> None:
+    def _apply_audio_settings(self, *, start_music: bool = True) -> None:
         """Applies saved audio settings to the active audio managers."""
 
         if self.repository is None:
@@ -710,6 +849,7 @@ class GameShell(QWidget):
             self.repository,
             sound_manager=self.sound_manager,
             narration_player=self.narration_player,
+            start_music=start_music,
         )
 
     def _sample_narrator_voice(

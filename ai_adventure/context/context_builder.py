@@ -20,6 +20,7 @@ from ai_adventure.combat import (
     normalize_combat_state,
 )
 from ai_adventure.currency import format_currency_amount
+from ai_adventure.crafting import evaluate_recipe_craftability, recipe_estimated_time
 from ai_adventure.core.models import AdventureState
 from ai_adventure.notes import note_entries_for_ai, normalize_note_entries
 from ai_adventure.narration_preferences import normalize_narration_preferences
@@ -247,6 +248,9 @@ class AiContextBuilder:
         current_background_ambience: str | None = None,
         resolved_skill_checks: list[dict[str, Any]] | None = None,
         planner_context_tags: list[str] | None = None,
+        merchant: dict[str, Any] | None = None,
+        out_of_game_correction: bool = False,
+        mechanical_events: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         """
         Builds the context packet for one story turn.
@@ -264,6 +268,10 @@ class AiContextBuilder:
             current_music: Currently selected background music filename.
             valid_sound_effect_tracks: Playable one-shot sound-effect filenames.
             resolved_skill_checks: Skill checks already resolved for this command.
+            merchant: Authoritative active-merchant profile and offers.
+            out_of_game_correction: Whether this out-of-game request may propose
+                narrowly scoped inventory corrections.
+            mechanical_events: Recent saved event-application results for audits.
             planner_context_tags: Validated tags selected by the pre-narration
                 planner. ``None`` falls back to keyword inference.
 
@@ -280,6 +288,20 @@ class AiContextBuilder:
             if planner_context_tags is None
             else _normalize_planner_context_tags(planner_context_tags)
         )
+        referenced_items = [
+            *state.inventory.items[:MAX_INVENTORY_CONTEXT_ITEMS],
+            *state.item_catalog.items,
+        ]
+        detailed_item_names = {
+            _item_context_identity(item)
+            for item in referenced_items
+            if _item_is_referenced(item, clean_command)
+        }
+        storage_aliases = _inventory_storage_aliases(state.inventory.items)
+        if detailed_item_names:
+            # Exploration verbs such as "inspect" do not otherwise select the
+            # inventory projection, but an explicit item name makes it relevant.
+            selected_tags.add("inventory")
         selected_tags.update(
             _hybrid_magic_relevance_tags(
                 state,
@@ -340,11 +362,14 @@ class AiContextBuilder:
         audio_transition_rules: list[str] = []
         if clean_music_tracks:
             audio_transition_rules.append(
-                "When StatusUpdatedEvent.location changes to a substantially different "
-                "environment type, compare state.audio.current_music to "
-                "state.audio.valid_music_tracks. If a listed track clearly better "
-                "matches the new environment or mood, include MusicChangedEvent "
-                "before the final StatusUpdatedEvent."
+                "MusicChangedEvent is optional, not required whenever the scene or "
+                "location changes. Compare state.audio.current_music with every entry "
+                "in state.audio.valid_music_tracks and include MusicChangedEvent "
+                "before the final StatusUpdatedEvent only when a listed replacement "
+                "is clearly a better fit for the new environment or mood. If none of "
+                "the available tracks is clearly better, omit the event and leave the "
+                "current track playing; never change music merely because the scene "
+                "changed."
             )
         if clean_sound_effect_tracks:
             audio_transition_rules.append(
@@ -441,12 +466,12 @@ class AiContextBuilder:
             state.magic,
             include_progression="magic" in selected_tags or "spell" in selected_tags,
         )
-
         packet = {
             "schema_version": 1,
             "packet_type": "story_turn",
             "player_command": clean_command,
             "conversation_mode": clean_conversation_mode,
+            "out_of_game_correction": bool(out_of_game_correction),
             "selection": {
                 "tags": sorted(selected_tags),
                 "max_history_entries": self.max_history_entries,
@@ -550,6 +575,8 @@ class AiContextBuilder:
                             "terrain": _compact_text(location.terrain),
                             "travel_multiplier": location.travel_multiplier,
                             "travel_notes": _compact_text(location.travel_notes),
+                            "is_sublocation": location.is_sublocation,
+                            "parent_location": _compact_text(location.parent_location),
                         }
                         for location in state.travel.locations
                     ],
@@ -594,18 +621,34 @@ class AiContextBuilder:
                 },
                 "inventory": {
                     "items": [
-                        {
-                            "database_id": item.id,
-                            "name": item.name,
-                            "category": item.category,
-                            "quantity": item.quantity,
-                            "equipped": item.equipped,
-                            "description": _compact_text(item.description),
-                            "value_base_units": item.value_base_units,
-                            "metadata": _compact_context_value(item.metadata),
-                        }
+                        _inventory_item_context(
+                            item,
+                            storage_aliases=storage_aliases,
+                            include_details=_item_context_identity(item)
+                            in detailed_item_names,
+                            include_metadata_details=_item_is_operationally_relevant(
+                                item,
+                                selected_tags=selected_tags,
+                                player_command=clean_command,
+                            ),
+                        )
                         for item in state.inventory.items[:MAX_INVENTORY_CONTEXT_ITEMS]
                     ],
+                    "storage_locations": _inventory_storage_locations(
+                        state.inventory.items
+                    ),
+                    "detail_policy": (
+                        "Inventory rows are compact by default: use name, category, "
+                        "quantity, equipped state, storage location, quantity unit, "
+                        "and stable identity for routine turns. Descriptions, values, "
+                        "and detailed item metadata are included only for an item "
+                        "whose name or generic family name is explicitly relevant to "
+                        "the player's command, or when operational metadata is needed "
+                        "for combat or container access. If a field is absent, Python "
+                        "omitted it intentionally; do not infer that the item lacks a "
+                        "detail."
+                    ),
+                    "detailed_item_names": sorted(detailed_item_names),
                     "container_rule": (
                         CONTAINER_ACCESS_RULE + " "
                         "Never reveal or award a closed container's contents. Use "
@@ -624,16 +667,22 @@ class AiContextBuilder:
                 },
                 "item_catalog": {
                     "items": [
-                        {
-                            "database_id": item.id,
-                            "name": item.name,
-                            "category": item.category,
-                            "description": _compact_text(item.description),
-                            "value_base_units": item.value_base_units,
-                            "metadata": _compact_context_value(item.metadata),
-                        }
+                        _item_catalog_entry_context(
+                            item,
+                            include_details=_item_context_identity(item)
+                            in detailed_item_names,
+                        )
                         for item in state.item_catalog.items
                     ],
+                    "detail_policy": (
+                        "Catalog rows are compact by default because the catalog is a "
+                        "memory of item identities, not a transcript of every item's "
+                        "description. Descriptions, values, and detailed metadata are "
+                        "included only for an explicitly relevant item name or generic "
+                        "family name. Use the catalog name and category for ordinary "
+                        "item recognition, and do not invent a missing description."
+                    ),
+                    "detailed_item_names": sorted(detailed_item_names),
                     "rules": {
                         "purpose": (
                             "This is the durable master list of known item "
@@ -648,11 +697,17 @@ class AiContextBuilder:
                         "Travel-tab locations; use actively_carried only when the "
                         "Player Character is carrying it. "
                             "Use item_catalog to remember descriptions, categories, "
-                            "values for previously seen items. Each item also "
-                            "has database_id, a globally unique database identity, and "
-                            "metadata.item_uuid, a stable item identity; "
-                            "reuse it for the same item and do not split one item "
-                            "into duplicate definitions because of name variations."
+                            "and values for previously seen items when a detailed "
+                            "record is supplied. Each item also "
+                        "has database_id, a globally unique database identity, and "
+                        "metadata.item_uuid, a stable item identity; "
+                        "reuse it for the same item and do not split one item "
+                        "into duplicate definitions because of name variations. "
+                        "For storage moves, use InventoryItemModifiedEvent with the "
+                        "existing item_uuid and new_storage_location; only use a "
+                        "reachable destination. Copy an existing value from "
+                        "state.inventory.storage_locations exactly instead of "
+                        "shortening or paraphrasing it."
                         ),
                     },
                 },
@@ -747,6 +802,12 @@ class AiContextBuilder:
                             :MAX_CRAFTING_CONTEXT_ENTRIES
                         ]
                     ],
+                    "crafting_status": _crafting_status_context(
+                        state.alchemy.known_recipes,
+                        state.inventory.items,
+                        state.skills.skills,
+                        state.settings.values.get("crafting.processes", []),
+                    ),
                     "rules": {
                         "reagent_fields": (
                               "Crafting items/materials use name, category, description, "
@@ -781,6 +842,16 @@ class AiContextBuilder:
                             "state.alchemy.known_reagents stores crafting knowledge, "
                             "but item_catalog categories decide whether an item can "
                             "be chosen as a recipe ingredient."
+                        ),
+                        "deterministic_crafting_rule": (
+                            "Crafting is application-managed. Suggest a crafting action "
+                            "only for a recipe whose crafting_status.craftable_now is true, "
+                            "and identify it using the exact recipe_id. Never suggest a "
+                            "recipe with missing ingredients or tools. Python consumes "
+                            "ingredients by item UUID, advances hidden active work using "
+                            "the matching skill, starts passive stages, and creates the "
+                            "result only when every stage is complete. Do not invent or "
+                            "change work amounts, time, item IDs, or tool requirements."
                         ),
                         "common_measurement_units": list(COMMON_MEASUREMENT_UNITS),
                     },
@@ -973,14 +1044,19 @@ class AiContextBuilder:
                     "valid_background_ambience_tracks": clean_background_ambience_tracks,
                     "rules": {
                         "music_change_rule": (
-                            "When scene mood, location, danger level, or environment "
-                            "changes enough that the current track no longer fits, "
-                            "suggest MusicChangedEvent."
+                            "MusicChangedEvent is optional. When scene mood, location, "
+                            "danger level, or environment changes, compare the current "
+                            "track with every entry in valid_music_tracks. Suggest the "
+                            "event only when a listed replacement is clearly a better "
+                            "fit; if none is clearly better, omit it and keep the "
+                            "current music playing. Do not change tracks merely because "
+                            "the scene changed."
                         ),
                         "filename_rule": (
                             "MusicChangedEvent.filename must exactly match one entry "
                             "from valid_music_tracks. If valid_music_tracks is empty, "
-                            "do not suggest MusicChangedEvent."
+                            "or no available track is clearly a better fit than the "
+                            "current track, do not suggest MusicChangedEvent."
                         ),
                         "sound_effect_rule": (
                             "SoundEffectChangedEvent is a short one-shot narration cue, "
@@ -997,7 +1073,11 @@ class AiContextBuilder:
                             "BackgroundAmbienceChangedEvent controls a quiet persistent "
                             "environmental loop independent of music. filename must "
                             "exactly match valid_background_ambience_tracks, or be STOP "
-                            "when ambience should end without replacement."
+                            "when ambience should end without replacement. When a "
+                            "StatusUpdatedEvent changes weather, re-evaluate the "
+                            "current ambience in the same response and stop or replace "
+                            "weather-specific ambience that no longer fits; for example, "
+                            "Rain to Clear requires stopping or replacing Rain ambience."
                         ),
                         "english_text_rule": (
                             "Every generated string value must use printable ASCII "
@@ -1011,15 +1091,21 @@ class AiContextBuilder:
                             "Return speaker_cues for every exact contiguous span of "
                             "non-narrator dialogue in response. Copy the complete span, "
                             "including outer double quotation marks, into a unique "
+                            "anchor_text copied verbatim from response. Never use "
+                            "placeholder text such as [X], [Y], ellipses, or a "
+                            "paraphrase as anchor_text. "
                             "anchor_text. Use an actual NPC's exact npc_id as speaker_id "
                             "and reuse it on later turns; use distinct stable "
                             "lower_snake_case IDs for other speakers. Choose only a "
                             "broad established voice_profile and use neutral when "
-                            "unspecified. speaker_name is the visible chat-bubble label: "
+                            "unspecified. For Player Character dialogue, use the literal "
+                            "player_character ID and follow state.player.pronouns: She/Her "
+                            "feminine, He/Him masculine, and They/Them or custom pronouns "
+                            "neutral. speaker_name is the visible chat-bubble label: "
                             "use the known name or a concise player-safe description "
                             "when the name is unknown. Python splits the response into "
                             "same-turn bubbles and durably remembers the installed "
-                            "voice ID. Do not cue narrator prose or the Player Character."
+                            "voice ID. Do not cue narrator prose."
                         ),
                     },
                 },
@@ -1047,7 +1133,11 @@ class AiContextBuilder:
                             "replace player_facing_information. location should be "
                             "a meaningful player-known place, usually the current "
                             "scene location, and should not be blank. Do not add "
-                            "unsupported NPC fields such as disposition."
+                            "unsupported NPC fields such as disposition. Emit the "
+                            "event in this same response even when the selected "
+                            "context tags do not include dialogue. Do not create "
+                            "profiles for unnamed background people or passing "
+                            "extras."
                         ),
                         "multiple_npc_rule": (
                             "If one turn introduces multiple distinct meaningful NPCs, "
@@ -1071,6 +1161,16 @@ class AiContextBuilder:
                         ),
                     },
                     "relevant": clean_relevant_npcs,
+                },
+                "merchant": merchant or {"active_npc_id": "", "profile": None, "stock": [], "buy_offers": []},
+                "event_audit": {
+                    "recent_mechanical_events": [
+                        dict(event) for event in (mechanical_events or [])[-40:]
+                    ],
+                    "rules": (
+                        "This is an audit trail, not a source of new facts. Compare it "
+                        "with current saved inventory before suggesting a correction."
+                    ),
                 },
                 "party": {
                     "members": clean_party_members,
@@ -1205,7 +1305,8 @@ class AiContextBuilder:
                     "quotes, speaker_id, speaker_name, and voice_profile. speaker_name "
                     "is the visible bubble label: use the known name or a concise "
                     "player-safe description when the name is unknown. Use the exact "
-                    "canonical npc_id for an NPC, reuse one ID for the same speaker, "
+                    "canonical npc_id for an NPC, player_character for Player Character "
+                    "dialogue, reuse one ID for the same speaker, "
                     "and use different IDs for different speakers. Return [] when only "
                     "the narrator speaks or for out_of_game. Python owns bubble "
                     "splitting, final installed voice assignment, and persistence."
@@ -1216,7 +1317,13 @@ class AiContextBuilder:
                     "or request directly, return out_of_game=true, suggested_actions=[], "
                     "and events=[]; do not advance time, turns, status, combat, skills, "
                     "inventory, tasks, NPC memory, secrets, miscellaneous canon, "
-                    "music, or any durable state. "
+                    "music, or any durable state unless out_of_game_correction is true. "
+                    "When out_of_game_correction is true, you may suggest only a narrowly "
+                    "supported InventoryItemAddedEvent correction after auditing the "
+                    "recent history, mechanical event log, and current inventory. "
+                    "Do not add an item merely because the player expected it; add it only "
+                    "when the saved log and narration establish that it was awarded and "
+                    "the current inventory is missing it. "
                     "For live_game, return out_of_game=false and resolve the message as "
                     "an in-world action. Never infer or override the mode from wording."
                 ),
@@ -1281,9 +1388,8 @@ class AiContextBuilder:
                 "player_ai_preferences": (
                     "Use state.player_ai_preferences.narration_tense_label and "
                     "state.player_ai_preferences.narration_style_label for the "
-                    "response field. Apply model_tone_instruction, "
-                    "response_length_instruction, and model_content_rules to "
-                    "player-facing prose. Also use "
+                    "response field. Tone, response length, and content permissions "
+                    "are supplied once in the prompt presentation section. Also use "
                     "state.player_ai_preferences.additional_context as persistent "
                     "player-provided guidance for boundaries and miscellaneous "
                     "preferences. This is always AI-facing; Notes are only AI-facing "
@@ -1315,17 +1421,27 @@ class AiContextBuilder:
                     "Use state.item_catalog.items as the master list of remembered "
                     "item definitions. Before inventing an item, reuse a fitting "
                     "existing catalog definition whenever one can serve the story. "
-                "It preserves descriptions, categories, and values, "
-                    "and metadata.item_uuid stable internal identities; reuse the same "
-                    "item_uuid for the same item even when its display name changes. "
-                    "It also preserves equipment metadata after items leave inventory. "
+                    "Routine rows are intentionally compact and may omit descriptions, "
+                    "values, and detailed metadata. Those fields are authoritative only "
+                    "when a targeted item record includes them; do not assume an omitted "
+                    "field is empty. The catalog preserves metadata.item_uuid stable "
+                    "internal identities; reuse the same item_uuid for the same item even "
+                    "when its display name changes. For every new item, also provide "
+                    "basic_name: a short generic item-family name with color, material, "
+                    "size, condition, craftsmanship, and other flavor adjectives removed. "
+                    "Use the same basic_name for equivalent items such as Wide Brimmed "
+                    "Fedora, Grey Felt Fedora, and Fedora. It also preserves equipment "
+                    "metadata after items leave inventory. "
                     "Use Weapon metadata for weapon_hands, damage dice, attack range, "
                     "and optional ammunition_type_required, clip_size, and "
                     "bullets_per_attack. Ammunition items use matching "
                     "ammunition_type metadata. Use Armor "
                     "metadata for covers_body_parts and armor_rating. Container "
                     "metadata preserves exact hidden contents, open/taken state, "
-                    "locks, traps, check skills/DCs, and failure consequences. "
+                    "locks, traps, check skills/DCs, and failure consequences when the "
+                    "relevant container is targeted. Closed-container contents are "
+                    "never revealed by this context projection; use the container events "
+                    "and Python validation to open or transfer them. "
                     "Do not treat "
                     "catalog entries as possessions unless they also appear in "
                     "state.inventory.items. Recipe ingredients may only use "
@@ -1341,8 +1457,8 @@ class AiContextBuilder:
                     "food, drinks, magic, crafting ingredients, species, or similar "
                     "invented details. Prefer the provided examples or close "
                     "stylistic relatives over generic training-data fantasy "
-                    "defaults. The banned_terms list is a hard exclusion list, "
-                    "not optional style guidance: never use creative_ideas.banned_terms "
+                    "defaults. The dedicated banned_terms prompt section is a hard "
+                    "exclusion list, not optional style guidance: never use those terms "
                     "or obvious spelling, hyphenation, or reskin variants for newly "
                     "invented proper nouns. Before returning JSON, scan every string "
                     "key and value and replace any newly invented banned term with "
@@ -1365,7 +1481,13 @@ class AiContextBuilder:
                     "identifier and update the one profile; do not create a second "
                     "internal name for the same role/person at the same location. Use "
                     "one NpcUpsertedEvent per distinct meaningful NPC introduced. "
-                    "Every party member remains that same canonical NPC: reuse npc_id "
+                    "When a named or materially important NPC first appears, emit "
+                    "that profile in the same response as the introduction, even "
+                    "if the selected context tags do not include dialogue. Do not "
+                    "create profiles for unnamed background people or passing extras. "
+                    "If that NPC speaks in the response, speaker_cues.speaker_id "
+                    "must exactly match the profile's npc_id. Every party member "
+                    "remains that same canonical NPC: reuse npc_id "
                     "with party_member=true and party_status, party_health_current, "
                     "party_health_max, party_armor_class, party_combat_style, and "
                     "party_skills when those visible details change. Use "
@@ -1433,6 +1555,14 @@ class AiContextBuilder:
                     "must not use CurrencyChangedEvent; Python adds it only when an "
                     "open container receives ContainerContentsTakenEvent."
                 ),
+                "merchant_transactions": (
+                    "state.merchant is authoritative for the active merchant's stock and "
+                    "committed offers. Never invent a price, availability, quantity, or "
+                    "completed purchase/sale in prose. The Merchant tab and Python-owned "
+                    "transaction service perform all actual inventory and currency changes. "
+                    "Gemini may narrate a greeting, explain a sold-out item, or propose a "
+                    "new offer, but any offer must be committed before the player can use it."
+                ),
                 (
                     "combat_handoff" if strict_combat else "narrative_combat"
                 ): (
@@ -1472,6 +1602,7 @@ class AiContextBuilder:
                     "ContainerOpenedEvent",
                     "ContainerContentsTakenEvent",
                     "CombatStartedEvent",
+                    "CraftingProcessRequestedEvent",
                     "RecipeDiscoveredEvent",
                     "ReagentDiscoveredEvent",
                     "CurrencyChangedEvent",
@@ -1575,6 +1706,236 @@ def _normalize_planner_context_tags(tags: list[str]) -> set[str]:
         for tag in tags
         if isinstance(tag, str) and tag.strip().casefold() in PLANNABLE_CONTEXT_TAGS
     }
+
+
+def _item_context_identity(item: Any) -> str:
+    """Returns the normalized identity used for targeted item detail lookup."""
+
+    name = str(getattr(item, "name", "") or "").strip().casefold()
+    metadata = getattr(item, "metadata", {})
+    basic_name = (
+        str(metadata.get("basic_name", "") or "").strip().casefold()
+        if isinstance(metadata, dict)
+        else ""
+    )
+    return name or basic_name
+
+
+def _item_is_referenced(item: Any, player_command: str) -> bool:
+    """Returns whether the command explicitly names an item or item family."""
+
+    command = str(player_command or "").casefold()
+    if not command:
+        return False
+
+    candidates = [str(getattr(item, "name", "") or "").strip()]
+    metadata = getattr(item, "metadata", {})
+    if isinstance(metadata, dict):
+        candidates.append(str(metadata.get("basic_name", "") or "").strip())
+
+    for candidate in candidates:
+        normalized = " ".join(candidate.casefold().split())
+        if not normalized:
+            continue
+        if re.search(rf"(?<![a-z0-9]){re.escape(normalized)}(?![a-z0-9])", command):
+            return True
+    return False
+
+
+def _item_is_operationally_relevant(
+    item: Any,
+    *,
+    selected_tags: set[str],
+    player_command: str,
+) -> bool:
+    """Returns whether detailed metadata is needed for a current game operation."""
+
+    if "combat" in selected_tags and bool(getattr(item, "equipped", False)):
+        return True
+
+    metadata = getattr(item, "metadata", {})
+    item_type = str(metadata.get("item_type", "") if isinstance(metadata, dict) else "")
+    category = str(getattr(item, "category", "") or "")
+    is_container = item_type.casefold() == "container" or category.casefold() == "container"
+    if not is_container:
+        return False
+
+    command = str(player_command or "").casefold()
+    return bool(
+        re.search(
+            r"\b(?:open|unlock|lock|trap|trapped|inside|contents|empty|take|remove|"
+            r"collect|search)\b",
+            command,
+        )
+    )
+
+
+_COMPACT_ITEM_METADATA_KEYS = {
+    "item_uuid",
+    "item_type",
+    "basic_name",
+    "quantity_unit",
+    "storage_location",
+}
+
+
+def _item_metadata_context(
+    metadata: Any,
+    *,
+    include_details: bool,
+) -> dict[str, Any]:
+    """Returns identity metadata, optionally expanding relevant item details.
+
+    Closed-container contents remain excluded even from a targeted item record.
+    The model receives the container's access state and checks, but Python remains
+    the authority for revealing and transferring its stored contents.
+    """
+
+    if not isinstance(metadata, dict):
+        return {}
+
+    if not include_details:
+        return {
+            key: _compact_context_value(metadata[key])
+            for key in _COMPACT_ITEM_METADATA_KEYS
+            if key in metadata
+        }
+
+    compact = _compact_context_value(metadata)
+    if not isinstance(compact, dict):
+        return {}
+    container = compact.get("container")
+    if isinstance(container, dict) and container.get("is_open") is not True:
+        container = dict(container)
+        container.pop("contents", None)
+        compact["container"] = container
+    return compact
+
+
+def _inventory_item_context(
+    item: Any,
+    *,
+    include_details: bool,
+    include_metadata_details: bool = False,
+    storage_aliases: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """Builds the compact or targeted context representation of an inventory item."""
+
+    context = {
+        "database_id": getattr(item, "id", None),
+        "name": str(getattr(item, "name", "") or "").strip(),
+        "category": str(getattr(item, "category", "") or "").strip(),
+        "quantity": getattr(item, "quantity", 0),
+        "equipped": bool(getattr(item, "equipped", False)),
+        "metadata": _item_metadata_context(
+            getattr(item, "metadata", {}),
+            include_details=include_details or include_metadata_details,
+        ),
+    }
+    metadata = context.get("metadata")
+    if isinstance(metadata, dict) and storage_aliases:
+        location = str(metadata.get("storage_location", "") or "").strip()
+        canonical = storage_aliases.get(location.casefold())
+        if canonical:
+            metadata["storage_location"] = canonical
+    if include_details:
+        context.update(
+            {
+                "description": _compact_text(getattr(item, "description", "")),
+                "value_base_units": getattr(item, "value_base_units", 0),
+            }
+        )
+    return context
+
+
+def _inventory_storage_locations(items: list[Any]) -> list[str]:
+    """Returns established storage labels and named inventory containers."""
+
+    aliases = _inventory_storage_aliases(items)
+    labels: dict[str, str] = {"actively_carried": "actively_carried"}
+    for item in items:
+        metadata = getattr(item, "metadata", {})
+        if isinstance(metadata, dict):
+            location = str(metadata.get("storage_location", "") or "").strip()
+            if location:
+                canonical = aliases.get(location.casefold(), location)
+                labels.setdefault(canonical.casefold(), canonical)
+        category = str(getattr(item, "category", "") or "").strip().casefold()
+        item_type = str(
+            metadata.get("item_type", "") if isinstance(metadata, dict) else ""
+        ).strip().casefold()
+        if category == "container" or item_type == "container":
+            name = str(getattr(item, "name", "") or "").strip()
+            if name:
+                labels.setdefault(name.casefold(), name)
+    return list(labels.values())
+
+
+def _inventory_storage_aliases(items: list[Any]) -> dict[str, str]:
+    """Maps unambiguous short storage labels to named inventory containers."""
+
+    containers = [
+        str(getattr(item, "name", "") or "").strip()
+        for item in items
+        if (
+            str(getattr(item, "category", "") or "").strip().casefold()
+            == "container"
+            or str(
+                (
+                    getattr(item, "metadata", {}).get("item_type", "")
+                    if isinstance(getattr(item, "metadata", {}), dict)
+                    else ""
+                )
+                or ""
+            ).strip().casefold()
+            == "container"
+        )
+        and str(getattr(item, "name", "") or "").strip()
+    ]
+    aliases: dict[str, str] = {}
+    for item in items:
+        metadata = getattr(item, "metadata", {})
+        if not isinstance(metadata, dict):
+            continue
+        location = str(metadata.get("storage_location", "") or "").strip()
+        key = _storage_context_key(location)
+        if not key or key in {"actively carried", "on person"}:
+            continue
+        matches = {
+            name
+            for name in containers
+            if _storage_context_key(name) == key
+            or _storage_context_key(name).endswith(f" {key}")
+        }
+        if len(matches) == 1:
+            aliases[location.casefold()] = next(iter(matches))
+    return aliases
+
+
+def _storage_context_key(value: str) -> str:
+    return " ".join(re.findall(r"[a-z0-9]+", value.casefold()))
+
+
+def _item_catalog_entry_context(item: Any, *, include_details: bool) -> dict[str, Any]:
+    """Builds the compact or targeted context representation of a catalog item."""
+
+    context = {
+        "database_id": getattr(item, "id", None),
+        "name": str(getattr(item, "name", "") or "").strip(),
+        "category": str(getattr(item, "category", "") or "").strip(),
+        "metadata": _item_metadata_context(
+            getattr(item, "metadata", {}),
+            include_details=include_details,
+        ),
+    }
+    if include_details:
+        context.update(
+            {
+                "description": _compact_text(getattr(item, "description", "")),
+                "value_base_units": getattr(item, "value_base_units", 0),
+            }
+        )
+    return context
 
 
 def _npc_context_profile(npc: dict[str, Any]) -> dict[str, Any]:
@@ -1880,6 +2241,63 @@ def _compact_context_value(value: Any) -> Any:
         return _compact_mapping(value)
 
     return value
+
+
+def _crafting_status_context(
+    recipes: list[Any],
+    inventory_items: list[Any],
+    skills: list[Any],
+    raw_processes: Any,
+) -> list[dict[str, Any]]:
+    """Builds the model-facing deterministic crafting eligibility snapshot."""
+
+    def as_dict(value: Any) -> dict[str, Any]:
+        if isinstance(value, dict):
+            return dict(value)
+        to_dict = getattr(value, "to_dict", None)
+        converted = to_dict() if callable(to_dict) else {}
+        return converted if isinstance(converted, dict) else {}
+
+    inventory = [as_dict(item) for item in inventory_items]
+    skill_rows = [as_dict(skill) for skill in skills]
+    processes = {
+        str(item.get("recipe_id", "")).strip(): item
+        for item in (raw_processes if isinstance(raw_processes, list) else [])
+        if isinstance(item, dict) and str(item.get("recipe_id", "")).strip()
+    }
+    statuses: list[dict[str, Any]] = []
+    for raw_recipe in recipes[:MAX_CRAFTING_CONTEXT_ENTRIES]:
+        recipe = as_dict(raw_recipe)
+        recipe_id = str(recipe.get("id", "")).strip()
+        if not recipe_id:
+            continue
+        availability = evaluate_recipe_craftability(recipe, inventory)
+        estimate = recipe_estimated_time(recipe, skill_rows)
+        process = processes.get(recipe_id)
+        statuses.append(
+            {
+                "recipe_id": recipe_id,
+                "recipe_name": str(recipe.get("name", "")).strip(),
+                "result_item_name": str(
+                    recipe.get("result_item_name", recipe.get("result", ""))
+                ).strip(),
+                "craftable_now": bool(availability["craftable"] or process),
+                "craftable_quantity": availability["craftable_quantity"],
+                "missing_ingredients": availability["missing_ingredients"],
+                "missing_tools": availability["missing_tools"],
+                "skill_name": estimate["skill_name"],
+                "skill_level": estimate["skill_level"],
+                "estimated_active_minutes": estimate["active_minutes"],
+                "estimated_passive_minutes": estimate["passive_minutes"],
+                "required_tool_item_uuids": recipe.get("required_tool_item_uuids", []),
+                "result_item_uuid": recipe.get("result_item_uuid", ""),
+                "process_state": (
+                    "active" if process and process.get("passive_due_minute") is None else
+                    "passive" if process else "not_started"
+                ),
+            }
+        )
+    return statuses
 
 
 def _coerce_bool(value: Any, *, default: bool = False) -> bool:

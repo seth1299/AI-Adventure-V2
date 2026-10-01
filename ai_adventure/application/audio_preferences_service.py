@@ -39,6 +39,7 @@ class AudioPreferencesService:
         *,
         sound_manager: Any = None,
         narration_player: Any = None,
+        start_music: bool = True,
     ) -> None:
         get = repository.get_setting
         music_enabled = bool_setting(get("audio.music_enabled", True), True)
@@ -59,7 +60,7 @@ class AudioPreferencesService:
             if hasattr(sound_manager, "set_background_ambience_enabled"):
                 sound_manager.set_background_ambience_enabled(ambience_enabled)
             current_music = str(get("audio.current_music", "") or "").strip()
-            if music_enabled and current_music:
+            if start_music and music_enabled and current_music:
                 sound_manager.play_music(current_music)
             else:
                 sound_manager.stop_music(clear_current=False)
@@ -80,6 +81,7 @@ class AudioPreferencesService:
                 "narrator_enabled": narrator_enabled,
                 "tts_volume": get("audio.tts_volume", 90),
                 "tts_voice": get("audio.tts_voice", DEFAULT_NARRATOR_VOICE),
+                "player_tts_voice": get("audio.player_tts_voice", "ai"),
                 "tts_speed": get("audio.tts_speed", DEFAULT_TTS_SPEED_PERCENT),
                 "tts_voice_mode": get("audio.tts_voice_mode", "preset"),
                 "tts_voice_blend": get("audio.tts_voice_blend", {}),

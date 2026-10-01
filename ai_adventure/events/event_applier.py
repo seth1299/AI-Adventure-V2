@@ -40,6 +40,7 @@ from ai_adventure.combat import (
 from ai_adventure.container_access import has_immediate_container_unlock_method
 from ai_adventure.currency import format_currency_amount
 from ai_adventure.locations import clean_player_location_name
+from ai_adventure.locations import calculate_travel_estimate, normalize_known_locations
 from ai_adventure.persistence.save_repository import GM_SECRET_STATUSES, SaveRepository
 from ai_adventure.skills.rules import bonus_for_level, dc_for_difficulty
 
@@ -121,7 +122,7 @@ class EventApplier:
             Application results for every attempted event.
         """
 
-        with self.repository.message_context(self.message_id):
+        with self.repository.transaction(), self.repository.message_context(self.message_id):
             return self._apply_events(raw_events, prior_results=prior_results)
 
     def _apply_events(
@@ -180,6 +181,9 @@ class EventApplier:
                 and str(result.payload.get("outcome", "")).casefold() == "failure"
             ):
                 blocking_failure = result
+
+            if result.status == "failed":
+                raise RuntimeError(f"Failed to apply {result.event_type}: {result.message}")
 
             self.repository.append_mechanical_event(
                 result.event_type,
@@ -259,6 +263,9 @@ class EventApplier:
             if event_type == "ReagentDiscoveredEvent":
                 return self._apply_reagent_discovered(event_type, payload)
 
+            if event_type == "CraftingProcessRequestedEvent":
+                return self._apply_crafting_process_requested(event_type, payload)
+
             if event_type == "CurrencyChangedEvent":
                 return self._apply_currency_changed(event_type, payload)
 
@@ -294,6 +301,12 @@ class EventApplier:
 
             if event_type == "NpcUpsertedEvent":
                 return self._apply_npc_upserted(event_type, payload)
+
+            if event_type == "MerchantStockUpsertedEvent":
+                return self._apply_merchant_stock_upserted(event_type, payload)
+
+            if event_type == "MerchantBuyOfferUpsertedEvent":
+                return self._apply_merchant_buy_offer_upserted(event_type, payload)
 
             if event_type == "NpcKnowledgeAddedEvent":
                 return self._apply_npc_knowledge_added(event_type, payload)
@@ -363,6 +376,10 @@ class EventApplier:
         ) or _first_text(payload, "description", "desc")
         quantity_unit = _first_text(payload, "quantity_unit", "unit", "measure_unit") or "each"
         storage_location = _first_text(payload, "storage_location") or "actively_carried"
+        if not owner_npc_id:
+            storage_location = _canonical_inventory_storage_location(
+                self.repository, storage_location
+            )
         value_base_units = max(
             1,
             _first_int(
@@ -498,6 +515,30 @@ class EventApplier:
             "base_unit_value",
             "value",
         )
+        metadata = dict(payload)
+        new_storage_location = _first_text(
+            payload, "new_storage_location", "storage_location"
+        )
+        if new_storage_location:
+            if not owner_npc_id:
+                new_storage_location = _canonical_inventory_storage_location(
+                    self.repository, new_storage_location
+                )
+            if not _storage_location_is_accessible(
+                self.repository, new_storage_location
+            ):
+                return _invalid(
+                    event_type,
+                    payload,
+                    (
+                        f"Cannot move {target_name} to storage location "
+                        f"{new_storage_location!r} from the player's current location."
+                    ),
+                )
+            metadata["storage_location"] = new_storage_location
+        new_basic_name = _first_text(payload, "new_basic_name")
+        if new_basic_name and new_basic_name.casefold() not in {"same", "skip"}:
+            metadata["basic_name"] = new_basic_name
 
         if owner_npc_id:
             self.repository.modify_party_inventory_item(
@@ -508,7 +549,7 @@ class EventApplier:
                 description=_first_text(payload, "new_description", "description"),
                 quantity=quantity,
                 value_base_units=value_base_units,
-                metadata=payload,
+                metadata=metadata,
             )
         else:
             self.repository.modify_inventory_item(
@@ -518,7 +559,7 @@ class EventApplier:
                 description=_first_text(payload, "new_description", "description"),
                 quantity=quantity,
                 value_base_units=value_base_units,
-                metadata=payload,
+                metadata=metadata,
             )
 
         return AppliedEventResult(
@@ -1273,6 +1314,8 @@ class EventApplier:
             "terrain": _first_text(payload, "terrain"),
             "travel_multiplier": payload.get("travel_multiplier", 1.0),
             "travel_notes": _first_text(payload, "travel_notes", "route_notes"),
+            "is_sublocation": bool(payload.get("is_sublocation")),
+            "parent_location": _first_text(payload, "parent_location"),
         }
 
         if not self.repository.upsert_travel_location(location):
@@ -1411,6 +1454,12 @@ class EventApplier:
             name=name,
             ingredients=ingredients,
             result=_first_text(payload, "result", "description"),
+            result_item_uuid=_first_text(payload, "result_item_uuid"),
+            result_item_name=_first_text(payload, "result_item_name", "result"),
+            skill_name=_first_text(payload, "skill_name") or "Crafting",
+            stages=payload.get("stages", []),
+            required_tool_item_uuids=_as_string_list(payload.get("required_tool_item_uuids", [])),
+            required_tool_item_names=_as_string_list(payload.get("required_tool_item_names", [])),
             notes=_first_text(payload, "notes"),
             value_base_units=max(
                 0,
@@ -1423,6 +1472,26 @@ class EventApplier:
             "applied",
             f"Discovered recipe: {name}.",
             payload,
+        )
+
+    def _apply_crafting_process_requested(
+        self,
+        event_type: str,
+        payload: dict[str, Any],
+    ) -> AppliedEventResult:
+        """Advances a recipe through the deterministic crafting service."""
+
+        recipe_id = _first_text(payload, "recipe_id")
+        if not recipe_id:
+            return _invalid(event_type, payload, "Recipe database id is required.")
+        quantity = max(1, _first_int(payload, 1, "quantity", "amount"))
+        result = self.repository.craft_recipe(recipe_id, quantity=quantity)
+        status = str(result.get("status", "rejected"))
+        return AppliedEventResult(
+            event_type,
+            "applied" if status in {"active", "passive", "ready", "completed"} else "skipped",
+            str(result.get("message", "Crafting request was rejected.")),
+            {**payload, "crafting_status": status},
         )
 
     def _apply_reagent_discovered(
@@ -1922,6 +1991,14 @@ class EventApplier:
         if npc is None:
             return _invalid(event_type, payload, "NPC could not be stored.")
 
+        merchant_profile = payload.get("merchant_profile")
+        if isinstance(merchant_profile, dict):
+            self.repository.upsert_merchant_profile(
+                str(npc["npc_id"]),
+                can_sell=bool(merchant_profile.get("can_sell", False)),
+                can_buy=bool(merchant_profile.get("can_buy", False)),
+            )
+
         has_party_fields = any(
             key in payload
             for key in (
@@ -1985,6 +2062,53 @@ class EventApplier:
             f"Stored NPC profile: {npc['name']}.",
             {**payload, "npc_id": npc["npc_id"]},
         )
+
+    def _merchant_catalog_id(self, payload: dict[str, Any]) -> str | None:
+        name = _first_text(payload, "item_name", "name")
+        if not name:
+            return None
+        self.repository.upsert_item_catalog_entry(
+            name=name,
+            category=_first_text(payload, "item_type", "category") or "Item",
+            description=_first_text(payload, "description"),
+            value_base_units=max(0, _safe_int(payload.get("value_base_units"), default=0) or 0),
+        )
+        for item in self.repository.list_item_catalog():
+            if str(item.get("name", "")).casefold() == name.casefold():
+                return str(item.get("id", ""))
+        return None
+
+    def _apply_merchant_stock_upserted(self, event_type: str, payload: dict[str, Any]) -> AppliedEventResult:
+        npc_id = _first_text(payload, "npc_id")
+        item_id = self._merchant_catalog_id(payload)
+        if not npc_id or not item_id:
+            return _invalid(event_type, payload, "Merchant NPC and item name are required.")
+        if self.repository.get_npc(npc_id) is None:
+            return _invalid(event_type, payload, "Merchant NPC does not exist.")
+        self.repository.upsert_merchant_profile(npc_id, can_sell=True, can_buy=True)
+        stock = self.repository.upsert_merchant_stock(
+            npc_id=npc_id, item_id=item_id,
+            stock_id=_first_text(payload, "stock_id"),
+            quantity=max(0, _safe_int(payload.get("quantity"), default=0) or 0),
+            unit_price_base_units=max(0, _safe_int(payload.get("unit_price_base_units"), default=0) or 0),
+        )
+        return AppliedEventResult(event_type, "applied", f"Updated merchant stock: {stock['item_name']}." if stock else "Merchant stock updated.", {**payload, "stock_id": stock["stock_id"] if stock else ""})
+
+    def _apply_merchant_buy_offer_upserted(self, event_type: str, payload: dict[str, Any]) -> AppliedEventResult:
+        npc_id = _first_text(payload, "npc_id")
+        item_id = self._merchant_catalog_id(payload)
+        if not npc_id or not item_id:
+            return _invalid(event_type, payload, "Merchant NPC and item name are required.")
+        if self.repository.get_npc(npc_id) is None:
+            return _invalid(event_type, payload, "Merchant NPC does not exist.")
+        self.repository.upsert_merchant_profile(npc_id, can_sell=True, can_buy=True)
+        offer = self.repository.upsert_merchant_buy_offer(
+            npc_id=npc_id, item_id=item_id,
+            offer_id=_first_text(payload, "offer_id"),
+            unit_price_base_units=max(0, _safe_int(payload.get("unit_price_base_units"), default=0) or 0),
+            max_quantity=max(0, _safe_int(payload.get("max_quantity"), default=0) or 0),
+        )
+        return AppliedEventResult(event_type, "applied", f"Updated merchant buy offer: {offer['item_name']}." if offer else "Merchant offer updated.", {**payload, "offer_id": offer["offer_id"] if offer else ""})
 
     def _apply_npc_knowledge_added(
         self,
@@ -2492,6 +2616,114 @@ def _current_player_location(repository: SaveRepository) -> str:
     """Returns the current player location for event defaulting."""
 
     return clean_player_location_name(repository.get_state_value("location", "")) or "Unknown"
+
+
+def _storage_location_is_accessible(
+    repository: SaveRepository,
+    destination: str,
+) -> bool:
+    """Checks that an item move does not target a known remote location.
+
+    Storage labels are intentionally free text, so an unregistered label such as
+    ``car`` may still describe a nearby object.  When a label resolves to a
+    player-known Travel location, however, it must be the current location (or
+    effectively co-located); this prevents remote actions such as putting an
+    item back at Home while the player is elsewhere.
+    """
+
+    target = clean_player_location_name(destination)
+    if not target or target.casefold() in {"actively_carried", "on_person"}:
+        return True
+
+    current = clean_player_location_name(
+        repository.get_state_value("location", "")
+    )
+    if current and target.casefold() == current.casefold():
+        return True
+
+    locations = normalize_known_locations(repository.get_travel_locations())
+    target_location = next(
+        (location for location in locations if location.name.casefold() == target.casefold()),
+        None,
+    )
+    current_location = next(
+        (location for location in locations if location.name.casefold() == current.casefold()),
+        None,
+    )
+    if target_location is not None:
+        if current_location is None:
+            return False
+        estimate = calculate_travel_estimate(
+            current_location,
+            target_location,
+            move_speed_mph=repository.get_setting("travel.move_speed_mph", 3.0),
+            travel_mode=repository.get_setting("travel.mode", "On Foot"),
+            speed_multiplier=repository.get_setting("travel.speed_multiplier", 1.0),
+        )
+        return estimate.distance_miles is not None and estimate.distance_miles <= 0.1
+
+    # Common home labels are meaningful even when an older save has no map row.
+    # Do not allow them from a plainly different current location.
+    home_label = target.casefold()
+    if home_label in {"home", "house", "at home", "display case at home"}:
+        return any(token in current.casefold() for token in ("home", "house"))
+
+    return True
+
+
+def _canonical_inventory_storage_location(
+    repository: SaveRepository,
+    destination: str,
+) -> str:
+    """Reuses an established container/storage label for unambiguous shorthand."""
+
+    clean = " ".join(str(destination or "").split())
+    if not clean:
+        return "actively_carried"
+    if clean.casefold() in {"actively_carried", "on_person"}:
+        return clean.casefold()
+
+    items = repository.list_inventory_items()
+    named_containers: list[str] = []
+    stored_labels: list[str] = []
+    for item in items:
+        metadata = item.get("metadata", {})
+        if not isinstance(metadata, dict):
+            metadata = {}
+        location = str(item.get("storage_location", "") or "").strip()
+        if location and location.casefold() not in {"actively_carried", "on_person"}:
+            stored_labels.append(location)
+        category = str(item.get("category", "") or "").strip().casefold()
+        item_type = str(metadata.get("item_type", "") or "").strip().casefold()
+        if category == "container" or item_type == "container":
+            name = str(item.get("name", "") or "").strip()
+            if name:
+                named_containers.append(name)
+
+    target_key = _storage_label_key(clean)
+    suffix_matches = {
+        label
+        for label in named_containers
+        if _storage_label_key(label) == target_key
+        or _storage_label_key(label).endswith(f" {target_key}")
+    }
+    if len(suffix_matches) == 1:
+        return next(iter(suffix_matches))
+
+    exact_matches = {
+        label
+        for label in [*named_containers, *stored_labels]
+        if label.casefold() == clean.casefold()
+    }
+    if len(exact_matches) == 1:
+        return next(iter(exact_matches))
+    return clean
+
+
+def _storage_label_key(value: str) -> str:
+    """Normalizes a storage label for conservative identity matching."""
+
+    return " ".join(re.findall(r"[a-z0-9]+", value.casefold()))
 
 
 def _active_task_defaults(

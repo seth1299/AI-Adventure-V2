@@ -10,6 +10,62 @@ from ai_adventure.new_game_setup import normalize_new_game_setup
 
 
 class NewGameServiceTests(unittest.TestCase):
+    def test_commit_generated_world_allows_empty_starting_inventory(self) -> None:
+        setup = normalize_new_game_setup({"title": "Inventory Guarantee"})
+        result = SimpleNamespace(
+            world_summary="A quiet beginning.",
+            introductory_message="The adventure begins.",
+            finalized_character={},
+            start_location="",
+            start_weather="",
+            finalized_starter_items=[{"description": "not a complete item"}],
+            finalized_skills=[],
+            suggested_events=[],
+            speaker_cues=[],
+            sound_effect_cues=[],
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = NewGameService.create_repository(
+                Path(temp_dir),
+                setup,
+            )
+            NewGameService.commit_generated_world(repository, setup, result)
+
+            inventory = repository.list_inventory_items()
+
+            self.assertEqual(inventory, [])
+
+    def test_commit_generated_world_preserves_fewer_than_five_setup_items(self) -> None:
+        setup = normalize_new_game_setup(
+            {
+                "title": "Small Inventory",
+                "starter_items": [
+                    {"name": "Notebook"},
+                    {"name": "Lantern"},
+                ],
+            }
+        )
+        result = SimpleNamespace(
+            world_summary="A quiet beginning.",
+            introductory_message="The adventure begins.",
+            finalized_character={},
+            finalized_starter_items=[],
+            finalized_skills=[],
+            suggested_events=[],
+            speaker_cues=[],
+            sound_effect_cues=[],
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = NewGameService.create_repository(Path(temp_dir), setup)
+            NewGameService.commit_generated_world(repository, setup, result)
+
+            self.assertEqual(
+                {item["name"] for item in repository.list_inventory_items()},
+                {"Notebook", "Lantern"},
+            )
+
     def test_commit_generated_world_persists_opening_and_player_identity(self) -> None:
         setup = normalize_new_game_setup(
             {
@@ -58,6 +114,43 @@ class NewGameServiceTests(unittest.TestCase):
             self.assertEqual(
                 repository.list_history()[-1]["content"],
                 "Mara Stone arrives at The Harbor.",
+            )
+
+    def test_commit_generated_world_persists_optional_starting_notes(self) -> None:
+        setup = normalize_new_game_setup({"title": "Starting Notes"})
+        result = SimpleNamespace(
+            world_summary="A world with a dangerous outbreak.",
+            introductory_message="The adventure begins.",
+            finalized_character={},
+            finalized_starter_items=[],
+            finalized_skills=[],
+            starting_notes=[
+                {
+                    "entry_id": "starting_note_1",
+                    "heading": "Known Symptoms",
+                    "body": "Fever and confusion are early warning signs.",
+                    "tags": ["Survival"],
+                }
+            ],
+            suggested_events=[],
+            speaker_cues=[],
+            sound_effect_cues=[],
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = NewGameService.create_repository(Path(temp_dir), setup)
+            NewGameService.commit_generated_world(repository, setup, result)
+
+            self.assertEqual(
+                repository.get_note_entries(),
+                [
+                    {
+                        "entry_id": "starting_note_1",
+                        "heading": "Known Symptoms",
+                        "body": "Fever and confusion are early warning signs.",
+                        "tags": ["Survival"],
+                    }
+                ],
             )
 
 

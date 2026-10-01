@@ -9,6 +9,7 @@ class _VisualAssetCoordinator(QObject):
 
     assets_changed = Signal()
     initial_batch_finished = Signal(object)
+    asset_status_changed = Signal(str, str, str)
 
     def __init__(
         self,
@@ -28,16 +29,167 @@ class _VisualAssetCoordinator(QObject):
         self._worker: QObject | None = None
         self._initial_batch_repositories: set[str] = set()
         self._initial_batch_repository_objects: dict[str, SaveRepository] = {}
+        LOGGER.info(
+            "Visual asset coordinator initialized: enabled=%s, images_dir=%s, "
+            "api_key_path=%s.",
+            self.enabled,
+            self.images_dir,
+            self.api_key_path,
+        )
         if self.enabled:
             self.images_dir.mkdir(parents=True, exist_ok=True)
 
     def begin_initial_batch(self, repository: SaveRepository) -> None:
-        """Defers the opening-scene reveal until this save's first images settle."""
+        """Queues the first finalized visual assets for this save."""
 
         self._initial_batch_repositories.add(str(repository.db_path))
         self._initial_batch_repository_objects[str(repository.db_path)] = repository
         self.scan(repository)
         self._finish_initial_batch_if_ready(repository)
+
+    def prepare_initial_batch(
+        self, repository: SaveRepository
+    ) -> list[VisualAssetRequest]:
+        """Registers initial assets without starting any paid image requests."""
+
+        if not self.enabled:
+            return []
+
+        repository_key = str(repository.db_path)
+        self._initial_batch_repositories.add(repository_key)
+        self._initial_batch_repository_objects[repository_key] = repository
+        model = normalize_image_model(
+            repository.get_setting("images.model", DEFAULT_IMAGE_MODEL)
+        )
+        pending: list[VisualAssetRequest] = []
+        for request in AssetGenerationService.requests_for(repository):
+            target_path = AssetGenerationService.target_path(
+                repository, request, self.images_dir
+            )
+            try:
+                repository.ensure_visual_asset(
+                    asset_id=request.asset_id,
+                    subject_type=request.subject_type,
+                    subject_key=request.subject_key,
+                    display_name=request.display_name,
+                    descriptor_hash=request.descriptor_hash,
+                    filename=save_relative_image_filename(repository, request),
+                    prompt=request.prompt,
+                    model=model,
+                    image_style=request.image_style,
+                    visual_description=request.description,
+                    basic_name=request.basic_name,
+                    resolution_tier=request.image_size,
+                    message_ids=request.message_ids,
+                    ready=target_path.is_file(),
+                )
+            except ValueError as error:
+                LOGGER.warning(
+                    "Skipping invalid initial visual asset request %s: %s",
+                    request.asset_id,
+                    error,
+                )
+                continue
+            if not target_path.is_file():
+                pending.append(request)
+        return pending
+
+    def finish_initial_batch(self, repository: SaveRepository) -> None:
+        """Ends source-selection mode after every initial asset has a disposition."""
+
+        repository_key = str(repository.db_path)
+        self._initial_batch_repositories.discard(repository_key)
+        self._initial_batch_repository_objects.pop(repository_key, None)
+
+    def upload_initial_image(
+        self,
+        repository: SaveRepository,
+        request: VisualAssetRequest,
+        source_path: Path,
+    ) -> tuple[bool, str]:
+        """Normalizes one player-selected image into the save image cache."""
+
+        if not source_path.is_file():
+            return False, "The selected file no longer exists."
+        try:
+            target_path = AssetGenerationService.target_path(
+                repository, request, self.images_dir
+            )
+            width, height = save_scaled_png(
+                source_path.read_bytes(),
+                target_path,
+                max_pixels=request.maximum_pixels,
+            )
+            repository.set_visual_asset_status(
+                request.asset_id,
+                "ready",
+                width=width,
+                height=height,
+            )
+        except Exception as error:
+            LOGGER.warning("Could not store uploaded image %s: %s", source_path, error)
+            repository.set_visual_asset_status(
+                request.asset_id,
+                "failed",
+                error_message=str(error),
+            )
+            self.asset_status_changed.emit(request.asset_id, "failed", str(error))
+            return False, f"Could not use that image: {error}"
+        self.asset_status_changed.emit(request.asset_id, "ready", "")
+        self.assets_changed.emit()
+        return True, ""
+
+    def skip_initial_image(
+        self, repository: SaveRepository, request: VisualAssetRequest
+    ) -> None:
+        """Persists an explicit no-image choice without making it a retryable failure."""
+
+        repository.set_visual_asset_status(
+            request.asset_id,
+            "skipped",
+            error_message="Skipped by player during new-game image selection.",
+        )
+
+    def create_initial_image(
+        self, repository: SaveRepository, request: VisualAssetRequest
+    ) -> tuple[bool, str]:
+        """Queues one initial image only after the player requests generation."""
+
+        if not self.enabled:
+            return False, "Image generation is disabled for this build."
+        if not _bool_setting(repository.get_setting("images.enabled", True), True):
+            return False, "Gemini image generation is disabled for this adventure."
+        if not read_api_key(self.api_key_path):
+            return False, "A Google Gemini API key is required to create this image."
+        model = normalize_image_model(
+            repository.get_setting("images.model", DEFAULT_IMAGE_MODEL)
+        )
+        limit = _clamped_int(
+            repository.get_setting("images.maximum_generated", DEFAULT_IMAGE_LIMIT),
+            DEFAULT_IMAGE_LIMIT,
+            1,
+            10_000,
+        )
+        if repository.visual_asset_generation_count() >= limit:
+            return False, "The image-generation limit for this save has been reached."
+        queued_for_repository = sum(
+            1
+            for queued_repository, _queued_request, _queued_model, _queued_limit in self._queue
+            if str(queued_repository.db_path) == str(repository.db_path)
+        )
+        if repository.visual_asset_generation_count() + queued_for_repository >= limit:
+            return False, "The image-generation limit for this save has already been reserved."
+        record = repository.get_visual_asset_by_id(request.asset_id)
+        if record is None:
+            return False, "The image asset is no longer available."
+        if record.get("status") == "generating":
+            return True, ""
+        repository.set_visual_asset_status(request.asset_id, "queued")
+        if request.asset_id not in self._queued_asset_ids:
+            self._queue.append((repository, request, model, limit))
+            self._queued_asset_ids.add(request.asset_id)
+        self._start_next()
+        return True, ""
 
     def _is_initial_batch(self, repository: SaveRepository) -> bool:
         """Returns whether per-image refreshes are currently suppressed for a save."""
@@ -100,9 +252,22 @@ class _VisualAssetCoordinator(QObject):
     def scan(self, repository: SaveRepository | None) -> None:
         """Registers cache hits and queues missing current entity images."""
 
-        if repository is None or not self.enabled:
+        if repository is None:
             return
-        if not _bool_setting(repository.get_setting("images.enabled", True), True):
+        if not self.enabled:
+            LOGGER.info(
+                "Visual asset scan skipped: coordinator disabled for %s.",
+                repository.db_path,
+            )
+            return
+        images_enabled = _bool_setting(
+            repository.get_setting("images.enabled", True), True
+        )
+        if not images_enabled:
+            LOGGER.info(
+                "Visual asset scan skipped: images.enabled=false for %s.",
+                repository.db_path,
+            )
             return
 
         has_api_key = bool(read_api_key(self.api_key_path))
@@ -115,28 +280,62 @@ class _VisualAssetCoordinator(QObject):
             1,
             10_000,
         )
-        for request in AssetGenerationService.requests_for(repository):
+        requests = AssetGenerationService.requests_for(repository)
+        queued_count = 0
+        reused_count = 0
+        ready_count = 0
+        skipped_record_count = 0
+        skipped_key_count = 0
+        for request in requests:
             relative_filename = save_relative_image_filename(repository, request)
             target_path = AssetGenerationService.target_path(
                 repository, request, self.images_dir
             )
-            record = repository.ensure_visual_asset(
-                asset_id=request.asset_id,
-                subject_type=request.subject_type,
-                subject_key=request.subject_key,
-                display_name=request.display_name,
-                descriptor_hash=request.descriptor_hash,
-                filename=relative_filename,
-                prompt=request.prompt,
-                model=model,
-                message_ids=request.message_ids,
-                ready=target_path.is_file(),
-            )
-            if (
-                target_path.is_file()
-                or record.get("status") != "queued"
-                or not has_api_key
-            ):
+            try:
+                record = repository.ensure_visual_asset(
+                    asset_id=request.asset_id,
+                    subject_type=request.subject_type,
+                    subject_key=request.subject_key,
+                    display_name=request.display_name,
+                    descriptor_hash=request.descriptor_hash,
+                    filename=relative_filename,
+                    prompt=request.prompt,
+                    model=model,
+                    image_style=request.image_style,
+                    visual_description=request.description,
+                    basic_name=request.basic_name,
+                    resolution_tier=request.image_size,
+                    message_ids=request.message_ids,
+                    ready=target_path.is_file(),
+                )
+            except ValueError as error:
+                # A newly added entity type should not prevent the rest of a
+                # save's visual batch from completing.  The repository owns
+                # the canonical allowlist; this guard keeps an invalid or
+                # future request from stranding the initial-generation modal.
+                LOGGER.warning(
+                    "Skipping invalid visual asset request: subject=%s/%s "
+                    "asset_id=%s error=%s.",
+                    request.subject_type,
+                    request.display_name,
+                    request.asset_id,
+                    error,
+                )
+                continue
+            if target_path.is_file():
+                ready_count += 1
+                continue
+            if record.get("status") != "queued":
+                skipped_record_count += 1
+                LOGGER.debug(
+                    "Visual asset not queued: subject=%s/%s status=%s.",
+                    request.subject_type,
+                    request.display_name,
+                    record.get("status"),
+                )
+                continue
+            if not has_api_key:
+                skipped_key_count += 1
                 continue
             if request.asset_id in self._queued_asset_ids:
                 continue
@@ -156,6 +355,7 @@ class _VisualAssetCoordinator(QObject):
                         width=int(reusable.get("width", 0)),
                         height=int(reusable.get("height", 0)),
                     )
+                    reused_count += 1
                     LOGGER.info(
                         "Reused visual asset %s for %s from another save (score %.1f).",
                         request.filename,
@@ -171,6 +371,25 @@ class _VisualAssetCoordinator(QObject):
                     )
             self._queue.append((repository, request, model, limit))
             self._queued_asset_ids.add(request.asset_id)
+            queued_count += 1
+        LOGGER.info(
+            "Visual asset scan summary: save=%s enabled=%s api_key=%s model=%s "
+            "limit=%s generated=%s discovered=%s ready=%s reused=%s queued=%s "
+            "skipped_record=%s skipped_missing_key=%s queue_total=%s.",
+            repository.db_path,
+            images_enabled,
+            has_api_key,
+            model,
+            limit,
+            repository.visual_asset_generation_count(),
+            len(requests),
+            ready_count,
+            reused_count,
+            queued_count,
+            skipped_record_count,
+            skipped_key_count,
+            len(self._queue),
+        )
         self._start_next()
         self._finish_initial_batch_if_ready(repository)
 
@@ -243,13 +462,14 @@ class _VisualAssetCoordinator(QObject):
         image_bytes: bytes,
         _mime_type: str,
     ) -> None:
-        """Downscales and records one completed generated image."""
+        """Normalizes and records one completed generated image."""
 
         try:
-            width, height = save_scaled_jpeg(
+            width, height = save_scaled_png(
                 image_bytes,
                 self.images_dir
                 / save_relative_image_filename(repository, request),
+                max_pixels=request.maximum_pixels,
             )
         except Exception as error:
             LOGGER.warning("Failed to save generated image %s: %s", request.filename, error)
@@ -258,6 +478,7 @@ class _VisualAssetCoordinator(QObject):
                 "failed",
                 error_message=str(error),
             )
+            self.asset_status_changed.emit(request.asset_id, "failed", str(error))
             return
         repository.set_visual_asset_status(
             request.asset_id,
@@ -265,6 +486,7 @@ class _VisualAssetCoordinator(QObject):
             width=width,
             height=height,
         )
+        self.asset_status_changed.emit(request.asset_id, "ready", "")
         record = repository.get_visual_asset_by_id(request.asset_id)
         LOGGER.info(
             "Generated visual asset %s (%sx%s) using %s.",
@@ -289,6 +511,7 @@ class _VisualAssetCoordinator(QObject):
             "failed",
             error_message=message,
         )
+        self.asset_status_changed.emit(request.asset_id, "failed", message)
         if not self._is_initial_batch(repository):
             self.assets_changed.emit()
 

@@ -25,17 +25,32 @@ except ImportError:  # pragma: no cover - the packaged build includes RapidFuzz.
 from ai_adventure.app.api_key_store import read_api_key
 from ai_adventure.ai.image_styles import (
     DEFAULT_IMAGE_STYLE,
-    KNOWN_IMAGE_STYLES,
     image_style_metadata,
     normalize_image_style,
 )
 from ai_adventure.ai.model_catalog import DEFAULT_IMAGE_MODEL, normalize_image_model
+from ai_adventure.context.creative_guardrails import (
+    default_banned_creative_terms,
+    find_banned_creative_terms,
+)
 
 
 LOGGER = logging.getLogger(__name__)
 
 DEFAULT_IMAGE_LIMIT = 100
 DISPLAY_IMAGE_MAX_PIXELS = 384
+STANDARD_IMAGE_MAX_PIXELS = 1024
+# Compatibility alias for callers that used the retired location/map tier.
+# All Gemini image requests now use the 1K tier.
+LARGE_IMAGE_MAX_PIXELS = STANDARD_IMAGE_MAX_PIXELS
+IMAGE_OUTPUT_MIME_TYPE = "image/png"
+ASSET_DIRECTORY_BY_SUBJECT_TYPE = {
+    "player": "characters",
+    "location": "locations",
+    "inventory": "inventory",
+    "npc": "npcs",
+    "bestiary": "bestiary",
+}
 
 
 class VisualAssetRepository(Protocol):
@@ -53,6 +68,8 @@ class VisualAssetRepository(Protocol):
 
     def list_player_visible_npcs(self, limit: int = 50) -> list[dict[str, Any]]: ...
 
+    def list_bestiary_entries(self) -> list[dict[str, Any]]: ...
+
 
 @dataclass(frozen=True)
 class VisualAssetRequest:
@@ -62,9 +79,12 @@ class VisualAssetRequest:
     subject_key: str
     display_name: str
     description: str
+    basic_name: str = ""
     world_context: str = ""
     message_ids: tuple[str, ...] = ()
     image_style: str = DEFAULT_IMAGE_STYLE
+    text_instructions: str = ""
+    banned_terms: tuple[str, ...] = ()
 
     @property
     def descriptor_hash(self) -> str:
@@ -93,16 +113,41 @@ class VisualAssetRequest:
 
         if self.subject_type in {"player", "npc"}:
             return "4:5"
-        if self.subject_type == "location":
-            return "16:9"
         return "1:1"
+
+    @property
+    def is_large_format(self) -> bool:
+        """Compatibility flag for the retired larger location/map tier."""
+
+        return False
+
+    @property
+    def image_size(self) -> str:
+        """Returns Gemini's native image-size tier for every generated asset."""
+
+        return "1K"
+
+    @property
+    def maximum_pixels(self) -> int:
+        """Returns the target longest edge retained in the local PNG cache."""
+
+        return STANDARD_IMAGE_MAX_PIXELS
+
+    @property
+    def directory_name(self) -> str:
+        """Returns the stable player-facing asset category directory."""
+
+        return ASSET_DIRECTORY_BY_SUBJECT_TYPE.get(
+            self.subject_type,
+            self.subject_type,
+        )
 
     @property
     def filename(self) -> str:
         """Returns a descriptive, bounded, collision-resistant cache filename."""
 
         stem = descriptive_image_stem(self.display_name)
-        return f"{self.subject_type}_{stem}_{self.descriptor_hash[:8]}.jpg"
+        return f"{stem}_{self.descriptor_hash[:8]}.png"
 
     @property
     def prompt(self) -> str:
@@ -129,6 +174,9 @@ class VisualAssetRequest:
             ),
             "inventory": (
                 "Create a clear inventory illustration of this one unique item by itself. "
+                "Depict exactly one representative item regardless of any inventory quantity; "
+                "never depict a stack, group, or repeated copies. Treat the supplied description "
+                "as generic item-trait metadata, not as a count or an image prompt. "
                 "The item is the only foreground subject: do not show a person, face, body, "
                 "hand, arm, or someone holding or using it. Make its materials, condition, "
                 "color, scale, and distinctive visible features easy to recognize. "
@@ -139,16 +187,35 @@ class VisualAssetRequest:
                 "or supporting surface is acceptable, but it must not compete with or obscure "
                 "the item."
             ),
+            "bestiary": (
+                "Create a single non-human creature illustration based only on the "
+                "player-known description. Show the creature as the only foreground "
+                "subject, with no extra creatures, people, character portraits, text, "
+                "labels, or invented hidden anatomy. Make its silhouette, scale, "
+                "coloration, texture, and distinctive traits easy to recognize."
+            ),
         }[self.subject_type]
         style = image_style_metadata(self.image_style)
+        banned_terms = self.banned_terms or default_banned_creative_terms()
+        banned_text = ", ".join(banned_terms) or "None"
+        text_instructions = self.text_instructions or (
+            "No readable text is permitted because the subject does not call for it. "
+            "The supplied subject name and description are metadata for the artist, "
+            "not words to render in the image."
+        )
+        basic_identity = (
+            f"Generic item family for reuse matching: {self.basic_name}\n"
+            if self.subject_type == "inventory" and self.basic_name.strip()
+            else ""
+        )
         return (
             "Generate one cohesive image for AI Adventure. "
             f"Selected visual style: {style['value']} ({style['label']}). "
             f"Style direction: {style['prompt']} "
             f"{subject_instruction} Use a coherent centered composition suitable for a compact "
-            "desktop game UI. Do not add words, captions, labels, signatures, watermarks, UI "
-            "frames, split panels, unrelated duplicate subjects, or extraneous foreground "
-            "characters. Only depict player-visible information; do not invent hidden identities "
+            "desktop game UI. Do not add unapproved words, captions, labels, signatures, "
+            "watermarks, UI frames, split panels, unrelated duplicate subjects, or extraneous "
+            "foreground characters. Only depict player-visible information; do not invent hidden identities "
             "or secret facts. Make the selected style feel intentional and specific rather than "
             "like a generic AI image. Unless the selected style explicitly calls for one of these "
             "traits, avoid excessive drop shadows, perfect symmetry, unnaturally perfect lighting, "
@@ -157,7 +224,15 @@ class VisualAssetRequest:
             "surfaces. Preserve believable variation, small imperfections, and style-appropriate "
             "texture, materials, and lighting.\n\n"
             f"Subject name: {self.display_name}\n"
+            f"{basic_identity}"
             f"Player-visible description: {self.description}\n"
+            "The Subject name and Player-visible description above are metadata only. "
+            "Do not copy them into the image as text unless the exact-label rules below "
+            "explicitly authorize that specific label.\n"
+            "Text and label instructions (follow exactly; never invent readable text):\n"
+            f"{text_instructions}\n"
+            "Forbidden words and names: do not render any of these exact terms, close "
+            f"spelling variants, hyphenation variants, or reskins: {banned_text}\n"
             "World context for visual consistency (honor this when relevant, especially "
             "historical era, technology level, architecture, clothing, vehicles, and "
             "materials; do not default to modern designs when the context establishes an "
@@ -199,7 +274,10 @@ class GeminiVisualAssetService:
             contents=request.prompt,
             config=types.GenerateContentConfig(
                 response_modalities=["IMAGE"],
-                image_config=types.ImageConfig(aspect_ratio=request.aspect_ratio),
+                image_config=types.ImageConfig(
+                    aspect_ratio=request.aspect_ratio,
+                    image_size=request.image_size,
+                ),
             ),
         )
         for part in getattr(response, "parts", []) or []:
@@ -220,13 +298,18 @@ class GeminiVisualAssetService:
 def build_visual_asset_requests(
     repository: VisualAssetRepository,
 ) -> list[VisualAssetRequest]:
-    """Builds deduplicated requests from the four durable player-visible surfaces."""
+    """Builds deduplicated requests from all durable player-visible image surfaces."""
 
     event_messages = _visual_event_message_ids(repository.list_mechanical_events())
     opening_story_message_id = _first_story_message_id(repository.list_history())
     world_context = _visible_world_context(repository)
     image_style = normalize_image_style(
         repository.get_setting("images.style", DEFAULT_IMAGE_STYLE)
+    )
+    banned_terms = default_banned_creative_terms()
+    known_location_positions = _known_location_positions(
+        repository,
+        banned_terms=banned_terms,
     )
     requests: list[VisualAssetRequest] = []
 
@@ -247,6 +330,7 @@ def build_visual_asset_requests(
                 world_context=world_context,
                 message_ids=(opening_story_message_id,) if opening_story_message_id else (),
                 image_style=image_style,
+                banned_terms=banned_terms,
             )
         )
 
@@ -268,6 +352,7 @@ def build_visual_asset_requests(
                     or event_messages.get(("location", name.casefold()), ())
                 ),
                 image_style=image_style,
+                banned_terms=banned_terms,
             )
         )
 
@@ -284,23 +369,31 @@ def build_visual_asset_requests(
             else ""
         ).strip()
         subject_key = item_uuid or name.casefold()
+        basic_name = _item_basic_name(item, item_catalog, fallback=name)
         requests.append(
             VisualAssetRequest(
                 subject_type="inventory",
                 subject_key=subject_key,
                 display_name=name,
                 description=f"{category}. {description}",
+                basic_name=basic_name,
                 world_context=world_context,
                 message_ids=tuple(
                     event_messages.get(("inventory", subject_key), ())
                     or event_messages.get(("inventory", name.casefold()), ())
                 ),
                 image_style=image_style,
+                text_instructions=_text_instructions_for_subject(
+                    name,
+                    description,
+                    known_location_positions,
+                ),
+                banned_terms=banned_terms,
             )
         )
 
     for npc in repository.list_player_visible_npcs(limit=500):
-        npc_id = str(npc.get("npc_id", "") or "").strip().casefold()
+        npc_id = str(npc.get("npc_id") or npc.get("id") or "").strip().casefold()
         display_name = str(npc.get("display_name", "Unknown NPC") or "").strip()
         description = str(
             npc.get("description") or npc.get("notes") or ""
@@ -316,6 +409,31 @@ def build_visual_asset_requests(
                 world_context=world_context,
                 message_ids=tuple(event_messages.get(("npc", npc_id), ())),
                 image_style=image_style,
+                banned_terms=banned_terms,
+            )
+        )
+
+    for creature in getattr(repository, "list_bestiary_entries", lambda: [])():
+        creature_id = str(creature.get("creature_id", "") or "").strip().casefold()
+        display_name = str(creature.get("name", "") or "").strip()
+        description = str(creature.get("details", "") or "").strip()
+        if not creature_id:
+            creature_id = display_name.casefold()
+        if not creature_id or not display_name or not description:
+            continue
+        requests.append(
+            VisualAssetRequest(
+                subject_type="bestiary",
+                subject_key=creature_id,
+                display_name=display_name,
+                description=description,
+                world_context=world_context,
+                message_ids=tuple(
+                    event_messages.get(("bestiary", creature_id), ())
+                    or event_messages.get(("bestiary", display_name.casefold()), ())
+                ),
+                image_style=image_style,
+                banned_terms=banned_terms,
             )
         )
 
@@ -325,33 +443,150 @@ def build_visual_asset_requests(
     return list(deduplicated.values())
 
 
+_TEXT_BEARING_HINTS = (
+    "book",
+    "chart",
+    "document",
+    "engraving",
+    "inscription",
+    "journal",
+    "label",
+    "letter",
+    "map",
+    "note",
+    "parchment",
+    "scroll",
+    "sign",
+    "text",
+    "writing",
+)
+
+
+def _known_location_positions(
+    repository: VisualAssetRepository,
+    *,
+    banned_terms: tuple[str, ...],
+) -> tuple[tuple[str, float | None, float | None], ...]:
+    """Returns safe Travel-tab names and coordinates for exact map labels."""
+
+    locations: list[tuple[str, float | None, float | None]] = []
+    for location in repository.ensure_travel_locations():
+        name = " ".join(str(location.get("name", "") or "").split()).strip()
+        if (
+            name
+            and not find_banned_creative_terms(name, terms=banned_terms)
+            and name.casefold() not in {existing[0].casefold() for existing in locations}
+        ):
+            locations.append(
+                (
+                    name,
+                    _optional_float(location.get("x_miles")),
+                    _optional_float(location.get("y_miles")),
+                )
+            )
+    return tuple(locations)
+
+
+def _text_instructions_for_subject(
+    display_name: str,
+    description: str,
+    known_location_positions: tuple[tuple[str, float | None, float | None], ...],
+) -> str:
+    """Builds strict exact-label rules for subjects that visibly carry writing."""
+
+    combined = f"{display_name} {description}".casefold()
+    if not any(hint in combined for hint in _TEXT_BEARING_HINTS):
+        return (
+            "No readable text is permitted because the subject does not call for it. "
+            "The subject name is metadata only and must not be rendered."
+        )
+
+    approved = [
+        display_name.strip(),
+        *(name for name, _x, _y in known_location_positions),
+    ]
+    unique_approved = list(dict.fromkeys(name for name in approved if name))
+    labels = ", ".join(f'"{name}"' for name in unique_approved)
+    relation_lines: list[str] = []
+    for index, (left_name, left_x, left_y) in enumerate(known_location_positions):
+        if left_x is None or left_y is None:
+            continue
+        for right_name, right_x, right_y in known_location_positions[index + 1 :]:
+            if right_x is None or right_y is None:
+                continue
+            horizontal = "east" if right_x > left_x else "west" if right_x < left_x else "same longitude as"
+            vertical = "north of" if right_y > left_y else "south of" if right_y < left_y else "same latitude as"
+            if horizontal.startswith("same"):
+                relation_lines.append(f'"{right_name}" is {vertical} "{left_name}".')
+            elif vertical.startswith("same"):
+                relation_lines.append(f'"{right_name}" is {horizontal} of "{left_name}".')
+            else:
+                relation_lines.append(
+                    f'"{right_name}" is {vertical.replace(" of", "")} and '
+                    f'{horizontal} of "{left_name}".'
+                )
+    directional_rules = (
+        "Use a north-facing compass rose with north at the top. Place locations using "
+        "only the directional relationships below: east is right, west is left, north "
+        "is up, and south is down. Preserve those relationships; never mirror, rotate, "
+        "or rearrange the map. Never render coordinates, coordinate pairs, numeric "
+        "anchors, internal IDs, or other hidden map metadata anywhere in the image.\n"
+        + ("Directional relationships: " + " ".join(relation_lines) if relation_lines else "")
+    )
+    return (
+        "This subject may contain readable writing only when it is visually appropriate. "
+        f"If text is shown, use only these exact labels, copied literally: {labels}. "
+        "For a map, label only these established Travel-tab locations; do not add, "
+        "rename, or imply any other place. Do not use decorative pseudo-writing, random "
+        "letters, or invented labels. "
+        f"{directional_rules}"
+    )
+
+
+def _optional_float(value: Any) -> float | None:
+    """Returns a finite coordinate when the saved value is numeric."""
+
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number == number and abs(number) != float("inf") else None
+
+
 def save_relative_image_filename(repository: Any, request: VisualAssetRequest) -> str:
     """Returns the save-grouped relative filename stored in visual-asset records."""
 
     save_name = descriptive_image_stem(repository.db_path.parent.name, maximum_length=96)
-    return f"{save_name}/{request.filename}"
+    return f"{save_name}/{request.directory_name}/{request.filename}"
 
 
-def find_reusable_inventory_asset(
+def find_reusable_visual_asset(
     *,
     images_dir: Path,
     saves_dir: Path,
     repository: Any,
     request: VisualAssetRequest,
 ) -> dict[str, Any] | None:
-    """Finds a conservative cross-save item-image match by name and description.
+    """Finds a conservative cross-save match using structured asset metadata.
 
-    Exact entity IDs are handled by the normal asset ID first. This fallback is
-    intentionally limited to inventory items and only considers ready assets
-    recorded by another save; it never searches the web or uses an image's
-    pixels to infer identity.
+    Exact entity IDs are preferred, then a high-confidence name/description
+    match may be reused. Art style, subject category, and resolution tier are
+    hard compatibility gates. Filename text and prompt parsing are deliberately
+    excluded from the decision; filenames are only used after a database record
+    has already been selected.
     """
 
-    if request.subject_type != "inventory" or not saves_dir.is_dir():
+    if not saves_dir.is_dir():
         return None
 
     target_description = " ".join(request.description.split()).casefold()
     target_name = " ".join(request.display_name.split()).casefold()
+    target_basic_name = _normalized_basic_name(
+        request.basic_name,
+        fallback=request.display_name,
+    )
+    target_style = normalize_image_style(request.image_style)
+    target_resolution = request.image_size
     current_db = Path(repository.db_path).resolve()
     best: dict[str, Any] | None = None
 
@@ -362,13 +597,38 @@ def find_reusable_inventory_asset(
             connection = sqlite3.connect(candidate_db)
             try:
                 connection.row_factory = sqlite3.Row
-                rows = connection.execute(
-                    """
-                    SELECT display_name, filename, prompt, width, height
-                    FROM visual_assets
-                    WHERE subject_type = 'inventory' AND status = 'ready'
-                    """
-                ).fetchall()
+                try:
+                    rows = connection.execute(
+                        """
+                        SELECT asset_id, subject_type, subject_key, display_name,
+                               visual_description, basic_name, filename, image_style,
+                               resolution_tier, width, height
+                        FROM visual_assets
+                        WHERE subject_type = ?
+                          AND status = 'ready'
+                          AND image_style = ?
+                          AND resolution_tier = ?
+                        """
+                        ,
+                        (request.subject_type.casefold(), target_style, target_resolution),
+                    ).fetchall()
+                except sqlite3.OperationalError as error:
+                    if "no such column: basic_name" not in str(error).casefold():
+                        raise
+                    rows = connection.execute(
+                        """
+                        SELECT asset_id, subject_type, subject_key, display_name,
+                               visual_description, filename, image_style,
+                               resolution_tier, width, height
+                        FROM visual_assets
+                        WHERE subject_type = ?
+                          AND status = 'ready'
+                          AND image_style = ?
+                          AND resolution_tier = ?
+                        """
+                        ,
+                        (request.subject_type.casefold(), target_style, target_resolution),
+                    ).fetchall()
             finally:
                 connection.close()
         except (OSError, sqlite3.Error):
@@ -376,66 +636,106 @@ def find_reusable_inventory_asset(
             continue
 
         for row in rows:
-            candidate_name = " ".join(str(row["display_name"] or "").split()).casefold()
-            name_score = token_set_ratio(target_name, candidate_name)
-            if name_score < 86:
-                continue
-            candidate_prompt = str(row["prompt"] or "")
-            if _image_style_from_prompt(candidate_prompt) != normalize_image_style(
-                request.image_style
-            ):
-                continue
-            description_match = re.search(
-                r"Player-visible description:\s*(.*?)(?:\nWorld context|$)",
-                candidate_prompt,
-                flags=re.IGNORECASE | re.DOTALL,
-            )
-            candidate_description = " ".join(
-                (description_match.group(1) if description_match else candidate_prompt).split()
+            candidate_name = " ".join(
+                str(row["display_name"] or "").split()
             ).casefold()
-            description_score = token_set_ratio(target_description, candidate_description)
-            if not (
-                name_score >= 94 and description_score >= 48
-                or name_score >= 86 and description_score >= 62
-            ):
+            candidate_description = " ".join(
+                str(row["visual_description"] or "").split()
+            ).casefold()
+            candidate_basic_name = _normalized_basic_name(
+                row["basic_name"] if "basic_name" in row.keys() else "",
+                fallback=str(row["display_name"] or ""),
+            )
+            if not candidate_name or not candidate_description:
+                continue
+            if str(row["image_style"] or "").strip().casefold() != target_style:
+                continue
+            if str(row["resolution_tier"] or "").strip().upper() != target_resolution:
                 continue
 
             stored_filename = Path(str(row["filename"] or ""))
-            source_candidates = (
-                images_dir / stored_filename,
-                images_dir / candidate_db.parent.name / stored_filename.name,
-                images_dir / stored_filename.name,
-            )
-            source_path = next((path for path in source_candidates if path.is_file()), None)
-            if source_path is None:
+            if (
+                stored_filename.is_absolute()
+                or ".." in stored_filename.parts
+                or stored_filename.suffix.casefold() != ".png"
+            ):
                 continue
-            score = (name_score * 0.65) + (description_score * 0.35)
+            source_path = images_dir / stored_filename
+            dimensions = _image_dimensions_for_resolution(
+                source_path,
+                minimum_longest_edge=request.maximum_pixels,
+            )
+            if dimensions is None:
+                continue
+
+            if str(row["asset_id"] or "") == request.asset_id:
+                return {
+                    "source_path": source_path,
+                    "display_name": str(row["display_name"] or ""),
+                    "width": dimensions[0],
+                    "height": dimensions[1],
+                    "score": 100.0,
+                }
+
+            name_score = token_set_ratio(target_name, candidate_name)
+            basic_name_score = token_set_ratio(target_basic_name, candidate_basic_name)
+            description_score = token_set_ratio(target_description, candidate_description)
+            basic_identity_match = basic_name_score >= 92 and description_score >= 40
+            relaxed_name_match = name_score >= 75 and description_score >= 50
+            if not (basic_identity_match or relaxed_name_match):
+                continue
+
+            score = (
+                (basic_name_score * 0.45) + (description_score * 0.55)
+                if basic_identity_match
+                else (name_score * 0.65) + (description_score * 0.35)
+            )
             if best is None or score > float(best["score"]):
                 best = {
                     "source_path": source_path,
                     "display_name": str(row["display_name"] or ""),
-                    "width": int(row["width"] or 0),
-                    "height": int(row["height"] or 0),
+                    "width": dimensions[0],
+                    "height": dimensions[1],
                     "score": score,
                 }
 
     return best
 
 
-def _image_style_from_prompt(prompt: str) -> str:
-    """Returns the style identity stored in a generated-asset prompt."""
+def find_reusable_inventory_asset(
+    *,
+    images_dir: Path,
+    saves_dir: Path,
+    repository: Any,
+    request: VisualAssetRequest,
+) -> dict[str, Any] | None:
+    """Compatibility alias for callers using the former inventory-only name."""
 
-    style_match = re.search(
-        r"Selected visual style:\s*([a-z0-9_]+)\s*\(",
-        prompt,
-        flags=re.IGNORECASE,
+    return find_reusable_visual_asset(
+        images_dir=images_dir,
+        saves_dir=saves_dir,
+        repository=repository,
+        request=request,
     )
-    if style_match:
-        value = style_match.group(1).casefold()
-        return value if value in KNOWN_IMAGE_STYLES else ""
-    if "semi-realistic digital game illustration" in prompt.casefold():
-        return DEFAULT_IMAGE_STYLE
-    return ""
+
+
+def _image_dimensions_for_resolution(
+    path: Path,
+    *,
+    minimum_longest_edge: int,
+) -> tuple[int, int] | None:
+    """Returns dimensions for a reusable PNG when it meets the requested tier."""
+
+    try:
+        with Image.open(path) as image:
+            dimensions = (int(image.width), int(image.height))
+            return (
+                dimensions
+                if max(dimensions) >= max(64, int(minimum_longest_edge))
+                else None
+            )
+    except (OSError, ValueError):
+        return None
 
 
 def _item_visual_description(
@@ -480,6 +780,55 @@ def _item_visual_description(
             parts.append(f"{key.replace('_', ' ').title()}: {text}")
 
     return " ".join(parts)
+
+
+def _item_basic_name(
+    item: dict[str, Any],
+    item_catalog: dict[str, dict[str, Any]],
+    *,
+    fallback: str,
+) -> str:
+    """Returns Gemini's generic item-family identity for reuse matching."""
+
+    name = str(item.get("name", "") or "").strip()
+    metadata = item.get("metadata", {})
+    metadata = metadata if isinstance(metadata, dict) else {}
+    item_uuid = str(metadata.get("item_uuid", "") or "").strip()
+    catalog_entry = item_catalog.get(item_uuid) or item_catalog.get(name.casefold())
+    catalog_metadata = (
+        catalog_entry.get("metadata", {})
+        if isinstance(catalog_entry, dict)
+        else {}
+    )
+    if not isinstance(catalog_metadata, dict):
+        catalog_metadata = {}
+    return _normalized_basic_name(
+        metadata.get("basic_name")
+        or catalog_metadata.get("basic_name")
+        or (catalog_entry or {}).get("basic_name"),
+        fallback=fallback,
+    )
+
+
+def _normalized_basic_name(value: Any, *, fallback: str = "") -> str:
+    """Normalizes a generic item name, with an old-record fallback."""
+
+    clean = " ".join(str(value or "").split()).strip()
+    if clean:
+        return clean[:120]
+    clean_fallback = " ".join(str(fallback or "").split()).strip()
+    words = re.findall(r"[A-Za-z0-9]+(?:['’-][A-Za-z0-9]+)*", clean_fallback)
+    if not words:
+        return clean_fallback[:120]
+    last = words[-1]
+    folded = last.casefold()
+    if len(last) > 3 and folded.endswith("ies"):
+        last = last[:-3] + "y"
+    elif len(last) > 4 and folded.endswith(("ches", "shes", "xes", "zes", "ses")):
+        last = last[:-2]
+    elif len(last) > 3 and folded.endswith("s") and not folded.endswith("ss"):
+        last = last[:-1]
+    return last[:120]
 
 
 def _item_catalog_by_identity(
@@ -555,13 +904,46 @@ def _visible_world_context(repository: VisualAssetRepository) -> str:
     return "\n".join(parts)
 
 
+def save_scaled_png(
+    image_bytes: bytes,
+    target_path: Path,
+    *,
+    max_pixels: int = STANDARD_IMAGE_MAX_PIXELS,
+) -> tuple[int, int]:
+    """Writes a forward-compatible RGB PNG and returns the final dimensions.
+
+    ``max_pixels`` is the retained longest edge, not the preview size.  The
+    image is allowed to scale up so a provider response that is smaller than
+    the requested tier still receives a consistent on-disk contract.  Native
+    Gemini 1K/2K responses should already match the requested tier, so this is
+    primarily a defensive fallback.
+    """
+
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    with Image.open(BytesIO(image_bytes)) as source:
+        image = source.convert("RGB")
+        target_longest_edge = max(64, int(max_pixels))
+        source_longest_edge = max(image.size)
+        if source_longest_edge != target_longest_edge:
+            scale = target_longest_edge / source_longest_edge
+            image = image.resize(
+                (
+                    max(1, round(image.width * scale)),
+                    max(1, round(image.height * scale)),
+                ),
+                Image.Resampling.LANCZOS,
+            )
+        image.save(target_path, format="PNG", optimize=True)
+        return image.size
+
+
 def save_scaled_jpeg(
     image_bytes: bytes,
     target_path: Path,
     *,
     max_pixels: int = DISPLAY_IMAGE_MAX_PIXELS,
 ) -> tuple[int, int]:
-    """Writes a compact RGB JPEG and returns the final dimensions."""
+    """Legacy JPEG helper retained for callers outside the asset pipeline."""
 
     target_path.parent.mkdir(parents=True, exist_ok=True)
     with Image.open(BytesIO(image_bytes)) as source:
@@ -620,6 +1002,10 @@ def _visual_event_message_ids(
         elif event_type == "NpcUpsertedEvent":
             npc_id = str(payload.get("npc_id", "") or "").strip().casefold()
             subjects = [("npc", npc_id)] if npc_id else []
+        elif event_type == "BestiaryEntryUpsertedEvent":
+            creature_id = str(payload.get("creature_id", "") or "").strip().casefold()
+            name = str(payload.get("name", "") or "").strip().casefold()
+            subjects = [("bestiary", key) for key in (creature_id, name) if key]
         if not subjects:
             continue
         for subject in subjects:

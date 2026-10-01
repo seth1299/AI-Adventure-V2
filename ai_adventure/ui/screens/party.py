@@ -90,7 +90,7 @@ class PartyScreen(RepositoryBackedWidget):
                 item.setData(Qt.ItemDataRole.UserRole, str(member.get("npc_id", "")))
                 self.table.setItem(row_index, column, item)
             npc_id = str(member.get("npc_id", "") or "").strip()
-            portrait = QLabel()
+            portrait = ClickableImageLabel()
             portrait.setObjectName("partyGeneratedPortrait")
             portrait.setMargin(4)
             asset = repository.get_visual_asset("npc", npc_id.casefold())

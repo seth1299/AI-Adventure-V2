@@ -13,18 +13,21 @@ from unittest.mock import Mock, patch
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QEventLoop, QThread, QTime, QTimer, Qt
-from PySide6.QtGui import QColor, QImage
+from PySide6.QtGui import QColor, QImage, QPixmap
+from PySide6.QtTest import QTest
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
     QDialog,
     QGridLayout,
     QHeaderView,
+    QInputDialog,
     QLabel,
     QLayoutItem,
     QLineEdit,
     QMessageBox,
     QPlainTextEdit,
+    QProgressBar,
     QPushButton,
     QSizePolicy,
     QTabWidget,
@@ -32,10 +35,15 @@ from PySide6.QtWidgets import (
     QTextEdit,
     QVBoxLayout,
     QWidget,
+    QWizard,
 )
 
 from ai_adventure.persistence.save_repository import SaveRepository
+from ai_adventure.app.app_paths import AppPaths
 from ai_adventure.new_game_setup import normalize_new_game_setup
+from ai_adventure.ui.screens.notes import NotesScreen
+from ai_adventure.ui.screens.skills import SkillsScreen
+from ai_adventure.ui.screens.travel import TravelScreen
 from ai_adventure.new_game_templates import (
     load_new_game_templates,
     save_new_game_template,
@@ -43,6 +51,7 @@ from ai_adventure.new_game_templates import (
 from ai_adventure.ui.main_window import (
     _DetachedTabWindow,
     _GeminiNewGameWorker,
+    _NewGameGenerationProgressDialog,
     AISettingsDialog,
     AlchemyNotebookScreen,
     BestiaryScreen,
@@ -143,6 +152,88 @@ class InventoryUiTests(unittest.TestCase):
         self.assertEqual(len(request_threads), 1)
         self.assertIsNot(request_threads[0], self.app.thread())
 
+    def test_load_game_selects_game_shell_after_binding_repository(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths = AppPaths(
+                app_data_dir=root,
+                saves_dir=root / "saves",
+                logs_dir=root / "logs",
+                log_file=root / "logs" / "ai_adventure.log",
+                local_app_data_dir=root,
+            )
+            paths.saves_dir.mkdir()
+            window = MainWindow(paths)
+            self.addCleanup(window.close)
+
+            repository = SaveRepository.create_new_save(
+                paths.saves_dir,
+                "Load Transition Test",
+            )
+            window.load_game_from_path(repository.db_path)
+            repository.add_inventory_item("Post-bind Item", "Tool", 1, "x")
+            repository.upsert_skill("Post-bind Skill", "x", 1)
+            refresh_loop = QEventLoop()
+            QTimer.singleShot(200, refresh_loop.quit)
+            refresh_loop.exec()
+
+            self.assertIs(window.stack.currentWidget(), window.game_shell)
+            self.assertIsNotNone(window.active_repository)
+            self.assertEqual(
+                len(window.game_shell.inventory_screen._inventory_items),
+                len(repository.list_inventory_items()),
+            )
+            self.assertEqual(
+                window.game_shell.skills_screen.skills_table.rowCount(),
+                len(repository.list_skills()),
+            )
+
+    def test_new_game_generation_progress_dialog_is_non_dismissible_and_staged(self) -> None:
+        dialog = _NewGameGenerationProgressDialog()
+        self.assertTrue(dialog.isModal())
+        self.assertFalse(bool(dialog.windowFlags() & Qt.WindowType.WindowCloseButtonHint))
+        self.assertFalse(bool(dialog.windowFlags() & Qt.WindowType.WindowMinimizeButtonHint))
+
+        dialog.show()
+        self.app.processEvents()
+        dialog.close()
+        self.app.processEvents()
+        self.assertTrue(dialog.isVisible())
+
+        dialog.update_phase("setup_compilation")
+        dialog.update_phase("world_skeleton")
+        dialog.update_phase("targeted_repairs")
+        self.assertEqual(dialog.progress_bar.value(), 27)
+        self.assertIn("World Skeleton", dialog.stage_label.text())
+
+        dialog.finish()
+        self.app.processEvents()
+        self.assertFalse(dialog.isVisible())
+
+    def test_new_game_generation_progress_dialog_eta_ticks_down_between_phases(self) -> None:
+        dialog = _NewGameGenerationProgressDialog()
+        dialog._sequence_index = 4
+        dialog._stage_durations = [10.0, 10.0]
+        dialog._last_stage_time = 100.0
+
+        with patch("ai_adventure.ui.main_window.monotonic", side_effect=[100.0, 101.0]):
+            dialog._update_eta()
+            first_estimate = dialog.eta_label.text()
+            dialog._update_eta()
+            second_estimate = dialog.eta_label.text()
+
+        self.assertEqual(dialog._eta_timer.interval(), 1000)
+        self.assertIn("about 50 seconds", first_estimate)
+        self.assertIn("about 49 seconds", second_estimate)
+        self.assertNotEqual(first_estimate, second_estimate)
+
+        dialog.show()
+        self.app.processEvents()
+        self.assertTrue(dialog._eta_timer.isActive())
+        dialog.finish()
+        self.app.processEvents()
+        self.assertFalse(dialog._eta_timer.isActive())
+
     def test_new_game_saves_unused_template_before_gemini_generation(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
@@ -167,6 +258,7 @@ class InventoryUiTests(unittest.TestCase):
             )
             window._normalize_new_game_setup_for_runtime = normalize_new_game_setup
             window.open_repository = Mock()
+            window._show_new_game_progress_dialog = Mock()
 
             def start_generation(_repository: object, _setup: object) -> None:
                 observed_template_names.extend(
@@ -280,8 +372,41 @@ class InventoryUiTests(unittest.TestCase):
         self.assertIn("next iteration", wizard.text_model_description.text())
         self.assertIn("professional-grade", wizard.image_model_description.text())
         self.assertIn("visible brushwork", wizard.image_style_description.text())
-        self.assertFalse(wizard.image_model_combo.isEnabled())
-        self.assertFalse(wizard.image_style_combo.isEnabled())
+        text_bars = wizard.text_model_ratings.findChildren(QProgressBar)
+        image_bars = wizard.image_model_ratings.findChildren(QProgressBar)
+        self.assertEqual(
+            [bar.format() for bar in text_bars],
+            ["Cost: 8/10", "Intelligence: 10/10", "Speed: 6/10"],
+        )
+        self.assertEqual(
+            [bar.format() for bar in image_bars],
+            ["Cost: 10/10", "Quality: 10/10", "Speed: 4/10"],
+        )
+        self.assertIn("#d9534f", text_bars[0].styleSheet())
+        self.assertIn("#d9534f", image_bars[0].styleSheet())
+        self.assertIn("#2eaf62", image_bars[1].styleSheet())
+        self.assertIn("#d9534f", image_bars[2].styleSheet())
+        self.assertTrue(wizard.image_model_field.isHidden())
+        self.assertTrue(wizard.image_style_field.isHidden())
+
+        wizard.generated_images_enabled_checkbox.setChecked(True)
+        lite_25_index = wizard.text_model_combo.findData("gemini-2.5-flash-lite")
+        wizard.text_model_combo.setCurrentIndex(lite_25_index)
+        self.app.processEvents()
+        self.assertEqual(
+            [bar.format() for bar in text_bars],
+            ["Cost: 1/10", "Intelligence: 4/10", "Speed: 10/10"],
+        )
+        lite_35_index = wizard.text_model_combo.findData("gemini-3.5-flash-lite")
+        wizard.text_model_combo.setCurrentIndex(lite_35_index)
+        self.app.processEvents()
+        self.assertEqual(
+            [bar.format() for bar in text_bars],
+            ["Cost: 4/10", "Intelligence: 6/10", "Speed: 9/10"],
+        )
+
+        wizard.text_model_combo.setCurrentIndex(text_index)
+        wizard.generated_images_enabled_checkbox.setChecked(False)
         setup = wizard.build_setup()
         self.assertEqual(setup["ai_settings"]["text_model"], "gemini-3.7-flash")
         self.assertEqual(setup["ai_settings"]["model_intelligence"], "smarter")
@@ -298,6 +423,93 @@ class InventoryUiTests(unittest.TestCase):
             },
         )
         wizard.close()
+
+    def test_new_game_wizard_tab_moves_focus_out_of_multiline_fields(self) -> None:
+        wizard = NewGameWizard(tts_enabled=False)
+        wizard.show()
+        self.app.processEvents()
+
+        editors = [
+            *wizard.findChildren(QTextEdit),
+            *wizard.findChildren(QPlainTextEdit),
+        ]
+        self.assertTrue(editors)
+        self.assertTrue(all(editor.tabChangesFocus() for editor in editors))
+
+        wizard.game_style_input.setPlainText("No indentation expected")
+        wizard.game_style_input.setFocus()
+        self.app.processEvents()
+        self.assertTrue(wizard.game_style_input.hasFocus())
+
+        QTest.keyClick(wizard.game_style_input, Qt.Key.Key_Tab)
+        self.app.processEvents()
+
+        self.assertFalse(wizard.game_style_input.hasFocus())
+        self.assertEqual(
+            wizard.game_style_input.toPlainText(),
+            "No indentation expected",
+        )
+        wizard.close()
+
+    def test_new_game_wizard_save_and_exit_uses_raw_partial_template(self) -> None:
+        captured: list[dict[str, Any]] = []
+        wizard = NewGameWizard(
+            tts_enabled=False,
+            on_save_and_exit=lambda setup: captured.append(setup) or True,
+        )
+        wizard.title_input.setText("")
+        wizard.character_name_input.setText("Half-Finished Hero")
+        wizard.game_style_input.setPlainText("A work in progress")
+
+        button = wizard.button(QWizard.WizardButton.CustomButton1)
+        self.assertIsNotNone(button)
+        self.assertEqual(button.text(), "Save + Exit")
+        button.click()
+        self.app.processEvents()
+
+        self.assertEqual(len(captured), 1)
+        self.assertEqual(captured[0]["title"], "")
+        self.assertEqual(captured[0]["character"]["name"], "Half-Finished Hero")
+        self.assertEqual(captured[0]["game_style"], "A work in progress")
+        self.assertEqual(wizard.result(), QDialog.DialogCode.Rejected)
+        wizard.deleteLater()
+
+    def test_main_window_save_and_exit_persists_partial_template(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            window = SimpleNamespace(
+                app_paths=SimpleNamespace(
+                    new_game_templates_path=temp_path / "new_game_templates.json",
+                    legacy_new_game_template_path=temp_path / "legacy_template.json",
+                )
+            )
+            setup = {
+                "title": "",
+                "character": {"name": "Draft Hero"},
+                "game_style": "Unfinished mystery",
+            }
+
+            with (
+                patch.object(
+                    QInputDialog,
+                    "getText",
+                    return_value=("Mystery Draft", True),
+                ),
+                patch.object(QMessageBox, "information") as information,
+            ):
+                saved = MainWindow._save_new_game_wizard_progress(
+                    cast(MainWindow, window),
+                    setup,
+                )
+
+            self.assertTrue(saved)
+            stored = load_new_game_templates(
+                window.app_paths.new_game_templates_path,
+                normalize_setups=False,
+            )
+            self.assertEqual([template.name for template in stored], ["Mystery Draft"])
+            self.assertEqual(stored[0].setup, setup)
+            information.assert_called_once()
 
     def test_in_game_ai_settings_dialog_keeps_existing_mode_controls(self) -> None:
         dialog = AISettingsDialog()
@@ -435,6 +647,49 @@ class InventoryUiTests(unittest.TestCase):
             )
             self.assertEqual(saved_mystery.setup["specified_genre"], "Thriller")
             dialog.close()
+
+    def test_lightweight_template_manager_omits_tts_controls(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            dialog = NewGameTemplateManagerDialog(
+                template_path=Path(temp_dir) / "new_game_templates.json",
+                tts_enabled=False,
+            )
+
+            self.assertIsNone(dialog.template_tts_settings_widget)
+            self.assertNotIn(
+                "Narration / TTS:",
+                [label.text() for label in dialog.findChildren(QLabel)],
+            )
+            self.assertNotIn(
+                "Sample Voice",
+                [button.text() for button in dialog.findChildren(QPushButton)],
+            )
+            setup = dialog._build_setup_from_editor()
+            self.assertFalse(setup["audio"]["narrator_enabled"])
+            dialog.close()
+
+    def test_main_window_passes_lightweight_tts_capability_to_templates(self) -> None:
+        window = SimpleNamespace(
+            app_paths=SimpleNamespace(
+                new_game_templates_path=Path("templates.json"),
+                legacy_new_game_template_path=Path("legacy-template.json"),
+                app_settings_path=Path("app-settings.json"),
+            ),
+            sound_manager=None,
+            app_settings={"audio": {}},
+            narration_player=None,
+            tts_enabled=False,
+            _play_narrator_sample=Mock(),
+            _persist_app_tts_settings=Mock(),
+        )
+
+        with patch(
+            "ai_adventure.ui.main_window.NewGameTemplateManagerDialog"
+        ) as dialog_type:
+            MainWindow.open_new_game_templates(cast(MainWindow, window))
+
+        self.assertFalse(dialog_type.call_args.kwargs["tts_enabled"])
+        dialog_type.return_value.exec.assert_called_once_with()
 
     def test_new_game_wizard_calendar_settings_button_opens_dialog(self) -> None:
         wizard = NewGameWizard(tts_enabled=False)
@@ -1079,6 +1334,122 @@ class InventoryUiTests(unittest.TestCase):
 
         screen.close()
 
+    def test_skills_table_renders_xp_as_a_progress_bar(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = SaveRepository.create_new_save(Path(temp_dir), "Skill Bar Test")
+            repository.upsert_skill("Foraging", "Finding useful materials.", 1)
+            repository.add_skill_xp("Foraging", 4)
+
+            screen = SkillsScreen()
+            screen.set_repository(repository)
+            screen.show()
+            self.app.processEvents()
+
+            row_index = -1
+            for row in range(screen.skills_table.rowCount()):
+                skill_item = screen.skills_table.item(row, 0)
+                if skill_item is not None and skill_item.text() == "Foraging":
+                    row_index = row
+                    break
+            self.assertGreaterEqual(row_index, 0)
+            progress_bar = screen.skills_table.cellWidget(row_index, 2)
+            self.assertIsInstance(progress_bar, QProgressBar)
+            assert isinstance(progress_bar, QProgressBar)
+            self.assertEqual(progress_bar.value(), 50)
+            self.assertEqual(progress_bar.format(), "50%")
+            self.assertIsNone(screen.skills_table.item(row_index, 2))
+            self.assertIn("4 / 8", progress_bar.toolTip())
+
+            screen.close()
+
+    def test_completed_story_preserves_prose_spacing_and_compact_actions(self) -> None:
+        screen = StoryScreen()
+        screen._render_conversation(
+            [
+                (
+                    "ai",
+                    "live_game",
+                    "First paragraph.\n\nSecond paragraph.\n\n"
+                    "What do you do now?\n"
+                    "- Take the northern road.\n"
+                    "- Check the market.",
+                    1,
+                )
+            ]
+        )
+        screen.show()
+        self.app.processEvents()
+
+        bubble = screen.findChild(QWidget, "conversationBubble")
+        self.assertIsNotNone(bubble)
+        assert bubble is not None
+        message = bubble.findChild(QTextEdit)
+        self.assertIsNotNone(message)
+        assert message is not None
+
+        blocks = []
+        block = message.document().begin()
+        while block.isValid():
+            blocks.append(block)
+            block = block.next()
+
+        self.assertEqual([block.text() for block in blocks], [
+            "First paragraph.",
+            "Second paragraph.",
+            "What do you do now?",
+            "Take the northern road.",
+            "Check the market.",
+        ])
+        self.assertGreater(blocks[0].blockFormat().bottomMargin(), 0)
+        self.assertGreater(blocks[1].blockFormat().bottomMargin(), 0)
+        self.assertEqual(blocks[2].blockFormat().bottomMargin(), 0)
+        self.assertEqual(blocks[3].blockFormat().bottomMargin(), 0)
+        self.assertTrue(blocks[3].textList() is not None)
+
+        screen.close()
+
+    def test_conversation_input_remains_visible_after_response_layout_growth(self) -> None:
+        screen = StoryScreen()
+        screen.resize(1000, 700)
+        screen._render_conversation(
+            [
+                (
+                    "ai",
+                    "live_game",
+                    "An opening response. " * 40,
+                    1,
+                )
+            ]
+        )
+        screen.show()
+        self.app.processEvents()
+
+        # A generated location image and a new response can both increase the
+        # content's preferred height while the window remains fullscreen.
+        screen.location_image_label.setPixmap(QPixmap(560, 280))
+        screen.location_image_label.show()
+        screen._render_conversation(
+            [
+                (
+                    "ai",
+                    "live_game",
+                    "An opening response. " * 40,
+                    1,
+                ),
+                (
+                    "ai",
+                    "live_game",
+                    "A newly generated response. " * 80,
+                    2,
+                ),
+            ]
+        )
+        self.app.processEvents()
+
+        self.assertTrue(screen.player_input.isVisible())
+        self.assertLessEqual(screen.player_input.geometry().bottom(), screen.height())
+        screen.close()
+
     def test_live_game_ai_headers_number_turns_without_counting_out_of_game(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             repository = SaveRepository.create_new_save(Path(temp_dir), "Turn Header Test")
@@ -1270,6 +1641,7 @@ class InventoryUiTests(unittest.TestCase):
                 speaker_cues=[speaker_cue],
             )
             repository.append_history("player", "I follow.")
+            repository.append_history("player_oog", "What is the name of this town?")
 
             images_dir = root / "images"
             images_dir.mkdir(parents=True)
@@ -1306,6 +1678,41 @@ class InventoryUiTests(unittest.TestCase):
                 {portrait.accessibleName() for portrait in portraits},
                 {"Profile picture of Mira", "Profile picture of You"},
             )
+            screen.close()
+
+    def test_hidden_conversation_messages_are_omitted_and_can_be_restored(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = SaveRepository.create_new_save(Path(temp_dir), "Hidden UI Test")
+            repository.append_history("story", "The first visible scene.")
+            repository.append_history("story", "The scene the player hid.")
+            hidden_id = int(repository.list_history()[-1]["id"])
+            repository.append_history("story", "The later visible scene.")
+            repository.set_history_entry_hidden(hidden_id, True)
+
+            screen = StoryScreen()
+            screen.set_repository(repository)
+            screen.show()
+            self.app.processEvents()
+
+            rendered_text = "\n".join(
+                message.toPlainText()
+                for message in screen.findChildren(QTextEdit)
+            )
+            self.assertIn("The first visible scene.", rendered_text)
+            self.assertNotIn("The scene the player hid.", rendered_text)
+            self.assertIn("The later visible scene.", rendered_text)
+            self.assertTrue(screen.view_hidden_messages_button.isVisible())
+            self.assertIn("(1)", screen.view_hidden_messages_button.text())
+
+            repository.set_history_entry_hidden(hidden_id, False)
+            screen.refresh()
+            self.app.processEvents()
+            rendered_text = "\n".join(
+                message.toPlainText()
+                for message in screen.findChildren(QTextEdit)
+            )
+            self.assertIn("The scene the player hid.", rendered_text)
+            self.assertFalse(screen.view_hidden_messages_button.isVisible())
             screen.close()
 
     def test_named_speaker_bubble_reads_only_its_saved_voice_passage(self) -> None:
@@ -1397,6 +1804,7 @@ class InventoryUiTests(unittest.TestCase):
         class FakeSoundManager:
             def __init__(self) -> None:
                 self.music_played = ""
+                self.music_stopped = 0
                 self.effect_played = ""
                 self.ambience_played = ""
 
@@ -1459,7 +1867,7 @@ class InventoryUiTests(unittest.TestCase):
                 pass
 
             def stop_music(self, *, clear_current: bool = True) -> None:
-                pass
+                self.music_stopped += 1
 
             def stop_sound_effect(self, *, clear_current: bool = True) -> None:
                 pass
@@ -1482,6 +1890,16 @@ class InventoryUiTests(unittest.TestCase):
             self.assertEqual(manager.music_played, "Slow Jazz.mp3")
             self.assertEqual(manager.effect_played, "")
             self.assertEqual(manager.ambience_played, "Quiet Rain.ogg")
+
+            manager.music_played = ""
+            _apply_audio_settings_to_managers(
+                repository,
+                sound_manager=manager,
+                narration_player=None,
+                start_music=False,
+            )
+            self.assertEqual(manager.music_played, "")
+            self.assertGreaterEqual(manager.music_stopped, 1)
 
     def test_latest_story_can_use_progressive_narration_with_pronunciations(self) -> None:
         class FakeNarrationPlayer:
@@ -1757,7 +2175,7 @@ class InventoryUiTests(unittest.TestCase):
 
         self.assertEqual(
             headers,
-            ["Name", "Ingredients", "Estimated Value", "Notes"],
+            ["Name", "Ingredients", "Estimated Value", "Notes", "Estimated Time"],
         )
         self.assertNotIn("Result", headers)
 
@@ -1963,7 +2381,93 @@ class InventoryUiTests(unittest.TestCase):
             visible_details = screen.details_output.toPlainText()
             self.assertIn("towering animal", visible_details)
             self.assertNotIn("built beneath", visible_details)
-            self.assertEqual(screen.findChildren(QPushButton), [])
+            button_texts = [button.text() for button in screen.findChildren(QPushButton)]
+            self.assertIn("Select Image...", button_texts)
+            self.assertIn("Create new image for me", button_texts)
+
+            repository.set_setting("images.enabled", False)
+            screen.refresh()
+            self.app.processEvents()
+            self.assertFalse(screen.select_image_button.isHidden())
+            self.assertTrue(screen.create_image_button.isHidden())
+            screen.close()
+
+    def test_travel_refresh_preserves_selected_location_after_visual_asset_update(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = SaveRepository.create_new_save(
+                Path(temp_dir),
+                "Travel Selection Persistence",
+            )
+            repository.set_state_value("location", "Oak Hollow")
+            repository.set_travel_locations(
+                [
+                    {
+                        "location_id": "oak_hollow",
+                        "name": "Oak Hollow",
+                        "description": "The current town.",
+                    },
+                    {
+                        "location_id": "moonlit_marsh",
+                        "name": "Moonlit Marsh",
+                        "description": "A distant wetland.",
+                        "is_sublocation": True,
+                        "parent_location": "Oak Hollow",
+                    },
+                ]
+            )
+
+            screen = TravelScreen()
+            screen.set_repository(repository)
+            self.app.processEvents()
+
+            self.assertEqual(screen._selected_location_name(), "Oak Hollow")
+            marsh_row = screen.location_selector.findText("Moonlit Marsh")
+            self.assertGreaterEqual(marsh_row, 0)
+            screen.location_selector.setCurrentIndex(marsh_row)
+            self.app.processEvents()
+
+            # GameShell calls refresh_screens() after an image upload or
+            # generation completes, which invokes this refresh method.
+            screen.refresh()
+            self.app.processEvents()
+
+            self.assertEqual(screen._selected_location_name(), "Moonlit Marsh")
+            self.assertIn("Sublocation of: Oak Hollow", screen.details_output.toPlainText())
+            screen.close()
+
+    def test_notes_default_to_markdown_preview_and_edit_on_demand(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = SaveRepository.create_new_save(Path(temp_dir), "Notes UI")
+            repository.set_note_entries(
+                [
+                    {
+                        "entry_id": "note-1",
+                        "heading": "Field clue",
+                        "body": "**A marked door**\n\n- Check the hinges",
+                        "tags": ["Clues"],
+                    }
+                ]
+            )
+
+            screen = NotesScreen()
+            screen.set_repository(repository)
+            self.app.processEvents()
+
+            self.assertIs(screen.entry_pages.currentWidget(), screen.entry_preview)
+            self.assertTrue(screen.entry_preview.isReadOnly())
+            self.assertIn("A marked door", screen.entry_preview.toPlainText())
+            self.assertEqual(screen.edit_note_button.text(), "Edit note")
+
+            screen.edit_note_button.click()
+            self.assertIs(screen.entry_pages.currentWidget(), screen.entry_editor)
+            self.assertEqual(screen.entry_body_input.toPlainText(), "**A marked door**\n\n- Check the hinges")
+            self.assertEqual(screen.edit_note_button.text(), "View note")
+
+            screen.entry_body_input.setPlainText("**Updated clue**")
+            screen.edit_note_button.click()
+            self.assertIs(screen.entry_pages.currentWidget(), screen.entry_preview)
+            self.assertIn("Updated clue", screen.entry_preview.toPlainText())
+            screen._autosave_timer.stop()
             screen.close()
 
     def test_game_shell_registers_bestiary_tab(self) -> None:
@@ -2099,7 +2603,7 @@ class InventoryUiTests(unittest.TestCase):
             )
             shell.close()
 
-    def test_inventory_uses_location_panels_and_modal_details(self) -> None:
+    def test_inventory_uses_location_panels_and_modeless_details(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             repository = SaveRepository.create_new_save(Path(temp_dir), "Inventory UI Test")
             repository.add_inventory_item(
@@ -2145,28 +2649,40 @@ class InventoryUiTests(unittest.TestCase):
             dialog = InventoryItemDetailsDialog(
                 item=compass,
                 catalog_entry=catalog_entry,
-                denominations=screen._denominations,
                 parent=screen,
             )
-            self.assertTrue(dialog.isModal())
+            self.assertFalse(dialog.isModal())
             self.assertEqual(
                 dialog.windowModality(),
-                Qt.WindowModality.ApplicationModal,
+                Qt.WindowModality.NonModal,
             )
             self.assertIsNone(dialog.findChild(QPlainTextEdit, "inventoryAsciiArt"))
             dialog_labels = [label.text() for label in dialog.findChildren(QLabel)]
             self.assertNotIn("Item Art", dialog_labels)
             self.assertNotIn("Equipped:", dialog_labels)
+            self.assertNotIn("Category:", dialog_labels)
+            self.assertNotIn("Quantity:", dialog_labels)
+            self.assertNotIn("Stored at:", dialog_labels)
+            self.assertNotIn("Value:", dialog_labels)
             self.assertIsNone(
                 dialog.findChild(QPlainTextEdit, "inventoryStructuredDetails")
             )
             self.assertIsNone(
                 dialog.findChild(QLabel, "inventoryStructuredDetailsLabel")
             )
+            stack_dialog = InventoryItemDetailsDialog(
+                item=screen._inventory_items["notebook"],
+                catalog_entry=None,
+                parent=screen,
+            )
+            stack_title = stack_dialog.findChild(QLabel, "inventoryItemDetailTitle")
+            self.assertIsNotNone(stack_title)
+            assert stack_title is not None
+            self.assertEqual(stack_title.text(), "Notebooks (x2)")
+            stack_dialog.close()
             playtesting_dialog = InventoryItemDetailsDialog(
                 item=compass,
                 catalog_entry=catalog_entry,
-                denominations=screen._denominations,
                 show_structured_details=True,
                 parent=screen,
             )
@@ -2179,6 +2695,22 @@ class InventoryUiTests(unittest.TestCase):
             self.assertIn("item_uuid", structured_details.toPlainText())
             playtesting_dialog.close()
             dialog.close()
+
+            screen._open_item_details(compass)
+            self.app.processEvents()
+            self.assertEqual(len(screen._item_detail_dialogs), 1)
+            popout = next(iter(screen._item_detail_dialogs.values()))
+            self.assertTrue(popout.isVisible())
+            self.assertFalse(popout.isModal())
+            self.assertIsNotNone(
+                popout.findChild(QPushButton, "inventorySelectImageButton")
+            )
+            self.assertIsNotNone(
+                popout.findChild(QPushButton, "inventoryCreateImageButton")
+            )
+            popout.close()
+            self.app.processEvents()
+            self.assertEqual(screen._item_detail_dialogs, {})
             screen.close()
 
     def test_npc_rows_open_resizable_player_visible_details(self) -> None:
@@ -2256,9 +2788,15 @@ class InventoryUiTests(unittest.TestCase):
         )
         button_texts = [button.text() for button in panel.item_buttons]
 
-        self.assertIn("Steel Dagger\nx1  ·  Weapon", button_texts)
-        self.assertIn("Healing Potions\nx3  ·  Consumable", button_texts)
-        self.assertIn("Food Rations\nx3 days  ·  Consumable", button_texts)
+        self.assertIn("Steel Dagger\n0 Copper Pieces  ·  Weapon", button_texts)
+        self.assertIn(
+            "Healing Potions (x3)\n0 Copper Pieces  ·  Consumable",
+            button_texts,
+        )
+        self.assertIn(
+            "Food Rations (x3 days)\n0 Copper Pieces  ·  Consumable",
+            button_texts,
+        )
 
         panel.close()
 
@@ -2329,7 +2867,11 @@ class InventoryUiTests(unittest.TestCase):
             ]
             self.assertLess(
                 carried_names.index("Amber Lens"),
-                carried_names.index("Copper Buckles"),
+                next(
+                    index
+                    for index, name in enumerate(carried_names)
+                    if name.startswith("Copper Buckles")
+                ),
             )
             self.assertTrue(home_panel.item_buttons[0].text().startswith("Zinc Plate"))
             self.assertEqual(home_panel.sort_direction_combo.currentData(), False)

@@ -25,6 +25,7 @@ def apply_ssmd_say_as_tags(text: str) -> str:
     """Adds SSMD say-as tags for common story text that benefits from normalization."""
 
     clean_text = str(text or "")
+    clean_text = _LEADING_DECIMAL_RE.sub(_replace_leading_decimal, clean_text)
     clean_text = _TWELVE_HOUR_TIME_RE.sub(
         lambda match: f"[{match.group(0)}](as: time)",
         clean_text,
@@ -110,6 +111,7 @@ _TWELVE_HOUR_TIME_RE = re.compile(
     r"\b(1[0-2]|0?[1-9]):([0-5]\d)\s*([AaPp])\.?\s*[Mm]\.?(?=$|[^A-Za-z0-9_])"
 )
 _TWENTY_FOUR_HOUR_TIME_RE = re.compile(r"\b([01]?\d|2[0-3]):([0-5]\d)\b")
+_LEADING_DECIMAL_RE = re.compile(r"(?<![A-Za-z0-9_.])\.(\d{1,3})(?!\d)")
 _NUMBER_WORDS_0_TO_59 = {
     0: "zero",
     1: "one",
@@ -207,3 +209,16 @@ def _number_word(number: int) -> str:
     tens = number - (number % 10)
     ones = number % 10
     return f"{_NUMBER_WORDS_0_TO_59[tens]} {_NUMBER_WORDS_0_TO_59[ones]}"
+
+
+def _replace_leading_decimal(match: Match[str]) -> str:
+    """Returns a spoken form for caliber-style leading decimals such as .38."""
+
+    digits = match.group(1)
+    if len(digits) == 1:
+        spoken_digits = _NUMBER_WORDS_0_TO_59[int(digits)]
+    elif len(digits) == 2:
+        spoken_digits = _number_word(int(digits))
+    else:
+        spoken_digits = " ".join(_NUMBER_WORDS_0_TO_59[int(digit)] for digit in digits)
+    return f"point {spoken_digits}"

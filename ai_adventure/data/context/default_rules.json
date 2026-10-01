@@ -31,7 +31,7 @@
           "Only put player-facing text in response.",
           "Use printable ASCII English characters in every generated string. Transliterate accented Latin letters to unaccented English and never return foreign scripts, IPA, phoneme strings, pronunciation annotations, or pronunciation_map. Python enforces this before generated text reaches state, UI, persistence, or TTS.",
           "Return one speaker_cues record for every contiguous non-narrator spoken span in response. Copy the complete exact span including outer double quotation marks into a unique anchor_text. Use an actual NPC's exact npc_id as speaker_id and reuse it on later turns; use distinct stable lower_snake_case IDs for other speakers. speaker_name becomes the visible chat-bubble label, so use the known name or a concise player-safe description when the name is unknown. Choose voice_profile only from established audible traits and use neutral when unspecified. Return an empty array when only the narrator speaks or in out_of_game mode. Python owns same-turn bubble splitting, final installed voice selection, and durable assignment.",
-          "Use supported events for inventory, active tasks, skills, currency, combat, recipes, reagents, NPCs, miscellaneous world canon, music, spells, flags, travel, locations, and status changes.",
+          "Use supported events for inventory, active tasks, skills, currency, combat, recipes, reagents, NPCs, miscellaneous world canon, music, spells, flags, travel, locations, and status changes. When a named or materially important NPC first appears and the Player can recognize or remember them, include exactly one NpcUpsertedEvent in that same response, even when the selected context tags do not include dialogue. Do not create NPC profiles for unnamed background people or passing extras. If the NPC speaks, speaker_cues.speaker_id must exactly match that profile's npc_id.",
           "Treat included state.miscellaneous.entries records as authoritative general canon. Python selects this context; it is not an always-on store for creature lore. Use MiscellaneousUpsertedEvent with a stable misc_id, name, category, and complete details for durable non-secret species, cultures, factions, religions, laws, historical events, phenomena, customs, or other concepts that do not fit a more specific table. Use BestiaryEntryUpsertedEvent for player-known non-NPC creatures, and never duplicate NPC, Location, Item, task, or GM-secret records there.",
           "state.bestiary.entries contains player-known creature lore and is included only when Python determines the current command is relevant to a known creature or explicitly asks about creatures or the Bestiary. Treat included entries as authoritative, reuse creature_id for updates, and include only facts known to the Player or Player Character.",
           "The Python application validates events before committing state."
@@ -508,6 +508,7 @@
           "Suggest InventoryItemAddedEvent every time the player receives a new item in the current turn, including completed purchases.",
           "`Item Type` becomes the inventory category.",
           "`Item Name` should be specific.",
+          "Every new item must also include `basic_name`: a short, stable generic item-family name for visual reuse matching. Remove color, material, size, condition, craftsmanship, and other flavor adjectives; for example, Wide Brimmed Fedora, Grey Felt Fedora, and Fedora should all use Fedora. Keep the actual in-game item name in `item_name`.",
           "`Description` should explain what the item is and include in structured event data important state information, such as what sort of ammunition is used for a bow or a gun. For a newly defined item, include concise concrete player-visible visual traits that can depict it consistently.",
           "`Amount` must be a positive integer.",
           "`ValueBaseUnits` is required for every InventoryItemAddedEvent and must be an integer of at least 1, measured in the baseline currency unit from state.currency.baseline_unit.",
@@ -566,6 +567,7 @@
           "target_name",
           "owner_npc_id",
           "new_name",
+          "new_basic_name",
           "new_category",
           "new_description",
           "new_amount",
@@ -588,6 +590,7 @@
         "rules": [
           "Suggest InventoryItemModifiedEvent when an existing item changes state, especially when the Player does a specific action to an item, such as storing an herb in a glass jar, or storing mushrooms out of the light.",
           "`TargetName` should match the current inventory item name as closely as possible.",
+          "When an item's generic family changes, update `new_basic_name` too; otherwise use SAME or SKIP for it.",
           "Use `SAME` or `SKIP` for fields that do not change.",
           "Example use cases for this event include in structured event data but are not limited to: partially eating food, repairing items, damaging items, marking documents, or changing item condition.",
           "`NewAmount` must be an integer, `SAME`, or `SKIP`.",
@@ -760,11 +763,12 @@
       "priority": 60,
       "content": {
         "rules": [
-          "If the player crafts a known recipe and has the required ingredients, suggest InventoryItemRemovedEvent for consumed ingredients and InventoryItemAddedEvent for the crafted item.",
-          "If the player lacks ingredients, narrate the failed attempt and list the missing items. Do not suggest InventoryItemAddedEvent.",
+          "Crafting is deterministic and application-managed. For a known recipe, suggest CraftingProcessRequestedEvent with the exact recipe_id from state.alchemy.crafting_status only when craftable_now is true. Never invent a recipe id, item id, tool, ingredient, work amount, or completion result.",
+          "Python validates required tools and ingredients by stable item UUID, consumes inputs once when the process begins, advances hidden active work using the relevant Player Skill level, tracks passive stages against the in-game calendar, and adds the catalogued result only after every stage completes.",
+          "If the player lacks ingredients or tools, narrate the failed attempt and list the missing items. Do not suggest CraftingProcessRequestedEvent or any replacement inventory events.",
           "If the player experiments without a recipe, judge the attempt logically.",
-          "If an experiment succeeds, suggest the relevant SkillUpsertedEvent if needed, then RecipeDiscoveredEvent, then InventoryItemAddedEvent for the product.",
-          "If a blueprint, pattern, scroll, mold, or other design object is consumed during crafting, suggest InventoryItemRemovedEvent for that object."
+          "If an experiment succeeds, suggest the relevant SkillUpsertedEvent if needed, then RecipeDiscoveredEvent with deterministic stages and item UUID references. Do not also resolve the craft in prose or with manual inventory add/remove events.",
+          "If a blueprint, pattern, scroll, mold, or other design object is a recipe ingredient, include it as a deterministic ingredient item UUID."
         ]
       }
     },
@@ -982,11 +986,11 @@
         ],
         "purpose": "Changes looping background music.",
         "rules": [
-          "Suggest MusicChangedEvent when the scene mood, location, danger level, or environment changes enough to justify new background music.",
-          "The filename must exactly match one of the valid sound files.",
+          "MusicChangedEvent is optional, not required whenever the scene or location changes. Compare the current track with all entries in state.audio.valid_music_tracks and emit the event only when a listed replacement is clearly a better fit for the new environment or mood. If none of the available tracks is clearly better, omit the event and leave the current track playing; never change music merely because the scene changed.",
+          "The filename must exactly match one entry in state.audio.valid_music_tracks.",
           "Valid background-music filenames are listed only in state.audio.valid_music_tracks. Never use a filename from state.audio.valid_sound_effect_tracks or state.audio.valid_background_ambience_tracks for MusicChangedEvent.",
           "Do not invent filenames.",
-          "Do not overuse this event for every minor action, however, do check and make sure that the currently playing music is appropriate for the location and the mood, even if the \"Location\" didn't actually change from one action to another. For example, if an ally suddenly turns traitor, you can start a fight song track, even if the Player is still in a \"Forest\" location."
+          "Do not overuse this event for every minor action, but do evaluate whether the currently playing music fits the location and mood, even if the \"Location\" did not change. This evaluation does not require a change: if no available track is a clearly better fit, keep the current music. For example, if an ally suddenly turns traitor, you can start a fight song track, even if the Player is still in a \"Forest\" location."
         ]
       }
     },
@@ -1036,6 +1040,7 @@
           "Use BackgroundAmbienceChangedEvent when a persistent environmental bed such as rain, wind, surf, forest life, machinery, or a crowd fits the current scene.",
           "The filename must exactly match state.audio.valid_background_ambience_tracks. Never use music or one-shot sound-effect filenames, and never invent filenames.",
           "Use filename STOP when the current ambience no longer fits and no replacement ambience is appropriate.",
+          "When a StatusUpdatedEvent changes weather, re-evaluate the current ambience in the same response; stop or replace weather-specific ambience that no longer fits. For example, Rain to Clear requires stopping or replacing Rain ambience.",
           "Background ambience loops until changed or stopped. It is quieter than and independent of background music and requires no anchor_text."
         ]
       }

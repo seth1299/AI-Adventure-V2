@@ -76,6 +76,16 @@ class StoryTurnService:
             if sound_manager is not None
             else []
         )
+        correction_request = (
+            conversation_mode == "out_of_game"
+            and any(
+                phrase in player_text.casefold()
+                for phrase in (
+                    "missing", "not in my inventory", "don't see", "didn't receive",
+                    "did not receive", "double-check", "double check", "correct my inventory",
+                )
+            )
+        )
         return AiContextBuilder.from_default_library().build_story_context(
             state,
             player_command=player_text,
@@ -94,6 +104,14 @@ class StoryTurnService:
             ),
             resolved_skill_checks=resolved_skill_checks,
             planner_context_tags=planner_context_tags,
+            merchant=(lambda npc_id: {
+                "active_npc_id": npc_id,
+                "profile": repository.get_merchant_profile(npc_id) if npc_id else None,
+                "stock": repository.list_merchant_stock(npc_id) if npc_id else [],
+                "buy_offers": repository.list_merchant_buy_offers(npc_id) if npc_id else [],
+            })(repository.get_active_merchant_npc_id()),
+            out_of_game_correction=correction_request,
+            mechanical_events=repository.list_mechanical_events()[-40:],
         )
 
     @staticmethod
@@ -106,16 +124,17 @@ class StoryTurnService:
     ) -> None:
         """Persists a submitted player action and captures rollback scope."""
 
-        clean_mode = (
-            "out_of_game" if conversation_mode == "out_of_game" else "live_game"
-        )
-        repository.append_history(
-            "player_oog" if clean_mode == "out_of_game" else "player",
-            player_text,
-            message_id=repository.create_message_id(),
-        )
-        if clean_mode == "live_game":
-            repository.capture_message_snapshot(message_id)
+        with repository.transaction():
+            clean_mode = (
+                "out_of_game" if conversation_mode == "out_of_game" else "live_game"
+            )
+            repository.append_history(
+                "player_oog" if clean_mode == "out_of_game" else "player",
+                player_text,
+                message_id=repository.create_message_id(),
+            )
+            if clean_mode == "live_game":
+                repository.capture_message_snapshot(message_id)
 
     @staticmethod
     def record_failure(
@@ -190,66 +209,98 @@ class StoryTurnService:
     ) -> StoryTurnCommitResult:
         """Persists narration metadata and applies authorized game events."""
 
-        is_out_of_game = conversation_mode == "out_of_game"
-        pronunciation_map = merge_pronunciation_maps(
-            repository.get_setting("tts.pronunciation_map", {}),
-            getattr(result, "pronunciation_map", {}),
-        )
-        player_name_pronunciation = repository.get_setting(
-            "player.name_pronunciation",
-            "",
-        )
-        if player_name_pronunciation:
-            pronunciation_map = set_authoritative_pronunciation(
-                pronunciation_map,
-                repository.get_setting("player_name", ""),
-                player_name_pronunciation,
+        with repository.transaction():
+            is_out_of_game = conversation_mode == "out_of_game"
+            pronunciation_map = merge_pronunciation_maps(
+                repository.get_setting("tts.pronunciation_map", {}),
+                getattr(result, "pronunciation_map", {}),
             )
-        repository.set_setting("tts.pronunciation_map", pronunciation_map)
+            player_name_pronunciation = repository.get_setting(
+                "player.name_pronunciation",
+                "",
+            )
+            if player_name_pronunciation:
+                pronunciation_map = set_authoritative_pronunciation(
+                    pronunciation_map,
+                    repository.get_setting("player_name", ""),
+                    player_name_pronunciation,
+                )
+            repository.set_setting("tts.pronunciation_map", pronunciation_map)
 
-        clean_message_id = message_id or repository.create_message_id()
-        speaker_cues: list[dict[str, str]] = []
-        if not is_out_of_game:
-            audio = normalize_tts_audio_fields(
-                {
-                    "tts_voice": repository.get_setting("audio.tts_voice", ""),
-                    "tts_voice_mode": repository.get_setting(
-                        "audio.tts_voice_mode", "preset"
+            clean_message_id = message_id or repository.create_message_id()
+            speaker_cues: list[dict[str, str]] = []
+            if not is_out_of_game:
+                audio = normalize_tts_audio_fields(
+                    {
+                        "tts_voice": repository.get_setting("audio.tts_voice", ""),
+                        "tts_voice_mode": repository.get_setting(
+                            "audio.tts_voice_mode", "preset"
+                        ),
+                        "tts_voice_blend": repository.get_setting(
+                            "audio.tts_voice_blend", {}
+                        ),
+                        "player_tts_voice": repository.get_setting(
+                            "audio.player_tts_voice", "ai"
+                        ),
+                    }
+                )
+                speaker_cues, assignments = assign_speaker_voices(
+                    getattr(result, "speaker_cues", []),
+                    narrator_voice=active_voice_spec_from_audio(audio),
+                    available_voice_ids=available_voice_ids or [],
+                    existing_assignments=repository.get_setting(
+                        "audio.speaker_voice_assignments",
+                        {},
                     ),
-                    "tts_voice_blend": repository.get_setting(
-                        "audio.tts_voice_blend", {}
+                    player_speaker_ids={
+                        "player",
+                        "player_character",
+                        str(repository.get_setting("player_name", "")).casefold(),
+                    },
+                    player_pronouns=repository.get_setting(
+                        "player.pronouns", "They/Them"
                     ),
-                }
-            )
-            speaker_cues, assignments = assign_speaker_voices(
-                getattr(result, "speaker_cues", []),
-                narrator_voice=active_voice_spec_from_audio(audio),
-                available_voice_ids=available_voice_ids or [],
-                existing_assignments=repository.get_setting(
-                    "audio.speaker_voice_assignments",
-                    {},
-                ),
-            )
-            repository.set_setting("audio.speaker_voice_assignments", assignments)
+                    player_voice=audio["player_tts_voice"],
+                )
+                repository.set_setting("audio.speaker_voice_assignments", assignments)
 
-        repository.append_history(
-            "story_oog" if is_out_of_game else "story",
-            result.narrative_text,
-            message_id=clean_message_id,
-            sound_effect_cues=result.sound_effect_cues,
-            speaker_cues=speaker_cues,
-        )
-
-        event_results: list[AppliedEventResult] = []
-        if not is_out_of_game and result.suggested_events:
-            event_results = StoryTurnService.apply_suggested_events(
-                repository,
+            repository.append_history(
+                "story_oog" if is_out_of_game else "story",
+                result.narrative_text,
                 message_id=clean_message_id,
-                suggested_events=result.suggested_events,
-                prior_results=prior_event_results,
+                sound_effect_cues=result.sound_effect_cues,
+                speaker_cues=speaker_cues,
             )
-        return StoryTurnCommitResult(
-            message_id=clean_message_id,
-            speaker_cues=speaker_cues,
-            event_results=event_results,
-        )
+
+            event_results: list[AppliedEventResult] = []
+            correction_events = [
+                event for event in result.suggested_events
+                if isinstance(event, dict)
+                and str(event.get("type", "")).strip() == "InventoryItemAddedEvent"
+            ]
+            events_to_apply = result.suggested_events if not is_out_of_game else correction_events
+            if events_to_apply:
+                event_results = StoryTurnService.apply_suggested_events(
+                    repository,
+                    message_id=clean_message_id,
+                    suggested_events=events_to_apply,
+                    prior_results=prior_event_results,
+                )
+            if not is_out_of_game:
+                merchant_npc_id = next(
+                    (
+                        str(cue.get("speaker_id", "") or "").strip()
+                        for cue in speaker_cues
+                        if str(cue.get("speaker_id", "") or "").strip()
+                        and repository.get_merchant_profile(
+                            str(cue.get("speaker_id", "") or "").strip()
+                        )
+                    ),
+                    "",
+                )
+                repository.set_active_merchant_npc(merchant_npc_id or None)
+            return StoryTurnCommitResult(
+                message_id=clean_message_id,
+                speaker_cues=speaker_cues,
+                event_results=event_results,
+            )

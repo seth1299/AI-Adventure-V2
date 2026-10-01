@@ -1,7 +1,19 @@
 from __future__ import annotations
 
+from PySide6.QtWidgets import QFileDialog
+
 from ai_adventure.ui.common import *  # noqa: F401,F403
 from ai_adventure.ui.dialogues import *  # noqa: F401,F403
+
+
+def _add_settings_section_separator(form: QFormLayout) -> None:
+    """Adds a subtle horizontal rule between major settings sections."""
+
+    separator = QFrame()
+    separator.setFrameShape(QFrame.Shape.HLine)
+    separator.setFrameShadow(QFrame.Shadow.Sunken)
+    separator.setObjectName("settingsSectionSeparator")
+    form.addRow("", separator)
 
 
 class SettingsScreen(RepositoryBackedWidget):
@@ -60,12 +72,15 @@ class SettingsScreen(RepositoryBackedWidget):
         self.ai_settings_button.clicked.connect(self._open_ai_settings_dialog)
 
         self.generated_images_enabled_checkbox = QCheckBox(
-            "Generate and reuse portraits, locations, items, and NPC images"
+            "Allow Gemini to generate portraits, locations, items, and NPC images"
         )
         self.generated_images_enabled_checkbox.setChecked(True)
         self.generated_images_enabled_checkbox.setToolTip(
-            "New subjects may incur one Gemini image-generation charge; matching "
-            "descriptions reuse the existing cached image."
+            "When disabled, Generate Image buttons are hidden, but local image "
+            "uploads remain available."
+        )
+        self.generated_images_enabled_checkbox.toggled.connect(
+            self._sync_image_control_visibility
         )
         self.generated_images_enabled_checkbox.toggled.connect(
             lambda _checked: self._save_settings()
@@ -80,9 +95,12 @@ class SettingsScreen(RepositoryBackedWidget):
         self.maximum_generated_images_input.valueChanged.connect(
             lambda _value: self._save_settings()
         )
-        self.generated_image_model_label = QLabel(DEFAULT_IMAGE_MODEL)
-        self.generated_image_model_label.setTextInteractionFlags(
-            Qt.TextInteractionFlag.TextSelectableByMouse
+        self.generated_image_model_combo = QComboBox()
+        AISettingsDialog._add_mode_options(
+            self.generated_image_model_combo, IMAGE_MODEL_OPTIONS
+        )
+        self.generated_image_model_combo.currentIndexChanged.connect(
+            lambda _index: self._save_settings()
         )
         self.retry_failed_images_button = QPushButton("Retry Failed Images")
         self.retry_failed_images_button.setToolTip(
@@ -92,6 +110,7 @@ class SettingsScreen(RepositoryBackedWidget):
 
         self.music_enabled_checkbox = QCheckBox("Music enabled")
         self.music_enabled_checkbox.setChecked(True)
+        self.music_enabled_checkbox.toggled.connect(self._sync_audio_control_visibility)
         self.music_enabled_checkbox.toggled.connect(lambda _checked: self._save_settings())
 
         self.music_track_combo = QComboBox()
@@ -102,6 +121,10 @@ class SettingsScreen(RepositoryBackedWidget):
         )
         self.music_track_combo.currentIndexChanged.connect(
             lambda _index: self._save_settings()
+        )
+        self.music_upload_button = QPushButton("Upload Music...")
+        self.music_upload_button.clicked.connect(
+            lambda _checked=False: self._upload_audio_file("music")
         )
 
         self.music_volume_slider = QSlider(Qt.Orientation.Horizontal)
@@ -115,6 +138,7 @@ class SettingsScreen(RepositoryBackedWidget):
 
         self.sound_effects_enabled_checkbox = QCheckBox("Sound effects enabled")
         self.sound_effects_enabled_checkbox.setChecked(True)
+        self.sound_effects_enabled_checkbox.toggled.connect(self._sync_audio_control_visibility)
         self.sound_effects_enabled_checkbox.toggled.connect(
             lambda _checked: self._save_settings()
         )
@@ -125,12 +149,19 @@ class SettingsScreen(RepositoryBackedWidget):
         self.sound_effects_volume_slider.valueChanged.connect(
             lambda value: self.sound_effects_volume_label.setText(f"{value}%")
         )
+        self.sound_effects_upload_button = QPushButton("Upload Sound Effect...")
+        self.sound_effects_upload_button.clicked.connect(
+            lambda _checked=False: self._upload_audio_file("sound_effects")
+        )
+        self.sound_effects_upload_status = QLabel("No new sound effect uploaded")
+        self.sound_effects_upload_status.setWordWrap(True)
         self.sound_effects_volume_slider.sliderReleased.connect(self._save_settings)
 
         self.background_ambience_enabled_checkbox = QCheckBox(
             "Background ambience enabled"
         )
         self.background_ambience_enabled_checkbox.setChecked(True)
+        self.background_ambience_enabled_checkbox.toggled.connect(self._sync_audio_control_visibility)
         self.background_ambience_enabled_checkbox.toggled.connect(
             lambda _checked: self._save_settings()
         )
@@ -145,6 +176,21 @@ class SettingsScreen(RepositoryBackedWidget):
         self.background_ambience_track_combo.currentIndexChanged.connect(
             lambda _index: self._save_settings()
         )
+        self.background_ambience_upload_button = QPushButton(
+            "Upload Background Ambience..."
+        )
+        self.background_ambience_upload_button.clicked.connect(
+            lambda _checked=False: self._upload_audio_file("background_ambience")
+        )
+        audio_import_available = callable(
+            getattr(self.sound_manager, "import_audio_file", None)
+        )
+        for button in (
+            self.music_upload_button,
+            self.sound_effects_upload_button,
+            self.background_ambience_upload_button,
+        ):
+            button.setEnabled(audio_import_available)
         self.background_ambience_volume_slider = QSlider(Qt.Orientation.Horizontal)
         self.background_ambience_volume_slider.setRange(0, 100)
         self.background_ambience_volume_slider.setValue(15)
@@ -174,53 +220,78 @@ class SettingsScreen(RepositoryBackedWidget):
         self.add_settings_currency_button.clicked.connect(self._add_settings_currency_row)
 
         layout = QFormLayout()
+        self._settings_form = layout
         layout.addRow("Theme Preference:", self.theme_combo)
         if self.ai_enabled:
+            _add_settings_section_separator(layout)
             layout.addRow("Artificial Intelligence:", self.ai_settings_button)
         if self.ai_enabled and not self.playtesting_tools:
+            _add_settings_section_separator(layout)
             layout.addRow("Generated Images:", self.generated_images_enabled_checkbox)
-            layout.addRow("Image Model:", self.generated_image_model_label)
-            layout.addRow("Generation Limit:", self.maximum_generated_images_input)
-            layout.addRow("Failed Images:", self.retry_failed_images_button)
+            self.generated_image_model_control = self.generated_image_model_combo
+            self.maximum_generated_images_control = self.maximum_generated_images_input
+            self.failed_images_control = self.retry_failed_images_button
+            layout.addRow("Image Model:", self.generated_image_model_control)
+            layout.addRow("Generation Limit:", self.maximum_generated_images_control)
+            layout.addRow("Failed Images:", self.failed_images_control)
         if self.music_feature_enabled:
+            _add_settings_section_separator(layout)
             layout.addRow("Background Music:", self.music_enabled_checkbox)
-            layout.addRow("Music Track:", self.music_track_combo)
+            self.music_track_control = _button_row(
+                self.music_track_combo, self.music_upload_button
+            )
+            layout.addRow("Music Track:", self.music_track_control)
+            self.music_volume_control = _slider_row(
+                self.music_volume_slider, self.music_volume_label
+            )
             layout.addRow(
                 "Music Volume:",
-                _slider_row(self.music_volume_slider, self.music_volume_label),
+                self.music_volume_control,
             )
+            _add_settings_section_separator(layout)
             layout.addRow("Narration Sound Effects:", self.sound_effects_enabled_checkbox)
-            layout.addRow(
-                "Sound Effects Volume:",
-                _slider_row(
-                    self.sound_effects_volume_slider,
-                    self.sound_effects_volume_label,
-                ),
+            self.sound_effects_volume_control = _slider_row(
+                self.sound_effects_volume_slider, self.sound_effects_volume_label
             )
+            layout.addRow("Sound Effects Volume:", self.sound_effects_volume_control)
+            self.sound_effects_library_control = _button_row(
+                self.sound_effects_upload_button, self.sound_effects_upload_status
+            )
+            layout.addRow("Sound Effect Library:", self.sound_effects_library_control)
             layout.addRow(
                 "Background Ambience:",
                 self.background_ambience_enabled_checkbox,
             )
-            layout.addRow("Ambience Track:", self.background_ambience_track_combo)
+            self.background_ambience_track_control = _button_row(
+                self.background_ambience_track_combo,
+                self.background_ambience_upload_button,
+            )
+            layout.addRow("Ambience Track:", self.background_ambience_track_control)
+            self.background_ambience_volume_control = _slider_row(
+                self.background_ambience_volume_slider,
+                self.background_ambience_volume_label,
+            )
             layout.addRow(
                 "Ambience Volume:",
-                _slider_row(
-                    self.background_ambience_volume_slider,
-                    self.background_ambience_volume_label,
-                ),
+                self.background_ambience_volume_control,
             )
 
         if self.tts_settings_button is not None:
+            _add_settings_section_separator(layout)
             layout.addRow("Narration Audio:", self.tts_settings_button)
 
         if self.custom_voice_button is not None:
+            _add_settings_section_separator(layout)
             layout.addRow("Custom Voices:", self.custom_voice_button)
 
         if self.playtesting_tools:
+            _add_settings_section_separator(layout)
             layout.addRow("Currencies:", self.currency_rows_widget)
             layout.addRow("", self.add_settings_currency_button)
 
         self.setLayout(layout)
+        self._sync_image_control_visibility()
+        self._sync_audio_control_visibility()
 
     def _populate_audio_track_combo(
         self,
@@ -250,6 +321,123 @@ class SettingsScreen(RepositoryBackedWidget):
             if clean_name:
                 combo.addItem(clean_name, clean_name)
         combo.setEnabled(True)
+
+    def _sync_audio_control_visibility(self, _checked: bool | None = None) -> None:
+        """Shows audio child controls only while their parent feature is enabled."""
+
+        form = getattr(self, "_settings_form", None)
+        if form is None:
+            return
+        if hasattr(self, "music_track_control"):
+            music_visible = self.music_enabled_checkbox.isChecked()
+            form.setRowVisible(self.music_track_control, music_visible)
+            form.setRowVisible(self.music_volume_control, music_visible)
+        effects_visible = self.sound_effects_enabled_checkbox.isChecked()
+        if hasattr(self, "sound_effects_volume_control"):
+            form.setRowVisible(self.sound_effects_volume_control, effects_visible)
+            form.setRowVisible(self.sound_effects_library_control, effects_visible)
+        ambience_visible = self.background_ambience_enabled_checkbox.isChecked()
+        if hasattr(self, "background_ambience_track_control"):
+            form.setRowVisible(self.background_ambience_track_control, ambience_visible)
+            form.setRowVisible(self.background_ambience_volume_control, ambience_visible)
+
+    def _sync_image_control_visibility(self, _checked: bool | None = None) -> None:
+        """Shows image-generation settings only while generation is enabled."""
+
+        form = getattr(self, "_settings_form", None)
+        if form is None or not hasattr(self, "generated_image_model_control"):
+            return
+        visible = self.generated_images_enabled_checkbox.isChecked()
+        form.setRowVisible(self.generated_image_model_control, visible)
+        form.setRowVisible(self.maximum_generated_images_control, visible)
+        form.setRowVisible(self.failed_images_control, visible)
+
+    def _upload_audio_file(self, category: str) -> None:
+        """Imports one user-selected audio file and refreshes its live catalog."""
+
+        LOGGER.info("Audio upload requested from Settings: category=%s.", category)
+        sound_manager = self.sound_manager
+        importer = getattr(sound_manager, "import_audio_file", None)
+        if not callable(importer):
+            LOGGER.warning(
+                "Audio upload unavailable from Settings: category=%s manager=%r.",
+                category,
+                type(sound_manager).__name__ if sound_manager is not None else None,
+            )
+            QMessageBox.warning(
+                self,
+                "Audio Unavailable",
+                "User audio import is unavailable in this build.",
+            )
+            return
+
+        dialog = QFileDialog(self, "Choose Audio File")
+        dialog.setFileMode(QFileDialog.FileMode.ExistingFile)
+        dialog.setNameFilters(["Audio (*.mp3 *.ogg *.wav)", "All Files (*)"])
+        dialog.setOption(QFileDialog.Option.DontUseNativeDialog, True)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            LOGGER.info("Audio upload cancelled from Settings: category=%s.", category)
+            return
+        selected_files = cast(list[str], dialog.selectedFiles())
+        file_path = selected_files[0] if selected_files else ""
+        if not file_path:
+            LOGGER.info(
+                "Audio upload ended without a selected file: category=%s.", category
+            )
+            return
+
+        try:
+            success, result = importer(Path(file_path), category)
+        except Exception as error:
+            LOGGER.exception(
+                "Audio upload crashed in Settings: category=%s file=%s.",
+                category,
+                file_path,
+            )
+            QMessageBox.warning(
+                self,
+                "Audio Import Failed",
+                f"Could not import that audio file: {error}",
+            )
+            return
+        if not success:
+            LOGGER.warning(
+                "Audio upload rejected in Settings: category=%s file=%s reason=%s.",
+                category,
+                file_path,
+                result,
+            )
+            QMessageBox.warning(self, "Audio Import Failed", result)
+            return
+
+        LOGGER.info(
+            "Audio upload completed in Settings: category=%s imported_name=%s.",
+            category,
+            result,
+        )
+
+        if category == "music":
+            self.music_track_combo.blockSignals(True)
+            self._populate_audio_track_combo(
+                self.music_track_combo,
+                "get_valid_track_names",
+            )
+            self._set_audio_track_combo_value(self.music_track_combo, result)
+            self.music_track_combo.blockSignals(False)
+        elif category == "background_ambience":
+            self.background_ambience_track_combo.blockSignals(True)
+            self._populate_audio_track_combo(
+                self.background_ambience_track_combo,
+                "get_valid_background_ambience_names",
+            )
+            self._set_audio_track_combo_value(
+                self.background_ambience_track_combo,
+                result,
+            )
+            self.background_ambience_track_combo.blockSignals(False)
+        else:
+            self.sound_effects_upload_status.setText(f"Available: {result}")
+        self._save_settings()
 
     @staticmethod
     def _set_audio_track_combo_value(combo: QComboBox, value: Any) -> None:
@@ -491,11 +679,11 @@ class SettingsScreen(RepositoryBackedWidget):
                     10_000,
                 )
             )
-            self.generated_image_model_label.setText(
-                str(
+            _set_combo_to_data(
+                self.generated_image_model_combo,
+                normalize_image_model(
                     repository.get_setting("images.model", DEFAULT_IMAGE_MODEL)
-                    or DEFAULT_IMAGE_MODEL
-                )
+                ),
             )
             self.retry_failed_images_button.setEnabled(True)
             self._set_audio_track_combo_value(
@@ -606,6 +794,10 @@ class SettingsScreen(RepositoryBackedWidget):
             repository.set_setting(
                 "images.maximum_generated",
                 self.maximum_generated_images_input.value(),
+            )
+            repository.set_setting(
+                "images.model",
+                normalize_image_model(self.generated_image_model_combo.currentData()),
             )
             repository.set_setting("audio.music_enabled", self.music_enabled_checkbox.isChecked())
             repository.set_setting("audio.music_volume", self.music_volume_slider.value())
@@ -826,6 +1018,7 @@ class SettingsScreen(RepositoryBackedWidget):
                 "narrator_enabled": repository.get_setting("audio.narrator_enabled", True),
                 "tts_volume": repository.get_setting("audio.tts_volume", 90),
                 "tts_voice": repository.get_setting("audio.tts_voice", DEFAULT_NARRATOR_VOICE),
+                "player_tts_voice": repository.get_setting("audio.player_tts_voice", "ai"),
                 "tts_speed": repository.get_setting(
                     "audio.tts_speed",
                     DEFAULT_TTS_SPEED_PERCENT,
@@ -860,6 +1053,7 @@ class SettingsScreen(RepositoryBackedWidget):
             repository.set_setting("audio.narrator_enabled", audio["narrator_enabled"])
             repository.set_setting("audio.tts_volume", audio["tts_volume"])
             repository.set_setting("audio.tts_voice", audio["tts_voice"])
+            repository.set_setting("audio.player_tts_voice", audio["player_tts_voice"])
             repository.set_setting("audio.tts_speed", audio["tts_speed"])
             repository.set_setting("audio.tts_voice_mode", audio["tts_voice_mode"])
             repository.set_setting("audio.tts_voice_blend", audio["tts_voice_blend"])

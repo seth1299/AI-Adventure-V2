@@ -50,6 +50,12 @@ class StoryScreen(RepositoryBackedWidget):
         self._combat_active = False
         self._default_input_placeholder = "Enter a player action..."
         self._out_of_game_input_placeholder = "Ask the AI about the adventure..."
+        self.view_hidden_messages_button = QPushButton("View Hidden Messages")
+        self.view_hidden_messages_button.setToolTip(
+            "Review conversation messages hidden from the main timeline and restore them."
+        )
+        self.view_hidden_messages_button.clicked.connect(self._show_hidden_messages)
+        self.view_hidden_messages_button.hide()
         self._narration_chunk_ready.connect(self._append_revealed_story_chunk)
         self._narration_complete.connect(self._complete_revealed_story)
         self._initial_generation_pending = False
@@ -57,7 +63,7 @@ class StoryScreen(RepositoryBackedWidget):
         self.day_value = QLabel(UNRESOLVED_STATUS_TEXT)
         self.time_value = QLabel(UNRESOLVED_STATUS_TEXT)
         self.weather_value = QLabel(UNRESOLVED_STATUS_TEXT)
-        self.location_image_label = QLabel()
+        self.location_image_label = ClickableImageLabel()
         self.location_image_label.setObjectName("storyCurrentLocationImage")
         self.location_image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.location_image_label.setStyleSheet(
@@ -78,6 +84,15 @@ class StoryScreen(RepositoryBackedWidget):
         self.conversation_scroll.setFrameShape(QFrame.Shape.NoFrame)
         self.conversation_scroll.setHorizontalScrollBarPolicy(
             Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        # The conversation viewport must yield space to the player controls
+        # when a new response changes the content's preferred height. Without
+        # an explicit flexible region, fullscreen/maximized layouts can place
+        # the input row just below the visible window until the next resize.
+        self.conversation_scroll.setMinimumHeight(0)
+        self.conversation_scroll.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Expanding,
         )
         self.conversation_contents = QWidget()
         self.conversation_layout = QVBoxLayout(self.conversation_contents)
@@ -116,6 +131,10 @@ class StoryScreen(RepositoryBackedWidget):
         input_row.addWidget(self.continue_button)
 
         layout = QVBoxLayout()
+        conversation_toolbar = QHBoxLayout()
+        conversation_toolbar.addWidget(self.view_hidden_messages_button)
+        conversation_toolbar.addStretch()
+        layout.addLayout(conversation_toolbar)
         layout.addLayout(status_row)
         location_image_row = QHBoxLayout()
         location_image_row.setContentsMargins(0, 0, 0, 0)
@@ -123,7 +142,7 @@ class StoryScreen(RepositoryBackedWidget):
         location_image_row.addWidget(self.location_image_label)
         location_image_row.addStretch()
         layout.addLayout(location_image_row)
-        layout.addWidget(self.conversation_scroll)
+        layout.addWidget(self.conversation_scroll, 1)
         layout.addLayout(input_row)
 
         self.setLayout(layout)
@@ -167,6 +186,7 @@ class StoryScreen(RepositoryBackedWidget):
 
         if repository is None:
             self._clear_conversation_messages()
+            self.view_hidden_messages_button.hide()
             self._show_unresolved_status()
             self._combat_active = False
             self._sync_story_input_state()
@@ -193,12 +213,24 @@ class StoryScreen(RepositoryBackedWidget):
             self._refresh_current_location_image(state.world.location)
 
         if self._initial_generation_pending:
+            self.view_hidden_messages_button.hide()
             self._render_conversation([])
             self._sync_story_input_state()
             self._update_continue_button_state()
             return
 
         entries = repository.list_history()
+        hidden_count = sum(
+            1
+            for entry in entries
+            if bool(entry.get("hidden", False))
+            and str(entry.get("kind", "")).casefold()
+            in {"player", "player_oog", "story", "story_oog"}
+        )
+        self.view_hidden_messages_button.setText(
+            f"View Hidden Messages ({hidden_count})"
+        )
+        self.view_hidden_messages_button.setVisible(hidden_count > 0)
         conversation_entries: list[tuple[Any, ...]] = []
         live_turn_number = 0
 
@@ -207,6 +239,8 @@ class StoryScreen(RepositoryBackedWidget):
             content = str(entry.get("content", ""))
 
             if kind in {"player", "player_oog"}:
+                if bool(entry.get("hidden", False)):
+                    continue
                 conversation_entries.append(
                     (
                         "player",
@@ -222,6 +256,8 @@ class StoryScreen(RepositoryBackedWidget):
                 if kind == "story":
                     live_turn_number += 1
                     turn_number = live_turn_number
+                if bool(entry.get("hidden", False)):
+                    continue
                 is_revealing = entry_id == self._revealing_story_id
                 visible_content = (
                     "".join(self._revealed_story_chunks)
@@ -484,11 +520,16 @@ class StoryScreen(RepositoryBackedWidget):
         )
         header = QLabel(f"{speaker}  |  {mode_label}{turn_label}")
         header.setStyleSheet("font-size: 11px; font-weight: 700;")
+        narration_enabled = self.narration_player is not None and (
+            repository is None
+            or bool(repository.get_setting("audio.narrator_enabled", True))
+        )
         read_aloud_button = QPushButton("Read Aloud")
-        read_aloud_button.setEnabled(self.narration_player is not None)
+        read_aloud_button.setVisible(narration_enabled)
+        read_aloud_button.setEnabled(narration_enabled)
         read_aloud_button.setToolTip(
             "Play this bubble with its saved narrator or character voice. No AI request is sent."
-            if self.narration_player is not None
+            if narration_enabled
             else "Local narrator playback is unavailable in this build."
         )
         read_aloud_button.setStyleSheet(
@@ -512,7 +553,28 @@ class StoryScreen(RepositoryBackedWidget):
         header_row.setContentsMargins(0, 0, 0, 0)
         header_row.addWidget(header)
         header_row.addStretch()
-        header_row.addWidget(read_aloud_button)
+        if narration_enabled:
+            header_row.addWidget(read_aloud_button)
+        else:
+            # Preserve the historical header geometry without exposing a dead
+            # control in builds/settings where narration is unavailable.
+            header_row.addSpacing(82)
+        hide_button = QPushButton("Hide")
+        hide_button.setToolTip(
+            "Remove this message from the Conversation tab without deleting it from history."
+        )
+        hide_button.setStyleSheet(
+            "QPushButton { background-color: rgba(255, 255, 255, 28); "
+            "color: white; border: 1px solid rgba(255, 255, 255, 70); "
+            "border-radius: 7px; padding: 3px 9px; font-size: 11px; } "
+            "QPushButton:hover { background-color: rgba(255, 255, 255, 48); }"
+        )
+        hide_button.clicked.connect(
+            lambda _checked=False, current_history_id=history_entry_id: (
+                self._hide_conversation_message(current_history_id)
+            )
+        )
+        header_row.addWidget(hide_button)
         if can_regenerate:
             regenerate_button = QPushButton("Regenerate")
             regenerate_button.setToolTip(
@@ -537,8 +599,8 @@ class StoryScreen(RepositoryBackedWidget):
             role,
             speaker_cues,
         )
-        if speaker_asset is not None:
-            portrait_label = QLabel()
+        if speaker_asset is not None and not is_out_of_game:
+            portrait_label = ClickableImageLabel()
             portrait_label.setObjectName("conversationSpeakerPortrait")
             portrait_label.setStyleSheet(
                 "background: rgba(15, 23, 42, 96); border-radius: 8px; padding: 3px;"
@@ -568,7 +630,7 @@ class StoryScreen(RepositoryBackedWidget):
                 image_grid.setHorizontalSpacing(8)
                 image_grid.setVerticalSpacing(8)
                 for index, asset in enumerate(visual_assets[:12]):
-                    image_label = QLabel()
+                    image_label = ClickableImageLabel()
                     image_label.setObjectName("conversationGeneratedImage")
                     image_label.setStyleSheet(
                         "background: rgba(15, 23, 42, 96); border-radius: 8px; padding: 3px;"
@@ -595,7 +657,7 @@ class StoryScreen(RepositoryBackedWidget):
         message.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
         message.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         message.setStyleSheet("background: transparent; border: none; padding: 0;")
-        _set_markdown_text(message, content)
+        _set_markdown_text(message, content, preserve_blank_lines=True)
         message.document().setDocumentMargin(0)
 
         def resize_message(*_args: Any) -> None:
@@ -624,6 +686,127 @@ class StoryScreen(RepositoryBackedWidget):
             )
             row_layout.addWidget(bubble, 1)
         return row
+
+    def _hide_conversation_message(self, history_entry_id: int) -> None:
+        """Hides one conversation entry while retaining it in the save history."""
+
+        repository = self.repository()
+        if repository is None or history_entry_id < 0:
+            return
+
+        if repository.set_history_entry_hidden(history_entry_id, True):
+            if self._revealing_story_id == history_entry_id:
+                self._clear_story_reveal_state()
+            self.refresh()
+
+    def _hidden_conversation_entries(self) -> list[dict[str, Any]]:
+        """Returns hidden player/AI messages in their original history order."""
+
+        repository = self.repository()
+        if repository is None:
+            return []
+
+        conversation_kinds = {"player", "player_oog", "story", "story_oog"}
+        return [
+            entry
+            for entry in repository.list_history()
+            if bool(entry.get("hidden", False))
+            and str(entry.get("kind", "")).casefold() in conversation_kinds
+        ]
+
+    def _show_hidden_messages(self) -> None:
+        """Shows hidden conversation entries and lets the player restore them."""
+
+        repository = self.repository()
+        if repository is None:
+            return
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Hidden Conversation Messages")
+        dialog.setModal(True)
+        dialog.setWindowModality(Qt.WindowModality.ApplicationModal)
+        dialog.resize(760, 520)
+
+        message_list = QListWidget()
+        message_list.setWordWrap(True)
+        message_list.setTextElideMode(Qt.TextElideMode.ElideNone)
+
+        def populate() -> None:
+            """Reloads the list after a message has been restored."""
+
+            message_list.clear()
+            for entry in self._hidden_conversation_entries():
+                kind = str(entry.get("kind", "")).casefold()
+                is_player = kind in {"player", "player_oog"}
+                mode_label = (
+                    "Out-of-Game"
+                    if kind in {"player_oog", "story_oog"}
+                    else "Live Game"
+                )
+                speaker = "You" if is_player else "AI Game Master"
+                item = QListWidgetItem(
+                    f"{speaker}  |  {mode_label}\n{entry.get('content', '')}"
+                )
+                item.setData(
+                    Qt.ItemDataRole.UserRole,
+                    _safe_int(entry.get("id"), -1),
+                )
+                message_list.addItem(item)
+            self.view_hidden_messages_button.setVisible(message_list.count() > 0)
+            self.view_hidden_messages_button.setText(
+                f"View Hidden Messages ({message_list.count()})"
+            )
+
+        restore_button = QPushButton("Unhide Selected")
+        restore_all_button = QPushButton("Unhide All")
+        close_button = QPushButton("Close")
+
+        def restore_selected() -> None:
+            """Restores the selected entry and lets the normal timeline reinsert it."""
+
+            item = message_list.currentItem()
+            if item is None:
+                return
+            history_entry_id = _safe_int(
+                item.data(Qt.ItemDataRole.UserRole),
+                -1,
+            )
+            if repository.set_history_entry_hidden(history_entry_id, False):
+                self.refresh()
+                populate()
+                if message_list.count() == 0:
+                    dialog.accept()
+
+        def restore_all() -> None:
+            """Restores every hidden conversation entry in one local operation."""
+
+            changed = False
+            for entry in self._hidden_conversation_entries():
+                changed = repository.set_history_entry_hidden(
+                    _safe_int(entry.get("id"), -1),
+                    False,
+                ) or changed
+            if changed:
+                self.refresh()
+            populate()
+            if message_list.count() == 0:
+                dialog.accept()
+
+        restore_button.clicked.connect(restore_selected)
+        restore_all_button.clicked.connect(restore_all)
+        close_button.clicked.connect(dialog.accept)
+
+        action_row = QHBoxLayout()
+        action_row.addWidget(restore_button)
+        action_row.addWidget(restore_all_button)
+        action_row.addStretch()
+        action_row.addWidget(close_button)
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(message_list)
+        layout.addLayout(action_row)
+        populate()
+        if message_list.count() > 0:
+            dialog.exec()
 
     def _conversation_speaker_asset(
         self,
@@ -952,12 +1135,16 @@ class StoryScreen(RepositoryBackedWidget):
 
         self._pending_message_id = repository.create_message_id()
         self._pending_regeneration_request = None
-        StoryTurnService.record_player_action(
-            repository,
-            player_text,
-            message_id=self._pending_message_id,
-            conversation_mode=clean_mode,
-        )
+        try:
+            StoryTurnService.record_player_action(
+                repository,
+                player_text,
+                message_id=self._pending_message_id,
+                conversation_mode=clean_mode,
+            )
+        except Exception:
+            self._handle_persistence_failure()
+            return False
         self.player_input.clear()
         self._pending_skill_check_event_results = []
         self._pending_travel_request = travel_request
@@ -1085,11 +1272,15 @@ class StoryScreen(RepositoryBackedWidget):
         check_events = StoryTurnService.skill_plan_events(plan_result)
 
         if check_events:
-            self._pending_skill_check_event_results = StoryTurnService.apply_suggested_events(
-                repository,
-                message_id=pending_message_id,
-                suggested_events=check_events,
-            )
+            try:
+                self._pending_skill_check_event_results = StoryTurnService.apply_suggested_events(
+                    repository,
+                    message_id=pending_message_id,
+                    suggested_events=check_events,
+                )
+            except Exception:
+                self._handle_persistence_failure()
+                return
             LOGGER.info(
                 "Applied %s pre-narration skill check(s).",
                 len(self._pending_skill_check_event_results),
@@ -1151,16 +1342,20 @@ class StoryScreen(RepositoryBackedWidget):
 
         is_out_of_game = self._pending_conversation_mode == "out_of_game"
         message_id = self._pending_message_id or repository.create_message_id()
-        commit_result = StoryTurnService.commit_response(
-            repository,
-            result,
-            message_id=message_id,
-            conversation_mode=self._pending_conversation_mode,
-            prior_event_results=self._pending_skill_check_event_results,
-            available_voice_ids=list(
-                _narrator_voice_options(self.narration_player).values()
-            ),
-        )
+        try:
+            commit_result = StoryTurnService.commit_response(
+                repository,
+                result,
+                message_id=message_id,
+                conversation_mode=self._pending_conversation_mode,
+                prior_event_results=self._pending_skill_check_event_results,
+                available_voice_ids=list(
+                    _narrator_voice_options(self.narration_player).values()
+                ),
+            )
+        except Exception:
+            self._handle_persistence_failure()
+            return
         speaker_cues = commit_result.speaker_cues
         if commit_result.event_results:
             event_results = commit_result.event_results
@@ -1197,6 +1392,22 @@ class StoryScreen(RepositoryBackedWidget):
 
         self._set_waiting_for_gm(False)
         self.refresh()
+
+    def _handle_persistence_failure(self) -> None:
+        """Release the UI after a rolled-back commit without starting media."""
+        LOGGER.exception("Story persistence failed; transaction rolled back.")
+        self._pending_skill_check_event_results = []
+        self._pending_travel_request = None
+        self._pending_conversation_mode = "live_game"
+        self._pending_message_id = None
+        self._pending_regeneration_request = None
+        self._set_waiting_for_gm(False)
+        QMessageBox.warning(
+            self,
+            "Could not save response",
+            "The latest database operation could not be saved and was rolled back. "
+            "Please try again.",
+        )
 
     @Slot(str)
     def _handle_gemini_configuration_error(self, _message: str) -> None:

@@ -11,12 +11,19 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from threading import local
 from typing import Any
 
 from ai_adventure.alchemy.ingredients import (
     normalize_crafting_item_rarity,
     normalize_crafting_item_notes,
     normalize_recipe_ingredients,
+)
+from ai_adventure.crafting import (
+    DEFAULT_CRAFTING_SKILL,
+    evaluate_recipe_craftability,
+    normalize_recipe_plan,
+    recipe_estimated_time,
 )
 from ai_adventure.ai.modes import (
     default_ai_mode_settings,
@@ -26,7 +33,7 @@ from ai_adventure.ai.model_catalog import (
     DEFAULT_IMAGE_MODEL,
     normalize_image_preferences,
 )
-from ai_adventure.ai.image_styles import DEFAULT_IMAGE_STYLE
+from ai_adventure.ai.image_styles import DEFAULT_IMAGE_STYLE, normalize_image_style
 from ai_adventure.calendar_system import (
     DEFAULT_CALENDAR_SETTINGS,
     DEFAULT_START_ELAPSED_MINUTES,
@@ -114,6 +121,7 @@ class SaveRepository:
 
         self.db_path = db_path
         self._active_message_id: str | None = None
+        self._transaction_state = local()
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._initialize_schema()
         self.set_player_equipment(self.get_setting("player.equipment", {}))
@@ -175,6 +183,7 @@ class SaveRepository:
         repository.set_setting("audio.background_ambience_volume", 15)
         repository.set_setting("audio.tts_volume", 90)
         repository.set_setting("audio.tts_voice", DEFAULT_NARRATOR_VOICE)
+        repository.set_setting("audio.player_tts_voice", "ai")
         repository.set_setting("audio.tts_speed", 100)
         repository.set_setting("audio.tts_voice_mode", "preset")
         repository.set_setting(
@@ -310,6 +319,7 @@ class SaveRepository:
         )
         self.set_setting("audio.tts_volume", int(audio_settings["tts_volume"]))
         self.set_setting("audio.tts_voice", audio_settings["tts_voice"])
+        self.set_setting("audio.player_tts_voice", audio_settings["player_tts_voice"])
         self.set_setting("audio.tts_speed", int(audio_settings["tts_speed"]))
         self.set_setting("audio.tts_voice_mode", audio_settings["tts_voice_mode"])
         self.set_setting("audio.tts_voice_blend", audio_settings["tts_voice_blend"])
@@ -730,10 +740,23 @@ class SaveRepository:
         )
         clean_metadata["quantity_unit"] = _inventory_quantity_unit(raw_metadata)
         clean_metadata["storage_location"] = _inventory_storage_location(raw_metadata)
-        clean_metadata["item_uuid"] = str(raw_metadata.get("item_uuid", "")).strip() or str(uuid.uuid4())
-        metadata_json = _encode_json_dict(clean_metadata)
 
         with self._connect() as connection:
+            item_uuid = str(raw_metadata.get("item_uuid", "")).strip()
+            if not item_uuid:
+                catalog_row = connection.execute(
+                    "SELECT metadata_json FROM item_catalog WHERE name = ? COLLATE NOCASE "
+                    "ORDER BY id ASC LIMIT 1",
+                    (clean_name,),
+                ).fetchone()
+                if catalog_row is not None:
+                    item_uuid = str(
+                        _decode_json_dict(
+                            catalog_row["metadata_json"], "item catalog metadata"
+                        ).get("item_uuid", "")
+                    ).strip()
+            clean_metadata["item_uuid"] = item_uuid or str(uuid.uuid4())
+            metadata_json = _encode_json_dict(clean_metadata)
             rows = connection.execute(
                 """
                 SELECT id, category, quantity, storage_location, description, value_base_units, metadata_json
@@ -807,13 +830,17 @@ class SaveRepository:
                     ),
                 )
 
-            _upsert_item_catalog_entry(
+            catalog_id = _upsert_item_catalog_entry(
                 connection,
                 name=clean_name,
                 category=category,
                 description=description,
                 value_base_units=clean_value,
                 metadata=clean_metadata,
+            )
+            connection.execute(
+                "UPDATE inventory_items SET id = ? WHERE name = ? COLLATE NOCASE AND id != ?",
+                (catalog_id, clean_name, catalog_id),
             )
 
         self.append_history("inventory", f"Added {quantity} x {clean_name}.")
@@ -912,9 +939,21 @@ class SaveRepository:
 
         with self._connect() as connection:
             connection.execute("DELETE FROM inventory_items")
+            catalog_ids = {
+                str(item["name"]).casefold(): _upsert_item_catalog_entry(
+                    connection,
+                    name=item["name"],
+                    category=item["category"],
+                    description=item["description"],
+                    value_base_units=item["value_base_units"],
+                    metadata=item["metadata"],
+                )
+                for item in clean_items
+            }
             connection.executemany(
                 """
                 INSERT INTO inventory_items (
+                    id,
                     name,
                     category,
                     quantity,
@@ -923,10 +962,11 @@ class SaveRepository:
                     value_base_units,
                     metadata_json
                 )
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
                     (
+                        catalog_ids[item["name"].casefold()],
                         item["name"],
                         item["category"],
                         item["quantity"],
@@ -938,16 +978,6 @@ class SaveRepository:
                     for item in clean_items
                 ],
             )
-            for item in clean_items:
-                _upsert_item_catalog_entry(
-                    connection,
-                    name=item["name"],
-                    category=item["category"],
-                    description=item["description"],
-                    value_base_units=item["value_base_units"],
-                    metadata=item["metadata"],
-                )
-
         self.set_player_equipment(self.get_setting("player.equipment", {}))
         self.append_history("inventory", "Starting inventory finalized.")
 
@@ -1298,6 +1328,17 @@ class SaveRepository:
                 ORDER BY name COLLATE NOCASE
                 """
             ).fetchall()
+            catalog_rows = connection.execute(
+                "SELECT name, metadata_json FROM item_catalog"
+            ).fetchall()
+            catalog_uuids = {
+                str(row["name"]).casefold(): str(
+                    _decode_json_dict(row["metadata_json"], "item catalog metadata").get(
+                        "item_uuid", ""
+                    )
+                ).strip()
+                for row in catalog_rows
+            }
 
         reagents: list[dict[str, Any]] = []
 
@@ -1315,6 +1356,10 @@ class SaveRepository:
                         row["notes"], row["rarity"]
                     ),
                     "value_base_units": max(0, int(row["value_base_units"] or 0)),
+                    "item_uuid": catalog_uuids.get(str(row["name"]).casefold(), ""),
+                    "metadata": {
+                        "item_uuid": catalog_uuids.get(str(row["name"]).casefold(), "")
+                    },
                     "discovered_at": row["discovered_at"],
                 }
             )
@@ -1329,6 +1374,12 @@ class SaveRepository:
         result: str,
         notes: str = "",
         value_base_units: int = 0,
+        result_item_uuid: str = "",
+        result_item_name: str = "",
+        skill_name: str = DEFAULT_CRAFTING_SKILL,
+        stages: list[dict[str, Any]] | None = None,
+        required_tool_item_uuids: list[str] | None = None,
+        required_tool_item_names: list[str] | None = None,
     ) -> None:
         """
         Adds or updates a discovered crafting recipe.
@@ -1367,6 +1418,123 @@ class SaveRepository:
                 )
                 if item_uuid:
                     ingredient["item_uuid"] = item_uuid
+
+            catalog_by_uuid = {
+                str(
+                    _decode_json_dict(row["metadata_json"], "item catalog metadata").get(
+                        "item_uuid", ""
+                    )
+                ).strip(): str(row["name"])
+                for row in catalog_rows
+            }
+            clean_tool_ids = list(
+                dict.fromkeys(
+                    str(item).strip()
+                    for item in (required_tool_item_uuids or [])
+                    if str(item).strip()
+                )
+            )
+            clean_tool_names = list(
+                dict.fromkeys(
+                    str(item).strip()
+                    for item in (required_tool_item_names or [])
+                    if str(item).strip()
+                )
+            )
+            for tool_name in clean_tool_names:
+                tool_uuid = catalog_uuids.get(tool_name.casefold(), "")
+                if tool_uuid and tool_uuid not in clean_tool_ids:
+                    clean_tool_ids.append(tool_uuid)
+
+            clean_result_name = result_item_name.strip() or result.strip()
+            clean_result_uuid = result_item_uuid.strip()
+            if not clean_result_uuid and clean_result_name:
+                clean_result_uuid = catalog_uuids.get(clean_result_name.casefold(), "")
+            if not clean_result_uuid and clean_result_name:
+                _upsert_item_catalog_entry(
+                    connection,
+                    name=clean_result_name,
+                    category="Consumable",
+                    description=notes.strip() or f"Made by crafting {clean_name}.",
+                    value_base_units=clean_value,
+                )
+                result_row = connection.execute(
+                    "SELECT metadata_json FROM item_catalog WHERE name = ? COLLATE NOCASE",
+                    (clean_result_name,),
+                ).fetchone()
+                if result_row is not None:
+                    clean_result_uuid = str(
+                        _decode_json_dict(
+                            result_row["metadata_json"], "item catalog metadata"
+                        ).get("item_uuid", "")
+                    ).strip()
+            elif clean_result_uuid and clean_result_uuid not in catalog_by_uuid:
+                # Preserve a model-supplied deterministic result ID even when
+                # this recipe is the first place that introduces the result.
+                _upsert_item_catalog_entry(
+                    connection,
+                    name=clean_result_name,
+                    category="Consumable",
+                    description=notes.strip() or f"Made by crafting {clean_name}.",
+                    value_base_units=clean_value,
+                    metadata={"item_uuid": clean_result_uuid},
+                )
+            plan = normalize_recipe_plan(
+                {
+                    "skill_name": skill_name,
+                    "stages": stages or [],
+                    "required_tool_item_uuids": clean_tool_ids,
+                    "required_tool_item_names": clean_tool_names,
+                    "result_item_uuid": clean_result_uuid,
+                    "result_item_name": clean_result_name,
+                }
+            )
+            all_tool_names = clean_tool_names + [
+                str(tool_name).strip()
+                for stage in plan["stages"]
+                for tool_name in stage.get("required_tool_item_names", [])
+                if str(tool_name).strip()
+            ]
+            for tool_name in dict.fromkeys(all_tool_names):
+                tool_key = tool_name.casefold()
+                if not catalog_uuids.get(tool_key):
+                    # Reserve a catalog identity even before the player owns
+                    # the tool. Later inventory additions by name will reuse
+                    # this UUID, so a recipe discovered first remains usable.
+                    _upsert_item_catalog_entry(
+                        connection,
+                        name=tool_name,
+                        category="Tool",
+                        description=f"Required tool for crafting {clean_name}.",
+                    )
+                    tool_row = connection.execute(
+                        "SELECT metadata_json FROM item_catalog WHERE name = ? COLLATE NOCASE "
+                        "ORDER BY id ASC LIMIT 1",
+                        (tool_name,),
+                    ).fetchone()
+                    if tool_row is not None:
+                        catalog_uuids[tool_key] = str(
+                            _decode_json_dict(
+                                tool_row["metadata_json"], "item catalog metadata"
+                            ).get("item_uuid", "")
+                        ).strip()
+
+            for tool_name in clean_tool_names:
+                tool_uuid = catalog_uuids.get(tool_name.casefold(), "")
+                if tool_uuid and tool_uuid not in plan["required_tool_item_uuids"]:
+                    plan["required_tool_item_uuids"].append(tool_uuid)
+            # Tool names are accepted as a model-facing convenience, but the
+            # persisted plan must use catalog UUIDs for enforcement.  Resolve
+            # stage-local names here as well as recipe-wide names so a passive
+            # stage cannot accidentally become name-only and bypass identity
+            # matching.
+            for stage in plan["stages"]:
+                stage_tool_ids = list(stage.get("required_tool_item_uuids", []))
+                for tool_name in stage.get("required_tool_item_names", []):
+                    tool_uuid = catalog_uuids.get(str(tool_name).casefold(), "")
+                    if tool_uuid and tool_uuid not in stage_tool_ids:
+                        stage_tool_ids.append(tool_uuid)
+                stage["required_tool_item_uuids"] = stage_tool_ids
             connection.execute(
                 """
                 INSERT INTO crafting_recipes (
@@ -1375,14 +1543,16 @@ class SaveRepository:
                     result,
                     notes,
                     value_base_units,
+                    recipe_data_json,
                     discovered_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(name) DO UPDATE SET
                     ingredients_json = excluded.ingredients_json,
                     result = excluded.result,
                     notes = excluded.notes,
-                    value_base_units = excluded.value_base_units
+                    value_base_units = excluded.value_base_units,
+                    recipe_data_json = excluded.recipe_data_json
                 """,
                 (
                     clean_name,
@@ -1390,6 +1560,7 @@ class SaveRepository:
                     result.strip(),
                     notes.strip(),
                     clean_value,
+                    json.dumps(plan, ensure_ascii=False, sort_keys=True),
                     discovered_at,
                 ),
             )
@@ -1414,6 +1585,7 @@ class SaveRepository:
                     result,
                     notes,
                     value_base_units,
+                    recipe_data_json,
                     discovered_at
                 FROM crafting_recipes
                 ORDER BY name COLLATE NOCASE
@@ -1433,11 +1605,310 @@ class SaveRepository:
                     "result": row["result"],
                     "notes": row["notes"],
                     "value_base_units": row["value_base_units"],
+                    **normalize_recipe_plan(
+                        _decode_json_dict(row["recipe_data_json"], "recipe details")
+                    ),
                     "discovered_at": row["discovered_at"],
                 }
             )
 
         return recipes
+
+    def craft_recipe(self, recipe_id: str, *, quantity: int = 1) -> dict[str, Any]:
+        """Advances one deterministic crafting interaction for a recipe."""
+
+        clean_recipe_id = str(recipe_id or "").strip()
+        recipe = next(
+            (
+                item
+                for item in self.list_crafting_recipes()
+                if str(item.get("id", "")) == clean_recipe_id
+            ),
+            None,
+        )
+        if recipe is None:
+            return {"status": "rejected", "message": "That recipe is no longer known."}
+
+        requested_quantity = max(1, min(999, int(quantity or 1)))
+        processes = self.get_setting("crafting.processes", [])
+        if not isinstance(processes, list):
+            processes = []
+        process = next(
+            (
+                item
+                for item in processes
+                if isinstance(item, dict)
+                and str(item.get("recipe_id", "")) == clean_recipe_id
+            ),
+            None,
+        )
+        current_minute = self.get_current_calendar_minute()
+        skills = self.list_skills()
+        plan = normalize_recipe_plan(recipe)
+
+        if process is None:
+            availability = evaluate_recipe_craftability(
+                recipe,
+                self.list_inventory_items(),
+                quantity=requested_quantity,
+            )
+            if not availability["craftable"]:
+                return {
+                    "status": "rejected",
+                    "message": _crafting_availability_message(availability),
+                    "availability": availability,
+                }
+            if not plan["result_item_uuid"]:
+                return {
+                    "status": "rejected",
+                    "message": "This recipe has no deterministic result item ID.",
+                }
+            if not self._consume_crafting_ingredients(recipe, requested_quantity):
+                return {
+                    "status": "rejected",
+                    "message": "The required ingredients changed before crafting began.",
+                }
+            process = {
+                "recipe_id": clean_recipe_id,
+                "quantity": requested_quantity,
+                "stage_index": 0,
+                "active_work_completed": 0,
+                "passive_due_minute": None,
+            }
+            processes.append(process)
+
+        stage_index = max(0, int(process.get("stage_index", 0)))
+        stages = plan["stages"]
+        if stage_index >= len(stages):
+            processes.remove(process)
+            self.set_setting("crafting.processes", processes)
+            return self._finish_crafting_process(recipe, process)
+
+        stage = stages[stage_index]
+        if not self._tools_available(recipe, stage):
+            return {
+                "status": "blocked",
+                "message": (
+                    "Crafting is paused because a required tool or piece of "
+                    "equipment is unavailable."
+                ),
+                "recipe_id": clean_recipe_id,
+            }
+
+        if stage["kind"] == "passive":
+            due_minute = process.get("passive_due_minute")
+            if due_minute is None:
+                process["passive_due_minute"] = current_minute + int(
+                    stage.get("duration_minutes", 0)
+                )
+                self.set_setting("crafting.processes", processes)
+                return {
+                    "status": "passive",
+                    "message": (
+                        "Passive stage started; check back after "
+                        f"{stage.get('duration_minutes', 0)} minutes."
+                    ),
+                    "recipe_id": clean_recipe_id,
+                }
+            if current_minute < int(due_minute):
+                remaining = int(due_minute) - current_minute
+                return {
+                    "status": "passive",
+                    "message": (
+                        "Passive stage is still underway; about "
+                        f"{remaining} minutes remain."
+                    ),
+                    "recipe_id": clean_recipe_id,
+                }
+            process["stage_index"] = stage_index + 1
+            process["passive_due_minute"] = None
+            process["active_work_completed"] = 0
+            if process["stage_index"] >= len(stages):
+                processes.remove(process)
+                self.set_setting("crafting.processes", processes)
+                return self._finish_crafting_process(recipe, process)
+            self.set_setting("crafting.processes", processes)
+            return {
+                "status": "ready",
+                "message": "The passive crafting stage is complete; continue the next stage.",
+                "recipe_id": clean_recipe_id,
+            }
+
+        estimate = recipe_estimated_time(recipe, skills)
+        skill_level = int(estimate["skill_level"])
+        work_completed = int(process.get("active_work_completed", 0)) + max(1, skill_level)
+        work_required = max(1, int(stage.get("work_amount", 1))) * int(
+            process.get("quantity", 1)
+        )
+        process["active_work_completed"] = work_completed
+        if work_completed < work_required:
+            self.set_setting("crafting.processes", processes)
+            return {
+                "status": "active",
+                "message": (
+                    "Active work progressed (the remaining work amount is hidden "
+                    f"from the player; skill level {skill_level} contributed)."
+                ),
+                "recipe_id": clean_recipe_id,
+            }
+
+        process["stage_index"] = stage_index + 1
+        process["active_work_completed"] = 0
+        if (
+            process["stage_index"] < len(stages)
+            and stages[process["stage_index"]]["kind"] == "passive"
+        ):
+            next_stage = stages[process["stage_index"]]
+            if not self._tools_available(recipe, next_stage):
+                # The completed active work is still meaningful.  Persist the
+                # advanced stage before reporting the missing passive tool so
+                # the player can obtain it and resume instead of losing work.
+                self.set_setting("crafting.processes", processes)
+                return {
+                    "status": "blocked",
+                    "message": "The next passive stage requires a tool that is not available.",
+                    "recipe_id": clean_recipe_id,
+                }
+            process["passive_due_minute"] = current_minute + int(
+                next_stage.get("duration_minutes", 0)
+            )
+            self.set_setting("crafting.processes", processes)
+            return {
+                "status": "passive",
+                "message": "Active crafting is complete; the passive stage has begun.",
+                "recipe_id": clean_recipe_id,
+            }
+        if process["stage_index"] >= len(stages):
+            processes.remove(process)
+            self.set_setting("crafting.processes", processes)
+            return self._finish_crafting_process(recipe, process)
+        self.set_setting("crafting.processes", processes)
+        return {
+            "status": "ready",
+            "message": "The active crafting stage is complete; continue the next stage.",
+            "recipe_id": clean_recipe_id,
+        }
+
+    def _consume_crafting_ingredients(
+        self, recipe: dict[str, Any], quantity: int
+    ) -> bool:
+        """Atomically consumes recipe ingredients by stable item UUID and unit."""
+
+        requirements: list[tuple[str, int, str]] = []
+        for ingredient in normalize_recipe_ingredients(recipe.get("ingredients", [])):
+            identity = str(ingredient.get("item_uuid", "")).strip()
+            if not identity:
+                return False
+            amount = max(1, int(ingredient.get("quantity", 1))) * max(
+                1, int(ingredient.get("measure_amount", 1))
+            ) * quantity
+            requirements.append(
+                (identity, amount, str(ingredient.get("measure_unit", "each")))
+            )
+
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT id, quantity, metadata_json FROM inventory_items ORDER BY id ASC"
+            ).fetchall()
+            for identity, amount, unit in requirements:
+                matching = []
+                for row in rows:
+                    metadata = _decode_json_dict(
+                        row["metadata_json"], "inventory item metadata"
+                    )
+                    if str(metadata.get("item_uuid", "")).strip() != identity:
+                        continue
+                    if str(metadata.get("quantity_unit", "each")).casefold() != unit.casefold():
+                        return False
+                    matching.append(row)
+                if sum(int(row["quantity"]) for row in matching) < amount:
+                    return False
+
+            for identity, amount, _unit in requirements:
+                remaining = amount
+                for row in rows:
+                    if remaining <= 0:
+                        break
+                    metadata = _decode_json_dict(
+                        row["metadata_json"], "inventory item metadata"
+                    )
+                    if str(metadata.get("item_uuid", "")).strip() != identity:
+                        continue
+                    available = int(row["quantity"])
+                    consumed = min(available, remaining)
+                    if available == consumed:
+                        connection.execute(
+                            "DELETE FROM inventory_items WHERE id = ?", (row["id"],)
+                        )
+                    else:
+                        connection.execute(
+                            "UPDATE inventory_items SET quantity = ? WHERE id = ?",
+                            (available - consumed, row["id"]),
+                        )
+                    remaining -= consumed
+        self.set_player_equipment(self.get_setting("player.equipment", {}))
+        self.append_history(
+            "crafting", f"Consumed ingredients for {recipe.get('name', 'recipe')}."
+        )
+        return True
+
+    def _tools_available(self, recipe: dict[str, Any], stage: dict[str, Any]) -> bool:
+        """Checks recipe and current-stage tools by stable item UUID."""
+
+        plan = normalize_recipe_plan(recipe)
+        required = list(plan["required_tool_item_uuids"])
+        required.extend(str(item) for item in stage.get("required_tool_item_uuids", []))
+        # A tool name is display/context data only. If it was not resolved to
+        # a UUID when the recipe was stored, do not allow a prose name match
+        # to make the recipe appear craftable.
+        if len(plan["required_tool_item_uuids"]) < len(
+            plan["required_tool_item_names"]
+        ) or len(stage.get("required_tool_item_uuids", [])) < len(
+            stage.get("required_tool_item_names", [])
+        ):
+            return False
+        owned = {
+            str(item.get("metadata", {}).get("item_uuid", "")).strip()
+            for item in self.list_inventory_items()
+            if isinstance(item.get("metadata"), dict)
+            and int(item.get("quantity", 0) or 0) > 0
+        }
+        return all(item_id and item_id in owned for item_id in required)
+
+    def _finish_crafting_process(
+        self, recipe: dict[str, Any], process: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Adds the deterministic result item after all stages complete."""
+
+        result_uuid = str(recipe.get("result_item_uuid", "")).strip()
+        catalog = next(
+            (
+                item
+                for item in self.list_item_catalog()
+                if str(item.get("metadata", {}).get("item_uuid", "")).strip()
+                == result_uuid
+            ),
+            None,
+        )
+        if catalog is None:
+            return {
+                "status": "rejected",
+                "message": "The recipe result item is missing from the item catalog.",
+            }
+        count = max(1, int(process.get("quantity", 1)))
+        self.add_inventory_item(
+            name=str(catalog["name"]),
+            category=str(catalog.get("category", "Consumable")),
+            quantity=count,
+            description=str(catalog.get("description", "")),
+            value_base_units=max(0, int(catalog.get("value_base_units", 0) or 0)),
+            metadata={"item_uuid": result_uuid, "quantity_unit": "each"},
+        )
+        return {
+            "status": "completed",
+            "message": f"Crafted {count} × {catalog['name']}.",
+            "recipe_id": str(recipe.get("id", "")),
+        }
 
     def get_magic_configuration(self) -> dict[str, Any]:
         """Returns the normalized casting configuration for this save."""
@@ -2314,7 +2785,7 @@ class SaveRepository:
                 """
                 SELECT knowledge_scope_json, known_facts_json
                 FROM npcs
-                WHERE npc_id = ?
+                WHERE id = ?
                 """,
                 (clean_npc_id,),
             ).fetchone()
@@ -2329,7 +2800,7 @@ class SaveRepository:
                 )
 
                 if matching_npc is not None:
-                    clean_npc_id = str(matching_npc["npc_id"])
+                    clean_npc_id = str(matching_npc["id"])
                     clean_name = str(matching_npc["name"]) or clean_name
                     existing = matching_npc
 
@@ -2347,14 +2818,14 @@ class SaveRepository:
                     known_facts or [],
                 )
                 created_at = connection.execute(
-                    "SELECT created_at FROM npcs WHERE npc_id = ?",
+                    "SELECT created_at FROM npcs WHERE id = ?",
                     (clean_npc_id,),
                 ).fetchone()["created_at"]
 
             connection.execute(
                 """
                 INSERT INTO npcs (
-                    npc_id,
+                    id,
                     name,
                     display_name,
                     role,
@@ -2371,7 +2842,7 @@ class SaveRepository:
                     updated_at
                 )
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(npc_id) DO UPDATE SET
+                ON CONFLICT(id) DO UPDATE SET
                     name = excluded.name,
                     display_name = CASE
                         WHEN ? != '' THEN excluded.display_name
@@ -2455,7 +2926,6 @@ class SaveRepository:
             """
             SELECT
                 id,
-                npc_id,
                 name,
                 display_name,
                 role,
@@ -2497,7 +2967,7 @@ class SaveRepository:
             key=lambda item: (
                 item[0],
                 str(item[1]["updated_at"]),
-                str(item[1]["npc_id"]),
+                str(item[1]["id"]),
             ),
             reverse=True,
         )
@@ -2515,7 +2985,7 @@ class SaveRepository:
             "Resolved NPC upsert %r at %r to existing npc_id %r.",
             name,
             location,
-            scored_rows[0][1]["npc_id"],
+            scored_rows[0][1]["id"],
         )
         return scored_rows[0][1]
 
@@ -2604,7 +3074,6 @@ class SaveRepository:
                 """
                 SELECT
                     id,
-                    npc_id,
                     name,
                     display_name,
                     role,
@@ -2620,7 +3089,7 @@ class SaveRepository:
                     created_at,
                     updated_at
                 FROM npcs
-                WHERE npc_id = ?
+                WHERE id = ?
                 """,
                 (clean_npc_id,),
             ).fetchone()
@@ -2629,6 +3098,194 @@ class SaveRepository:
             return None
 
         return _npc_row_to_dict(row)
+
+    def set_active_merchant_npc(self, npc_id: str | None) -> None:
+        """Sets the transient NPC whose merchant interface is currently open."""
+
+        self.set_setting("merchant.active_npc_id", str(npc_id or "").strip())
+
+    def get_active_merchant_npc_id(self) -> str:
+        """Returns the current merchant conversation target, if any."""
+
+        return str(self.get_setting("merchant.active_npc_id", "") or "").strip()
+
+    def upsert_merchant_profile(
+        self, npc_id: str, *, can_sell: bool = True, can_buy: bool = True
+    ) -> dict[str, Any] | None:
+        """Creates or updates one NPC's merchant capabilities."""
+
+        clean_id = str(npc_id).strip()
+        if not clean_id or self.get_npc(clean_id) is None:
+            return None
+        timestamp = datetime.now().isoformat(timespec="seconds")
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO merchant_profiles (npc_id, can_sell, can_buy, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(npc_id) DO UPDATE SET
+                    can_sell = excluded.can_sell, can_buy = excluded.can_buy,
+                    updated_at = excluded.updated_at
+                """,
+                (clean_id, int(can_sell), int(can_buy), timestamp, timestamp),
+            )
+        return self.get_merchant_profile(clean_id)
+
+    def get_merchant_profile(self, npc_id: str) -> dict[str, Any] | None:
+        """Reads one merchant capability profile."""
+
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT npc_id, can_sell, can_buy FROM merchant_profiles WHERE npc_id = ?",
+                (str(npc_id).strip(),),
+            ).fetchone()
+        if row is None:
+            return None
+        return {"npc_id": row["npc_id"], "can_sell": bool(row["can_sell"]), "can_buy": bool(row["can_buy"])}
+
+    def upsert_merchant_stock(
+        self, *, npc_id: str, item_id: str, quantity: int, unit_price_base_units: int,
+        stock_id: str = "", item_name: str = ""
+    ) -> dict[str, Any] | None:
+        """Stores one deterministic item listing using a catalog item ID."""
+
+        clean_npc = str(npc_id).strip()
+        clean_item = str(item_id).strip()
+        quantity = max(0, int(quantity))
+        price = max(0, int(unit_price_base_units))
+        with self._connect() as connection:
+            npc = connection.execute("SELECT 1 FROM npcs WHERE id = ?", (clean_npc,)).fetchone()
+            item = connection.execute("SELECT name FROM item_catalog WHERE id = ?", (clean_item,)).fetchone()
+            if npc is None or item is None:
+                return None
+            clean_name = str(item_name).strip() or str(item["name"])
+            clean_stock = str(stock_id).strip() or f"stock_{uuid.uuid4().hex}"
+            timestamp = datetime.now().isoformat(timespec="seconds")
+            connection.execute(
+                """
+                INSERT INTO merchant_stock
+                    (stock_id, npc_id, item_id, item_name, quantity, unit_price_base_units, active, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)
+                ON CONFLICT(stock_id) DO UPDATE SET
+                    npc_id=excluded.npc_id, item_id=excluded.item_id, item_name=excluded.item_name,
+                    quantity=excluded.quantity, unit_price_base_units=excluded.unit_price_base_units,
+                    active=1, updated_at=excluded.updated_at
+                """,
+                (clean_stock, clean_npc, clean_item, clean_name, quantity, price, timestamp, timestamp),
+            )
+            row = connection.execute(
+                "SELECT stock_id, npc_id, item_id, item_name, quantity, unit_price_base_units, active FROM merchant_stock WHERE stock_id = ?",
+                (clean_stock,),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def list_merchant_stock(self, npc_id: str) -> list[dict[str, Any]]:
+        """Lists active deterministic goods offered by an NPC."""
+
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT stock_id, npc_id, item_id, item_name, quantity, unit_price_base_units, active FROM merchant_stock WHERE npc_id = ? AND active = 1 ORDER BY item_name COLLATE NOCASE",
+                (str(npc_id).strip(),),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def list_merchant_buy_offers(self, npc_id: str) -> list[dict[str, Any]]:
+        """Lists active committed offers for items the NPC buys from the player."""
+
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT offer_id, npc_id, item_id, item_name, unit_price_base_units, max_quantity, active FROM merchant_buy_offers WHERE npc_id = ? AND active = 1 ORDER BY item_name COLLATE NOCASE",
+                (str(npc_id).strip(),),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def upsert_merchant_buy_offer(
+        self, *, npc_id: str, item_id: str, unit_price_base_units: int,
+        max_quantity: int = 0, offer_id: str = "", item_name: str = ""
+    ) -> dict[str, Any] | None:
+        """Commits a validated offer before it is shown in the Merchant tab."""
+
+        clean_npc, clean_item = str(npc_id).strip(), str(item_id).strip()
+        with self._connect() as connection:
+            npc = connection.execute("SELECT 1 FROM npcs WHERE id = ?", (clean_npc,)).fetchone()
+            item = connection.execute("SELECT name FROM item_catalog WHERE id = ?", (clean_item,)).fetchone()
+            if npc is None or item is None:
+                return None
+            clean_offer = str(offer_id).strip() or f"offer_{uuid.uuid4().hex}"
+            timestamp = datetime.now().isoformat(timespec="seconds")
+            connection.execute(
+                """
+                INSERT INTO merchant_buy_offers
+                    (offer_id, npc_id, item_id, item_name, unit_price_base_units, max_quantity, active, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)
+                ON CONFLICT(offer_id) DO UPDATE SET
+                    npc_id=excluded.npc_id, item_id=excluded.item_id, item_name=excluded.item_name,
+                    unit_price_base_units=excluded.unit_price_base_units, max_quantity=excluded.max_quantity,
+                    active=1, updated_at=excluded.updated_at
+                """,
+                (clean_offer, clean_npc, clean_item, str(item_name).strip() or str(item["name"]),
+                 max(0, int(unit_price_base_units)), max(0, int(max_quantity)), timestamp, timestamp),
+            )
+            row = connection.execute("SELECT * FROM merchant_buy_offers WHERE offer_id = ?", (clean_offer,)).fetchone()
+        return dict(row) if row is not None else None
+
+    def execute_merchant_transaction(
+        self, *, transaction_id: str, npc_id: str, direction: str,
+        reference_id: str, quantity: int
+    ) -> dict[str, Any]:
+        """Atomically applies one player buy or sell transaction."""
+
+        direction = str(direction).strip().casefold()
+        if direction not in {"buy", "sell"} or quantity <= 0:
+            raise ValueError("Invalid merchant transaction.")
+        with self._connect() as connection:
+            existing = connection.execute("SELECT * FROM merchant_transactions WHERE transaction_id = ?", (transaction_id,)).fetchone()
+            if existing is not None:
+                return dict(existing)
+            table = "merchant_stock" if direction == "buy" else "merchant_buy_offers"
+            id_column = "stock_id" if direction == "buy" else "offer_id"
+            row = connection.execute(f"SELECT * FROM {table} WHERE {id_column} = ? AND npc_id = ? AND active = 1", (reference_id, npc_id)).fetchone()
+            if row is None:
+                raise ValueError("That merchant offer is no longer available.")
+            if direction == "buy":
+                if int(row["quantity"]) < quantity:
+                    raise ValueError("The merchant does not have enough stock.")
+                item = connection.execute("SELECT * FROM item_catalog WHERE id = ?", (row["item_id"],)).fetchone()
+                if item is None:
+                    raise ValueError("The catalog item no longer exists.")
+                total = int(row["unit_price_base_units"]) * quantity
+                balance = int(self._state_value_from_connection(connection, "currency.balance", "0") or 0)
+                if balance < total:
+                    raise ValueError("You do not have enough currency.")
+                metadata = _decode_json_dict(item["metadata_json"], "merchant item metadata")
+                metadata["item_uuid"] = str(uuid.uuid4())
+                connection.execute("UPDATE merchant_stock SET quantity = quantity - ?, updated_at = ? WHERE stock_id = ?", (quantity, datetime.now().isoformat(timespec="seconds"), reference_id))
+                connection.execute("INSERT INTO game_state (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", ("currency.balance", str(balance - total)))
+                connection.execute("INSERT INTO inventory_items (name, category, quantity, storage_location, description, value_base_units, metadata_json) VALUES (?, ?, ?, 'actively_carried', ?, ?, ?)", (item["name"], item["category"], quantity, item["description"], item["value_base_units"], _encode_json_dict(metadata)))
+                item_name = str(item["name"])
+            else:
+                inventory = connection.execute("SELECT * FROM inventory_items WHERE name = ? COLLATE NOCASE ORDER BY id LIMIT 1", (row["item_name"],)).fetchone()
+                if inventory is None or int(inventory["quantity"]) < quantity:
+                    raise ValueError("You do not have enough of that item.")
+                total = int(row["unit_price_base_units"]) * quantity
+                balance = int(self._state_value_from_connection(connection, "currency.balance", "0") or 0)
+                new_quantity = int(inventory["quantity"]) - quantity
+                if new_quantity:
+                    connection.execute("UPDATE inventory_items SET quantity = ? WHERE id = ?", (new_quantity, inventory["id"]))
+                else:
+                    connection.execute("DELETE FROM inventory_items WHERE id = ?", (inventory["id"],))
+                connection.execute("INSERT INTO game_state (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", ("currency.balance", str(balance + total)))
+                item_name = str(inventory["name"])
+            timestamp = datetime.now().isoformat(timespec="seconds")
+            connection.execute("INSERT INTO merchant_transactions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (transaction_id, npc_id, direction, reference_id, str(row["item_id"]), item_name, quantity, int(row["unit_price_base_units"]), total, timestamp))
+            result = connection.execute("SELECT * FROM merchant_transactions WHERE transaction_id = ?", (transaction_id,)).fetchone()
+        self.append_history("merchant", f"Merchant {direction}: {quantity} x {item_name} for {total} base currency units.")
+        return dict(result)
+
+    @staticmethod
+    def _state_value_from_connection(connection: sqlite3.Connection, key: str, default: str = "") -> str:
+        row = connection.execute("SELECT value FROM game_state WHERE key = ?", (key,)).fetchone()
+        return str(row["value"]) if row is not None else default
 
     def get_npc_by_name(self, name: str) -> dict[str, Any] | None:
         """
@@ -2651,7 +3308,6 @@ class SaveRepository:
                 """
                 SELECT
                     id,
-                    npc_id,
                     name,
                     display_name,
                     role,
@@ -2695,7 +3351,6 @@ class SaveRepository:
                 """
                 SELECT
                     id,
-                    npc_id,
                     name,
                     display_name,
                     role,
@@ -2743,7 +3398,7 @@ class SaveRepository:
 
             visible_npcs.append(
                 {
-                    "npc_id": npc["npc_id"],
+                    "id": npc["id"],
                     "display_name": (
                         npc.get("display_name")
                         or npc.get("name")
@@ -2894,7 +3549,7 @@ class SaveRepository:
                     n.created_at,
                     n.updated_at
                 FROM party_members AS p
-                JOIN npcs AS n ON n.npc_id = p.npc_id
+                JOIN npcs AS n ON n.id = p.npc_id
                 ORDER BY n.display_name COLLATE NOCASE, n.name COLLATE NOCASE
                 """
             ).fetchall()
@@ -3717,9 +4372,10 @@ class SaveRepository:
                     content,
                     sound_effect_cues_json,
                     speaker_cues_json,
+                    hidden,
                     created_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, 0, ?)
                 """,
                 (
                     resolved_message_id,
@@ -3829,7 +4485,7 @@ class SaveRepository:
             rows = connection.execute(
                 """
                 SELECT id, message_id, kind, content, sound_effect_cues_json,
-                       speaker_cues_json, created_at
+                       speaker_cues_json, hidden, created_at
                 FROM history_entries
                 ORDER BY id ASC
                 """
@@ -3838,6 +4494,7 @@ class SaveRepository:
         history: list[dict[str, Any]] = []
         for row in rows:
             entry = dict(row)
+            entry["hidden"] = bool(entry.get("hidden", 0))
             entry["content"] = sanitize_english_text(entry.get("content", ""))
             try:
                 raw_cues = json.loads(str(entry.pop("sound_effect_cues_json", "[]")))
@@ -3890,6 +4547,16 @@ class SaveRepository:
             history.append(entry)
         return history
 
+    def set_history_entry_hidden(self, history_entry_id: int, hidden: bool) -> bool:
+        """Hides or restores one conversation entry without deleting its history."""
+
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "UPDATE history_entries SET hidden = ? WHERE id = ?",
+                (1 if hidden else 0, int(history_entry_id)),
+            )
+            return cursor.rowcount > 0
+
     def ensure_visual_asset(
         self,
         *,
@@ -3903,6 +4570,10 @@ class SaveRepository:
         model: str,
         message_ids: tuple[str, ...] | list[str] = (),
         ready: bool = False,
+        image_style: str = "",
+        visual_description: str = "",
+        basic_name: str = "",
+        resolution_tier: str = "",
     ) -> dict[str, Any]:
         """Creates one versioned visual-asset record and links related messages."""
 
@@ -3913,7 +4584,8 @@ class SaveRepository:
         clean_filename = filename_path.as_posix()
         if (
             not clean_asset_id
-            or clean_subject_type not in {"player", "location", "inventory", "npc"}
+            or clean_subject_type
+            not in {"player", "location", "inventory", "npc", "bestiary"}
             or not clean_subject_key
             or not clean_filename
             or filename_path.is_absolute()
@@ -3923,20 +4595,34 @@ class SaveRepository:
 
         timestamp = datetime.now().isoformat(timespec="seconds")
         requested_status = "ready" if ready else "queued"
+        raw_image_style = str(image_style or "").strip()
+        clean_image_style = (
+            normalize_image_style(raw_image_style) if raw_image_style else ""
+        )
+        clean_visual_description = " ".join(
+            str(visual_description or "").split()
+        ).strip()
+        clean_basic_name = " ".join(str(basic_name or "").split()).strip()[:120]
+        clean_resolution_tier = str(resolution_tier or "").strip().upper()
         with self._connect() as connection:
             connection.execute(
                 """
                 INSERT INTO visual_assets (
                     asset_id, subject_type, subject_key, display_name,
-                    descriptor_hash, filename, prompt, model, status,
-                    error_message, width, height, created_at, updated_at
+                    descriptor_hash, filename, prompt, model, image_style,
+                    visual_description, basic_name, resolution_tier, status, error_message,
+                    width, height, created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, '', 0, 0, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', 0, 0, ?, ?)
                 ON CONFLICT(asset_id) DO UPDATE SET
                     display_name = excluded.display_name,
                     filename = excluded.filename,
                     prompt = excluded.prompt,
                     model = excluded.model,
+                    image_style = excluded.image_style,
+                    visual_description = excluded.visual_description,
+                    basic_name = excluded.basic_name,
+                    resolution_tier = excluded.resolution_tier,
                     status = CASE
                         WHEN visual_assets.status = 'ready' THEN 'ready'
                         WHEN excluded.status = 'ready' THEN 'ready'
@@ -3953,6 +4639,10 @@ class SaveRepository:
                     clean_filename,
                     str(prompt or "").strip(),
                     str(model or "").strip(),
+                    clean_image_style,
+                    clean_visual_description,
+                    clean_basic_name,
+                    clean_resolution_tier,
                     requested_status,
                     timestamp,
                     timestamp,
@@ -3987,7 +4677,7 @@ class SaveRepository:
         """Updates one image generation record after worker completion."""
 
         clean_status = str(status or "").strip().casefold()
-        if clean_status not in {"queued", "generating", "ready", "failed"}:
+        if clean_status not in {"queued", "generating", "ready", "failed", "skipped"}:
             raise ValueError(f"Unsupported visual asset status: {status}")
         with self._connect() as connection:
             connection.execute(
@@ -5018,25 +5708,46 @@ class SaveRepository:
         return bool(self.get_combat_state().get("active", False))
 
     @contextmanager
-    def _connect(self) -> Iterator[sqlite3.Connection]:
-        """
-        Opens a SQLite connection and closes it after use.
+    def transaction(self) -> Iterator[sqlite3.Connection]:
+        """Share one connection and commit only at the outermost scope.
 
-        Yields:
-            SQLite connection configured with row dictionaries.
+        Scopes are local to this repository and thread. Nested scopes join the
+        outer transaction; any exception marks it for rollback even if a caller
+        catches the exception. Keep network and media work outside this scope.
         """
+        state = self._transaction_state
+        active_connection = getattr(state, "connection", None)
+        if active_connection is not None:
+            try:
+                yield active_connection
+            except BaseException:
+                state.rollback_only = True
+                raise
+            return
 
         connection = sqlite3.connect(self.db_path)
         connection.row_factory = sqlite3.Row
-
+        state.connection = connection
+        state.rollback_only = False
         try:
+            connection.execute("BEGIN")
             yield connection
+            if state.rollback_only:
+                raise RuntimeError("Repository transaction aborted after a nested failure.")
             connection.commit()
-        except Exception:
+        except BaseException:
             connection.rollback()
             raise
         finally:
+            state.connection = None
+            state.rollback_only = False
             connection.close()
+
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
+        """Join the active transaction, or commit one standalone operation."""
+        with self.transaction() as connection:
+            yield connection
 
     def _initialize_schema(self) -> None:
         """Creates database tables if they do not already exist."""
@@ -5078,7 +5789,7 @@ class SaveRepository:
                     description TEXT NOT NULL DEFAULT '',
                     value_base_units INTEGER NOT NULL DEFAULT 0,
                     metadata_json TEXT NOT NULL DEFAULT '{}',
-                    FOREIGN KEY (npc_id) REFERENCES npcs(npc_id) ON DELETE CASCADE
+                    FOREIGN KEY (npc_id) REFERENCES npcs(id) ON DELETE CASCADE
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_party_inventory_owner
@@ -5115,6 +5826,7 @@ class SaveRepository:
                     result TEXT NOT NULL DEFAULT '',
                     notes TEXT NOT NULL DEFAULT '',
                     value_base_units INTEGER NOT NULL DEFAULT 0,
+                    recipe_data_json TEXT NOT NULL DEFAULT '{}',
                     discovered_at TEXT NOT NULL
                 );
 
@@ -5231,8 +5943,7 @@ class SaveRepository:
                 );
 
                 CREATE TABLE IF NOT EXISTS npcs (
-                    id TEXT PRIMARY KEY NOT NULL DEFAULT ('rec_' || lower(hex(randomblob(16)))),
-                    npc_id TEXT NOT NULL UNIQUE,
+                    id TEXT PRIMARY KEY NOT NULL,
                     name TEXT NOT NULL,
                     display_name TEXT NOT NULL DEFAULT '',
                     role TEXT NOT NULL DEFAULT '',
@@ -5249,6 +5960,58 @@ class SaveRepository:
                     updated_at TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS merchant_profiles (
+                    npc_id TEXT PRIMARY KEY,
+                    can_sell INTEGER NOT NULL DEFAULT 0,
+                    can_buy INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY (npc_id) REFERENCES npcs(id) ON DELETE CASCADE
+                );
+
+                CREATE TABLE IF NOT EXISTS merchant_stock (
+                    stock_id TEXT PRIMARY KEY,
+                    npc_id TEXT NOT NULL,
+                    item_id TEXT NOT NULL,
+                    item_name TEXT NOT NULL,
+                    quantity INTEGER NOT NULL DEFAULT 0,
+                    unit_price_base_units INTEGER NOT NULL DEFAULT 0,
+                    active INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY (npc_id) REFERENCES npcs(id) ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_merchant_stock_npc
+                ON merchant_stock(npc_id, active, item_name COLLATE NOCASE);
+
+                CREATE TABLE IF NOT EXISTS merchant_buy_offers (
+                    offer_id TEXT PRIMARY KEY,
+                    npc_id TEXT NOT NULL,
+                    item_id TEXT NOT NULL,
+                    item_name TEXT NOT NULL,
+                    unit_price_base_units INTEGER NOT NULL DEFAULT 0,
+                    max_quantity INTEGER NOT NULL DEFAULT 0,
+                    active INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY (npc_id) REFERENCES npcs(id) ON DELETE CASCADE
+                );
+
+                CREATE TABLE IF NOT EXISTS merchant_transactions (
+                    transaction_id TEXT PRIMARY KEY,
+                    npc_id TEXT NOT NULL,
+                    direction TEXT NOT NULL,
+                    reference_id TEXT NOT NULL,
+                    item_id TEXT NOT NULL,
+                    item_name TEXT NOT NULL,
+                    quantity INTEGER NOT NULL,
+                    unit_price_base_units INTEGER NOT NULL,
+                    total_base_units INTEGER NOT NULL,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY (npc_id) REFERENCES npcs(id) ON DELETE CASCADE
+                );
+
                 CREATE TABLE IF NOT EXISTS party_members (
                     npc_id TEXT PRIMARY KEY,
                     status TEXT NOT NULL DEFAULT 'Active',
@@ -5259,7 +6022,7 @@ class SaveRepository:
                     skills_json TEXT NOT NULL DEFAULT '[]',
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
-                    FOREIGN KEY (npc_id) REFERENCES npcs(npc_id) ON DELETE CASCADE
+                    FOREIGN KEY (npc_id) REFERENCES npcs(id) ON DELETE CASCADE
                 );
 
                 CREATE TABLE IF NOT EXISTS gm_secrets (
@@ -5290,6 +6053,7 @@ class SaveRepository:
                     content TEXT NOT NULL,
                     sound_effect_cues_json TEXT NOT NULL DEFAULT '[]',
                     speaker_cues_json TEXT NOT NULL DEFAULT '[]',
+                    hidden INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL
                 );
 
@@ -5323,6 +6087,10 @@ class SaveRepository:
                     filename TEXT NOT NULL,
                     prompt TEXT NOT NULL,
                     model TEXT NOT NULL,
+                    image_style TEXT NOT NULL DEFAULT '',
+                    visual_description TEXT NOT NULL DEFAULT '',
+                    basic_name TEXT NOT NULL DEFAULT '',
+                    resolution_tier TEXT NOT NULL DEFAULT '',
                     status TEXT NOT NULL DEFAULT 'queued',
                     error_message TEXT NOT NULL DEFAULT '',
                     width INTEGER NOT NULL DEFAULT 0,
@@ -5363,6 +6131,36 @@ class SaveRepository:
             )
             _ensure_column(
                 connection,
+                "visual_assets",
+                "image_style",
+                "TEXT NOT NULL DEFAULT ''",
+            )
+            _ensure_column(
+                connection,
+                "visual_assets",
+                "visual_description",
+                "TEXT NOT NULL DEFAULT ''",
+            )
+            _ensure_column(
+                connection,
+                "visual_assets",
+                "basic_name",
+                "TEXT NOT NULL DEFAULT ''",
+            )
+            _ensure_column(
+                connection,
+                "visual_assets",
+                "resolution_tier",
+                "TEXT NOT NULL DEFAULT ''",
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_visual_assets_reuse
+                ON visual_assets(subject_type, image_style, resolution_tier, status)
+                """
+            )
+            _ensure_column(
+                connection,
                 "inventory_items",
                 "value_base_units",
                 "INTEGER NOT NULL DEFAULT 0",
@@ -5396,6 +6194,12 @@ class SaveRepository:
                 "crafting_recipes",
                 "value_base_units",
                 "INTEGER NOT NULL DEFAULT 0",
+            )
+            _ensure_column(
+                connection,
+                "crafting_recipes",
+                "recipe_data_json",
+                "TEXT NOT NULL DEFAULT '{}'",
             )
             _ensure_column(
                 connection,
@@ -5444,6 +6248,12 @@ class SaveRepository:
                 "history_entries",
                 "speaker_cues_json",
                 "TEXT NOT NULL DEFAULT '[]'",
+            )
+            _ensure_column(
+                connection,
+                "history_entries",
+                "hidden",
+                "INTEGER NOT NULL DEFAULT 0",
             )
             _ensure_column(
                 connection,
@@ -6082,13 +6892,13 @@ def _upsert_item_catalog_entry(
     description: str = "",
     value_base_units: int = 0,
     metadata: Any | None = None,
-) -> None:
+) -> str:
     """Adds or updates the durable item definition catalog."""
 
     clean_name = name.strip()
 
     if not clean_name:
-        return
+        return ""
 
     clean_category = category.strip()
     clean_description = description.strip()
@@ -6141,7 +6951,12 @@ def _upsert_item_catalog_entry(
                 now,
             ),
         )
-        return
+        return str(
+            connection.execute(
+                "SELECT id FROM item_catalog WHERE name = ? COLLATE NOCASE",
+                (clean_name,),
+            ).fetchone()["id"]
+        )
 
     existing_metadata = _decode_json_dict(
         row["metadata_json"],
@@ -6174,6 +6989,7 @@ def _upsert_item_catalog_entry(
             row["id"],
         ),
     )
+    return str(row["id"])
 
 
 def _inventory_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
@@ -6230,12 +7046,21 @@ def _item_catalog_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
     }
 
 
+class _NpcIdentityDict(dict[str, Any]):
+    """NPC records expose only ``id`` while tolerating legacy in-process reads."""
+
+    def __getitem__(self, key: str) -> Any:
+        return super().__getitem__("id" if key == "npc_id" else key)
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return super().get("id" if key == "npc_id" else key, default)
+
+
 def _npc_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
     """Converts an NPC database row to a plain dictionary."""
 
-    return {
+    return _NpcIdentityDict({
         "id": row["id"],
-        "npc_id": row["npc_id"],
         "name": row["name"],
         "display_name": row["display_name"],
         "role": row["role"],
@@ -6253,7 +7078,7 @@ def _npc_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
         "disposition": row["disposition"],
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
-    }
+    })
 
 
 def _party_member_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
@@ -6512,6 +7337,26 @@ def _decode_json_dict(raw_json: Any, label: str) -> dict[str, Any]:
         return {}
 
     return value
+
+
+def _crafting_availability_message(availability: dict[str, Any]) -> str:
+    """Formats deterministic crafting requirements for a player-facing error."""
+
+    missing = [
+        str(item.get("name", "required ingredient"))
+        for item in availability.get("missing_ingredients", [])
+        if isinstance(item, dict)
+    ]
+    missing.extend(
+        str(item)
+        for item in availability.get("missing_tools", [])
+        if str(item).strip()
+    )
+    if missing:
+        return "Cannot craft yet; unavailable requirements: " + ", ".join(
+            dict.fromkeys(missing)
+        ) + "."
+    return "Cannot craft this recipe yet."
 
 
 def _decode_json_list(raw_json: Any, label: str) -> list[Any]:

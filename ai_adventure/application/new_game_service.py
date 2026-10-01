@@ -30,7 +30,6 @@ from ai_adventure.infrastructure.sqlite import SaveRepository
 from ai_adventure.locations import normalize_known_locations
 from ai_adventure.new_game_setup import build_new_game_setup_packet
 from ai_adventure.new_game_setup import (
-    STARTER_INVENTORY_MIN_ITEMS,
     ai_generated_calendar_settings_or_fallback,
     fallback_introductory_message,
     fallback_world_summary,
@@ -123,6 +122,9 @@ class NewGameService:
                 ),
             )
         repository.set_world_summary(fallback_world_summary(setup))
+        fallback_items = _starter_items_for_save([], setup)
+        if fallback_items:
+            repository.replace_inventory_items(fallback_items)
         repository.append_history(
             "story",
             (
@@ -178,6 +180,9 @@ class NewGameService:
             api_key_path=api_key_path,
             **({"model": model} if model else {}),  # type: ignore[call-arg]
         )
+        staged_generator = getattr(service, "generate_new_game_world_staged", None)
+        if callable(staged_generator):
+            return staged_generator(setup_packet)
         return service.generate_new_game_world(setup_packet)
 
     @staticmethod
@@ -190,74 +195,85 @@ class NewGameService:
     ) -> NewGameCommitResult:
         """Persists a generated world and applies its authorized opening events."""
 
-        LOGGER.debug("INITIAL NEW GAME GEMINI PROMPT: \n\n%s", result)
-        NewGameService._apply_generated_state(repository, setup, result)
+        with repository.transaction():
+            LOGGER.debug("INITIAL NEW GAME GEMINI PROMPT: \n\n%s", result)
+            NewGameService._apply_generated_state(repository, setup, result)
 
-        finalized_character = getattr(result, "finalized_character", {})
-        repository.set_world_summary(
-            _preserve_player_character_text(
-                getattr(result, "world_summary", ""),
+            finalized_character = getattr(result, "finalized_character", {})
+            repository.set_world_summary(
+                _preserve_player_character_text(
+                    getattr(result, "world_summary", ""),
+                    setup,
+                    finalized_character,
+                )
+            )
+            introductory_message = _preserve_player_character_text(
+                _introductory_message_for_save(setup, result),
                 setup,
                 finalized_character,
             )
-        )
-        introductory_message = _preserve_player_character_text(
-            _introductory_message_for_save(setup, result),
-            setup,
-            finalized_character,
-        )
 
-        audio = normalize_tts_audio_fields(
-            {
-                "tts_voice": repository.get_setting(
-                    "audio.tts_voice", DEFAULT_NARRATOR_VOICE
+            audio = normalize_tts_audio_fields(
+                {
+                    "tts_voice": repository.get_setting(
+                        "audio.tts_voice", DEFAULT_NARRATOR_VOICE
+                    ),
+                    "tts_voice_mode": repository.get_setting(
+                        "audio.tts_voice_mode", "preset"
+                    ),
+                    "tts_voice_blend": repository.get_setting(
+                        "audio.tts_voice_blend", {}
+                    ),
+                    "player_tts_voice": repository.get_setting(
+                        "audio.player_tts_voice", "ai"
+                    ),
+                }
+            )
+            speaker_cues, assignments = assign_speaker_voices(
+                getattr(result, "speaker_cues", []),
+                narrator_voice=active_voice_spec_from_audio(audio),
+                available_voice_ids=available_voice_ids or [],
+                existing_assignments=repository.get_setting(
+                    "audio.speaker_voice_assignments", {}
                 ),
-                "tts_voice_mode": repository.get_setting(
-                    "audio.tts_voice_mode", "preset"
-                ),
-                "tts_voice_blend": repository.get_setting(
-                    "audio.tts_voice_blend", {}
-                ),
-            }
-        )
-        speaker_cues, assignments = assign_speaker_voices(
-            getattr(result, "speaker_cues", []),
-            narrator_voice=active_voice_spec_from_audio(audio),
-            available_voice_ids=available_voice_ids or [],
-            existing_assignments=repository.get_setting(
-                "audio.speaker_voice_assignments", {}
-            ),
-        )
-        repository.set_setting("audio.speaker_voice_assignments", assignments)
+                player_speaker_ids={
+                    "player",
+                    "player_character",
+                    str(setup.get("character", {}).get("name", "")).casefold(),
+                },
+                player_pronouns=setup.get("character", {}).get("pronouns", "They/Them"),
+                player_voice=audio["player_tts_voice"],
+            )
+            repository.set_setting("audio.speaker_voice_assignments", assignments)
 
-        message_id = repository.append_history(
-            "story",
-            introductory_message,
-            sound_effect_cues=getattr(result, "sound_effect_cues", []),
-            speaker_cues=speaker_cues,
-        )
-        event_results: list[AppliedEventResult] = []
-        suggested_events = getattr(result, "suggested_events", [])
-        if suggested_events:
-            event_results = EventApplier(
-                repository,
+            message_id = repository.append_history(
+                "story",
+                introductory_message,
+                sound_effect_cues=getattr(result, "sound_effect_cues", []),
+                speaker_cues=speaker_cues,
+            )
+            event_results: list[AppliedEventResult] = []
+            suggested_events = getattr(result, "suggested_events", [])
+            if suggested_events:
+                event_results = EventApplier(
+                    repository,
+                    message_id=message_id,
+                ).apply_events(suggested_events)
+                applied_count = sum(
+                    1 for event_result in event_results
+                    if event_result.status == "applied"
+                )
+                LOGGER.info(
+                    "Applied %s new-game event(s); skipped %s.",
+                    applied_count,
+                    len(event_results) - applied_count,
+                )
+
+            return NewGameCommitResult(
                 message_id=message_id,
-            ).apply_events(suggested_events)
-            applied_count = sum(
-                1 for event_result in event_results
-                if event_result.status == "applied"
+                speaker_cues=speaker_cues,
+                event_results=event_results,
             )
-            LOGGER.info(
-                "Applied %s new-game event(s); skipped %s.",
-                applied_count,
-                len(event_results) - applied_count,
-            )
-
-        return NewGameCommitResult(
-            message_id=message_id,
-            speaker_cues=speaker_cues,
-            event_results=event_results,
-        )
 
     @staticmethod
     def _apply_generated_state(
@@ -418,6 +434,9 @@ class NewGameService:
             if value:
                 repository.set_setting(setting_key, value)
 
+        starting_notes = getattr(result, "starting_notes", [])
+        repository.set_note_entries(starting_notes)
+
         pronunciation_map = merge_pronunciation_maps(
             setup.get("pronunciation_map", {}),
             getattr(result, "pronunciation_map", {}),
@@ -483,8 +502,15 @@ class NewGameService:
             getattr(result, "finalized_starter_items", []),
             setup,
         )
-        if finalized_starter_items:
-            repository.replace_inventory_items(finalized_starter_items)
+        repository.replace_inventory_items(finalized_starter_items)
+
+        LOGGER.info(
+            "Committed new-game starting state: inventory_items=%s, skills=%s, "
+            "starting_notes=%s.",
+            len(repository.list_inventory_items()),
+            len(repository.list_skills()),
+            len(repository.get_note_entries()),
+        )
 
         _apply_new_game_crafting_knowledge(
             repository,
@@ -629,18 +655,12 @@ def _travel_locations_for_save(
             parent_location = str(
                 raw_requested_location.get("parent_location", "") or ""
             ).strip()
-            if bool(raw_requested_location.get("is_sublocation")) and parent_location:
-                relationship_note = f"Located within {parent_location}."
-                existing_notes = str(
-                    matched_location.get("travel_notes", "") or ""
-                ).strip()
-                if (
-                    "located within " not in existing_notes.casefold()
-                    and relationship_note.casefold() not in existing_notes.casefold()
-                ):
-                    matched_location["travel_notes"] = " ".join(
-                        value for value in [existing_notes, relationship_note] if value
-                    )
+            matched_location["is_sublocation"] = bool(
+                raw_requested_location.get("is_sublocation")
+            ) and bool(parent_location)
+            matched_location["parent_location"] = (
+                parent_location if matched_location["is_sublocation"] else ""
+            )
 
     requested_location = str(setup.get("start_location", "") or "").strip()
     ai_location = str(getattr(result, "start_location", "") or "").strip()
@@ -816,6 +836,34 @@ def _apply_new_game_crafting_knowledge(
             name=name,
             ingredients=ingredients,
             result=result_text,
+            result_item_uuid=str(raw_recipe.get("result_item_uuid", "") or "").strip(),
+            result_item_name=str(
+                raw_recipe.get("result_item_name", result_text) or result_text
+            ).strip(),
+            skill_name=str(raw_recipe.get("skill_name", "Crafting") or "Crafting").strip(),
+            stages=(
+                raw_recipe.get("stages", [])
+                if isinstance(raw_recipe.get("stages", []), list)
+                else []
+            ),
+            required_tool_item_uuids=(
+                [
+                    str(value).strip()
+                    for value in raw_recipe.get("required_tool_item_uuids", [])
+                    if str(value).strip()
+                ]
+                if isinstance(raw_recipe.get("required_tool_item_uuids", []), list)
+                else []
+            ),
+            required_tool_item_names=(
+                [
+                    str(value).strip()
+                    for value in raw_recipe.get("required_tool_item_names", [])
+                    if str(value).strip()
+                ]
+                if isinstance(raw_recipe.get("required_tool_item_names", []), list)
+                else []
+            ),
             notes=str(raw_recipe.get("notes", "") or "").strip(),
             value_base_units=max(0, _safe_int(raw_recipe.get("value_base_units", 0), 0)),
         )
@@ -951,7 +999,11 @@ def _starter_items_for_save(
     setup_items = setup.get("starter_items", [])
     if not isinstance(setup_items, list):
         setup_items = []
-    completed_items = [dict(item) for item in ai_items if isinstance(item, dict)]
+    completed_items = [
+        dict(item)
+        for item in (ai_items if isinstance(ai_items, list) else [])
+        if isinstance(item, dict) and str(item.get("name", "")).strip()
+    ]
     for item in completed_items:
         source_index = _optional_int(item.get("source_index"))
         if source_index is None or not (0 <= source_index < len(setup_items)):
@@ -986,10 +1038,6 @@ def _starter_items_for_save(
     for index, setup_item in enumerate(setup_items):
         if index in used_source_indexes or not isinstance(setup_item, dict):
             continue
-        if bool(setup_item.get("requires_ai_invention")) and len(
-            completed_items
-        ) >= STARTER_INVENTORY_MIN_ITEMS:
-            continue
         fallback_item = _fallback_starter_item_from_setup(
             setup_item, source_index=index
         )
@@ -998,27 +1046,13 @@ def _starter_items_for_save(
         completed_items.append(fallback_item)
         seen_names.add(fallback_item["name"].casefold())
 
-    while len(completed_items) < STARTER_INVENTORY_MIN_ITEMS:
-        fallback_item = _starter_inventory_top_up_item(seen_names)
-        if fallback_item is None:
-            break
-        completed_items.append(fallback_item)
-        seen_names.add(fallback_item["name"].casefold())
-
     if len(completed_items) > original_completed_count:
         added_count = len(completed_items) - original_completed_count
-        if original_completed_count < STARTER_INVENTORY_MIN_ITEMS:
-            LOGGER.warning(
-                "Gemini returned fewer than %s complete starter item(s); added %s "
-                "fallback item(s) so the new save starts with enough inventory.",
-                STARTER_INVENTORY_MIN_ITEMS,
-                added_count,
-            )
-        else:
-            LOGGER.warning(
-                "Gemini omitted %s explicit starter item(s); preserved named setup item(s).",
-                added_count,
-            )
+        LOGGER.warning(
+            "Gemini omitted or partially finalized %s starter item(s); preserved "
+            "the corresponding setup item(s).",
+            added_count,
+        )
     return completed_items
 
 
@@ -1038,6 +1072,7 @@ def _fallback_starter_item_from_setup(
         return None
     item = {
         "name": name,
+        "basic_name": str(raw_item.get("basic_name", name) or name).strip()[:120],
         "category": str(raw_item.get("category", "Item")).strip() or "Item",
         "quantity": max(1, _safe_int(raw_item.get("quantity"), 1)),
         "description": description
@@ -1091,6 +1126,7 @@ def _starter_inventory_top_up_item(
             continue
         return {
             "name": name,
+            "basic_name": name,
             "category": category,
             "description": description,
             "value_base_units": value_base_units,

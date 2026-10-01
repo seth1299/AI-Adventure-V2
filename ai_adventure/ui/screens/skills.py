@@ -54,10 +54,10 @@ class SkillsScreen(RepositoryBackedWidget):
                 1,
                 _table_item(_skill_level_label(level), level),
             )
-            self.skills_table.setItem(
+            self.skills_table.setCellWidget(
                 row_index,
                 2,
-                _table_item(_skill_xp_progress_label(skill), _safe_int(skill.get("xp", 0), 0)),
+                _skill_xp_progress_bar(skill),
             )
             self.skills_table.setItem(
                 row_index,
@@ -93,3 +93,39 @@ class SkillsScreen(RepositoryBackedWidget):
             return str(skill.get("description", "")).casefold(), name
 
         return name, name
+
+
+def _skill_xp_progress_bar(skill: dict[str, Any]) -> QProgressBar:
+    """Builds a themed XP bar using the skill system's existing thresholds."""
+
+    level = max(1, min(MAX_SKILL_LEVEL, _safe_int(skill.get("level", 1), 1)))
+    xp = max(0, _safe_int(skill.get("xp", 0), 0))
+    target_xp = XP_THRESHOLDS_BY_LEVEL[MAX_SKILL_LEVEL]
+    if level < MAX_SKILL_LEVEL:
+        target_xp = XP_THRESHOLDS_BY_LEVEL[level + 1]
+
+    percentage = 0 if target_xp <= 0 else min(100, round(xp * 100 / target_xp))
+    bar = QProgressBar()
+    bar.setObjectName("skillXpProgressBar")
+    bar.setRange(0, 100)
+    bar.setValue(percentage)
+    bar.setFormat(f"{percentage}%")
+    bar.setTextVisible(True)
+    bar.setMinimumWidth(120)
+    bar.setMinimumHeight(20)
+    bar.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+    bar.setToolTip(f"XP progress: {_skill_xp_progress_label(skill)}")
+    bar.setAccessibleName(
+        f"{str(skill.get('name', 'Skill'))} XP progress: {percentage}%"
+    )
+    bar.setStyleSheet(
+        "QProgressBar#skillXpProgressBar {"
+        " border: 1px solid #64748b; border-radius: 4px;"
+        " background-color: #111827; color: #f8fafc;"
+        " text-align: center; min-height: 18px;"
+        "}"
+        "QProgressBar#skillXpProgressBar::chunk {"
+        " background-color: #38bdf8; border-radius: 3px;"
+        "}"
+    )
+    return bar

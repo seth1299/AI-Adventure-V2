@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import queue
+import logging
 import sys
 import threading
 import types
@@ -25,6 +26,7 @@ from ai_adventure.audio.ssmd import strip_ssmd_markup_for_plain_tts
 from ai_adventure.audio.tts_settings import (
     build_voice_blend_spec,
     merge_custom_voices,
+    normalize_tts_audio_fields,
     normalize_custom_voices,
     normalize_narrator_voice_spec,
     parse_voice_blend_spec,
@@ -46,10 +48,44 @@ from ai_adventure.audio.tts.tts_manager import (
     KokoroOnnxTTSEngine,
     PyKokoroTTSEngine,
     TTSRequest,
+    _BenignPhonemizerWarningFilter,
 )
 
 
 class AudioTests(unittest.TestCase):
+    def test_music_volume_normalizes_one_percent_without_full_volume_jump(self) -> None:
+        manager = SoundManager.__new__(SoundManager)
+        manager._initialized = False
+        manager._pygame = None
+
+        for requested, expected in (
+            (0, 0.0),
+            (1, 0.01),
+            (2, 0.02),
+            (100, 1.0),
+        ):
+            manager.set_music_volume(requested)
+            self.assertAlmostEqual(manager.music_volume, expected)
+
+    def test_phonemizer_filter_suppresses_only_known_summary_warning(self) -> None:
+        warning_filter = _BenignPhonemizerWarningFilter()
+        benign = logging.LogRecord(
+            "phonemizer", logging.WARNING, __file__, 1,
+            "words count mismatch on 200.0% of the lines (2/1)", (), None,
+        )
+        other_summary = logging.LogRecord(
+            "phonemizer", logging.WARNING, __file__, 1,
+            "words count mismatch on 100% of the lines (1/1)", (), None,
+        )
+        other = logging.LogRecord(
+            "phonemizer", logging.WARNING, __file__, 1,
+            "words count mismatch on line 1 (expected 2 words but get 1)", (), None,
+        )
+
+        self.assertFalse(warning_filter.filter(benign))
+        self.assertFalse(warning_filter.filter(other_summary))
+        self.assertTrue(warning_filter.filter(other))
+
     def test_speaker_voice_assignments_are_distinct_and_durable(self) -> None:
         cues = [
             {
@@ -93,6 +129,53 @@ class AudioTests(unittest.TestCase):
         )
         self.assertEqual(replayed[0]["voice_id"], resolved[0]["voice_id"])
         self.assertEqual(replay_assignments, assignments)
+
+    def test_player_voice_assignment_honors_pronouns_when_ai_chooses(self) -> None:
+        cues = [{
+            "anchor_text": '"I will go."',
+            "speaker_id": "player_character",
+            "speaker_name": "Alex",
+            "voice_profile": "masculine",
+        }]
+
+        resolved, _assignments = assign_speaker_voices(
+            cues,
+            narrator_voice="am_echo",
+            available_voice_ids=["af_sarah", "af_bella", "am_echo", "am_onyx"],
+            player_pronouns="She/Her",
+            player_voice="ai",
+        )
+
+        self.assertEqual(resolved[0]["voice_profile"], "feminine")
+        self.assertIn(resolved[0]["voice_id"], {"af_sarah", "af_bella"})
+
+    def test_player_voice_assignment_accepts_explicit_voice(self) -> None:
+        cues = [{
+            "anchor_text": '"I will go."',
+            "speaker_id": "player",
+            "speaker_name": "Alex",
+            "voice_profile": "feminine",
+        }]
+
+        resolved, _assignments = assign_speaker_voices(
+            cues,
+            narrator_voice="af_sarah",
+            available_voice_ids=["af_sarah", "am_echo", "am_onyx"],
+            player_pronouns="She/Her",
+            player_voice="am_onyx",
+        )
+
+        self.assertEqual(resolved[0]["voice_id"], "am_onyx")
+
+    def test_player_voice_setting_defaults_to_pronoun_aware_ai(self) -> None:
+        audio = normalize_tts_audio_fields({})
+        self.assertEqual(audio["player_tts_voice"], "ai")
+        self.assertEqual(
+            normalize_tts_audio_fields({"player_tts_voice": "am_onyx"})[
+                "player_tts_voice"
+            ],
+            "am_onyx",
+        )
 
     def test_local_replay_forwards_sound_cues_to_narration(self) -> None:
         player = NarrationPlayer.__new__(NarrationPlayer)
@@ -249,6 +332,77 @@ class AudioTests(unittest.TestCase):
             else:
                 sys.modules["pygame"] = original_pygame
 
+    def test_user_audio_import_augments_packaged_catalogs(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            package_music = root / "package_music"
+            package_effects = root / "package_effects"
+            package_ambience = root / "package_ambience"
+            user_music = root / "user_music"
+            user_effects = root / "user_effects"
+            user_ambience = root / "user_ambience"
+            for directory in (
+                package_music,
+                package_effects,
+                package_ambience,
+                user_music,
+                user_effects,
+                user_ambience,
+            ):
+                directory.mkdir()
+            (package_music / "Packaged Theme.mp3").write_bytes(b"music")
+            (package_ambience / "Packaged Rain.ogg").write_bytes(b"ambience")
+            source = root / "My Custom Theme.wav"
+            source.write_bytes(b"custom music")
+
+            manager = SoundManager(
+                package_music,
+                package_effects,
+                package_ambience,
+                user_music_directory=user_music,
+                user_sound_effects_directory=user_effects,
+                user_background_ambience_directory=user_ambience,
+            )
+            success, filename = manager.import_audio_file(source, "music")
+
+            self.assertTrue(success)
+            self.assertEqual(filename, source.name)
+            self.assertTrue((user_music / source.name).exists())
+            self.assertEqual(
+                manager.get_valid_track_names(),
+                ["My Custom Theme.wav", "Packaged Theme.mp3"],
+            )
+
+            effect_source = root / "Custom Bell.ogg"
+            effect_source.write_bytes(b"custom effect")
+            effect_success, effect_name = manager.import_audio_file(
+                effect_source,
+                "sound_effects",
+            )
+            self.assertTrue(effect_success)
+            self.assertEqual(
+                manager.get_valid_sound_effect_names(),
+                [effect_name],
+            )
+
+            ambience_source = root / "Custom Wind.wav"
+            ambience_source.write_bytes(b"custom ambience")
+            ambience_success, ambience_name = manager.import_audio_file(
+                ambience_source,
+                "background_ambience",
+            )
+            self.assertTrue(ambience_success)
+            self.assertEqual(
+                manager.get_valid_background_ambience_names(),
+                [ambience_name, "Packaged Rain.ogg"],
+            )
+
+            invalid = root / "not-audio.txt"
+            invalid.write_text("not audio", encoding="utf-8")
+            success, message = manager.import_audio_file(invalid, "music")
+            self.assertFalse(success)
+            self.assertIn("MP3", message)
+
     def test_sanitize_tts_text_removes_embedded_events_and_action_suggestions(self) -> None:
         text = sanitize_tts_text(
             "The room falls quiet. "
@@ -284,6 +438,18 @@ class AudioTests(unittest.TestCase):
         self.assertIn("seven in the morning", plain_text)
         self.assertIn("six oh five in the evening", plain_text)
 
+    def test_sanitize_tts_text_pronounces_leading_decimal_calibers(self) -> None:
+        text = sanitize_tts_text("She carries a .38 Special beside a 3.8 vial.")
+
+        self.assertIn("point thirty eight Special", text)
+        self.assertIn("3.8 vial", text)
+
+    def test_sanitize_tts_text_does_not_speak_markdown_escape_backslashes(self) -> None:
+        text = sanitize_tts_text(r'Vera said: \"I saw \*someone\* near the door.\"')
+
+        self.assertNotIn("\\", text)
+        self.assertIn('"I saw someone near the door."', text)
+
     def test_normalize_tts_time_text_handles_midnight_noon_and_minutes(self) -> None:
         text = normalize_tts_time_text(
             "Meet at 12:00 A.M., return by 12:00 P.M., and report at 8:30 P.M."
@@ -306,14 +472,25 @@ class AudioTests(unittest.TestCase):
 
         self.assertEqual(
             chunks[0].display_text,
-            "The bell rings at 7:00 A.M. What do you do now?",
+            "The bell rings at 7:00 A.M. ",
         )
         self.assertEqual(
             chunks[0].tts_text,
-            "The bell rings at [7:00 A.M.](as: time) What do you do now?",
+            "The bell rings at [7:00 A.M.](as: time)",
+        )
+        self.assertEqual(chunks[1].display_text, "What do you do now?")
+
+    def test_narration_chunks_reveal_one_sentence_at_a_time(self) -> None:
+        text = "First sentence. Second sentence! Is this the third?"
+
+        chunks = build_narration_chunks(text)
+
+        self.assertEqual(
+            [chunk.display_text for chunk in chunks],
+            ["First sentence. ", "Second sentence! ", "Is this the third?"],
         )
 
-    def test_player_merges_short_same_voice_paragraphs_for_gapless_playback(self) -> None:
+    def test_player_keeps_short_same_voice_sentences_separate_for_progressive_reveal(self) -> None:
         chunks = build_narration_chunks(
             "The bell rings.\n\nThe gates open.",
         )
@@ -321,9 +498,11 @@ class AudioTests(unittest.TestCase):
         merged = _merge_compatible_narration_chunks(chunks)
 
         self.assertEqual(len(chunks), 2)
-        self.assertEqual(len(merged), 1)
-        self.assertEqual(merged[0].display_text, "The bell rings.\n\nThe gates open.")
-        self.assertIn("...p", merged[0].tts_text)
+        self.assertEqual(len(merged), 2)
+        self.assertEqual(
+            [chunk.display_text for chunk in merged],
+            ["The bell rings.\n\n", "The gates open."],
+        )
 
     def test_narration_chunks_apply_pronunciation_only_to_spoken_text(self) -> None:
         text = "Ironpeak City wakes.\n\nThe market opens."
@@ -401,7 +580,7 @@ class AudioTests(unittest.TestCase):
         self.assertNotIn("is_phonemes", create_calls[0][1])
         self.assertEqual(len(writes), 1)
 
-    def test_narration_sound_cue_forces_exact_word_boundary(self) -> None:
+    def test_narration_sound_cue_uses_sentence_boundary(self) -> None:
         text = "The hammer falls. Sparks leap from the anvil."
         chunks = build_narration_chunks(
             text,
@@ -415,9 +594,9 @@ class AudioTests(unittest.TestCase):
         )
 
         self.assertEqual("".join(chunk.display_text for chunk in chunks), text)
-        self.assertEqual(chunks[0].display_text, "The hammer")
+        self.assertEqual(chunks[0].display_text, "The hammer falls. ")
         self.assertEqual(chunks[0].sound_effects_after, ("Hammer Strike.wav",))
-        self.assertEqual(chunks[1].display_text, " falls. Sparks leap from the anvil.")
+        self.assertEqual(chunks[1].display_text, "Sparks leap from the anvil.")
 
     def test_narration_chunks_switch_voice_only_for_exact_speaker_spans(self) -> None:
         text = 'Mira whispers, "Stay low." The watch passes. Orin says, "Now run."'
@@ -446,8 +625,9 @@ class AudioTests(unittest.TestCase):
             [(chunk.display_text, chunk.voice_id) for chunk in chunks],
             [
                 ("Mira whispers, ", ""),
-                ('"Stay low."', "af_bella"),
-                (" The watch passes. Orin says, ", ""),
+                ('"Stay low." ', "af_bella"),
+                ("The watch passes. ", ""),
+                ("Orin says, ", ""),
                 ('"Now run."', "am_onyx"),
             ],
         )

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import tempfile
 import uuid
 from abc import ABC, abstractmethod
@@ -29,6 +30,9 @@ from ai_adventure.text_sanitization import sanitize_english_text
 LOGGER = logging.getLogger(__name__)
 PYKOKORO_MODEL_QUALITY = "q8"
 PYKOKORO_SPACY_MODEL = "en_core_web_sm"
+_PHONEMIZER_MISMATCH_WARNING_RE = re.compile(
+    r"^words count mismatch on \d+(?:\.\d+)?% of the lines \(\d+/\d+\)$"
+)
 PykokoroModelQuality = Literal[
     "fp32",
     "fp16",
@@ -42,6 +46,25 @@ PykokoroModelQuality = Literal[
 ]
 
 
+class _BenignPhonemizerWarningFilter(logging.Filter):
+    """Suppresses one known-benign phonemizer summary warning."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return not _PHONEMIZER_MISMATCH_WARNING_RE.fullmatch(record.getMessage())
+
+
+def _configure_phonemizer_warning_filter() -> None:
+    """Hides only the recurring benign Kokoro phonemizer summary warning."""
+
+    phonemizer_logger = logging.getLogger("phonemizer")
+    if any(
+        isinstance(log_filter, _BenignPhonemizerWarningFilter)
+        for log_filter in phonemizer_logger.filters
+    ):
+        return
+    phonemizer_logger.addFilter(_BenignPhonemizerWarningFilter())
+
+
 def _configure_kokoro_cli_no_console_windows() -> None:
     """Prevent the espeak CLI fallback from flashing a console on Windows.
 
@@ -53,7 +76,10 @@ def _configure_kokoro_cli_no_console_windows() -> None:
     """
 
     if os.name != "nt":
+        _configure_phonemizer_warning_filter()
         return
+
+    _configure_phonemizer_warning_filter()
 
     try:
         cli_wrapper: Any = importlib.import_module(

@@ -379,6 +379,50 @@ class EventApplierTests(unittest.TestCase):
             self.assertNotIn("Old Brass Light", {item["name"] for item in catalog})
             self.assertNotIn("ascii_art", catalog_lantern)
 
+    def test_inventory_item_added_canonicalizes_unique_container_shorthand(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = SaveRepository.create_new_save(
+                Path(temp_dir),
+                "Storage Identity Test",
+            )
+            repository.add_inventory_item(
+                "Woven Willow Foraging Basket",
+                "Container",
+                1,
+                "A sturdy willow basket.",
+                4,
+                metadata={
+                    "item_type": "Container",
+                    "storage_location": "actively_carried",
+                },
+            )
+
+            result = EventApplier(repository).apply_event(
+                {
+                    "type": "InventoryItemAddedEvent",
+                    "payload": {
+                        "item_type": "Material",
+                        "item_name": "Madder Root",
+                        "description": "Roots used to make red dye.",
+                        "amount": 2,
+                        "quantity_unit": "bundles",
+                        "storage_location": "basket",
+                        "value_base_units": 15,
+                    },
+                }
+            )
+
+            root = next(
+                item
+                for item in repository.list_inventory_items()
+                if item["name"] == "Madder Root"
+            )
+            self.assertEqual(result.status, "applied")
+            self.assertEqual(
+                root["storage_location"],
+                "Woven Willow Foraging Basket",
+            )
+
     def test_inventory_item_added_drops_legacy_art_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             repository = SaveRepository.create_new_save(
@@ -523,6 +567,51 @@ class EventApplierTests(unittest.TestCase):
                 "Glass Jar",
                 {item["name"] for item in repository.list_inventory_items()},
             )
+
+    def test_inventory_storage_move_updates_existing_item_and_rejects_remote_home(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = SaveRepository.create_new_save(Path(temp_dir), "Move Test")
+            repository.set_state_value("location", "Car")
+            repository.set_travel_locations(
+                [
+                    {"name": "Car", "x_miles": 0, "y_miles": 0},
+                    {"name": "Home", "x_miles": 10, "y_miles": 0},
+                ]
+            )
+            repository.add_inventory_item(
+                "Suitcase", "Tool", 1, "A packed suitcase.", 10,
+                metadata={"storage_location": "home"},
+            )
+            item_before = next(item for item in repository.list_inventory_items() if item["name"] == "Suitcase")
+            applier = EventApplier(repository)
+
+            moved = applier.apply_event(
+                {
+                    "type": "InventoryItemModifiedEvent",
+                    "payload": {
+                        "target_name": "Suitcase",
+                        "item_uuid": item_before["metadata"]["item_uuid"],
+                        "new_storage_location": "car",
+                    },
+                }
+            )
+            item_after = next(item for item in repository.list_inventory_items() if item["name"] == "Suitcase")
+            self.assertEqual(moved.status, "applied")
+            self.assertEqual(item_after["id"], item_before["id"])
+            self.assertEqual(item_after["metadata"]["item_uuid"], item_before["metadata"]["item_uuid"])
+            self.assertEqual(item_after["storage_location"], "car")
+
+            remote = applier.apply_event(
+                {
+                    "type": "InventoryItemModifiedEvent",
+                    "payload": {
+                        "target_name": "Suitcase",
+                        "new_storage_location": "Home",
+                    },
+                }
+            )
+            self.assertEqual(remote.status, "skipped")
+            self.assertEqual(next(item for item in repository.list_inventory_items() if item["name"] == "Suitcase")["storage_location"], "car")
 
     def test_container_contents_require_opening_and_transfer_exactly_once(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

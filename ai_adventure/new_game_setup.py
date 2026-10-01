@@ -36,7 +36,9 @@ SKILL_PRESET_LEVEL_PLANS: dict[str, list[int]] = {
     "blank": [],
 }
 SKILL_LEVEL_PLAN = SKILL_PRESET_LEVEL_PLANS["professional"]
-STARTER_INVENTORY_MIN_ITEMS = 5
+# Kept as a compatibility constant for callers that import it. Starting
+# inventory may legitimately contain zero or any positive number of items.
+STARTER_INVENTORY_MIN_ITEMS = 0
 DEFAULT_STARTING_WEALTH_GUIDANCE = (
     "They should have enough money to cover a few meals."
 )
@@ -560,6 +562,8 @@ def build_new_game_setup_packet(
                 "the complete span including outer double "
                 "quotation marks from one unique place. Use an actual NPC's exact "
                 "npc_id as speaker_id, reuse IDs for the same speaker, and use distinct "
+                "Never use placeholders such as [X], [Y], ellipses, or a paraphrase "
+                "as anchor_text; it must be copied verbatim from introductory_message. "
                 "stable lower_snake_case IDs for incidental speakers. speaker_name is "
                 "the visible bubble label: use the known name or a concise player-safe "
                 "description when the name is unknown. Choose voice_profile from "
@@ -621,6 +625,13 @@ def build_new_game_setup_packet(
                 "setup.starting_locations row, including when its suggestion-mode "
                 "name changes. Fill blank "
                 "name, location, or description fields with fitting specifics. "
+                "Suggestion-mode NPC names are placeholders: replace them with fresh "
+                "proper names; preserve names only for exact-mode rows. Every NPC "
+                "must include non-empty gender_identity, age, species, and "
+                "player_facing_information. Keep public_description (observable "
+                "appearance, role, or behavior) distinct from "
+                "player_facing_information (concise player-known facts); never copy "
+                "either field or use 'Not specified'. "
                 "If description_mode is exact, copy description into "
                 "public_description unchanged; if description_mode is "
                 "suggestion, use description only as inspiration and write a "
@@ -793,10 +804,15 @@ def build_new_game_setup_packet(
                 "travel_notes, NPC details, tasks, "
                 "secrets, and opening prose; never reuse the superseded setup "
                 "placeholder or suggestion name. "
-                "If is_sublocation is true and parent_location is set, treat the "
-                "location as existing inside that parent location; reflect that "
-                "relationship in the returned location description and travel_notes "
-                "without creating a separate hidden route. "
+                "If is_sublocation is true and parent_location is set, preserve "
+                "those structured fields and do not repeat the relationship in the "
+                "description or travel_notes; the application displays it separately. "
+                "For every non-exact generated location description, write at least "
+                "two complete player-facing sentences with concrete visual and "
+                "sensory details such as layout, scale, architecture, materials, "
+                "landmarks, activity, lighting, terrain, or weather. Make it useful "
+                "for an artist to understand the place, but write natural setting "
+                "prose rather than an image-generation prompt or keyword list. "
                 "For an unknown crash-landing, isolated survival, amnesia, or "
                 "new-arrival premise, it is valid for the only known location to "
                 "be the finalized starting location at x_miles=0 and y_miles=0. "
@@ -846,6 +862,13 @@ def build_new_game_setup_packet(
                 "self-contained notes stating its intended purpose/effect, expected "
                 "strength or outcome, onset, duration, and important use conditions; "
                 "say unknown or not applicable when a detail is not established. "
+                "Each recipe must also include a result_item_name, skill_name, and "
+                "one or more deterministic stages. An active stage uses a hidden "
+                "positive work_amount and optional estimated_minutes; a passive "
+                "stage uses duration_minutes. Include required_tool_item_uuids and "
+                "required_tool_item_names arrays for recipe-wide or stage-specific "
+                "tools. Use exact item UUIDs copied from known catalog entries; "
+                "Python is authoritative for generating missing result IDs. "
                 "value_base_units as a reasonable estimated result value in the "
                 "world's baseline currency unit."
             ),
@@ -879,11 +902,10 @@ def build_new_game_setup_packet(
             ),
             "starter_inventory": (
                 "Return finalized inventory in the starting_items field, never in "
-                "starting_inventory. starting_items must contain at least five "
-                "total tracked possessions and has no maximum count. Include any "
-                "player-requested items, then invent enough additional concrete "
-                "items that fit the finalized character, genre, starting location, "
-                "weather, and opening situation to reach the minimum. "
+                "starting_inventory. There is no fixed minimum; there is no maximum count "
+                "of tracked possessions. Preserve every player-requested starter "
+                "item and never invent filler merely to reach five items. If no "
+                "starter items were supplied, return an empty starting_items array. "
                 "First identify the activities, responsibilities, and goals that "
                 "the player emphasizes in the character description, backstory, "
                 "notes, profession, and skills. Prioritize concrete tools and "
@@ -926,7 +948,11 @@ def build_new_game_setup_packet(
                 "gram, kilogram, ounce, liter, or meter. Classify a physical journal, "
                 "notebook, ledger, manual, or other book as Book or Document, not "
                 "Information; Information describes content, not a physical item. "
-                "Every finalized starting item must also include storage_location. "
+                "Every finalized starting item must also include storage_location and "
+                "basic_name. basic_name is a short, stable generic item-family name used "
+                "for visual reuse matching; remove color, material, size, condition, "
+                "craftsmanship, and other flavor adjectives, so Wide Brimmed Fedora, "
+                "Grey Felt Fedora, and Fedora all use Fedora. "
                 "Use home for items kept in the player's house, workshop, base, room, "
                 "or other home storage, and actively_carried only for items the Player "
                 "Character is actually carrying. Interpret phrases such as 'kept in "
@@ -935,7 +961,12 @@ def build_new_game_setup_packet(
                 "state concrete visible traits beyond the name: form, approximate "
                 "size, color, material, texture, markings, condition, opacity or "
                 "translucency, and any visible changes under relevant conditions such "
-                "as sunlight, darkness, heat, or moisture. Never make the name alone "
+                "as sunlight, darkness, heat, or moisture. Descriptions describe one "
+                "representative item and must remain quantity-neutral: never mention "
+                "the item's stack count, number of copies, batch size, or wording such "
+                "as 'ten vials'. Put all quantity information only in quantity and "
+                "quantity_unit. Write ordinary item prose, not an image-generation "
+                "prompt, shot list, or keyword sequence. Never make the name alone "
                 "carry the item's visual identity."
             ),
             "currency_generation": (
@@ -992,6 +1023,18 @@ def build_new_game_setup_packet(
                 "means Gemini describes and resolves fights in story prose without "
                 "CombatStartedEvent or the deterministic Combat tab."
             ),
+            "starting_notes": (
+                "Optionally return one or more concise player-facing notes only when "
+                "the Player Character would benefit from keeping important starting "
+                "information that does not belong in character, locations, NPCs, "
+                "Bestiary, inventory, crafting, or another structured section. For "
+                "example, a zombie-survival premise may warrant a note about known "
+                "virus symptoms or practical survival rules when the character would "
+                "already know them. Each note must have heading, body, and tags. Do "
+                "not duplicate information represented elsewhere, do not reveal GM "
+                "secrets or hidden future information, and return an empty array when "
+                "no starting note is beneficial."
+            ),
             "creative_ideas": (
                 "Treat creative_ideas as high-priority style seeds when inventing "
                 "names, locations, cultures, religions, foods, drinks, species, "
@@ -1014,14 +1057,25 @@ def build_new_game_setup_packet(
             "requested_item_count": starter_item_count,
             "minimum_finalized_item_count": STARTER_INVENTORY_MIN_ITEMS,
             "count_rule": (
-                "At least 5 finalized starting items are required; there is no "
-                "maximum starting item count."
+                "There is no fixed starting-item count. Preserve all supplied "
+                "starter items, do not add filler to reach five, and allow an "
+                "empty starting_items array when none were supplied."
             ),
             "output_field": "starting_items",
             "alias_not_allowed": "starting_inventory",
             "source_index_rule": (
                 "Use the zero-based setup.starter_items index for items based on "
                 "a setup starter-item entry and -1 only for extra invented items."
+            ),
+        },
+        "starting_notes_contract": {
+            "output_field": "starting_notes",
+            "optional": True,
+            "rules": (
+                "Return [] or omit the field when no player-known reference note is "
+                "useful. Notes are player-visible and should contain only concise "
+                "facts the Player Character knows at the start; never include GM "
+                "secrets, hidden motives, mystery solutions, or future information."
             ),
         },
         "starting_task_contract": {

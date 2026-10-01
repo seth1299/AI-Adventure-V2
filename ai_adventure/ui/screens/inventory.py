@@ -25,12 +25,15 @@ class InventoryLocationPanel(QGroupBox):
         secondary_sort_field: str = "",
         secondary_sort_descending: bool = False,
         on_sort_changed: Callable[[str, bool, str, bool], None] | None = None,
+        denominations: list[dict[str, Any]] | None = None,
     ) -> None:
         super().__init__(f"{_inventory_location_label(location)} ({len(items)})")
         self.location = location
         self._items = [dict(item) for item in items]
         self._on_item_clicked = on_item_clicked
         self._on_sort_changed = on_sort_changed
+        self._denominations = denominations
+        self._secondary_sort_field_preference = str(secondary_sort_field or "")
         self.item_buttons: list[QPushButton] = []
         self.group_separators: list[QFrame] = []
         layout = QVBoxLayout()
@@ -99,6 +102,10 @@ class InventoryLocationPanel(QGroupBox):
     def _sorting_changed(self, _index: int) -> None:
         """Applies this location's independent sort selection immediately."""
 
+        if self.sender() is self.secondary_sort_field_combo:
+            self._secondary_sort_field_preference = str(
+                self.secondary_sort_field_combo.currentData() or ""
+            )
         sort_field = str(self.sort_field_combo.currentData() or "name")
         sort_descending = bool(self.sort_direction_combo.currentData())
         secondary_sort_field = str(
@@ -118,7 +125,21 @@ class InventoryLocationPanel(QGroupBox):
         self._render_items()
 
     def _sync_secondary_sort_controls(self) -> None:
-        """Enables secondary direction only when a secondary field is selected."""
+        """Keeps secondary choices distinct from the primary sort field."""
+
+        primary_sort_field = str(self.sort_field_combo.currentData() or "name")
+        current_secondary = self._secondary_sort_field_preference
+        if current_secondary == primary_sort_field:
+            current_secondary = ""
+
+        self.secondary_sort_field_combo.blockSignals(True)
+        self.secondary_sort_field_combo.clear()
+        self.secondary_sort_field_combo.addItem("None", "")
+        for label, value in self.SORT_OPTIONS:
+            if value != primary_sort_field:
+                self.secondary_sort_field_combo.addItem(label, value)
+        _set_combo_to_data(self.secondary_sort_field_combo, current_secondary)
+        self.secondary_sort_field_combo.blockSignals(False)
 
         has_secondary_sort = bool(self.secondary_sort_field_combo.currentData())
         self.secondary_sort_direction_combo.setEnabled(has_secondary_sort)
@@ -173,9 +194,14 @@ class InventoryLocationPanel(QGroupBox):
                 unit,
             )
             display_quantity = _inventory_quantity_display(quantity, unit)
-            button = QPushButton(
-                f"{display_name}\n{display_quantity}  ·  {category}"
+            if quantity != 1:
+                display_name = f"{display_name} ({display_quantity})"
+            value = format_currency_amount(
+                max(0, _safe_int(item.get("value_base_units", 0), 0)),
+                self._denominations,
             )
+            details = [value, category]
+            button = QPushButton(f"{display_name}\n{'  ·  '.join(details)}")
             button.setObjectName("inventoryItemButton")
             button.setMinimumHeight(52)
             button.setToolTip("Open all item details")
@@ -200,7 +226,7 @@ class InventoryLocationPanel(QGroupBox):
 
 
 class InventoryScreen(RepositoryBackedWidget):
-    """Location-grouped inventory journal with modal item details."""
+    """Location-grouped inventory journal with modeless item details."""
 
     def __init__(self, *, playtesting_tools: bool = False) -> None:
         super().__init__()
@@ -211,6 +237,7 @@ class InventoryScreen(RepositoryBackedWidget):
         self._inventory_items: dict[str, dict[str, Any]] = {}
         self._catalog_by_name: dict[str, dict[str, Any]] = {}
         self._denominations: list[dict[str, Any]] = []
+        self._item_detail_dialogs: dict[str, InventoryItemDetailsDialog] = {}
         self._location_sort_settings: dict[
             str,
             tuple[str, bool, str, bool],
@@ -475,6 +502,7 @@ class InventoryScreen(RepositoryBackedWidget):
                 secondary_sort_field=secondary_sort_field,
                 secondary_sort_descending=secondary_sort_descending,
                 on_sort_changed=remember_sort,
+                denominations=self._denominations,
             )
             is_unpaired_final_panel = location_count % 2 == 1 and index == location_count - 1
             column = 1 if is_unpaired_final_panel else (0 if index % 2 == 0 else 2)
@@ -502,7 +530,7 @@ class InventoryScreen(RepositoryBackedWidget):
         )
 
     def _open_item_details(self, item: dict[str, Any]) -> None:
-        """Opens one blocking item-detail dialog and primes playtesting edits."""
+        """Opens or raises a resizable, modeless item-detail pop-out."""
 
         selected_name = str(item.get("name", ""))
         self._selected_item_name = selected_name
@@ -510,28 +538,51 @@ class InventoryScreen(RepositoryBackedWidget):
             self._load_selected_item(selected_name)
         catalog_entry = item.get("catalog_entry")
         repository = self.repository()
+        image_subject_key = str(
+            (item.get("metadata") or {}).get("item_uuid", "")
+            if isinstance(item.get("metadata"), dict)
+            else ""
+        ).strip() or selected_name.casefold()
         image_asset = (
             repository.get_visual_asset(
                 "inventory",
-                str(
-                    (item.get("metadata") or {}).get("item_uuid", "")
-                    if isinstance(item.get("metadata"), dict)
-                    else ""
-                ).strip()
-                or selected_name.casefold(),
+                image_subject_key,
             )
             if repository is not None and selected_name
             else None
         )
+        dialog_key = str(item.get("id", "") or "").strip() or selected_name.casefold()
+        existing_dialog = self._item_detail_dialogs.get(dialog_key)
+        if existing_dialog is not None:
+            if existing_dialog.isVisible():
+                existing_dialog.raise_()
+                existing_dialog.activateWindow()
+                return
+            self._item_detail_dialogs.pop(dialog_key, None)
+            existing_dialog.deleteLater()
+
         dialog = InventoryItemDetailsDialog(
             item=item,
             catalog_entry=catalog_entry if isinstance(catalog_entry, dict) else None,
-            denominations=self._denominations,
             image_path=self.visual_asset_path(image_asset),
+            on_select_image=lambda: self.choose_visual_asset(
+                "inventory", image_subject_key
+            ),
+            on_create_image=(
+                lambda: self.create_visual_asset("inventory", image_subject_key)
+            )
+            if self.visual_asset_generation_enabled()
+            else None,
             show_structured_details=self.playtesting_tools,
             parent=self,
         )
-        dialog.exec()
+        dialog.finished.connect(
+            lambda _result, key=dialog_key: self._item_detail_dialogs.pop(key, None)
+        )
+        self._item_detail_dialogs[dialog_key] = dialog
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
 
     def _sync_item_editor_type(self) -> None:
         """Shows metadata fields for the selected playtesting item type."""

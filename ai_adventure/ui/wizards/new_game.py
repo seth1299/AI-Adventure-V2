@@ -211,6 +211,7 @@ class NewGameWizard(QWizard):
         api_key_path: Path | str | None = None,
         terms_acceptance_path: Path | str | None = None,
         sound_manager: SoundManagerProtocol | None = None,
+        on_save_and_exit: Callable[[dict[str, Any]], bool] | None = None,
     ) -> None:
         super().__init__(parent)
 
@@ -220,6 +221,7 @@ class NewGameWizard(QWizard):
         self.on_tts_settings_saved = on_tts_settings_saved
         self.custom_voice_storage_path = custom_voice_storage_path
         self.sound_manager = sound_manager
+        self.on_save_and_exit = on_save_and_exit
         self.api_key_path = (
             Path(api_key_path).expanduser().resolve()
             if api_key_path is not None
@@ -295,6 +297,8 @@ class NewGameWizard(QWizard):
         if self.tts_enabled:
             self._build_tts_page()
         self._build_calendar_page()
+        self._configure_tab_navigation()
+        self._configure_save_and_exit_button()
 
         self.currentIdChanged.connect(self._schedule_page_heading_style)
         self._style_current_page_headings()
@@ -302,6 +306,32 @@ class NewGameWizard(QWizard):
 
         if template_setup is not None:
             self.load_setup(template_setup)
+
+    def _configure_tab_navigation(self) -> None:
+        """Makes Tab traverse controls instead of indenting multiline editors."""
+
+        for editor_type in (QTextEdit, QPlainTextEdit):
+            for editor in self.findChildren(editor_type):
+                editor.setTabChangesFocus(True)
+
+    def _configure_save_and_exit_button(self) -> None:
+        """Adds the partial-template save action when persistence is available."""
+
+        if self.on_save_and_exit is None:
+            return
+        self.setOption(QWizard.WizardOption.HaveCustomButton1, True)
+        self.setButtonText(QWizard.WizardButton.CustomButton1, "Save + Exit")
+        self.customButtonClicked.connect(self._handle_custom_wizard_button)
+
+    def _handle_custom_wizard_button(self, button: Any) -> None:
+        """Saves the current form as a template before closing the wizard."""
+
+        button_value = getattr(button, "value", button)
+        if button_value != QWizard.WizardButton.CustomButton1.value:
+            return
+        callback = self.on_save_and_exit
+        if callback is not None and callback(self.build_template_setup()):
+            self.reject()
 
     def nextId(self) -> int:
         """Skips Party dynamically when the setup explicitly has no NPCs."""
@@ -639,7 +669,7 @@ class NewGameWizard(QWizard):
         for color_name, color_value in colors.items():
             stylesheet = stylesheet.replace(f'{{colors["{color_name}"]}}', color_value)
 
-        self.setStyleSheet(stylesheet)
+        self.setStyleSheet(_scale_stylesheet_font_sizes(stylesheet))
         self._wizard_subtitle_color = colors["placeholder"]
 
     def _schedule_page_heading_style(self, _page_id: int) -> None:
@@ -662,7 +692,8 @@ class NewGameWizard(QWizard):
             if not title_styled and label.text() == title:
                 label.setObjectName("newGameWizardPageTitle")
                 label.setStyleSheet(
-                    "font-size: 26px; font-weight: 700; padding: 8px 0 2px 0;"
+                    f"font-size: {round(26 * _active_ui_font_scale())}px; "
+                    "font-weight: 700; padding: 8px 0 2px 0;"
                 )
                 label.ensurePolished()
                 heading_width = max(320, self.width() - 100)
@@ -680,7 +711,8 @@ class NewGameWizard(QWizard):
             if not subtitle_styled and label.text() == subtitle:
                 label.setObjectName("newGameWizardPageSubtitle")
                 label.setStyleSheet(
-                    f"color: {self._wizard_subtitle_color}; font-size: 17px; "
+                    f"color: {self._wizard_subtitle_color}; font-size: "
+                    f"{round(17 * _active_ui_font_scale())}px; "
                     "padding: 0 0 10px 0;"
                 )
                 label.ensurePolished()
@@ -698,6 +730,11 @@ class NewGameWizard(QWizard):
 
     def build_setup(self) -> dict[str, Any]:
         """Builds a normalized setup dictionary from wizard fields."""
+
+        return normalize_new_game_setup(self.build_template_setup())
+
+    def build_template_setup(self) -> dict[str, Any]:
+        """Builds a raw wizard-shaped setup suitable for a partial template."""
 
         self._new_game_ai_settings = self._new_game_ai_settings_from_controls()
         self._new_game_image_settings = self._new_game_image_settings_from_controls()
@@ -803,7 +840,7 @@ class NewGameWizard(QWizard):
             "world_context": self.world_context_input.toPlainText(),
         }
 
-        return normalize_new_game_setup(setup)
+        return setup
 
     def load_setup(self, setup: dict[str, Any]) -> None:
         """Populates wizard fields from a reusable setup template."""
@@ -1093,6 +1130,8 @@ class NewGameWizard(QWizard):
         self.text_model_description.setText(str(text_model["description"]))
         self.image_model_description.setText(str(image_model["description"]))
         self.image_style_description.setText(str(image_style["description"]))
+        self._update_model_rating_bars(self.text_model_ratings, text_model, False)
+        self._update_model_rating_bars(self.image_model_ratings, image_model, True)
         self.model_tone_description.setText(str(modes["model_tone_description"]))
         self.response_length_description.setText(
             str(modes["response_length_description"])
@@ -1105,24 +1144,87 @@ class NewGameWizard(QWizard):
             + "."
         )
         enabled = self.generated_images_enabled_checkbox.isChecked()
-        self.image_model_combo.setEnabled(enabled)
-        self.image_model_description.setEnabled(enabled)
-        self.image_style_combo.setEnabled(enabled)
-        self.image_style_description.setEnabled(enabled)
+        self.image_model_field.setVisible(enabled)
+        self.image_style_field.setVisible(enabled)
 
     @staticmethod
     def _new_game_ai_choice_field(
         title: str,
         control: QWidget,
         description: QLabel,
+        details: QWidget | None = None,
     ) -> QWidget:
         field = QWidget()
         layout = QVBoxLayout(field)
         layout.setContentsMargins(0, 3, 0, 6)
         layout.addWidget(QLabel(title))
         layout.addWidget(control)
+        if details is not None:
+            layout.addWidget(details)
         layout.addWidget(description)
         return field
+
+    @staticmethod
+    def _model_rating_bars() -> QWidget:
+        """Creates the comparative rating bars shown under a model selector."""
+
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        layout.setContentsMargins(0, 2, 0, 2)
+        # Keep the rating rows readable when the application font is enlarged.
+        # A fixed 17 px height lets the format text overlap the neighboring row.
+        layout.setSpacing(6)
+        for key in ("cost_rating", "intelligence_rating", "speed_rating"):
+            bar = QProgressBar()
+            bar.setObjectName(f"model_{key}")
+            bar.setRange(0, 10)
+            bar.setValue(0)
+            bar.setTextVisible(True)
+            bar.setMinimumHeight(max(24, bar.fontMetrics().height() + 8))
+            layout.addWidget(bar)
+        return widget
+
+    @staticmethod
+    def _update_model_rating_bars(
+        widget: QWidget,
+        metadata: Any,
+        image_model: bool,
+    ) -> None:
+        """Updates bars, using Quality instead of Intelligence for images."""
+
+        labels = (
+            ("Cost", "cost_rating"),
+            (
+                "Quality" if image_model else "Intelligence",
+                "quality_rating" if image_model else "intelligence_rating",
+            ),
+            ("Speed", "speed_rating"),
+        )
+        for bar, (label, key) in zip(widget.findChildren(QProgressBar), labels):
+            value = max(0, min(10, int(metadata.get(key, 0))))
+            bar.setValue(value)
+            bar.setFormat(f"{label}: {value}/10")
+            bar.setStyleSheet(
+                "QProgressBar::chunk { background-color: "
+                f"{NewGameWizard._rating_bar_color(value, key == 'cost_rating')}; }}"
+            )
+
+    @staticmethod
+    def _rating_bar_color(value: int, inverted: bool = False) -> str:
+        """Returns a traffic-light color for a 1-to-10 model rating."""
+
+        rating = max(0, min(10, int(value)))
+        if inverted:
+            if rating <= 4:
+                return "#2eaf62"
+            if rating <= 6:
+                return "#d9a441"
+            return "#d9534f"
+        if rating >= 7:
+            return "#2eaf62"
+        if rating >= 5:
+            return "#d9a441"
+        return "#d9534f"
 
     def _build_adventure_page(self) -> None:
         """Builds the adventure/world setup page."""
@@ -2291,6 +2393,7 @@ class NewGameWizard(QWizard):
         self.text_model_description = QLabel()
         self.text_model_description.setWordWrap(True)
         self.text_model_description.setStyleSheet(description_style)
+        self.text_model_ratings = self._model_rating_bars()
 
         self.smarter_ai_checkbox = QCheckBox(
             'Do you want the A.I. to be "Smarter"?'
@@ -2308,9 +2411,13 @@ class NewGameWizard(QWizard):
         smarter_note.setStyleSheet(description_style)
 
         self.generated_images_enabled_checkbox = QCheckBox(
-            "Generate images for characters, locations, NPCs, and inventory items"
+            "Allow Gemini to generate images (local image uploads remain available)"
         )
         self.generated_images_enabled_checkbox.setChecked(True)
+        self.generated_images_enabled_checkbox.setToolTip(
+            "When disabled, all Generate Image buttons are hidden. You can still "
+            "choose and upload your own image files."
+        )
         self.image_model_combo = _NoWheelComboBox(page)
         AISettingsDialog._add_mode_options(self.image_model_combo, IMAGE_MODEL_OPTIONS)
         _set_combo_to_data(
@@ -2320,6 +2427,7 @@ class NewGameWizard(QWizard):
         self.image_model_description = QLabel()
         self.image_model_description.setWordWrap(True)
         self.image_model_description.setStyleSheet(description_style)
+        self.image_model_ratings = self._model_rating_bars()
 
         self.image_style_combo = _NoWheelComboBox(page)
         AISettingsDialog._add_mode_options(self.image_style_combo, IMAGE_STYLE_OPTIONS)
@@ -2338,34 +2446,41 @@ class NewGameWizard(QWizard):
         )
         catalog_note.setWordWrap(True)
         catalog_note.setStyleSheet(description_style)
+        rating_note = QLabel(
+            "Ratings use a comparative 10-point scale. Lower Cost is cheaper; "
+            "higher Intelligence, Quality, and Speed are better."
+        )
+        rating_note.setWordWrap(True)
+        rating_note.setStyleSheet(description_style)
 
         model_group = QGroupBox("Models")
         model_layout = QVBoxLayout(model_group)
         model_layout.addWidget(catalog_note)
+        model_layout.addWidget(rating_note)
         model_layout.addWidget(
             self._new_game_ai_choice_field(
                 "Text Model",
                 self.text_model_combo,
                 self.text_model_description,
+                self.text_model_ratings,
             )
         )
         model_layout.addWidget(self.smarter_ai_checkbox)
         model_layout.addWidget(smarter_note)
         model_layout.addWidget(self.generated_images_enabled_checkbox)
-        model_layout.addWidget(
-            self._new_game_ai_choice_field(
-                "Image Model",
-                self.image_model_combo,
-                self.image_model_description,
-            )
+        self.image_model_field = self._new_game_ai_choice_field(
+            "Image Model",
+            self.image_model_combo,
+            self.image_model_description,
+            self.image_model_ratings,
         )
-        model_layout.addWidget(
-            self._new_game_ai_choice_field(
-                "Image Style (applies to every generated image)",
-                self.image_style_combo,
-                self.image_style_description,
-            )
+        model_layout.addWidget(self.image_model_field)
+        self.image_style_field = self._new_game_ai_choice_field(
+            "Image Style (applies to every generated image)",
+            self.image_style_combo,
+            self.image_style_description,
         )
+        model_layout.addWidget(self.image_style_field)
 
         modes = normalize_ai_mode_preferences(self._new_game_ai_settings)
         self.model_tone_combo = _NoWheelComboBox(page)
@@ -2801,6 +2916,28 @@ class NewGameWizard(QWizard):
                 "tab. Python controls initiative, attacks, damage, victory, and loot."
             )
         self.combat_resolution_explanation.setText(explanation)
+        self._sync_inventory_combat_sections()
+
+    def _is_narrative_combat(self) -> bool:
+        """Returns whether Gemini, rather than deterministic Combat, resolves fights."""
+
+        return (
+            str(self.combat_resolution_mode_combo.currentData() or "strict")
+            == "narrative"
+        )
+
+    def _sync_inventory_combat_sections(self) -> None:
+        """Hides deterministic weapon/armor editors for narrative combat."""
+
+        sections = getattr(self, "_inventory_combat_sections", None)
+        if not isinstance(sections, dict):
+            return
+
+        show_deterministic_sections = not self._is_narrative_combat()
+        for widgets in sections.values():
+            for widget in widgets:
+                if widget is not None:
+                    widget.setVisible(show_deterministic_sections)
 
     def _build_inventory_currency_page(self) -> None:
         """Builds the starter inventory and currency page."""
@@ -3053,10 +3190,18 @@ class NewGameWizard(QWizard):
             )
         basic_inventory_layout.addRow("Items:", self.starter_item_suggestions_table)
         basic_inventory_layout.addRow("", _button_row(add_item_suggestion_button))
+        basic_weapon_button_row = _button_row(add_weapon_suggestion_button)
+        basic_armor_button_row = _button_row(add_armor_suggestion_button)
         basic_inventory_layout.addRow("Weapons:", self.starter_weapon_suggestions_table)
-        basic_inventory_layout.addRow("", _button_row(add_weapon_suggestion_button))
+        basic_inventory_layout.addRow("", basic_weapon_button_row)
         basic_inventory_layout.addRow("Armor:", self.starter_armor_suggestions_table)
-        basic_inventory_layout.addRow("", _button_row(add_armor_suggestion_button))
+        basic_inventory_layout.addRow("", basic_armor_button_row)
+        basic_weapon_label = basic_inventory_layout.labelForField(
+            self.starter_weapon_suggestions_table
+        )
+        basic_armor_label = basic_inventory_layout.labelForField(
+            self.starter_armor_suggestions_table
+        )
         basic_inventory_widget = QWidget()
         basic_inventory_widget.setLayout(basic_inventory_layout)
 
@@ -3064,10 +3209,18 @@ class NewGameWizard(QWizard):
         _configure_responsive_form(advanced_inventory_layout)
         advanced_inventory_layout.addRow("Items:", self.starter_items_table)
         advanced_inventory_layout.addRow("", _button_row(add_item_button))
+        advanced_weapon_button_row = _button_row(add_weapon_button)
+        advanced_armor_button_row = _button_row(add_armor_button)
         advanced_inventory_layout.addRow("Weapons:", self.starter_weapons_table)
-        advanced_inventory_layout.addRow("", _button_row(add_weapon_button))
+        advanced_inventory_layout.addRow("", advanced_weapon_button_row)
         advanced_inventory_layout.addRow("Armor:", self.starter_armor_table)
-        advanced_inventory_layout.addRow("", _button_row(add_armor_button))
+        advanced_inventory_layout.addRow("", advanced_armor_button_row)
+        advanced_weapon_label = advanced_inventory_layout.labelForField(
+            self.starter_weapons_table
+        )
+        advanced_armor_label = advanced_inventory_layout.labelForField(
+            self.starter_armor_table
+        )
         advanced_inventory_widget = QWidget()
         advanced_inventory_widget.setLayout(advanced_inventory_layout)
 
@@ -3077,6 +3230,30 @@ class NewGameWizard(QWizard):
         self.starter_inventory_mode_buttons.idClicked.connect(
             self.starter_inventory_mode_stack.setCurrentIndex
         )
+
+        self._inventory_combat_sections = {
+            "weapons": [
+                self.starter_weapon_suggestions_table,
+                add_weapon_suggestion_button,
+                basic_weapon_button_row,
+                basic_weapon_label,
+                self.starter_weapons_table,
+                add_weapon_button,
+                advanced_weapon_button_row,
+                advanced_weapon_label,
+            ],
+            "armor": [
+                self.starter_armor_suggestions_table,
+                add_armor_suggestion_button,
+                basic_armor_button_row,
+                basic_armor_label,
+                self.starter_armor_table,
+                add_armor_button,
+                advanced_armor_button_row,
+                advanced_armor_label,
+            ],
+        }
+        self._sync_inventory_combat_sections()
 
         layout = QFormLayout()
         _configure_responsive_form(layout)
@@ -3189,9 +3366,38 @@ class NewGameWizard(QWizard):
             self._test_background_ambience_preview
         )
 
+        self.music_upload_button = QPushButton("Upload Music...")
+        self.music_upload_button.clicked.connect(
+            lambda _checked=False: self._upload_audio_file("music")
+        )
+        self.sound_effects_upload_button = QPushButton("Upload Sound Effect...")
+        self.sound_effects_upload_button.clicked.connect(
+            lambda _checked=False: self._upload_audio_file("sound_effects")
+        )
+        self.background_ambience_upload_button = QPushButton(
+            "Upload Background Ambience..."
+        )
+        self.background_ambience_upload_button.clicked.connect(
+            lambda _checked=False: self._upload_audio_file("background_ambience")
+        )
+        self.audio_upload_status_label = QLabel(
+            "Uploaded files are added to the audio catalog used by this adventure."
+        )
+        self.audio_upload_status_label.setWordWrap(True)
+        importer_available = callable(
+            getattr(self.sound_manager, "import_audio_file", None)
+        )
+        for button in (
+            self.music_upload_button,
+            self.sound_effects_upload_button,
+            self.background_ambience_upload_button,
+        ):
+            button.setEnabled(importer_available)
+
         layout = QFormLayout()
         _configure_responsive_form(layout)
         layout.addRow("Background Music:", self.music_enabled_checkbox)
+        layout.addRow("Music Library:", self.music_upload_button)
         layout.addRow("Music Volume:", _slider_row(self.music_volume_slider, self.music_volume_label))
         layout.addRow("Music Preview:", self.music_test_button)
         layout.addRow("Narration Sound Effects:", self.sound_effects_enabled_checkbox)
@@ -3203,6 +3409,7 @@ class NewGameWizard(QWizard):
             ),
         )
         layout.addRow("Sound Effects Preview:", self.sound_effects_test_button)
+        layout.addRow("Sound Effect Library:", self.sound_effects_upload_button)
         layout.addRow(
             "Background Ambience:",
             self.background_ambience_enabled_checkbox,
@@ -3215,10 +3422,37 @@ class NewGameWizard(QWizard):
             ),
         )
         layout.addRow("Ambience Preview:", self.background_ambience_test_button)
+        layout.addRow(
+            "Ambience Library:",
+            _button_row(
+                self.background_ambience_upload_button,
+                self.audio_upload_status_label,
+            ),
+        )
 
         page.setLayout(layout)
 
         self.addPage(page)
+
+    def _upload_audio_file(self, category: str) -> None:
+        """Imports one user-selected audio file into the shared runtime catalog."""
+
+        importer = getattr(self.sound_manager, "import_audio_file", None)
+        if not callable(importer):
+            return
+        file_path, _selected_filter = QFileDialog.getOpenFileName(
+            self,
+            "Choose Audio File",
+            "",
+            "Audio (*.mp3 *.ogg *.wav);;All Files (*)",
+        )
+        if not file_path:
+            return
+        success, result = importer(Path(file_path), category)
+        if success:
+            self.audio_upload_status_label.setText(f"Available in this game: {result}")
+        else:
+            QMessageBox.warning(self, "Audio Import Failed", result)
 
     def _test_music_preview(self) -> None:
         if self.sound_manager is None:
@@ -3372,23 +3606,29 @@ class NewGameWizard(QWizard):
         """Reads starter item rows from the wizard table."""
 
         if self._starter_inventory_mode() == "advanced":
-            return [
-                *_starter_items_from_table(self.starter_items_table),
-                *_starter_weapons_from_table(self.starter_weapons_table),
-                *_starter_armor_from_table(self.starter_armor_table),
-            ]
+            items = _starter_items_from_table(self.starter_items_table)
+            if not self._is_narrative_combat():
+                items.extend(_starter_weapons_from_table(self.starter_weapons_table))
+                items.extend(_starter_armor_from_table(self.starter_armor_table))
+            return items
 
-        return [
+        items = [
             *_starter_suggestions_from_table(
                 self.starter_item_suggestions_table, "Item"
             ),
-            *_starter_suggestions_from_table(
-                self.starter_weapon_suggestions_table, "Weapon"
-            ),
-            *_starter_suggestions_from_table(
-                self.starter_armor_suggestions_table, "Armor"
-            ),
         ]
+        if not self._is_narrative_combat():
+            items.extend(
+                _starter_suggestions_from_table(
+                    self.starter_weapon_suggestions_table, "Weapon"
+                )
+            )
+            items.extend(
+                _starter_suggestions_from_table(
+                    self.starter_armor_suggestions_table, "Armor"
+                )
+            )
+        return items
 
     def _starter_inventory_mode(self) -> str:
         """Returns the selected Basic/Advanced starter-equipment mode."""

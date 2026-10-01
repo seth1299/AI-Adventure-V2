@@ -87,6 +87,20 @@ class StateManagerTests(unittest.TestCase):
             self.assertEqual(history_entry["message_id"], message_id)
             self.assertEqual(mechanical_event["message_id"], message_id)
 
+    def test_history_message_can_be_hidden_and_restored_without_deletion(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = SaveRepository.create_new_save(Path(temp_dir), "Hidden Message Test")
+            repository.append_history("story", "A message the player may hide.")
+            entry_id = int(repository.list_history()[-1]["id"])
+
+            self.assertTrue(repository.set_history_entry_hidden(entry_id, True))
+            hidden_entry = repository.list_history()[-1]
+            self.assertTrue(hidden_entry["hidden"])
+            self.assertEqual(hidden_entry["content"], "A message the player may hide.")
+
+            self.assertTrue(repository.set_history_entry_hidden(entry_id, False))
+            self.assertFalse(repository.list_history()[-1]["hidden"])
+
     def test_history_preserves_narration_sound_cues_for_replay(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             repository = SaveRepository.create_new_save(Path(temp_dir), "Cue Replay Test")

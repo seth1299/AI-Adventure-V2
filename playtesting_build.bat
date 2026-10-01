@@ -5,7 +5,8 @@ cd /d "%~dp0"
 
 set "APP_NAME=AI Adventure Playtesting"
 set "ENTRYPOINT=main.py"
-if not defined PYTHON set "PYTHON=python"
+if not defined PYTHON set "PYTHON=%~dp0.venv\Scripts\python.exe"
+set "PYGAME_HIDE_SUPPORT_PROMPT=1"
 set "APP_ICON=ai_adventure\data\app_icon.ico"
 set "PLAYTESTING_RUNTIME_HOOK=ai_adventure\app\pyinstaller_playtesting_runtime.py"
 set "PLAYTESTING_REQUIREMENTS=playtesting_requirements.txt"
@@ -18,6 +19,12 @@ echo.
 
 if not exist "%ENTRYPOINT%" (
     echo ERROR: Could not find "%ENTRYPOINT%".
+    exit /b 1
+)
+
+if not exist "%PYTHON%" (
+    echo ERROR: Could not find the build Python interpreter: "%PYTHON%"
+    echo Create the project virtual environment or set PYTHON explicitly before building.
     exit /b 1
 )
 
@@ -36,16 +43,7 @@ if not exist "%PLAYTESTING_REQUIREMENTS%" (
     exit /b 1
 )
 
-for /f "delims=" %%I in ('"%PYTHON%" -m site --user-site 2^>nul') do set "PYTHON_USER_SITE=%%I"
-if defined PYTHON_USER_SITE if exist "%PYTHON_USER_SITE%" (
-    if defined PYTHONPATH (
-        set "PYTHONPATH=%PYTHON_USER_SITE%;%PYTHONPATH%"
-    ) else (
-        set "PYTHONPATH=%PYTHON_USER_SITE%"
-    )
-)
-
-"%PYTHON%" -m pip install --user --disable-pip-version-check --no-input --quiet -r "%PLAYTESTING_REQUIREMENTS%"
+"%PYTHON%" -m pip install --disable-pip-version-check --no-input --quiet -r "%PLAYTESTING_REQUIREMENTS%"
 if errorlevel 1 (
     echo ERROR: Failed to install playtesting requirements.
     exit /b 1

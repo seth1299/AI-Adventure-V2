@@ -5,7 +5,8 @@ cd /d "%~dp0"
 
 set "APP_NAME=AI Adventure"
 set "ENTRYPOINT=main.py"
-if not defined PYTHON set "PYTHON=python"
+if not defined PYTHON set "PYTHON=%~dp0.venv\Scripts\python.exe"
+set "PYGAME_HIDE_SUPPORT_PROMPT=1"
 set "TTS_MODEL=ai_adventure\audio\tts\kokoro-v1.0.onnx"
 set "TTS_VOICES=ai_adventure\audio\tts\voices-v1.0.bin"
 set "APP_ICON=ai_adventure\data\app_icon.ico"
@@ -15,6 +16,12 @@ echo.
 
 if not exist "%ENTRYPOINT%" (
     echo ERROR: Could not find "%ENTRYPOINT%".
+    exit /b 1
+)
+
+if not exist "%PYTHON%" (
+    echo ERROR: Could not find the build Python interpreter: "%PYTHON%"
+    echo Create the project virtual environment or set PYTHON explicitly before building.
     exit /b 1
 )
 
@@ -28,16 +35,7 @@ if not exist "%TTS_VOICES%" (
     exit /b 1
 )
 
-for /f "delims=" %%I in ('"%PYTHON%" -m site --user-site 2^>nul') do set "PYTHON_USER_SITE=%%I"
-if defined PYTHON_USER_SITE if exist "%PYTHON_USER_SITE%" (
-    if defined PYTHONPATH (
-        set "PYTHONPATH=%PYTHON_USER_SITE%;%PYTHONPATH%"
-    ) else (
-        set "PYTHONPATH=%PYTHON_USER_SITE%"
-    )
-)
-
-"%PYTHON%" -m pip install --user --disable-pip-version-check --no-input --quiet -r requirements.txt
+"%PYTHON%" -m pip install --disable-pip-version-check --no-input --quiet -r requirements.txt
 if errorlevel 1 (
     echo ERROR: Failed to install requirements.txt.
     exit /b 1

@@ -1,6 +1,11 @@
 from __future__ import annotations
 
+import logging
+
 from ai_adventure.ui.common import *  # noqa: F401,F403
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 class MainMenuScreen(QWidget):
@@ -117,12 +122,28 @@ class MainMenuScreen(QWidget):
         """Handles the Load Game button."""
 
         db_path = self.save_combo.currentData()
+        LOGGER.info(
+            "Load Game clicked: index=%s, label=%r, data=%r, data_type=%s, "
+            "enabled=%s.",
+            self.save_combo.currentIndex(),
+            self.save_combo.currentText(),
+            db_path,
+            type(db_path).__name__,
+            self.load_button.isEnabled(),
+        )
 
         if db_path is None:
+            LOGGER.warning("Load Game aborted because no save database was selected.")
             QMessageBox.information(self, "No Save Selected", "There is no save to load.")
             return
 
-        self.on_load_game(Path(db_path))
+        resolved_path = Path(db_path).expanduser().resolve()
+        LOGGER.info(
+            "Load Game dispatching callback for database: %s (exists=%s).",
+            resolved_path,
+            resolved_path.exists(),
+        )
+        self.on_load_game(resolved_path)
 
     def _handle_rename_save(self) -> None:
         """Prompts for a new title for the selected save."""

@@ -28,6 +28,8 @@ from ai_adventure.ai.gemini_service import (
     GeminiSettings,
     build_skill_check_plan_prompt,
     build_gemini_new_game_prompt,
+    build_gemini_new_game_phase_prompt,
+    build_new_game_phase_schema,
     build_new_game_response_schema,
     build_story_response_schema,
     build_gemini_story_prompt,
@@ -38,6 +40,7 @@ from ai_adventure.ai.gemini_service import (
     parse_gemini_story_response,
     _drop_unwarranted_skill_check_events,
     _enforce_explicit_conversation_mode,
+    _filter_unsupported_crafting_suggestions,
     _filter_unwarranted_planned_skill_checks,
     _generate_new_game_response_with_quality_retry,
     _prefer_clearly_relevant_known_skill,
@@ -257,12 +260,25 @@ class GeminiServiceTests(unittest.TestCase):
         npc_payload = schema["properties"]["starting_npcs"]["items"]
         self.assertEqual(
             npc_payload["required"],
-            ["npc_id", "name", "location", "public_description", "party_member"],
+            [
+                "npc_id",
+                "name",
+                "location",
+                "public_description",
+                "player_facing_information",
+                "party_member",
+                "gender_identity",
+                "age",
+                "species",
+            ],
         )
         self.assertNotIn("display_name", npc_payload["required"])
         self.assertIn("party_combat_style", npc_payload["properties"])
         self.assertIn("party_skills", npc_payload["properties"])
         self.assertIn("gender_identity", npc_payload["properties"])
+        self.assertIn("player_facing_information", npc_payload["properties"])
+        self.assertIn("age", npc_payload["properties"])
+        self.assertIn("species", npc_payload["properties"])
         self.assertIn("starting_npcs", schema["required"])
         self.assertIn("starting_task", schema["required"])
         self.assertNotIn("events", schema["properties"])
@@ -321,7 +337,7 @@ class GeminiServiceTests(unittest.TestCase):
         self.assertNotIn("damage", api_starter_item_schema["properties"])
         self.assertIn("damage", strict_starter_item_schema["properties"])
 
-    def test_new_game_location_parser_preserves_finalized_parent_relationship(self) -> None:
+    def test_new_game_location_parser_preserves_structured_parent_relationship(self) -> None:
         locations = _parse_new_game_locations(
             [
                 {
@@ -336,7 +352,9 @@ class GeminiServiceTests(unittest.TestCase):
             "Nexus Arena Lobby",
         )
 
-        self.assertIn("Located within Aegis Core City.", locations[0]["travel_notes"])
+        self.assertTrue(locations[0]["is_sublocation"])
+        self.assertEqual(locations[0]["parent_location"], "Aegis Core City")
+        self.assertEqual(locations[0]["travel_notes"], "Reached by teleporter.")
 
     def test_new_game_parser_converts_top_level_audio_contract_to_runtime_events(self) -> None:
         result = parse_gemini_new_game_response(
@@ -453,6 +471,44 @@ class GeminiServiceTests(unittest.TestCase):
         self.assertEqual(result.suggested_actions, [])
         self.assertEqual(result.suggested_events, [])
 
+    def test_unavailable_crafting_suggestions_are_removed_by_recipe_name(self) -> None:
+        result = _filter_unsupported_crafting_suggestions(
+            AiNarrationResult(
+                narrative_text="The workbench is ready. What do you do now?",
+                suggested_actions=[
+                    "Brew Herbal Tonic.",
+                    "Brew Clear Tea.",
+                    "Inspect the workbench.",
+                ],
+                suggested_events=[],
+                out_of_game=False,
+            ),
+            {
+                "state": {
+                    "alchemy": {
+                        "crafting_status": [
+                            {
+                                "recipe_name": "Herbal Tonic",
+                                "result_item_name": "Herbal Tonic",
+                                "craftable_now": False,
+                            },
+                            {
+                                "recipe_name": "Clear Tea",
+                                "result_item_name": "Clear Tea",
+                                "craftable_now": True,
+                            },
+                        ]
+                    }
+                }
+            },
+        )
+
+        self.assertEqual(
+            result.suggested_actions,
+            ["Brew Clear Tea.", "Inspect the workbench."],
+        )
+        self.assertNotIn("Brew Herbal Tonic.", result.narrative_text)
+
     def test_story_parser_uses_explicit_mode_instead_of_model_flag(self) -> None:
         result = parse_gemini_story_response(
             json.dumps(
@@ -561,6 +617,7 @@ class GeminiServiceTests(unittest.TestCase):
                 "Main City",
                 "A large politically divided city.",
                 "Overarching Region",
+                "Guild Contact",
                 "The player's discreet guild contact.",
             ),
         )
@@ -570,6 +627,7 @@ class GeminiServiceTests(unittest.TestCase):
                 "The Rusty Dagger Inn",
                 "Main City",
                 "A large politically divided city.",
+                "Guild Contact",
                 "The player's discreet guild contact.",
             ],
         )
@@ -579,6 +637,7 @@ class GeminiServiceTests(unittest.TestCase):
                 "start_location",
                 "locations[source_index=0].name",
                 "locations[source_index=0].description",
+                "starting_npcs[0].name",
                 "starting_npcs[0].public_description",
             ],
         )
@@ -993,6 +1052,30 @@ class GeminiServiceTests(unittest.TestCase):
         self.assertIn("MusicChangedEvent", event_types)
         self.assertNotIn("SoundEffectChangedEvent", event_types)
 
+    def test_story_schema_always_allows_meaningful_npc_memory_events(self) -> None:
+        schema = build_story_response_schema(
+            {
+                "selection": {"tags": ["inventory"]},
+                "state": {
+                    "audio": {
+                        "valid_music_tracks": [],
+                        "valid_sound_effect_tracks": [],
+                        "valid_background_ambience_tracks": [],
+                    }
+                },
+            }
+        )
+        event_schema = schema["properties"]["events"]["items"]
+        branches = event_schema.get("anyOf", [event_schema])
+        event_types = {
+            branch["properties"]["type"]["enum"][0]
+            for branch in branches
+        }
+
+        self.assertIn("NpcUpsertedEvent", event_types)
+        self.assertIn("NpcKnowledgeAddedEvent", event_types)
+        self.assertIn("InventoryItemAddedEvent", event_types)
+
     def test_narrative_combat_schema_omits_combat_started_event(self) -> None:
         schema = build_story_response_schema(
             {
@@ -1254,6 +1337,36 @@ class GeminiServiceTests(unittest.TestCase):
 
         self.assertEqual(result.speaker_cues[0]["speaker_id"], "captain_orin")
         self.assertEqual(result.speaker_cues[0]["voice_profile"], "deep_masculine")
+
+    def test_new_game_parser_extracts_optional_starting_notes(self) -> None:
+        result = parse_gemini_new_game_response(
+            json.dumps(
+                {
+                    "world_summary": "A settlement facing an outbreak.",
+                    "introductory_message": "The day begins.",
+                    "starting_notes": [
+                        {
+                            "heading": "Outbreak Symptoms",
+                            "body": "Fever and confusion are commonly reported first.",
+                            "tags": ["survival", "Survival"],
+                        },
+                        {"heading": "", "body": "", "tags": []},
+                    ],
+                }
+            )
+        )
+
+        self.assertEqual(
+            result.starting_notes,
+            [
+                {
+                    "entry_id": "starting_note_1",
+                    "heading": "Outbreak Symptoms",
+                    "body": "Fever and confusion are commonly reported first.",
+                    "tags": ["survival"],
+                }
+            ],
+        )
 
     def test_new_game_starter_items_preserve_free_text_storage_location(self) -> None:
         item_schema = NEW_GAME_RESPONSE_JSON_SCHEMA["properties"]["starting_items"]["items"]
@@ -2942,6 +3055,18 @@ class GeminiServiceTests(unittest.TestCase):
             "rediscover something they knowingly did",
             secret_schema["properties"]["reveal_condition"]["description"],
         )
+        starting_notes_schema = NEW_GAME_RESPONSE_JSON_SCHEMA["properties"][
+            "starting_notes"
+        ]
+        self.assertNotIn("starting_notes", NEW_GAME_RESPONSE_JSON_SCHEMA["required"])
+        self.assertEqual(
+            starting_notes_schema["items"]["required"],
+            ["heading", "body", "tags"],
+        )
+        self.assertIn(
+            "Player Character",
+            starting_notes_schema["description"],
+        )
         self.assertIn(
             "$.status is not allowed",
             _json_schema_shape_errors(
@@ -3260,6 +3385,146 @@ class GeminiServiceTests(unittest.TestCase):
         self.assertNotIn("events", schema["properties"])
         self.assertIn('"required_output_fields"', call["contents"])
         self.assertNotIn('"character_generation"', call["contents"])
+
+    def test_staged_new_game_generation_uses_three_canonical_phases(self) -> None:
+        packet = self._completed_new_game_packet(start_location_mode="exact")
+        world_response = {
+            "world_summary": "A compact city of steep roofs and narrow alleys.",
+            "locations": [],
+            "weather": "Clear",
+            "starting_currency_balance_base_units": 20,
+        }
+        entities_response = {
+            "gm_secrets": [],
+            "miscellaneous": [],
+            "bestiary": [],
+            "starting_items": [
+                {
+                    "name": f"Useful Item {index}",
+                    "category": "Tool",
+                    "quantity": 1,
+                    "quantity_unit": "each",
+                    "storage_location": "actively_carried",
+                    "description": "A useful personal item.",
+                    "value_base_units": index + 1,
+                    "source_index": -1,
+                }
+                for index in range(5)
+            ],
+            "known_crafting_items": [],
+            "known_crafting_recipes": [],
+        }
+        opening_response = {
+            "introductory_message": "Morning light reaches the loft.",
+            "suggested_actions": ["Look outside.", "Check your gear.", "Leave quietly."],
+            "opening_cues": [],
+        }
+        fake_client_class = self._install_fake_genai_client(
+            [
+                json.dumps(world_response),
+                json.dumps(entities_response),
+                json.dumps(opening_response),
+            ]
+        )
+        progress: list[str] = []
+
+        try:
+            result = GeminiNarrationService(
+                GeminiSettings(api_key="test-key", model="gemini-3.5-flash-lite")
+            ).generate_new_game_world_staged(
+                packet,
+                progress_callback=progress.append,
+            )
+        finally:
+            self._remove_fake_genai_client()
+
+        calls = fake_client_class.last_client.models.calls
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(
+            progress,
+            [
+                "setup_compilation",
+                "world_skeleton",
+                "targeted_repairs",
+                "entities_mechanics",
+                "targeted_repairs",
+                "opening_prose",
+                "targeted_repairs",
+                "final_commit",
+            ],
+        )
+        self.assertEqual(result.world_summary, world_response["world_summary"])
+        self.assertEqual(
+            result.finalized_starter_items[0]["name"],
+            "Useful Item 0",
+        )
+        self.assertIn(opening_response["introductory_message"], result.introductory_message)
+        self.assertIn("world_skeleton", calls[0]["contents"])
+        self.assertIn("entities_mechanics", calls[1]["contents"])
+        self.assertIn("opening_prose", calls[2]["contents"])
+        self.assertIn("approved_state", calls[1]["contents"])
+        self.assertIn("approved_state", calls[2]["contents"])
+
+    def test_new_game_phase_prompt_requires_directionally_consistent_map(self) -> None:
+        prompt = build_gemini_new_game_phase_prompt(
+            {"packet_type": "new_game_setup", "setup": {}},
+            "world_skeleton",
+        )
+
+        self.assertIn("north-facing compass", prompt)
+        self.assertIn("east is right and west is left", prompt)
+        self.assertIn("Return no NPCs, creatures, items, secrets, or opening prose", prompt)
+        schema = build_new_game_phase_schema(
+            {"packet_type": "new_game_setup", "setup": {}},
+            "world_skeleton",
+        )
+        self.assertEqual(
+            set(schema["properties"]),
+            {
+                "selected_genre",
+                "world_summary",
+                "locations",
+                "start_location",
+                "weather",
+                "currency_denominations",
+                "currency_description",
+                "starting_currency_balance_base_units",
+            },
+        )
+
+    def test_staged_opening_does_not_validate_suggestions_in_prose(self) -> None:
+        packet = {
+            "packet_type": "new_game_setup",
+            "setup": {
+                "start_location": "Suggested City",
+                "start_location_mode": "suggestion",
+                "starting_locations": [
+                    {
+                        "name": "Suggested City",
+                        "description": "A city of canals and clock towers.",
+                        "location_mode": "suggestion",
+                    }
+                ],
+            },
+        }
+        opening = json.dumps(
+            {
+                "introductory_message": (
+                    "You arrive in Suggested City beneath the clock towers."
+                ),
+                "suggested_actions": [],
+                "opening_cues": [],
+            }
+        )
+
+        self.assertEqual(
+            _unfinalized_suggested_setup_paths(
+                opening,
+                packet,
+                suggestion_scopes=set(),
+            ),
+            [],
+        )
 
     def test_new_game_retries_incomplete_response_without_output_cap(self) -> None:
         packet = self._completed_new_game_packet(start_location_mode="exact")
@@ -3889,7 +4154,7 @@ class GeminiServiceTests(unittest.TestCase):
         self.assertIn("Inventory contract sentinel", prompt)
         self.assertNotIn("Filtered combat sentinel", prompt)
         self.assertIn("InventoryItemAddedEvent", prompt)
-        self.assertIn("NpcUpsertedEvent", prompt)
+        self.assertNotIn("known_event_types", prompt)
         self.assertNotIn("CombatStartedEvent", prompt)
         self.assertIn("<examples>", prompt)
         self.assertIn("<output_format>", prompt)
@@ -3908,13 +4173,38 @@ class GeminiServiceTests(unittest.TestCase):
             {
                 "packet_type": "story_turn",
                 "player_command": "Check my inventory.",
+                "conversation_mode": "live_game",
                 "selection": {"tags": ["inventory"]},
+                "creative_ideas": {
+                    "banned_terms": ["Repeated Name"],
+                    "item_examples": ["Keepsake"],
+                },
+                "recent_history": [
+                    {"kind": "story", "content": "Earlier narration."},
+                    {"kind": "player", "content": "Check my inventory."},
+                ],
                 "state": {
                     "player": {"name": "Kit"},
-                    "player_ai_preferences": {"narration_style": "present"},
+                    "player_ai_preferences": {
+                        "text_model": "internal-model-id",
+                        "narration_style": "present",
+                        "narration_style_label": "Limited",
+                        "additional_context": "Keep the tone grounded.",
+                    },
                     "scene": {"location": "Workshop"},
                     "world_profile": {"genre": "Mystery"},
-                    "inventory": {"items": [{"name": "Key"}]},
+                    "inventory": {
+                        "items": [{"name": "Key"}],
+                        "storage_locations": ["actively_carried", "Key Basket"],
+                        "rules": {"duplicate": "Do not repeat this guidance."},
+                        "detail_policy": "Duplicate detail policy.",
+                    },
+                    "merchant": {
+                        "active_npc_id": "",
+                        "profile": None,
+                        "stock": [],
+                        "buy_offers": [],
+                    },
                     "magic": {"known_spells": [{"name": "Spark"}]},
                     "active_tasks": {"tasks": [{"name": "Find the ledger"}]},
                     "miscellaneous": {"entries": [{"name": "Old faction"}]},
@@ -3924,10 +4214,54 @@ class GeminiServiceTests(unittest.TestCase):
         )
 
         self.assertIn("inventory", packet["state"])
+        self.assertEqual(
+            packet["state"]["inventory"]["storage_locations"],
+            ["actively_carried", "Key Basket"],
+        )
+        self.assertNotIn("rules", packet["state"]["inventory"])
+        self.assertNotIn("detail_policy", packet["state"]["inventory"])
         self.assertNotIn("magic", packet["state"])
         self.assertNotIn("active_tasks", packet["state"])
         self.assertNotIn("miscellaneous", packet["state"])
+        self.assertNotIn("merchant", packet["state"])
+        self.assertNotIn("text_model", packet["state"]["player_ai_preferences"])
+        self.assertIn(
+            "additional_context",
+            packet["state"]["player_ai_preferences"],
+        )
         self.assertNotIn("reference_sections", packet)
+        self.assertNotIn("selection", packet)
+        self.assertNotIn("conversation_mode", packet)
+        self.assertNotIn("banned_terms", packet["creative_ideas"])
+        self.assertEqual(packet["creative_ideas"]["item_examples"], ["Keepsake"])
+        self.assertEqual(
+            packet["recent_history"],
+            [{"kind": "story", "content": "Earlier narration."}],
+        )
+
+    def test_story_prompt_includes_merchant_only_for_merchant_turns(self) -> None:
+        packet = _story_prompt_packet(
+            {
+                "packet_type": "story_turn",
+                "player_command": "Buy a lantern.",
+                "selection": {"tags": ["merchant"]},
+                "state": {
+                    "player": {"name": "Kit"},
+                    "player_ai_preferences": {},
+                    "scene": {"location": "Market"},
+                    "world_profile": {},
+                    "merchant": {
+                        "active_npc_id": "merchant_1",
+                        "profile": {"name": "Ada"},
+                        "stock": [{"name": "Lantern", "price": 4}],
+                        "buy_offers": [],
+                    },
+                },
+                "response_contract": {},
+            }
+        )
+
+        self.assertIn("merchant", packet["state"])
         """Legacy prose assertions retained here only as migration documentation.
         self.assertIn("response", prompt)
         self.assertIn("suggested_actions", prompt)
@@ -4454,6 +4788,7 @@ class GeminiServiceTests(unittest.TestCase):
         self.assertIn("pronunciation_map", prompt)
         self.assertNotIn("Setup packet:", prompt)
         self.assertLess(len(prompt), 9_000)
+
         raw_text = json.dumps(
             {
                 "selected_genre": "Realistic detective mystery",
@@ -4738,9 +5073,9 @@ class GeminiServiceTests(unittest.TestCase):
         self.assertIn("not physical inventory", prompt)
         self.assertIn("alchemist, cook, engineer", prompt)
         """
-        self.assertEqual(
-            NEW_GAME_RESPONSE_JSON_SCHEMA["properties"]["starting_items"]["minItems"],
-            5,
+        self.assertNotIn(
+            "minItems",
+            NEW_GAME_RESPONSE_JSON_SCHEMA["properties"]["starting_items"],
         )
         starter_item_properties = NEW_GAME_RESPONSE_JSON_SCHEMA["properties"][
             "starting_items"
@@ -4769,6 +5104,8 @@ class GeminiServiceTests(unittest.TestCase):
         self.assertIn("convert it into the number of concrete", prompt)
         self.assertIn("Fuel instead of Starting Fuel Amount", prompt)
         self.assertIn("Put quantities in quantity, not name", prompt)
+        self.assertIn("must remain quantity-neutral", prompt)
+        self.assertIn("such as 'ten vials'", prompt)
         self.assertIn("currency_denominations must", prompt)
         self.assertIn("starting_currency_balance_base_units", prompt)
         self.assertIn("game_state/currency.balance", prompt)
@@ -5137,6 +5474,21 @@ class GeminiServiceTests(unittest.TestCase):
         self.assertIn("sun rises over the city", result.introductory_message)
         self.assertIn("What do you do now?\n-", result.introductory_message)
         self.assertEqual(len(result.suggested_actions), 3)
+
+    def test_new_game_prompt_serializes_banned_terms_once(self) -> None:
+        prompt = build_gemini_new_game_prompt(
+            {
+                "packet_type": "new_game_setup",
+                "creative_ideas": {
+                    "banned_terms": ["Elara"],
+                    "location_examples": ["Rainmarket"],
+                },
+                "setup": {"title": "Rainmarket"},
+            }
+        )
+
+        self.assertEqual(prompt.count('"Elara"'), 1)
+        self.assertIn('"location_examples":["Rainmarket"]', prompt)
 
     def test_parse_new_game_response_accepts_starting_inventory_alias(self) -> None:
         raw_text = json.dumps(
