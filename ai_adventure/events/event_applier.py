@@ -122,7 +122,7 @@ class EventApplier:
             Application results for every attempted event.
         """
 
-        with self.repository.message_context(self.message_id):
+        with self.repository.transaction(), self.repository.message_context(self.message_id):
             return self._apply_events(raw_events, prior_results=prior_results)
 
     def _apply_events(
@@ -181,6 +181,9 @@ class EventApplier:
                 and str(result.payload.get("outcome", "")).casefold() == "failure"
             ):
                 blocking_failure = result
+
+            if result.status == "failed":
+                raise RuntimeError(f"Failed to apply {result.event_type}: {result.message}")
 
             self.repository.append_mechanical_event(
                 result.event_type,

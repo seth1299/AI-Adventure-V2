@@ -1135,12 +1135,16 @@ class StoryScreen(RepositoryBackedWidget):
 
         self._pending_message_id = repository.create_message_id()
         self._pending_regeneration_request = None
-        StoryTurnService.record_player_action(
-            repository,
-            player_text,
-            message_id=self._pending_message_id,
-            conversation_mode=clean_mode,
-        )
+        try:
+            StoryTurnService.record_player_action(
+                repository,
+                player_text,
+                message_id=self._pending_message_id,
+                conversation_mode=clean_mode,
+            )
+        except Exception:
+            self._handle_persistence_failure()
+            return False
         self.player_input.clear()
         self._pending_skill_check_event_results = []
         self._pending_travel_request = travel_request
@@ -1268,11 +1272,15 @@ class StoryScreen(RepositoryBackedWidget):
         check_events = StoryTurnService.skill_plan_events(plan_result)
 
         if check_events:
-            self._pending_skill_check_event_results = StoryTurnService.apply_suggested_events(
-                repository,
-                message_id=pending_message_id,
-                suggested_events=check_events,
-            )
+            try:
+                self._pending_skill_check_event_results = StoryTurnService.apply_suggested_events(
+                    repository,
+                    message_id=pending_message_id,
+                    suggested_events=check_events,
+                )
+            except Exception:
+                self._handle_persistence_failure()
+                return
             LOGGER.info(
                 "Applied %s pre-narration skill check(s).",
                 len(self._pending_skill_check_event_results),
@@ -1334,25 +1342,21 @@ class StoryScreen(RepositoryBackedWidget):
 
         is_out_of_game = self._pending_conversation_mode == "out_of_game"
         message_id = self._pending_message_id or repository.create_message_id()
-        commit_result = StoryTurnService.commit_response(
-            repository,
-            result,
-            message_id=message_id,
-            conversation_mode=self._pending_conversation_mode,
-            prior_event_results=self._pending_skill_check_event_results,
-            available_voice_ids=list(
-                _narrator_voice_options(self.narration_player).values()
-            ),
-        )
+        try:
+            commit_result = StoryTurnService.commit_response(
+                repository,
+                result,
+                message_id=message_id,
+                conversation_mode=self._pending_conversation_mode,
+                prior_event_results=self._pending_skill_check_event_results,
+                available_voice_ids=list(
+                    _narrator_voice_options(self.narration_player).values()
+                ),
+            )
+        except Exception:
+            self._handle_persistence_failure()
+            return
         speaker_cues = commit_result.speaker_cues
-        if not is_out_of_game:
-            merchant_npc_id = ""
-            for cue in speaker_cues:
-                speaker_id = str(cue.get("speaker_id", "") or "").strip()
-                if speaker_id and repository.get_merchant_profile(speaker_id):
-                    merchant_npc_id = speaker_id
-                    break
-            repository.set_active_merchant_npc(merchant_npc_id or None)
         if commit_result.event_results:
             event_results = commit_result.event_results
             applied_count = sum(
@@ -1388,6 +1392,22 @@ class StoryScreen(RepositoryBackedWidget):
 
         self._set_waiting_for_gm(False)
         self.refresh()
+
+    def _handle_persistence_failure(self) -> None:
+        """Release the UI after a rolled-back commit without starting media."""
+        LOGGER.exception("Story persistence failed; transaction rolled back.")
+        self._pending_skill_check_event_results = []
+        self._pending_travel_request = None
+        self._pending_conversation_mode = "live_game"
+        self._pending_message_id = None
+        self._pending_regeneration_request = None
+        self._set_waiting_for_gm(False)
+        QMessageBox.warning(
+            self,
+            "Could not save response",
+            "The latest database operation could not be saved and was rolled back. "
+            "Please try again.",
+        )
 
     @Slot(str)
     def _handle_gemini_configuration_error(self, _message: str) -> None:

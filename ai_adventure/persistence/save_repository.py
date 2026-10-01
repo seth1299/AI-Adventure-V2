@@ -11,6 +11,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from threading import local
 from typing import Any
 
 from ai_adventure.alchemy.ingredients import (
@@ -120,6 +121,7 @@ class SaveRepository:
 
         self.db_path = db_path
         self._active_message_id: str | None = None
+        self._transaction_state = local()
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._initialize_schema()
         self.set_player_equipment(self.get_setting("player.equipment", {}))
@@ -5706,25 +5708,46 @@ class SaveRepository:
         return bool(self.get_combat_state().get("active", False))
 
     @contextmanager
-    def _connect(self) -> Iterator[sqlite3.Connection]:
-        """
-        Opens a SQLite connection and closes it after use.
+    def transaction(self) -> Iterator[sqlite3.Connection]:
+        """Share one connection and commit only at the outermost scope.
 
-        Yields:
-            SQLite connection configured with row dictionaries.
+        Scopes are local to this repository and thread. Nested scopes join the
+        outer transaction; any exception marks it for rollback even if a caller
+        catches the exception. Keep network and media work outside this scope.
         """
+        state = self._transaction_state
+        active_connection = getattr(state, "connection", None)
+        if active_connection is not None:
+            try:
+                yield active_connection
+            except BaseException:
+                state.rollback_only = True
+                raise
+            return
 
         connection = sqlite3.connect(self.db_path)
         connection.row_factory = sqlite3.Row
-
+        state.connection = connection
+        state.rollback_only = False
         try:
+            connection.execute("BEGIN")
             yield connection
+            if state.rollback_only:
+                raise RuntimeError("Repository transaction aborted after a nested failure.")
             connection.commit()
-        except Exception:
+        except BaseException:
             connection.rollback()
             raise
         finally:
+            state.connection = None
+            state.rollback_only = False
             connection.close()
+
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
+        """Join the active transaction, or commit one standalone operation."""
+        with self.transaction() as connection:
+            yield connection
 
     def _initialize_schema(self) -> None:
         """Creates database tables if they do not already exist."""

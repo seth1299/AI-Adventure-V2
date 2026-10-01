@@ -4154,7 +4154,7 @@ class GeminiServiceTests(unittest.TestCase):
         self.assertIn("Inventory contract sentinel", prompt)
         self.assertNotIn("Filtered combat sentinel", prompt)
         self.assertIn("InventoryItemAddedEvent", prompt)
-        self.assertIn("NpcUpsertedEvent", prompt)
+        self.assertNotIn("known_event_types", prompt)
         self.assertNotIn("CombatStartedEvent", prompt)
         self.assertIn("<examples>", prompt)
         self.assertIn("<output_format>", prompt)
@@ -4173,7 +4173,16 @@ class GeminiServiceTests(unittest.TestCase):
             {
                 "packet_type": "story_turn",
                 "player_command": "Check my inventory.",
+                "conversation_mode": "live_game",
                 "selection": {"tags": ["inventory"]},
+                "creative_ideas": {
+                    "banned_terms": ["Repeated Name"],
+                    "item_examples": ["Keepsake"],
+                },
+                "recent_history": [
+                    {"kind": "story", "content": "Earlier narration."},
+                    {"kind": "player", "content": "Check my inventory."},
+                ],
                 "state": {
                     "player": {"name": "Kit"},
                     "player_ai_preferences": {
@@ -4221,6 +4230,14 @@ class GeminiServiceTests(unittest.TestCase):
             packet["state"]["player_ai_preferences"],
         )
         self.assertNotIn("reference_sections", packet)
+        self.assertNotIn("selection", packet)
+        self.assertNotIn("conversation_mode", packet)
+        self.assertNotIn("banned_terms", packet["creative_ideas"])
+        self.assertEqual(packet["creative_ideas"]["item_examples"], ["Keepsake"])
+        self.assertEqual(
+            packet["recent_history"],
+            [{"kind": "story", "content": "Earlier narration."}],
+        )
 
     def test_story_prompt_includes_merchant_only_for_merchant_turns(self) -> None:
         packet = _story_prompt_packet(
@@ -4771,6 +4788,7 @@ class GeminiServiceTests(unittest.TestCase):
         self.assertIn("pronunciation_map", prompt)
         self.assertNotIn("Setup packet:", prompt)
         self.assertLess(len(prompt), 9_000)
+
         raw_text = json.dumps(
             {
                 "selected_genre": "Realistic detective mystery",
@@ -5456,6 +5474,21 @@ class GeminiServiceTests(unittest.TestCase):
         self.assertIn("sun rises over the city", result.introductory_message)
         self.assertIn("What do you do now?\n-", result.introductory_message)
         self.assertEqual(len(result.suggested_actions), 3)
+
+    def test_new_game_prompt_serializes_banned_terms_once(self) -> None:
+        prompt = build_gemini_new_game_prompt(
+            {
+                "packet_type": "new_game_setup",
+                "creative_ideas": {
+                    "banned_terms": ["Elara"],
+                    "location_examples": ["Rainmarket"],
+                },
+                "setup": {"title": "Rainmarket"},
+            }
+        )
+
+        self.assertEqual(prompt.count('"Elara"'), 1)
+        self.assertIn('"location_examples":["Rainmarket"]', prompt)
 
     def test_parse_new_game_response_accepts_starting_inventory_alias(self) -> None:
         raw_text = json.dumps(

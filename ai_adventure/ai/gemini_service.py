@@ -3465,7 +3465,7 @@ def _without_repeated_state_guidance(value: Any) -> Any:
 
 
 def _story_player_preferences(value: Any) -> dict[str, Any]:
-    """Keeps only preference fields not already rendered in the presentation block."""
+    """Keeps preferences not already rendered in the presentation block."""
 
     if not isinstance(value, dict):
         return {}
@@ -3474,11 +3474,6 @@ def _story_player_preferences(value: Any) -> dict[str, Any]:
         "narration_tense_label",
         "narration_style_label",
         "narration_style_rules",
-        "model_tone_label",
-        "model_tone_instruction",
-        "response_length_label",
-        "response_length_instruction",
-        "model_content_rules",
     )
     return {
         key: value[key]
@@ -3503,8 +3498,7 @@ def _story_prompt_packet(context_packet: dict[str, Any]) -> dict[str, Any]:
 
     always = {
         "response", "suggested_actions", "events", "status_event", "skill_checks",
-        "player_ai_preferences", "creative_ideas", "conversation_mode", "out_of_game", "event_shape",
-        "known_event_types", "speaker_cues",
+        "player_ai_preferences", "creative_ideas", "speaker_cues",
     }
     tags_by_contract = {
         "calendar_time": {"time", "events"},
@@ -3530,11 +3524,23 @@ def _story_prompt_packet(context_packet: dict[str, Any]) -> dict[str, Any]:
         filtered_contract["miscellaneous_memory"] = contract["miscellaneous_memory"]
     if "bestiary" in projected_state and "bestiary_memory" in contract:
         filtered_contract["bestiary_memory"] = contract["bestiary_memory"]
-    filtered_contract["known_event_types"] = list(
-        _story_event_type_names(context_packet)
-    )
     packet["response_contract"] = filtered_contract
     packet["state"] = projected_state
+    packet["recent_history"] = _without_repeated_current_command(
+        context_packet.get("recent_history"),
+        str(context_packet.get("player_command", "") or ""),
+    )
+    creative_ideas = packet.get("creative_ideas")
+    if isinstance(creative_ideas, dict):
+        packet["creative_ideas"] = {
+            key: value
+            for key, value in creative_ideas.items()
+            if key != "banned_terms"
+        }
+    # These fields have already served their routing purpose or are rendered in
+    # dedicated prompt sections. Serializing them again only repeats guidance.
+    packet.pop("selection", None)
+    packet.pop("conversation_mode", None)
     # Reference sections duplicate the rules authored by context_builder.py;
     # retain them in the internal packet for diagnostics, but do not serialize
     # them into the model prompt.
@@ -3542,12 +3548,41 @@ def _story_prompt_packet(context_packet: dict[str, Any]) -> dict[str, Any]:
     return packet
 
 
+def _without_repeated_current_command(value: Any, player_command: str) -> Any:
+    """Drops a trailing history copy of the command rendered in the task section."""
+
+    if not isinstance(value, list) or not value:
+        return value
+    command = " ".join(player_command.split()).casefold()
+    if not command:
+        return value
+    result = list(value)
+    last = result[-1]
+    if not isinstance(last, dict):
+        return result
+    kind = str(last.get("kind", last.get("role", "")) or "").casefold()
+    content = " ".join(
+        str(last.get("content", last.get("text", "")) or "").split()
+    ).casefold()
+    if kind in {"player", "user", "player_oog"} and content == command:
+        result.pop()
+    return result
+
+
 def _build_xml_new_game_prompt(setup_packet: dict[str, Any]) -> str:
     """Builds a concise XML-delimited new-game synthesis prompt."""
 
     banned_terms = _banned_terms_from_context(setup_packet)
+    prompt_packet = dict(setup_packet)
+    creative_ideas = prompt_packet.get("creative_ideas")
+    if isinstance(creative_ideas, dict):
+        prompt_packet["creative_ideas"] = {
+            key: value
+            for key, value in creative_ideas.items()
+            if key != "banned_terms"
+        }
     context_sections = _xml_packet_sections(
-        setup_packet,
+        prompt_packet,
         excluded_keys={"schema_version", "packet_type"},
     )
     return "\n\n".join(
@@ -5442,7 +5477,10 @@ def _skill_check_planning_packet(context_packet: dict[str, Any]) -> dict[str, An
         ],
         "gm_secrets": compact_secrets,
         "recent_checks": skills.get("recent_checks", [])[-4:],
-        "recent_history": recent_history[-1:],
+        "recent_history": _without_repeated_current_command(
+            recent_history[-1:],
+            str(context_packet.get("player_command", "") or ""),
+        ),
     }
     bestiary = state.get("bestiary", {})
     if isinstance(bestiary, dict) and bestiary.get("entries"):

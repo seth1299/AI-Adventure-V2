@@ -195,84 +195,85 @@ class NewGameService:
     ) -> NewGameCommitResult:
         """Persists a generated world and applies its authorized opening events."""
 
-        LOGGER.debug("INITIAL NEW GAME GEMINI PROMPT: \n\n%s", result)
-        NewGameService._apply_generated_state(repository, setup, result)
+        with repository.transaction():
+            LOGGER.debug("INITIAL NEW GAME GEMINI PROMPT: \n\n%s", result)
+            NewGameService._apply_generated_state(repository, setup, result)
 
-        finalized_character = getattr(result, "finalized_character", {})
-        repository.set_world_summary(
-            _preserve_player_character_text(
-                getattr(result, "world_summary", ""),
+            finalized_character = getattr(result, "finalized_character", {})
+            repository.set_world_summary(
+                _preserve_player_character_text(
+                    getattr(result, "world_summary", ""),
+                    setup,
+                    finalized_character,
+                )
+            )
+            introductory_message = _preserve_player_character_text(
+                _introductory_message_for_save(setup, result),
                 setup,
                 finalized_character,
             )
-        )
-        introductory_message = _preserve_player_character_text(
-            _introductory_message_for_save(setup, result),
-            setup,
-            finalized_character,
-        )
 
-        audio = normalize_tts_audio_fields(
-            {
-                "tts_voice": repository.get_setting(
-                    "audio.tts_voice", DEFAULT_NARRATOR_VOICE
+            audio = normalize_tts_audio_fields(
+                {
+                    "tts_voice": repository.get_setting(
+                        "audio.tts_voice", DEFAULT_NARRATOR_VOICE
+                    ),
+                    "tts_voice_mode": repository.get_setting(
+                        "audio.tts_voice_mode", "preset"
+                    ),
+                    "tts_voice_blend": repository.get_setting(
+                        "audio.tts_voice_blend", {}
+                    ),
+                    "player_tts_voice": repository.get_setting(
+                        "audio.player_tts_voice", "ai"
+                    ),
+                }
+            )
+            speaker_cues, assignments = assign_speaker_voices(
+                getattr(result, "speaker_cues", []),
+                narrator_voice=active_voice_spec_from_audio(audio),
+                available_voice_ids=available_voice_ids or [],
+                existing_assignments=repository.get_setting(
+                    "audio.speaker_voice_assignments", {}
                 ),
-                "tts_voice_mode": repository.get_setting(
-                    "audio.tts_voice_mode", "preset"
-                ),
-                "tts_voice_blend": repository.get_setting(
-                    "audio.tts_voice_blend", {}
-                ),
-                "player_tts_voice": repository.get_setting(
-                    "audio.player_tts_voice", "ai"
-                ),
-            }
-        )
-        speaker_cues, assignments = assign_speaker_voices(
-            getattr(result, "speaker_cues", []),
-            narrator_voice=active_voice_spec_from_audio(audio),
-            available_voice_ids=available_voice_ids or [],
-            existing_assignments=repository.get_setting(
-                "audio.speaker_voice_assignments", {}
-            ),
-            player_speaker_ids={
-                "player",
-                "player_character",
-                str(setup.get("character", {}).get("name", "")).casefold(),
-            },
-            player_pronouns=setup.get("character", {}).get("pronouns", "They/Them"),
-            player_voice=audio["player_tts_voice"],
-        )
-        repository.set_setting("audio.speaker_voice_assignments", assignments)
+                player_speaker_ids={
+                    "player",
+                    "player_character",
+                    str(setup.get("character", {}).get("name", "")).casefold(),
+                },
+                player_pronouns=setup.get("character", {}).get("pronouns", "They/Them"),
+                player_voice=audio["player_tts_voice"],
+            )
+            repository.set_setting("audio.speaker_voice_assignments", assignments)
 
-        message_id = repository.append_history(
-            "story",
-            introductory_message,
-            sound_effect_cues=getattr(result, "sound_effect_cues", []),
-            speaker_cues=speaker_cues,
-        )
-        event_results: list[AppliedEventResult] = []
-        suggested_events = getattr(result, "suggested_events", [])
-        if suggested_events:
-            event_results = EventApplier(
-                repository,
+            message_id = repository.append_history(
+                "story",
+                introductory_message,
+                sound_effect_cues=getattr(result, "sound_effect_cues", []),
+                speaker_cues=speaker_cues,
+            )
+            event_results: list[AppliedEventResult] = []
+            suggested_events = getattr(result, "suggested_events", [])
+            if suggested_events:
+                event_results = EventApplier(
+                    repository,
+                    message_id=message_id,
+                ).apply_events(suggested_events)
+                applied_count = sum(
+                    1 for event_result in event_results
+                    if event_result.status == "applied"
+                )
+                LOGGER.info(
+                    "Applied %s new-game event(s); skipped %s.",
+                    applied_count,
+                    len(event_results) - applied_count,
+                )
+
+            return NewGameCommitResult(
                 message_id=message_id,
-            ).apply_events(suggested_events)
-            applied_count = sum(
-                1 for event_result in event_results
-                if event_result.status == "applied"
+                speaker_cues=speaker_cues,
+                event_results=event_results,
             )
-            LOGGER.info(
-                "Applied %s new-game event(s); skipped %s.",
-                applied_count,
-                len(event_results) - applied_count,
-            )
-
-        return NewGameCommitResult(
-            message_id=message_id,
-            speaker_cues=speaker_cues,
-            event_results=event_results,
-        )
 
     @staticmethod
     def _apply_generated_state(
