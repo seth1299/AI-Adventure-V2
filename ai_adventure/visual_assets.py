@@ -357,7 +357,11 @@ def build_visual_asset_requests(
         )
 
     item_catalog = _item_catalog_by_identity(repository)
+    access_reader = getattr(repository, "inventory_access", None)
+    inventory_access = access_reader() if callable(access_reader) else {}
     for item in repository.list_inventory_items():
+        if inventory_access.get(str(item.get("id", "")), {}).get("known") is False:
+            continue
         name = str(item.get("name", "") or "").strip()
         description = _item_visual_description(item, item_catalog)
         category = str(item.get("category", "Item") or "Item").strip()

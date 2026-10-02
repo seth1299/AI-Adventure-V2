@@ -2,9 +2,9 @@
   "version": 1,
   "scenarios": [
     {
-      "id": "failed_check_not_rerolled", "context": {"player_command": "Pick the locked door.", "selection": {"tags": ["skill"]}, "state": {"skills": {"known_skills": [{"name": "Lockpicking"}], "resolved_checks_this_turn": [{"skill_name": "Lockpicking", "success": false}]}}},
-      "response": {"response": "The lock remains shut.", "suggested_actions": [], "events": [{"type": "SkillCheckRequestedEvent", "payload": {"skill_name": "Lockpicking", "difficulty": "hard"}}], "out_of_game": false},
-      "forbidden_events": ["SkillCheckRequestedEvent"]
+      "id": "failed_check_not_rerolled", "context": {"player_command": "Pick the locked door.", "selection": {"tags": ["skill"]}, "state": {"skills": {"known_skills": [{"name": "Lockpicking"}], "resolved_checks_this_turn": [{"skill_name": "Lockpicking", "success": false, "attribute": "Dexterity", "test_kind": "check"}]}}},
+      "response": {"response": "The lock remains shut.", "suggested_actions": [], "events": [{"type": "D20TestRequestedEvent", "payload": {"skill_name": "Lockpicking", "difficulty": "hard", "attribute": "Dexterity", "test_kind": "check", "reason": "Pick the locked door."}}], "out_of_game": false},
+      "forbidden_events": ["D20TestRequestedEvent"]
     },
     {
       "id": "ordinary_inventory_receipt", "context": {"player_command": "Accept the sealed letter.", "selection": {"tags": ["inventory"]}},

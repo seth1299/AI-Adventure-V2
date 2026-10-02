@@ -51,6 +51,8 @@ def has_immediate_container_unlock_method(
     for item in inventory_items:
         if not isinstance(item, Mapping):
             continue
+        if item.get("available") is False:
+            continue
 
         metadata = item.get("metadata", {})
         metadata = metadata if isinstance(metadata, Mapping) else {}

@@ -5,7 +5,7 @@ from ai_adventure.container_flow import ContainerFlowError
 from ai_adventure.ui.common import *  # noqa: F401,F403
 from ai_adventure.ui.dialogues import *  # noqa: F401,F403
 from ai_adventure.ui.workers.gemini import (
-    GeminiSkillCheckPlanWorker as _GeminiSkillCheckPlanWorker,
+    GeminiD20TestPlanWorker as _GeminiD20TestPlanWorker,
     GeminiStoryWorker as _GeminiStoryWorker,
 )
 
@@ -42,7 +42,7 @@ class StoryScreen(RepositoryBackedWidget):
         self._story_reveal_generation = 0
         self._gemini_thread: QThread | None = None
         self._gemini_worker: QObject | None = None
-        self._pending_skill_check_event_results: list[Any] = []
+        self._pending_d20_test_event_results: list[Any] = []
         self._pending_travel_request: dict[str, Any] | None = None
         self._pending_conversation_mode = "live_game"
         self._pending_message_id: str | None = None
@@ -53,7 +53,6 @@ class StoryScreen(RepositoryBackedWidget):
         self._thinking_timer = QTimer(self)
         self._thinking_timer.setInterval(GM_THINKING_TIMER_INTERVAL_MS)
         self._thinking_timer.timeout.connect(self._advance_thinking_indicator)
-        self._combat_active = False
         self._default_input_placeholder = "Enter a player action..."
         self._out_of_game_input_placeholder = "Ask the AI about the adventure..."
         self.view_hidden_messages_button = QPushButton("View Hidden Messages")
@@ -201,13 +200,11 @@ class StoryScreen(RepositoryBackedWidget):
             self.load_older_messages_button.hide()
             self.view_hidden_messages_button.hide()
             self._show_unresolved_status()
-            self._combat_active = False
             self._sync_story_input_state()
             self._update_continue_button_state()
             return
 
         state = StateManager(repository).load_state(history_limit=0)
-        self._combat_active = repository.is_combat_active()
         if self._initial_generation_pending:
             self._show_unresolved_status()
         else:
@@ -1035,7 +1032,7 @@ class StoryScreen(RepositoryBackedWidget):
                 "Python's restored state authoritative."
             ),
         }
-        self._pending_skill_check_event_results = []
+        self._pending_d20_test_event_results = []
         self._pending_travel_request = None
         self._pending_conversation_mode = "live_game"
         repository.capture_message_snapshot(self._pending_message_id)
@@ -1049,7 +1046,7 @@ class StoryScreen(RepositoryBackedWidget):
             conversation_mode="live_game",
         )
         self._apply_pending_regeneration_context(context_packet)
-        self._start_skill_check_planning_request(context_packet)
+        self._start_d20_test_planning_request(context_packet)
 
     def _apply_pending_regeneration_context(
         self,
@@ -1103,7 +1100,7 @@ class StoryScreen(RepositoryBackedWidget):
     ) -> bool:
         """Submits a Travel-tab journey with calculated logistics for Gemini."""
 
-        if self._waiting_for_gm or self._combat_active:
+        if self._waiting_for_gm:
             return False
 
         repository = self.repository()
@@ -1159,7 +1156,7 @@ class StoryScreen(RepositoryBackedWidget):
         """Records one submitted message and starts its mode-specific Gemini request."""
 
         clean_mode = "out_of_game" if conversation_mode == "out_of_game" else "live_game"
-        if self._waiting_for_gm or (self._combat_active and clean_mode == "live_game"):
+        if self._waiting_for_gm:
             return False
 
         repository = self.repository()
@@ -1186,7 +1183,7 @@ class StoryScreen(RepositoryBackedWidget):
             self._handle_persistence_failure()
             return False
         self.player_input.clear()
-        self._pending_skill_check_event_results = []
+        self._pending_d20_test_event_results = []
         self._pending_travel_request = travel_request
         self._pending_conversation_mode = clean_mode
         self._set_waiting_for_gm(True)
@@ -1205,13 +1202,13 @@ class StoryScreen(RepositoryBackedWidget):
         if clean_mode == "out_of_game":
             self._start_gemini_story_request(context_packet)
         else:
-            self._start_skill_check_planning_request(context_packet)
+            self._start_d20_test_planning_request(context_packet)
         return True
 
     def _continue_story_response(self) -> None:
         """Requests a fuller continuation of the latest story response."""
 
-        if self._waiting_for_gm or self._combat_active:
+        if self._waiting_for_gm:
             return
 
         repository = self.repository()
@@ -1226,7 +1223,7 @@ class StoryScreen(RepositoryBackedWidget):
             return
 
         player_text = self._latest_player_command() or "Continue the previous narration."
-        self._pending_skill_check_event_results = []
+        self._pending_d20_test_event_results = []
         self._pending_travel_request = None
         self._pending_conversation_mode = "live_game"
         self._pending_message_id = repository.create_message_id()
@@ -1249,7 +1246,7 @@ class StoryScreen(RepositoryBackedWidget):
         player_text: str,
         *,
         conversation_mode: str = "live_game",
-        resolved_skill_checks: list[dict[str, Any]] | None = None,
+        resolved_d20_tests: list[dict[str, Any]] | None = None,
         planner_context_tags: list[str] | None = None,
     ) -> dict[str, Any]:
         """Builds the Gemini story context packet for the current save."""
@@ -1258,20 +1255,20 @@ class StoryScreen(RepositoryBackedWidget):
             repository,
             player_text=player_text,
             conversation_mode=conversation_mode,
-            resolved_skill_checks=resolved_skill_checks,
+            resolved_d20_tests=resolved_d20_tests,
             planner_context_tags=planner_context_tags,
             sound_manager=self.sound_manager,
         )
 
-    def _start_skill_check_planning_request(self, context_packet: dict[str, Any]) -> None:
+    def _start_d20_test_planning_request(self, context_packet: dict[str, Any]) -> None:
         """Starts one background pre-narration skill-check planning request."""
 
         thread = QThread(self)
-        worker = _GeminiSkillCheckPlanWorker(context_packet, self.api_key_path)
+        worker = _GeminiD20TestPlanWorker(context_packet, self.api_key_path)
         worker.moveToThread(thread)
 
         thread.started.connect(worker.run)
-        worker.completed.connect(self._handle_skill_check_plan_result)
+        worker.completed.connect(self._handle_d20_test_plan_result)
         worker.configuration_error.connect(self._handle_gemini_configuration_error)
         worker.failed.connect(self._handle_gemini_story_failure)
         worker.finished.connect(thread.quit)
@@ -1286,13 +1283,13 @@ class StoryScreen(RepositoryBackedWidget):
         thread.start()
 
     @Slot(object)
-    def _handle_skill_check_plan_result(self, plan_result: Any) -> None:
-        """Applies planned skill checks, then starts the full narration request."""
+    def _handle_d20_test_plan_result(self, plan_result: Any) -> None:
+        """Applies planned d20 tests, then starts the full narration request."""
 
         repository = self.repository()
 
         if repository is None:
-            self._pending_skill_check_event_results = []
+            self._pending_d20_test_event_results = []
             self._set_waiting_for_gm(False)
             return
 
@@ -1320,7 +1317,7 @@ class StoryScreen(RepositoryBackedWidget):
 
         if check_events:
             try:
-                self._pending_skill_check_event_results = StoryTurnService.apply_suggested_events(
+                self._pending_d20_test_event_results = StoryTurnService.apply_suggested_events(
                     repository,
                     message_id=pending_message_id,
                     suggested_events=check_events,
@@ -1329,21 +1326,21 @@ class StoryScreen(RepositoryBackedWidget):
                 self._handle_persistence_failure()
                 return
             LOGGER.info(
-                "Applied %s pre-narration skill check(s).",
-                len(self._pending_skill_check_event_results),
+                "Applied %s pre-narration d20 test(s).",
+                len(self._pending_d20_test_event_results),
             )
             self.notify_repository_changed()
         else:
-            self._pending_skill_check_event_results = []
+            self._pending_d20_test_event_results = []
 
-        resolved_skill_checks = _resolved_skill_checks_for_context(
-            self._pending_skill_check_event_results
+        resolved_d20_tests = _resolved_d20_tests_for_context(
+            self._pending_d20_test_event_results
         )
         context_packet = self._build_story_context_packet(
             repository,
             player_text,
             conversation_mode=self._pending_conversation_mode,
-            resolved_skill_checks=resolved_skill_checks,
+            resolved_d20_tests=resolved_d20_tests,
             planner_context_tags=getattr(plan_result, "relevant_tags", None),
         )
         self._apply_pending_regeneration_context(context_packet)
@@ -1395,7 +1392,7 @@ class StoryScreen(RepositoryBackedWidget):
                 result,
                 message_id=message_id,
                 conversation_mode=self._pending_conversation_mode,
-                prior_event_results=self._pending_skill_check_event_results,
+                prior_event_results=self._pending_d20_test_event_results,
                 available_voice_ids=list(
                     _narrator_voice_options(self.narration_player).values()
                 ),
@@ -1429,7 +1426,7 @@ class StoryScreen(RepositoryBackedWidget):
             )
             self.notify_repository_changed()
 
-        self._pending_skill_check_event_results = []
+        self._pending_d20_test_event_results = []
         self._pending_travel_request = None
         self._pending_conversation_mode = "live_game"
         self._pending_message_id = None
@@ -1450,7 +1447,7 @@ class StoryScreen(RepositoryBackedWidget):
     def _handle_persistence_failure(self, message: str | None = None) -> None:
         """Release the UI after a rolled-back commit without starting media."""
         LOGGER.exception("Story persistence failed; transaction rolled back.")
-        self._pending_skill_check_event_results = []
+        self._pending_d20_test_event_results = []
         self._pending_travel_request = None
         self._pending_conversation_mode = "live_game"
         self._pending_message_id = None
@@ -1469,7 +1466,7 @@ class StoryScreen(RepositoryBackedWidget):
 
         repository = self.repository()
         is_out_of_game = self._pending_conversation_mode == "out_of_game"
-        self._pending_skill_check_event_results = []
+        self._pending_d20_test_event_results = []
         self._pending_travel_request = None
         self._pending_conversation_mode = "live_game"
         message_id = self._pending_message_id or (
@@ -1498,7 +1495,7 @@ class StoryScreen(RepositoryBackedWidget):
 
         repository = self.repository()
         is_out_of_game = self._pending_conversation_mode == "out_of_game"
-        self._pending_skill_check_event_results = []
+        self._pending_d20_test_event_results = []
         self._pending_travel_request = None
         self._pending_conversation_mode = "live_game"
         message_id = self._pending_message_id or (
@@ -1549,12 +1546,6 @@ class StoryScreen(RepositoryBackedWidget):
 
         if waiting:
             self._apply_thinking_indicator_text()
-        elif self._combat_active and self._conversation_mode() == "live_game":
-            tooltip = "Resolve the active combat in the Combat tab before sending story actions."
-            self.player_input.setPlaceholderText("Combat is active...")
-            self.player_input.setToolTip(tooltip)
-            self.submit_button.setToolTip(tooltip)
-            self.continue_button.setToolTip(tooltip)
         else:
             self.player_input.setPlaceholderText(
                 self._out_of_game_input_placeholder
@@ -1588,24 +1579,16 @@ class StoryScreen(RepositoryBackedWidget):
         self.continue_button.setToolTip(text)
 
     def _sync_story_input_state(self) -> None:
-        """Enables input according to request state, combat, and explicit mode."""
+        """Enables input according to request state and explicit mode."""
 
         is_out_of_game = self._conversation_mode() == "out_of_game"
-        can_submit = not self._waiting_for_gm and (not self._combat_active or is_out_of_game)
+        can_submit = not self._waiting_for_gm
         self.player_input.setEnabled(can_submit)
         self.submit_button.setEnabled(can_submit)
         self.mode_button.setEnabled(not self._waiting_for_gm)
 
         if self._waiting_for_gm:
             self._apply_thinking_indicator_text()
-            return
-
-        if self._combat_active and not is_out_of_game:
-            tooltip = "Resolve the active combat in the Combat tab before sending story actions."
-            self.player_input.setPlaceholderText("Combat is active...")
-            self.player_input.setToolTip(tooltip)
-            self.submit_button.setToolTip(tooltip)
-            self.continue_button.setToolTip(tooltip)
             return
 
         self.player_input.setPlaceholderText(
@@ -1630,7 +1613,6 @@ class StoryScreen(RepositoryBackedWidget):
 
         self.continue_button.setEnabled(
             not self._waiting_for_gm
-            and not self._combat_active
             and self._conversation_mode() == "live_game"
             and self.repository() is not None
             and self._latest_story_entry() is not None

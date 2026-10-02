@@ -6,7 +6,7 @@ from __future__ import annotations
 CONTEXT_TAG_DESCRIPTIONS: dict[str, str] = {
     "alchemy": "potions, mixtures, reagents, recipes, and crafting experiments",
     "character": "character-specific background, class, profession, and identity boundaries",
-    "combat": "fights, combatants, damage, and combat-state rules",
+    "combat": "narrative fighting, d20 tests, injuries, and consequences",
     "crafting": "making, repairing, or building items",
     "crime": "theft, trespass, deception, law, and criminal consequences",
     "currency": "money, denominations, prices, and monetary changes",
@@ -25,7 +25,7 @@ CONTEXT_TAG_DESCRIPTIONS: dict[str, str] = {
     "reagent": "discovering, collecting, or recording alchemical reagents",
     "recipe": "recipes, recipe discovery, and recipe ingredients",
     "scene": "scene framing, setting, and immediate narrative situation",
-    "skill": "skills, training, experience, and skill checks",
+    "skill": "skills, training, experience, and d20 tests",
     "spell": "individual spells and their learned details",
     "state": "general persistent state changes and their event representation",
     "story": "general narration and player-command handling",

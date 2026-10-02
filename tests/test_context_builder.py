@@ -71,7 +71,7 @@ class ContextBuilderTests(unittest.TestCase):
         )
 
         self.assertEqual(packet["state"]["party"]["members"][0]["npc_id"], "mira_coppercup")
-        self.assertEqual(packet["state"]["party"]["members"][0]["health_current"], 8)
+        self.assertNotIn("health_current", packet["state"]["party"]["members"][0])
         self.assertEqual(packet["state"]["party"]["members"][0]["skills"], ["Archery", "Tracking"])
         self.assertEqual(
             packet["state"]["party"]["members"][0]["equipment"][0]["name"],
@@ -91,10 +91,7 @@ class ContextBuilderTests(unittest.TestCase):
         state = AdventureState(
             settings=SettingsState(
                 values={
-                    "combat.preferences": {
-                        "resolution_mode": "narrative",
-                        "focus": "low",
-                    }
+                    "fighting.focus": "low"
                 }
             )
         )
@@ -103,10 +100,10 @@ class ContextBuilderTests(unittest.TestCase):
             ContextReferenceLoader().load_default_library()
         ).build_story_context(state, player_command="I fight the bandit.")
 
-        self.assertEqual(packet["state"]["combat"]["resolution_mode"], "narrative")
-        self.assertEqual(packet["state"]["combat"]["focus"], "low")
-        self.assertIn("Keep combat uncommon", packet["state"]["combat"]["focus_instruction"])
-        self.assertIn("narrative_combat", packet["response_contract"])
+        self.assertNotIn("combat", packet["state"])
+        self.assertEqual(packet["state"]["fighting"]["focus"], "low")
+        self.assertIn("Keep fighting uncommon", packet["state"]["fighting"]["focus_instruction"])
+        self.assertIn("narrative_fighting", packet["response_contract"])
         self.assertNotIn("combat_handoff", packet["response_contract"])
         self.assertNotIn(
             "CombatStartedEvent", packet["response_contract"]["known_event_types"]
@@ -268,7 +265,6 @@ class ContextBuilderTests(unittest.TestCase):
                 notes="Distrusts locked doors.",
                 health_current=17,
                 health_max=24,
-                armor_rating=13,
                 equipment={"Main Hand": "Lantern"},
             ),
             world=WorldState(location="Old Road", time="Dusk", weather="Rain"),
@@ -392,7 +388,7 @@ class ContextBuilderTests(unittest.TestCase):
             valid_sound_effect_tracks=["Steady Rain.wav", "Crowd Ambience.ogg"],
             valid_background_ambience_tracks=["Quiet Rain.ogg"],
             current_background_ambience="Quiet Rain.ogg",
-            resolved_skill_checks=[
+            resolved_d20_tests=[
                 {
                     "skill_name": "Foraging",
                     "roll": 20,
@@ -414,7 +410,7 @@ class ContextBuilderTests(unittest.TestCase):
         self.assertEqual(packet["state"]["player"]["notes"], "Distrusts locked doors.")
         self.assertEqual(packet["state"]["player"]["health_current"], 17)
         self.assertEqual(packet["state"]["player"]["health_max"], 24)
-        self.assertEqual(packet["state"]["player"]["armor_rating"], 13)
+        self.assertNotIn("armor_rating", packet["state"]["player"])
         self.assertEqual(packet["state"]["player"]["equipment"]["Main Hand"], "Lantern")
         self.assertEqual(
             packet["state"]["player_ai_preferences"]["additional_context"],
@@ -632,22 +628,22 @@ class ContextBuilderTests(unittest.TestCase):
         self.assertIn("skills.default_guidance", section_ids)
         self.assertIn("event.add", section_ids)
         self.assertIn("event.secret_memory", section_ids)
-        self.assertIn("skill_checks", packet["response_contract"])
+        self.assertIn("d20_tests", packet["response_contract"])
         self.assertEqual(
             packet["state"]["skills"]["resolved_checks_this_turn"][0]["roll"],
             20,
         )
         self.assertIn(
             "do not request duplicate checks",
-            packet["response_contract"]["skill_checks"],
+            packet["response_contract"]["d20_tests"],
         )
         self.assertIn(
             "meaningful uncertainty",
-            packet["response_contract"]["skill_checks"],
+            packet["response_contract"]["d20_tests"],
         )
         self.assertIn(
             "most directly relevant known skill",
-            packet["response_contract"]["skill_checks"],
+            packet["response_contract"]["d20_tests"],
         )
         self.assertIn(
             "known Foraging rather than Investigation or Perception",
@@ -784,37 +780,10 @@ class ContextBuilderTests(unittest.TestCase):
         self.assertNotIn("disposition", packet["state"]["npcs"]["relevant"][0])
         self.assertIn("ActiveTaskUpsertedEvent", packet["response_contract"]["known_event_types"])
         self.assertIn("ActiveTaskCompletedEvent", packet["response_contract"]["known_event_types"])
-        self.assertIn("CombatStartedEvent", packet["response_contract"]["known_event_types"])
-        self.assertTrue(packet["state"]["combat"]["active"])
-        self.assertEqual(packet["state"]["combat"]["round"], 2)
-        self.assertEqual(packet["state"]["combat"]["combatants"][1]["name"], "Bandit")
-        self.assertEqual(
-            packet["state"]["combat"]["combatants"][0]["threat_level"],
-            100,
-        )
-        self.assertEqual(
-            packet["state"]["combat"]["combatants"][1]["threat_level"],
-            100,
-        )
-        self.assertIn("CombatStartedEvent", packet["response_contract"]["combat_handoff"])
-        self.assertIn("to_hit_bonus", packet["state"]["combat"]["rules"])
-        self.assertIn("to_hit_bonus", packet["response_contract"]["combat_handoff"])
-        self.assertIn(
-            "initiative_bonus",
-            packet["response_contract"]["combat_handoff"],
-        )
-        self.assertIn(
-            "personality",
-            packet["response_contract"]["combat_handoff"],
-        )
-        self.assertIn(
-            "Threat Levels",
-            packet["response_contract"]["combat_handoff"],
-        )
-        self.assertIn(
-            "ammunition",
-            packet["response_contract"]["combat_handoff"],
-        )
+        self.assertNotIn("CombatStartedEvent", packet["response_contract"]["known_event_types"])
+        self.assertNotIn("combat_handoff", packet["response_contract"])
+        self.assertIn("narrative", packet["state"]["fighting"]["rules"])
+        self.assertIn("PlayerHealthChangedEvent", packet["response_contract"]["known_event_types"])
         self.assertIn(
             "For a new task, do not leave visible fields blank",
             packet["state"]["active_tasks"]["rules"]["field_completion_rule"],

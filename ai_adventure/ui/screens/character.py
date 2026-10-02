@@ -3,7 +3,6 @@ from typing import cast
 
 from ai_adventure.ui.common import *  # noqa: F401,F403
 from ai_adventure.ui.dialogues import *  # noqa: F401,F403
-from ai_adventure.ui.screens.combat import CombatScreen
 
 
 class CharacterScreen(RepositoryBackedWidget):
@@ -54,24 +53,8 @@ class CharacterScreen(RepositoryBackedWidget):
         self.health_max_input.valueChanged.connect(
             lambda _value: self._handle_character_spin_changed()
         )
-        self.initiative_bonus_input = QSpinBox()
-        self.initiative_bonus_input.setRange(-99, 99)
-        self.initiative_bonus_input.valueChanged.connect(
-            lambda _value: self._save_character()
-        )
-
-        if not self.playtesting_tools:
-            health_tooltip = (
-                "Health is managed by gameplay. Direct health editing is available "
-                "only in the Playtesting build."
-            )
-            self.health_current_input.setEnabled(False)
-            self.health_max_input.setEnabled(False)
-            self.health_current_input.setToolTip(health_tooltip)
-            self.health_max_input.setToolTip(health_tooltip)
-            self.initiative_bonus_input.setEnabled(False)
-        self.armor_rating_label = QLabel(str(DEFAULT_BASE_ARMOR_RATING))
-        self.weapon_damage_label = QLabel(DEFAULT_UNARMED_DAMAGE)
+        self.health_current_input.setEnabled(False)
+        self.health_max_input.setEnabled(False)
         self.equipment_combos: dict[str, QComboBox] = {}
         self._equipment_selection = {
             slot: ""
@@ -132,9 +115,6 @@ class CharacterScreen(RepositoryBackedWidget):
         self.stats_group = QGroupBox("Vitals")
         stats_layout = QFormLayout()
         stats_layout.addRow("Health:", _spin_pair_row(self.health_current_input, self.health_max_input))
-        stats_layout.addRow("Initiative Bonus:", self.initiative_bonus_input)
-        stats_layout.addRow("Armor Rating:", self.armor_rating_label)
-        stats_layout.addRow("Weapon Damage:", self.weapon_damage_label)
         self.stats_group.setLayout(stats_layout)
 
         self.equipment_group = QGroupBox("Equipment")
@@ -432,9 +412,6 @@ class CharacterScreen(RepositoryBackedWidget):
     ) -> None:
         """Shows only character controls relevant to the save's active systems."""
 
-        narrative_combat = bool(
-            repository is not None and CombatScreen._uses_narrative_combat(repository)
-        )
         narrator_enabled = bool(
             self.tts_enabled
             and (
@@ -446,10 +423,10 @@ class CharacterScreen(RepositoryBackedWidget):
             )
         )
         # Status is part of the profile summary in every game mode.  The
-        # combat-specific stats and equipment controls remain contextual.
+        # Derived health and held/worn gear are relevant in every game.
         self.condition_group.setVisible(True)
-        self.stats_group.setVisible(not narrative_combat)
-        self.equipment_group.setVisible(not narrative_combat)
+        self.stats_group.setVisible(True)
+        self.equipment_group.setVisible(True)
         self.name_pronunciation_label.setVisible(narrator_enabled)
         self.name_pronunciation_input.setVisible(narrator_enabled)
 
@@ -470,7 +447,6 @@ class CharacterScreen(RepositoryBackedWidget):
                 self.notes_input.clear()
                 self.health_current_input.setValue(DEFAULT_PLAYER_MAX_HEALTH)
                 self.health_max_input.setValue(DEFAULT_PLAYER_MAX_HEALTH)
-                self.initiative_bonus_input.setValue(0)
                 self._populate_equipment_combos([], empty_equipment())
                 self._sync_equipment_summary()
                 self.condition_label.setText("Healthy")
@@ -480,11 +456,8 @@ class CharacterScreen(RepositoryBackedWidget):
                 return
 
             state = StateManager(repository).load_state()
-            inventory_items = repository.list_inventory_items()
+            inventory_items = repository.list_accessible_inventory_items()
             equipment = normalize_equipment(repository.get_player_equipment(), inventory_items)
-            armor_rating = armor_rating_from_equipment(equipment, inventory_items)
-            repository.set_setting("player.armor_rating", armor_rating)
-
             self.name_input.setText(state.player.name)
             self.name_pronunciation_input.setText(state.player.name_pronunciation)
             self._set_pronouns(state.player.pronouns)
@@ -494,12 +467,6 @@ class CharacterScreen(RepositoryBackedWidget):
             self.health_max_input.setValue(max(1, int(state.player.health_max)))
             self.health_current_input.setValue(
                 max(0, min(int(state.player.health_current), self.health_max_input.value()))
-            )
-            self.initiative_bonus_input.setValue(
-                _safe_int(
-                    repository.get_setting("player.initiative_bonus", 0),
-                    0,
-                )
             )
             self._populate_equipment_combos(inventory_items, equipment)
             self._sync_equipment_summary()
@@ -566,7 +533,7 @@ class CharacterScreen(RepositoryBackedWidget):
     def _character_payload(self, repository: SaveRepository) -> dict[str, Any]:
         """Builds the character payload currently represented by the widgets."""
 
-        inventory_items = repository.list_inventory_items()
+        inventory_items = repository.list_accessible_inventory_items()
         equipment = normalize_equipment(
             {
                 slot: self.equipment_combos[slot].currentData() or ""
@@ -574,36 +541,9 @@ class CharacterScreen(RepositoryBackedWidget):
             },
             inventory_items,
         )
-        armor_rating = armor_rating_from_equipment(equipment, inventory_items)
-        if self.playtesting_tools:
-            health_max = max(1, self.health_max_input.value())
-            health_current = max(0, min(self.health_current_input.value(), health_max))
-            initiative_bonus = self.initiative_bonus_input.value()
-        else:
-            health_max = max(
-                1,
-                _safe_int(
-                    repository.get_setting(
-                        "player.health_max",
-                        DEFAULT_PLAYER_MAX_HEALTH,
-                    ),
-                    DEFAULT_PLAYER_MAX_HEALTH,
-                ),
-            )
-            health_current = max(
-                0,
-                min(
-                    _safe_int(
-                        repository.get_setting("player.health_current", health_max),
-                        health_max,
-                    ),
-                    health_max,
-                ),
-            )
-            initiative_bonus = _safe_int(
-                repository.get_setting("player.initiative_bonus", 0),
-                0,
-            )
+        stats = repository.player_stats()
+        health_max = stats["health_max"]
+        health_current = stats["health_current"]
 
         return {
             "name": self.name_input.text().strip(),
@@ -614,8 +554,6 @@ class CharacterScreen(RepositoryBackedWidget):
             "notes": self.notes_input.toPlainText().strip(),
             "health_current": health_current,
             "health_max": health_max,
-            "initiative_bonus": initiative_bonus,
-            "armor_rating": armor_rating,
             "equipment": equipment,
         }
 
@@ -656,22 +594,7 @@ class CharacterScreen(RepositoryBackedWidget):
             repository.set_setting("player.appearance", payload["appearance"])
             repository.set_setting("player.backstory", payload["backstory"])
             repository.set_setting("player.notes", payload["notes"])
-            repository.set_setting("player.health_current", payload["health_current"])
-            repository.set_setting("player.health_max", payload["health_max"])
-            repository.set_setting("player.armor_rating", payload["armor_rating"])
-
-            if self.playtesting_tools:
-                repository.set_setting(
-                    "player.initiative_bonus",
-                    payload["initiative_bonus"],
-                )
             repository.set_player_equipment(payload["equipment"])
-            self._sync_player_combatant(
-                repository,
-                payload["health_current"],
-                payload["health_max"],
-                payload["armor_rating"],
-            )
             self._last_saved_character_payload = payload
         finally:
             self._saving_character = False
@@ -763,25 +686,18 @@ class CharacterScreen(RepositoryBackedWidget):
             repository = self.repository()
 
             if repository is not None:
-                inventory_items = repository.list_inventory_items()
+                inventory_items = repository.list_accessible_inventory_items()
                 equipment = repository.set_player_equipment(
                     {
                         equipment_slot: combo.currentData() or ""
                         for equipment_slot, combo in self.equipment_combos.items()
                     }
                 )
-                armor_rating = armor_rating_from_equipment(
-                    equipment,
-                    inventory_items,
-                )
-                repository.set_setting("player.armor_rating", armor_rating)
-                self._populate_equipment_combos(inventory_items, equipment)
-                self._sync_player_combatant(
-                    repository,
-                    self.health_current_input.value(),
-                    self.health_max_input.value(),
-                    armor_rating,
-                )
+                self._populate_equipment_combos(repository.list_accessible_inventory_items(), equipment)
+        except ValueError as exc:
+            if repository is not None:
+                self._populate_equipment_combos(repository.list_accessible_inventory_items(), repository.get_player_equipment())
+            QMessageBox.warning(self, "Cannot equip item", str(exc))
         finally:
             self._loading_character = False
             self._remember_equipment_selection()
@@ -859,7 +775,7 @@ class CharacterScreen(RepositoryBackedWidget):
         if repository is None or not name:
             return None
 
-        for item in repository.list_inventory_items():
+        for item in repository.list_accessible_inventory_items():
             if str(item.get("name", "")).casefold() == name.casefold():
                 return item
 
@@ -872,73 +788,5 @@ class CharacterScreen(RepositoryBackedWidget):
             self.health_current_input.setValue(self.health_max_input.value())
 
     def _sync_equipment_summary(self) -> None:
-        """Updates computed armor and weapon labels."""
-
-        repository = self.repository()
-        inventory_items = repository.list_inventory_items() if repository is not None else []
-        equipment = normalize_equipment(
-            {
-                slot: self.equipment_combos[slot].currentData() or ""
-                for slot in EQUIPMENT_SLOTS
-            },
-            inventory_items,
-        )
-        self.armor_rating_label.setText(str(armor_rating_from_equipment(equipment, inventory_items)))
-        self.weapon_damage_label.setText(equipped_weapon_damage(equipment, inventory_items))
-
-    def _sync_player_combatant(
-        self,
-        repository: SaveRepository,
-        health_current: int,
-        health_max: int,
-        armor_rating: int,
-    ) -> None:
-        """Updates the persisted player combatant when combat is active."""
-
-        combat_state = repository.get_combat_state()
-
-        if not combat_state.get("active"):
-            return
-
-        for combatant in combat_state["combatants"]:
-            if combatant.get("id") != "player":
-                continue
-
-            inventory_items = repository.list_inventory_items()
-            equipment = repository.get_player_equipment()
-            weapon_profile = equipped_weapon_combat_profile(
-                equipment,
-                inventory_items,
-            )
-            combatant["name"] = self.name_input.text().strip() or combatant.get("name", "Player")
-            combatant["current_health"] = health_current
-            combatant["max_health"] = health_max
-            combatant["armor_rating"] = armor_rating
-            attack_skill = equipped_weapon_attack_skill(
-                equipment,
-                inventory_items,
-            )
-            combatant["to_hit_bonus"] = attack_bonus_from_skills(
-                attack_skill,
-                repository.list_skills(),
-            )
-            combatant["damage"] = equipped_weapon_damage(
-                equipment,
-                inventory_items,
-            )
-            previous_weapon_name = str(combatant.get("weapon_name", ""))
-            combatant.update(weapon_profile)
-
-            if previous_weapon_name.casefold() != str(
-                weapon_profile["weapon_name"]
-            ).casefold():
-                combatant["clip_ammo"] = int(weapon_profile["clip_size"])
-
-            combatant["initiative_bonus"] = _safe_int(
-                repository.get_setting("player.initiative_bonus", 0),
-                0,
-            )
-            combatant["defeated"] = health_current <= 0
-            break
-
-        repository.set_combat_state(combat_state)
+        """Equipment capabilities are descriptive, with no numeric fighting ratings."""
+        self._sync_health_bounds()

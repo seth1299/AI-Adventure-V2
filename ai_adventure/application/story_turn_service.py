@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
@@ -49,7 +49,7 @@ class StoryTurnService:
         player_text: str,
         *,
         conversation_mode: str = "live_game",
-        resolved_skill_checks: list[dict[str, Any]] | None = None,
+        resolved_d20_tests: list[dict[str, Any]] | None = None,
         planner_context_tags: list[str] | None = None,
         sound_manager: Any = None,
     ) -> dict[str, Any]:
@@ -106,7 +106,7 @@ class StoryTurnService:
             current_background_ambience=str(
                 repository.get_setting("audio.current_background_ambience", "")
             ),
-            resolved_skill_checks=resolved_skill_checks,
+            resolved_d20_tests=resolved_d20_tests,
             planner_context_tags=planner_context_tags,
             merchant=(lambda npc_id: {
                 "active_npc_id": npc_id,
@@ -165,11 +165,11 @@ class StoryTurnService:
 
         return [
             {
-                "type": "SkillCheckRequestedEvent",
+                "type": "D20TestRequestedEvent",
                 "payload": check,
             }
             for check in getattr(plan_result, "checks", [])
-            if isinstance(check, dict) and str(check.get("skill_name", "")).strip()
+            if isinstance(check, dict) and str(check.get("attribute", "")).strip()
         ]
 
     @staticmethod
@@ -189,14 +189,14 @@ class StoryTurnService:
         )
         return service.generate_story_response(context_packet)
 
-    def plan_skill_checks(self, context_packet: dict[str, Any]) -> Any:
+    def plan_d20_tests(self, context_packet: dict[str, Any]) -> Any:
         """Generates the pre-narration skill-check plan."""
 
         service = GeminiNarrationService(
             api_key_path=self.api_key_path,
             **({"model": self.model} if self.model else {}),
         )
-        return service.plan_story_skill_checks(context_packet)
+        return service.plan_story_d20_tests(context_packet)
 
     @staticmethod
     def apply_suggested_events(
@@ -224,13 +224,19 @@ class StoryTurnService:
         """Persists narration metadata and applies authorized game events."""
 
         with repository.transaction():
+            clean_message_id = message_id or repository.create_message_id()
+            receipt = repository.event_receipt(clean_message_id, "story_commit")
+            if receipt:
+                return StoryTurnCommitResult(message_id=clean_message_id, speaker_cues=receipt["speaker_cues"],
+                                             event_results=[AppliedEventResult(**event) for event in receipt["event_results"]])
             is_out_of_game = conversation_mode == "out_of_game"
             if not is_out_of_game:
                 inventory = repository.list_inventory_items()
                 checks = [event.payload for event in prior_event_results or []
-                          if event.event_type == "SkillCheckRequestedEvent" and event.status == "applied"]
+                          if event.event_type == "D20TestRequestedEvent" and event.status == "applied"]
                 issues = container_event_issues(list(result.suggested_events), {
-                    "state": {"inventory": {"items": inventory, "container_authority": inventory},
+                    "state": {"inventory": {"items": inventory, "container_authority": inventory, "container_items": inventory, "carrying": repository.inventory_load()},
+                              "world": {"location": repository.get_state_value("location", "")},
                               "skills": {"resolved_checks_this_turn": checks}},
                 }, narrative_text=result.narrative_text)
                 if issues:
@@ -251,7 +257,6 @@ class StoryTurnService:
                 )
             repository.set_setting("tts.pronunciation_map", pronunciation_map)
 
-            clean_message_id = message_id or repository.create_message_id()
             StoryTurnService.record_dropped_events(repository, result, message_id=clean_message_id)
             speaker_cues: list[dict[str, str]] = []
             if not is_out_of_game:
@@ -299,7 +304,9 @@ class StoryTurnService:
                     prior_results=prior_event_results,
                 )
             failed_container_events = [event for event in event_results
-                if event.event_type in {"ContainerOpenedEvent", "ContainerContentsTakenEvent"}
+                if (event.event_type in {"ContainerOpenedEvent", "ContainerContentsTakenEvent"}
+                    or event.event_type in {"InventoryItemModifiedEvent", "ItemModifiedEvent"}
+                    and (event.payload.get("new_storage_location") or event.payload.get("storage_location")))
                 and event.status != "applied" and "already open" not in event.message]
             if failed_container_events:
                 raise ContainerFlowError("Container operation failed; narration and rewards were rolled back: "
@@ -317,6 +324,7 @@ class StoryTurnService:
                     "",
                 )
                 repository.set_active_merchant_npc(merchant_npc_id or None)
+            repository.record_event_receipt(clean_message_id, "story_commit", {"speaker_cues": speaker_cues, "event_results": [asdict(event) for event in event_results]})
             return StoryTurnCommitResult(
                 message_id=clean_message_id,
                 speaker_cues=speaker_cues,

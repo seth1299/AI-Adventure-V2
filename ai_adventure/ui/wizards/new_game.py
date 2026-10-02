@@ -1,10 +1,21 @@
 from __future__ import annotations
 
+from ai_adventure.stats import ATTRIBUTES, RULES_VERSION, rank_stats, point_buy_cost, starting_attributes, attribute_modifier
+
 from ai_adventure.ui.widgets.inputs import FeatureToggleCheckBox
 from ai_adventure.audio.tts_settings import DEFAULT_TTS_VOLUME_PERCENT
 
 from ai_adventure.ui.common import *  # noqa: F401,F403
 from ai_adventure.ui.dialogues import *  # noqa: F401,F403
+
+
+class _StatsWizardPage(QWizardPage):
+    def __init__(self, owner):
+        super().__init__(owner)
+        self.owner = owner
+
+    def isComplete(self) -> bool:
+        return self.owner._point_buy_remaining() == 0
 
 
 class _GeminiApiKeyWizardPage(QWizardPage):
@@ -294,7 +305,7 @@ class NewGameWizard(QWizard):
         self._build_character_page()
         self._build_skills_page()
         self._build_magic_page()
-        self._build_combat_page()
+        self._build_fighting_page()
         self._build_inventory_currency_page()
         self._build_audio_page()
         if self.tts_enabled:
@@ -782,12 +793,15 @@ class NewGameWizard(QWizard):
                 "appearance": self.appearance_input.toPlainText(),
                 "backstory": self.backstory_input.toPlainText(),
                 "notes": self.character_notes_input.toPlainText(),
+                "attributes": {a: widget.value() for a, widget in self.attribute_inputs.items()},
             },
             "skills": skills,
             "skill_preset": str(self.skill_preset_combo.currentData() or "professional"),
             "skill_level_plan": [level for level, _name, _description in self.skill_inputs],
             "magic": self._magic_setup_from_controls(),
-            "combat": self._combat_setup_from_controls(),
+            "fighting": self._fighting_setup_from_controls(),
+            "rules_version": RULES_VERSION,
+            "rank_baseline": str(self.rank_baseline_combo.currentData() or "professional"),
             "starter_inventory_mode": self._starter_inventory_mode(),
             "starter_items": self._starter_items_from_table(),
             "starting_npcs": self._starting_npcs_from_table(),
@@ -848,7 +862,17 @@ class NewGameWizard(QWizard):
     def load_setup(self, setup: dict[str, Any]) -> None:
         """Populates wizard fields from a reusable setup template."""
 
+        if setup.get("rules_version") != RULES_VERSION:
+            raise ValueError("This template uses older rules. Create a new Stats template; no conversion is performed.")
+        # Partial templates can be completed in the wizard.
+        import copy
+        setup = copy.deepcopy(setup)
+        attributes = (setup.get("character") or {}).get("attributes")
+        if attributes:
+            setup["character"].pop("attributes", None)
         clean_setup = normalize_new_game_setup(setup)
+        if attributes:
+            clean_setup["character"]["attributes"] = attributes
         character = clean_setup["character"]
         calendar = clean_setup["calendar"]
         audio = {
@@ -911,6 +935,7 @@ class NewGameWizard(QWizard):
             clean_setup["images"],
         )
 
+        self.character_capacity_input.setValue(character.get("carrying_capacity_lb", 50))
         self.character_name_input.setText(character["name"])
         self.character_name_pronunciation_input.setText(
             character["name_pronunciation"]
@@ -920,7 +945,7 @@ class NewGameWizard(QWizard):
         self.backstory_input.setPlainText(character["backstory"])
         self.character_notes_input.setPlainText(character["notes"])
         self._load_magic_setup(clean_setup["magic"])
-        self._load_combat_setup(clean_setup["combat"])
+        self._load_fighting_setup(clean_setup["fighting"])
 
         preset_index = self.skill_preset_combo.findData(clean_setup.get("skill_preset", "professional"))
         self.skill_preset_combo.setCurrentIndex(max(0, preset_index))
@@ -939,30 +964,17 @@ class NewGameWizard(QWizard):
                 skill_input.setText(str(skill.get("name", "")))
                 description_input.setText(str(skill.get("description", "")))
 
+        _set_combo_to_data(self.rank_baseline_combo, clean_setup["rank_baseline"])
+        for attribute, value in character["attributes"].items():
+            self.attribute_inputs[attribute].setValue(value)
+        self._refresh_point_buy()
+
         self.starter_items_table.setRowCount(0)
-        self.starter_weapons_table.setRowCount(0)
-        self.starter_armor_table.setRowCount(0)
         self.starter_item_suggestions_table.setRowCount(0)
-        self.starter_weapon_suggestions_table.setRowCount(0)
-        self.starter_armor_suggestions_table.setRowCount(0)
-
         self._set_starter_inventory_mode(clean_setup["starter_inventory_mode"])
-
         for item in clean_setup["starter_items"]:
-            kind = _starter_item_kind(item)
-
             if item.get("requires_ai_invention") and item.get("item_request"):
-                suggestion_table = {
-                    "Weapon": self.starter_weapon_suggestions_table,
-                    "Armor": self.starter_armor_suggestions_table,
-                }.get(kind, self.starter_item_suggestions_table)
-                _append_starter_suggestion_table_row(
-                    suggestion_table, kind, str(item.get("item_request", ""))
-                )
-            elif kind == "Weapon":
-                self._append_starter_weapon_row(item)
-            elif kind == "Armor":
-                self._append_starter_armor_row(item)
+                _append_starter_suggestion_table_row(self.starter_item_suggestions_table, "Item", str(item["item_request"]))
             else:
                 self._append_starter_item_row(item)
 
@@ -1979,6 +1991,14 @@ class NewGameWizard(QWizard):
 
         self.appearance_input = QTextEdit()
         self.backstory_input = QTextEdit()
+        self.character_capacity_input = QDoubleSpinBox()
+        self.character_capacity_input.setRange(0, 1_000_000)
+        self.character_capacity_input.setDecimals(2)
+        self.character_capacity_input.setSuffix(" lb")
+        self.character_capacity_input.setValue(50)
+        self.character_capacity_input.setReadOnly(True)
+        self.character_capacity_input.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
+        self.character_capacity_input.setToolTip("Derived from Strength × 5 lb. Directly carried containers add bonuses.")
         self.character_notes_input = QTextEdit()
 
         self.appearance_input.setPlaceholderText("Appearance, clothing, visible traits, voice...")
@@ -1994,6 +2014,7 @@ class NewGameWizard(QWizard):
         layout.addRow("Custom Pronouns:", self.character_custom_pronouns_input)
         layout.addRow("Appearance:", self.appearance_input)
         layout.addRow("Backstory:", self.backstory_input)
+        layout.addRow("Base carrying capacity:", self.character_capacity_input)
         layout.addRow("Notes:", self.character_notes_input)
         self._sync_character_pronoun_controls()
         page.setLayout(layout)
@@ -2038,8 +2059,8 @@ class NewGameWizard(QWizard):
     def _build_skills_page(self) -> None:
         """Builds the starting skills page."""
 
-        page = QWizardPage()
-        page.setTitle("Skills")
+        page = _StatsWizardPage(self)
+        page.setTitle("Stats and Skills")
         page.setSubTitle("Choose a starting experience profile, then name and describe its skills.")
 
         self.skill_inputs: list[tuple[int, QLineEdit, QLineEdit]] = []
@@ -2061,6 +2082,32 @@ class NewGameWizard(QWizard):
             self.skill_preset_combo.addItem(label, key)
         layout.addWidget(QLabel("Starting Skill Profile"))
         layout.addWidget(self.skill_preset_combo)
+        self.stats_page = page
+        self.rank_baseline_combo = _NoWheelComboBox()
+        for key in ("professional", "experienced", "average", "beginner", "blank"):
+            self.rank_baseline_combo.addItem(key.title(), key)
+        self.rank_baseline_combo.currentIndexChanged.connect(self._reset_point_buy)
+        layout.addWidget(QLabel("Custom rank baseline"))
+        layout.addWidget(self.rank_baseline_combo)
+        self.attribute_inputs = {}
+        attribute_form = QFormLayout()
+        for attribute in ATTRIBUTES:
+            control = _NoWheelSpinBox()
+            control.setRange(8, 18)
+            control.setValue(8)
+            control.valueChanged.connect(self._refresh_point_buy)
+            self.attribute_inputs[attribute] = control
+            attribute_form.addRow(attribute, control)
+        self.point_buy_summary = QLabel()
+        self.point_buy_summary.setWordWrap(True)
+        layout.addLayout(attribute_form)
+        layout.addWidget(self.point_buy_summary)
+        reset = QPushButton("Reset attributes to 8")
+        reset.clicked.connect(lambda: self._reset_point_buy(blank=True))
+        allocate = QPushButton("Allocate balanced attributes")
+        allocate.clicked.connect(lambda: self._reset_point_buy())
+        layout.addWidget(_button_row(reset, allocate))
+
 
         for level in range(5, 0, -1):
             group = QGroupBox(f"Level {level}")
@@ -2179,6 +2226,36 @@ class NewGameWizard(QWizard):
                 parent_widget.setVisible(is_custom or count > 0)
             self.skill_table_controls[level].setVisible(is_custom)
         self._sync_starting_skill_inputs()
+        self._reset_point_buy()
+
+    def _point_buy_remaining(self) -> int:
+        budget, _ = rank_stats(str(self.skill_preset_combo.currentData()), str(self.rank_baseline_combo.currentData()))
+        return budget - point_buy_cost({a: w.value() for a, w in self.attribute_inputs.items()})
+
+    def _reset_point_buy(self, _index=None, *, blank=False) -> None:
+        if not hasattr(self, "attribute_inputs"):
+            return
+        budget, _ = rank_stats(str(self.skill_preset_combo.currentData()), str(self.rank_baseline_combo.currentData()))
+        attributes = {a: 8 for a in ATTRIBUTES} if blank else starting_attributes(budget)
+        for a, control in self.attribute_inputs.items():
+            control.blockSignals(True)
+            control.setValue(attributes[a])
+            control.blockSignals(False)
+        self.rank_baseline_combo.setEnabled(self.skill_preset_combo.currentData() == "custom")
+        self._refresh_point_buy()
+
+    def _refresh_point_buy(self, _value=None) -> None:
+        if not hasattr(self, "point_buy_summary"):
+            return
+        attributes = {a: w.value() for a, w in self.attribute_inputs.items()}
+        budget, level = rank_stats(str(self.skill_preset_combo.currentData()), str(self.rank_baseline_combo.currentData()))
+        remaining = self._point_buy_remaining()
+        self.point_buy_summary.setText(f"Budget {budget} · Remaining {remaining} · Starting Player Level {level}\n"
+            + " | ".join(f"{a} {attribute_modifier(v):+d}" for a, v in attributes.items())
+            + f"\nHealth {2 * attributes['Constitution']} · Base capacity {5 * attributes['Strength']} lb")
+        self.point_buy_summary.setStyleSheet("color: #ef4444;" if remaining < 0 else "")
+        self.character_capacity_input.setValue(5 * attributes["Strength"])
+        self.stats_page.completeChanged.emit()
 
     def _build_magic_page(self) -> None:
         """Builds world magic and optional starting player-spell controls."""
@@ -2833,114 +2910,26 @@ class NewGameWizard(QWizard):
         )
         self.starting_spells_group.setVisible(show_player_casting_controls)
 
-    def _build_combat_page(self) -> None:
-        """Builds the player-facing combat focus and resolution page."""
-
+    def _build_fighting_page(self) -> None:
         page = QWizardPage()
-        page.setTitle("Combat")
-        page.setSubTitle(
-            "Choose how prominent combat should be and who resolves actual fights."
-        )
-
-        self.combat_focus_combo = QComboBox()
-        for focus in COMBAT_FOCUS_LEVELS:
-            self.combat_focus_combo.addItem(COMBAT_FOCUS_LABELS[focus], focus)
-
-        self.combat_resolution_mode_combo = QComboBox()
-        for mode in COMBAT_RESOLUTION_MODES:
-            self.combat_resolution_mode_combo.addItem(
-                COMBAT_RESOLUTION_MODE_LABELS[mode], mode
-            )
-
-        self.combat_resolution_explanation = QLabel()
-        self.combat_resolution_explanation.setWordWrap(True)
-
-        form = QFormLayout()
-        _configure_responsive_form(form)
-        form.addRow("Combat Focus:", self.combat_focus_combo)
-        form.addRow("Combat Resolution:", self.combat_resolution_mode_combo)
-        form.addRow(self.combat_resolution_explanation)
-
-        content = QWidget()
-        content.setLayout(form)
-        layout = QVBoxLayout()
-        introduction = QLabel(
-            "Combat Focus influences how often the adventure presents fights. "
-            "Combat Resolution determines whether fights use the deterministic "
-            "Combat tab or remain part of Gemini's narration."
-        )
-        introduction.setWordWrap(True)
-        layout.addWidget(introduction)
-        layout.addWidget(content)
-        layout.addStretch()
-        page.setLayout(layout)
-
-        self.combat_resolution_mode_combo.currentIndexChanged.connect(
-            self._sync_combat_explanation
-        )
-        self._sync_combat_explanation()
+        page.setTitle("Fighting frequency")
+        page.setSubTitle("Fights are narrated; the application resolves uncertain d20 tests and tracks consequences.")
+        self.fighting_focus_combo = QComboBox()
+        for focus in FIGHTING_FOCUS_LEVELS:
+            self.fighting_focus_combo.addItem(FIGHTING_FOCUS_LABELS[focus], focus)
+        _set_combo_to_data(self.fighting_focus_combo, "balanced")
+        form = QFormLayout(page)
+        form.addRow("Fighting frequency:", self.fighting_focus_combo)
         self.addPage(page)
 
-    def _combat_setup_from_controls(self) -> dict[str, str]:
-        """Serializes the Wizard's combat preferences."""
+    def _fighting_setup_from_controls(self) -> dict[str, str]:
+        return {"focus": str(self.fighting_focus_combo.currentData() or "balanced")}
 
-        return {
-            "focus": str(self.combat_focus_combo.currentData() or "balanced"),
-            "resolution_mode": str(
-                self.combat_resolution_mode_combo.currentData() or "strict"
-            ),
-        }
+    def _load_fighting_setup(self, preferences: dict[str, Any]) -> None:
+        _set_combo_to_data(self.fighting_focus_combo, preferences.get("focus", "balanced"))
 
-    def _load_combat_setup(self, combat: dict[str, Any]) -> None:
-        """Loads normalized combat preferences into Wizard controls."""
 
-        _set_combo_to_data(
-            self.combat_focus_combo,
-            str(combat.get("focus", "balanced")),
-        )
-        _set_combo_to_data(
-            self.combat_resolution_mode_combo,
-            str(combat.get("resolution_mode", "strict")),
-        )
-        self._sync_combat_explanation()
 
-    def _sync_combat_explanation(self, _value: Any = None) -> None:
-        """Explains the behavior controlled by the selected resolution mode."""
-
-        mode = str(self.combat_resolution_mode_combo.currentData() or "strict")
-        if mode == "narrative":
-            explanation = (
-                "Gemini narrates and resolves fights as part of the story. It will "
-                "not start the deterministic Combat tab or use CombatStartedEvent."
-            )
-        else:
-            explanation = (
-                "When a fight begins, Gemini hands it to the deterministic Combat "
-                "tab. Python controls initiative, attacks, damage, victory, and loot."
-            )
-        self.combat_resolution_explanation.setText(explanation)
-        self._sync_inventory_combat_sections()
-
-    def _is_narrative_combat(self) -> bool:
-        """Returns whether Gemini, rather than deterministic Combat, resolves fights."""
-
-        return (
-            str(self.combat_resolution_mode_combo.currentData() or "strict")
-            == "narrative"
-        )
-
-    def _sync_inventory_combat_sections(self) -> None:
-        """Hides deterministic weapon/armor editors for narrative combat."""
-
-        sections = getattr(self, "_inventory_combat_sections", None)
-        if not isinstance(sections, dict):
-            return
-
-        show_deterministic_sections = not self._is_narrative_combat()
-        for widgets in sections.values():
-            for widget in widgets:
-                if widget is not None:
-                    widget.setVisible(show_deterministic_sections)
 
     def _build_inventory_currency_page(self) -> None:
         """Builds the starter inventory and currency page."""
@@ -2952,9 +2941,9 @@ class NewGameWizard(QWizard):
             "the Player's starting wealth."
         )
 
-        self.starter_items_table = _AppTableWidget(0, 7)
+        self.starter_items_table = _AppTableWidget(0, 9)
         self.starter_items_table.setHorizontalHeaderLabels(
-            ["Name", "Amount", "Category", "Description", "Value", "Storage", "Remove"]
+            ["Name", "Amount", "Category", "Description", "Value", "Storage", "Moveable", "Storable", "Remove"]
         )
         self.starter_items_table.setMinimumHeight(170)
         self.starter_items_table.verticalHeader().setVisible(False)
@@ -2967,7 +2956,7 @@ class NewGameWizard(QWizard):
         _configure_responsive_table(
             self.starter_items_table,
             stretch_columns={0, 2, 3, 5},
-            compact_columns={1, 4, 6},
+            compact_columns={1, 4, 6, 7, 8},
         )
 
         add_item_button = QPushButton("Add Item")
@@ -2978,68 +2967,6 @@ class NewGameWizard(QWizard):
         add_item_suggestion_button.clicked.connect(
             lambda: _append_starter_suggestion_table_row(
                 self.starter_item_suggestions_table, "Item"
-            )
-        )
-
-        self.starter_weapons_table = _AppTableWidget(0, 9)
-        self.starter_weapons_table.setHorizontalHeaderLabels(
-            [
-                "Name",
-                "Amount",
-                "Hands",
-                "Damage",
-                "Skill",
-                "Range",
-                "Ammo Type",
-                "Clip Size",
-                "Remove",
-            ]
-        )
-        _configure_inline_table(
-            self.starter_weapons_table,
-            STARTER_WEAPON_COLUMN_WIDTHS,
-            minimum_height=150,
-        )
-        _configure_responsive_table(
-            self.starter_weapons_table,
-            stretch_columns={0, 3, 4, 5, 6},
-            compact_columns={1, 2, 7, 8},
-        )
-
-        add_weapon_button = QPushButton("Add Weapon")
-        add_weapon_button.clicked.connect(lambda: self._append_starter_weapon_row({}))
-
-        self.starter_weapon_suggestions_table = _build_starter_suggestion_table("Weapon")
-        add_weapon_suggestion_button = QPushButton("Add Weapon Idea")
-        add_weapon_suggestion_button.clicked.connect(
-            lambda: _append_starter_suggestion_table_row(
-                self.starter_weapon_suggestions_table, "Weapon"
-            )
-        )
-
-        self.starter_armor_table = _AppTableWidget(0, 6)
-        self.starter_armor_table.setHorizontalHeaderLabels(
-            ["Name", "Amount", "Covers", "Armor Bonus", "Value", "Remove"]
-        )
-        _configure_inline_table(
-            self.starter_armor_table,
-            STARTER_ARMOR_COLUMN_WIDTHS,
-            minimum_height=130,
-        )
-        _configure_responsive_table(
-            self.starter_armor_table,
-            stretch_columns={0, 2},
-            compact_columns={1, 3, 4, 5},
-        )
-
-        add_armor_button = QPushButton("Add Armor")
-        add_armor_button.clicked.connect(lambda: self._append_starter_armor_row({}))
-
-        self.starter_armor_suggestions_table = _build_starter_suggestion_table("Armor")
-        add_armor_suggestion_button = QPushButton("Add Armor Idea")
-        add_armor_suggestion_button.clicked.connect(
-            lambda: _append_starter_suggestion_table_row(
-                self.starter_armor_suggestions_table, "Armor"
             )
         )
 
@@ -3180,31 +3107,9 @@ class NewGameWizard(QWizard):
 
         basic_inventory_layout = QFormLayout()
         _configure_responsive_form(basic_inventory_layout)
-        for suggestion_table in (
-            self.starter_item_suggestions_table,
-            self.starter_weapon_suggestions_table,
-            self.starter_armor_suggestions_table,
-        ):
-            suggestion_table.setMaximumHeight(16777215)
-            _configure_responsive_table(
-                suggestion_table,
-                stretch_columns={0},
-                compact_columns={1},
-            )
-        basic_inventory_layout.addRow("Items:", self.starter_item_suggestions_table)
+        _configure_responsive_table(self.starter_item_suggestions_table, stretch_columns={0}, compact_columns={1})
+        basic_inventory_layout.addRow("Item / equipment ideas:", self.starter_item_suggestions_table)
         basic_inventory_layout.addRow("", _button_row(add_item_suggestion_button))
-        basic_weapon_button_row = _button_row(add_weapon_suggestion_button)
-        basic_armor_button_row = _button_row(add_armor_suggestion_button)
-        basic_inventory_layout.addRow("Weapons:", self.starter_weapon_suggestions_table)
-        basic_inventory_layout.addRow("", basic_weapon_button_row)
-        basic_inventory_layout.addRow("Armor:", self.starter_armor_suggestions_table)
-        basic_inventory_layout.addRow("", basic_armor_button_row)
-        basic_weapon_label = basic_inventory_layout.labelForField(
-            self.starter_weapon_suggestions_table
-        )
-        basic_armor_label = basic_inventory_layout.labelForField(
-            self.starter_armor_suggestions_table
-        )
         basic_inventory_widget = QWidget()
         basic_inventory_widget.setLayout(basic_inventory_layout)
 
@@ -3212,18 +3117,6 @@ class NewGameWizard(QWizard):
         _configure_responsive_form(advanced_inventory_layout)
         advanced_inventory_layout.addRow("Items:", self.starter_items_table)
         advanced_inventory_layout.addRow("", _button_row(add_item_button))
-        advanced_weapon_button_row = _button_row(add_weapon_button)
-        advanced_armor_button_row = _button_row(add_armor_button)
-        advanced_inventory_layout.addRow("Weapons:", self.starter_weapons_table)
-        advanced_inventory_layout.addRow("", advanced_weapon_button_row)
-        advanced_inventory_layout.addRow("Armor:", self.starter_armor_table)
-        advanced_inventory_layout.addRow("", advanced_armor_button_row)
-        advanced_weapon_label = advanced_inventory_layout.labelForField(
-            self.starter_weapons_table
-        )
-        advanced_armor_label = advanced_inventory_layout.labelForField(
-            self.starter_armor_table
-        )
         advanced_inventory_widget = QWidget()
         advanced_inventory_widget.setLayout(advanced_inventory_layout)
 
@@ -3233,30 +3126,6 @@ class NewGameWizard(QWizard):
         self.starter_inventory_mode_buttons.idClicked.connect(
             self.starter_inventory_mode_stack.setCurrentIndex
         )
-
-        self._inventory_combat_sections = {
-            "weapons": [
-                self.starter_weapon_suggestions_table,
-                add_weapon_suggestion_button,
-                basic_weapon_button_row,
-                basic_weapon_label,
-                self.starter_weapons_table,
-                add_weapon_button,
-                advanced_weapon_button_row,
-                advanced_weapon_label,
-            ],
-            "armor": [
-                self.starter_armor_suggestions_table,
-                add_armor_suggestion_button,
-                basic_armor_button_row,
-                basic_armor_label,
-                self.starter_armor_table,
-                add_armor_button,
-                advanced_armor_button_row,
-                advanced_armor_label,
-            ],
-        }
-        self._sync_inventory_combat_sections()
 
         layout = QFormLayout()
         _configure_responsive_form(layout)
@@ -3620,32 +3489,9 @@ class NewGameWizard(QWizard):
         _remove_table_row_by_button(self.starter_items_table, button)
 
     def _starter_items_from_table(self) -> list[dict[str, Any]]:
-        """Reads starter item rows from the wizard table."""
-
         if self._starter_inventory_mode() == "advanced":
-            items = _starter_items_from_table(self.starter_items_table)
-            if not self._is_narrative_combat():
-                items.extend(_starter_weapons_from_table(self.starter_weapons_table))
-                items.extend(_starter_armor_from_table(self.starter_armor_table))
-            return items
-
-        items = [
-            *_starter_suggestions_from_table(
-                self.starter_item_suggestions_table, "Item"
-            ),
-        ]
-        if not self._is_narrative_combat():
-            items.extend(
-                _starter_suggestions_from_table(
-                    self.starter_weapon_suggestions_table, "Weapon"
-                )
-            )
-            items.extend(
-                _starter_suggestions_from_table(
-                    self.starter_armor_suggestions_table, "Armor"
-                )
-            )
-        return items
+            return _starter_items_from_table(self.starter_items_table)
+        return _starter_suggestions_from_table(self.starter_item_suggestions_table, "Item")
 
     def _starter_inventory_mode(self) -> str:
         """Returns the selected Basic/Advanced starter-equipment mode."""
@@ -3664,33 +3510,9 @@ class NewGameWizard(QWizard):
         self.starter_inventory_basic_button.setChecked(not is_advanced)
         self.starter_inventory_mode_stack.setCurrentIndex(1 if is_advanced else 0)
 
-    def _append_starter_weapon_row(self, item: dict[str, Any]) -> None:
-        """Adds a starter weapon row to the wizard table."""
 
-        _append_starter_weapon_table_row(
-            self.starter_weapons_table,
-            item,
-            self._remove_starter_weapon_row,
-        )
 
-    def _remove_starter_weapon_row(self, button: QPushButton) -> None:
-        """Removes the starter weapon row containing button."""
 
-        _remove_table_row_by_button(self.starter_weapons_table, button)
-
-    def _append_starter_armor_row(self, item: dict[str, Any]) -> None:
-        """Adds a starter armor row to the wizard table."""
-
-        _append_starter_armor_table_row(
-            self.starter_armor_table,
-            item,
-            self._remove_starter_armor_row,
-        )
-
-    def _remove_starter_armor_row(self, button: QPushButton) -> None:
-        """Removes the starter armor row containing button."""
-
-        _remove_table_row_by_button(self.starter_armor_table, button)
 
     def _append_currency_row(self, denomination: dict[str, Any]) -> None:
         """Adds a currency denomination row to the wizard table."""

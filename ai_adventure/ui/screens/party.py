@@ -10,14 +10,12 @@ class PartyScreen(RepositoryBackedWidget):
     def __init__(self) -> None:
         super().__init__()
 
-        self.table = _AppTableWidget(0, 9)
+        self.table = _AppTableWidget(0, 7)
         self.table.setHorizontalHeaderLabels(
             [
                 "Name",
                 "Status",
-                "Health",
-                "Armor Class",
-                "Combat Style",
+                "Capabilities",
                 "Skills",
                 "Description",
                 "Equipment",
@@ -26,7 +24,7 @@ class PartyScreen(RepositoryBackedWidget):
         )
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
-        _configure_wrapping_table(self.table, {4, 5, 6, 7})
+        _configure_wrapping_table(self.table, {2, 3, 4, 5})
 
         explanation = QLabel(
             "Party members are shared NPC identities. Names and descriptions come "
@@ -50,19 +48,9 @@ class PartyScreen(RepositoryBackedWidget):
         members = repository.list_party_members()
         self.table.setRowCount(len(members))
         for row_index, member in enumerate(members):
-            health_current = _safe_int(member.get("health_current"), -1)
-            health_max = _safe_int(member.get("health_max"), -1)
-            health = (
-                f"{health_current}/{health_max}"
-                if health_current >= 0 and health_max >= 0
-                else "N/A"
-            )
-            armor_class = _safe_int(member.get("armor_class"), -1)
             values = (
                 member.get("display_name") or member.get("name") or "Unknown NPC",
                 member.get("status", "Active"),
-                health,
-                armor_class if armor_class >= 0 else "N/A",
                 member.get("combat_style", ""),
                 ", ".join(str(skill) for skill in member.get("skills", [])),
                 member.get("description") or member.get("notes") or "",
@@ -103,11 +91,11 @@ class PartyScreen(RepositoryBackedWidget):
                     f"Generated portrait of {member.get('display_name', 'Unknown NPC')}"
                 ),
             ):
-                self.table.setCellWidget(row_index, 8, portrait)
+                self.table.setCellWidget(row_index, 6, portrait)
 
         _resize_wrapping_table_rows(self.table)
         for row_index in range(self.table.rowCount()):
-            if self.table.cellWidget(row_index, 8) is not None:
+            if self.table.cellWidget(row_index, 6) is not None:
                 self.table.setRowHeight(
                     row_index,
                     max(104, self.table.rowHeight(row_index)),

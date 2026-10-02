@@ -408,6 +408,7 @@ class NewGameService:
             setup,
             getattr(result, "finalized_character", {}),
         )
+        repository.set_setting("player.carrying_capacity_lb", setup["character"].get("carrying_capacity_lb", 50))
         character_setting_map = {
             "name": "player_name",
             "name_pronunciation": "player.name_pronunciation",
@@ -1008,6 +1009,12 @@ def _starter_items_for_save(
             )[:120]
             or "actively_carried"
         )
+        for field_name in ("weight_lb", "carrying_capacity_lb"):
+            if field_name in setup_item:
+                item[field_name] = setup_item[field_name]
+        for field_name in ("moveable", "storable"):
+            if setup_item.get(field_name) is False:
+                item[field_name] = False
 
     original_completed_count = len(completed_items)
     used_source_indexes = {
@@ -1078,17 +1085,22 @@ def _fallback_starter_item_from_setup(
     }
     for field_name in (
         "item_type",
+        "weight_lb",
+        "carrying_capacity_lb",
+        "moveable",
+        "storable",
+        "container",
         "weapon_hands",
-        "damage",
-        "damage_type",
-        "attack_skill",
-        "attack_range_feet",
-        "ammunition_type_required",
-        "clip_size",
-        "bullets_per_attack",
+
+
+
+
+
+
+
         "ammunition_type",
         "covers_body_parts",
-        "armor_rating",
+
     ):
         if field_name in raw_item:
             item[field_name] = raw_item[field_name]
@@ -1119,6 +1131,8 @@ def _starter_inventory_top_up_item(
             "value_base_units": value_base_units,
             "quantity": 1,
             "source_index": -1,
+            "weight_lb": 0.25 if category == "Personal" else 1.0,
+            "carrying_capacity_lb": 0.0,
         }
     return None
 

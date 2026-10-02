@@ -858,40 +858,21 @@ class NewGameSetupTests(unittest.TestCase):
             advanced_packet["requirements"]["starter_inventory"],
         )
 
-    def test_combat_preferences_default_to_current_rules_and_support_narrative_mode(self) -> None:
+    def test_fighting_preferences_default_and_preserve_focus(self) -> None:
         default_setup = normalize_new_game_setup({})
-        narrative_setup = normalize_new_game_setup(
-            {"combat": {"resolution_mode": "narrative", "focus": "high"}}
-        )
-        packet = build_new_game_setup_packet(narrative_setup)
+        setup = normalize_new_game_setup({"fighting": {"focus": "high"}})
+        packet = build_new_game_setup_packet(setup)
+        self.assertEqual(default_setup["fighting"], {"focus": "balanced"})
+        self.assertEqual(setup["fighting"], {"focus": "high"})
+        self.assertNotIn("combat", setup)
+        self.assertIn("narrative", str(packet["fighting_contract"]).lower())
 
-        self.assertEqual(
-            default_setup["combat"],
-            {"resolution_mode": "strict", "focus": "balanced"},
-        )
-        self.assertEqual(narrative_setup["combat"]["resolution_mode"], "narrative")
-        self.assertEqual(narrative_setup["combat"]["focus"], "high")
-        self.assertEqual(packet["combat_contract"]["resolution_mode"], "narrative")
-        self.assertIn("major recurring part", packet["combat_contract"]["focus_instruction"])
-        self.assertIn("forbids CombatStartedEvent", packet["combat_contract"]["rules"])
-
-    def test_new_game_setup_persists_combat_preferences(self) -> None:
+    def test_new_game_setup_persists_fighting_focus(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            repository = SaveRepository.create_new_save(
-                Path(temp_dir), "Combat Preferences Test"
-            )
-            repository.apply_new_game_setup(
-                {"combat": {"resolution_mode": "narrative", "focus": "high"}}
-            )
-
-            self.assertEqual(
-                repository.get_setting("combat.preferences"),
-                {"resolution_mode": "narrative", "focus": "high"},
-            )
-            self.assertEqual(
-                repository.get_setting("combat.resolution_mode"), "narrative"
-            )
-            self.assertEqual(repository.get_setting("combat.focus"), "high")
+            repository = SaveRepository.create_new_save(Path(temp_dir), "Fighting Preferences Test")
+            repository.apply_new_game_setup({"fighting": {"focus": "high"}})
+            self.assertEqual(repository.get_setting("fighting.focus"), "high")
+            self.assertIsNone(repository.get_setting("combat.resolution_mode"))
 
     def test_blank_currency_setup_is_reserved_for_ai_generation(self) -> None:
         setup = normalize_new_game_setup({})
@@ -1013,7 +994,7 @@ class NewGameSetupTests(unittest.TestCase):
             self.assertTrue(
                 save_new_game_template(
                     template_path,
-                    {
+                    {"rules_version": "stats-v1",
                         "title": "Space Test",
                         "character": {"name": "Nova"},
                         "skills": [{"name": f"Ship Skill {index}"} for index in range(15)],
@@ -1076,7 +1057,7 @@ class NewGameSetupTests(unittest.TestCase):
             self.assertTrue(
                 save_new_game_template(
                     template_path,
-                    {"title": "Gun Jam Online", "specified_genre": "Existing"},
+                    {"rules_version": "stats-v1", "title": "Gun Jam Online", "specified_genre": "Existing"},
                 )
             )
             self.assertIsNone(
@@ -1095,7 +1076,7 @@ class NewGameSetupTests(unittest.TestCase):
             self.assertTrue(
                 save_new_game_template(
                     template_path,
-                    {
+                    {"rules_version": "stats-v1",
                         "title": "",
                         "character": {"name": ""},
                         "specified_genre": "Cozy mystery",
@@ -1285,7 +1266,7 @@ class NewGameSetupTests(unittest.TestCase):
             packet["requirements"]["gm_secrets"],
         )
         self.assertIn(
-            "cannot be a skill check or search",
+            "cannot be a d20 test or search",
             packet["requirements"]["gm_secrets"],
         )
         self.assertIn("miscellaneous", packet["requirements"])
@@ -1657,12 +1638,12 @@ class NewGameSetupTests(unittest.TestCase):
         armor = packet["setup"]["starter_items"][1]
 
         self.assertEqual(weapon["item_type"], "Weapon")
-        self.assertEqual(weapon["damage"], "1d8")
-        self.assertEqual(weapon["ammunition_type_required"], "Rail Cells")
-        self.assertEqual(weapon["clip_size"], 6)
+        self.assertNotIn("damage", weapon)
+        self.assertNotIn("ammunition_type_required", weapon)
+        self.assertNotIn("clip_size", weapon)
         self.assertEqual(armor["item_type"], "Armor")
         self.assertEqual(armor["covers_body_parts"], ["Torso", "Arms", "Legs"])
-        self.assertEqual(armor["armor_rating"], 2)
+        self.assertNotIn("armor_rating", armor)
         self.assertIn(
             "Do not downgrade setup weapons or armor into generic items",
             packet["requirements"]["starter_inventory"],

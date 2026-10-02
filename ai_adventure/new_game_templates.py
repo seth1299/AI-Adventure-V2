@@ -7,10 +7,11 @@ from pathlib import Path
 from typing import Any
 
 from ai_adventure.new_game_setup import normalize_new_game_setup
+from ai_adventure.stats import RULES_VERSION
 
 
 LOGGER = logging.getLogger(__name__)
-TEMPLATE_SCHEMA_VERSION = 2
+TEMPLATE_SCHEMA_VERSION = 3
 
 
 @dataclass(frozen=True)
@@ -19,6 +20,10 @@ class NewGameTemplate:
 
     name: str
     setup: dict[str, Any]
+
+    @property
+    def compatible(self) -> bool:
+        return self.setup.get("rules_version") == RULES_VERSION
 
 
 def load_new_game_templates(
@@ -247,8 +252,12 @@ def _parse_template_entry(
 def _template_setup_payload(setup: Any, *, normalize_setup: bool) -> dict[str, Any]:
     """Returns a template setup payload, optionally keeping partial fields partial."""
 
-    if normalize_setup:
-        return normalize_new_game_setup(setup)
+    if normalize_setup and isinstance(setup, dict) and setup.get("rules_version") == RULES_VERSION:
+        try:
+            return normalize_new_game_setup(setup)
+        except ValueError:
+            # Templates may be unfinished; the wizard validates before creation.
+            pass
 
     if not isinstance(setup, dict):
         return {}

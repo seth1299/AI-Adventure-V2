@@ -244,9 +244,9 @@ TABLE_INLINE_EDITOR_HEIGHT = 30
 TABLE_INLINE_EDITOR_MIN_WIDTH = 132
 TABLE_CELL_HORIZONTAL_PADDING = 10
 TABLE_CELL_VERTICAL_PADDING = 4
-STARTER_ITEM_COLUMN_WIDTHS = (140, 132, 140, 220, 132, 150, 100)
-STARTER_WEAPON_COLUMN_WIDTHS = (150, 132, 100, 96, 120, 120, 132, 132, 100)
-STARTER_ARMOR_COLUMN_WIDTHS = (150, 132, 220, 132, 132, 100)
+STARTER_ITEM_COLUMN_WIDTHS = (140, 132, 140, 220, 132, 150, 100, 100, 100)
+STARTER_WEAPON_COLUMN_WIDTHS = (150, 132, 100, 96, 120, 120, 132, 132, 100, 100, 100)
+STARTER_ARMOR_COLUMN_WIDTHS = (150, 132, 220, 132, 132, 100, 100, 100)
 STARTING_NPC_COLUMN_WIDTHS = (150, 160, 260, 132, 100)
 STARTING_LOCATION_COLUMN_WIDTHS = (180, 320, 132, 110, 180, 120)
 CURRENCY_COLUMN_WIDTHS = (150, 160, 132, 100)
@@ -545,13 +545,13 @@ def _clamped_int(value: Any, default: int, minimum: int, maximum: int) -> int:
     return domain_clamped_int(value, default, minimum, maximum)
 
 
-def _resolved_skill_checks_for_context(event_results: list[Any]) -> list[dict[str, Any]]:
+def _resolved_d20_tests_for_context(event_results: list[Any]) -> list[dict[str, Any]]:
     """Converts applied skill-check results into serializable narration context."""
 
     resolved_checks: list[dict[str, Any]] = []
 
     for result in event_results:
-        if getattr(result, "event_type", "") != "SkillCheckRequestedEvent":
+        if getattr(result, "event_type", "") != "D20TestRequestedEvent":
             continue
 
         if getattr(result, "status", "") != "applied":
@@ -858,7 +858,7 @@ __all__ = [
     "_text_model_from_ai_packet",
     "_bool_setting",
     "_clamped_int",
-    "_resolved_skill_checks_for_context",
+    "_resolved_d20_tests_for_context",
     "_set_combo_to_data",
     "_set_combo_to_text",
     "_add_combo_options",

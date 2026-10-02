@@ -4,21 +4,19 @@ import logging
 
 from ai_adventure.ui.common import *  # noqa: F401,F403
 from ai_adventure.ui.dialogues import *  # noqa: F401,F403
-from ai_adventure.ui.screens.combat import CombatScreen
 from ai_adventure.ui.screens.merchant import MerchantScreen
 from ai_adventure.ui.workers.visual_assets import _VisualAssetCoordinator
 from ai_adventure.ui.screens.alchemy import *  # noqa: F401,F403
 from ai_adventure.ui.screens.bestiary import *  # noqa: F401,F403
 from ai_adventure.ui.screens.calendar import *  # noqa: F401,F403
 from ai_adventure.ui.screens.character import *  # noqa: F401,F403
-from ai_adventure.ui.screens.combat import *  # noqa: F401,F403
 from ai_adventure.ui.screens.inventory import *  # noqa: F401,F403
 from ai_adventure.ui.screens.magic import *  # noqa: F401,F403
 from ai_adventure.ui.screens.npcs import *  # noqa: F401,F403
 from ai_adventure.ui.screens.notes import *  # noqa: F401,F403
 from ai_adventure.ui.screens.party import *  # noqa: F401,F403
 from ai_adventure.ui.screens.settings import *  # noqa: F401,F403
-from ai_adventure.ui.screens.skills import *  # noqa: F401,F403
+from ai_adventure.ui.screens.stats import *  # noqa: F401,F403
 from ai_adventure.ui.screens.story import *  # noqa: F401,F403
 from ai_adventure.ui.screens.tasks import *  # noqa: F401,F403
 from ai_adventure.ui.screens.travel import *  # noqa: F401,F403
@@ -201,13 +199,10 @@ class GameShell(QWidget):
             playtesting_tools=self.playtesting_tools,
         )
         self.merchant_screen = MerchantScreen()
-        self.combat_screen = CombatScreen(
-            playtesting_tools=self.playtesting_tools,
-        )
         self.npcs_screen = NpcsScreen()
         self.party_screen = PartyScreen()
         self.active_tasks_screen = ActiveTasksScreen()
-        self.skills_screen = SkillsScreen()
+        self.stats_screen = StatsScreen()
         self.magic_screen = MagicScreen()
         self.alchemy_screen = AlchemyNotebookScreen(
             playtesting_tools=self.playtesting_tools,
@@ -236,11 +231,10 @@ class GameShell(QWidget):
             self.calendar_screen,
             self.inventory_screen,
             self.merchant_screen,
-            self.combat_screen,
             self.npcs_screen,
             self.party_screen,
             self.active_tasks_screen,
-            self.skills_screen,
+            self.stats_screen,
             self.magic_screen,
             self.alchemy_screen,
             self.notes_screen,
@@ -256,11 +250,11 @@ class GameShell(QWidget):
         visible_tabs = (
             [
                 ("character", self.character_screen, "Character", True),
+                ("stats", self.stats_screen, "Stats", True),
                 ("calendar", self.calendar_screen, "Calendar", True),
                 ("inventory", self.inventory_screen, "Inventory", True),
                 ("merchant", self.merchant_screen, "Merchant", True),
                 ("magic", self.magic_screen, "Magic", True),
-                ("combat", self.combat_screen, "Combat", True),
                 ("party", self.party_screen, "Party", True),
                 ("settings", self.settings_screen, "Settings", True),
             ]
@@ -273,10 +267,9 @@ class GameShell(QWidget):
                 ("calendar", self.calendar_screen, "Calendar", True),
                 ("inventory", self.inventory_screen, "Inventory", True),
                 ("merchant", self.merchant_screen, "Merchant", True),
-                ("combat", self.combat_screen, "Combat", True),
                 ("party", self.party_screen, "Party", True),
                 ("npcs", self.npcs_screen, "NPCs", True),
-                ("skills", self.skills_screen, "Skills", True),
+                ("stats", self.stats_screen, "Stats", True),
                 ("magic", self.magic_screen, "Magic", True),
                 ("crafting", self.alchemy_screen, "Crafting", True),
                 ("notes", self.notes_screen, "Notes", True),
@@ -678,13 +671,6 @@ class GameShell(QWidget):
             magic = {}
         requested_spells = magic.get("starting_spell_requests", [])
         starting_spells = magic.get("starting_spells", [])
-        combat = setup.get("combat", {})
-        if not isinstance(combat, dict):
-            combat = {}
-        combat_focus = str(
-            combat.get("focus", repository.get_setting("combat.focus", "balanced"))
-            or "balanced"
-        ).strip().casefold()
         should_hide = {
             "npcs": not repository.list_player_visible_npcs()
             and not (isinstance(starting_npcs, list) and starting_npcs),
@@ -693,7 +679,6 @@ class GameShell(QWidget):
             "magic": not repository.list_character_spells()
             and not (isinstance(requested_spells, list) and requested_spells)
             and not (isinstance(starting_spells, list) and starting_spells),
-            "combat": combat_focus == "low" and not repository.is_combat_active(),
         }
         for tab_key, hidden in should_hide.items():
             if not hidden:
@@ -745,15 +730,10 @@ class GameShell(QWidget):
         if not isinstance(magic, dict):
             magic = {}
         world_contains_magic = bool(magic.get("world_contains_magic", True))
-        combat = setup.get("combat", {})
-        if not isinstance(combat, dict):
-            combat = {}
-        combat_focus = str(combat.get("focus", "balanced") or "balanced").casefold()
         has_content = {
             "npcs": bool(repository.list_player_visible_npcs()),
             "party": bool(repository.list_party_members()),
             "magic": world_contains_magic and bool(repository.list_character_spells()),
-            "combat": combat_focus == "low" and repository.is_combat_active(),
         }
         for tab_key in list(self._smart_hidden_tabs):
             if has_content.get(tab_key, False):

@@ -12,7 +12,7 @@ from unittest.mock import Mock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QEventLoop, QThread, QTime, QTimer, Qt
+from PySide6.QtCore import QEvent, QEventLoop, QThread, QTime, QTimer, Qt
 from PySide6.QtGui import QColor, QImage, QPixmap
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import (
@@ -42,7 +42,7 @@ from ai_adventure.persistence.save_repository import SaveRepository
 from ai_adventure.app.app_paths import AppPaths
 from ai_adventure.new_game_setup import normalize_new_game_setup
 from ai_adventure.ui.screens.notes import NotesScreen
-from ai_adventure.ui.screens.skills import SkillsScreen
+from ai_adventure.ui.screens.stats import StatsScreen
 from ai_adventure.ui.screens.travel import TravelScreen
 from ai_adventure.new_game_templates import (
     load_new_game_templates,
@@ -58,7 +58,6 @@ from ai_adventure.ui.main_window import (
     CalendarPlayerEventDialog,
     CalendarScreen,
     CharacterScreen,
-    CombatScreen,
     GameShell,
     InventoryItemDetailsDialog,
     InventoryLocationPanel,
@@ -96,6 +95,16 @@ class InventoryUiTests(unittest.TestCase):
         cls.addClassCleanup(cls.app_data_env_patcher.stop)
         cls.addClassCleanup(cls.app_data_temp_dir.cleanup)
         cls.app = QApplication.instance() or QApplication([])
+
+    def setUp(self) -> None:
+        self.addCleanup(self._release_qt_widgets)
+
+    def _release_qt_widgets(self) -> None:
+        # Release Qt objects between tests so global font changes stay bounded.
+        self.app.processEvents()
+        for widget in self.app.topLevelWidgets():
+            widget.deleteLater()
+        QApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
 
     def test_new_game_gemini_worker_keeps_qt_event_loop_responsive(self) -> None:
         test_case = self
@@ -184,7 +193,7 @@ class InventoryUiTests(unittest.TestCase):
                 len(repository.list_inventory_items()),
             )
             self.assertEqual(
-                window.game_shell.skills_screen.skills_table.rowCount(),
+                window.game_shell.stats_screen.skills_table.rowCount(),
                 len(repository.list_skills()),
             )
 
@@ -528,7 +537,7 @@ class InventoryUiTests(unittest.TestCase):
     def test_template_selection_reuses_widgets_without_mutating_templates(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             template_path = Path(temp_dir) / "new_game_templates.json"
-            first_setup = {
+            first_setup = {"rules_version": "stats-v1",
                 "specified_genre": "Mystery",
                 "starting_locations": [
                     {"name": "Office", "description": "A cramped office."},
@@ -553,7 +562,7 @@ class InventoryUiTests(unittest.TestCase):
                     {"name": "Coffee", "value_base_units": 1}
                 ],
             }
-            second_setup = {
+            second_setup = {"rules_version": "stats-v1",
                 "specified_genre": "Fantasy",
                 "starting_locations": [
                     {"name": "Keep", "description": "A stone keep."}
@@ -803,7 +812,7 @@ class InventoryUiTests(unittest.TestCase):
     def test_new_game_wizard_round_trips_magic_configuration(self) -> None:
         wizard = NewGameWizard(tts_enabled=False)
         wizard.load_setup(
-            {
+            {"rules_version": "stats-v1",
                 "magic": {
                     "enabled": True,
                     "casting_mode": "tiered",
@@ -912,11 +921,11 @@ class InventoryUiTests(unittest.TestCase):
         self.assertEqual(wizard.build_setup()["character"]["pronouns"], "They/Them")
         self.assertTrue(wizard.character_custom_pronouns_input.isHidden())
 
-        wizard.load_setup({"character": {"pronouns": "She/Her"}})
+        wizard.load_setup({"rules_version": "stats-v1", "character": {"pronouns": "She/Her"}})
         self.assertEqual(wizard.character_pronouns_combo.currentData(), "She/Her")
         self.assertEqual(wizard.build_setup()["character"]["pronouns"], "She/Her")
 
-        wizard.load_setup({"character": {"pronouns": "Xe/Xem"}})
+        wizard.load_setup({"rules_version": "stats-v1", "character": {"pronouns": "Xe/Xem"}})
         self.app.processEvents()
         self.assertEqual(wizard.character_pronouns_combo.currentData(), "other")
         self.assertFalse(wizard.character_custom_pronouns_input.isHidden())
@@ -941,17 +950,11 @@ class InventoryUiTests(unittest.TestCase):
         )
         wizard.close()
 
-    def test_new_game_wizard_round_trips_combat_preferences(self) -> None:
+    def test_new_game_wizard_round_trips_fighting_focus(self) -> None:
         wizard = NewGameWizard(tts_enabled=False)
-        wizard.load_setup(
-            {"combat": {"resolution_mode": "narrative", "focus": "low"}}
-        )
-
-        combat = wizard.build_setup()["combat"]
-
-        self.assertEqual(combat["resolution_mode"], "narrative")
-        self.assertEqual(combat["focus"], "low")
-        self.assertIn("Gemini narrates", wizard.combat_resolution_explanation.text())
+        wizard.load_setup({"rules_version": "stats-v1", "fighting": {"focus": "low"}})
+        self.assertEqual(wizard.build_setup()["fighting"], {"focus": "low"})
+        self.assertFalse(hasattr(wizard, "combat_resolution_combo"))
         wizard.close()
 
     def test_new_game_wizard_party_tracks_the_live_starting_npc_list(self) -> None:
@@ -1086,23 +1089,6 @@ class InventoryUiTests(unittest.TestCase):
         )
         wizard.close()
 
-    def test_combat_screen_disables_manual_start_for_narrative_combat(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            repository = SaveRepository.create_new_save(
-                Path(temp_dir), "Narrative Combat UI"
-            )
-            repository.set_setting(
-                "combat.preferences",
-                {"resolution_mode": "narrative", "focus": "balanced"},
-            )
-            screen = CombatScreen(playtesting_tools=True)
-            screen.set_repository(repository)
-            self.app.processEvents()
-
-            self.assertIn("Gemini resolves fights", screen.status_label.text())
-            self.assertFalse(screen.start_button.isEnabled())
-            self.assertFalse(screen.add_combatant_button.isEnabled())
-            screen.close()
 
     def test_character_identity_pronouns_and_contextual_controls(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1124,8 +1110,8 @@ class InventoryUiTests(unittest.TestCase):
             self.assertEqual(screen.custom_pronouns_input.text(), "Xe/Xem")
             self.assertFalse(screen.custom_pronouns_input.isHidden())
             self.assertTrue(screen.name_pronunciation_input.isHidden())
-            self.assertTrue(screen.stats_group.isHidden())
-            self.assertTrue(screen.equipment_group.isHidden())
+            self.assertFalse(screen.stats_group.isHidden())
+            self.assertFalse(screen.equipment_group.isHidden())
             self.assertFalse(screen.condition_group.isHidden())
             self.assertEqual(screen.condition_label.text(), "Wounded")
 
@@ -1340,7 +1326,7 @@ class InventoryUiTests(unittest.TestCase):
             repository.upsert_skill("Foraging", "Finding useful materials.", 1)
             repository.add_skill_xp("Foraging", 4)
 
-            screen = SkillsScreen()
+            screen = StatsScreen()
             screen.set_repository(repository)
             screen.show()
             self.app.processEvents()
@@ -1493,7 +1479,7 @@ class InventoryUiTests(unittest.TestCase):
                         "speaker_id": "mira_coppercup",
                         "speaker_name": "Mira",
                         "voice_profile": "feminine",
-                        "voice_id": "af_sarah",
+                        "voice_id": "af_sarah", "speaker_role": "character",
                     },
                     {
                         "anchor_text": '"Not that door."',
@@ -1632,7 +1618,7 @@ class InventoryUiTests(unittest.TestCase):
                 "speaker_id": "mira_coppercup",
                 "speaker_name": "Mira",
                 "voice_profile": "feminine",
-                "voice_id": "af_sarah",
+                "voice_id": "af_sarah", "speaker_role": "character",
             }
             repository.append_history(
                 "story",
@@ -1741,7 +1727,7 @@ class InventoryUiTests(unittest.TestCase):
             "speaker_id": "mira_coppercup",
             "speaker_name": "Mira",
             "voice_profile": "feminine",
-            "voice_id": "af_sarah",
+            "voice_id": "af_sarah", "speaker_role": "character",
         }
         with tempfile.TemporaryDirectory() as temp_dir:
             repository = SaveRepository.create_new_save(
@@ -1944,7 +1930,7 @@ class InventoryUiTests(unittest.TestCase):
                         "speaker_id": "market_crier",
                         "speaker_name": "Market Crier",
                         "voice_profile": "deep_masculine",
-                        "voice_id": "am_onyx",
+                        "voice_id": "am_onyx", "speaker_role": "character",
                     }
                 ],
             )
@@ -1985,7 +1971,7 @@ class InventoryUiTests(unittest.TestCase):
                         "speaker_id": "market_crier",
                         "speaker_name": "Market Crier",
                         "voice_profile": "deep_masculine",
-                        "voice_id": "am_onyx",
+                        "voice_id": "am_onyx", "speaker_role": "character",
                     }
                 ],
             )
@@ -2091,7 +2077,7 @@ class InventoryUiTests(unittest.TestCase):
             "speaker_id": "town_crier",
             "speaker_name": "Town Crier",
             "voice_profile": "deep_masculine",
-            "voice_id": "am_onyx",
+            "voice_id": "am_onyx", "speaker_role": "character",
         }
         with tempfile.TemporaryDirectory() as temp_dir:
             repository = SaveRepository.create_new_save(Path(temp_dir), "Replay Test")
@@ -2549,9 +2535,6 @@ class InventoryUiTests(unittest.TestCase):
             repository.upsert_party_member(
                 "mira_coppercup",
                 status="Wounded",
-                health_current=8,
-                health_max=18,
-                armor_class=13,
                 combat_style="Mobile archer",
                 skills=["Archery", "Tracking"],
             )
@@ -2576,9 +2559,7 @@ class InventoryUiTests(unittest.TestCase):
                 [
                     "Name",
                     "Status",
-                    "Health",
-                    "Armor Class",
-                    "Combat Style",
+                    "Capabilities",
                     "Skills",
                     "Description",
                     "Equipment",
@@ -2586,17 +2567,17 @@ class InventoryUiTests(unittest.TestCase):
                 ],
             )
             name_item = screen.table.item(0, 0)
-            health_item = screen.table.item(0, 2)
-            armor_item = screen.table.item(0, 3)
+            capability_item = screen.table.item(0, 2)
+            skills_item = screen.table.item(0, 3)
             self.assertIsNotNone(name_item)
-            self.assertIsNotNone(health_item)
-            self.assertIsNotNone(armor_item)
+            self.assertIsNotNone(capability_item)
+            self.assertIsNotNone(skills_item)
             assert name_item is not None
-            assert health_item is not None
-            assert armor_item is not None
+            assert capability_item is not None
+            assert skills_item is not None
             self.assertEqual(name_item.text(), "Mira")
-            self.assertEqual(health_item.text(), "8/18")
-            self.assertEqual(armor_item.text(), "13")
+            self.assertEqual(capability_item.text(), "Mobile archer")
+            self.assertEqual(skills_item.text(), "Archery, Tracking")
             self.assertEqual(
                 name_item.data(Qt.ItemDataRole.UserRole),
                 "mira_coppercup",
@@ -2659,7 +2640,7 @@ class InventoryUiTests(unittest.TestCase):
             self.assertIsNone(dialog.findChild(QPlainTextEdit, "inventoryAsciiArt"))
             dialog_labels = [label.text() for label in dialog.findChildren(QLabel)]
             self.assertNotIn("Item Art", dialog_labels)
-            self.assertNotIn("Equipped:", dialog_labels)
+            self.assertIn("Equipped:", dialog_labels)
             self.assertNotIn("Category:", dialog_labels)
             self.assertNotIn("Quantity:", dialog_labels)
             self.assertNotIn("Stored at:", dialog_labels)

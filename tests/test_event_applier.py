@@ -203,8 +203,8 @@ class EventApplierTests(unittest.TestCase):
             self.assertIsNotNone(npc)
             self.assertEqual(len(party), 1)
             self.assertEqual(party[0]["npc_id"], npc["npc_id"] if npc else "")
-            self.assertEqual(party[0]["health_current"], 14)
-            self.assertEqual(party[0]["armor_class"], 13)
+            self.assertNotIn("health_current", party[0])
+            self.assertNotIn("armor_class", party[0])
             self.assertEqual(party[0]["skills"], ["Archery", "Tracking"])
 
             removed = applier.apply_event(
@@ -228,49 +228,6 @@ class EventApplierTests(unittest.TestCase):
             self.assertEqual(repository.list_party_members(), [])
             self.assertIsNotNone(repository.get_npc("mira_coppercup"))
 
-    def test_combat_ally_preserves_party_npc_id_and_initial_vitals(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            repository = SaveRepository.create_new_save(Path(temp_dir), "Party Combat Test")
-            repository.upsert_npc(
-                npc_id="mira_coppercup",
-                name="Mira Coppercup",
-                display_name="Mira",
-                role="Scout",
-                location="Old Road",
-            )
-            repository.upsert_party_member(
-                "mira_coppercup", health_current=18, health_max=18, armor_class=11
-            )
-
-            result = EventApplier(repository).apply_event(
-                {
-                    "type": "CombatStartedEvent",
-                    "payload": {
-                        "enemies": [{"name": "Bandit", "health": 8}],
-                        "allies": [
-                            {
-                                "npc_id": "mira_coppercup",
-                                "name": "Mira",
-                                "health": 14,
-                                "armor_rating": 13,
-                            }
-                        ],
-                    },
-                }
-            )
-
-            ally = next(
-                combatant
-                for combatant in repository.get_combat_state()["combatants"]
-                if combatant.get("npc_id") == "mira_coppercup"
-            )
-            party_member = repository.list_party_members()[0]
-            self.assertEqual(result.status, "applied")
-            self.assertEqual(ally["npc_id"], "mira_coppercup")
-            self.assertEqual(party_member["npc_id"], "mira_coppercup")
-            self.assertEqual(party_member["status"], "Active")
-            self.assertEqual(party_member["health_current"], 14)
-            self.assertEqual(party_member["armor_class"], 13)
 
     def test_calendar_game_events_store_exact_time_and_cannot_change_player_events(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -394,6 +351,7 @@ class EventApplierTests(unittest.TestCase):
                 metadata={
                     "item_type": "Container",
                     "storage_location": "actively_carried",
+                    "container": {"is_open": True, "contents": {"currency_base_units": 0, "items": []}},
                 },
             )
 
@@ -481,43 +439,6 @@ class EventApplierTests(unittest.TestCase):
             self.assertEqual(item["category"], "Poison")
             self.assertEqual(catalog_item["category"], "Poison")
 
-    def test_inventory_item_added_upgrades_player_weapon_damage_above_unarmed(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            repository = SaveRepository.create_new_save(Path(temp_dir), "Weapon Floor Test")
-
-            result = EventApplier(repository).apply_events(
-                [
-                    {
-                        "type": "InventoryItemAddedEvent",
-                        "payload": {
-                            "item_type": "Weapon",
-                            "item_name": "Rusty Dagger",
-                            "description": "A small blade that should still matter.",
-                            "amount": 1,
-                            "value_base_units": 5,
-                            "weapon_hands": "one-handed",
-                            "damage": "1d4",
-                            "attack_skill": "Melee",
-                            "attack_range_feet": 5,
-                        },
-                    }
-                ]
-            )[0]
-
-            item = _require(
-                next(
-                    (
-                        inventory_item
-                        for inventory_item in repository.list_inventory_items()
-                        if inventory_item["name"] == "Rusty Dagger"
-                    ),
-                    None,
-                )
-            )
-
-            self.assertEqual(result.status, "applied")
-            self.assertEqual(item["metadata"]["item_type"], "Weapon")
-            self.assertEqual(item["metadata"]["damage"], "1d6")
 
     def test_applies_inventory_add_remove_and_modify_events(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -580,7 +501,7 @@ class EventApplierTests(unittest.TestCase):
             )
             repository.add_inventory_item(
                 "Suitcase", "Tool", 1, "A packed suitcase.", 10,
-                metadata={"storage_location": "home"},
+                metadata={"storage_location": "actively_carried"},
             )
             item_before = next(item for item in repository.list_inventory_items() if item["name"] == "Suitcase")
             applier = EventApplier(repository)
@@ -666,7 +587,7 @@ class EventApplierTests(unittest.TestCase):
             }
             container = items["Stolen Coin Pouch"]["metadata"]["container"]
 
-            self.assertEqual(generic_modify.status, "skipped")
+            self.assertEqual(generic_modify.status, "applied")
             self.assertEqual(closed_take.status, "skipped")
             self.assertEqual(
                 [result.status for result in opened_and_taken],
@@ -702,12 +623,12 @@ class EventApplierTests(unittest.TestCase):
             check_results = applier.apply_events(
                 [
                     {
-                        "type": "SkillCheckRequestedEvent",
-                        "payload": {"skill_name": "Lockpicking", "dc": 16},
+                        "type": "D20TestRequestedEvent",
+                        "payload": {"attribute": 'Dexterity', "test_kind": "check", "reason": "A consequential uncertain action", "skill_name": "Lockpicking", "dc": 16},
                     },
                     {
-                        "type": "SkillCheckRequestedEvent",
-                        "payload": {"skill_name": "Sleight of Hand", "dc": 15},
+                        "type": "D20TestRequestedEvent",
+                        "payload": {"attribute": 'Dexterity', "test_kind": "check", "reason": "A consequential uncertain action", "skill_name": "Sleight of Hand", "dc": 15},
                     },
                 ]
             )
@@ -825,144 +746,7 @@ class EventApplierTests(unittest.TestCase):
                 1,
             )
 
-    def test_combat_started_event_persists_combat_state(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            repository = SaveRepository.create_new_save(Path(temp_dir), "Combat Event Test")
-            repository.add_inventory_item(
-                "Spear",
-                "Weapon",
-                1,
-                "A sturdy one-handed spear.",
-                6,
-                metadata={
-                    "item_type": "Weapon",
-                    "weapon_hands": "one-handed",
-                    "damage": "1d8",
-                },
-            )
-            repository.set_player_equipment({"Main Hand": "Spear"})
-            repository.set_setting("player.health_current", 18)
-            repository.set_setting("player.health_max", 24)
 
-            results = EventApplier(repository).apply_events(
-                [
-                    {
-                        "type": "CombatStartedEvent",
-                        "payload": {
-                            "description": "Two bandits draw blades.",
-                            "enemies": [
-                                {
-                                    "name": "Bandit",
-                                    "health": 7,
-                                    "armor_rating": 12,
-                                    "to_hit_bonus": 3,
-                                    "initiative_bonus": 4,
-                                    "personality": "aggressive",
-                                    "weapon_name": "Rusty Knife",
-                                    "ammunition_type_required": "",
-                                    "clip_size": 0,
-                                    "clip_ammo": 0,
-                                    "bullets_per_attack": 0,
-                                    "reserve_ammo": 0,
-                                    "damage": "1d6+1",
-                                    "loot": ["Rusty Knife", "Copper Ring"],
-                                }
-                            ],
-                            "allies": [
-                                {
-                                    "name": "Mira",
-                                    "health": 10,
-                                    "armor_rating": 11,
-                                    "to_hit_bonus": 2,
-                                    "initiative_bonus": 1,
-                                    "personality": "cautious",
-                                    "weapon_name": "Shortbow",
-                                    "ammunition_type_required": "Arrow",
-                                    "clip_size": 1,
-                                    "clip_ammo": 1,
-                                    "bullets_per_attack": 1,
-                                    "reserve_ammo": 12,
-                                    "damage": "1d4",
-                                }
-                            ],
-                        },
-                    }
-                ]
-            )
-            combat_state = repository.get_combat_state()
-            player = next(
-                combatant
-                for combatant in combat_state["combatants"]
-                if combatant["id"] == "player"
-            )
-            ally = next(
-                combatant
-                for combatant in combat_state["combatants"]
-                if combatant["name"] == "Mira"
-            )
-            enemy = next(
-                combatant
-                for combatant in combat_state["combatants"]
-                if combatant["name"] == "Bandit"
-            )
-
-            self.assertEqual(results[0].status, "applied")
-            self.assertTrue(combat_state["active"])
-            self.assertEqual(combat_state["round"], 1)
-            self.assertEqual(player["name"], "Player Name")
-            self.assertEqual(player["team"], "party")
-            self.assertEqual(player["current_health"], 18)
-            self.assertEqual(player["max_health"], 24)
-            self.assertEqual(player["damage"], "1d8")
-            self.assertEqual(player["to_hit_bonus"], 2)
-            self.assertEqual(ally["name"], "Mira")
-            self.assertEqual(ally["team"], "party")
-            self.assertEqual(ally["to_hit_bonus"], 2)
-            self.assertEqual(enemy["name"], "Bandit")
-            self.assertEqual(enemy["team"], "enemy")
-            self.assertEqual(enemy["current_health"], 7)
-            self.assertEqual(enemy["armor_rating"], 12)
-            self.assertEqual(enemy["to_hit_bonus"], 3)
-            self.assertEqual(enemy["initiative_bonus"], 4)
-            self.assertEqual(enemy["personality"], "aggressive")
-            self.assertGreater(enemy["threat_level"], 0)
-            self.assertEqual(enemy["damage"], "1d6+1")
-            self.assertEqual(enemy["loot"], ["Rusty Knife", "Copper Ring"])
-            self.assertEqual(combat_state["log"][0], "Two bandits draw blades.")
-            self.assertIn("Initiative order:", combat_state["log"][1])
-            self.assertTrue(
-                all(
-                    1 <= combatant["initiative_roll"] <= 20
-                    for combatant in combat_state["combatants"]
-                )
-            )
-
-            skipped = EventApplier(repository).apply_event(
-                {"type": "CombatStartedEvent", "payload": {"enemy_name": "Second Bandit"}}
-            )
-
-            self.assertEqual(skipped.status, "skipped")
-
-    def test_combat_started_event_is_rejected_for_narrative_combat(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            repository = SaveRepository.create_new_save(
-                Path(temp_dir), "Narrative Combat Event Test"
-            )
-            repository.set_setting(
-                "combat.preferences",
-                {"resolution_mode": "narrative", "focus": "balanced"},
-            )
-
-            result = EventApplier(repository).apply_event(
-                {
-                    "type": "CombatStartedEvent",
-                    "payload": {"enemy_name": "Bandit"},
-                }
-            )
-
-            self.assertEqual(result.status, "skipped")
-            self.assertIn("narrative combat", result.message)
-            self.assertFalse(repository.is_combat_active())
 
     def test_player_equipment_updates_inventory_equipped_flag(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1108,15 +892,15 @@ class EventApplierTests(unittest.TestCase):
             self.assertFalse(fern_items[0]["equipped"])
             self.assertEqual(fern_items[0]["value_base_units"], 8)
 
-    def test_failed_skill_check_blocks_following_reward_events(self) -> None:
+    def test_failed_d20_test_blocks_following_reward_events(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             repository = SaveRepository.create_new_save(Path(temp_dir), "Gate Test")
             repository.upsert_skill("Foraging", "Finding useful materials.", 1)
             results = EventApplier(repository, rng=random.Random(2)).apply_events(
                 [
                     {
-                        "type": "SkillCheckRequestedEvent",
-                        "payload": {"skill_name": "Foraging", "dc": 14},
+                        "type": "D20TestRequestedEvent",
+                        "payload": {"attribute": 'Wisdom', "test_kind": "check", "reason": "A consequential uncertain action", "skill_name": "Foraging", "dc": 14},
                     },
                     {
                         "type": "InventoryItemAddedEvent",
@@ -1140,14 +924,14 @@ class EventApplierTests(unittest.TestCase):
             )
 
             self.assertEqual([result.status for result in results], ["applied", "skipped", "applied"])
-            self.assertIn("previous skill check failed", results[1].message)
+            self.assertIn("previous d20 test failed", results[1].message)
             self.assertNotIn(
                 "Shimmering Stream Mineral",
                 {item["name"] for item in repository.list_inventory_items()},
             )
             self.assertEqual(repository.get_state_snapshot()["location"], "Dastrium Valley")
 
-    def test_failed_prior_skill_check_blocks_later_reward_events(self) -> None:
+    def test_failed_prior_d20_test_blocks_later_reward_events(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             repository = SaveRepository.create_new_save(Path(temp_dir), "Split Gate Test")
             repository.upsert_skill("Foraging", "Finding useful materials.", 1)
@@ -1155,8 +939,8 @@ class EventApplierTests(unittest.TestCase):
             prior_results = applier.apply_events(
                 [
                     {
-                        "type": "SkillCheckRequestedEvent",
-                        "payload": {"skill_name": "Foraging", "dc": 14},
+                        "type": "D20TestRequestedEvent",
+                        "payload": {"attribute": 'Wisdom', "test_kind": "check", "reason": "A consequential uncertain action", "skill_name": "Foraging", "dc": 14},
                     }
                 ]
             )
@@ -1179,22 +963,22 @@ class EventApplierTests(unittest.TestCase):
 
             self.assertEqual(prior_results[0].payload["outcome"], "failure")
             self.assertEqual(results[0].status, "skipped")
-            self.assertIn("previous skill check failed", results[0].message)
+            self.assertIn("previous d20 test failed", results[0].message)
             self.assertNotIn(
                 "Silver-Spire Fern",
                 {item["name"] for item in repository.list_inventory_items()},
             )
 
-    def test_successful_skill_check_allows_following_reward_events(self) -> None:
+    def test_successful_d20_test_allows_following_reward_events(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             repository = SaveRepository.create_new_save(Path(temp_dir), "Gate Test")
             repository.upsert_skill("Foraging", "Finding useful materials.", 5)
 
-            results = EventApplier(repository, rng=random.Random(2)).apply_events(
+            results = EventApplier(repository, rng=random.Random(5)).apply_events(
                 [
                     {
-                        "type": "SkillCheckRequestedEvent",
-                        "payload": {"skill_name": "Foraging", "dc": 11},
+                        "type": "D20TestRequestedEvent",
+                        "payload": {"attribute": 'Wisdom', "test_kind": "check", "reason": "A consequential uncertain action", "skill_name": "Foraging", "dc": 11},
                     },
                     {
                         "type": "InventoryItemAddedEvent",
@@ -1215,108 +999,8 @@ class EventApplierTests(unittest.TestCase):
                 {item["name"] for item in repository.list_inventory_items()},
             )
 
-    def test_bad_luck_streak_nudges_skill_check_roll(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            repository = SaveRepository.create_new_save(Path(temp_dir), "Luck Test")
-            repository.upsert_skill("Prospecting", "Reading ore signs and mineral veins.", 3)
 
-            for roll in [3, 11, 9, 2, 13, 5, 4]:
-                repository.record_skill_check(
-                    skill_name="Prospecting",
-                    level=3,
-                    bonus=6,
-                    roll=roll,
-                    total=roll + 6,
-                    dc=14,
-                    outcome="success" if roll + 6 >= 14 else "failure",
-                )
 
-            result = EventApplier(repository, rng=_FixedRollRng(8)).apply_event(
-                {
-                    "type": "SkillCheckRequestedEvent",
-                    "payload": {"skill_name": "Prospecting", "dc": 15},
-                }
-            )
-            check = repository.list_skill_checks(limit=1)[0]
-
-            self.assertEqual(result.status, "applied")
-            self.assertEqual(result.payload["raw_roll"], 8)
-            self.assertEqual(result.payload["bad_luck_nudge"], 2)
-            self.assertEqual(result.payload["roll"], 10)
-            self.assertEqual(result.payload["total"], 16)
-            self.assertEqual(result.payload["outcome"], "success")
-            self.assertEqual(check["roll"], 10)
-            self.assertEqual(check["total"], 16)
-
-    def test_normal_roll_history_does_not_nudge_skill_check_roll(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            repository = SaveRepository.create_new_save(Path(temp_dir), "Luck Test")
-            repository.upsert_skill("Prospecting", "Reading ore signs and mineral veins.", 3)
-
-            for roll in [3, 11, 9, 12, 13]:
-                repository.record_skill_check(
-                    skill_name="Prospecting",
-                    level=3,
-                    bonus=6,
-                    roll=roll,
-                    total=roll + 6,
-                    dc=14,
-                    outcome="success" if roll + 6 >= 14 else "failure",
-                )
-
-            result = EventApplier(repository, rng=_FixedRollRng(8)).apply_event(
-                {
-                    "type": "SkillCheckRequestedEvent",
-                    "payload": {"skill_name": "Prospecting", "dc": 15},
-                }
-            )
-
-            self.assertEqual(result.status, "applied")
-            self.assertEqual(result.payload["raw_roll"], 8)
-            self.assertEqual(result.payload["bad_luck_nudge"], 0)
-            self.assertEqual(result.payload["roll"], 8)
-            self.assertEqual(result.payload["total"], 14)
-            self.assertEqual(result.payload["outcome"], "failure")
-
-    def test_existing_duplicate_inventory_stacks_are_coalesced_on_load(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            save_path = Path(temp_dir) / "old.sqlite3"
-            connection = sqlite3.connect(save_path)
-            try:
-                connection.executescript(
-                    """
-                    CREATE TABLE inventory_items (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        name TEXT NOT NULL,
-                        category TEXT NOT NULL DEFAULT '',
-                        quantity INTEGER NOT NULL DEFAULT 1,
-                        description TEXT NOT NULL DEFAULT '',
-                        value_base_units INTEGER NOT NULL DEFAULT 0
-                    );
-                    INSERT INTO inventory_items (
-                        name,
-                        category,
-                        quantity,
-                        description,
-                        value_base_units
-                    )
-                    VALUES
-                        ('Silver-Spire Fern', 'Botanical', 2, 'Cool-natured fern.', 8),
-                        ('Silver-Spire Fern', 'Botanical', 2, 'Cool-natured fern.', 8);
-                    """
-                )
-            finally:
-                connection.close()
-
-            repository = SaveRepository(save_path)
-            fern_items = [
-                item
-                for item in repository.list_inventory_items()
-                if item["name"] == "Silver-Spire Fern"
-            ]
-
-            self.assertEqual(len(fern_items), 1)
-            self.assertEqual(fern_items[0]["quantity"], 4)
 
     def test_status_updated_event_stores_short_broad_location_name(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

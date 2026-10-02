@@ -105,7 +105,7 @@ class GeminiContractTests(unittest.TestCase):
 
     def test_planning_tags_must_be_unique(self):
         with self.assertRaises(g.GeminiRequestError):
-            g._validate_response_contract('{"checks":[],"relevant_tags":["skill","skill"]}', g.SKILL_CHECK_PLAN_RESPONSE_JSON_SCHEMA, "plan")
+            g._validate_response_contract('{"checks":[],"relevant_tags":["skill","skill"]}', g.D20_TEST_PLAN_RESPONSE_JSON_SCHEMA, "plan")
 
     def test_new_game_rejects_incomplete_staged_and_single_responses(self):
         from google import genai

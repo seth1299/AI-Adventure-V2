@@ -383,7 +383,7 @@ class AlchemyNotebookScreen(RepositoryBackedWidget):
 
         recipe = self._recipe_rows[row_index]
         availability = evaluate_recipe_craftability(
-            recipe, repository.list_inventory_items()
+            recipe, repository.list_accessible_inventory_items()
         )
         estimate = recipe_estimated_time(recipe, repository.list_skills())
         processes = repository.get_setting("crafting.processes", [])

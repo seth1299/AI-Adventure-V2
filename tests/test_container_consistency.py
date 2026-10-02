@@ -12,7 +12,7 @@ from ai_adventure.ai.gemini_service import (
     build_gemini_story_prompt,
 )
 from ai_adventure.application.story_turn_service import StoryTurnService
-from ai_adventure.combat import normalize_item_metadata
+from ai_adventure.items import normalize_item_metadata
 from ai_adventure.container_flow import ContainerFlowError, container_event_issues
 from ai_adventure.events.event_applier import EventApplier, AppliedEventResult
 from ai_adventure.persistence.save_repository import SaveRepository
@@ -83,12 +83,12 @@ class ContainerConsistencyTests(unittest.TestCase):
         self.assertEqual(self.repository.get_state_value("currency.balance"), "70")
         inventory = {item["name"]: item for item in self.repository.list_inventory_items()}
         self.assertEqual(inventory["Glass Vial"]["quantity"], 1)
-        self.assertNotIn("City Map", inventory)
+        self.assertEqual(inventory["City Map"]["storage_location"], "Silver-Trimmed Satchel")
         container = inventory["Silver-Trimmed Satchel"]["metadata"]["container"]
         self.assertTrue(container["contents_initialized"])
         self.assertFalse(container["contents_taken"])
         self.assertEqual(container["contents"]["currency_base_units"], 0)
-        self.assertEqual([item["name"] for item in container["contents"]["items"]], ["City Map"])
+        self.assertEqual([next(row["name"] for row in self.repository.list_item_catalog() if row["id"] == item_id) for item_id in container["contents"]["items"]], ["City Map"])
         events = self.repository.list_mechanical_events()
         transferred = next(event for event in events if event["event_type"] == "ContainerContentsTakenEvent")
         self.assertEqual(transferred["payload"]["currency_base_units"], 50)
@@ -171,7 +171,7 @@ class ContainerConsistencyTests(unittest.TestCase):
         StoryTurnService.commit_response(self.repository, result, message_id="new-container")
         self.assertEqual(self.repository.get_state_value("currency.balance"), "70")
         satchel = next(item for item in self.repository.list_inventory_items() if item["name"] == "New Satchel")
-        self.assertEqual([item["name"] for item in satchel["metadata"]["container"]["contents"]["items"]], ["City Map"])
+        self.assertEqual([next(row["name"] for row in self.repository.list_item_catalog() if row["id"] == item_id) for item_id in satchel["metadata"]["container"]["contents"]["items"]], ["City Map"])
 
     def test_known_manifest_is_used_during_duplicate_reward_repair(self):
         EventApplier(self.repository).apply_event(corrected_response()["events"][0])

@@ -6,11 +6,8 @@ from typing import Any
 from ai_adventure.calendar_system import (
     build_calendar_snapshot,
 )
-from ai_adventure.combat import (
-    DEFAULT_BASE_ARMOR_RATING,
-    DEFAULT_PLAYER_MAX_HEALTH,
-    normalize_equipment,
-)
+from ai_adventure.items import normalize_equipment
+from ai_adventure.stats import DEFAULT_PLAYER_MAX_HEALTH
 from ai_adventure.core.models import (
     AdventureMetadata,
     AdventureState,
@@ -36,7 +33,7 @@ from ai_adventure.core.models import (
     RecipeKnowledge,
     SettingsState,
     Skill,
-    SkillCheck,
+    D20Test,
     SkillsState,
     TravelState,
     WorldState,
@@ -89,7 +86,8 @@ class StateManager:
             settings.values.get("player.equipment", {}),
             [item.to_dict() for item in inventory.items],
         )
-        health_max = _read_int(settings.values, "player.health_max", DEFAULT_PLAYER_MAX_HEALTH)
+        stats = self.repository.player_stats()
+        health_max = stats["health_max"]
 
         return AdventureState(
             metadata=AdventureMetadata(
@@ -105,7 +103,7 @@ class StateManager:
                 ),
                 appearance=str(settings.values.get("player.appearance", "")),
                 backstory=str(settings.values.get("player.backstory", "")),
-                condition=_read_string(state_snapshot, "condition", "Healthy"),
+                condition="Incapacitated" if stats["health_current"] == 0 else _read_string(state_snapshot, "condition", "Healthy"),
                 notes=str(settings.values.get("player.notes", "")),
                 health_current=max(
                     0,
@@ -119,11 +117,14 @@ class StateManager:
                     ),
                 ),
                 health_max=health_max,
-                armor_rating=_read_int(
-                    settings.values,
-                    "player.armor_rating",
-                    DEFAULT_BASE_ARMOR_RATING,
-                ),
+                attributes=stats["attributes"],
+                modifiers=stats["modifiers"],
+                level=stats["level"],
+                xp=stats["xp"],
+                reward_choices=stats["reward_choices"],
+                progression_records=self.repository.list_progression_records(200),
+                skill_advances=stats["skill_advances"],
+                carrying_capacity_lb=stats["carrying_capacity_lb"],
                 equipment=equipment,
             ),
             world=WorldState(
@@ -301,7 +302,7 @@ class StateManager:
         """Loads typed skill state."""
 
         skills: list[Skill] = []
-        recent_checks: list[SkillCheck] = []
+        recent_checks: list[D20Test] = []
 
         for row in self.repository.list_skills():
             skills.append(
@@ -311,17 +312,23 @@ class StateManager:
                     description=_read_string(row, "description", ""),
                     level=_read_int(row, "level", 1),
                     xp=_read_int(row, "xp", 0),
-                    bonus=_read_int(row, "bonus", 2),
+                    bonus=_read_int(row, "bonus", 1),
                 )
             )
 
-        for row in self.repository.list_skill_checks():
+        for row in self.repository.list_d20_tests():
             recent_checks.append(
-                SkillCheck(
+                D20Test(
                     id=_read_optional_int(row, "id"),
+                    attribute=_read_string(row, "attribute", "Strength"),
+                    test_kind=_read_string(row, "test_kind", "check"),
+                    attribute_modifier=_read_int(row, "attribute_modifier", 0),
+                    skill_bonus=_read_int(row, "skill_bonus", 0),
+                    rolls=row.get("rolls", []),
+                    reason=_read_string(row, "reason", ""),
                     skill_name=_read_string(row, "skill_name", ""),
                     level=_read_int(row, "level", 1),
-                    bonus=_read_int(row, "bonus", 2),
+                    bonus=_read_int(row, "bonus", 1),
                     roll=_read_int(row, "roll", 0),
                     total=_read_int(row, "total", 0),
                     dc=_read_int(row, "dc", 14),

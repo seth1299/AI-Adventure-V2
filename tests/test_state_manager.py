@@ -129,7 +129,7 @@ class StateManagerTests(unittest.TestCase):
                 "speaker_id": "mira_coppercup",
                 "speaker_name": "Mira",
                 "voice_profile": "feminine",
-                "voice_id": "af_bella",
+                "voice_id": "af_bella", "speaker_role": "character",
             }
             repository.append_history(
                 "story",

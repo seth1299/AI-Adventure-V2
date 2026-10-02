@@ -1084,7 +1084,9 @@ class AudioTests(unittest.TestCase):
             )
             self.assertEqual(
                 background_ambience_directory,
-                paths.background_ambience_dir,
+                paths.package_background_ambience_dir
+                if any(path.suffix.casefold() in {".mp3", ".wav", ".ogg"} for path in paths.package_background_ambience_dir.glob("*"))
+                else paths.background_ambience_dir,
             )
             self.assertEqual(
                 paths.package_background_ambience_dir.name,

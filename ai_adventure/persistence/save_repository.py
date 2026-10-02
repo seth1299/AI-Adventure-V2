@@ -10,7 +10,7 @@ import shutil
 import sqlite3
 import uuid
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, closing
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -46,12 +46,14 @@ from ai_adventure.calendar_system import (
 )
 from ai_adventure.audio.tts_settings import normalize_tts_audio_fields
 from ai_adventure.audio.voices import DEFAULT_NARRATOR_VOICE
-from ai_adventure.combat import normalize_combat_state, normalize_equipment, normalize_item_metadata
+from ai_adventure.items import normalize_equipment, normalize_item_metadata
 from ai_adventure.currency import (
     DEFAULT_CURRENCY_DENOMINATIONS,
     normalize_currency_denominations,
 )
 from ai_adventure.item_categories import normalize_inventory_category
+from ai_adventure.inventory_storage import inventory_access, move_destinations, move_error, inventory_load, capacity_error, pounds
+from ai_adventure.persistence.inventory_containers import synchronize_container_records
 from ai_adventure.new_game_setup import normalize_new_game_setup
 from ai_adventure.narration_preferences import (
     DEFAULT_NARRATION_STYLE,
@@ -74,9 +76,12 @@ from ai_adventure.magic import (
     normalize_magic_advancement_significance,
     normalize_magic_setup,
 )
-from ai_adventure.skills.rules import MAX_SKILL_LEVEL, bonus_for_level, clamp_skill_level, level_for_xp
+from ai_adventure.skills.rules import MAX_SKILL_LEVEL, XP_THRESHOLDS_BY_LEVEL, bonus_for_level, clamp_skill_level, level_for_xp
 from ai_adventure.text_sanitization import sanitize_english_text
 
+
+from ai_adventure.persistence.player_stats import PlayerStatsRepository
+from ai_adventure.stats import RULES_VERSION, ATTRIBUTES
 
 LOGGER = logging.getLogger(__name__)
 GM_SECRET_STATUSES = frozenset({"active", "revealed", "retired"})
@@ -106,7 +111,7 @@ class SaveFileOperationError(ValueError):
     """Raised when a save file operation cannot be performed safely."""
 
 
-class SaveRepository:
+class SaveRepository(PlayerStatsRepository):
     """
     SQLite-backed repository for one adventure save.
 
@@ -122,11 +127,20 @@ class SaveRepository:
             db_path: Path to this save's SQLite database.
         """
 
+        if db_path.exists() and db_path.stat().st_size:
+            with closing(sqlite3.connect(db_path.resolve().as_uri() + "?mode=ro", uri=True)) as connection:
+                try:
+                    version = connection.execute("SELECT value FROM meta WHERE key = 'rules_version'").fetchone()
+                except sqlite3.Error:
+                    version = None
+                if version is None or version[0] != RULES_VERSION:
+                    raise SaveFileOperationError("This save uses older rules. Create a new game for Stats; the original save has not been changed.")
         self.db_path = db_path
         self._active_message_id: str | None = None
         self._transaction_state = local()
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._initialize_schema()
+        self.set_meta("rules_version", RULES_VERSION)
         self.set_player_equipment(self.get_setting("player.equipment", {}))
 
     @classmethod
@@ -167,6 +181,7 @@ class SaveRepository:
         repository.set_setting("player_name", "Player Name")
         repository.set_setting("player.name_pronunciation", "")
         repository.set_setting("player.pronouns", "They/Them")
+        repository.initialize_player_stats({a: 10 for a in ATTRIBUTES})
         repository.set_setting("player.appearance", "")
         repository.set_setting("player.backstory", "")
         repository.set_setting("player.notes", "")
@@ -207,30 +222,35 @@ class SaveRepository:
             "Potion",
             1,
             "A mild red draught meant to steady minor wounds and fatigue.",
+            metadata={"weight_lb": 0.5},
         )
         repository.add_inventory_item(
             "Iron Dagger",
             "Weapon",
             1,
             "A plain iron dagger with a worn leather grip.",
+            metadata={"weight_lb": 1},
         )
         repository.add_inventory_item(
             "Lantern",
             "Tool",
             1,
             "A brass lantern with a shuttered flame chamber.",
+            metadata={"weight_lb": 2},
         )
         repository.add_inventory_item(
             "Trail Ration",
             "Food",
             3,
             "Dried bread, hard cheese, and smoked fruit wrapped for travel.",
+            metadata={"weight_lb": 1},
         )
         repository.add_inventory_item(
             "Waterskin",
             "Tool",
             1,
             "A sealed waterskin suitable for a day's travel.",
+            metadata={"weight_lb": 2},
         )
         repository.upsert_skill(
             "Crafting",
@@ -283,6 +303,7 @@ class SaveRepository:
         self.set_setting("player_name", character["name"])
         self.set_setting("player.name_pronunciation", character["name_pronunciation"])
         self.set_setting("player.pronouns", character["pronouns"])
+        self.initialize_player_stats(character["attributes"], clean_setup["starting_player_level"])
         self.set_setting("player.appearance", character["appearance"])
         self.set_setting("player.backstory", character["backstory"])
         self.set_setting("player.notes", character["notes"])
@@ -321,11 +342,7 @@ class SaveRepository:
         self.set_setting("world.setup_context", clean_setup["world_context"])
         self.set_setting("world.genre", clean_setup["specified_genre"])
         self.set_setting("world.game_style", clean_setup["game_style"])
-        self.set_setting("combat.preferences", clean_setup["combat"])
-        self.set_setting(
-            "combat.resolution_mode", clean_setup["combat"]["resolution_mode"]
-        )
-        self.set_setting("combat.focus", clean_setup["combat"]["focus"])
+        self.set_setting("fighting.focus", clean_setup["fighting"]["focus"])
         self.set_setting("currency.description", clean_setup["currency_description"])
         self.set_note_entries([])
         self.set_notes_share_with_ai(False)
@@ -354,18 +371,12 @@ class SaveRepository:
         self.set_state_value("weather", clean_setup["starting_weather"] or "Clear")
         self.set_state_value("condition", "Healthy")
 
-        for item in clean_setup["starter_items"]:
-            if bool(item.get("requires_ai_invention")) or not str(item.get("name", "")).strip():
-                continue
-
-            self.add_inventory_item(
-                name=item["name"],
-                category=item["category"],
-                quantity=int(item["quantity"]),
-                description=item["description"],
-                value_base_units=int(item["value_base_units"]),
-                metadata=item,
-            )
+        # Validate the complete starting load together: a bag can appear after
+        # its contents in the authored list without creating a temporary overload.
+        starter_items = [item for item in clean_setup["starter_items"]
+                         if not item.get("requires_ai_invention") and str(item.get("name", "")).strip()]
+        if starter_items:
+            self.replace_inventory_items(starter_items)
 
         for skill in clean_setup["skills"]:
             if str(skill.get("name", "")).strip():
@@ -723,9 +734,16 @@ class SaveRepository:
             quantity = 1
 
         clean_value = max(0, _safe_int(value_base_units, default=0) or 0)
-        raw_metadata = metadata if isinstance(metadata, dict) else {}
+        raw_metadata = dict(metadata) if isinstance(metadata, dict) else {}
+        with self._connect() as catalog_connection:
+            known = catalog_connection.execute("SELECT metadata_json FROM item_catalog WHERE name = ? COLLATE NOCASE LIMIT 1", (clean_name,)).fetchone()
+        if known is not None:
+            catalog_metadata = _decode_json_dict(known["metadata_json"], "item catalog metadata")
+            for field in ("weight_lb", "carrying_capacity_lb"):
+                if field not in raw_metadata and field in catalog_metadata:
+                    raw_metadata[field] = catalog_metadata[field]
         clean_metadata = normalize_item_metadata(
-            metadata,
+            raw_metadata,
             name=clean_name,
             category=category,
             description=description,
@@ -733,7 +751,8 @@ class SaveRepository:
         clean_metadata["quantity_unit"] = _inventory_quantity_unit(raw_metadata)
         clean_metadata["storage_location"] = _inventory_storage_location(raw_metadata)
 
-        with self._connect() as connection:
+        with self.transaction() as connection:
+            before_capacity = self.list_inventory_items()
             item_uuid = str(raw_metadata.get("item_uuid", "")).strip()
             if not item_uuid:
                 catalog_row = connection.execute(
@@ -761,6 +780,13 @@ class SaveRepository:
 
             if rows:
                 primary_row = rows[0]
+                if str(primary_row["storage_location"]).casefold() != _inventory_storage_location(clean_metadata).casefold():
+                    raise ValueError("This item stack is stored elsewhere; move it first or use a distinct item name.")
+                existing_metadata = _decode_json_dict(primary_row["metadata_json"], "inventory item metadata")
+                for field in ("moveable", "storable", "container", "container_id", "weight_lb", "carrying_capacity_lb"):
+                    if field not in raw_metadata and field in existing_metadata:
+                        clean_metadata[field] = existing_metadata[field]
+                metadata_json = _encode_json_dict(clean_metadata)
                 duplicate_ids = [row["id"] for row in rows[1:]]
                 existing_quantity = sum(int(row["quantity"]) for row in rows)
                 existing_value = max(int(row["value_base_units"]) for row in rows)
@@ -834,6 +860,8 @@ class SaveRepository:
                 "UPDATE inventory_items SET id = ? WHERE name = ? COLLATE NOCASE AND id != ?",
                 (catalog_id, clean_name, catalog_id),
             )
+            synchronize_container_records(connection, _upsert_item_catalog_entry)
+            self._check_inventory_capacity(before_capacity)
 
         self.append_history("inventory", f"Added {quantity} x {clean_name}.")
 
@@ -864,6 +892,62 @@ class SaveRepository:
             ).fetchall()
 
         return [_inventory_row_to_dict(row) for row in rows]
+
+    def player_carrying_capacity_lb(self) -> float:
+        return self.player_stats()["carrying_capacity_lb"]
+
+    def inventory_load(self) -> dict[str, Any]:
+        return inventory_load(self.list_inventory_items(), self.player_carrying_capacity_lb())
+
+    def _check_inventory_capacity(self, before: list[dict[str, Any]]) -> None:
+        error = capacity_error(before, self.list_inventory_items(), self.player_carrying_capacity_lb())
+        if error:
+            raise ValueError(error)
+
+    def inventory_access(self) -> dict[str, dict[str, Any]]:
+        return inventory_access(self.list_inventory_items(), self.get_state_value("location", ""))
+
+    def list_accessible_inventory_items(self) -> list[dict[str, Any]]:
+        items = self.list_inventory_items()
+        access = inventory_access(items, self.get_state_value("location", ""))
+        return [item for item in items if access[str(item["id"])]["available"] and access[str(item["id"])]["known"]]
+
+    def inventory_move_destinations(self, item_id: str) -> list[tuple[str, str]]:
+        return move_destinations(item_id, self.list_inventory_items(), self.get_state_value("location", ""), self.player_carrying_capacity_lb())
+
+    def move_inventory_item(self, item_id: str, destination: str) -> None:
+        """Atomically move one existing stack, preserving its catalog identity."""
+        with self.transaction() as connection:
+            items = self.list_inventory_items()
+            by_id = {str(item["id"]): item for item in items}
+            if destination not in by_id:
+                named = [item for item in items if item["name"].casefold() == destination.casefold() and "container" in item["metadata"]]
+                if len(named) == 1:
+                    destination = str(named[0]["id"])
+            error = move_error(item_id, destination, items, self.get_state_value("location", ""), self.player_carrying_capacity_lb())
+            if error:
+                raise ValueError(error)
+            item = by_id[item_id]
+            item_metadata = dict(item["metadata"])
+            old_parent = str(item_metadata.pop("container_id", "") or "")
+            if old_parent:
+                parent = by_id[old_parent]
+                parent_metadata = parent["metadata"]
+                parent_metadata["container"]["contents"]["items"].remove(item_id)
+                contents = parent_metadata["container"]["contents"]
+                parent_metadata["container"]["contents_taken"] = not contents["items"] and not contents["currency_base_units"]
+                connection.execute("UPDATE inventory_items SET metadata_json = ? WHERE id = ?", (_encode_json_dict(parent_metadata), old_parent))
+            if destination in by_id:
+                item_metadata["container_id"] = destination
+                storage = str(by_id[destination]["name"])
+            else:
+                storage = destination
+            item_metadata["storage_location"] = storage
+            connection.execute("UPDATE inventory_items SET storage_location = ?, equipped = 0, metadata_json = ? WHERE id = ?", (storage, _encode_json_dict(item_metadata), item_id))
+            synchronize_container_records(connection, _upsert_item_catalog_entry)
+            equipment = self.get_setting("player.equipment", {})
+            self.set_player_equipment({slot: name for slot, name in equipment.items() if str(name).casefold() != item["name"].casefold()})
+            self.append_history("inventory", f"Moved {item['quantity']} x {item['name']} to {storage}.")
 
     def replace_inventory_items(self, items: list[dict[str, Any]]) -> None:
         """
@@ -929,7 +1013,8 @@ class SaveRepository:
             LOGGER.warning("Skipped replace_inventory_items because no valid items were provided.")
             return
 
-        with self._connect() as connection:
+        with self.transaction() as connection:
+            before_capacity = self.list_inventory_items()
             connection.execute("DELETE FROM inventory_items")
             catalog_ids = {
                 str(item["name"]).casefold(): _upsert_item_catalog_entry(
@@ -970,6 +1055,8 @@ class SaveRepository:
                     for item in clean_items
                 ],
             )
+            synchronize_container_records(connection, _upsert_item_catalog_entry)
+            self._check_inventory_capacity(before_capacity)
         self.set_player_equipment(self.get_setting("player.equipment", {}))
         self.append_history("inventory", "Starting inventory finalized.")
 
@@ -1043,7 +1130,8 @@ class SaveRepository:
             LOGGER.warning("Invalid remove quantity '%s' for '%s'.", quantity, clean_name)
             return
 
-        with self._connect() as connection:
+        with self.transaction() as connection:
+            before_capacity = self.list_inventory_items()
             row = connection.execute(
                 """
                 SELECT id, quantity
@@ -1068,10 +1156,25 @@ class SaveRepository:
                     (new_quantity, row["id"]),
                 )
             else:
+                item_row = connection.execute("SELECT metadata_json FROM inventory_items WHERE id = ?", (row["id"],)).fetchone()
+                item_metadata = _decode_json_dict(item_row["metadata_json"], "inventory item metadata")
+                contents = item_metadata.get("container", {}).get("contents", {})
+                if contents.get("items") or contents.get("currency_base_units"):
+                    raise ValueError("Empty the container before removing it, or move it to its new location.")
+                parent_id = str(item_metadata.get("container_id", "") or "")
+                if parent_id:
+                    parent_row = connection.execute("SELECT metadata_json FROM inventory_items WHERE id = ?", (parent_id,)).fetchone()
+                    parent_metadata = _decode_json_dict(parent_row["metadata_json"], "container metadata")
+                    parent_contents = parent_metadata["container"]["contents"]
+                    parent_contents["items"] = [value for value in parent_contents["items"] if value != str(row["id"])]
+                    parent_metadata["container"]["contents_taken"] = not parent_contents["items"] and not parent_contents["currency_base_units"]
+                    connection.execute("UPDATE inventory_items SET metadata_json = ? WHERE id = ?", (_encode_json_dict(parent_metadata), parent_id))
                 connection.execute(
                     "DELETE FROM inventory_items WHERE id = ?",
                     (row["id"],),
                 )
+            synchronize_container_records(connection, _upsert_item_catalog_entry)
+            self._check_inventory_capacity(before_capacity)
 
         self.set_player_equipment(self.get_setting("player.equipment", {}))
         self.append_history("inventory", f"Removed {quantity} x {clean_name}.")
@@ -1106,7 +1209,8 @@ class SaveRepository:
             LOGGER.error("Attempted to modify inventory item with blank target name.")
             return
 
-        with self._connect() as connection:
+        with self.transaction() as connection:
+            before_capacity = self.list_inventory_items()
             row = connection.execute(
                 """
                 SELECT id, name, category, description, quantity, storage_location, value_base_units, metadata_json
@@ -1121,6 +1225,11 @@ class SaveRepository:
             if row is None:
                 LOGGER.warning("Attempted to modify missing inventory item: %s", clean_target)
                 return
+
+            updates = metadata if isinstance(metadata, dict) else {}
+            if "storage_location" in updates and _clean_storage_location(updates["storage_location"]).casefold() != str(row["storage_location"]).casefold():
+                self.move_inventory_item(str(row["id"]), _clean_storage_location(updates["storage_location"]))
+                row = connection.execute("SELECT id, name, category, description, quantity, storage_location, value_base_units, metadata_json FROM inventory_items WHERE id = ?", (row["id"],)).fetchone()
 
             updated_name = new_name.strip() if new_name and new_name.strip() else row["name"]
             updated_category = (
@@ -1203,6 +1312,8 @@ class SaveRepository:
                 value_base_units=updated_value,
                 metadata=updated_metadata,
             )
+            synchronize_container_records(connection, _upsert_item_catalog_entry)
+            self._check_inventory_capacity(before_capacity)
 
         self.set_player_equipment(self.get_setting("player.equipment", {}))
         self.append_history("inventory", f"Modified inventory item: {clean_target}.")
@@ -1368,6 +1479,7 @@ class SaveRepository:
         value_base_units: int = 0,
         result_item_uuid: str = "",
         result_item_name: str = "",
+        result_weight_lb: float | None = None,
         skill_name: str = DEFAULT_CRAFTING_SKILL,
         stages: list[dict[str, Any]] | None = None,
         required_tool_item_uuids: list[str] | None = None,
@@ -1439,6 +1551,7 @@ class SaveRepository:
                     clean_tool_ids.append(tool_uuid)
 
             clean_result_name = result_item_name.strip() or result.strip()
+            result_metadata = {"weight_lb": pounds(result_weight_lb)} if result_weight_lb is not None else {}
             clean_result_uuid = result_item_uuid.strip()
             if not clean_result_uuid and clean_result_name:
                 clean_result_uuid = catalog_uuids.get(clean_result_name.casefold(), "")
@@ -1449,6 +1562,7 @@ class SaveRepository:
                     category="Consumable",
                     description=notes.strip() or f"Made by crafting {clean_name}.",
                     value_base_units=clean_value,
+                    metadata=result_metadata,
                 )
                 result_row = connection.execute(
                     "SELECT metadata_json FROM item_catalog WHERE name = ? COLLATE NOCASE",
@@ -1469,8 +1583,15 @@ class SaveRepository:
                     category="Consumable",
                     description=notes.strip() or f"Made by crafting {clean_name}.",
                     value_base_units=clean_value,
-                    metadata={"item_uuid": clean_result_uuid},
+                    metadata={**result_metadata, "item_uuid": clean_result_uuid},
                 )
+            if result_metadata and clean_result_uuid:
+                result_row = connection.execute("SELECT id, metadata_json FROM item_catalog WHERE name = ? COLLATE NOCASE", (clean_result_name,)).fetchone()
+                if result_row is not None:
+                    saved_metadata = _decode_json_dict(result_row["metadata_json"], "recipe result metadata")
+                    if "weight_lb" not in saved_metadata:
+                        saved_metadata.update(result_metadata)
+                        connection.execute("UPDATE item_catalog SET metadata_json = ? WHERE id = ?", (_encode_json_dict(saved_metadata), result_row["id"]))
             plan = normalize_recipe_plan(
                 {
                     "skill_name": skill_name,
@@ -1607,6 +1728,16 @@ class SaveRepository:
         return recipes
 
     def craft_recipe(self, recipe_id: str, *, quantity: int = 1) -> dict[str, Any]:
+        """Keep ingredients and work intact when the completed output cannot fit."""
+        try:
+            with self.transaction():
+                return self._craft_recipe(recipe_id, quantity=quantity)
+        except ValueError as error:
+            if "capacity exceeded" not in str(error):
+                raise
+            return {"status": "blocked", "message": str(error), "recipe_id": recipe_id}
+
+    def _craft_recipe(self, recipe_id: str, *, quantity: int = 1) -> dict[str, Any]:
         """Advances one deterministic crafting interaction for a recipe."""
 
         clean_recipe_id = str(recipe_id or "").strip()
@@ -1641,7 +1772,7 @@ class SaveRepository:
         if process is None:
             availability = evaluate_recipe_craftability(
                 recipe,
-                self.list_inventory_items(),
+                self.list_accessible_inventory_items(),
                 quantity=requested_quantity,
             )
             if not availability["craftable"]:
@@ -1798,19 +1929,18 @@ class SaveRepository:
                 (identity, amount, str(ingredient.get("measure_unit", "each")))
             )
 
-        with self._connect() as connection:
-            rows = connection.execute(
-                "SELECT id, quantity, metadata_json FROM inventory_items ORDER BY id ASC"
-            ).fetchall()
+        with self.transaction():
+            rows = self.list_accessible_inventory_items()
             for identity, amount, unit in requirements:
                 matching = []
                 for row in rows:
-                    metadata = _decode_json_dict(
-                        row["metadata_json"], "inventory item metadata"
-                    )
+                    metadata = row["metadata"]
                     if str(metadata.get("item_uuid", "")).strip() != identity:
                         continue
                     if str(metadata.get("quantity_unit", "each")).casefold() != unit.casefold():
+                        return False
+                    contents = metadata.get("container", {}).get("contents", {})
+                    if contents.get("items") or contents.get("currency_base_units"):
                         return False
                     matching.append(row)
                 if sum(int(row["quantity"]) for row in matching) < amount:
@@ -1821,22 +1951,12 @@ class SaveRepository:
                 for row in rows:
                     if remaining <= 0:
                         break
-                    metadata = _decode_json_dict(
-                        row["metadata_json"], "inventory item metadata"
-                    )
+                    metadata = row["metadata"]
                     if str(metadata.get("item_uuid", "")).strip() != identity:
                         continue
                     available = int(row["quantity"])
                     consumed = min(available, remaining)
-                    if available == consumed:
-                        connection.execute(
-                            "DELETE FROM inventory_items WHERE id = ?", (row["id"],)
-                        )
-                    else:
-                        connection.execute(
-                            "UPDATE inventory_items SET quantity = ? WHERE id = ?",
-                            (available - consumed, row["id"]),
-                        )
+                    self.remove_inventory_item(str(row["name"]), consumed)
                     remaining -= consumed
         self.set_player_equipment(self.get_setting("player.equipment", {}))
         self.append_history(
@@ -1861,7 +1981,7 @@ class SaveRepository:
             return False
         owned = {
             str(item.get("metadata", {}).get("item_uuid", "")).strip()
-            for item in self.list_inventory_items()
+            for item in self.list_accessible_inventory_items()
             if isinstance(item.get("metadata"), dict)
             and int(item.get("quantity", 0) or 0) > 0
         }
@@ -2449,13 +2569,14 @@ class SaveRepository:
             connection.execute(
                 """
                 INSERT INTO skills (name, description, level, xp, bonus)
-                VALUES (?, ?, ?, 0, ?)
+                VALUES (?, ?, ?, ?, ?)
                 ON CONFLICT(name) DO UPDATE SET
                     description = excluded.description,
                     level = MAX(skills.level, excluded.level),
-                    bonus = MAX(skills.bonus, excluded.bonus)
+                    bonus = MAX(skills.bonus, excluded.bonus),
+                    xp = MAX(skills.xp, excluded.xp)
                 """,
-                (clean_name, description.strip(), clean_level, bonus),
+                (clean_name, description.strip(), clean_level, XP_THRESHOLDS_BY_LEVEL[clean_level], bonus),
             )
 
         self.append_history("skill", f"Skill updated: {clean_name} Level {clean_level}.")
@@ -2510,13 +2631,14 @@ class SaveRepository:
             connection.executemany(
                 """
                 INSERT INTO skills (name, description, level, xp, bonus)
-                VALUES (?, ?, ?, 0, ?)
+                VALUES (?, ?, ?, ?, ?)
                 """,
                 [
                     (
                         skill["name"],
                         skill["description"],
                         skill["level"],
+                        XP_THRESHOLDS_BY_LEVEL[skill["level"]],
                         skill["bonus"],
                     )
                     for skill in clean_skills
@@ -2628,82 +2750,7 @@ class SaveRepository:
 
         return [dict(row) for row in rows]
 
-    def record_skill_check(
-        self,
-        *,
-        skill_name: str,
-        level: int,
-        bonus: int,
-        roll: int,
-        total: int,
-        dc: int,
-        outcome: str,
-    ) -> None:
-        """
-        Records a resolved skill check.
 
-        Args:
-            skill_name: Checked skill.
-            level: Skill level used.
-            bonus: Skill bonus used.
-            roll: Raw d20 roll.
-            total: Roll plus bonus.
-            dc: Difficulty class.
-            outcome: success or failure.
-        """
-
-        with self._connect() as connection:
-            connection.execute(
-                """
-                INSERT INTO skill_checks (
-                    skill_name,
-                    level,
-                    bonus,
-                    roll,
-                    total,
-                    dc,
-                    outcome,
-                    created_at
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    skill_name.strip(),
-                    level,
-                    bonus,
-                    roll,
-                    total,
-                    dc,
-                    outcome,
-                    datetime.now().isoformat(timespec="seconds"),
-                ),
-            )
-
-    def list_skill_checks(self, limit: int = 10) -> list[dict[str, Any]]:
-        """
-        Reads recent skill checks.
-
-        Args:
-            limit: Maximum checks to return.
-
-        Returns:
-            Recent skill check dictionaries, oldest first within the returned set.
-        """
-
-        with self._connect() as connection:
-            rows = connection.execute(
-                """
-                SELECT id, skill_name, level, bonus, roll, total, dc, outcome, created_at
-                FROM skill_checks
-                ORDER BY id DESC
-                LIMIT ?
-                """,
-                (limit,),
-            ).fetchall()
-
-        checks = [dict(row) for row in rows]
-        checks.reverse()
-        return checks
 
     def upsert_npc(
         self,
@@ -3232,7 +3279,7 @@ class SaveRepository:
         direction = str(direction).strip().casefold()
         if direction not in {"buy", "sell"} or quantity <= 0:
             raise ValueError("Invalid merchant transaction.")
-        with self._connect() as connection:
+        with self.transaction() as connection:
             existing = connection.execute("SELECT * FROM merchant_transactions WHERE transaction_id = ?", (transaction_id,)).fetchone()
             if existing is not None:
                 return dict(existing)
@@ -3252,22 +3299,28 @@ class SaveRepository:
                 if balance < total:
                     raise ValueError("You do not have enough currency.")
                 metadata = _decode_json_dict(item["metadata_json"], "merchant item metadata")
-                metadata["item_uuid"] = str(uuid.uuid4())
+                metadata["storage_location"] = "actively_carried"
                 connection.execute("UPDATE merchant_stock SET quantity = quantity - ?, updated_at = ? WHERE stock_id = ?", (quantity, datetime.now().isoformat(timespec="seconds"), reference_id))
                 connection.execute("INSERT INTO game_state (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", ("currency.balance", str(balance - total)))
-                connection.execute("INSERT INTO inventory_items (name, category, quantity, storage_location, description, value_base_units, metadata_json) VALUES (?, ?, ?, 'actively_carried', ?, ?, ?)", (item["name"], item["category"], quantity, item["description"], item["value_base_units"], _encode_json_dict(metadata)))
+                existing_item = next((owned for owned in self.list_inventory_items() if owned["name"].casefold() == str(item["name"]).casefold()), None)
+                if existing_item is not None and (existing_item["storage_location"] != "actively_carried" or "container" in existing_item["metadata"]):
+                    raise ValueError("This item already has a separate stored instance; use a distinct item name.")
+                self.add_inventory_item(str(item["name"]), str(item["category"]), quantity, str(item["description"]), int(item["value_base_units"]), metadata=metadata)
                 item_name = str(item["name"])
             else:
                 inventory = connection.execute("SELECT * FROM inventory_items WHERE name = ? COLLATE NOCASE ORDER BY id LIMIT 1", (row["item_name"],)).fetchone()
                 if inventory is None or int(inventory["quantity"]) < quantity:
                     raise ValueError("You do not have enough of that item.")
+                if str(inventory["id"]) not in {str(item["id"]) for item in self.list_accessible_inventory_items()}:
+                    raise ValueError("That item is not currently accessible for sale.")
+                inventory_metadata = _decode_json_dict(inventory["metadata_json"], "inventory metadata")
+                contents = inventory_metadata.get("container", {}).get("contents", {})
+                if contents.get("items") or contents.get("currency_base_units"):
+                    raise ValueError("Empty the container before selling it.")
                 total = int(row["unit_price_base_units"]) * quantity
                 balance = int(self._state_value_from_connection(connection, "currency.balance", "0") or 0)
                 new_quantity = int(inventory["quantity"]) - quantity
-                if new_quantity:
-                    connection.execute("UPDATE inventory_items SET quantity = ? WHERE id = ?", (new_quantity, inventory["id"]))
-                else:
-                    connection.execute("DELETE FROM inventory_items WHERE id = ?", (inventory["id"],))
+                self.remove_inventory_item(str(inventory["name"]), quantity)
                 connection.execute("INSERT INTO game_state (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", ("currency.balance", str(balance + total)))
                 item_name = str(inventory["name"])
             timestamp = datetime.now().isoformat(timespec="seconds")
@@ -3409,95 +3462,20 @@ class SaveRepository:
 
         return visible_npcs
 
-    def upsert_party_member(
-        self,
-        npc_id: str,
-        *,
-        status: str | None = None,
-        health_current: int | None = None,
-        health_max: int | None = None,
-        armor_class: int | None = None,
-        combat_style: str | None = None,
-        skills: list[str] | None = None,
-    ) -> dict[str, Any] | None:
-        """Creates or updates party-specific data for an existing NPC identity."""
-
-        clean_npc_id = npc_id.strip()
-        if not clean_npc_id or self.get_npc(clean_npc_id) is None:
-            LOGGER.warning("Skipped party-member upsert for unknown NPC %r.", npc_id)
+    def upsert_party_member(self, npc_id: str, *, status: str | None = None, combat_style: str | None = None, skills: list[str] | None = None) -> dict[str, Any] | None:
+        if self.get_npc(npc_id) is None:
             return None
-
         timestamp = datetime.now().isoformat(timespec="seconds")
         with self._connect() as connection:
-            existing = connection.execute(
-                "SELECT * FROM party_members WHERE npc_id = ?",
-                (clean_npc_id,),
-            ).fetchone()
-            existing_status = str(existing["status"]) if existing is not None else "Active"
-            existing_health_current = int(existing["health_current"]) if existing is not None else -1
-            existing_health_max = int(existing["health_max"]) if existing is not None else -1
-            existing_armor_class = int(existing["armor_class"]) if existing is not None else -1
-            existing_combat_style = str(existing["combat_style"]) if existing is not None else ""
-            existing_skills = (
-                _decode_string_list(existing["skills_json"], "party skills")
-                if existing is not None
-                else []
-            )
-
-            clean_health_max = (
-                max(-1, _safe_int(health_max))
-                if health_max is not None
-                else existing_health_max
-            )
-            clean_health_current = (
-                max(-1, _safe_int(health_current))
-                if health_current is not None
-                else existing_health_current
-            )
-            if clean_health_max >= 0 and clean_health_current >= 0:
-                clean_health_current = min(clean_health_current, clean_health_max)
-
-            connection.execute(
-                """
-                INSERT INTO party_members (
-                    npc_id, status, health_current, health_max, armor_class,
-                    combat_style, skills_json, created_at, updated_at
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(npc_id) DO UPDATE SET
-                    status = excluded.status,
-                    health_current = excluded.health_current,
-                    health_max = excluded.health_max,
-                    armor_class = excluded.armor_class,
-                    combat_style = excluded.combat_style,
-                    skills_json = excluded.skills_json,
-                    updated_at = excluded.updated_at
-                """,
-                (
-                    clean_npc_id,
-                    status.strip() if isinstance(status, str) and status.strip() else existing_status,
-                    clean_health_current,
-                    clean_health_max,
-                    max(-1, _safe_int(armor_class))
-                    if armor_class is not None
-                    else existing_armor_class,
-                    combat_style.strip() if isinstance(combat_style, str) else existing_combat_style,
-                    _encode_string_list(
-                        _clean_string_list(skills) if skills is not None else existing_skills
-                    ),
-                    str(existing["created_at"]) if existing is not None else timestamp,
-                    timestamp,
-                ),
-            )
-
-        return next(
-            (
-                member
-                for member in self.list_party_members()
-                if str(member.get("npc_id", "")) == clean_npc_id
-            ),
-            None,
-        )
+            existing = connection.execute("SELECT * FROM party_members WHERE npc_id = ?", (npc_id,)).fetchone()
+            connection.execute("""INSERT INTO party_members (npc_id, status, combat_style, skills_json, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(npc_id) DO UPDATE SET status=excluded.status,
+                combat_style=excluded.combat_style, skills_json=excluded.skills_json, updated_at=excluded.updated_at""",
+                (npc_id, status if status is not None else existing["status"] if existing else "Active",
+                 combat_style if combat_style is not None else existing["combat_style"] if existing else "",
+                 _encode_string_list(_clean_string_list(skills)) if skills is not None else existing["skills_json"] if existing else "[]",
+                 timestamp, timestamp))
+        return next((m for m in self.list_party_members() if m["npc_id"] == npc_id), None)
 
     def remove_party_member(self, npc_id: str) -> bool:
         """Removes party membership without deleting the canonical NPC profile."""
@@ -3521,9 +3499,6 @@ class SaveRepository:
                 SELECT
                     p.npc_id,
                     p.status,
-                    p.health_current,
-                    p.health_max,
-                    p.armor_class,
                     p.combat_style,
                     p.skills_json,
                     p.created_at AS party_created_at,
@@ -4924,6 +4899,7 @@ class SaveRepository:
                     [tuple(row) for row in rows if isinstance(row, list)],
                 )
 
+            synchronize_container_records(connection, _upsert_item_catalog_entry)
             if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
                 raise sqlite3.IntegrityError("Snapshot contains invalid record relationships.")
 
@@ -5680,16 +5656,22 @@ class SaveRepository:
 
         return normalize_equipment(
             self.get_setting("player.equipment", {}),
-            self.list_inventory_items(),
+            self.list_accessible_inventory_items(),
         )
 
     def set_player_equipment(self, equipment: Any) -> dict[str, str]:
         """Stores current player equipment and returns the normalized result."""
 
-        clean_equipment = normalize_equipment(equipment, self.list_inventory_items())
-        self.set_setting("player.equipment", clean_equipment)
-        self._sync_inventory_equipped_flags(clean_equipment)
-        return clean_equipment
+        with self.transaction():
+            accessible = self.list_accessible_inventory_items()
+            clean_equipment = normalize_equipment(equipment, accessible)
+            names = {name.casefold() for name in clean_equipment.values() if name}
+            for item in accessible:
+                if item["name"].casefold() in names and (str(item.get("storage_location", "")).casefold() not in {"actively_carried", "actively carried", "on_person"} or item["metadata"].get("container_id")):
+                    self.move_inventory_item(str(item["id"]), "actively_carried")
+            self.set_setting("player.equipment", clean_equipment)
+            self._sync_inventory_equipped_flags(clean_equipment)
+            return clean_equipment
 
     def _sync_inventory_equipped_flags(self, equipment: dict[str, str]) -> None:
         """Keeps inventory flags aligned with the canonical equipment map."""
@@ -5713,22 +5695,8 @@ class SaveRepository:
                     (item_name,),
                 )
 
-    def get_combat_state(self) -> dict[str, Any]:
-        """Reads the saved deterministic combat state."""
 
-        return normalize_combat_state(self.get_setting("combat.state", {}))
 
-    def set_combat_state(self, combat_state: Any) -> dict[str, Any]:
-        """Stores the deterministic combat state."""
-
-        clean_state = normalize_combat_state(combat_state)
-        self.set_setting("combat.state", clean_state)
-        return clean_state
-
-    def is_combat_active(self) -> bool:
-        """Returns whether an unresolved deterministic combat is active."""
-
-        return bool(self.get_combat_state().get("active", False))
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
@@ -5860,11 +5828,30 @@ class SaveRepository:
                     description TEXT NOT NULL DEFAULT '',
                     level INTEGER NOT NULL DEFAULT 1,
                     xp INTEGER NOT NULL DEFAULT 0,
-                    bonus INTEGER NOT NULL DEFAULT 2
+                    bonus INTEGER NOT NULL DEFAULT 1
                 );
 
-                CREATE TABLE IF NOT EXISTS skill_checks (
+                CREATE TABLE IF NOT EXISTS event_receipts (
+                    message_id TEXT NOT NULL, event_key TEXT NOT NULL,
+                    result_json TEXT NOT NULL,
+                    PRIMARY KEY(message_id, event_key)
+                );
+                CREATE TABLE IF NOT EXISTS progression_records (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    kind TEXT NOT NULL, source_id TEXT NOT NULL,
+                    details_json TEXT NOT NULL, created_at TEXT NOT NULL,
+                    UNIQUE(kind, source_id)
+                );
+                CREATE TABLE IF NOT EXISTS d20_tests (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    attribute TEXT NOT NULL,
+                    test_kind TEXT NOT NULL DEFAULT 'check',
+                    attribute_modifier INTEGER NOT NULL,
+                    skill_bonus INTEGER NOT NULL,
+                    rolls_json TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    message_id TEXT NOT NULL DEFAULT '',
+                    request_id TEXT NOT NULL UNIQUE,
                     skill_name TEXT NOT NULL,
                     level INTEGER NOT NULL,
                     bonus INTEGER NOT NULL,
@@ -6042,9 +6029,6 @@ class SaveRepository:
                 CREATE TABLE IF NOT EXISTS party_members (
                     npc_id TEXT PRIMARY KEY,
                     status TEXT NOT NULL DEFAULT 'Active',
-                    health_current INTEGER NOT NULL DEFAULT -1,
-                    health_max INTEGER NOT NULL DEFAULT -1,
-                    armor_class INTEGER NOT NULL DEFAULT -1,
                     combat_style TEXT NOT NULL DEFAULT '',
                     skills_json TEXT NOT NULL DEFAULT '[]',
                     created_at TEXT NOT NULL,
@@ -6326,6 +6310,7 @@ class SaveRepository:
             self._coalesce_inventory_stacks(connection)
             self._seed_item_catalog_from_inventory(connection)
             self._synchronize_item_identity_metadata(connection)
+            synchronize_container_records(connection, _upsert_item_catalog_entry)
 
     def _migrate_calendar_minute_from_game_state(
         self,
@@ -6942,6 +6927,8 @@ def _upsert_item_catalog_entry(
     )
     # Storage belongs to the current inventory instance, never the durable catalog.
     clean_metadata.pop("storage_location", None)
+    clean_metadata.pop("container_id", None)
+    clean_metadata.pop("manifest_name", None)
     # Keep a stable, AI-facing identity separate from the player-visible name.
     clean_metadata["item_uuid"] = str(raw_metadata.get("item_uuid", "")).strip() or str(uuid.uuid4())
     metadata_json = _encode_json_dict(clean_metadata)
@@ -6950,11 +6937,11 @@ def _upsert_item_catalog_entry(
         """
         SELECT id, category, description, value_base_units, metadata_json, first_seen_at
         FROM item_catalog
-        WHERE name = ? COLLATE NOCASE
+        WHERE name = ? COLLATE NOCASE OR json_extract(metadata_json, '$.item_uuid') = ?
         ORDER BY id ASC
         LIMIT 1
         """,
-        (clean_name,),
+        (clean_name, str(raw_metadata.get("item_uuid", "") or "")),
     ).fetchone()
 
     if row is None:
@@ -6992,6 +6979,9 @@ def _upsert_item_catalog_entry(
         row["metadata_json"],
         "item catalog metadata",
     )
+    for field in ("moveable", "storable", "weight_lb", "carrying_capacity_lb"):
+        if field not in raw_metadata and field in existing_metadata:
+            clean_metadata[field] = existing_metadata[field]
     if not str(raw_metadata.get("item_uuid", "")).strip():
         clean_metadata["item_uuid"] = str(
             existing_metadata.get("item_uuid", clean_metadata["item_uuid"])
@@ -7126,9 +7116,6 @@ def _party_member_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
         "age": row["age"],
         "species": row["species"],
         "status": row["status"],
-        "health_current": row["health_current"],
-        "health_max": row["health_max"],
-        "armor_class": row["armor_class"],
         "combat_style": row["combat_style"],
         "skills": _decode_string_list(row["skills_json"], "party skills"),
         "party_created_at": row["party_created_at"],
@@ -7265,6 +7252,8 @@ def _clean_storage_location(value: Any) -> str:
     """Normalizes one inventory table storage-location value."""
 
     clean_value = " ".join(str(value or "actively_carried").strip().split())
+    if clean_value.casefold() in {"actively carried", "actively_carried", "on person", "on_person"}:
+        return "actively_carried"
     return clean_value[:120] or "actively_carried"
 
 

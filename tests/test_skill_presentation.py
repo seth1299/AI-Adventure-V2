@@ -17,7 +17,7 @@ from ai_adventure.events.event_applier import EventApplier
 from ai_adventure.new_game_setup import build_new_game_setup_packet
 from ai_adventure.persistence.save_repository import SaveRepository
 from ai_adventure.skills.rules import SKILL_DESCRIPTION_RULE, MAX_SKILL_XP_RULE
-from ai_adventure.ui.screens.skills import _skill_xp_progress_bar
+from ai_adventure.ui.screens.stats import _skill_xp_progress_bar
 
 
 class SkillPresentationTests(unittest.TestCase):

@@ -14,7 +14,6 @@ from ai_adventure.ui.game_shell import _DetachedTabWindow
 from ai_adventure.ui.screens.main_menu import MainMenuScreen
 from ai_adventure.ui.screens.story import StoryScreen
 from ai_adventure.ui.screens.character import CharacterScreen
-from ai_adventure.ui.screens.combat import CombatScreen
 from ai_adventure.ui.screens.bestiary import BestiaryScreen
 from ai_adventure.ui.screens.travel import TravelScreen
 from ai_adventure.ui.screens.calendar import CalendarScreen
@@ -23,7 +22,7 @@ from ai_adventure.ui.common import _inventory_item_display_name, _inventory_quan
 from ai_adventure.ui.screens.party import PartyScreen
 from ai_adventure.ui.screens.npcs import NpcsScreen
 from ai_adventure.ui.screens.tasks import ActiveTasksScreen
-from ai_adventure.ui.screens.skills import SkillsScreen
+from ai_adventure.ui.screens.stats import StatsScreen
 from ai_adventure.ui.screens.magic import MagicScreen
 from ai_adventure.ui.screens.alchemy import AlchemyNotebookScreen
 from ai_adventure.ui.screens.notes import NotesScreen
@@ -31,7 +30,7 @@ from ai_adventure.ui.screens.settings import SettingsScreen
 from ai_adventure.ui.wizards.new_game import NewGameWizard
 from ai_adventure.ui.workers.gemini import (
     GeminiNewGameWorker as _GeminiNewGameWorker,
-    GeminiSkillCheckPlanWorker as _GeminiSkillCheckPlanWorker,
+    GeminiD20TestPlanWorker as _GeminiD20TestPlanWorker,
     GeminiStoryWorker as _GeminiStoryWorker,
     GeminiVisualAssetWorker as _GeminiVisualAssetWorker,
 )
@@ -412,7 +411,7 @@ class MainWindow(QMainWindow):
             "save_game_service",
             SaveGameService(self.app_paths.saves_dir),
         )
-        suggested_title = save_service.next_available_title("Combat Playtest")
+        suggested_title = save_service.next_available_title("Stats Playtest")
         title, accepted = QInputDialog.getText(
             self,
             "New Playtest",
@@ -549,6 +548,9 @@ class MainWindow(QMainWindow):
 
         for template in templates:
             if template.name == selected_name:
+                if not template.compatible:
+                    QMessageBox.warning(self, "Older rules template", "This template predates Stats and cannot start a new adventure. It has not been changed; create a new Stats template.")
+                    return False, None, None
                 return (
                     True,
                     self._template_setup_with_available_title(

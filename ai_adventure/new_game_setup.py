@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+from ai_adventure.stats import RULES_VERSION, STATS_RULE, rank_stats, starting_attributes, normalize_attributes, point_buy_cost, carrying_capacity
+
+from ai_adventure.inventory_storage import pounds
+
 from ai_adventure.skills.rules import SKILL_DESCRIPTION_RULE, MAX_SKILL_XP_RULE
 
 import random
@@ -27,7 +31,9 @@ from ai_adventure.currency import (
 )
 from ai_adventure.narration_preferences import normalize_narration_preferences
 from ai_adventure.magic import normalize_magic_setup
-from ai_adventure.combat import COMBAT_FOCUS_INSTRUCTIONS, normalize_combat_preferences
+from ai_adventure.items import normalize_item_metadata
+from ai_adventure.story_preferences import FIGHTING_FOCUS_INSTRUCTIONS, normalize_fighting_preferences
+from ai_adventure.inventory_storage import NEW_GAME_STORAGE_RULE
 
 
 SKILL_PRESET_LEVEL_PLANS: dict[str, list[int]] = {
@@ -304,7 +310,12 @@ def normalize_new_game_setup(raw_setup: Any) -> dict[str, Any]:
         raw_setup.get("starting_task", raw_setup.get("starting_quest", {}))
     )
     magic = normalize_magic_setup(raw_setup.get("magic", {}))
-    combat = normalize_combat_preferences(raw_setup.get("combat", {}))
+    fighting = normalize_fighting_preferences(raw_setup.get("fighting", {}))
+    rank_baseline = _normalize_skill_preset(raw_setup.get("rank_baseline", "professional"))
+    budget, starting_level = rank_stats(skill_preset, rank_baseline)
+    attributes = normalize_attributes(character.get("attributes", starting_attributes(budget)), maximum=18)
+    if point_buy_cost(attributes) != budget:
+        raise ValueError(f"Allocate exactly {budget} attribute points for this rank.")
 
     return {
         "title": _clean_text(raw_setup.get("title")) or "New Adventure",
@@ -315,6 +326,8 @@ def normalize_new_game_setup(raw_setup: Any) -> dict[str, Any]:
             "appearance": _clean_text(character.get("appearance")),
             "backstory": _clean_text(character.get("backstory")),
             "notes": _clean_text(character.get("notes")),
+            "attributes": attributes,
+            "carrying_capacity_lb": carrying_capacity(attributes),
         },
         "skills": skills,
         "skill_preset": skill_preset,
@@ -327,7 +340,11 @@ def normalize_new_game_setup(raw_setup: Any) -> dict[str, Any]:
         "starting_locations": starting_locations,
         "starting_task": starting_task,
         "magic": magic,
-        "combat": combat,
+        "fighting": fighting,
+        "rules_version": RULES_VERSION,
+        "rank_baseline": rank_baseline,
+        "point_buy_budget": budget,
+        "starting_player_level": starting_level,
         "calendar": calendar_settings,
         "starting_calendar": starting_calendar,
         "starting_weather": starting_weather,
@@ -652,7 +669,7 @@ def build_new_game_setup_packet(
                 "exception is when setup explicitly establishes a credible knowledge "
                 "barrier such as amnesia, memory alteration, unconsciousness, or "
                 "deception. A reveal condition must discover an externally hidden "
-                "truth; it cannot be a skill check or search that makes the Player "
+                "truth; it cannot be a d20 test or search that makes the Player "
                 "Character rediscover their own knowing act. Valid examples include "
                 "an NPC's hidden identity or motive, a conspiracy, a trap, someone "
                 "else's off-screen plan, or an object planted without the Player "
@@ -935,10 +952,9 @@ def build_new_game_setup_packet(
                 "based on a specific setup.starter_items entry, set source_index to "
                 "-1. Do not "
                 "downgrade setup weapons or armor into generic items: preserve "
-                "Weapon fields such as weapon_hands, damage, attack_skill, "
-                "attack_range_feet, ammunition_type_required, clip_size, and "
-                "bullets_per_attack, and preserve Armor fields such as "
-                "covers_body_parts and armor_rating. "
+                "Weapon hand requirements and descriptive capabilities; "
+                "descriptive capabilities, and preserve Armor body coverage such as "
+                "covers_body_parts. "
                 "Do not include setup bookkeeping words such as Starting, Starter, Initial, "
                 "Amount, Quantity, Count, or Total in item names. Generalize resource "
                 "names to the actual inventory item, such as Fuel instead of Starting "
@@ -951,15 +967,16 @@ def build_new_game_setup_packet(
                 "gram, kilogram, ounce, liter, or meter. Classify a physical journal, "
                 "notebook, ledger, manual, or other book as Book or Document, not "
                 "Information; Information describes content, not a physical item. "
+                "Every finalized starting item must include moveable and storable booleans. "
                 "Every finalized starting item must also include storage_location and "
                 "basic_name. basic_name is a short, stable generic item-family name used "
                 "for visual reuse matching; remove color, material, size, condition, "
                 "craftsmanship, and other flavor adjectives, so Wide Brimmed Fedora, "
                 "Grey Felt Fedora, and Fedora all use Fedora. "
-                "Use home for items kept in the player's house, workshop, base, room, "
-                "or other home storage, and actively_carried only for items the Player "
-                "Character is actually carrying. Interpret phrases such as 'kept in "
-                "their house' in item_request as home storage. For every fictional, "
+                "Use the exact in-game Location name for items kept in the player's house, workshop, base, room, "
+                "or other storage, and actively_carried only for items the Player "
+                "Character is actually carrying. Resolve 'kept in their house' to "
+                "that house's actual Location name. For every fictional, "
                 "unfamiliar, or newly invented item, make description explicitly "
                 "state concrete visible traits beyond the name: form, approximate "
                 "size, color, material, texture, markings, condition, opacity or "
@@ -972,6 +989,7 @@ def build_new_game_setup_packet(
                 "prompt, shot list, or keyword sequence. Never make the name alone "
                 "carry the item's visual identity."
             ),
+            "inventory_storage": NEW_GAME_STORAGE_RULE,
             "currency_generation": (
                 "If setup.currency_denominations is empty, create a finalized "
                 "currency_denominations list with at least one and at most four "
@@ -1019,13 +1037,8 @@ def build_new_game_setup_packet(
                 "Never use any other new-game field to add, remove, rename, or alter starting "
                 "spells."
             ),
-            "combat": (
-                "setup.combat is authoritative. Follow its focus instruction when "
-                "deciding how prominent fights should be. strict resolution means "
-                "the Python Combat tab resolves actual fights; narrative resolution "
-                "means Gemini describes and resolves fights in story prose without "
-                "CombatStartedEvent or the deterministic Combat tab."
-            ),
+            "stats": STATS_RULE,
+            "fighting": "setup.fighting.focus governs narrative fighting frequency.",
             "starting_notes": (
                 "Optionally return one or more concise player-facing notes only when "
                 "the Player Character would benefit from keeping important starting "
@@ -1130,17 +1143,8 @@ def build_new_game_setup_packet(
                 "events during new-game generation."
             ),
         },
-        "combat_contract": {
-            "resolution_mode": clean_setup["combat"]["resolution_mode"],
-            "focus": clean_setup["combat"]["focus"],
-            "focus_instruction": COMBAT_FOCUS_INSTRUCTIONS[clean_setup["combat"]["focus"]],
-            "rules": (
-                "Strict mode hands actual fights to Python with CombatStartedEvent. "
-                "Narrative mode lets Gemini resolve fights in prose and forbids "
-                "CombatStartedEvent. The selected focus guides frequency, not a "
-                "requirement to force implausible encounters."
-            ),
-        },
+        "stats_contract": {"rules": STATS_RULE, "attributes": clean_setup["character"]["attributes"], "starting_player_level": clean_setup["starting_player_level"]},
+        "fighting_contract": {"rules": STATS_RULE, "focus": clean_setup["fighting"]["focus"], "focus_instruction": FIGHTING_FOCUS_INSTRUCTIONS[clean_setup["fighting"]["focus"]]},
         "turn_prompt": _turn_prompt_for_setup(clean_setup),
         "character_generation_guidance": _character_generation_guidance(clean_setup),
         "genre_generation_guidance": _genre_generation_guidance(clean_setup),
@@ -1761,6 +1765,15 @@ def _starter_item_with_metadata(
     base_item["storage_location"] = _normalize_starter_storage_location(
         raw_item.get("storage_location", metadata.get("storage_location", "actively_carried"))
     )
+    clean_metadata = normalize_item_metadata({**metadata, **raw_item}, name=str(base_item.get("name", "")), category=category)
+    base_item["moveable"] = clean_metadata["moveable"]
+    base_item["storable"] = clean_metadata["storable"]
+    for field in ("weight_lb", "carrying_capacity_lb"):
+        if field in clean_metadata:
+            base_item[field] = clean_metadata[field]
+    if clean_metadata["item_type"] in {"Container", "Vehicle"}:
+        base_item["item_type"] = clean_metadata["item_type"]
+        base_item["container"] = clean_metadata["container"]
 
     if item_type == "Weapon" or category == "Weapon":
         base_item["category"] = "Weapon"
@@ -1770,49 +1783,6 @@ def _starter_item_with_metadata(
             or _clean_text(metadata.get("weapon_hands"))
             or "one-handed"
         )
-        base_item["damage"] = (
-            _clean_text(raw_item.get("damage"))
-            or _clean_text(metadata.get("damage"))
-            or "1d6"
-        )
-        base_item["damage_type"] = (
-            _clean_text(raw_item.get("damage_type"))
-            or _clean_text(metadata.get("damage_type"))
-        )
-        base_item["attack_skill"] = (
-            _clean_text(raw_item.get("attack_skill"))
-            or _clean_text(metadata.get("attack_skill"))
-            or "Melee"
-        )
-        base_item["attack_range_feet"] = max(
-            0,
-            _safe_int(
-                raw_item.get(
-                    "attack_range_feet",
-                    metadata.get("attack_range_feet", 5),
-                ),
-                5,
-            ),
-        )
-        ammunition_type_required = (
-            _clean_text(raw_item.get("ammunition_type_required"))
-            or _clean_text(metadata.get("ammunition_type_required"))
-        )
-        base_item["ammunition_type_required"] = ammunition_type_required
-        base_item["clip_size"] = max(
-            0,
-            _safe_int(raw_item.get("clip_size", metadata.get("clip_size", 0)), 0),
-        )
-        base_item["bullets_per_attack"] = max(
-            0,
-            _safe_int(
-                raw_item.get(
-                    "bullets_per_attack",
-                    metadata.get("bullets_per_attack", 0),
-                ),
-                0,
-            ),
-        )
         return base_item
 
     if item_type == "Armor" or category in {"Armor", "Armour", "Shield"}:
@@ -1820,13 +1790,6 @@ def _starter_item_with_metadata(
         base_item["item_type"] = "Armor"
         base_item["covers_body_parts"] = _normalize_text_list(
             raw_item.get("covers_body_parts", metadata.get("covers_body_parts", []))
-        )
-        base_item["armor_rating"] = max(
-            0,
-            _safe_int(
-                raw_item.get("armor_rating", metadata.get("armor_rating", 0)),
-                0,
-            ),
         )
         return base_item
 
