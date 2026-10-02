@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from ai_adventure.ui.widgets.inputs import FeatureToggleCheckBox
+from ai_adventure.audio.tts_settings import DEFAULT_TTS_VOLUME_PERCENT
+
 from ai_adventure.ui.common import *  # noqa: F401,F403
 from ai_adventure.ui.dialogues import *  # noqa: F401,F403
 
@@ -3312,7 +3315,7 @@ class NewGameWizard(QWizard):
             "Choose music, background ambience, and narration sound-effect preferences."
         )
 
-        self.music_enabled_checkbox = QCheckBox("Music enabled")
+        self.music_enabled_checkbox = FeatureToggleCheckBox('Music')
         self.music_enabled_checkbox.setChecked(bool(self.audio_defaults["music_enabled"]))
 
         self.music_volume_slider = QSlider(Qt.Orientation.Horizontal)
@@ -3322,7 +3325,7 @@ class NewGameWizard(QWizard):
         self.music_volume_slider.valueChanged.connect(
             lambda value: self.music_volume_label.setText(f"{value}%")
         )
-        self.sound_effects_enabled_checkbox = QCheckBox("Sound effects enabled")
+        self.sound_effects_enabled_checkbox = FeatureToggleCheckBox('Sound effects')
         self.sound_effects_enabled_checkbox.setChecked(
             bool(self.audio_defaults["sound_effects_enabled"])
         )
@@ -3337,9 +3340,7 @@ class NewGameWizard(QWizard):
         self.sound_effects_volume_slider.valueChanged.connect(
             lambda value: self.sound_effects_volume_label.setText(f"{value}%")
         )
-        self.background_ambience_enabled_checkbox = QCheckBox(
-            "Background ambience enabled"
-        )
+        self.background_ambience_enabled_checkbox = FeatureToggleCheckBox('Background ambience')
         self.background_ambience_enabled_checkbox.setChecked(
             bool(self.audio_defaults["background_ambience_enabled"])
         )
@@ -3431,7 +3432,16 @@ class NewGameWizard(QWizard):
         )
 
         page.setLayout(layout)
-
+        self.music_enabled_checkbox.bind_form_children(
+            layout, self.music_upload_button, self.music_volume_slider, self.music_test_button,
+        )
+        self.sound_effects_enabled_checkbox.bind_form_children(
+            layout, self.sound_effects_volume_slider, self.sound_effects_test_button, self.sound_effects_upload_button,
+        )
+        self.background_ambience_enabled_checkbox.bind_form_children(
+            layout, self.background_ambience_volume_slider, self.background_ambience_test_button,
+            self.background_ambience_upload_button,
+        )
         self.addPage(page)
 
     def _upload_audio_file(self, category: str) -> None:
@@ -3510,12 +3520,13 @@ class NewGameWizard(QWizard):
 
         page = QWizardPage()
         page.setTitle("TTS")
-        page.setSubTitle("Choose narrator speed, voice, and custom blends before the save starts.")
+        page.setSubTitle("Choose separate narrator and player volumes, speeds, and voices before the save starts.")
 
         self.tts_settings_widget = TTSSettingsWidget(
             audio_settings=self.audio_defaults,
             voice_options=self.voice_options,
             on_sample_voice=self._sample_voice,
+            player_pronouns_provider=self._character_pronouns_from_controls,
             on_custom_voice_saved=self.on_tts_settings_saved,
             custom_voice_storage_path=self.custom_voice_storage_path,
         )
@@ -3527,7 +3538,11 @@ class NewGameWizard(QWizard):
         self.sample_voice_button = self.tts_settings_widget.sample_voice_button
 
         layout = QVBoxLayout()
-        layout.addWidget(self.tts_settings_widget)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        scroll.setWidget(self.tts_settings_widget)
+        layout.addWidget(scroll)
         page.setLayout(layout)
 
         self.addPage(page)
@@ -3562,6 +3577,7 @@ class NewGameWizard(QWizard):
         voice: str | None = None,
         volume: int | None = None,
         speed: int | None = None,
+        *, text: str | None = None,
     ) -> bool:
         """Plays the selected narrator voice sample."""
 
@@ -3578,6 +3594,7 @@ class NewGameWizard(QWizard):
             ),
             self._tts_volume_value() if volume is None else int(volume),
             DEFAULT_TTS_SPEED_PERCENT if speed is None else int(speed),
+            text=text,
         )
 
     def _tts_settings_value(self) -> dict[str, Any]:

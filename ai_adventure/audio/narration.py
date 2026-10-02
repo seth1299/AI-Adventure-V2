@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from ai_adventure.audio.tts_settings import DEFAULT_TTS_VOLUME_PERCENT
+
 import logging
 import queue
 import re
@@ -72,16 +74,18 @@ class NarrationChunk:
     voice_id: str = ""
     sound_effects_before: tuple[str, ...] = ()
     sound_effects_after: tuple[str, ...] = ()
+    is_player: bool = False
 
 
 @dataclass(frozen=True)
 class GeneratedNarrationChunk:
     """A generated audio file and the display text it speaks."""
 
-    audio_path: Path
+    audio_path: Path | None
     display_text: str
     sound_effects_before: tuple[str, ...] = ()
     sound_effects_after: tuple[str, ...] = ()
+    volume: float | None = None
 
 
 class NarrationPlayer:
@@ -90,9 +94,13 @@ class NarrationPlayer:
     def __init__(self, tts_manager: TTSManagerProtocol) -> None:
         self.tts_manager = tts_manager
         self.enabled = True
-        self.volume = 0.9
+        self.volume = DEFAULT_TTS_VOLUME_PERCENT / 100.0
         self.voice = normalize_narrator_voice_spec(tts_manager.get_default_voice())
         self.speed = 1.0
+        self.player_volume = DEFAULT_TTS_VOLUME_PERCENT / 100.0
+        self.player_speed = 1.0
+        self.narrator_enabled = True
+        self.player_enabled = True
         self._pygame: Any = None
         self._initialized = False
         self._session_id = 0
@@ -100,6 +108,15 @@ class NarrationPlayer:
         self._generation_lock = threading.Lock()
 
         self._initialize_audio()
+
+    def set_speaker_preferences(self, audio: dict[str, Any]) -> None:
+        """Applies independent player and narrator playback preferences."""
+        from ai_adventure.audio.tts_settings import normalize_tts_audio_fields
+        clean = normalize_tts_audio_fields(audio)
+        self.player_volume = clean["player_tts_volume"] / 100.0
+        self.player_speed = tts_speed_multiplier(clean["player_tts_speed"])
+        self.narrator_enabled = clean["narrator_enabled"]
+        self.player_enabled = clean["player_enabled"]
 
     def _initialize_audio(self) -> None:
         """Initializes pygame audio for narration playback."""
@@ -200,10 +217,18 @@ class NarrationPlayer:
 
         previous_enabled = self.enabled
 
+        sample_volume = self.volume
         if volume is not None:
-            self.set_volume(volume)
+            parsed_volume = float(volume)
+            if isinstance(volume, int) or parsed_volume > 1.0:
+                parsed_volume /= 100.0
+            sample_volume = max(0.0, min(1.0, parsed_volume))
+        sample_speed = self.speed
         if speed is not None:
-            self.set_speed(speed)
+            parsed_speed = float(speed)
+            if isinstance(speed, int) or parsed_speed > 2.0:
+                parsed_speed /= 100.0
+            sample_speed = max(0.5, min(2.0, parsed_speed))
 
         self.set_enabled(True)
 
@@ -219,6 +244,7 @@ class NarrationPlayer:
             tts_text_transform=tts_text_transform,
             on_sound_effect=on_sound_effect,
             on_complete=restore_enabled,
+            _sample_preferences=(sample_volume, sample_speed),
         )
 
         if not started:
@@ -237,6 +263,7 @@ class NarrationPlayer:
         on_chunk_start: Callable[[str], None] | None = None,
         on_sound_effect: Callable[[str], None] | None = None,
         on_complete: Callable[[], None] | None = None,
+        _sample_preferences: tuple[float, float] | None = None,
     ) -> bool:
         """Starts narrating text in generated chunks."""
 
@@ -273,7 +300,7 @@ class NarrationPlayer:
         )
         producer = threading.Thread(
             target=self._produce_chunks,
-            args=(session_id, chunks, audio_queue, session_voice),
+            args=(session_id, chunks, audio_queue, session_voice, _sample_preferences),
             daemon=True,
         )
         consumer = threading.Thread(
@@ -309,6 +336,7 @@ class NarrationPlayer:
         chunks: list[NarrationChunk],
         audio_queue: queue.Queue[GeneratedNarrationChunk | None],
         voice: str,
+        sample_preferences: tuple[float, float] | None = None,
     ) -> None:
         """Generates audio files while earlier chunks are being played."""
 
@@ -321,21 +349,29 @@ class NarrationPlayer:
                     if not self._is_active_session(session_id):
                         return
 
+                    audible = sample_preferences is not None or (
+                        self.player_enabled if chunk.is_player else self.narrator_enabled
+                    )
+                    volume, speed = sample_preferences or (
+                        (self.player_volume, self.player_speed) if chunk.is_player
+                        else (self.volume, self.speed)
+                    )
                     audio_path = self.tts_manager.synthesize_to_file(
                         TTSRequest(
                             text=chunk.tts_text,
                             voice=normalize_narrator_voice_spec(
                                 chunk.voice_id or voice
                             ),
-                            speed=self.speed,
+                            speed=speed,
                         )
-                    )
+                    ) if audible else None
 
-                if audio_path is None:
+                if audio_path is None and audible:
                     continue
 
                 queue_item = GeneratedNarrationChunk(
                     audio_path=audio_path,
+                    volume=volume,
                     display_text=chunk.display_text,
                     sound_effects_before=chunk.sound_effects_before,
                     sound_effects_after=chunk.sound_effects_after,
@@ -374,14 +410,15 @@ class NarrationPlayer:
                         on_sound_effect(filename)
                 if on_chunk_start is not None:
                     on_chunk_start(queue_item.display_text)
-                self._play_file_blocking(queue_item.audio_path, session_id)
+                if queue_item.audio_path is not None:
+                    self._play_file_blocking(queue_item.audio_path, session_id, **({"volume": queue_item.volume} if queue_item.volume is not None else {}))
                 if on_sound_effect is not None:
                     for filename in queue_item.sound_effects_after:
                         on_sound_effect(filename)
             finally:
                 _delete_file(queue_item.audio_path)
 
-    def _play_file_blocking(self, audio_path: Path, session_id: int) -> None:
+    def _play_file_blocking(self, audio_path: Path, session_id: int, *, volume: float | None = None) -> None:
         """Plays one generated narration file and waits for it to finish."""
 
         if self._pygame is None:
@@ -390,7 +427,7 @@ class NarrationPlayer:
         try:
             sound = self._pygame.mixer.Sound(str(audio_path))
             channel = self._pygame.mixer.Channel(TTS_CHANNEL_INDEX)
-            channel.set_volume(self.volume)
+            channel.set_volume(self.volume if volume is None else volume)
             channel.play(sound)
 
             while self._is_active_session(session_id) and channel.get_busy():
@@ -495,7 +532,7 @@ def build_narration_chunks(
 
     before_at: dict[int, list[str]] = {}
     after_at: dict[int, list[str]] = {}
-    speaker_ranges: list[tuple[int, int, str]] = []
+    speaker_ranges: list[tuple[int, int, str, bool]] = []
     natural_boundaries = _natural_sentence_boundary_offsets(clean_text)
     forced_offsets = set(natural_boundaries)
     forced_offsets.update({0, len(clean_text)})
@@ -546,10 +583,13 @@ def build_narration_chunks(
             continue
         start = clean_text.index(anchor_text)
         end = start + len(anchor_text)
-        if any(start < existing_end and end > existing_start for existing_start, existing_end, _ in speaker_ranges):
+        if any(start < existing_end and end > existing_start for existing_start, existing_end, _, _ in speaker_ranges):
             LOGGER.warning("Skipped overlapping narration speaker cue %r.", anchor_text)
             continue
-        speaker_ranges.append((start, end, voice_id))
+        is_player = raw_cue.get("speaker_role") == "player" or str(
+            raw_cue.get("speaker_id", "")
+        ).casefold() in {"player", "player_character"}
+        speaker_ranges.append((start, end, voice_id, is_player))
         forced_offsets.update({start, end})
 
     ranges = _narration_chunk_ranges(
@@ -568,6 +608,7 @@ def build_narration_chunks(
                     display_text=previous.display_text + display_text,
                     tts_text=previous.tts_text,
                     voice_id=previous.voice_id,
+                    is_player=previous.is_player,
                     sound_effects_before=previous.sound_effects_before,
                     sound_effects_after=previous.sound_effects_after,
                 )
@@ -583,10 +624,14 @@ def build_narration_chunks(
                 voice_id=next(
                     (
                         voice_id
-                        for speaker_start, speaker_end, voice_id in speaker_ranges
+                        for speaker_start, speaker_end, voice_id, _is_player in speaker_ranges
                         if start >= speaker_start and end <= speaker_end
                     ),
                     "",
+                ),
+                is_player=next(
+                    (is_player for speaker_start, speaker_end, _voice, is_player in speaker_ranges
+                     if start >= speaker_start and end <= speaker_end), False,
                 ),
                 sound_effects_before=tuple(before_at.get(start, ())),
                 sound_effects_after=tuple(after_at.get(end, ())),
@@ -600,6 +645,7 @@ def build_narration_chunks(
                 display_text=last.display_text,
                 tts_text=last.tts_text,
                 voice_id=last.voice_id,
+                is_player=last.is_player,
                 sound_effects_before=last.sound_effects_before,
                 sound_effects_after=(
                     last.sound_effects_after + tuple(before_at[len(clean_text)])
@@ -611,6 +657,7 @@ def build_narration_chunks(
                 display_text=first.display_text,
                 tts_text=first.tts_text,
                 voice_id=first.voice_id,
+                is_player=first.is_player,
                 sound_effects_before=tuple(after_at[0]) + first.sound_effects_before,
                 sound_effects_after=first.sound_effects_after,
             )
@@ -813,6 +860,7 @@ def _merge_compatible_narration_chunks(
         previous = merged[-1]
         can_merge = (
             previous.voice_id == chunk.voice_id
+            and previous.is_player == chunk.is_player
             and not previous.sound_effects_after
             and not chunk.sound_effects_before
             and not _ends_at_natural_sentence(previous.display_text)
@@ -826,6 +874,7 @@ def _merge_compatible_narration_chunks(
             display_text=previous.display_text + chunk.display_text,
             tts_text=f"{previous.tts_text} ...p {chunk.tts_text}".strip(),
             voice_id=previous.voice_id,
+            is_player=previous.is_player,
             sound_effects_before=previous.sound_effects_before,
             sound_effects_after=chunk.sound_effects_after,
         )

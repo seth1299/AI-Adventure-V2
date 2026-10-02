@@ -1,6 +1,15 @@
 from __future__ import annotations
 
 
+SKILL_DESCRIPTION_RULE = (
+    "Skill descriptions must describe the skill's uses and scope independently of the "
+    "player's current training level. Do not describe current proficiency with wording "
+    "such as 'basic capability', 'novice understanding', or 'expert mastery'; the level "
+    "field records proficiency separately. For example, use 'Enduring harsh conditions "
+    "and finding shelter' rather than 'Basic capability to endure harsh conditions'."
+)
+MAX_SKILL_XP_RULE = "Master (level 5) skills cannot gain further XP or levels. Do not propose XP awards for them."
+
 MAX_SKILL_LEVEL = 5
 XP_THRESHOLDS_BY_LEVEL = {
     1: 0,

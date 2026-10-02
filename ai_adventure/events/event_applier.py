@@ -38,11 +38,12 @@ from ai_adventure.combat import (
     roll_combat_initiative,
 )
 from ai_adventure.container_access import has_immediate_container_unlock_method
+from ai_adventure.container_flow import ContainerFlowError, selected_contents, validate_contents_manifest
 from ai_adventure.currency import format_currency_amount
 from ai_adventure.locations import clean_player_location_name
 from ai_adventure.locations import calculate_travel_estimate, normalize_known_locations
 from ai_adventure.persistence.save_repository import GM_SECRET_STATUSES, SaveRepository
-from ai_adventure.skills.rules import bonus_for_level, dc_for_difficulty
+from ai_adventure.skills.rules import MAX_SKILL_LEVEL, bonus_for_level, dc_for_difficulty
 
 
 LOGGER = logging.getLogger(__name__)
@@ -135,17 +136,28 @@ class EventApplier:
 
         results: list[AppliedEventResult] = []
         blocking_failure = _blocking_skill_check_failure(prior_results or [])
+        interacting_containers = {
+            _first_text(normalize_event(event)[1], "container_name").casefold()
+            for event in raw_events
+            if normalize_event(event)[0] in {"ContainerOpenedEvent", "ContainerContentsTakenEvent"}
+        }
         protects_container_contents = any(
             _raw_event_protects_container_contents(raw_event)
             for raw_event in raw_events
         )
+        existing_container_names = {
+            str(item["name"]).strip().casefold()
+            for item in self.repository.list_inventory_items()
+            if isinstance(item.get("metadata", {}).get("container"), dict)
+        } if protects_container_contents else set()
 
         for raw_event in raw_events:
             event_type, payload = normalize_event(raw_event)
 
             if protects_container_contents and _is_direct_container_reward(
                 event_type,
-                payload,
+                payload, interacting_containers=interacting_containers,
+                existing_container_names=existing_container_names,
             ):
                 result = AppliedEventResult(
                     event_type,
@@ -700,7 +712,7 @@ class EventApplier:
         metadata = dict(item.get("metadata", {}))
         container = dict(metadata.get("container", {}))
 
-        if container.get("is_open") is True:
+        if container.get("is_open") is True and container.get("contents_initialized", True):
             return AppliedEventResult(
                 event_type,
                 "skipped",
@@ -773,6 +785,18 @@ class EventApplier:
 
             container["is_trapped"] = False
 
+        if not container.get("contents_initialized", True):
+            try:
+                validate_contents_manifest(payload.get("contents"))
+            except ContainerFlowError as error:
+                return _invalid(event_type, payload, str(error))
+            normalized = normalize_item_metadata(
+                {"item_type": "Container", "container": {**container, "contents": payload["contents"], "contents_initialized": True}},
+                name=str(item["name"]), category="Container",
+            )
+            container = normalized["container"]
+        elif "contents" in payload:
+            return _invalid(event_type, payload, "Already initialized contents cannot be replaced.")
         container["is_open"] = True
         metadata["container"] = container
         self.repository.modify_inventory_item(
@@ -825,11 +849,13 @@ class EventApplier:
                 payload,
             )
 
+        if not container.get("contents_initialized", True):
+            return _invalid(event_type, payload, "Container contents have not been initialized.")
         contents = dict(container.get("contents", {}))
-        currency_amount = max(
-            0,
-            _safe_int(contents.get("currency_base_units"), default=0) or 0,
-        )
+        try:
+            currency_amount, selected_items, remaining_contents = selected_contents(contents, payload)
+        except ContainerFlowError as error:
+            return _invalid(event_type, payload, str(error))
         transferred_items: list[dict[str, Any]] = []
 
         if currency_amount:
@@ -842,7 +868,7 @@ class EventApplier:
                 str(current_balance + currency_amount),
             )
 
-        for raw_item in contents.get("items", []):
+        for raw_item in selected_items:
             if not isinstance(raw_item, dict):
                 continue
 
@@ -886,7 +912,8 @@ class EventApplier:
                 }
             )
 
-        container["contents_taken"] = True
+        container["contents"] = remaining_contents
+        container["contents_taken"] = not remaining_contents["currency_base_units"] and not remaining_contents["items"]
         metadata["container"] = container
         self.repository.modify_inventory_item(
             target_name=str(item["name"]),
@@ -1145,6 +1172,10 @@ class EventApplier:
 
         if xp_amount <= 0:
             return _invalid(event_type, payload, "Positive XP amount is required.")
+
+        existing_skill = self.repository.get_skill(name)
+        if existing_skill is not None and int(existing_skill["level"]) >= MAX_SKILL_LEVEL:
+            return _invalid(event_type, payload, f"{name} is already at Max Level and cannot gain XP.")
 
         skill = self.repository.add_skill_xp(name, xp_amount)
 
@@ -2329,7 +2360,7 @@ def _raw_event_protects_container_contents(raw_event: dict[str, Any]) -> bool:
 
     event_type, payload = normalize_event(raw_event)
 
-    if event_type == "ContainerContentsTakenEvent":
+    if event_type in {"ContainerOpenedEvent", "ContainerContentsTakenEvent"}:
         return True
 
     if event_type != "InventoryItemAddedEvent":
@@ -2346,6 +2377,8 @@ def _raw_event_protects_container_contents(raw_event: dict[str, Any]) -> bool:
 def _is_direct_container_reward(
     event_type: str,
     payload: dict[str, Any],
+    *, interacting_containers: set[str] | None = None,
+    existing_container_names: set[str] | None = None,
 ) -> bool:
     """Detects reward events that would duplicate or bypass stored contents."""
 
@@ -2359,12 +2392,14 @@ def _is_direct_container_reward(
         )
         return amount is not None and amount > 0
 
-    return (
-        event_type in {"InventoryItemAddedEvent", "ItemAddedEvent"}
-        and str(payload.get("item_type", payload.get("category", "")))
-        .strip()
-        .casefold()
-        != "container"
+    if event_type not in {"InventoryItemAddedEvent", "ItemAddedEvent"}:
+        return False
+    is_container = str(payload.get("item_type", payload.get("category", ""))).strip().casefold() == "container"
+    if not is_container:
+        return True
+    name = _first_text(payload, "item_name", "name").casefold()
+    return bool(interacting_containers) and (
+        name not in interacting_containers or name in (existing_container_names or set())
     )
 
 

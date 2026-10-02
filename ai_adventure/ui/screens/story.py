@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from ai_adventure.container_flow import ContainerFlowError
+
 from ai_adventure.ui.common import *  # noqa: F401,F403
 from ai_adventure.ui.dialogues import *  # noqa: F401,F403
 from ai_adventure.ui.workers.gemini import (
@@ -1308,6 +1310,13 @@ class StoryScreen(RepositoryBackedWidget):
             return
 
         check_events = StoryTurnService.skill_plan_events(plan_result)
+        try:
+            StoryTurnService.record_dropped_events(repository, plan_result, message_id=pending_message_id)
+            if getattr(plan_result, "dropped_events", []):
+                LOGGER.info("Audited %s dropped planning check(s) in mechanical_events.", len(plan_result.dropped_events))
+        except Exception:
+            self._handle_persistence_failure()
+            return
 
         if check_events:
             try:
@@ -1391,6 +1400,12 @@ class StoryScreen(RepositoryBackedWidget):
                     _narrator_voice_options(self.narration_player).values()
                 ),
             )
+        except ContainerFlowError as error:
+            self._handle_persistence_failure(
+                "The container response did not match the saved state. Its narration and rewards "
+                f"were rolled back. Please retry.\n\n{error}"
+            )
+            return
         except Exception:
             self._handle_persistence_failure()
             return
@@ -1402,9 +1417,10 @@ class StoryScreen(RepositoryBackedWidget):
             )
             skipped_count = len(event_results) - applied_count
             LOGGER.info(
-                "Applied %s Gemini event(s); skipped %s.",
+                "Applied %s Gemini event(s); skipped %s; dropped %s before application.",
                 applied_count,
                 skipped_count,
+                len(getattr(result, "dropped_events", [])),
             )
             _apply_audio_settings_to_managers(
                 repository,
@@ -1431,7 +1447,7 @@ class StoryScreen(RepositoryBackedWidget):
         self._set_waiting_for_gm(False)
         self.refresh()
 
-    def _handle_persistence_failure(self) -> None:
+    def _handle_persistence_failure(self, message: str | None = None) -> None:
         """Release the UI after a rolled-back commit without starting media."""
         LOGGER.exception("Story persistence failed; transaction rolled back.")
         self._pending_skill_check_event_results = []
@@ -1442,9 +1458,9 @@ class StoryScreen(RepositoryBackedWidget):
         self._set_waiting_for_gm(False)
         QMessageBox.warning(
             self,
-            "Could not save response",
-            "The latest database operation could not be saved and was rolled back. "
-            "Please try again.",
+            "Container response needs correction" if message else "Could not save response",
+            message or ("The latest database operation could not be saved and was rolled back. "
+                        "Please try again."),
         )
 
     @Slot(str)

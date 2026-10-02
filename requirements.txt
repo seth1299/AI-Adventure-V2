@@ -14,7 +14,7 @@ pykokoro==0.6.5
 soundfile==0.13.1
 spacy==3.8.16
 # Required by PyKokoro tokenization and collected by the standard build.
-en-core-web-sm #@ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl#sha256=1932429db727d4bff3deed6b34cfc05df17794f4a52eeb26cf8928f7c1a0fb85
+en-core-web-sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl#sha256=1932429db727d4bff3deed6b34cfc05df17794f4a52eeb26cf8928f7c1a0fb85
 
 # Packaging used by build.bat and lightweight_build.bat.
 PyInstaller==6.16.0

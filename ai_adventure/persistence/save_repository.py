@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+
+from ai_adventure.audio.tts_settings import DEFAULT_TTS_VOLUME_PERCENT
+
 import json
 import logging
 import re
@@ -71,7 +74,7 @@ from ai_adventure.magic import (
     normalize_magic_advancement_significance,
     normalize_magic_setup,
 )
-from ai_adventure.skills.rules import bonus_for_level, clamp_skill_level, level_for_xp
+from ai_adventure.skills.rules import MAX_SKILL_LEVEL, bonus_for_level, clamp_skill_level, level_for_xp
 from ai_adventure.text_sanitization import sanitize_english_text
 
 
@@ -181,16 +184,8 @@ class SaveRepository:
         repository.set_setting("audio.music_volume", 25)
         repository.set_setting("audio.sound_effects_volume", 35)
         repository.set_setting("audio.background_ambience_volume", 15)
-        repository.set_setting("audio.tts_volume", 90)
-        repository.set_setting("audio.tts_voice", DEFAULT_NARRATOR_VOICE)
-        repository.set_setting("audio.player_tts_voice", "ai")
-        repository.set_setting("audio.tts_speed", 100)
-        repository.set_setting("audio.tts_voice_mode", "preset")
-        repository.set_setting(
-            "audio.tts_voice_blend",
-            normalize_tts_audio_fields({})["tts_voice_blend"],
-        )
-        repository.set_setting("audio.tts_custom_voices", [])
+        for key, value in normalize_tts_audio_fields({}).items():
+            repository.set_setting(f"audio.{key}", value)
         repository.set_setting("tts.pronunciation_map", {})
         repository.set_setting("audio.current_music", "")
         repository.set_setting("audio.current_background_ambience", "")
@@ -317,13 +312,8 @@ class SaveRepository:
             "audio.background_ambience_volume",
             int(audio_settings["background_ambience_volume"]),
         )
-        self.set_setting("audio.tts_volume", int(audio_settings["tts_volume"]))
-        self.set_setting("audio.tts_voice", audio_settings["tts_voice"])
-        self.set_setting("audio.player_tts_voice", audio_settings["player_tts_voice"])
-        self.set_setting("audio.tts_speed", int(audio_settings["tts_speed"]))
-        self.set_setting("audio.tts_voice_mode", audio_settings["tts_voice_mode"])
-        self.set_setting("audio.tts_voice_blend", audio_settings["tts_voice_blend"])
-        self.set_setting("audio.tts_custom_voices", audio_settings["tts_custom_voices"])
+        for key, value in normalize_tts_audio_fields(audio_settings).items():
+            self.set_setting(f"audio.{key}", value)
         self.set_setting("tts.pronunciation_map", clean_setup["pronunciation_map"])
         self.set_setting("audio.current_music", "")
         self.set_setting("audio.current_background_ambience", "")
@@ -2544,7 +2534,7 @@ class SaveRepository:
             xp_amount: XP to add.
 
         Returns:
-            Updated skill dictionary, or None when the skill does not exist.
+            Updated skill dictionary, or None when missing or already at max level.
         """
 
         clean_name = name.strip()
@@ -2572,6 +2562,8 @@ class SaveRepository:
                 return None
 
             current_level = int(row["level"])
+            if current_level >= MAX_SKILL_LEVEL:
+                return None
             new_xp = int(row["xp"]) + xp_amount
             new_level = level_for_xp(current_level, new_xp)
             new_bonus = bonus_for_level(new_level)
@@ -4357,6 +4349,7 @@ class SaveRepository:
                     cue.get("voice_profile", "neutral") or "neutral"
                 ).strip().casefold(),
                 "voice_id": str(cue.get("voice_id", "") or "").strip(),
+                "speaker_role": str(cue.get("speaker_role", "character") or "character"),
             }
             for cue in (speaker_cues or [])
             if isinstance(cue, dict)
@@ -4405,7 +4398,7 @@ class SaveRepository:
         Args:
             event_type: Event type name.
             payload: Event payload.
-            status: applied, skipped, or failed.
+            status: applied, skipped, failed, or dropped before application.
             message: Short status message.
             message_id: Optional conversation message ID.
         """

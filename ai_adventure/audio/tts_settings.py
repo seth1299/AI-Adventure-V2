@@ -9,6 +9,7 @@ from ai_adventure.audio.voices import DEFAULT_NARRATOR_VOICE, KOKORO_VOICES, nor
 MIN_TTS_SPEED_PERCENT = 50
 MAX_TTS_SPEED_PERCENT = 200
 DEFAULT_TTS_SPEED_PERCENT = 100
+DEFAULT_TTS_VOLUME_PERCENT = 80
 DEFAULT_TTS_VOICE_MODE = "preset"
 DEFAULT_PLAYER_TTS_VOICE = "ai"
 PLAYER_TTS_VOICE_AI = "ai"
@@ -70,7 +71,7 @@ def normalize_voice_blend(raw_blend: Any) -> dict[str, Any]:
         "voice_b": voice_b,
         "voice_a_weight": weight_a,
         "voice_b_weight": 100 - weight_a,
-        "tts_volume": _clamped_int(raw_blend.get("tts_volume"), 90, 0, 100),
+        "tts_volume": _clamped_int(raw_blend.get("tts_volume"), DEFAULT_TTS_VOLUME_PERCENT, 0, 100),
         "tts_speed": normalize_tts_speed_percent(raw_blend.get("tts_speed")),
     }
 
@@ -115,11 +116,11 @@ def normalize_tts_audio_fields(raw_audio: Any, *, tts_enabled: bool = True) -> d
         raw_audio = {}
 
     narrator_enabled = _safe_bool(raw_audio.get("narrator_enabled"), True)
-    tts_volume = _clamped_int(raw_audio.get("tts_volume"), 90, 0, 100)
+    tts_volume = _clamped_int(raw_audio.get("tts_volume"), DEFAULT_TTS_VOLUME_PERCENT, 0, 100)
 
     if not tts_enabled:
         narrator_enabled = False
-        tts_volume = 0
+        # Feature availability must not overwrite the user's volume preference.
 
     voice_blend = normalize_voice_blend(raw_audio.get("tts_voice_blend"))
     custom_voices = normalize_custom_voices(raw_audio.get("tts_custom_voices"))
@@ -131,6 +132,11 @@ def normalize_tts_audio_fields(raw_audio: Any, *, tts_enabled: bool = True) -> d
 
     return {
         "narrator_enabled": narrator_enabled,
+        "player_enabled": tts_enabled and _safe_bool(raw_audio.get("player_enabled"), True),
+        "player_tts_volume": _clamped_int(raw_audio.get("player_tts_volume"), DEFAULT_TTS_VOLUME_PERCENT, 0, 100),
+        "player_tts_speed": normalize_tts_speed_percent(raw_audio.get("player_tts_speed")),
+        "player_tts_voice_mode": normalize_tts_voice_mode(raw_audio.get("player_tts_voice_mode")),
+        "player_tts_voice_blend": normalize_voice_blend(raw_audio.get("player_tts_voice_blend")),
         "tts_volume": tts_volume,
         "tts_voice": normalize_narrator_voice(raw_audio.get("tts_voice")),
         "tts_speed": normalize_tts_speed_percent(raw_audio.get("tts_speed")),
@@ -162,6 +168,22 @@ def active_voice_spec_from_audio(audio: Any) -> str:
         return build_voice_blend_spec(normalize_voice_blend(audio.get("tts_voice_blend")))
 
     return normalize_narrator_voice(audio.get("tts_voice"))
+
+
+def active_player_voice_spec_from_audio(audio: Any) -> str:
+    """Returns the player's preset, automatic selection, or custom blend."""
+    audio = audio if isinstance(audio, dict) else {}
+    if normalize_tts_voice_mode(audio.get("player_tts_voice_mode")) == "blend":
+        return build_voice_blend_spec(audio.get("player_tts_voice_blend"))
+    return normalize_player_tts_voice(audio.get("player_tts_voice"))
+
+
+def read_tts_audio_settings(get_setting: Any) -> dict[str, Any]:
+    """Reads every TTS preference using the same defaults as app settings."""
+    return normalize_tts_audio_fields({
+        key: get_setting(f"audio.{key}", default)
+        for key, default in normalize_tts_audio_fields({}).items()
+    })
 
 
 def normalize_narrator_voice_spec(value: Any) -> str:

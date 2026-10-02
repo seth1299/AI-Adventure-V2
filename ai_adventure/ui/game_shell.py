@@ -857,6 +857,7 @@ class GameShell(QWidget):
         voice: str,
         volume: int,
         speed: int = DEFAULT_TTS_SPEED_PERCENT,
+        *, text: str | None = None,
     ) -> bool:
         """Plays a local narrator voice sample."""
 
@@ -868,6 +869,7 @@ class GameShell(QWidget):
                 voice=normalize_narrator_voice_spec(voice),
                 volume=volume,
                 speed=speed,
+                **({"text": text} if text is not None else {}),
             )
         )
 

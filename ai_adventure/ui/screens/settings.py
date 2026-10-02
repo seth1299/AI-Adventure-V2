@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+from ai_adventure.audio.tts_settings import read_tts_audio_settings
+
+from ai_adventure.ui.widgets.inputs import FeatureToggleCheckBox
+from ai_adventure.audio.tts_settings import DEFAULT_TTS_VOLUME_PERCENT
+
 from PySide6.QtWidgets import QFileDialog
 
 from ai_adventure.ui.common import *  # noqa: F401,F403
@@ -108,7 +113,7 @@ class SettingsScreen(RepositoryBackedWidget):
         )
         self.retry_failed_images_button.clicked.connect(self._retry_failed_images)
 
-        self.music_enabled_checkbox = QCheckBox("Music enabled")
+        self.music_enabled_checkbox = FeatureToggleCheckBox('Music')
         self.music_enabled_checkbox.setChecked(True)
         self.music_enabled_checkbox.toggled.connect(self._sync_audio_control_visibility)
         self.music_enabled_checkbox.toggled.connect(lambda _checked: self._save_settings())
@@ -136,7 +141,7 @@ class SettingsScreen(RepositoryBackedWidget):
         )
         self.music_volume_slider.sliderReleased.connect(self._save_settings)
 
-        self.sound_effects_enabled_checkbox = QCheckBox("Sound effects enabled")
+        self.sound_effects_enabled_checkbox = FeatureToggleCheckBox('Sound effects')
         self.sound_effects_enabled_checkbox.setChecked(True)
         self.sound_effects_enabled_checkbox.toggled.connect(self._sync_audio_control_visibility)
         self.sound_effects_enabled_checkbox.toggled.connect(
@@ -157,9 +162,7 @@ class SettingsScreen(RepositoryBackedWidget):
         self.sound_effects_upload_status.setWordWrap(True)
         self.sound_effects_volume_slider.sliderReleased.connect(self._save_settings)
 
-        self.background_ambience_enabled_checkbox = QCheckBox(
-            "Background ambience enabled"
-        )
+        self.background_ambience_enabled_checkbox = FeatureToggleCheckBox('Background ambience')
         self.background_ambience_enabled_checkbox.setChecked(True)
         self.background_ambience_enabled_checkbox.toggled.connect(self._sync_audio_control_visibility)
         self.background_ambience_enabled_checkbox.toggled.connect(
@@ -638,7 +641,7 @@ class SettingsScreen(RepositoryBackedWidget):
                     self.narrator_enabled_checkbox.setChecked(True)
 
                 if self.tts_volume_slider is not None:
-                    self.tts_volume_slider.setValue(90)
+                    self.tts_volume_slider.setValue(DEFAULT_TTS_VOLUME_PERCENT)
 
                 if self.tts_voice_combo is not None:
                     _set_combo_to_data(self.tts_voice_combo, DEFAULT_NARRATOR_VOICE)
@@ -744,7 +747,7 @@ class SettingsScreen(RepositoryBackedWidget):
 
             if self.tts_volume_slider is not None:
                 self.tts_volume_slider.setValue(
-                    _clamped_int(repository.get_setting("audio.tts_volume", 90), 90, 0, 100)
+                    _clamped_int(repository.get_setting("audio.tts_volume", DEFAULT_TTS_VOLUME_PERCENT), DEFAULT_TTS_VOLUME_PERCENT, 0, 100)
                 )
 
             if self.tts_voice_combo is not None:
@@ -1013,25 +1016,11 @@ class SettingsScreen(RepositoryBackedWidget):
     def _current_tts_settings(self, repository: SaveRepository) -> dict[str, Any]:
         """Reads current save TTS settings into one normalized audio object."""
 
-        return normalize_tts_audio_fields(
-            {
-                "narrator_enabled": repository.get_setting("audio.narrator_enabled", True),
-                "tts_volume": repository.get_setting("audio.tts_volume", 90),
-                "tts_voice": repository.get_setting("audio.tts_voice", DEFAULT_NARRATOR_VOICE),
-                "player_tts_voice": repository.get_setting("audio.player_tts_voice", "ai"),
-                "tts_speed": repository.get_setting(
-                    "audio.tts_speed",
-                    DEFAULT_TTS_SPEED_PERCENT,
-                ),
-                "tts_voice_mode": repository.get_setting("audio.tts_voice_mode", "preset"),
-                "tts_voice_blend": repository.get_setting("audio.tts_voice_blend", {}),
-                "tts_custom_voices": merge_custom_voices(
-                    repository.get_setting("audio.tts_custom_voices", []),
-                    self._global_custom_voices(),
-                ),
-            },
-            tts_enabled=self.tts_enabled,
+        audio = read_tts_audio_settings(repository.get_setting)
+        audio["tts_custom_voices"] = merge_custom_voices(
+            audio["tts_custom_voices"], self._global_custom_voices()
         )
+        return normalize_tts_audio_fields(audio, tts_enabled=self.tts_enabled)
 
     def _save_tts_settings(
         self,
@@ -1050,14 +1039,8 @@ class SettingsScreen(RepositoryBackedWidget):
         self._saving_settings = True
 
         try:
-            repository.set_setting("audio.narrator_enabled", audio["narrator_enabled"])
-            repository.set_setting("audio.tts_volume", audio["tts_volume"])
-            repository.set_setting("audio.tts_voice", audio["tts_voice"])
-            repository.set_setting("audio.player_tts_voice", audio["player_tts_voice"])
-            repository.set_setting("audio.tts_speed", audio["tts_speed"])
-            repository.set_setting("audio.tts_voice_mode", audio["tts_voice_mode"])
-            repository.set_setting("audio.tts_voice_blend", audio["tts_voice_blend"])
-            repository.set_setting("audio.tts_custom_voices", audio["tts_custom_voices"])
+            for key, value in audio.items():
+                repository.set_setting(f"audio.{key}", value)
             if persist_app_defaults and self.on_app_tts_settings_saved is not None:
                 self.on_app_tts_settings_saved(audio)
             if self.on_audio_settings_changed is not None:
@@ -1105,6 +1088,7 @@ class SettingsScreen(RepositoryBackedWidget):
         voice: str | None = None,
         volume: int | None = None,
         speed: int | None = None,
+        *, text: str | None = None,
     ) -> bool:
         """Plays the selected voice sample."""
 
@@ -1116,6 +1100,7 @@ class SettingsScreen(RepositoryBackedWidget):
             voice or self._tts_voice_value(),
             self._tts_volume_value() if volume is None else int(volume),
             DEFAULT_TTS_SPEED_PERCENT if speed is None else int(speed),
+            text=text,
         )
 
     def _tts_volume_value(self) -> int:

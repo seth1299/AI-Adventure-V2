@@ -8,6 +8,7 @@ DEFAULT_NARRATOR_VOICE = "af_sarah"
 NARRATOR_SAMPLE_TEXT = (
     "The narrator is ready. This is a sample of the selected voice."
 )
+PLAYER_SAMPLE_TEXT = "The Player Character is ready. This is a sample of the selected voice."
 KOKORO_VOICES: dict[str, str] = {
     "Heart (Female, US)": "af_heart",
     "Alloy (Female, US)": "af_alloy",
@@ -167,8 +168,10 @@ def assign_speaker_voices(
 
         voice_id = assignments.get(speaker_id, "")
         if is_player and clean_player_voice.casefold() != "ai":
-            selected_player_voice = normalize_narrator_voice(clean_player_voice)
-            if selected_player_voice in available:
+            from ai_adventure.audio.tts_settings import normalize_narrator_voice_spec, parse_voice_blend_spec
+            selected_player_voice = normalize_narrator_voice_spec(clean_player_voice)
+            blend = parse_voice_blend_spec(selected_player_voice)
+            if selected_player_voice in available or (blend is not None and blend["voice_a"] in available and blend["voice_b"] in available):
                 voice_id = selected_player_voice
         elif is_player and voice_id not in VOICE_IDS_BY_PROFILE[player_profile]:
             voice_id = ""
@@ -202,6 +205,7 @@ def assign_speaker_voices(
                 "speaker_name": speaker_name or speaker_id,
                 "voice_profile": voice_profile,
                 "voice_id": voice_id,
+                "speaker_role": "player" if is_player else "character",
             }
         )
 

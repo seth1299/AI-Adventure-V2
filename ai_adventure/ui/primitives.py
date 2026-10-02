@@ -733,7 +733,7 @@ def _skill_xp_progress_label(skill: dict[str, Any]) -> str:
     level = max(1, min(MAX_SKILL_LEVEL, _safe_int(skill.get("level", 1), 1)))
     xp = max(0, _safe_int(skill.get("xp", 0), 0))
     if level >= MAX_SKILL_LEVEL:
-        return f"{xp} / MAX"
+        return "Max Level; no further XP or levels"
     return f"{xp} / {XP_THRESHOLDS_BY_LEVEL[level + 1]}"
 
 

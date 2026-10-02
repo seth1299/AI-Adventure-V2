@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from ai_adventure.ui.widgets.containers import CurrentPageStackedWidget
+
 import logging
 from math import ceil
 from time import monotonic
@@ -259,7 +261,7 @@ class MainWindow(QMainWindow):
         self._set_app_icon()
         self.resize(1100, 750)
 
-        self.stack = QStackedWidget()
+        self.stack = CurrentPageStackedWidget()
         self.setCentralWidget(self.stack)
 
         self.main_menu = _ExtractedMainMenuScreen(
@@ -466,6 +468,7 @@ class MainWindow(QMainWindow):
             voice_options=_narrator_voice_options(self.narration_player),
             on_sample_voice=self._play_narrator_sample,
             custom_voice_storage_path=self.app_paths.app_settings_path,
+            on_restore_defaults=lambda settings: self._apply_app_settings(settings, persist=True),
         )
 
         if dialog.exec() != QDialog.DialogCode.Accepted:
@@ -1452,13 +1455,16 @@ class MainWindow(QMainWindow):
                 self.narration_player.set_speed(audio["tts_speed"])
             if hasattr(self.narration_player, "set_voice"):
                 self.narration_player.set_voice(active_voice_spec_from_audio(audio))
-            self.narration_player.set_enabled(audio["narrator_enabled"])
+            self.narration_player.set_enabled(audio["narrator_enabled"] or audio["player_enabled"])
+            if hasattr(self.narration_player, "set_speaker_preferences"):
+                self.narration_player.set_speaker_preferences(audio)
 
     def _play_narrator_sample(
         self,
         voice: str,
         volume: int,
         speed: int = DEFAULT_TTS_SPEED_PERCENT,
+        *, text: str | None = None,
     ) -> bool:
         """Plays a local narrator voice sample."""
 
@@ -1470,6 +1476,7 @@ class MainWindow(QMainWindow):
                 voice=normalize_narrator_voice_spec(voice),
                 volume=volume,
                 speed=speed,
+                **({"text": text} if text is not None else {}),
             )
         )
 

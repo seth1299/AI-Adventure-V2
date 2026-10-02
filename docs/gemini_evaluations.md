@@ -49,6 +49,15 @@ This follows Google's guidance to [validate structured output in the application
 
 ## Metrics
 
+Skill-check filtering is conservative: only complete, clearly routine commands
+qualify; compound goals and check reasons describing danger preserve the planner's
+checks. Inflected theft and stealth actions are recognized. Planner rejections and
+story policy removals are saved in `mechanical_events` with status `dropped`, their
+original payload, turn message ID, filter stage, and reason. These are audit records
+and never execute checks or award XP. Applied/skipped/failed application outcomes
+retain their existing statuses. Story audit writes roll back with a failed commit.
+Run `tests.test_skill_check_audit` for the pouch-lifting regression and audit behavior.
+
 Normal application logs include content-free request and operation metrics:
 
 - Operation ID links individual API attempts to a complete story/planning/new-game operation.
@@ -67,3 +76,21 @@ Normal application logs include content-free request and operation metrics:
 Operation metrics are isolated by execution context so concurrent workers do not
 mix counts. These metrics do not include generated audio or image API usage.
 Raw prompts/responses remain restricted to the existing playtesting debug logging.
+
+## Container consistency
+
+Uninitialized contents are distinct from a known empty container. The first valid
+opening must supply a complete manifest; an initialized manifest cannot be replaced.
+Private container authority supplies saved contents to the GM even while ordinary
+inventory rows hide them. Taking selects stored records and currency, including
+nested containers, without separate inventory or currency awards.
+
+Container proposals are simulated before returning narration. Invalid proposals,
+and obvious unsupported coin claims, trigger at most two complete response repairs.
+A valid response needs no repair call. Failed repairs stop the turn; commit checks
+the current saved state again and rolls back narration and rewards if application
+fails. Repairs occur outside the database transaction and count in request metrics.
+These checks enforce stored transfers; they do not prove all natural-language prose
+accurate. Run `tests.test_container_consistency` alongside the suites above for
+manifest initialization, selective transfers, retries, duplicate prevention, and
+transaction rollback with a real temporary SQLite save.

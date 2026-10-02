@@ -45,6 +45,8 @@ class NewGameImageSourceDialog(QDialog):
             "you press Create an Image for me."
         )
         explanation.setWordWrap(True)
+        self.skip_all_button = QPushButton("Skip All for now")
+        self.skip_all_button.clicked.connect(self._skip_all)
 
         content = QWidget()
         content_layout = QVBoxLayout(content)
@@ -65,6 +67,7 @@ class NewGameImageSourceDialog(QDialog):
         layout = QVBoxLayout(self)
         layout.addWidget(title)
         layout.addWidget(explanation)
+        layout.addWidget(self.skip_all_button, alignment=Qt.AlignmentFlag.AlignRight)
         layout.addWidget(scroll_area, 1)
         layout.addWidget(
             _button_row(self.continue_button),
@@ -186,6 +189,15 @@ class NewGameImageSourceDialog(QDialog):
 
         self._skip_image_callback(request)
         self._set_resolved(request, "Skipped for now")
+
+    def _skip_all(self) -> None:
+        """Skips remaining choices, preserving selected and pending images."""
+
+        for request in self._requests:
+            if request.asset_id not in self._resolved and self._rows[request.asset_id][3].isEnabled():
+                self._skip(request)
+        if all(request.asset_id in self._resolved for request in self._requests):
+            self._continue()
 
     def set_asset_status(self, asset_id: str, status: str, message: str = "") -> None:
         """Updates one row after the coordinator finishes an explicit request."""

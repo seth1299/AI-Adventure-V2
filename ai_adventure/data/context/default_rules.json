@@ -332,7 +332,8 @@
       "content": {
         "event_type": "SkillCheckRequestedEvent",
         "payload_fields": [
-          "skill_name"
+          "skill_name",
+          "reason"
         ],
         "purpose": "Suggest SkillCheckRequestedEvent before narrating the final outcome only when the current command has meaningful uncertainty, opposition, hidden information, danger, scarcity, time pressure, or consequences. Do not request checks merely because an action could theoretically vary in quality or take extra time. Routine movement, paying a known price, receiving ordinary goods, eating, drinking, and casual conversation are not checks unless the player adds a contested, risky, hidden, time-sensitive, or deceptive goal.",
         "rules": [
@@ -342,6 +343,8 @@
           "Do not request a check merely because an action could theoretically vary in quality or take extra time.",
           "Foraging, harvesting, searching, researching, identifying, crafting experiments, persuasion, stealth, and combat need checks only when real stakes are present.",
           "Do not request checks for routine movement, paying a known price, receiving ordinary goods, eating, drinking, or casual conversation unless the player adds a contested, risky, hidden, time-sensitive, or deceptive goal.",
+          "Judge the complete action. A routine verb such as move or talk does not cancel theft, stealth, deception, danger, or a compound goal. Lifting someone's pouch and silently fleeing calls for appropriate theft and stealth checks.",
+          "Mechanical events marked dropped were rejected before execution; skipped and failed events likewise do not establish successful game changes. An already-resolved check must not be rolled again.",
           "Prefer SkillCheckRequestedEvent over SkillXpAddedEvent when the player is attempting a risky or uncertain action.",
           "Do not narrate found items, harvested resources, crafted products, persuaded NPC outcomes, stealth results, combat results, or research conclusions as final success until after the Python application resolves the check.",
           "Use the most directly relevant skill name, not merely a broadly plausible one.",
@@ -380,6 +383,7 @@
           "Put local flavor, culture, equipment, and backstory specifics in `Skill Description` instead of the skill name.",
           "For specific lore domains, use the shape `Lore (Specific Domain)`, such as `Lore (Syndicate)` or `Lore (Merchant Law)`, rather than `Syndicate Lore`.",
           "`Skill Description` should explain what the skill is used for.",
+          "Skill descriptions must describe the skill's uses and scope independently of the player's current training level. Do not describe current proficiency with wording such as 'basic capability', 'novice understanding', or 'expert mastery'; the level field records proficiency separately. For example, use 'Enduring harsh conditions and finding shelter' rather than 'Basic capability to endure harsh conditions'.",
           "`Level` must be an integer from 1 to 5.",
           "Use Level 1 for newly learned skills unless the player's backstory or setup clearly justifies a higher level.",
           "Do not use this event to award XP to an existing skill. Use SkillXpAddedEvent for that."
@@ -408,9 +412,9 @@
           "Do not suggest SkillXpAddedEvent merely because an action is uncertain; request SkillCheckRequestedEvent for uncertainty.",
           "`XP Amount` must be a small integer.",
           "Always include `xp_amount`; use 1 XP for a tiny meaningful gain if no stronger amount is obvious.",
+          "Master (level 5) skills cannot gain further XP or levels. Do not propose XP awards for them.",
           "Most study sessions should award 2-3 XP.",
           "Do not award very large XP amounts.",
-          "Do not award XP to a Level 5 skill.",
           "Do not use this event to create a new skill. Use SkillUpsertedEvent for that."
         ]
       }
@@ -613,10 +617,12 @@
       "content": {
         "event_type": "ContainerOpenedEvent",
         "payload_fields": [
-          "container_name"
+          "container_name",
+          "contents"
         ],
         "purpose": "Asks Python to validate and open a named inventory container.",
         "rules": [
+          "ContainerOpenedEvent and ContainerContentsTakenEvent may occur in the same turn, in that order. Unknown contents are not empty: when contents_initialized is false, include a complete contents manifest (currency_base_units and items) in ContainerOpenedEvent. Initialize it once, after access checks succeed. Never replace already initialized contents. container_authority is private GM state; reveal its contents only after a permitted opening. Transfer rewards exclusively through ContainerContentsTakenEvent, including nested containers such as vials or coin pouches; never add the same loot with InventoryItemAddedEvent or CurrencyChangedEvent. Use item_names and take_currency for selective taking; omitting them takes all stored contents. Narrate only the manifest and the actual selected transfer. Leave untaken items inside the container.",
           "Use only when the player actually attempts to open the named container.",
           "When the player attempts to access or take from an unlocked container, infer that they routinely open it and return ContainerOpenedEvent; do not request a check.",
           "When the player owns an unambiguous key, keycard, combination, or equivalent access item for the named locked container, infer that an attempt to access or take from it includes routinely using that item and return ContainerOpenedEvent; do not request a lockpick check.",
@@ -640,13 +646,16 @@
       "content": {
         "event_type": "ContainerContentsTakenEvent",
         "payload_fields": [
-          "container_name"
+          "container_name",
+          "item_names",
+          "take_currency"
         ],
-        "purpose": "Transfers an open container's exact stored contents to the player once.",
+        "purpose": "Transfers selected stored contents from an open container, removing only the transferred records and currency.",
         "rules": [
           "Use only after the named inventory container is open and the player explicitly takes, pockets, removes, or collects its contents.",
           "Looking inside, inspecting, identifying, or merely opening a container is not the same as taking its contents.",
           "Python reads the stored metadata and transfers its exact currency and items; never invent a new amount or a new item list at this step.",
+          "Use item_names to take only named records and take_currency to choose whether to take the stored money. Omitting both transfers all remaining contents. Untaken items remain inside; contents_taken becomes true only after the container is empty.",
           "Do not accompany this event with CurrencyChangedEvent or InventoryItemAddedEvent for stored contents.",
           "Python rejects closed containers and ignores repeat attempts after contents_taken is true."
         ]

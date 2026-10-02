@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+from ai_adventure.container_flow import CONTAINER_FLOW_RULE
+
+from ai_adventure.skills.rules import SKILL_DESCRIPTION_RULE, MAX_SKILL_XP_RULE
+
 import re
 from typing import Any
 
@@ -620,6 +624,13 @@ class AiContextBuilder:
                     },
                 },
                 "inventory": {
+                    "container_authority": [
+                        {"name": item.name, "metadata": item.metadata}
+                        for item in state.inventory.items
+                        if isinstance(item.metadata.get("container"), dict)
+                        and _item_is_operationally_relevant(item,
+                            selected_tags=selected_tags, player_command=clean_command)
+                    ],
                     "items": [
                         _inventory_item_context(
                             item,
@@ -649,6 +660,7 @@ class AiContextBuilder:
                         "detail."
                     ),
                     "detailed_item_names": sorted(detailed_item_names),
+                    "container_flow": CONTAINER_FLOW_RULE,
                     "container_rule": (
                         CONTAINER_ACCESS_RULE + " "
                         "Never reveal or award a closed container's contents. Use "
@@ -858,6 +870,8 @@ class AiContextBuilder:
                 },
                 "skills": {
                     "rules": {
+                        "description_rule": SKILL_DESCRIPTION_RULE,
+                        "maximum_xp_rule": MAX_SKILL_XP_RULE,
                         "check_formula": "d20 + bonus vs dc",
                         "bonus_formula": "level * 2",
                         "levels": "1-5",
@@ -1340,8 +1354,11 @@ class AiContextBuilder:
                     "weather to that actual condition instead of AUTO or the old value."
                 ),
                 "skill_checks": (
+                    "A routine verb inside a risky or compound action does not make the whole action routine. "
+                    "Lifting a person's pouch and silently fleeing is theft and stealth, not ordinary movement. "
+                    "Mechanical audit records marked dropped, skipped, or failed are not applied game changes. "
                     "Suggest SkillCheckRequestedEvent with skill_name and either dc "
-                    "or difficulty only for actions with meaningful uncertainty, "
+                    "or difficulty; include reason to explain its stakes. Use checks only for actions with meaningful uncertainty, "
                     "opposition, hidden information, danger, resource pressure, time "
                     "pressure, or consequences in the current scene. "
                     "Choose the most directly relevant known skill. Locating or "
@@ -1440,7 +1457,8 @@ class AiContextBuilder:
                     "metadata preserves exact hidden contents, open/taken state, "
                     "locks, traps, check skills/DCs, and failure consequences when the "
                     "relevant container is targeted. Closed-container contents are "
-                    "never revealed by this context projection; use the container events "
+                    "excluded from ordinary inventory rows. Private container_authority "
+                    "supplies the saved manifest for validated opening; use the container events "
                     "and Python validation to open or transfer them. "
                     "Do not treat "
                     "catalog entries as possessions unless they also appear in "
@@ -1761,10 +1779,13 @@ def _item_is_operationally_relevant(
         return False
 
     command = str(player_command or "").casefold()
+    name = str(getattr(item, "name", "") or "").strip().casefold()
     return bool(
+        (name and name in command)
+        or
         re.search(
             r"\b(?:open|unlock|lock|trap|trapped|inside|contents|empty|take|remove|"
-            r"collect|search)\b",
+            r"collect|search|inspect|examine|rummage|peek|check)\b",
             command,
         )
     )

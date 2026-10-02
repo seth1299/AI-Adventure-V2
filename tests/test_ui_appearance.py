@@ -8,8 +8,8 @@ from unittest.mock import Mock, patch
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QFont, QPalette
-from PySide6.QtWidgets import QApplication, QDialog, QMessageBox, QFileDialog, QFrame
+from PySide6.QtGui import QFont, QFontDatabase, QPalette
+from PySide6.QtWidgets import QApplication, QDialog, QMessageBox, QFileDialog, QFrame, QPushButton
 
 from ai_adventure.app.user_settings import (
     DEFAULT_UI_FONT_SIZE,
@@ -34,6 +34,44 @@ class UiAppearanceTests(unittest.TestCase):
             settings["appearance"],
             {"font_family": "", "font_size": DEFAULT_UI_FONT_SIZE},
         )
+
+    def test_font_preview_applies_current_size_and_allows_vertical_shrinking(self) -> None:
+        apply_application_theme("Dark", {"font_size": 11})
+        dialog = MainMenuSettingsDialog(settings={"theme": "Dark", "appearance": {"font_size": 11}})
+        try:
+            dialog.show()
+            self.app.processEvents()
+            base_family = self.app.property("ai_adventure_base_font_family")
+            families = [family for family in QFontDatabase.families() if family != base_family][:3]
+            for family in [*families, ""]:
+                with self.subTest(family=family):
+                    dialog.font_family_combo.setCurrentIndex(dialog.font_family_combo.findData(family))
+                    dialog.font_size_spin.setValue(24)
+                    self.app.processEvents()
+                    self.assertEqual(dialog.font_size_spin.font().pointSize(), 24)
+                    dialog.font_size_spin.setValue(11)
+                    self.app.processEvents()
+                    self.assertEqual(dialog.font_size_spin.font().pointSize(), 11)
+                    self.assertEqual(dialog.music_enabled_checkbox.font().pointSize(), 11)
+                    if not family:
+                        self.assertEqual(dialog.font_size_spin.font().family(), base_family)
+                        preview_font = dialog.font_family_combo.itemData(0, Qt.ItemDataRole.FontRole)
+                        self.assertEqual(preview_font.family(), base_family)
+                    dialog.resize(680, 800)
+                    self.app.processEvents()
+                    dialog.resize(680, 420)
+                    self.app.processEvents()
+                    self.assertEqual(dialog.height(), 420)
+                    self.assertGreater(dialog.settings_scroll_area.verticalScrollBar().maximum(), 0)
+                    buttons = [button for button in dialog.findChildren(QPushButton) if button.text() in {"Apply", "Cancel"}]
+                    self.assertEqual({button.text() for button in buttons}, {"Apply", "Cancel"})
+                    for button in buttons:
+                        self.assertTrue(button.isVisible())
+                        self.assertLess(button.mapTo(dialog, button.rect().bottomRight()).y(), dialog.height())
+        finally:
+            dialog.close()
+            dialog.deleteLater()
+            apply_application_theme("Light", {"font_size": DEFAULT_UI_FONT_SIZE})
 
     def test_app_settings_clamps_appearance_values(self) -> None:
         settings = normalize_app_settings(
@@ -72,6 +110,35 @@ class UiAppearanceTests(unittest.TestCase):
         settings = dialog.build_settings()
         self.assertEqual(settings["appearance"], {"font_family": "", "font_size": 16})
         dialog.deleteLater()
+
+    def test_restore_defaults_confirmation_and_complete_reset(self) -> None:
+        original = {"theme": "Dark", "appearance": {"font_family": "Arial", "font_size": 18},
+                    "audio": {"music_enabled": False, "music_volume": 72, "sound_effects_enabled": False,
+                              "sound_effects_volume": 41, "background_ambience_enabled": False,
+                              "background_ambience_volume": 29, "narrator_enabled": False,
+                              "tts_volume": 3, "tts_speed": 150, "tts_voice_mode": "blend",
+                              "tts_custom_voices": [{"name": "Custom"}]}}
+        for tts_enabled in (True, False):
+            with self.subTest(tts_enabled=tts_enabled):
+                persist = Mock()
+                dialog = MainMenuSettingsDialog(settings=original, tts_enabled=tts_enabled, on_restore_defaults=persist)
+                before = dialog.build_settings()
+                with patch.object(QMessageBox, "warning", return_value=QMessageBox.StandardButton.No):
+                    dialog.restore_defaults_button.click()
+                self.assertEqual(dialog.build_settings(), before)
+                persist.assert_not_called()
+                with patch.object(QMessageBox, "warning", return_value=QMessageBox.StandardButton.Yes) as warning:
+                    dialog.restore_defaults_button.click()
+                defaults = normalize_app_settings({}, tts_enabled=tts_enabled)
+                self.assertEqual(dialog.build_settings(), defaults)
+                persist.assert_called_once_with(defaults)
+                self.assertEqual(warning.call_args.args[-1], QMessageBox.StandardButton.No)
+                self.assertEqual(dialog.tts_volume_slider.value() if tts_enabled else defaults["audio"]["tts_volume"], 80)
+                buttons = dialog.layout().itemAt(1).layout()
+                self.assertEqual([buttons.itemAt(index).widget().text() for index in (1, 2, 3)],
+                                 ["Apply", "Restore Default Settings", "Cancel"])
+                dialog.close()
+                dialog.deleteLater()
 
     def test_font_family_choices_use_their_own_font_faces(self) -> None:
         dialog = MainMenuSettingsDialog(settings={}, tts_enabled=False)

@@ -259,6 +259,9 @@ def _normalize_container_metadata(raw_container: Any) -> dict[str, Any]:
 
     return {
         "is_open": is_open,
+        "contents_initialized": bool(container.get(
+            "contents_initialized", "contents" in container or "currency_base_units" in container or "items" in container
+        ) or currency_base_units or raw_items),
         "contents_taken": bool(is_open and contents_taken),
         "is_locked": is_locked,
         "lockpick_skill": (

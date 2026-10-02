@@ -6,8 +6,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from ai_adventure.container_flow import ContainerFlowError, container_event_issues
 from ai_adventure.infrastructure.gemini import GeminiNarrationService
-from ai_adventure.audio.tts_settings import active_voice_spec_from_audio, normalize_tts_audio_fields
+from ai_adventure.audio.tts_settings import (
+    active_voice_spec_from_audio, read_tts_audio_settings, active_player_voice_spec_from_audio,
+)
 from ai_adventure.audio.voices import assign_speaker_voices
 from ai_adventure.context.context_builder import AiContextBuilder
 from ai_adventure.core.state_manager import StateManager
@@ -169,6 +172,16 @@ class StoryTurnService:
             if isinstance(check, dict) and str(check.get("skill_name", "")).strip()
         ]
 
+    @staticmethod
+    def record_dropped_events(repository: SaveRepository, result: Any, *, message_id: str) -> None:
+        """Audit rejected provider proposals without rolling or applying them."""
+        with repository.transaction():
+            for event in getattr(result, "dropped_events", []):
+                repository.append_mechanical_event(
+                    event["type"], event["payload"], "dropped",
+                    f"{event['stage']}: {event['reason']}", message_id=message_id,
+                )
+
     def generate_response(self, context_packet: dict[str, Any]) -> Any:
         service = GeminiNarrationService(
             api_key_path=self.api_key_path,
@@ -212,6 +225,16 @@ class StoryTurnService:
 
         with repository.transaction():
             is_out_of_game = conversation_mode == "out_of_game"
+            if not is_out_of_game:
+                inventory = repository.list_inventory_items()
+                checks = [event.payload for event in prior_event_results or []
+                          if event.event_type == "SkillCheckRequestedEvent" and event.status == "applied"]
+                issues = container_event_issues(list(result.suggested_events), {
+                    "state": {"inventory": {"items": inventory, "container_authority": inventory},
+                              "skills": {"resolved_checks_this_turn": checks}},
+                }, narrative_text=result.narrative_text)
+                if issues:
+                    raise ContainerFlowError("; ".join(issues))
             pronunciation_map = merge_pronunciation_maps(
                 repository.get_setting("tts.pronunciation_map", {}),
                 getattr(result, "pronunciation_map", {}),
@@ -229,22 +252,10 @@ class StoryTurnService:
             repository.set_setting("tts.pronunciation_map", pronunciation_map)
 
             clean_message_id = message_id or repository.create_message_id()
+            StoryTurnService.record_dropped_events(repository, result, message_id=clean_message_id)
             speaker_cues: list[dict[str, str]] = []
             if not is_out_of_game:
-                audio = normalize_tts_audio_fields(
-                    {
-                        "tts_voice": repository.get_setting("audio.tts_voice", ""),
-                        "tts_voice_mode": repository.get_setting(
-                            "audio.tts_voice_mode", "preset"
-                        ),
-                        "tts_voice_blend": repository.get_setting(
-                            "audio.tts_voice_blend", {}
-                        ),
-                        "player_tts_voice": repository.get_setting(
-                            "audio.player_tts_voice", "ai"
-                        ),
-                    }
-                )
+                audio = read_tts_audio_settings(repository.get_setting)
                 speaker_cues, assignments = assign_speaker_voices(
                     getattr(result, "speaker_cues", []),
                     narrator_voice=active_voice_spec_from_audio(audio),
@@ -261,7 +272,7 @@ class StoryTurnService:
                     player_pronouns=repository.get_setting(
                         "player.pronouns", "They/Them"
                     ),
-                    player_voice=audio["player_tts_voice"],
+                    player_voice=active_player_voice_spec_from_audio(audio),
                 )
                 repository.set_setting("audio.speaker_voice_assignments", assignments)
 
@@ -287,6 +298,12 @@ class StoryTurnService:
                     suggested_events=events_to_apply,
                     prior_results=prior_event_results,
                 )
+            failed_container_events = [event for event in event_results
+                if event.event_type in {"ContainerOpenedEvent", "ContainerContentsTakenEvent"}
+                and event.status != "applied" and "already open" not in event.message]
+            if failed_container_events:
+                raise ContainerFlowError("Container operation failed; narration and rewards were rolled back: "
+                    + "; ".join(event.message for event in failed_container_events))
             if not is_out_of_game:
                 merchant_npc_id = next(
                     (

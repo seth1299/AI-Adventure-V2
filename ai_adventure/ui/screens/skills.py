@@ -109,14 +109,17 @@ def _skill_xp_progress_bar(skill: dict[str, Any]) -> QProgressBar:
     bar.setObjectName("skillXpProgressBar")
     bar.setRange(0, 100)
     bar.setValue(percentage)
-    bar.setFormat(f"{percentage}%")
+    max_level = level >= MAX_SKILL_LEVEL
+    progress_text = "Max Level" if max_level else f"{percentage}%"
+    bar.setValue(0 if max_level else percentage)
+    bar.setFormat(progress_text)
     bar.setTextVisible(True)
     bar.setMinimumWidth(120)
     bar.setMinimumHeight(20)
     bar.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
     bar.setToolTip(f"XP progress: {_skill_xp_progress_label(skill)}")
     bar.setAccessibleName(
-        f"{str(skill.get('name', 'Skill'))} XP progress: {percentage}%"
+        f"{str(skill.get('name', 'Skill'))} XP progress: {progress_text}"
     )
     bar.setStyleSheet(
         "QProgressBar#skillXpProgressBar {"

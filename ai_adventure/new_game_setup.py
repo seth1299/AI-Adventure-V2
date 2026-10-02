@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from ai_adventure.skills.rules import SKILL_DESCRIPTION_RULE, MAX_SKILL_XP_RULE
+
 import random
 from typing import Any
 
@@ -899,6 +901,7 @@ def build_new_game_setup_packet(
                 "Medicine, Melee, Performance, Persuasion, Primary Training, "
                 "Secondary Training, Signature Expertise, Stealth, or Survival "
                 "unless the player explicitly typed that skill name."
+                + " " + SKILL_DESCRIPTION_RULE
             ),
             "starter_inventory": (
                 "Return finalized inventory in the starting_items field, never in "

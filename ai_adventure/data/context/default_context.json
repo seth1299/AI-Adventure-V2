@@ -81,6 +81,7 @@
       "priority": 70,
       "content": {
         "guidelines": [
+          "ContainerOpenedEvent and ContainerContentsTakenEvent may occur in the same turn, in that order. Unknown contents are not empty: when contents_initialized is false, include a complete contents manifest (currency_base_units and items) in ContainerOpenedEvent. Initialize it once, after access checks succeed. Never replace already initialized contents. container_authority is private GM state; reveal its contents only after a permitted opening. Transfer rewards exclusively through ContainerContentsTakenEvent, including nested containers such as vials or coin pouches; never add the same loot with InventoryItemAddedEvent or CurrencyChangedEvent. Use item_names and take_currency for selective taking; omitting them takes all stored contents. Narrate only the manifest and the actual selected transfer. Leave untaken items inside the container.",
           "Use the current location, time, and weather as the anchor for scene details.",
           "Offer clear consequences, discoveries, or obstacles when the player explores.",
           "Treat a travel request's calculated distance and estimated time as logistics for an attempted journey, not automatic arrival. Avoid moving the player to a new named location unless a location-change event is proposed."
@@ -132,6 +133,8 @@
       "priority": 82,
       "content": {
         "guidelines": [
+          "Skill descriptions must describe the skill's uses and scope independently of the player's current training level. Do not describe current proficiency with wording such as 'basic capability', 'novice understanding', or 'expert mastery'; the level field records proficiency separately. For example, use 'Enduring harsh conditions and finding shelter' rather than 'Basic capability to endure harsh conditions'.",
+          "Master (level 5) skills cannot gain further XP or levels. Do not propose XP awards for them.",
           "Suggest SkillCheckRequestedEvent before narrating a final outcome only when the current command has meaningful uncertainty, opposition, hidden information, danger, scarcity, time pressure, or consequences.",
           "Choose the most directly relevant skill from state.skills.known_skills, not merely a plausible broad skill. Locating or gathering wild plants, herbs, or reagents uses known Foraging rather than Investigation or Perception. SkillCheckRequestedEvent may name an unknown skill only when no known skill fits; then include a clear skill_description so Python can create it at level 1 before resolving the check.",
           "Do not request a check merely because an action could theoretically vary in quality or take extra time. Foraging, harvesting, searching, researching, identifying, crafting experiments, persuasion, stealth, and combat need checks only when real stakes are present.",

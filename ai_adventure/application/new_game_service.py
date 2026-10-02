@@ -12,7 +12,9 @@ from ai_adventure.alchemy.ingredients import (
     is_crafting_ingredient_category,
     normalize_recipe_ingredients,
 )
-from ai_adventure.audio.tts_settings import normalize_tts_audio_fields
+from ai_adventure.audio.tts_settings import (
+    normalize_tts_audio_fields, read_tts_audio_settings, active_player_voice_spec_from_audio,
+)
 from ai_adventure.audio.tts_settings import active_voice_spec_from_audio
 from ai_adventure.audio.voices import DEFAULT_NARRATOR_VOICE
 from ai_adventure.audio.voices import assign_speaker_voices
@@ -213,22 +215,7 @@ class NewGameService:
                 finalized_character,
             )
 
-            audio = normalize_tts_audio_fields(
-                {
-                    "tts_voice": repository.get_setting(
-                        "audio.tts_voice", DEFAULT_NARRATOR_VOICE
-                    ),
-                    "tts_voice_mode": repository.get_setting(
-                        "audio.tts_voice_mode", "preset"
-                    ),
-                    "tts_voice_blend": repository.get_setting(
-                        "audio.tts_voice_blend", {}
-                    ),
-                    "player_tts_voice": repository.get_setting(
-                        "audio.player_tts_voice", "ai"
-                    ),
-                }
-            )
+            audio = read_tts_audio_settings(repository.get_setting)
             speaker_cues, assignments = assign_speaker_voices(
                 getattr(result, "speaker_cues", []),
                 narrator_voice=active_voice_spec_from_audio(audio),
@@ -242,7 +229,7 @@ class NewGameService:
                     str(setup.get("character", {}).get("name", "")).casefold(),
                 },
                 player_pronouns=setup.get("character", {}).get("pronouns", "They/Them"),
-                player_voice=audio["player_tts_voice"],
+                player_voice=active_player_voice_spec_from_audio(audio),
             )
             repository.set_setting("audio.speaker_voice_assignments", assignments)
 

@@ -2069,7 +2069,7 @@ class GeminiServiceTests(unittest.TestCase):
             [event["type"] for event in result.suggested_events],
         )
 
-    def test_story_request_drops_direct_rewards_from_unopened_container(self) -> None:
+    def test_story_request_repairs_direct_rewards_from_unopened_container(self) -> None:
         self._install_fake_genai_client(
             json.dumps(
                 {
@@ -2103,38 +2103,35 @@ class GeminiServiceTests(unittest.TestCase):
             service = GeminiNarrationService(
                 GeminiSettings(api_key="test-key", model="gemini-2.5-flash")
             )
-            result = service.generate_story_response(
-                {
-                    "selection": {"tags": ['inventory', 'currency']},
-                    "packet_type": "story_turn",
-                    "player_command": "Open the Stolen Coin Pouch.",
-                    "state": {
-                        "inventory": {
-                            "items": [
-                                {
-                                    "name": "Stolen Coin Pouch",
-                                    "category": "Container",
-                                    "quantity": 1,
-                                    "metadata": {
-                                        "item_type": "Container",
-                                        "container": {
-                                            **_container_metadata(),
-                                            "is_locked": True,
-                                            "lockpick_dc": 16,
+            with self.assertRaisesRegex(GeminiRequestError, "not saved"):
+                service.generate_story_response(
+                    {
+                        "selection": {"tags": ['inventory', 'currency']},
+                        "packet_type": "story_turn",
+                        "player_command": "Open the Stolen Coin Pouch.",
+                        "state": {
+                            "inventory": {
+                                "items": [
+                                    {
+                                        "name": "Stolen Coin Pouch",
+                                        "category": "Container",
+                                        "quantity": 1,
+                                        "metadata": {
+                                            "item_type": "Container",
+                                            "container": {
+                                                **_container_metadata(),
+                                                "is_locked": True,
+                                                "lockpick_dc": 16,
+                                            },
                                         },
-                                    },
-                                }
-                            ]
-                        }
-                    },
-                }
-            )
+                                    }
+                                ]
+                            }
+                        },
+                    }
+                )
         finally:
             self._remove_fake_genai_client()
-
-        event_types = [event["type"] for event in result.suggested_events]
-
-        self.assertNotIn("CurrencyChangedEvent", event_types)
 
     def test_story_request_keeps_pantry_rations_when_locked_chest_has_key(self) -> None:
         self._install_fake_genai_client(
@@ -2318,7 +2315,7 @@ class GeminiServiceTests(unittest.TestCase):
         self.assertEqual(inventory_events[0]["payload"]["item_name"], "Rain Bindweed")
         self.assertEqual(inventory_events[0]["payload"]["amount"], 2)
 
-    def test_story_request_keeps_container_events_but_drops_duplicate_rewards(self) -> None:
+    def test_story_request_repairs_duplicate_rewards_without_silent_filtering(self) -> None:
         self._install_fake_genai_client(
             json.dumps(
                 {
@@ -2354,25 +2351,19 @@ class GeminiServiceTests(unittest.TestCase):
         )
 
         try:
-            result = GeminiNarrationService(
-                GeminiSettings(api_key="test-key", model="gemini-2.5-flash")
-            ).generate_story_response(
-                {
-                    "selection": {"tags": ['inventory', 'currency']},
-                    "packet_type": "story_turn",
-                    "player_command": "Open the pouch and take everything inside.",
-                    "state": {"inventory": {"items": []}},
-                }
-            )
+            with self.assertRaisesRegex(GeminiRequestError, "not saved"):
+                GeminiNarrationService(
+                    GeminiSettings(api_key="test-key", model="gemini-2.5-flash")
+                ).generate_story_response(
+                    {
+                        "selection": {"tags": ['inventory', 'currency']},
+                        "packet_type": "story_turn",
+                        "player_command": "Open the pouch and take everything inside.",
+                        "state": {"inventory": {"items": []}},
+                    }
+                )
         finally:
             self._remove_fake_genai_client()
-
-        event_types = [event["type"] for event in result.suggested_events]
-
-        self.assertIn("ContainerOpenedEvent", event_types)
-        self.assertIn("ContainerContentsTakenEvent", event_types)
-        self.assertNotIn("CurrencyChangedEvent", event_types)
-        self.assertNotIn("InventoryItemAddedEvent", event_types)
 
     def test_story_request_does_not_inject_skill_check_from_narration_or_actions(self) -> None:
         self._install_fake_genai_client(

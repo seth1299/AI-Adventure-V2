@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+from ai_adventure.ui.widgets.inputs import FeatureToggleCheckBox
+from ai_adventure.audio.tts_settings import DEFAULT_TTS_VOLUME_PERCENT, active_player_voice_spec_from_audio
+from ai_adventure.audio.voices import PLAYER_SAMPLE_TEXT
+
 from PySide6.QtWidgets import QFileDialog
 
 from ai_adventure.ui.common import *  # noqa: F401,F403
@@ -46,7 +50,7 @@ class CustomVoiceDialog(QDialog):
 
         self.tts_volume_slider = QSlider(Qt.Orientation.Horizontal)
         self.tts_volume_slider.setRange(0, 100)
-        self.tts_volume_slider.setValue(90)
+        self.tts_volume_slider.setValue(DEFAULT_TTS_VOLUME_PERCENT)
         self.tts_volume_label = QLabel(f"{self.tts_volume_slider.value()}%")
         self.tts_volume_slider.valueChanged.connect(
             lambda value: self.tts_volume_label.setText(f"{value}%")
@@ -427,7 +431,7 @@ class CustomVoiceDialog(QDialog):
 
 
 class TTSSettingsWidget(QWidget):
-    """Shared advanced narrator controls."""
+    """Independent narrator and player speech controls."""
 
     def __init__(
         self,
@@ -436,6 +440,7 @@ class TTSSettingsWidget(QWidget):
         voice_options: dict[str, str] | None = None,
         on_sample_voice: SampleVoiceCallback | None = None,
         on_custom_voice_saved: Callable[[dict[str, Any]], None] | None = None,
+        player_pronouns_provider: Callable[[], str] | None = None,
         custom_voice_storage_path: Path | str | None = None,
         parent: QWidget | None = None,
     ) -> None:
@@ -444,20 +449,22 @@ class TTSSettingsWidget(QWidget):
         self.voice_options = voice_options or available_narrator_voices()
         self.on_sample_voice = on_sample_voice
         self.on_custom_voice_saved = on_custom_voice_saved
+        self.player_pronouns_provider = player_pronouns_provider
         self.custom_voice_storage_path = custom_voice_storage_path
         self._loading_tts_settings = False
         self.custom_voice_library_changed = False
         self.custom_voices: list[dict[str, Any]] = []
         self.current_voice_blend = normalize_voice_blend({})
+        self.current_player_voice_blend = normalize_voice_blend({})
 
-        self.narrator_enabled_checkbox = QCheckBox("Narrator enabled")
+        self.narrator_enabled_checkbox = FeatureToggleCheckBox('Narrator')
         self.narrator_enabled_checkbox.toggled.connect(
             lambda checked: self._sync_control_states(checked)
         )
 
         self.tts_volume_slider = QSlider(Qt.Orientation.Horizontal)
         self.tts_volume_slider.setRange(0, 100)
-        self.tts_volume_slider.setValue(90)
+        self.tts_volume_slider.setValue(DEFAULT_TTS_VOLUME_PERCENT)
         self.tts_volume_label = QLabel(f"{self.tts_volume_slider.value()}%")
         self.tts_volume_slider.valueChanged.connect(
             lambda value: self.tts_volume_label.setText(f"{value}%")
@@ -503,8 +510,10 @@ class TTSSettingsWidget(QWidget):
         self.custom_voice_button = QPushButton("Custom Voices...")
         self.custom_voice_button.clicked.connect(self._open_custom_voice_dialog)
 
-        self.sample_voice_button = QPushButton("Sample Voice")
+        self.sample_voice_button = QPushButton("Sample Narrator Voice")
         self.sample_voice_button.clicked.connect(self._sample_voice)
+        self.sample_player_voice_button = QPushButton("Sample Player Character Voice")
+        self.sample_player_voice_button.clicked.connect(self._sample_player_voice)
 
         self.tts_volume_row = _slider_row(self.tts_volume_slider, self.tts_volume_label)
         self.tts_speed_row = _slider_row(self.tts_speed_slider, self.tts_speed_label)
@@ -512,18 +521,54 @@ class TTSSettingsWidget(QWidget):
             self.custom_voice_summary_label,
             self.custom_voice_button,
         )
-        self.voice_button_row = _button_row(self.sample_voice_button)
 
-        form = QFormLayout()
-        form.addRow("Narrator:", self.narrator_enabled_checkbox)
-        form.addRow("Volume:", self.tts_volume_row)
-        form.addRow("Speed:", self.tts_speed_row)
-        form.addRow("Voice Source:", self.voice_mode_combo)
-        form.addRow("Preset Voice:", self.preset_voice_combo)
-        form.addRow("Player Character Voice:", self.player_voice_combo)
-        form.addRow("Custom Voice:", self.custom_voice_row)
-        form.addRow("", self.voice_button_row)
-        self.setLayout(form)
+        self.player_enabled_checkbox = FeatureToggleCheckBox("Player Character")
+        self.player_enabled_checkbox.toggled.connect(lambda _checked: self._sync_control_states(self.narrator_enabled_checkbox.isChecked()))
+        self.player_tts_volume_slider = QSlider(Qt.Orientation.Horizontal)
+        self.player_tts_volume_slider.setRange(0, 100)
+        self.player_tts_volume_label = QLabel()
+        self.player_tts_volume_slider.valueChanged.connect(lambda value: self.player_tts_volume_label.setText(f"{value}%"))
+        self.player_tts_speed_slider = QSlider(Qt.Orientation.Horizontal)
+        self.player_tts_speed_slider.setRange(50, 200)
+        self.player_tts_speed_label = QLabel()
+        self.player_tts_speed_slider.valueChanged.connect(lambda value: self.player_tts_speed_label.setText(f"{value}%"))
+        self.player_voice_mode_combo = _NoWheelComboBox()
+        self.player_voice_mode_combo.addItem("Preset Voice", "preset")
+        self.player_voice_mode_combo.addItem("Custom Blend", "blend")
+        self.player_voice_mode_combo.currentIndexChanged.connect(lambda _index: self._sync_control_states(self.narrator_enabled_checkbox.isChecked()))
+        self.player_custom_voice_summary_label = QLabel()
+        self.player_custom_voice_summary_label.setWordWrap(True)
+        self.player_custom_voice_button = QPushButton("Custom Voices...")
+        self.player_custom_voice_button.clicked.connect(lambda: self._open_custom_voice_dialog(player=True))
+        self.player_tts_volume_row = _slider_row(self.player_tts_volume_slider, self.player_tts_volume_label)
+        self.player_tts_speed_row = _slider_row(self.player_tts_speed_slider, self.player_tts_speed_label)
+        self.player_custom_voice_row = _button_row(self.player_custom_voice_summary_label, self.player_custom_voice_button)
+        self.voice_button_row = _button_row(self.sample_voice_button)
+        self.player_voice_button_row = _button_row(self.sample_player_voice_button)
+
+        self.narrator_section = QGroupBox("Narrator")
+        narrator_form = QFormLayout(self.narrator_section)
+        narrator_form.addRow("Narrator:", self.narrator_enabled_checkbox)
+        narrator_form.addRow("Narrator Volume:", self.tts_volume_row)
+        narrator_form.addRow("Narrator Speed:", self.tts_speed_row)
+        narrator_form.addRow("Voice Source:", self.voice_mode_combo)
+        narrator_form.addRow("Preset Voice:", self.preset_voice_combo)
+        narrator_form.addRow("Custom Voice:", self.custom_voice_row)
+        narrator_form.addRow("", self.voice_button_row)
+        self.player_section = QGroupBox("Player Character")
+        player_form = QFormLayout(self.player_section)
+        player_form.addRow("Player Character:", self.player_enabled_checkbox)
+        player_form.addRow("Player Volume:", self.player_tts_volume_row)
+        player_form.addRow("Player Speed:", self.player_tts_speed_row)
+        player_form.addRow("Voice Source:", self.player_voice_mode_combo)
+        player_form.addRow("Preset Voice:", self.player_voice_combo)
+        player_form.addRow("Custom Voice:", self.player_custom_voice_row)
+        player_form.addRow("", self.player_voice_button_row)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self.narrator_section)
+        layout.addWidget(self.player_section)
+        layout.addStretch(1)
         self.load_audio_settings(audio_settings or {})
 
     def load_audio_settings(self, audio_settings: dict[str, Any]) -> None:
@@ -535,6 +580,13 @@ class TTSSettingsWidget(QWidget):
         try:
             self.custom_voices = normalize_custom_voices(audio["tts_custom_voices"])
             self.current_voice_blend = normalize_voice_blend(audio["tts_voice_blend"])
+            self.current_player_voice_blend = normalize_voice_blend(audio["player_tts_voice_blend"])
+            self.player_enabled_checkbox.setChecked(audio["player_enabled"])
+            self.player_tts_volume_slider.setValue(audio["player_tts_volume"])
+            self.player_tts_volume_label.setText(f"{audio['player_tts_volume']}%")
+            self.player_tts_speed_slider.setValue(audio["player_tts_speed"])
+            self.player_tts_speed_label.setText(f"{audio['player_tts_speed']}%")
+            _set_combo_to_data(self.player_voice_mode_combo, audio["player_tts_voice_mode"])
             self.narrator_enabled_checkbox.setChecked(bool(audio["narrator_enabled"]))
             self.tts_volume_slider.setValue(int(audio["tts_volume"]))
             self.tts_speed_slider.setValue(normalize_tts_speed_percent(audio["tts_speed"]))
@@ -560,6 +612,13 @@ class TTSSettingsWidget(QWidget):
                 "tts_voice_blend": self._current_blend(),
                 "tts_custom_voices": self.custom_voices,
                 "player_tts_voice": self.player_voice_combo.currentData() or "ai",
+                "player_enabled": self.player_enabled_checkbox.isChecked(),
+                "player_tts_volume": self.player_tts_volume_slider.value(),
+                "player_tts_speed": self.player_tts_speed_slider.value(),
+                "player_tts_voice_mode": self.player_voice_mode_combo.currentData(),
+                "player_tts_voice_blend": {**self.current_player_voice_blend,
+                    "tts_volume": self.player_tts_volume_slider.value(),
+                    "tts_speed": self.player_tts_speed_slider.value()},
             }
         )
 
@@ -583,21 +642,35 @@ class TTSSettingsWidget(QWidget):
         blend["tts_speed"] = self.tts_speed_slider.value()
         return normalize_voice_blend(blend)
 
-    def _open_custom_voice_dialog(self) -> None:
+    def _open_custom_voice_dialog(self, *, player: bool = False) -> None:
         """Opens the dedicated custom voice editor."""
 
+        base_audio = self.build_audio_settings()
+        editor_audio = dict(base_audio)
+        if player:
+            for key in ("tts_volume", "tts_speed", "tts_voice_mode", "tts_voice_blend"):
+                editor_audio[key] = base_audio[f"player_{key}"]
+        sample_callback = self.on_sample_voice
+        if player and self.on_sample_voice is not None:
+            sample_callback = lambda voice, volume, speed: _invoke_sample_voice_callback(
+                self.on_sample_voice, voice, volume, speed, text=PLAYER_SAMPLE_TEXT
+            )
         dialog = CustomVoiceDialog(
             self,
-            audio_settings=self.build_audio_settings(),
+            audio_settings=editor_audio,
             voice_options=self.voice_options,
-            on_sample_voice=self.on_sample_voice,
+            on_sample_voice=sample_callback,
             storage_path=self.custom_voice_storage_path,
         )
 
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
 
-        self.load_audio_settings(dialog.build_audio_settings())
+        edited = dialog.build_audio_settings()
+        for key in ("tts_volume", "tts_speed", "tts_voice_mode", "tts_voice_blend"):
+            base_audio[f"player_{key}" if player else key] = edited[key]
+        base_audio["tts_custom_voices"] = edited["tts_custom_voices"]
+        self.load_audio_settings(base_audio)
 
         if dialog.custom_voice_library_changed:
             self.custom_voice_library_changed = True
@@ -608,6 +681,7 @@ class TTSSettingsWidget(QWidget):
     def _sync_custom_voice_summary(self) -> None:
         """Updates the selected custom voice summary label."""
 
+        self.player_custom_voice_summary_label.setText(_custom_voice_display_text(self.current_player_voice_blend))
         blend = self._current_blend()
         saved_name = self._saved_voice_name_for(blend)
 
@@ -646,9 +720,29 @@ class TTSSettingsWidget(QWidget):
             self.tts_speed_slider.value(),
         )
 
+    def _sample_player_voice(self) -> None:
+        """Preview the selected player voice using the gameplay voice resolver."""
+        if self.on_sample_voice is None:
+            return
+        from ai_adventure.audio.voices import assign_speaker_voices
+        text = PLAYER_SAMPLE_TEXT
+        cues, _assignments = assign_speaker_voices(
+            [{"speaker_id": "player", "speaker_name": "Player Character", "anchor_text": text}],
+            available_voice_ids=list(self.voice_options.values()),
+            narrator_voice=self.active_voice_spec(),
+            player_voice=active_player_voice_spec_from_audio(self.build_audio_settings()),
+            player_pronouns=self.player_pronouns_provider() if self.player_pronouns_provider else None,
+        )
+        _invoke_sample_voice_callback(
+            self.on_sample_voice, cues[0]["voice_id"], self.player_tts_volume_slider.value(),
+            self.player_tts_speed_slider.value(), text=text,
+        )
+
     def _sync_control_states(self, checked: bool) -> None:
         """Enables controls based on narrator and voice-source state."""
 
+        if self._loading_tts_settings:
+            return
         mode = normalize_tts_voice_mode(self.voice_mode_combo.currentData())
         preset_visible = checked and mode == "preset"
         custom_visible = checked and mode == "blend"
@@ -663,7 +757,6 @@ class TTSSettingsWidget(QWidget):
             widget.setEnabled(checked)
 
         self.preset_voice_combo.setEnabled(preset_visible)
-        self.player_voice_combo.setEnabled(checked)
         self.custom_voice_button.setEnabled(checked)
         self.sample_voice_button.setEnabled(checked and self.on_sample_voice is not None)
 
@@ -676,15 +769,22 @@ class TTSSettingsWidget(QWidget):
             self._set_form_field_visible(field, checked)
 
         self._set_form_field_visible(self.preset_voice_combo, preset_visible)
-        self._set_form_field_visible(self.player_voice_combo, checked)
         self._set_form_field_visible(self.custom_voice_row, custom_visible)
+        player_enabled = self.player_enabled_checkbox.isChecked()
+        player_blend = self.player_voice_mode_combo.currentData() == "blend"
+        for field in (self.player_tts_volume_row, self.player_tts_speed_row,
+                      self.player_voice_mode_combo, self.player_voice_button_row):
+            self._set_form_field_visible(field, player_enabled)
+        self._set_form_field_visible(self.player_voice_combo, player_enabled and not player_blend)
+        self._set_form_field_visible(self.player_custom_voice_row, player_enabled and player_blend)
+        self.sample_player_voice_button.setEnabled(player_enabled and self.on_sample_voice is not None)
 
     def _set_form_field_visible(self, field: QWidget, visible: bool) -> None:
         """Shows or hides a form field and its label together."""
 
         field.setVisible(visible)
 
-        layout = self.layout()
+        layout = field.parentWidget().layout()
 
         if not isinstance(layout, QFormLayout):
             return
@@ -727,7 +827,11 @@ class TTSSettingsDialog(QDialog):
         buttons.rejected.connect(self.reject)
 
         layout = QVBoxLayout()
-        layout.addWidget(self.tts_settings_widget)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        scroll.setWidget(self.tts_settings_widget)
+        layout.addWidget(scroll)
         layout.addWidget(buttons)
         self.setLayout(layout)
 
@@ -1214,11 +1318,13 @@ class MainMenuSettingsDialog(QDialog):
         voice_options: dict[str, str] | None = None,
         on_sample_voice: SampleVoiceCallback | None = None,
         custom_voice_storage_path: Path | str | None = None,
+        on_restore_defaults: Callable[[dict[str, Any]], None] | None = None,
     ) -> None:
         super().__init__(parent)
 
         self.tts_enabled = bool(tts_enabled)
         self.music_enabled = bool(music_enabled)
+        self.on_restore_defaults = on_restore_defaults
         self.sound_manager = sound_manager
         self.voice_options = voice_options or available_narrator_voices()
         self.on_sample_voice = on_sample_voice
@@ -1230,7 +1336,7 @@ class MainMenuSettingsDialog(QDialog):
         appearance = clean_settings["appearance"]
 
         self.setWindowTitle("Settings")
-        self.resize(580, 460)
+        self.resize(680, 720)
 
         self.theme_combo = QComboBox()
         self.theme_combo.addItems(["Light", "Dark"])
@@ -1266,11 +1372,8 @@ class MainMenuSettingsDialog(QDialog):
         self.font_size_spin.valueChanged.connect(
             lambda _value: self._preview_appearance()
         )
-        self.font_size_spin.valueChanged.connect(
-            lambda _value: self._apply_font_family_item_fonts()
-        )
 
-        self.music_enabled_checkbox = QCheckBox("Music enabled")
+        self.music_enabled_checkbox = FeatureToggleCheckBox('Music')
         self.music_enabled_checkbox.setChecked(bool(audio["music_enabled"]))
         self.music_enabled_checkbox.toggled.connect(self._sync_audio_control_visibility)
         self.music_upload_button = QPushButton("Upload Music...")
@@ -1289,7 +1392,7 @@ class MainMenuSettingsDialog(QDialog):
             self.music_volume_slider, self.music_volume_label
         )
 
-        self.sound_effects_enabled_checkbox = QCheckBox("Sound effects enabled")
+        self.sound_effects_enabled_checkbox = FeatureToggleCheckBox('Sound effects')
         self.sound_effects_enabled_checkbox.setChecked(
             bool(audio["sound_effects_enabled"])
         )
@@ -1313,9 +1416,7 @@ class MainMenuSettingsDialog(QDialog):
             self.sound_effects_volume_slider, self.sound_effects_volume_label
         )
 
-        self.background_ambience_enabled_checkbox = QCheckBox(
-            "Background ambience enabled"
-        )
+        self.background_ambience_enabled_checkbox = FeatureToggleCheckBox('Background ambience')
         self.background_ambience_enabled_checkbox.setChecked(
             bool(audio["background_ambience_enabled"])
         )
@@ -1391,6 +1492,15 @@ class MainMenuSettingsDialog(QDialog):
                 "Ambience Volume:",
                 self.background_ambience_volume_control,
             )
+            self.music_enabled_checkbox.bind_form_children(
+                form, self.music_upload_button, self.music_volume_slider,
+            )
+            self.sound_effects_enabled_checkbox.bind_form_children(
+                form, self.sound_effects_upload_button, self.sound_effects_volume_slider,
+            )
+            self.background_ambience_enabled_checkbox.bind_form_children(
+                form, self.background_ambience_upload_button, self.background_ambience_volume_slider,
+            )
 
         if self.tts_enabled:
             self.tts_settings_widget = TTSSettingsWidget(
@@ -1411,21 +1521,62 @@ class MainMenuSettingsDialog(QDialog):
 
         save_button = QPushButton("Apply")
         save_button.clicked.connect(self.accept)
+        self.restore_defaults_button = QPushButton("Restore Default Settings")
+        self.restore_defaults_button.clicked.connect(self._restore_default_settings)
         cancel_button = QPushButton("Cancel")
         cancel_button.clicked.connect(self.reject)
 
         button_row = QHBoxLayout()
         button_row.addStretch()
         button_row.addWidget(save_button)
+        button_row.addWidget(self.restore_defaults_button)
         button_row.addWidget(cancel_button)
 
+        content = QWidget()
+        content.setLayout(form)
+        self.settings_scroll_area = QScrollArea()
+        self.settings_scroll_area.setWidgetResizable(True)
+        self.settings_scroll_area.setFrameShape(QFrame.Shape.NoFrame)
+        self.settings_scroll_area.setWidget(content)
         layout = QVBoxLayout()
-        layout.addLayout(form)
-        layout.addStretch()
+        layout.addWidget(self.settings_scroll_area, 1)
         layout.addLayout(button_row)
         self.setLayout(layout)
         self._sync_audio_control_visibility()
         self._preview_appearance()
+
+    def _restore_default_settings(self) -> None:
+        """Confirm, restore every app preference, and persist the confirmed reset."""
+        answer = QMessageBox.warning(
+            self, "Restore Default Settings",
+            "Are you sure you want to restore default settings? "
+            "Your saved settings and any changes in this dialog will be replaced "
+            "with the application defaults. This cannot be undone.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        defaults = normalize_app_settings({}, tts_enabled=self.tts_enabled)
+        controls = [self.theme_combo, self.font_family_combo, self.font_size_spin]
+        blocked = [control.blockSignals(True) for control in controls]
+        try:
+            self.theme_combo.setCurrentText(defaults["theme"])
+            self.font_family_combo.setCurrentIndex(self.font_family_combo.findData(""))
+            self.font_size_spin.setValue(defaults["appearance"]["font_size"])
+            audio = defaults["audio"]
+            for prefix in ("music", "sound_effects", "background_ambience"):
+                getattr(self, prefix + "_enabled_checkbox").setChecked(audio[prefix + "_enabled"])
+                getattr(self, prefix + "_volume_slider").setValue(audio[prefix + "_volume"])
+            if self.tts_settings_widget is not None:
+                self.tts_settings_widget.load_audio_settings(audio)
+        finally:
+            for control, was_blocked in zip(controls, blocked):
+                control.blockSignals(was_blocked)
+        self._sync_audio_control_visibility()
+        self._preview_appearance()
+        if self.on_restore_defaults is not None:
+            self.on_restore_defaults(defaults)
 
     def build_settings(self) -> dict[str, Any]:
         """Builds normalized app-level settings from dialog fields."""
@@ -1489,6 +1640,7 @@ class MainMenuSettingsDialog(QDialog):
         voice: str | None = None,
         volume: int | None = None,
         speed: int | None = None,
+        *, text: str | None = None,
     ) -> bool:
         """Plays the selected voice sample."""
 
@@ -1505,6 +1657,7 @@ class MainMenuSettingsDialog(QDialog):
             ),
             self._tts_volume_value() if volume is None else int(volume),
             DEFAULT_TTS_SPEED_PERCENT if speed is None else int(speed),
+            text=text,
         )
 
     def _tts_settings_value(self) -> dict[str, Any]:
@@ -1519,7 +1672,8 @@ class MainMenuSettingsDialog(QDialog):
         """Renders each font-family choice using that family, like Word."""
 
         point_size = max(1, int(self.font_size_spin.value()))
-        default_family = QApplication.font().family()
+        app = QApplication.instance()
+        default_family = (app.property("ai_adventure_base_font_family") if app else None) or QApplication.font().family()
         for index in range(self.font_family_combo.count()):
             family = str(self.font_family_combo.itemData(index) or "").strip()
             font = QFont(family or default_family)
@@ -1536,6 +1690,7 @@ class MainMenuSettingsDialog(QDialog):
                 "font_size": self.font_size_spin.value(),
             },
         )
+        self._apply_font_family_item_fonts()
 
     def _sync_audio_control_visibility(self, _checked: bool | None = None) -> None:
         """Shows each volume control only while its feature is enabled."""
@@ -1917,23 +2072,21 @@ class NewGameTemplateManagerDialog(QDialog):
         task_form.addRow("Due:", self.starting_task_due_date_input)
         self.starting_task_custom_group.setLayout(task_form)
 
-        self.music_enabled_checkbox = QCheckBox("Music enabled")
+        self.music_enabled_checkbox = FeatureToggleCheckBox('Music')
         self.music_volume_slider = QSlider(Qt.Orientation.Horizontal)
         self.music_volume_slider.setRange(0, 100)
         self.music_volume_label = QLabel()
         self.music_volume_slider.valueChanged.connect(
             lambda value: self.music_volume_label.setText(f"{value}%")
         )
-        self.sound_effects_enabled_checkbox = QCheckBox("Sound effects enabled")
+        self.sound_effects_enabled_checkbox = FeatureToggleCheckBox('Sound effects')
         self.sound_effects_volume_slider = QSlider(Qt.Orientation.Horizontal)
         self.sound_effects_volume_slider.setRange(0, 100)
         self.sound_effects_volume_label = QLabel()
         self.sound_effects_volume_slider.valueChanged.connect(
             lambda value: self.sound_effects_volume_label.setText(f"{value}%")
         )
-        self.background_ambience_enabled_checkbox = QCheckBox(
-            "Background ambience enabled"
-        )
+        self.background_ambience_enabled_checkbox = FeatureToggleCheckBox('Background ambience')
         self.background_ambience_volume_slider = QSlider(Qt.Orientation.Horizontal)
         self.background_ambience_volume_slider.setRange(0, 100)
         self.background_ambience_volume_label = QLabel()
@@ -2114,6 +2267,15 @@ class NewGameTemplateManagerDialog(QDialog):
             form.addRow("Narration / TTS:", self.template_tts_settings_widget)
         tab = QWidget()
         tab.setLayout(form)
+        self.music_enabled_checkbox.bind_form_children(
+            form, self.music_volume_slider, self.music_test_button,
+        )
+        self.sound_effects_enabled_checkbox.bind_form_children(
+            form, self.sound_effects_volume_slider, self.sound_effects_test_button,
+        )
+        self.background_ambience_enabled_checkbox.bind_form_children(
+            form, self.background_ambience_volume_slider, self.background_ambience_test_button,
+        )
         return tab
 
     def _test_music_preview(self) -> None:
