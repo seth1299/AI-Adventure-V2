@@ -2,6 +2,31 @@ from __future__ import annotations
 
 from ai_adventure.ui.common import *  # noqa: F401,F403
 from ai_adventure.ui.dialogues import *  # noqa: F401,F403
+from PySide6.QtWidgets import QGraphicsOpacityEffect
+from ai_adventure.inventory_storage import inventory_access, move_error, metadata as storage_metadata
+
+
+class InventoryMoveDialog(QDialog):
+    """Choose among destinations the player can physically reach right now."""
+
+    def __init__(self, destinations: list[tuple[str, str]], *, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Move Item")
+        self.destination_combo = QComboBox()
+        self.destination_combo.setObjectName("inventoryMoveDestination")
+        for label, item_id in destinations:
+            self.destination_combo.addItem(label, item_id)
+        form = QFormLayout()
+        form.addRow("Move to where?", self.destination_combo)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Move")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout = QVBoxLayout()
+        layout.addLayout(form)
+        layout.addWidget(buttons)
+        self.setLayout(layout)
+        self.setMinimumWidth(320)
 
 
 class InventoryLocationPanel(QGroupBox):
@@ -205,6 +230,11 @@ class InventoryLocationPanel(QGroupBox):
             button.setObjectName("inventoryItemButton")
             button.setMinimumHeight(52)
             button.setToolTip("Open all item details")
+            if item.get("available") is False:
+                opacity = QGraphicsOpacityEffect(button)
+                opacity.setOpacity(0.45)
+                button.setGraphicsEffect(opacity)
+                button.setToolTip(str(item.get("access_reason") or "Item is not currently accessible.") + " Click to view details.")
             button.clicked.connect(
                 lambda _checked=False, selected=dict(item): self._on_item_clicked(selected)
             )
@@ -244,6 +274,8 @@ class InventoryScreen(RepositoryBackedWidget):
         ] = {}
         self.location_panels: list[InventoryLocationPanel] = []
         self.currency_label = QLabel("Currency: 0")
+        self.carrying_label = QLabel()
+        self.carrying_label.setWordWrap(True)
 
         self.inventory_scroll = QScrollArea()
         self.inventory_scroll.setWidgetResizable(True)
@@ -259,6 +291,7 @@ class InventoryScreen(RepositoryBackedWidget):
         layout = QVBoxLayout()
         layout.addWidget(QLabel("Inventory"))
         layout.addWidget(self.currency_label)
+        layout.addWidget(self.carrying_label)
         layout.addWidget(self.inventory_scroll, 1)
 
         if self.playtesting_tools:
@@ -275,6 +308,8 @@ class InventoryScreen(RepositoryBackedWidget):
         self.item_type_combo.addItem("Weapon", "Weapon")
         self.item_type_combo.addItem("Armor / Shield", "Armor")
         self.item_type_combo.addItem("Ammunition", "Ammunition")
+        self.item_type_combo.addItem("Container", "Container")
+        self.item_type_combo.addItem("Vehicle", "Vehicle")
         self.item_type_combo.currentIndexChanged.connect(
             lambda _index: self._sync_item_editor_type()
         )
@@ -289,23 +324,22 @@ class InventoryScreen(RepositoryBackedWidget):
         self.item_value_input = QSpinBox()
         self.item_value_input.setRange(0, 999999999)
         self.item_description_input = QLineEdit()
+        self.item_weight_input = QDoubleSpinBox()
+        self.item_capacity_input = QDoubleSpinBox()
+        for control in (self.item_weight_input, self.item_capacity_input):
+            control.setRange(-1, 1_000_000_000)
+            control.setDecimals(4)
+            control.setSuffix(" lb")
+            control.setSpecialValueText("Unspecified")
+            control.setValue(-1)
+        self.item_moveable_checkbox = QCheckBox("Can be moved")
+        self.item_moveable_checkbox.setChecked(True)
+        self.item_storable_checkbox = QCheckBox("Can be stored in containers")
+        self.item_storable_checkbox.setChecked(True)
 
         self.weapon_hands_combo = QComboBox()
         self.weapon_hands_combo.addItem("One-handed", "one-handed")
         self.weapon_hands_combo.addItem("Two-handed", "two-handed")
-        self.weapon_damage_input = QLineEdit("1d6")
-        self.weapon_attack_skill_input = QLineEdit("Melee")
-        self.weapon_range_input = QSpinBox()
-        self.weapon_range_input.setRange(0, 999999)
-        self.weapon_range_input.setValue(DEFAULT_ATTACK_RANGE_FEET)
-        self.weapon_ammunition_type_input = QLineEdit()
-        self.weapon_ammunition_type_input.setPlaceholderText(
-            "Optional, e.g. 9mm Round"
-        )
-        self.weapon_clip_size_input = QSpinBox()
-        self.weapon_clip_size_input.setRange(0, 9999)
-        self.weapon_bullets_per_attack_input = QSpinBox()
-        self.weapon_bullets_per_attack_input.setRange(1, 9999)
         self.ammunition_type_name_input = QLineEdit()
         self.ammunition_type_name_input.setPlaceholderText(
             "Type matched by a weapon, e.g. 9mm Round"
@@ -315,9 +349,6 @@ class InventoryScreen(RepositoryBackedWidget):
         self.armor_body_parts_input.setPlaceholderText(
             "Head, Torso, Arms, Hands, Legs, Feet, Off Hand"
         )
-        self.armor_rating_input = QSpinBox()
-        self.armor_rating_input.setRange(0, 99)
-        self.armor_rating_input.setValue(1)
 
         save_button = QPushButton("Add Item")
         save_button.clicked.connect(self._save_playtesting_item)
@@ -333,30 +364,21 @@ class InventoryScreen(RepositoryBackedWidget):
         general_form.addRow("Quantity:", self.item_quantity_input)
         general_form.addRow("Unit:", self.item_quantity_unit_input)
         general_form.addRow("Storage:", self.item_storage_location_combo)
+        general_form.addRow("Weight per unit:", self.item_weight_input)
+        general_form.addRow("Cargo capacity / bag bonus:", self.item_capacity_input)
+        general_form.addRow("Moveable:", self.item_moveable_checkbox)
+        general_form.addRow("Storable:", self.item_storable_checkbox)
         general_form.addRow("Value (base units):", self.item_value_input)
         general_form.addRow("Description:", self.item_description_input)
 
         self.weapon_group = QGroupBox("Weapon Metadata")
         weapon_form = QFormLayout()
         weapon_form.addRow("Hands:", self.weapon_hands_combo)
-        weapon_form.addRow("Damage:", self.weapon_damage_input)
-        weapon_form.addRow("Attack Skill:", self.weapon_attack_skill_input)
-        weapon_form.addRow("Attack Range (feet):", self.weapon_range_input)
-        weapon_form.addRow(
-            "Ammunition Required:",
-            self.weapon_ammunition_type_input,
-        )
-        weapon_form.addRow("Clip Size:", self.weapon_clip_size_input)
-        weapon_form.addRow(
-            "Bullets per Attack:",
-            self.weapon_bullets_per_attack_input,
-        )
         self.weapon_group.setLayout(weapon_form)
 
         self.armor_group = QGroupBox("Armor Metadata")
         armor_form = QFormLayout()
         armor_form.addRow("Covers:", self.armor_body_parts_input)
-        armor_form.addRow("Armor Bonus:", self.armor_rating_input)
         self.armor_group.setLayout(armor_form)
 
         self.ammunition_group = QGroupBox("Ammunition Metadata")
@@ -392,6 +414,15 @@ class InventoryScreen(RepositoryBackedWidget):
             return
 
         items = repository.list_inventory_items()
+        access = inventory_access(items, repository.get_state_value("location", ""))
+        load = repository.inventory_load()
+        lines = [f"Carrying: {load['weight_lb']:g} / {load['capacity_lb']:g} lb (base {load['base_capacity_lb']:g} + containers {load['container_bonus_lb']:g}); remaining {load['remaining_lb']:g} lb"]
+        for key, cargo in load['cargo'].items():
+            if access.get(key, {}).get('known') and cargo['capacity_lb'] is not None:
+                lines.append(f"{cargo['name']}: {cargo['weight_lb']:g} / {cargo['capacity_lb']:g} lb cargo")
+        if load['unweighed_item_count']:
+            lines.append(f"{load['unweighed_item_count']} inventory record(s) have unspecified weights; totals exclude those weights.")
+        self.carrying_label.setText("\n".join(lines))
         denominations = repository.get_currency_denominations()
         self._denominations = denominations
         catalog = repository.list_item_catalog()
@@ -416,7 +447,10 @@ class InventoryScreen(RepositoryBackedWidget):
         grouped_items: dict[str, list[dict[str, Any]]] = {}
         self._inventory_items = {}
         for raw_item in items:
+            if not access[str(raw_item["id"])]["known"]:
+                continue
             item = dict(raw_item)
+            item.update(access[str(item["id"])])
             metadata = item.get("metadata", {})
             item_uuid = (
                 str(metadata.get("item_uuid", ""))
@@ -438,6 +472,7 @@ class InventoryScreen(RepositoryBackedWidget):
             grouped_items.setdefault(location, []).append(item)
 
         self._replace_location_panels(grouped_items)
+        self._update_open_move_buttons()
 
     def _replace_location_panels(
         self,
@@ -574,6 +609,8 @@ class InventoryScreen(RepositoryBackedWidget):
             if self.visual_asset_generation_enabled()
             else None,
             show_structured_details=self.playtesting_tools,
+            on_move=lambda: self._move_item(str(item["id"])),
+            move_disabled_reason=self._move_disabled_reason(item),
             parent=self,
         )
         dialog.finished.connect(
@@ -583,6 +620,50 @@ class InventoryScreen(RepositoryBackedWidget):
         dialog.show()
         dialog.raise_()
         dialog.activateWindow()
+
+    def _move_disabled_reason(self, item: dict[str, Any]) -> str:
+        if storage_metadata(item).get("moveable", True) is not True:
+            return "Item cannot be moved/stored."
+        if item.get("available") is False:
+            return str(item.get("access_reason") or "Item is not currently accessible.")
+        repository = self.repository()
+        if repository is None:
+            return "No save is open."
+        if not repository.inventory_move_destinations(str(item["id"])):
+            error = move_error(str(item["id"]), "actively_carried", repository.list_inventory_items(), repository.get_state_value("location", ""), repository.player_carrying_capacity_lb())
+            return error or "No accessible destinations with enough cargo capacity. Open a nearby container first."
+        return ""
+
+    def _move_item(self, item_id: str) -> None:
+        repository = self.repository()
+        if repository is None:
+            return
+        destinations = repository.inventory_move_destinations(item_id)
+        if not destinations:
+            QMessageBox.information(self, "Move Item", "No accessible destinations are available.")
+            return
+        dialog = InventoryMoveDialog(destinations, parent=self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        try:
+            repository.move_inventory_item(item_id, str(dialog.destination_combo.currentData()))
+        except ValueError as error:
+            QMessageBox.warning(self, "Cannot Move Item", str(error))
+            return
+        self.refresh()
+        self.notify_repository_changed()
+        existing = self._item_detail_dialogs.get(item_id)
+        if existing is not None:
+            existing.close()
+
+    def _update_open_move_buttons(self) -> None:
+        """Keep modeless dialogs honest after travel or another inventory change."""
+        by_id = {str(item["id"]): item for item in self._inventory_items.values()}
+        for item_id, dialog in list(self._item_detail_dialogs.items()):
+            item = by_id.get(item_id)
+            reason = self._move_disabled_reason(item) if item else "Item is no longer accessible in inventory."
+            dialog.move_button.setEnabled(not reason)
+            dialog.move_button.setToolTip(reason or "Move this item to an accessible container")
 
     def _sync_item_editor_type(self) -> None:
         """Shows metadata fields for the selected playtesting item type."""
@@ -623,42 +704,19 @@ class InventoryScreen(RepositoryBackedWidget):
             self.item_storage_location_combo.setEditText(storage_value)
         self.item_value_input.setValue(max(0, int(selected_item.get("value_base_units", 0))))
         self.item_description_input.setText(str(selected_item.get("description", "")))
+        self.item_weight_input.setValue(metadata.get("weight_lb", -1))
+        self.item_capacity_input.setValue(metadata.get("carrying_capacity_lb", -1))
+        self.item_moveable_checkbox.setChecked(metadata.get("moveable", True))
+        self.item_storable_checkbox.setChecked(metadata.get("storable", True))
         _set_combo_to_data(
             self.weapon_hands_combo,
             str(metadata.get("weapon_hands", "one-handed")),
-        )
-        self.weapon_damage_input.setText(str(metadata.get("damage", "1d6")))
-        self.weapon_attack_skill_input.setText(
-            str(metadata.get("attack_skill", "Melee"))
-        )
-        self.weapon_range_input.setValue(
-            max(
-                0,
-                int(
-                    metadata.get(
-                        "attack_range_feet",
-                        DEFAULT_ATTACK_RANGE_FEET,
-                    )
-                ),
-            )
-        )
-        self.weapon_ammunition_type_input.setText(
-            str(metadata.get("ammunition_type_required", ""))
-        )
-        self.weapon_clip_size_input.setValue(
-            max(0, int(metadata.get("clip_size", 0)))
-        )
-        self.weapon_bullets_per_attack_input.setValue(
-            max(1, int(metadata.get("bullets_per_attack", 1)))
         )
         self.ammunition_type_name_input.setText(
             str(metadata.get("ammunition_type", selected_name))
         )
         self.armor_body_parts_input.setText(
             ", ".join(str(part) for part in metadata.get("covers_body_parts", []))
-        )
-        self.armor_rating_input.setValue(
-            max(0, int(metadata.get("armor_rating", 0)))
         )
         self.save_item_button.setText("Update Item")
         self._sync_item_editor_type()
@@ -678,25 +736,17 @@ class InventoryScreen(RepositoryBackedWidget):
             return
 
         item_type = str(self.item_type_combo.currentData() or "Item")
-        metadata: dict[str, Any] = {"item_type": item_type}
+        metadata: dict[str, Any] = {"item_type": item_type, "moveable": self.item_moveable_checkbox.isChecked(), "storable": self.item_storable_checkbox.isChecked()}
+
+        for field, control in (("weight_lb", self.item_weight_input), ("carrying_capacity_lb", self.item_capacity_input)):
+            if control.value() >= 0:
+                metadata[field] = control.value()
 
         if item_type == "Weapon":
             metadata.update(
                 {
                     "weapon_hands": (
                         self.weapon_hands_combo.currentData() or "one-handed"
-                    ),
-                    "damage": self.weapon_damage_input.text(),
-                    "attack_skill": (
-                        self.weapon_attack_skill_input.text().strip() or "Melee"
-                    ),
-                    "attack_range_feet": self.weapon_range_input.value(),
-                    "ammunition_type_required": (
-                        self.weapon_ammunition_type_input.text().strip()
-                    ),
-                    "clip_size": self.weapon_clip_size_input.value(),
-                    "bullets_per_attack": (
-                        self.weapon_bullets_per_attack_input.value()
                     ),
                 }
             )
@@ -706,7 +756,6 @@ class InventoryScreen(RepositoryBackedWidget):
                     "covers_body_parts": _split_list(
                         self.armor_body_parts_input.text()
                     ),
-                    "armor_rating": self.armor_rating_input.value(),
                 }
             )
         elif item_type == "Ammunition":
@@ -720,25 +769,30 @@ class InventoryScreen(RepositoryBackedWidget):
             or "actively_carried"
         )
 
-        if self._selected_item_name:
-            repository.modify_inventory_item(
-                target_name=self._selected_item_name,
-                new_name=name,
-                category=item_type,
-                description=self.item_description_input.text().strip(),
-                quantity=self.item_quantity_input.value(),
-                value_base_units=self.item_value_input.value(),
-                metadata=metadata,
-            )
-        else:
-            repository.add_inventory_item(
-                name,
-                item_type,
-                self.item_quantity_input.value(),
-                self.item_description_input.text().strip(),
-                self.item_value_input.value(),
-                metadata=metadata,
-            )
+        try:
+            if self._selected_item_name:
+                repository.modify_inventory_item(
+                    target_name=self._selected_item_name,
+                    new_name=name,
+                    category=item_type,
+                    description=self.item_description_input.text().strip(),
+                    quantity=self.item_quantity_input.value(),
+                    value_base_units=self.item_value_input.value(),
+                    metadata=metadata,
+                )
+            else:
+                repository.add_inventory_item(
+                    name,
+                    item_type,
+                    self.item_quantity_input.value(),
+                    self.item_description_input.text().strip(),
+                    self.item_value_input.value(),
+                    metadata=metadata,
+                )
+
+        except ValueError as error:
+            QMessageBox.warning(self, "Cannot Save Item", str(error))
+            return
 
         self._selected_item_name = name
         self.refresh()
@@ -785,16 +839,13 @@ class InventoryScreen(RepositoryBackedWidget):
             self.item_quantity_input.setValue(1)
             self.item_value_input.setValue(0)
             self.item_description_input.clear()
+            self.item_weight_input.setValue(-1)
+            self.item_capacity_input.setValue(-1)
+            self.item_moveable_checkbox.setChecked(True)
+            self.item_storable_checkbox.setChecked(True)
             _set_combo_to_data(self.weapon_hands_combo, "one-handed")
-            self.weapon_damage_input.setText("1d6")
-            self.weapon_attack_skill_input.setText("Melee")
-            self.weapon_range_input.setValue(DEFAULT_ATTACK_RANGE_FEET)
-            self.weapon_ammunition_type_input.clear()
-            self.weapon_clip_size_input.setValue(0)
-            self.weapon_bullets_per_attack_input.setValue(1)
             self.ammunition_type_name_input.clear()
             self.armor_body_parts_input.setText("Torso")
-            self.armor_rating_input.setValue(1)
             self.save_item_button.setText("Add Item")
             self._sync_item_editor_type()
         finally:

@@ -12,7 +12,9 @@ from ai_adventure.alchemy.ingredients import (
     is_crafting_ingredient_category,
     normalize_recipe_ingredients,
 )
-from ai_adventure.audio.tts_settings import normalize_tts_audio_fields
+from ai_adventure.audio.tts_settings import (
+    normalize_tts_audio_fields, read_tts_audio_settings, active_player_voice_spec_from_audio,
+)
 from ai_adventure.audio.tts_settings import active_voice_spec_from_audio
 from ai_adventure.audio.voices import DEFAULT_NARRATOR_VOICE
 from ai_adventure.audio.voices import assign_speaker_voices
@@ -213,22 +215,7 @@ class NewGameService:
                 finalized_character,
             )
 
-            audio = normalize_tts_audio_fields(
-                {
-                    "tts_voice": repository.get_setting(
-                        "audio.tts_voice", DEFAULT_NARRATOR_VOICE
-                    ),
-                    "tts_voice_mode": repository.get_setting(
-                        "audio.tts_voice_mode", "preset"
-                    ),
-                    "tts_voice_blend": repository.get_setting(
-                        "audio.tts_voice_blend", {}
-                    ),
-                    "player_tts_voice": repository.get_setting(
-                        "audio.player_tts_voice", "ai"
-                    ),
-                }
-            )
+            audio = read_tts_audio_settings(repository.get_setting)
             speaker_cues, assignments = assign_speaker_voices(
                 getattr(result, "speaker_cues", []),
                 narrator_voice=active_voice_spec_from_audio(audio),
@@ -242,7 +229,7 @@ class NewGameService:
                     str(setup.get("character", {}).get("name", "")).casefold(),
                 },
                 player_pronouns=setup.get("character", {}).get("pronouns", "They/Them"),
-                player_voice=audio["player_tts_voice"],
+                player_voice=active_player_voice_spec_from_audio(audio),
             )
             repository.set_setting("audio.speaker_voice_assignments", assignments)
 
@@ -421,6 +408,7 @@ class NewGameService:
             setup,
             getattr(result, "finalized_character", {}),
         )
+        repository.set_setting("player.carrying_capacity_lb", setup["character"].get("carrying_capacity_lb", 50))
         character_setting_map = {
             "name": "player_name",
             "name_pronunciation": "player.name_pronunciation",
@@ -1021,6 +1009,12 @@ def _starter_items_for_save(
             )[:120]
             or "actively_carried"
         )
+        for field_name in ("weight_lb", "carrying_capacity_lb"):
+            if field_name in setup_item:
+                item[field_name] = setup_item[field_name]
+        for field_name in ("moveable", "storable"):
+            if setup_item.get(field_name) is False:
+                item[field_name] = False
 
     original_completed_count = len(completed_items)
     used_source_indexes = {
@@ -1091,17 +1085,22 @@ def _fallback_starter_item_from_setup(
     }
     for field_name in (
         "item_type",
+        "weight_lb",
+        "carrying_capacity_lb",
+        "moveable",
+        "storable",
+        "container",
         "weapon_hands",
-        "damage",
-        "damage_type",
-        "attack_skill",
-        "attack_range_feet",
-        "ammunition_type_required",
-        "clip_size",
-        "bullets_per_attack",
+
+
+
+
+
+
+
         "ammunition_type",
         "covers_body_parts",
-        "armor_rating",
+
     ):
         if field_name in raw_item:
             item[field_name] = raw_item[field_name]
@@ -1132,6 +1131,8 @@ def _starter_inventory_top_up_item(
             "value_base_units": value_base_units,
             "quantity": 1,
             "source_index": -1,
+            "weight_lb": 0.25 if category == "Personal" else 1.0,
+            "carrying_capacity_lb": 0.0,
         }
     return None
 

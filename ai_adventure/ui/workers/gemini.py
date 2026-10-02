@@ -78,7 +78,7 @@ class GeminiStoryWorker(QObject):
             self.finished.emit()
 
 
-class GeminiSkillCheckPlanWorker(QObject):
+class GeminiD20TestPlanWorker(QObject):
     """Runs one lightweight skill-check planning request away from the UI."""
 
     completed = Signal(object)
@@ -99,7 +99,7 @@ class GeminiSkillCheckPlanWorker(QObject):
             result = StoryTurnService(
                 api_key_path=self._api_key_path,
                 model=_text_model_from_ai_packet(self._context_packet),
-            ).plan_skill_checks(self._context_packet)
+            ).plan_d20_tests(self._context_packet)
         except GeminiConfigurationError as error:
             LOGGER.warning("Gemini skill-check planning skipped: %s", error)
             self.configuration_error.emit(str(error))

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from ai_adventure.ui.widgets.containers import CurrentPageStackedWidget
+
 import logging
 from math import ceil
 from time import monotonic
@@ -12,7 +14,6 @@ from ai_adventure.ui.game_shell import _DetachedTabWindow
 from ai_adventure.ui.screens.main_menu import MainMenuScreen
 from ai_adventure.ui.screens.story import StoryScreen
 from ai_adventure.ui.screens.character import CharacterScreen
-from ai_adventure.ui.screens.combat import CombatScreen
 from ai_adventure.ui.screens.bestiary import BestiaryScreen
 from ai_adventure.ui.screens.travel import TravelScreen
 from ai_adventure.ui.screens.calendar import CalendarScreen
@@ -21,7 +22,7 @@ from ai_adventure.ui.common import _inventory_item_display_name, _inventory_quan
 from ai_adventure.ui.screens.party import PartyScreen
 from ai_adventure.ui.screens.npcs import NpcsScreen
 from ai_adventure.ui.screens.tasks import ActiveTasksScreen
-from ai_adventure.ui.screens.skills import SkillsScreen
+from ai_adventure.ui.screens.stats import StatsScreen
 from ai_adventure.ui.screens.magic import MagicScreen
 from ai_adventure.ui.screens.alchemy import AlchemyNotebookScreen
 from ai_adventure.ui.screens.notes import NotesScreen
@@ -29,7 +30,7 @@ from ai_adventure.ui.screens.settings import SettingsScreen
 from ai_adventure.ui.wizards.new_game import NewGameWizard
 from ai_adventure.ui.workers.gemini import (
     GeminiNewGameWorker as _GeminiNewGameWorker,
-    GeminiSkillCheckPlanWorker as _GeminiSkillCheckPlanWorker,
+    GeminiD20TestPlanWorker as _GeminiD20TestPlanWorker,
     GeminiStoryWorker as _GeminiStoryWorker,
     GeminiVisualAssetWorker as _GeminiVisualAssetWorker,
 )
@@ -259,7 +260,7 @@ class MainWindow(QMainWindow):
         self._set_app_icon()
         self.resize(1100, 750)
 
-        self.stack = QStackedWidget()
+        self.stack = CurrentPageStackedWidget()
         self.setCentralWidget(self.stack)
 
         self.main_menu = _ExtractedMainMenuScreen(
@@ -410,7 +411,7 @@ class MainWindow(QMainWindow):
             "save_game_service",
             SaveGameService(self.app_paths.saves_dir),
         )
-        suggested_title = save_service.next_available_title("Combat Playtest")
+        suggested_title = save_service.next_available_title("Stats Playtest")
         title, accepted = QInputDialog.getText(
             self,
             "New Playtest",
@@ -466,6 +467,7 @@ class MainWindow(QMainWindow):
             voice_options=_narrator_voice_options(self.narration_player),
             on_sample_voice=self._play_narrator_sample,
             custom_voice_storage_path=self.app_paths.app_settings_path,
+            on_restore_defaults=lambda settings: self._apply_app_settings(settings, persist=True),
         )
 
         if dialog.exec() != QDialog.DialogCode.Accepted:
@@ -546,6 +548,9 @@ class MainWindow(QMainWindow):
 
         for template in templates:
             if template.name == selected_name:
+                if not template.compatible:
+                    QMessageBox.warning(self, "Older rules template", "This template predates Stats and cannot start a new adventure. It has not been changed; create a new Stats template.")
+                    return False, None, None
                 return (
                     True,
                     self._template_setup_with_available_title(
@@ -1452,13 +1457,16 @@ class MainWindow(QMainWindow):
                 self.narration_player.set_speed(audio["tts_speed"])
             if hasattr(self.narration_player, "set_voice"):
                 self.narration_player.set_voice(active_voice_spec_from_audio(audio))
-            self.narration_player.set_enabled(audio["narrator_enabled"])
+            self.narration_player.set_enabled(audio["narrator_enabled"] or audio["player_enabled"])
+            if hasattr(self.narration_player, "set_speaker_preferences"):
+                self.narration_player.set_speaker_preferences(audio)
 
     def _play_narrator_sample(
         self,
         voice: str,
         volume: int,
         speed: int = DEFAULT_TTS_SPEED_PERCENT,
+        *, text: str | None = None,
     ) -> bool:
         """Plays a local narrator voice sample."""
 
@@ -1470,6 +1478,7 @@ class MainWindow(QMainWindow):
                 voice=normalize_narrator_voice_spec(voice),
                 volume=volume,
                 speed=speed,
+                **({"text": text} if text is not None else {}),
             )
         )
 

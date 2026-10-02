@@ -1,5 +1,12 @@
 from __future__ import annotations
 
+from ai_adventure.stats import STATS_RULE
+
+from ai_adventure.container_flow import CONTAINER_FLOW_RULE
+from ai_adventure.inventory_storage import inventory_access, inventory_load
+
+from ai_adventure.skills.rules import SKILL_DESCRIPTION_RULE, MAX_SKILL_XP_RULE
+
 import re
 from typing import Any
 
@@ -14,11 +21,7 @@ from ai_adventure.context.models import ContextLibrary
 from ai_adventure.context.naming import GENERIC_PROPER_NOUN_PLACEHOLDER_RULE
 from ai_adventure.context.reference_loader import ContextReferenceLoader
 from ai_adventure.context.tags import PLANNABLE_CONTEXT_TAGS
-from ai_adventure.combat import (
-    COMBAT_FOCUS_INSTRUCTIONS,
-    normalize_combat_preferences,
-    normalize_combat_state,
-)
+from ai_adventure.story_preferences import FIGHTING_FOCUS_INSTRUCTIONS, normalize_fighting_preferences
 from ai_adventure.currency import format_currency_amount
 from ai_adventure.crafting import evaluate_recipe_craftability, recipe_estimated_time
 from ai_adventure.core.models import AdventureState
@@ -246,7 +249,7 @@ class AiContextBuilder:
         valid_sound_effect_tracks: list[str] | None = None,
         valid_background_ambience_tracks: list[str] | None = None,
         current_background_ambience: str | None = None,
-        resolved_skill_checks: list[dict[str, Any]] | None = None,
+        resolved_d20_tests: list[dict[str, Any]] | None = None,
         planner_context_tags: list[str] | None = None,
         merchant: dict[str, Any] | None = None,
         out_of_game_correction: bool = False,
@@ -267,7 +270,7 @@ class AiContextBuilder:
             valid_music_tracks: Playable background music filenames.
             current_music: Currently selected background music filename.
             valid_sound_effect_tracks: Playable one-shot sound-effect filenames.
-            resolved_skill_checks: Skill checks already resolved for this command.
+            resolved_d20_tests: d20 tests already resolved for this command.
             merchant: Authoritative active-merchant profile and offers.
             out_of_game_correction: Whether this out-of-game request may propose
                 narrowly scoped inventory corrections.
@@ -298,6 +301,12 @@ class AiContextBuilder:
             if _item_is_referenced(item, clean_command)
         }
         storage_aliases = _inventory_storage_aliases(state.inventory.items)
+        inventory_rows = [item.to_dict() for item in state.inventory.items]
+        inventory_status = inventory_access(inventory_rows, state.world.location)
+        carrying = inventory_load(inventory_rows, state.settings.values.get("player.carrying_capacity_lb", 50))
+        carrying["cargo"] = {key: cargo for key, cargo in carrying["cargo"].items() if inventory_status[key]["known"]}
+        known_inventory = [item for item in state.inventory.items if inventory_status[str(item.id)]["known"]]
+        hidden_item_ids = {str(item.id) for item in state.inventory.items if not inventory_status[str(item.id)]["known"]}
         if detailed_item_names:
             # Exploration verbs such as "inspect" do not otherwise select the
             # inventory projection, but an explicit item name makes it relevant.
@@ -449,25 +458,12 @@ class AiContextBuilder:
             }
         )
         ai_mode_preferences = ai_mode_preferences_from_settings(state.settings.values)
-        combat_state = normalize_combat_state(state.settings.values.get("combat.state", {}))
-        combat_preferences = normalize_combat_preferences(
-            state.settings.values.get(
-                "combat.preferences",
-                {
-                    "resolution_mode": state.settings.values.get(
-                        "combat.resolution_mode", "strict"
-                    ),
-                    "focus": state.settings.values.get("combat.focus", "balanced"),
-                },
-            )
-        )
-        strict_combat = combat_preferences["resolution_mode"] == "strict"
         magic_context = _magic_context_packet(
             state.magic,
             include_progression="magic" in selected_tags or "spell" in selected_tags,
         )
         packet = {
-            "schema_version": 1,
+            "schema_version": 2,
             "packet_type": "story_turn",
             "player_command": clean_command,
             "conversation_mode": clean_conversation_mode,
@@ -491,7 +487,14 @@ class AiContextBuilder:
                     "notes": _compact_text(state.player.notes),
                     "health_current": state.player.health_current,
                     "health_max": state.player.health_max,
-                    "armor_rating": state.player.armor_rating,
+                    "attributes": state.player.attributes,
+                    "modifiers": state.player.modifiers,
+                    "level": state.player.level,
+                    "xp": state.player.xp,
+                    "reward_choices": state.player.reward_choices,
+                    "progression_records": state.player.progression_records,
+                    "skill_advances": state.player.skill_advances,
+                    "carrying_capacity_lb": state.player.carrying_capacity_lb,
                     "equipment": state.player.equipment,
                 },
                 "player_ai_preferences": {
@@ -620,8 +623,21 @@ class AiContextBuilder:
                     },
                 },
                 "inventory": {
+                    "carrying": carrying,
+                    "capacity_items": inventory_rows,
+                    "container_authority": [
+                        {"id": item.id, "name": item.name, "metadata": item.metadata, **inventory_status[str(item.id)]}
+                        for item in state.inventory.items
+                        if isinstance(item.metadata.get("container"), dict)
+                        and _item_is_operationally_relevant(item,
+                            selected_tags=selected_tags, player_command=clean_command)
+                    ],
+                    "container_items": inventory_rows if any(
+                        isinstance(item.metadata.get("container"), dict) and _item_is_operationally_relevant(item, selected_tags=selected_tags, player_command=clean_command)
+                        for item in state.inventory.items
+                    ) else [],
                     "items": [
-                        _inventory_item_context(
+                        {**_inventory_item_context(
                             item,
                             storage_aliases=storage_aliases,
                             include_details=_item_context_identity(item)
@@ -631,11 +647,11 @@ class AiContextBuilder:
                                 selected_tags=selected_tags,
                                 player_command=clean_command,
                             ),
-                        )
-                        for item in state.inventory.items[:MAX_INVENTORY_CONTEXT_ITEMS]
+                        ), **inventory_status[str(item.id)]}
+                        for item in known_inventory[:MAX_INVENTORY_CONTEXT_ITEMS]
                     ],
                     "storage_locations": _inventory_storage_locations(
-                        state.inventory.items
+                        known_inventory
                     ),
                     "detail_policy": (
                         "Inventory rows are compact by default: use name, category, "
@@ -649,6 +665,7 @@ class AiContextBuilder:
                         "detail."
                     ),
                     "detailed_item_names": sorted(detailed_item_names),
+                    "container_flow": CONTAINER_FLOW_RULE,
                     "container_rule": (
                         CONTAINER_ACCESS_RULE + " "
                         "Never reveal or award a closed container's contents. Use "
@@ -673,6 +690,7 @@ class AiContextBuilder:
                             in detailed_item_names,
                         )
                         for item in state.item_catalog.items
+                        if str(item.id) not in hidden_item_ids
                     ],
                     "detail_policy": (
                         "Catalog rows are compact by default because the catalog is a "
@@ -693,8 +711,10 @@ class AiContextBuilder:
                         "possession_rule": (
                         "Only state.inventory.items are current possessions. Each "
                         "inventory item includes quantity, quantity_unit, and "
-                        "storage_location, a free-text storage label independent of "
-                        "Travel-tab locations; use actively_carried only when the "
+                        "storage_location and available. A named physical container "
+                        "inherits its physical Location from its parent; a direct "
+                        "Location label must match the current world.location. "
+                        "Unavailable possessions cannot be used. Use actively_carried only when the "
                         "Player Character is carrying it. "
                             "Use item_catalog to remember descriptions, categories, "
                             "and values for previously seen items when a detailed "
@@ -754,41 +774,7 @@ class AiContextBuilder:
                         "remaining balance as the appropriate denominations."
                     ),
                 },
-                "combat": {
-                    "resolution_mode": combat_preferences["resolution_mode"],
-                    "focus": combat_preferences["focus"],
-                    "focus_instruction": COMBAT_FOCUS_INSTRUCTIONS[
-                        combat_preferences["focus"]
-                    ],
-                    "active": bool(combat_state.get("active", False)),
-                    "round": combat_state.get("round", 1),
-                    "turn_index": combat_state.get("turn_index", 0),
-                    "combatants": [
-                        _compact_context_value(combatant)
-                        for combatant in combat_state.get("combatants", [])
-                    ],
-                    "rules": (
-                        (
-                            "When a fight starts, suggest CombatStartedEvent with "
-                            "enemy/allied combatants, health, armor_rating, "
-                            "to_hit_bonus, initiative_bonus, personality, ammunition/clip "
-                            "fields, damage dice, and loot. The Python combat system "
-                            "rolls initiative, calculates team Threat Levels, and resolves "
-                            "attacks, damage, victory, defeat, and loot. Do not resolve "
-                            "those mechanics in story prose after combat starts."
-                        )
-                        if strict_combat
-                        else (
-                            "Resolve and describe combat narratively in story prose. "
-                            "Do not suggest CombatStartedEvent and do not hand the fight "
-                            "to the Combat tab. Respect the player's declared actions, "
-                            "use warranted skill checks before uncertain outcomes, give "
-                            "all participants meaningful agency, and persist any actual "
-                            "injuries, items, currency, status, or other durable changes "
-                            "with the supported non-combat events."
-                        )
-                    ),
-                },
+                "fighting": {"focus": state.settings.values.get("fighting.focus", "balanced"), "focus_instruction": FIGHTING_FOCUS_INSTRUCTIONS.get(state.settings.values.get("fighting.focus", "balanced"), FIGHTING_FOCUS_INSTRUCTIONS["balanced"]), "rules": STATS_RULE},
                 "alchemy": {
                     "known_reagents": [
                         _compact_context_value(reagent.to_dict())
@@ -804,7 +790,7 @@ class AiContextBuilder:
                     ],
                     "crafting_status": _crafting_status_context(
                         state.alchemy.known_recipes,
-                        state.inventory.items,
+                        [item for item in known_inventory if inventory_status[str(item.id)]["available"]],
                         state.skills.skills,
                         state.settings.values.get("crafting.processes", []),
                     ),
@@ -858,8 +844,11 @@ class AiContextBuilder:
                 },
                 "skills": {
                     "rules": {
-                        "check_formula": "d20 + bonus vs dc",
-                        "bonus_formula": "level * 2",
+                        "description_rule": SKILL_DESCRIPTION_RULE,
+                        "maximum_xp_rule": MAX_SKILL_XP_RULE,
+                        "check_formula": "d20 + attribute modifier + optional skill level vs dc",
+                        "d20_test_rules": STATS_RULE,
+                        "bonus_formula": "skill level (+1 per level)",
                         "levels": "1-5",
                         "maximum_level_rule": (
                             "Level 5 is the absolute maximum. Never create a skill "
@@ -867,16 +856,10 @@ class AiContextBuilder:
                             "that requires a skill level above 5."
                         ),
                         "unknown_skill_rule": (
-                            "Choose the most directly relevant known skill, not merely "
-                            "a plausible broad skill. Locating or gathering wild plants, "
-                            "herbs, or reagents uses known Foraging rather than "
-                            "Investigation or Perception. skill_name may identify a "
-                            "generalized capability absent from known_skills only when "
-                            "no known skill fits. When it does, include skill_description "
-                            "so Python can create the new skill at level 1 before rolling."
+                            STATS_RULE
                         ),
                         "uncertain_action_rule": (
-                            "Suggest SkillCheckRequestedEvent before narrating a "
+                            "Suggest D20TestRequestedEvent before narrating a "
                             "final outcome only when the current command has "
                             "meaningful uncertainty, opposition, hidden information, "
                             "danger, scarcity, time pressure, or consequences. Do "
@@ -915,7 +898,7 @@ class AiContextBuilder:
                     ],
                     "resolved_checks_this_turn": [
                         dict(check)
-                        for check in (resolved_skill_checks or [])
+                        for check in (resolved_d20_tests or [])
                         if isinstance(check, dict)
                     ],
                 },
@@ -1339,25 +1322,8 @@ class AiContextBuilder:
                     "rain, snow, fog, or any other different current weather, set "
                     "weather to that actual condition instead of AUTO or the old value."
                 ),
-                "skill_checks": (
-                    "Suggest SkillCheckRequestedEvent with skill_name and either dc "
-                    "or difficulty only for actions with meaningful uncertainty, "
-                    "opposition, hidden information, danger, resource pressure, time "
-                    "pressure, or consequences in the current scene. "
-                    "Choose the most directly relevant known skill. Locating or "
-                    "gathering wild plants, herbs, or reagents uses known Foraging "
-                    "rather than Investigation or Perception; create a new skill "
-                    "only when no known skill fits. "
-                    "When state.skills.resolved_checks_this_turn is non-empty, those "
-                    "checks are already resolved for the current player command; "
-                    "narrate the outcome from those results and do not request "
-                    "duplicate checks for those skills. "
-                    "Do not narrate final success, failure, discoveries, harvested "
-                    "items, crafted products, persuaded NPC outcomes, stealth results, "
-                    "or combat results until the application has resolved the check. "
-                    "Do not request checks for routine movement, ordinary purchases, "
-                    "meals, drinking, or casual conversation unless the player adds "
-                    "a contested, risky, hidden, time-sensitive, or deceptive goal."
+                "d20_tests": (
+                    STATS_RULE
                 ),
                 "calendar_time": (
                     "Use state.calendar.current for date, day names, seasons, and "
@@ -1379,7 +1345,7 @@ class AiContextBuilder:
                     "The player character's class, profession, backstory, inventory, "
                     "and skills are facts about the player character, not proof that "
                     "the whole world shares that theme. Use them for personal "
-                    "opportunities, plausible contacts, skill checks, and inventory, "
+                    "opportunities, plausible contacts, d20 tests, and inventory, "
                     "but do not make every new location, religion, faction, political "
                     "conflict, NPC, mystery, or economy detail revolve around the "
                     "player's specialty unless the player explicitly requested that "
@@ -1418,35 +1384,7 @@ class AiContextBuilder:
                     "instead of vague due-date prose."
                 ),
                 "item_catalog": (
-                    "Use state.item_catalog.items as the master list of remembered "
-                    "item definitions. Before inventing an item, reuse a fitting "
-                    "existing catalog definition whenever one can serve the story. "
-                    "Routine rows are intentionally compact and may omit descriptions, "
-                    "values, and detailed metadata. Those fields are authoritative only "
-                    "when a targeted item record includes them; do not assume an omitted "
-                    "field is empty. The catalog preserves metadata.item_uuid stable "
-                    "internal identities; reuse the same item_uuid for the same item even "
-                    "when its display name changes. For every new item, also provide "
-                    "basic_name: a short generic item-family name with color, material, "
-                    "size, condition, craftsmanship, and other flavor adjectives removed. "
-                    "Use the same basic_name for equivalent items such as Wide Brimmed "
-                    "Fedora, Grey Felt Fedora, and Fedora. It also preserves equipment "
-                    "metadata after items leave inventory. "
-                    "Use Weapon metadata for weapon_hands, damage dice, attack range, "
-                    "and optional ammunition_type_required, clip_size, and "
-                    "bullets_per_attack. Ammunition items use matching "
-                    "ammunition_type metadata. Use Armor "
-                    "metadata for covers_body_parts and armor_rating. Container "
-                    "metadata preserves exact hidden contents, open/taken state, "
-                    "locks, traps, check skills/DCs, and failure consequences when the "
-                    "relevant container is targeted. Closed-container contents are "
-                    "never revealed by this context projection; use the container events "
-                    "and Python validation to open or transfer them. "
-                    "Do not treat "
-                    "catalog entries as possessions unless they also appear in "
-                    "state.inventory.items. Recipe ingredients may only use "
-                    "catalog items whose category is one of "
-                    f"{CRAFTING_INGREDIENT_CATEGORY_NAMES}."
+                    "Item catalog definitions are authoritative. Preserve Weapon/Armor categories, hand requirements and body coverage, ordinary ammunition items, movement/storage flags, weights, containers, and exact item IDs. Weapon effects and armor protection are descriptive. Valid crafting ingredient categories: " + f"{CRAFTING_INGREDIENT_CATEGORY_NAMES}."
                 ),
                 "background_music": (
                     " ".join(audio_transition_rules)
@@ -1467,31 +1405,7 @@ class AiContextBuilder:
                     f"{GENERIC_PROPER_NOUN_PLACEHOLDER_RULE}"
                 ),
                 "npc_memory": (
-                    "Use NpcUpsertedEvent when a new meaningful NPC appears or an "
-                    "existing NPC profile needs correction. Use NpcKnowledgeAddedEvent "
-                    "only for facts the NPC plausibly learned this turn. In "
-                    "NpcUpsertedEvent, display_name and player_facing_information are "
-                    "player-visible and must not include secrets or undiscovered names. "
-                    "role, location, public_description, knowledge_scope, and known_facts "
-                    "are required NPC memory fields; do not add unsupported fields such "
-                    "as disposition. Make public_description concise, concrete, and "
-                    "visually depictable using only player-observable traits. "
-                    "Before creating an NPC, inspect state.npcs.relevant. If the same "
-                    "person is already listed, reuse that existing npc_id/internal "
-                    "identifier and update the one profile; do not create a second "
-                    "internal name for the same role/person at the same location. Use "
-                    "one NpcUpsertedEvent per distinct meaningful NPC introduced. "
-                    "When a named or materially important NPC first appears, emit "
-                    "that profile in the same response as the introduction, even "
-                    "if the selected context tags do not include dialogue. Do not "
-                    "create profiles for unnamed background people or passing extras. "
-                    "If that NPC speaks in the response, speaker_cues.speaker_id "
-                    "must exactly match the profile's npc_id. Every party member "
-                    "remains that same canonical NPC: reuse npc_id "
-                    "with party_member=true and party_status, party_health_current, "
-                    "party_health_max, party_armor_class, party_combat_style, and "
-                    "party_skills when those visible details change. Use "
-                    "party_member=false to remove membership without deleting the NPC."
+                    "Use NpcUpsertedEvent when a new meaningful NPC appears or an existing NPC profile needs correction. Use NpcKnowledgeAddedEvent only for facts the NPC plausibly learned this turn. In NpcUpsertedEvent, display_name and player_facing_information are player-visible and must not include secrets or undiscovered names. role, location, public_description, knowledge_scope, and known_facts are required NPC memory fields; do not add unsupported fields such as disposition. Make public_description concise, concrete, and visually depictable using only player-observable traits. Before creating an NPC, inspect state.npcs.relevant. If the same person is already listed, reuse that existing npc_id/internal identifier and update the one profile; do not create a second internal name for the same role/person at the same location. Use one NpcUpsertedEvent per distinct meaningful NPC introduced. When a named or materially important NPC first appears, emit that profile in the same response as the introduction, even if the selected context tags do not include dialogue. Do not create profiles for unnamed background people or passing extras. If that NPC speaks in the response, speaker_cues.speaker_id must exactly match the profile's npc_id. Every party member remains that same canonical NPC: reuse npc_id with party_member=true and party_status, party_combat_style, and party_skills when those visible details change. Use party_member=false to remove membership without deleting the NPC."
                 ),
                 "generated_visuals": (
                     "Write new inventory descriptions, location descriptions, and NPC "
@@ -1511,7 +1425,7 @@ class AiContextBuilder:
                     "or stored items unless established state explicitly provides a "
                     "credible knowledge barrier such as amnesia, memory alteration, "
                     "unconsciousness, or deception. A reveal_condition cannot be a "
-                    "skill check or search that makes the Player Character rediscover "
+                    "d20 test or search that makes the Player Character rediscover "
                     "their own knowing act. If the Player Character knows a fact, keep "
                     "it in player-visible narrative or appropriate public state rather "
                     "than secret memory. Set "
@@ -1564,24 +1478,9 @@ class AiContextBuilder:
                     "new offer, but any offer must be committed before the player can use it."
                 ),
                 (
-                    "combat_handoff" if strict_combat else "narrative_combat"
+                    "narrative_fighting"
                 ): (
-                    (
-                        "When a fight begins, suggest CombatStartedEvent with concrete "
-                        "enemy/allied combatants, health, armor_rating, to_hit_bonus, "
-                        "initiative_bonus, personality, complete ammunition/clip fields, "
-                        "damage dice, and loot. Python rolls initiative, calculates team "
-                        "Threat Levels from maximum health, armor rating, and average "
-                        "damage, uses them for non-intelligent NPC targets, preserves "
-                        "tactical targeting for intelligent NPCs, and owns attacks, "
-                        "reloading, damage, victory, defeat, and loot in the Combat tab."
-                    )
-                    if strict_combat
-                    else (
-                        "Narrate and resolve the complete fight in the story without "
-                        "CombatStartedEvent. Use warranted skill checks for uncertain "
-                        "actions and supported non-combat events for durable consequences."
-                    )
+                    STATS_RULE
                 ),
                 "out_of_game": (
                     "Boolean. Must be true exactly when conversation_mode is out_of_game; "
@@ -1593,7 +1492,7 @@ class AiContextBuilder:
                 },
                 "known_event_types": [
                     "StatusUpdatedEvent",
-                    "SkillCheckRequestedEvent",
+                    "D20TestRequestedEvent",
                     "SkillUpsertedEvent",
                     "SkillXpAddedEvent",
                     "InventoryItemAddedEvent",
@@ -1601,7 +1500,8 @@ class AiContextBuilder:
                     "InventoryItemModifiedEvent",
                     "ContainerOpenedEvent",
                     "ContainerContentsTakenEvent",
-                    "CombatStartedEvent",
+                    "PlayerHealthChangedEvent",
+                    "PlayerAchievementRecordedEvent",
                     "CraftingProcessRequestedEvent",
                     "RecipeDiscoveredEvent",
                     "ReagentDiscoveredEvent",
@@ -1640,7 +1540,7 @@ class AiContextBuilder:
             event_type
             for event_type in known_event_types
             if event_type not in disabled_audio_event_types
-            and (strict_combat or event_type != "CombatStartedEvent")
+
         ]
         return packet
 
@@ -1756,15 +1656,18 @@ def _item_is_operationally_relevant(
     metadata = getattr(item, "metadata", {})
     item_type = str(metadata.get("item_type", "") if isinstance(metadata, dict) else "")
     category = str(getattr(item, "category", "") or "")
-    is_container = item_type.casefold() == "container" or category.casefold() == "container"
+    is_container = item_type.casefold() in {"container", "vehicle"} or category.casefold() in {"container", "vehicle"}
     if not is_container:
         return False
 
     command = str(player_command or "").casefold()
+    name = str(getattr(item, "name", "") or "").strip().casefold()
     return bool(
+        (name and name in command)
+        or
         re.search(
             r"\b(?:open|unlock|lock|trap|trapped|inside|contents|empty|take|remove|"
-            r"collect|search)\b",
+            r"collect|search|inspect|examine|rummage|peek|check|move|store|put|pack|stash)\b",
             command,
         )
     )
@@ -1776,6 +1679,11 @@ _COMPACT_ITEM_METADATA_KEYS = {
     "basic_name",
     "quantity_unit",
     "storage_location",
+    "container_id",
+    "moveable",
+    "storable",
+    "weight_lb",
+    "carrying_capacity_lb",
 }
 
 
@@ -1864,7 +1772,7 @@ def _inventory_storage_locations(items: list[Any]) -> list[str]:
         item_type = str(
             metadata.get("item_type", "") if isinstance(metadata, dict) else ""
         ).strip().casefold()
-        if category == "container" or item_type == "container":
+        if category in {"container", "vehicle"} or item_type in {"container", "vehicle"}:
             name = str(getattr(item, "name", "") or "").strip()
             if name:
                 labels.setdefault(name.casefold(), name)
@@ -1879,7 +1787,7 @@ def _inventory_storage_aliases(items: list[Any]) -> dict[str, str]:
         for item in items
         if (
             str(getattr(item, "category", "") or "").strip().casefold()
-            == "container"
+            in {"container", "vehicle"}
             or str(
                 (
                     getattr(item, "metadata", {}).get("item_type", "")
@@ -1888,7 +1796,7 @@ def _inventory_storage_aliases(items: list[Any]) -> dict[str, str]:
                 )
                 or ""
             ).strip().casefold()
-            == "container"
+            in {"container", "vehicle"}
         )
         and str(getattr(item, "name", "") or "").strip()
     ]
@@ -2107,9 +2015,6 @@ def _party_context_profile(member: dict[str, Any]) -> dict[str, Any]:
         "age",
         "species",
         "status",
-        "health_current",
-        "health_max",
-        "armor_class",
         "combat_style",
         "skills",
         "inventory",
@@ -2281,7 +2186,7 @@ def _crafting_status_context(
                 "result_item_name": str(
                     recipe.get("result_item_name", recipe.get("result", ""))
                 ).strip(),
-                "craftable_now": bool(availability["craftable"] or process),
+                "craftable_now": bool(availability["craftable"] or (process and not availability["missing_tools"])),
                 "craftable_quantity": availability["craftable_quantity"],
                 "missing_ingredients": availability["missing_ingredients"],
                 "missing_tools": availability["missing_tools"],

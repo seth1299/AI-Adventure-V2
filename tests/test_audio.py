@@ -180,6 +180,8 @@ class AudioTests(unittest.TestCase):
     def test_local_replay_forwards_sound_cues_to_narration(self) -> None:
         player = NarrationPlayer.__new__(NarrationPlayer)
         player.enabled = False
+        player.volume = 0.8
+        player.speed = 1.0
         calls: list[tuple[str, dict[str, object]]] = []
         cues = [
             {
@@ -674,6 +676,8 @@ class AudioTests(unittest.TestCase):
         player = NarrationPlayer.__new__(NarrationPlayer)
         player.enabled = True
         player.speed = 1.0
+        player.volume = 0.8
+        player.set_speaker_preferences({})
         player.tts_manager = cast(Any, FakeTtsManager())
         player._session_id = 9
         player._state_lock = threading.Lock()
@@ -1080,7 +1084,9 @@ class AudioTests(unittest.TestCase):
             )
             self.assertEqual(
                 background_ambience_directory,
-                paths.background_ambience_dir,
+                paths.package_background_ambience_dir
+                if any(path.suffix.casefold() in {".mp3", ".wav", ".ogg"} for path in paths.package_background_ambience_dir.glob("*"))
+                else paths.background_ambience_dir,
             )
             self.assertEqual(
                 paths.package_background_ambience_dir.name,

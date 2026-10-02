@@ -71,7 +71,7 @@ class MainMenuScreen(QWidget):
         self.templates_button.setVisible(show_templates)
 
         layout = QVBoxLayout()
-        layout.addStretch()
+        layout.addStretch(1)
         layout.addWidget(title_label)
         layout.addSpacing(30)
 
@@ -85,12 +85,12 @@ class MainMenuScreen(QWidget):
         layout.addWidget(self.load_button)
         layout.addWidget(self.rename_save_button)
         layout.addWidget(self.delete_save_button)
-        layout.addStretch()
+        layout.addStretch(1)
 
         wrapper = QHBoxLayout()
-        wrapper.addStretch()
+        wrapper.addStretch(1)
         wrapper.addLayout(layout, stretch=2)
-        wrapper.addStretch()
+        wrapper.addStretch(1)
 
         self.setLayout(wrapper)
         self.refresh_saves()

@@ -7,7 +7,7 @@ from typing import Any, Callable
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
-    QAbstractSpinBox, QCheckBox, QComboBox, QFormLayout, QHeaderView, QLineEdit,
+    QAbstractSpinBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QCheckBox, QComboBox, QFormLayout, QHeaderView, QLineEdit,
     QPushButton, QSizePolicy, QSpinBox, QTableWidget, QTableWidgetItem, QTextEdit,
     QTimeEdit, QVBoxLayout, QWidget,
 )
@@ -22,12 +22,7 @@ from ai_adventure.alchemy.ingredients import (
     normalize_recipe_ingredients,
 )
 from ai_adventure.calendar_system import format_time_of_day
-from ai_adventure.combat import (
-    DEFAULT_ATTACK_RANGE_FEET,
-    DEFAULT_BASE_ARMOR_RATING,
-    DEFAULT_UNARMED_DAMAGE,
-    EQUIPMENT_SLOTS,
-)
+from ai_adventure.items import EQUIPMENT_SLOTS
 from ai_adventure.currency import describe_currency_denominations, format_currency_amount
 from ai_adventure.new_game_setup import (
     GREGORIAN_CALENDAR_SETTINGS,
@@ -57,9 +52,9 @@ from ai_adventure.ui.table_helpers import (
 )
 
 LOGGER = __import__("logging").getLogger(__name__)
-STARTER_ITEM_COLUMN_WIDTHS = (140, 132, 140, 220, 132, 150, 100)
-STARTER_WEAPON_COLUMN_WIDTHS = (150, 132, 100, 96, 120, 120, 132, 132, 100)
-STARTER_ARMOR_COLUMN_WIDTHS = (150, 132, 220, 132, 132, 100)
+STARTER_ITEM_COLUMN_WIDTHS = (140, 132, 140, 220, 132, 150, 100, 100, 100)
+STARTER_WEAPON_COLUMN_WIDTHS = (150, 132, 100, 96, 120, 120, 132, 132, 100, 100, 100)
+STARTER_ARMOR_COLUMN_WIDTHS = (150, 132, 220, 132, 132, 100, 100, 100)
 STARTING_NPC_COLUMN_WIDTHS = (150, 160, 260, 132, 100)
 STARTING_LOCATION_COLUMN_WIDTHS = (180, 320, 132, 110, 180, 120)
 CURRENCY_COLUMN_WIDTHS = (150, 160, 132, 100)
@@ -498,6 +493,7 @@ def _append_starter_item_table_row(
     table.insertRow(row)
     table.setRowHeight(row, 36)
     name_input = _table_line_edit(str(item.get("name", "")))
+    name_input.setProperty("starterItemSource", dict(item))
     category_input = _table_line_edit(str(item.get("category", "Item") or "Item"))
     description_input = _table_line_edit(str(item.get("description", "")))
 
@@ -523,7 +519,8 @@ def _append_starter_item_table_row(
     table.setCellWidget(row, 3, description_input)
     table.setCellWidget(row, 4, value_input)
     table.setCellWidget(row, 5, storage_input)
-    _set_remove_row_button(table, row, 6, "item", remove_callback)
+    _set_starter_mobility_controls(table, row, 6, item)
+    _set_remove_row_button(table, row, 8, "item", remove_callback)
     _set_table_column_widths(table, STARTER_ITEM_COLUMN_WIDTHS)
 
 
@@ -541,6 +538,8 @@ def _starter_items_from_table(table: QTableWidget) -> list[dict[str, Any]]:
         description_widget = table.cellWidget(row, 3)
         value_widget = table.cellWidget(row, 4)
         storage_widget = table.cellWidget(row, 5)
+        moveable_widget = table.cellWidget(row, 6)
+        storable_widget = table.cellWidget(row, 7)
         name = name_widget.text().strip() if isinstance(name_widget, QLineEdit) else ""
 
         if not name:
@@ -548,6 +547,7 @@ def _starter_items_from_table(table: QTableWidget) -> list[dict[str, Any]]:
 
         items.append(
             {
+                **(name_widget.property("starterItemSource") or {}),
                 "name": name,
                 "category": (
                     category_widget.text().strip()
@@ -563,10 +563,12 @@ def _starter_items_from_table(table: QTableWidget) -> list[dict[str, Any]]:
                 ),
                 "value_base_units": value_widget.value() if isinstance(value_widget, QSpinBox) else 0,
                 "storage_location": (
-                    str(storage_widget.currentData() or "actively_carried")
+                    str((storage_widget.currentData() if storage_widget.currentText() == storage_widget.itemText(storage_widget.currentIndex()) else storage_widget.currentText()) or "actively_carried")
                     if isinstance(storage_widget, QComboBox)
                     else "actively_carried"
                 ),
+                "moveable": moveable_widget.isChecked() if isinstance(moveable_widget, QCheckBox) else True,
+                "storable": storable_widget.isChecked() if isinstance(storable_widget, QCheckBox) else True,
                 "item_request": "",
                 "requires_ai_invention": False,
             }
@@ -613,194 +615,88 @@ def _metadata_int(item: dict[str, Any], key: str, default: int = 0) -> int:
     return _safe_int(value, default)
 
 
-def _append_starter_weapon_table_row(
-    table: QTableWidget,
-    item: dict[str, Any],
-    remove_callback: Callable[[QPushButton], None],
-) -> None:
-    """Adds one editable starter-weapon row to table."""
-
-    row = table.rowCount()
-    table.insertRow(row)
-    table.setRowHeight(row, 36)
-
-    name_input = _table_line_edit(str(item.get("name", "")))
-    quantity_input = _table_spin_box(1, 999_999)
-    quantity_input.setValue(_safe_int(item.get("quantity", 1), 1))
-    hands_input = _table_combo_box(
-        {"One-handed": "one-handed", "Two-handed": "two-handed"},
-        _metadata_text(item, "weapon_hands", "one-handed") or "one-handed",
-    )
-    damage_input = _table_line_edit(_metadata_text(item, "damage", "1d6") or "1d6")
-    attack_skill_input = _table_line_edit(
-        _metadata_text(item, "attack_skill", "Melee") or "Melee"
-    )
-    range_input = _table_spin_box(0, 10_000)
-    range_input.setValue(max(0, _metadata_int(item, "attack_range_feet", 5)))
-    ammo_input = _table_line_edit(_metadata_text(item, "ammunition_type_required"))
-    clip_size_input = _table_spin_box(0, 999)
-    clip_size_input.setValue(max(0, _metadata_int(item, "clip_size", 0)))
-
-    table.setCellWidget(row, 0, name_input)
-    table.setCellWidget(row, 1, quantity_input)
-    table.setCellWidget(row, 2, hands_input)
-    table.setCellWidget(row, 3, damage_input)
-    table.setCellWidget(row, 4, attack_skill_input)
-    table.setCellWidget(row, 5, range_input)
-    table.setCellWidget(row, 6, ammo_input)
-    table.setCellWidget(row, 7, clip_size_input)
-    _set_remove_row_button(table, row, 8, "weapon", remove_callback)
-    _set_table_column_widths(table, STARTER_WEAPON_COLUMN_WIDTHS)
+def _append_starter_weapon_table_row(table, item, remove_callback):
+    table.setColumnCount(9)
+    table.setHorizontalHeaderLabels(["Name", "Amount", "Category", "Description", "Value", "Storage", "Moveable", "Storable", "Remove"])
+    _append_starter_item_table_row(table, {**item, "category": "Weapon"}, remove_callback)
 
 
-def _starter_weapons_from_table(table: QTableWidget) -> list[dict[str, Any]]:
-    """Reads starter-weapon rows from table."""
-
-    items: list[dict[str, Any]] = []
-
-    for row in range(table.rowCount()):
-        if table.isRowHidden(row):
-            continue
-        name_widget = table.cellWidget(row, 0)
-        quantity_widget = table.cellWidget(row, 1)
-        hands_widget = table.cellWidget(row, 2)
-        damage_widget = table.cellWidget(row, 3)
-        attack_skill_widget = table.cellWidget(row, 4)
-        range_widget = table.cellWidget(row, 5)
-        ammo_widget = table.cellWidget(row, 6)
-        clip_size_widget = table.cellWidget(row, 7)
-        name = name_widget.text().strip() if isinstance(name_widget, QLineEdit) else ""
-
-        if not name:
-            continue
-
-        ammunition_type_required = (
-            ammo_widget.text().strip() if isinstance(ammo_widget, QLineEdit) else ""
-        )
-        clip_size = clip_size_widget.value() if isinstance(clip_size_widget, QSpinBox) else 0
-
-        items.append(
-            {
-                "name": name,
-                "category": "Weapon",
-                "quantity": quantity_widget.value() if isinstance(quantity_widget, QSpinBox) else 1,
-                "description": "",
-                "value_base_units": 0,
-                "item_type": "Weapon",
-                "weapon_hands": (
-                    str(hands_widget.currentData())
-                    if isinstance(hands_widget, QComboBox)
-                    else "one-handed"
-                ),
-                "damage": (
-                    damage_widget.text().strip()
-                    if isinstance(damage_widget, QLineEdit)
-                    and damage_widget.text().strip()
-                    else "1d6"
-                ),
-                "attack_skill": (
-                    attack_skill_widget.text().strip()
-                    if isinstance(attack_skill_widget, QLineEdit)
-                    and attack_skill_widget.text().strip()
-                    else "Melee"
-                ),
-                "attack_range_feet": (
-                    range_widget.value() if isinstance(range_widget, QSpinBox) else 5
-                ),
-                "ammunition_type_required": ammunition_type_required,
-                "clip_size": clip_size if ammunition_type_required else 0,
-                "bullets_per_attack": 1 if ammunition_type_required and clip_size > 0 else 0,
-                "item_request": "",
-                "requires_ai_invention": False,
-            }
-        )
-
-    return items
+def _starter_weapons_from_table(table):
+    return _starter_items_from_table(table)
 
 
-def _append_starter_armor_table_row(
-    table: QTableWidget,
-    item: dict[str, Any],
-    remove_callback: Callable[[QPushButton], None],
-) -> None:
-    """Adds one editable starter-armor row to table."""
-
-    row = table.rowCount()
-    table.insertRow(row)
-    table.setRowHeight(row, 36)
-
-    name_input = _table_line_edit(str(item.get("name", "")))
-    quantity_input = _table_spin_box(1, 999_999)
-    quantity_input.setValue(_safe_int(item.get("quantity", 1), 1))
-    raw_covers_body_parts = item.get("covers_body_parts")
-
-    if not isinstance(raw_covers_body_parts, list) and isinstance(
-        item.get("metadata"), dict
-    ):
-        raw_covers_body_parts = item["metadata"].get("covers_body_parts")
-
-    covers_body_parts = (
-        raw_covers_body_parts if isinstance(raw_covers_body_parts, list) else []
-    )
-    covers_input = _table_line_edit(
-        ", ".join(str(part) for part in covers_body_parts if part is not None)
-    )
-    armor_rating_input = _table_spin_box(0, 99)
-    armor_rating_input.setValue(max(0, _metadata_int(item, "armor_rating", 1)))
-    value_input = _table_spin_box(0, 1_000_000_000)
-    value_input.setValue(_safe_int(item.get("value_base_units", 0), 0))
-
-    table.setCellWidget(row, 0, name_input)
-    table.setCellWidget(row, 1, quantity_input)
-    table.setCellWidget(row, 2, covers_input)
-    table.setCellWidget(row, 3, armor_rating_input)
-    table.setCellWidget(row, 4, value_input)
-    _set_remove_row_button(table, row, 5, "armor", remove_callback)
-    _set_table_column_widths(table, STARTER_ARMOR_COLUMN_WIDTHS)
+def _append_starter_armor_table_row(table, item, remove_callback):
+    table.setColumnCount(9)
+    table.setHorizontalHeaderLabels(["Name", "Amount", "Category", "Description", "Value", "Storage", "Moveable", "Storable", "Remove"])
+    _append_starter_item_table_row(table, {**item, "category": "Armor"}, remove_callback)
 
 
-def _starter_armor_from_table(table: QTableWidget) -> list[dict[str, Any]]:
-    """Reads starter-armor rows from table."""
+def _starter_armor_from_table(table):
+    return _starter_items_from_table(table)
 
-    items: list[dict[str, Any]] = []
 
-    for row in range(table.rowCount()):
-        if table.isRowHidden(row):
-            continue
-        name_widget = table.cellWidget(row, 0)
-        quantity_widget = table.cellWidget(row, 1)
-        covers_widget = table.cellWidget(row, 2)
-        armor_rating_widget = table.cellWidget(row, 3)
-        value_widget = table.cellWidget(row, 4)
-        name = name_widget.text().strip() if isinstance(name_widget, QLineEdit) else ""
+def _set_starter_mobility_controls(table: QTableWidget, row: int, first_column: int, item: dict[str, Any]) -> None:
+    column = first_column + 3
+    if table.columnCount() <= column:
+        table.setColumnCount(column + 1)
+    table.setHorizontalHeaderItem(column, QTableWidgetItem("Weight / Capacity"))
+    button = table.cellWidget(row, column)
+    if not isinstance(button, QPushButton):
+        button = QPushButton("Weight / Capacity…")
+        button.setToolTip("Set pounds per quantity unit and container/vehicle cargo capacity; leave unspecified for Gemini.")
+        button.clicked.connect(lambda: _edit_starter_weight(table, button))
+        table.setCellWidget(row, column, button)
+    table.setColumnWidth(column, 160)
+    for offset, field in enumerate(("moveable", "storable")):
+        checkbox = table.cellWidget(row, first_column + offset)
+        if not isinstance(checkbox, QCheckBox):
+            checkbox = QCheckBox()
+            table.setCellWidget(row, first_column + offset, checkbox)
+        checkbox.setChecked(item.get(field, (item.get("metadata") or {}).get(field, True)) is not False)
+        checkbox.setToolTip("Can be moved" if field == "moveable" else "Can be put inside a container")
 
-        if not name:
-            continue
 
-        items.append(
-            {
-                "name": name,
-                "category": "Armor",
-                "quantity": quantity_widget.value() if isinstance(quantity_widget, QSpinBox) else 1,
-                "description": "",
-                "value_base_units": value_widget.value() if isinstance(value_widget, QSpinBox) else 0,
-                "item_type": "Armor",
-                "covers_body_parts": (
-                    _split_list(covers_widget.text())
-                    if isinstance(covers_widget, QLineEdit)
-                    else []
-                ),
-                "armor_rating": (
-                    armor_rating_widget.value()
-                    if isinstance(armor_rating_widget, QSpinBox)
-                    else 1
-                ),
-                "item_request": "",
-                "requires_ai_invention": False,
-            }
-        )
+def _edit_starter_weight(table: QTableWidget, button: QPushButton) -> None:
+    row = next((r for r in range(table.rowCount()) if any(table.cellWidget(r, c) is button for c in range(table.columnCount()))), -1)
+    if row < 0:
+        return
+    name = table.cellWidget(row, 0)
+    source = dict(name.property("starterItemSource") or {})
+    metadata = source.get("metadata") or {}
+    dialog = QDialog(table)
+    dialog.setWindowTitle("Item weight and cargo capacity")
+    form = QFormLayout()
+    controls = {}
+    for field, label in (("weight_lb", "Weight per quantity unit:"), ("carrying_capacity_lb", "Container / Vehicle capacity:")):
+        control = QDoubleSpinBox()
+        control.setRange(-1, 1_000_000_000)
+        control.setDecimals(4)
+        control.setSuffix(" lb")
+        control.setSpecialValueText("Gemini decides")
+        control.setValue(float(source.get(field, metadata.get(field, -1))))
+        controls[field] = control
+        form.addRow(label, control)
+    buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+    buttons.accepted.connect(dialog.accept)
+    buttons.rejected.connect(dialog.reject)
+    layout = QVBoxLayout(dialog)
+    layout.addLayout(form)
+    layout.addWidget(buttons)
+    if dialog.exec() == QDialog.DialogCode.Accepted:
+        for field, control in controls.items():
+            source.pop(field, None)
+            if isinstance(source.get("metadata"), dict):
+                source["metadata"] = dict(source["metadata"])
+                source["metadata"].pop(field, None)
+            if control.value() >= 0:
+                source[field] = control.value()
+        name.setProperty("starterItemSource", source)
 
-    return items
+
+def _starter_mobility_values(table: QTableWidget, row: int, first_column: int) -> dict[str, bool]:
+    return {field: table.cellWidget(row, first_column + offset).isChecked()
+            if isinstance(table.cellWidget(row, first_column + offset), QCheckBox) else True
+            for offset, field in enumerate(("moveable", "storable"))}
 
 
 def _append_currency_table_row(

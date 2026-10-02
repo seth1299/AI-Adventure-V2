@@ -11,7 +11,7 @@ from ai_adventure.ai.gemini_service import (
     KNOWN_EVENT_TYPE_NAMES,
     AiNarrationResult,
     _drop_unauthorized_player_spell_cast_events,
-    _skill_check_planning_packet,
+    _d20_test_planning_packet,
     _story_event_type_names,
 )
 from ai_adventure.context.context_builder import AiContextBuilder
@@ -430,10 +430,10 @@ class MagicSystemTests(unittest.TestCase):
                     {section["id"] for section in packet["reference_sections"]},
                 )
 
-            planning_packet = _skill_check_planning_packet(indirect_training)
+            planning_packet = _d20_test_planning_packet(indirect_training)
             self.assertIn("magic", planning_packet)
             self.assertEqual(planning_packet["magic"]["known_spells"][0]["name"], "Ember Lance")
-            self.assertNotIn("magic", _skill_check_planning_packet(mundane))
+            self.assertNotIn("magic", _d20_test_planning_packet(mundane))
 
     def test_state_context_and_contract_expose_new_magic_model_only(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

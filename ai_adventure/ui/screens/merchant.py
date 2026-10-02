@@ -78,7 +78,7 @@ class MerchantScreen(RepositoryBackedWidget):
             self.sell_table.setCellWidget(row_index, 4, button)
 
     def _render_buy(self, repository: SaveRepository, npc_id: str, profile: dict[str, Any]) -> None:
-        inventory = {str(item.get("id")): item for item in repository.list_inventory_items()}
+        inventory = {str(item.get("id")): item for item in repository.list_accessible_inventory_items()}
         rows = [offer for offer in repository.list_merchant_buy_offers(npc_id) if any(str(item.get("name", "")).casefold() == str(offer["item_name"]).casefold() for item in inventory.values())] if profile.get("can_buy") else []
         self.buy_table.setRowCount(len(rows))
         for row_index, offer in enumerate(rows):

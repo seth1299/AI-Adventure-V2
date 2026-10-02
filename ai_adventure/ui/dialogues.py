@@ -1,8 +1,15 @@
 from __future__ import annotations
 
+from ai_adventure.stats import ATTRIBUTES, RULES_VERSION, rank_stats, starting_attributes, point_buy_cost
+
+from ai_adventure.ui.widgets.inputs import FeatureToggleCheckBox
+from ai_adventure.audio.tts_settings import DEFAULT_TTS_VOLUME_PERCENT, active_player_voice_spec_from_audio
+from ai_adventure.audio.voices import PLAYER_SAMPLE_TEXT
+
 from PySide6.QtWidgets import QFileDialog
 
 from ai_adventure.ui.common import *  # noqa: F401,F403
+from ai_adventure.ui.new_game_form_helpers import _set_starter_mobility_controls
 
 
 class CustomVoiceDialog(QDialog):
@@ -46,7 +53,7 @@ class CustomVoiceDialog(QDialog):
 
         self.tts_volume_slider = QSlider(Qt.Orientation.Horizontal)
         self.tts_volume_slider.setRange(0, 100)
-        self.tts_volume_slider.setValue(90)
+        self.tts_volume_slider.setValue(DEFAULT_TTS_VOLUME_PERCENT)
         self.tts_volume_label = QLabel(f"{self.tts_volume_slider.value()}%")
         self.tts_volume_slider.valueChanged.connect(
             lambda value: self.tts_volume_label.setText(f"{value}%")
@@ -427,7 +434,7 @@ class CustomVoiceDialog(QDialog):
 
 
 class TTSSettingsWidget(QWidget):
-    """Shared advanced narrator controls."""
+    """Independent narrator and player speech controls."""
 
     def __init__(
         self,
@@ -436,6 +443,7 @@ class TTSSettingsWidget(QWidget):
         voice_options: dict[str, str] | None = None,
         on_sample_voice: SampleVoiceCallback | None = None,
         on_custom_voice_saved: Callable[[dict[str, Any]], None] | None = None,
+        player_pronouns_provider: Callable[[], str] | None = None,
         custom_voice_storage_path: Path | str | None = None,
         parent: QWidget | None = None,
     ) -> None:
@@ -444,20 +452,22 @@ class TTSSettingsWidget(QWidget):
         self.voice_options = voice_options or available_narrator_voices()
         self.on_sample_voice = on_sample_voice
         self.on_custom_voice_saved = on_custom_voice_saved
+        self.player_pronouns_provider = player_pronouns_provider
         self.custom_voice_storage_path = custom_voice_storage_path
         self._loading_tts_settings = False
         self.custom_voice_library_changed = False
         self.custom_voices: list[dict[str, Any]] = []
         self.current_voice_blend = normalize_voice_blend({})
+        self.current_player_voice_blend = normalize_voice_blend({})
 
-        self.narrator_enabled_checkbox = QCheckBox("Narrator enabled")
+        self.narrator_enabled_checkbox = FeatureToggleCheckBox('Narrator')
         self.narrator_enabled_checkbox.toggled.connect(
             lambda checked: self._sync_control_states(checked)
         )
 
         self.tts_volume_slider = QSlider(Qt.Orientation.Horizontal)
         self.tts_volume_slider.setRange(0, 100)
-        self.tts_volume_slider.setValue(90)
+        self.tts_volume_slider.setValue(DEFAULT_TTS_VOLUME_PERCENT)
         self.tts_volume_label = QLabel(f"{self.tts_volume_slider.value()}%")
         self.tts_volume_slider.valueChanged.connect(
             lambda value: self.tts_volume_label.setText(f"{value}%")
@@ -503,8 +513,10 @@ class TTSSettingsWidget(QWidget):
         self.custom_voice_button = QPushButton("Custom Voices...")
         self.custom_voice_button.clicked.connect(self._open_custom_voice_dialog)
 
-        self.sample_voice_button = QPushButton("Sample Voice")
+        self.sample_voice_button = QPushButton("Sample Narrator Voice")
         self.sample_voice_button.clicked.connect(self._sample_voice)
+        self.sample_player_voice_button = QPushButton("Sample Player Character Voice")
+        self.sample_player_voice_button.clicked.connect(self._sample_player_voice)
 
         self.tts_volume_row = _slider_row(self.tts_volume_slider, self.tts_volume_label)
         self.tts_speed_row = _slider_row(self.tts_speed_slider, self.tts_speed_label)
@@ -512,18 +524,54 @@ class TTSSettingsWidget(QWidget):
             self.custom_voice_summary_label,
             self.custom_voice_button,
         )
-        self.voice_button_row = _button_row(self.sample_voice_button)
 
-        form = QFormLayout()
-        form.addRow("Narrator:", self.narrator_enabled_checkbox)
-        form.addRow("Volume:", self.tts_volume_row)
-        form.addRow("Speed:", self.tts_speed_row)
-        form.addRow("Voice Source:", self.voice_mode_combo)
-        form.addRow("Preset Voice:", self.preset_voice_combo)
-        form.addRow("Player Character Voice:", self.player_voice_combo)
-        form.addRow("Custom Voice:", self.custom_voice_row)
-        form.addRow("", self.voice_button_row)
-        self.setLayout(form)
+        self.player_enabled_checkbox = FeatureToggleCheckBox("Player Character")
+        self.player_enabled_checkbox.toggled.connect(lambda _checked: self._sync_control_states(self.narrator_enabled_checkbox.isChecked()))
+        self.player_tts_volume_slider = QSlider(Qt.Orientation.Horizontal)
+        self.player_tts_volume_slider.setRange(0, 100)
+        self.player_tts_volume_label = QLabel()
+        self.player_tts_volume_slider.valueChanged.connect(lambda value: self.player_tts_volume_label.setText(f"{value}%"))
+        self.player_tts_speed_slider = QSlider(Qt.Orientation.Horizontal)
+        self.player_tts_speed_slider.setRange(50, 200)
+        self.player_tts_speed_label = QLabel()
+        self.player_tts_speed_slider.valueChanged.connect(lambda value: self.player_tts_speed_label.setText(f"{value}%"))
+        self.player_voice_mode_combo = _NoWheelComboBox()
+        self.player_voice_mode_combo.addItem("Preset Voice", "preset")
+        self.player_voice_mode_combo.addItem("Custom Blend", "blend")
+        self.player_voice_mode_combo.currentIndexChanged.connect(lambda _index: self._sync_control_states(self.narrator_enabled_checkbox.isChecked()))
+        self.player_custom_voice_summary_label = QLabel()
+        self.player_custom_voice_summary_label.setWordWrap(True)
+        self.player_custom_voice_button = QPushButton("Custom Voices...")
+        self.player_custom_voice_button.clicked.connect(lambda: self._open_custom_voice_dialog(player=True))
+        self.player_tts_volume_row = _slider_row(self.player_tts_volume_slider, self.player_tts_volume_label)
+        self.player_tts_speed_row = _slider_row(self.player_tts_speed_slider, self.player_tts_speed_label)
+        self.player_custom_voice_row = _button_row(self.player_custom_voice_summary_label, self.player_custom_voice_button)
+        self.voice_button_row = _button_row(self.sample_voice_button)
+        self.player_voice_button_row = _button_row(self.sample_player_voice_button)
+
+        self.narrator_section = QGroupBox("Narrator")
+        narrator_form = QFormLayout(self.narrator_section)
+        narrator_form.addRow("Narrator:", self.narrator_enabled_checkbox)
+        narrator_form.addRow("Narrator Volume:", self.tts_volume_row)
+        narrator_form.addRow("Narrator Speed:", self.tts_speed_row)
+        narrator_form.addRow("Voice Source:", self.voice_mode_combo)
+        narrator_form.addRow("Preset Voice:", self.preset_voice_combo)
+        narrator_form.addRow("Custom Voice:", self.custom_voice_row)
+        narrator_form.addRow("", self.voice_button_row)
+        self.player_section = QGroupBox("Player Character")
+        player_form = QFormLayout(self.player_section)
+        player_form.addRow("Player Character:", self.player_enabled_checkbox)
+        player_form.addRow("Player Volume:", self.player_tts_volume_row)
+        player_form.addRow("Player Speed:", self.player_tts_speed_row)
+        player_form.addRow("Voice Source:", self.player_voice_mode_combo)
+        player_form.addRow("Preset Voice:", self.player_voice_combo)
+        player_form.addRow("Custom Voice:", self.player_custom_voice_row)
+        player_form.addRow("", self.player_voice_button_row)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self.narrator_section)
+        layout.addWidget(self.player_section)
+        layout.addStretch(1)
         self.load_audio_settings(audio_settings or {})
 
     def load_audio_settings(self, audio_settings: dict[str, Any]) -> None:
@@ -535,6 +583,13 @@ class TTSSettingsWidget(QWidget):
         try:
             self.custom_voices = normalize_custom_voices(audio["tts_custom_voices"])
             self.current_voice_blend = normalize_voice_blend(audio["tts_voice_blend"])
+            self.current_player_voice_blend = normalize_voice_blend(audio["player_tts_voice_blend"])
+            self.player_enabled_checkbox.setChecked(audio["player_enabled"])
+            self.player_tts_volume_slider.setValue(audio["player_tts_volume"])
+            self.player_tts_volume_label.setText(f"{audio['player_tts_volume']}%")
+            self.player_tts_speed_slider.setValue(audio["player_tts_speed"])
+            self.player_tts_speed_label.setText(f"{audio['player_tts_speed']}%")
+            _set_combo_to_data(self.player_voice_mode_combo, audio["player_tts_voice_mode"])
             self.narrator_enabled_checkbox.setChecked(bool(audio["narrator_enabled"]))
             self.tts_volume_slider.setValue(int(audio["tts_volume"]))
             self.tts_speed_slider.setValue(normalize_tts_speed_percent(audio["tts_speed"]))
@@ -560,6 +615,13 @@ class TTSSettingsWidget(QWidget):
                 "tts_voice_blend": self._current_blend(),
                 "tts_custom_voices": self.custom_voices,
                 "player_tts_voice": self.player_voice_combo.currentData() or "ai",
+                "player_enabled": self.player_enabled_checkbox.isChecked(),
+                "player_tts_volume": self.player_tts_volume_slider.value(),
+                "player_tts_speed": self.player_tts_speed_slider.value(),
+                "player_tts_voice_mode": self.player_voice_mode_combo.currentData(),
+                "player_tts_voice_blend": {**self.current_player_voice_blend,
+                    "tts_volume": self.player_tts_volume_slider.value(),
+                    "tts_speed": self.player_tts_speed_slider.value()},
             }
         )
 
@@ -583,21 +645,35 @@ class TTSSettingsWidget(QWidget):
         blend["tts_speed"] = self.tts_speed_slider.value()
         return normalize_voice_blend(blend)
 
-    def _open_custom_voice_dialog(self) -> None:
+    def _open_custom_voice_dialog(self, *, player: bool = False) -> None:
         """Opens the dedicated custom voice editor."""
 
+        base_audio = self.build_audio_settings()
+        editor_audio = dict(base_audio)
+        if player:
+            for key in ("tts_volume", "tts_speed", "tts_voice_mode", "tts_voice_blend"):
+                editor_audio[key] = base_audio[f"player_{key}"]
+        sample_callback = self.on_sample_voice
+        if player and self.on_sample_voice is not None:
+            sample_callback = lambda voice, volume, speed: _invoke_sample_voice_callback(
+                self.on_sample_voice, voice, volume, speed, text=PLAYER_SAMPLE_TEXT
+            )
         dialog = CustomVoiceDialog(
             self,
-            audio_settings=self.build_audio_settings(),
+            audio_settings=editor_audio,
             voice_options=self.voice_options,
-            on_sample_voice=self.on_sample_voice,
+            on_sample_voice=sample_callback,
             storage_path=self.custom_voice_storage_path,
         )
 
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
 
-        self.load_audio_settings(dialog.build_audio_settings())
+        edited = dialog.build_audio_settings()
+        for key in ("tts_volume", "tts_speed", "tts_voice_mode", "tts_voice_blend"):
+            base_audio[f"player_{key}" if player else key] = edited[key]
+        base_audio["tts_custom_voices"] = edited["tts_custom_voices"]
+        self.load_audio_settings(base_audio)
 
         if dialog.custom_voice_library_changed:
             self.custom_voice_library_changed = True
@@ -608,6 +684,7 @@ class TTSSettingsWidget(QWidget):
     def _sync_custom_voice_summary(self) -> None:
         """Updates the selected custom voice summary label."""
 
+        self.player_custom_voice_summary_label.setText(_custom_voice_display_text(self.current_player_voice_blend))
         blend = self._current_blend()
         saved_name = self._saved_voice_name_for(blend)
 
@@ -646,9 +723,29 @@ class TTSSettingsWidget(QWidget):
             self.tts_speed_slider.value(),
         )
 
+    def _sample_player_voice(self) -> None:
+        """Preview the selected player voice using the gameplay voice resolver."""
+        if self.on_sample_voice is None:
+            return
+        from ai_adventure.audio.voices import assign_speaker_voices
+        text = PLAYER_SAMPLE_TEXT
+        cues, _assignments = assign_speaker_voices(
+            [{"speaker_id": "player", "speaker_name": "Player Character", "anchor_text": text}],
+            available_voice_ids=list(self.voice_options.values()),
+            narrator_voice=self.active_voice_spec(),
+            player_voice=active_player_voice_spec_from_audio(self.build_audio_settings()),
+            player_pronouns=self.player_pronouns_provider() if self.player_pronouns_provider else None,
+        )
+        _invoke_sample_voice_callback(
+            self.on_sample_voice, cues[0]["voice_id"], self.player_tts_volume_slider.value(),
+            self.player_tts_speed_slider.value(), text=text,
+        )
+
     def _sync_control_states(self, checked: bool) -> None:
         """Enables controls based on narrator and voice-source state."""
 
+        if self._loading_tts_settings:
+            return
         mode = normalize_tts_voice_mode(self.voice_mode_combo.currentData())
         preset_visible = checked and mode == "preset"
         custom_visible = checked and mode == "blend"
@@ -663,7 +760,6 @@ class TTSSettingsWidget(QWidget):
             widget.setEnabled(checked)
 
         self.preset_voice_combo.setEnabled(preset_visible)
-        self.player_voice_combo.setEnabled(checked)
         self.custom_voice_button.setEnabled(checked)
         self.sample_voice_button.setEnabled(checked and self.on_sample_voice is not None)
 
@@ -676,15 +772,22 @@ class TTSSettingsWidget(QWidget):
             self._set_form_field_visible(field, checked)
 
         self._set_form_field_visible(self.preset_voice_combo, preset_visible)
-        self._set_form_field_visible(self.player_voice_combo, checked)
         self._set_form_field_visible(self.custom_voice_row, custom_visible)
+        player_enabled = self.player_enabled_checkbox.isChecked()
+        player_blend = self.player_voice_mode_combo.currentData() == "blend"
+        for field in (self.player_tts_volume_row, self.player_tts_speed_row,
+                      self.player_voice_mode_combo, self.player_voice_button_row):
+            self._set_form_field_visible(field, player_enabled)
+        self._set_form_field_visible(self.player_voice_combo, player_enabled and not player_blend)
+        self._set_form_field_visible(self.player_custom_voice_row, player_enabled and player_blend)
+        self.sample_player_voice_button.setEnabled(player_enabled and self.on_sample_voice is not None)
 
     def _set_form_field_visible(self, field: QWidget, visible: bool) -> None:
         """Shows or hides a form field and its label together."""
 
         field.setVisible(visible)
 
-        layout = self.layout()
+        layout = field.parentWidget().layout()
 
         if not isinstance(layout, QFormLayout):
             return
@@ -727,7 +830,11 @@ class TTSSettingsDialog(QDialog):
         buttons.rejected.connect(self.reject)
 
         layout = QVBoxLayout()
-        layout.addWidget(self.tts_settings_widget)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        scroll.setWidget(self.tts_settings_widget)
+        layout.addWidget(scroll)
         layout.addWidget(buttons)
         self.setLayout(layout)
 
@@ -1214,11 +1321,13 @@ class MainMenuSettingsDialog(QDialog):
         voice_options: dict[str, str] | None = None,
         on_sample_voice: SampleVoiceCallback | None = None,
         custom_voice_storage_path: Path | str | None = None,
+        on_restore_defaults: Callable[[dict[str, Any]], None] | None = None,
     ) -> None:
         super().__init__(parent)
 
         self.tts_enabled = bool(tts_enabled)
         self.music_enabled = bool(music_enabled)
+        self.on_restore_defaults = on_restore_defaults
         self.sound_manager = sound_manager
         self.voice_options = voice_options or available_narrator_voices()
         self.on_sample_voice = on_sample_voice
@@ -1230,7 +1339,7 @@ class MainMenuSettingsDialog(QDialog):
         appearance = clean_settings["appearance"]
 
         self.setWindowTitle("Settings")
-        self.resize(580, 460)
+        self.resize(680, 720)
 
         self.theme_combo = QComboBox()
         self.theme_combo.addItems(["Light", "Dark"])
@@ -1266,11 +1375,8 @@ class MainMenuSettingsDialog(QDialog):
         self.font_size_spin.valueChanged.connect(
             lambda _value: self._preview_appearance()
         )
-        self.font_size_spin.valueChanged.connect(
-            lambda _value: self._apply_font_family_item_fonts()
-        )
 
-        self.music_enabled_checkbox = QCheckBox("Music enabled")
+        self.music_enabled_checkbox = FeatureToggleCheckBox('Music')
         self.music_enabled_checkbox.setChecked(bool(audio["music_enabled"]))
         self.music_enabled_checkbox.toggled.connect(self._sync_audio_control_visibility)
         self.music_upload_button = QPushButton("Upload Music...")
@@ -1289,7 +1395,7 @@ class MainMenuSettingsDialog(QDialog):
             self.music_volume_slider, self.music_volume_label
         )
 
-        self.sound_effects_enabled_checkbox = QCheckBox("Sound effects enabled")
+        self.sound_effects_enabled_checkbox = FeatureToggleCheckBox('Sound effects')
         self.sound_effects_enabled_checkbox.setChecked(
             bool(audio["sound_effects_enabled"])
         )
@@ -1313,9 +1419,7 @@ class MainMenuSettingsDialog(QDialog):
             self.sound_effects_volume_slider, self.sound_effects_volume_label
         )
 
-        self.background_ambience_enabled_checkbox = QCheckBox(
-            "Background ambience enabled"
-        )
+        self.background_ambience_enabled_checkbox = FeatureToggleCheckBox('Background ambience')
         self.background_ambience_enabled_checkbox.setChecked(
             bool(audio["background_ambience_enabled"])
         )
@@ -1391,6 +1495,15 @@ class MainMenuSettingsDialog(QDialog):
                 "Ambience Volume:",
                 self.background_ambience_volume_control,
             )
+            self.music_enabled_checkbox.bind_form_children(
+                form, self.music_upload_button, self.music_volume_slider,
+            )
+            self.sound_effects_enabled_checkbox.bind_form_children(
+                form, self.sound_effects_upload_button, self.sound_effects_volume_slider,
+            )
+            self.background_ambience_enabled_checkbox.bind_form_children(
+                form, self.background_ambience_upload_button, self.background_ambience_volume_slider,
+            )
 
         if self.tts_enabled:
             self.tts_settings_widget = TTSSettingsWidget(
@@ -1411,21 +1524,62 @@ class MainMenuSettingsDialog(QDialog):
 
         save_button = QPushButton("Apply")
         save_button.clicked.connect(self.accept)
+        self.restore_defaults_button = QPushButton("Restore Default Settings")
+        self.restore_defaults_button.clicked.connect(self._restore_default_settings)
         cancel_button = QPushButton("Cancel")
         cancel_button.clicked.connect(self.reject)
 
         button_row = QHBoxLayout()
         button_row.addStretch()
         button_row.addWidget(save_button)
+        button_row.addWidget(self.restore_defaults_button)
         button_row.addWidget(cancel_button)
 
+        content = QWidget()
+        content.setLayout(form)
+        self.settings_scroll_area = QScrollArea()
+        self.settings_scroll_area.setWidgetResizable(True)
+        self.settings_scroll_area.setFrameShape(QFrame.Shape.NoFrame)
+        self.settings_scroll_area.setWidget(content)
         layout = QVBoxLayout()
-        layout.addLayout(form)
-        layout.addStretch()
+        layout.addWidget(self.settings_scroll_area, 1)
         layout.addLayout(button_row)
         self.setLayout(layout)
         self._sync_audio_control_visibility()
         self._preview_appearance()
+
+    def _restore_default_settings(self) -> None:
+        """Confirm, restore every app preference, and persist the confirmed reset."""
+        answer = QMessageBox.warning(
+            self, "Restore Default Settings",
+            "Are you sure you want to restore default settings? "
+            "Your saved settings and any changes in this dialog will be replaced "
+            "with the application defaults. This cannot be undone.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        defaults = normalize_app_settings({}, tts_enabled=self.tts_enabled)
+        controls = [self.theme_combo, self.font_family_combo, self.font_size_spin]
+        blocked = [control.blockSignals(True) for control in controls]
+        try:
+            self.theme_combo.setCurrentText(defaults["theme"])
+            self.font_family_combo.setCurrentIndex(self.font_family_combo.findData(""))
+            self.font_size_spin.setValue(defaults["appearance"]["font_size"])
+            audio = defaults["audio"]
+            for prefix in ("music", "sound_effects", "background_ambience"):
+                getattr(self, prefix + "_enabled_checkbox").setChecked(audio[prefix + "_enabled"])
+                getattr(self, prefix + "_volume_slider").setValue(audio[prefix + "_volume"])
+            if self.tts_settings_widget is not None:
+                self.tts_settings_widget.load_audio_settings(audio)
+        finally:
+            for control, was_blocked in zip(controls, blocked):
+                control.blockSignals(was_blocked)
+        self._sync_audio_control_visibility()
+        self._preview_appearance()
+        if self.on_restore_defaults is not None:
+            self.on_restore_defaults(defaults)
 
     def build_settings(self) -> dict[str, Any]:
         """Builds normalized app-level settings from dialog fields."""
@@ -1489,6 +1643,7 @@ class MainMenuSettingsDialog(QDialog):
         voice: str | None = None,
         volume: int | None = None,
         speed: int | None = None,
+        *, text: str | None = None,
     ) -> bool:
         """Plays the selected voice sample."""
 
@@ -1505,6 +1660,7 @@ class MainMenuSettingsDialog(QDialog):
             ),
             self._tts_volume_value() if volume is None else int(volume),
             DEFAULT_TTS_SPEED_PERCENT if speed is None else int(speed),
+            text=text,
         )
 
     def _tts_settings_value(self) -> dict[str, Any]:
@@ -1519,7 +1675,8 @@ class MainMenuSettingsDialog(QDialog):
         """Renders each font-family choice using that family, like Word."""
 
         point_size = max(1, int(self.font_size_spin.value()))
-        default_family = QApplication.font().family()
+        app = QApplication.instance()
+        default_family = (app.property("ai_adventure_base_font_family") if app else None) or QApplication.font().family()
         for index in range(self.font_family_combo.count()):
             family = str(self.font_family_combo.itemData(index) or "").strip()
             font = QFont(family or default_family)
@@ -1536,6 +1693,7 @@ class MainMenuSettingsDialog(QDialog):
                 "font_size": self.font_size_spin.value(),
             },
         )
+        self._apply_font_family_item_fonts()
 
     def _sync_audio_control_visibility(self, _checked: bool | None = None) -> None:
         """Shows each volume control only while its feature is enabled."""
@@ -1680,6 +1838,12 @@ class NewGameTemplateManagerDialog(QDialog):
         self.appearance_input.setPlaceholderText("Appearance, clothing, visible traits...")
         self.backstory_input = QTextEdit()
         self.backstory_input.setPlaceholderText("Origin, history, goals, relationships...")
+        self.character_capacity_input = QDoubleSpinBox()
+        self.character_capacity_input.setRange(0, 1_000_000)
+        self.character_capacity_input.setDecimals(2)
+        self.character_capacity_input.setSuffix(" lb")
+        self.character_capacity_input.setValue(50)
+        self.character_capacity_input.setToolTip("Base carrying capacity. Directly carried containers add their own capacity bonuses.")
         self.character_notes_input = QTextEdit()
         self.character_notes_input.setPlaceholderText("Other player-character notes...")
 
@@ -1720,9 +1884,9 @@ class NewGameTemplateManagerDialog(QDialog):
         )
         self.add_npc_button = QPushButton("Add NPC")
         self.add_npc_button.clicked.connect(lambda: self._append_starting_npc_row({}))
-        self.starter_items_table = _AppTableWidget(0, 7)
+        self.starter_items_table = _AppTableWidget(0, 9)
         self.starter_items_table.setHorizontalHeaderLabels(
-            ["Name", "Amount", "Category", "Description", "Value", "Storage", "Remove"]
+            ["Name", "Amount", "Category", "Description", "Value", "Storage", "Moveable", "Storable", "Remove"]
         )
         _configure_inline_table(
             self.starter_items_table,
@@ -1734,19 +1898,7 @@ class NewGameTemplateManagerDialog(QDialog):
             lambda: self._append_starter_item_row({})
         )
         self.starter_weapons_table = _AppTableWidget(0, 9)
-        self.starter_weapons_table.setHorizontalHeaderLabels(
-            [
-                "Name",
-                "Amount",
-                "Hands",
-                "Damage",
-                "Skill",
-                "Range",
-                "Ammo Type",
-                "Clip Size",
-                "Remove",
-            ]
-        )
+        self.starter_weapons_table.setHorizontalHeaderLabels(["Name", "Amount", "Category", "Description", "Value", "Storage", "Moveable", "Storable", "Remove"])
         _configure_inline_table(
             self.starter_weapons_table,
             STARTER_WEAPON_COLUMN_WIDTHS,
@@ -1756,9 +1908,9 @@ class NewGameTemplateManagerDialog(QDialog):
         self.add_starter_weapon_button.clicked.connect(
             lambda: self._append_starter_weapon_row({})
         )
-        self.starter_armor_table = _AppTableWidget(0, 6)
+        self.starter_armor_table = _AppTableWidget(0, 9)
         self.starter_armor_table.setHorizontalHeaderLabels(
-            ["Name", "Amount", "Covers", "Armor Bonus", "Value", "Remove"]
+            ["Name", "Amount", "Category", "Description", "Value", "Storage", "Moveable", "Storable", "Remove"]
         )
         _configure_inline_table(
             self.starter_armor_table,
@@ -1796,18 +1948,8 @@ class NewGameTemplateManagerDialog(QDialog):
         self.starter_inventory_mode_combo.currentIndexChanged.connect(
             lambda _index: self._sync_template_inventory_controls()
         )
-        self.combat_resolution_mode_combo = _NoWheelComboBox()
-        self.combat_resolution_mode_combo.addItem(
-            "Strict / App-Managed Combat", "strict"
-        )
-        self.combat_resolution_mode_combo.addItem(
-            "Narrative / Gemini-Managed Combat", "narrative"
-        )
-        self.combat_resolution_mode_combo.currentIndexChanged.connect(
-            lambda _index: self._sync_template_inventory_controls()
-        )
         self.combat_focus_combo = _NoWheelComboBox()
-        for value, label in COMBAT_FOCUS_LABELS.items():
+        for value, label in FIGHTING_FOCUS_LABELS.items():
             self.combat_focus_combo.addItem(label, value)
         self.magic_enabled_checkbox = QCheckBox(
             "The player character can cast spells at the start"
@@ -1917,23 +2059,21 @@ class NewGameTemplateManagerDialog(QDialog):
         task_form.addRow("Due:", self.starting_task_due_date_input)
         self.starting_task_custom_group.setLayout(task_form)
 
-        self.music_enabled_checkbox = QCheckBox("Music enabled")
+        self.music_enabled_checkbox = FeatureToggleCheckBox('Music')
         self.music_volume_slider = QSlider(Qt.Orientation.Horizontal)
         self.music_volume_slider.setRange(0, 100)
         self.music_volume_label = QLabel()
         self.music_volume_slider.valueChanged.connect(
             lambda value: self.music_volume_label.setText(f"{value}%")
         )
-        self.sound_effects_enabled_checkbox = QCheckBox("Sound effects enabled")
+        self.sound_effects_enabled_checkbox = FeatureToggleCheckBox('Sound effects')
         self.sound_effects_volume_slider = QSlider(Qt.Orientation.Horizontal)
         self.sound_effects_volume_slider.setRange(0, 100)
         self.sound_effects_volume_label = QLabel()
         self.sound_effects_volume_slider.valueChanged.connect(
             lambda value: self.sound_effects_volume_label.setText(f"{value}%")
         )
-        self.background_ambience_enabled_checkbox = QCheckBox(
-            "Background ambience enabled"
-        )
+        self.background_ambience_enabled_checkbox = FeatureToggleCheckBox('Background ambience')
         self.background_ambience_volume_slider = QSlider(Qt.Orientation.Horizontal)
         self.background_ambience_volume_slider.setRange(0, 100)
         self.background_ambience_volume_label = QLabel()
@@ -1974,14 +2114,14 @@ class NewGameTemplateManagerDialog(QDialog):
         tabs = QTabWidget()
         tabs.addTab(_scrollable_widget(self._build_overview_tab()), "Overview")
         tabs.addTab(_scrollable_widget(self._build_character_tab()), "Character")
-        tabs.addTab(_scrollable_widget(self._build_skills_tab()), "Skills")
+        tabs.addTab(_scrollable_widget(self._build_skills_tab()), "Stats")
         tabs.addTab(_scrollable_widget(self._build_starting_task_tab()), "Starting Quest")
         tabs.addTab(_scrollable_widget(self._build_locations_tab()), "Locations")
         tabs.addTab(_scrollable_widget(self._build_npcs_tab()), "NPCs")
         tabs.addTab(_scrollable_widget(self._build_party_tab()), "Party")
         tabs.addTab(_scrollable_widget(self._build_world_tab()), "Inventory & World")
         tabs.addTab(_scrollable_widget(self._build_magic_tab()), "Magic")
-        tabs.addTab(_scrollable_widget(self._build_combat_tab()), "Combat")
+        tabs.addTab(_scrollable_widget(self._build_combat_tab()), "Fighting frequency")
         tabs.addTab(_scrollable_widget(self._build_audio_tab()), "Audio")
 
         close_button = QPushButton("Close")
@@ -2033,6 +2173,7 @@ class NewGameTemplateManagerDialog(QDialog):
         form.addRow("Name Pronunciation:", self.character_name_pronunciation_input)
         form.addRow("Appearance:", self.appearance_input)
         form.addRow("Backstory:", self.backstory_input)
+        form.addRow("Base carrying capacity:", self.character_capacity_input)
         form.addRow("Notes:", self.character_notes_input)
 
         tab = QWidget()
@@ -2048,6 +2189,26 @@ class NewGameTemplateManagerDialog(QDialog):
             self.skill_preset_combo.addItem(label, key)
         layout.addWidget(QLabel("Starting Skill Profile"))
         layout.addWidget(self.skill_preset_combo)
+        self.rank_baseline_combo = _NoWheelComboBox()
+        for rank in ("professional", "experienced", "average", "beginner", "blank"):
+            self.rank_baseline_combo.addItem(rank.title(), rank)
+        layout.addWidget(self.rank_baseline_combo)
+        self.attribute_inputs = {}
+        attributes_form = QFormLayout()
+        for attribute in ATTRIBUTES:
+            control = _NoWheelSpinBox()
+            control.setRange(8, 18)
+            control.setValue(8)
+            self.attribute_inputs[attribute] = control
+            attributes_form.addRow(attribute, control)
+        layout.addLayout(attributes_form)
+        self.template_stats_summary = QLabel()
+        layout.addWidget(self.template_stats_summary)
+        for control in self.attribute_inputs.values():
+            control.valueChanged.connect(self._refresh_template_stats)
+        self.rank_baseline_combo.currentIndexChanged.connect(self._refresh_template_stats)
+        self.skill_preset_combo.currentIndexChanged.connect(self._refresh_template_stats)
+
         for level in range(5, 0, -1):
             group = QGroupBox(f"Level {level}")
             group_layout = QVBoxLayout()
@@ -2071,6 +2232,13 @@ class NewGameTemplateManagerDialog(QDialog):
         tab = QWidget()
         tab.setLayout(layout)
         return tab
+
+    def _refresh_template_stats(self, _index=None) -> None:
+        if not hasattr(self, "template_stats_summary"):
+            return
+        budget, level = rank_stats(str(self.skill_preset_combo.currentData()), str(self.rank_baseline_combo.currentData()))
+        remaining = budget - point_buy_cost({a: w.value() for a, w in self.attribute_inputs.items()})
+        self.template_stats_summary.setText(f"Level {level} · Budget {budget} · Remaining {remaining}; finish allocating in New Game.")
 
     def _build_starting_task_tab(self) -> QWidget:
         layout = QVBoxLayout()
@@ -2114,6 +2282,15 @@ class NewGameTemplateManagerDialog(QDialog):
             form.addRow("Narration / TTS:", self.template_tts_settings_widget)
         tab = QWidget()
         tab.setLayout(form)
+        self.music_enabled_checkbox.bind_form_children(
+            form, self.music_volume_slider, self.music_test_button,
+        )
+        self.sound_effects_enabled_checkbox.bind_form_children(
+            form, self.sound_effects_volume_slider, self.sound_effects_test_button,
+        )
+        self.background_ambience_enabled_checkbox.bind_form_children(
+            form, self.background_ambience_volume_slider, self.background_ambience_test_button,
+        )
         return tab
 
     def _test_music_preview(self) -> None:
@@ -2242,10 +2419,9 @@ class NewGameTemplateManagerDialog(QDialog):
         """Builds combat focus and resolution preferences."""
 
         form = QFormLayout()
-        form.addRow("Combat Focus:", self.combat_focus_combo)
-        form.addRow("Combat Resolution:", self.combat_resolution_mode_combo)
+        form.addRow("Fighting frequency:", self.combat_focus_combo)
         note = QLabel(
-            "Narrative / Gemini-managed combat hides deterministic weapon and armor editors."
+            "Fighting is narrated; uncertain actions use application-owned d20 tests."
         )
         note.setWordWrap(True)
         form.addRow("", note)
@@ -2275,7 +2451,7 @@ class NewGameTemplateManagerDialog(QDialog):
         """Keeps Basic/Advanced and narrative-combat item sections aligned."""
 
         advanced = self.starter_inventory_mode_combo.currentData() == "advanced"
-        narrative = self.combat_resolution_mode_combo.currentData() == "narrative"
+        narrative = False
         for widget in (
             self.starter_items_table,
             self.starter_items_controls,
@@ -2312,10 +2488,7 @@ class NewGameTemplateManagerDialog(QDialog):
     def _load_template_combat(self, raw_combat: Any) -> None:
         combat = raw_combat if isinstance(raw_combat, dict) else {}
         _set_combo_to_data(self.combat_focus_combo, combat.get("focus", "balanced"))
-        _set_combo_to_data(
-            self.combat_resolution_mode_combo,
-            combat.get("resolution_mode", "strict"),
-        )
+
 
     def _load_template_magic(self, raw_magic: Any) -> None:
         magic = raw_magic if isinstance(raw_magic, dict) else {}
@@ -2425,6 +2598,8 @@ class NewGameTemplateManagerDialog(QDialog):
 
         for index, template in enumerate(self.templates):
             self.template_list.addItem(template.name)
+            if not template.compatible:
+                self.template_list.item(index).setToolTip("Older rules: incompatible with Stats; kept for reference.")
 
             if selected_key and template.name.casefold() == selected_key:
                 selected_row = index
@@ -2508,6 +2683,10 @@ class NewGameTemplateManagerDialog(QDialog):
             return
 
         template = self.templates[row]
+        if not template.compatible:
+            QMessageBox.information(self, "Older rules template", "This template is kept unchanged for reference and is incompatible with Stats. Use New Template to create a Stats template.")
+            self._new_template()
+            return
         self.active_template_name = template.name
         self.active_setup = deepcopy(template.setup)
         self._load_setup_into_editor(template.name, deepcopy(template.setup))
@@ -2671,7 +2850,7 @@ class NewGameTemplateManagerDialog(QDialog):
                     if str(value).strip()
                 )
             )
-            self._load_template_combat(setup.get("combat", {}))
+            self._load_template_combat(setup.get("fighting", {}))
             self._load_template_magic(setup.get("magic", {}))
             self._load_template_wealth(setup.get("starting_wealth", {}))
 
@@ -2708,6 +2887,7 @@ class NewGameTemplateManagerDialog(QDialog):
             self.no_starting_npcs_checkbox.blockSignals(False)
             self._sync_template_no_starting_npcs_controls()
 
+            self.character_capacity_input.setValue(float(character.get("carrying_capacity_lb", 50)))
             self.character_name_input.setText(str(character.get("name", "") or ""))
             self.character_name_pronunciation_input.setText(
                 str(character.get("name_pronunciation", "") or "")
@@ -2748,6 +2928,13 @@ class NewGameTemplateManagerDialog(QDialog):
                     )
                 self._sync_template_skill_inputs()
 
+            _set_combo_to_data(self.rank_baseline_combo, setup.get("rank_baseline", "professional"))
+            budget, _ = rank_stats(str(self.skill_preset_combo.currentData()), str(self.rank_baseline_combo.currentData()))
+            defaults = starting_attributes(budget)
+            saved_attributes = (setup.get("character") or {}).get("attributes", defaults)
+            for attribute, control in self.attribute_inputs.items():
+                control.setValue(saved_attributes.get(attribute, defaults[attribute]))
+            self._refresh_template_stats()
             skills = self._skills_for_editor(setup.get("skills", []))
             self._load_template_skills(skills)
 
@@ -2993,12 +3180,17 @@ class NewGameTemplateManagerDialog(QDialog):
             "appearance": self.appearance_input.toPlainText().strip(),
             "backstory": self.backstory_input.toPlainText().strip(),
             "notes": self.character_notes_input.toPlainText().strip(),
+            "carrying_capacity_lb": self.character_capacity_input.value(),
         }
         setup["skills"] = [
             skill for level in range(5, 0, -1)
             for skill in self._template_skills_from_table(level)
         ]
         setup["skill_preset"] = str(self.skill_preset_combo.currentData() or "professional")
+        setup["rank_baseline"] = str(self.rank_baseline_combo.currentData() or "professional")
+        setup["character"]["attributes"] = {a: w.value() for a, w in self.attribute_inputs.items()}
+        if not self.active_setup or self.active_setup.get("rules_version") == RULES_VERSION:
+            setup["rules_version"] = RULES_VERSION
         setup["skill_level_plan"] = [level for level, _name, _description in self.skill_inputs]
         setup["starter_items"] = [
             *self._starter_items_from_table(),
@@ -3040,9 +3232,8 @@ class NewGameTemplateManagerDialog(QDialog):
 
         setup["starting_task"] = self._template_starting_task_from_controls()
         setup["starting_weather"] = self.calendar_start_weather_input.text().strip()
-        setup["combat"] = {
+        setup["fighting"] = {
             "focus": self.combat_focus_combo.currentData() or "balanced",
-            "resolution_mode": self.combat_resolution_mode_combo.currentData() or "strict",
         }
         setup["magic"] = {
             "world_contains_magic": not self.magic_no_world_checkbox.isChecked(),
@@ -3588,7 +3779,9 @@ class NewGameTemplateManagerDialog(QDialog):
             description = self.starter_items_table.cellWidget(row, 3)
             value = self.starter_items_table.cellWidget(row, 4)
             storage = self.starter_items_table.cellWidget(row, 5)
+            _set_starter_mobility_controls(self.starter_items_table, row, 6, item)
             if isinstance(name, QLineEdit):
+                name.setProperty("starterItemSource", dict(item))
                 name.setText(str(item.get("name", "")))
             if isinstance(quantity, QSpinBox):
                 quantity.setValue(_safe_int(item.get("quantity", 1), 1))
@@ -3632,7 +3825,7 @@ class NewGameTemplateManagerDialog(QDialog):
         )
 
     def _load_starter_weapon_rows(self, items: list[dict[str, Any]]) -> None:
-        """Loads exact starter weapons while reusing existing row editors."""
+        """Loads exact starter items while reusing existing row editors."""
 
         self._resize_template_table(
             self.starter_weapons_table,
@@ -3642,38 +3835,31 @@ class NewGameTemplateManagerDialog(QDialog):
         for row, item in enumerate(items):
             name = self.starter_weapons_table.cellWidget(row, 0)
             quantity = self.starter_weapons_table.cellWidget(row, 1)
-            hands = self.starter_weapons_table.cellWidget(row, 2)
-            damage = self.starter_weapons_table.cellWidget(row, 3)
-            attack_skill = self.starter_weapons_table.cellWidget(row, 4)
-            attack_range = self.starter_weapons_table.cellWidget(row, 5)
-            ammunition = self.starter_weapons_table.cellWidget(row, 6)
-            clip_size = self.starter_weapons_table.cellWidget(row, 7)
+            category = self.starter_weapons_table.cellWidget(row, 2)
+            description = self.starter_weapons_table.cellWidget(row, 3)
+            value = self.starter_weapons_table.cellWidget(row, 4)
+            storage = self.starter_weapons_table.cellWidget(row, 5)
+            _set_starter_mobility_controls(self.starter_weapons_table, row, 6, item)
             if isinstance(name, QLineEdit):
+                name.setProperty("starterItemSource", dict(item))
                 name.setText(str(item.get("name", "")))
             if isinstance(quantity, QSpinBox):
                 quantity.setValue(_safe_int(item.get("quantity", 1), 1))
-            if isinstance(hands, QComboBox):
-                _set_combo_to_data(
-                    hands,
-                    _metadata_text(item, "weapon_hands", "one-handed")
-                    or "one-handed",
-                )
-            if isinstance(damage, QLineEdit):
-                damage.setText(_metadata_text(item, "damage", "1d6") or "1d6")
-            if isinstance(attack_skill, QLineEdit):
-                attack_skill.setText(
-                    _metadata_text(item, "attack_skill", "Melee") or "Melee"
-                )
-            if isinstance(attack_range, QSpinBox):
-                attack_range.setValue(
-                    max(0, _metadata_int(item, "attack_range_feet", 5))
-                )
-            if isinstance(ammunition, QLineEdit):
-                ammunition.setText(
-                    _metadata_text(item, "ammunition_type_required")
-                )
-            if isinstance(clip_size, QSpinBox):
-                clip_size.setValue(max(0, _metadata_int(item, "clip_size", 0)))
+            if isinstance(category, QLineEdit):
+                category.setText(str(item.get("category", "Item") or "Item"))
+            if isinstance(description, QLineEdit):
+                description.setText(str(item.get("description", "")))
+            if isinstance(value, QSpinBox):
+                value.setValue(_safe_int(item.get("value_base_units", 0), 0))
+            if isinstance(storage, QComboBox):
+                storage_value = str(
+                    item.get("storage_location", "actively_carried")
+                    or "actively_carried"
+                ).strip()
+                if storage.findData(storage_value) >= 0:
+                    _set_combo_to_data(storage, storage_value)
+                else:
+                    storage.setEditText(storage_value)
 
     def _remove_starter_weapon_row(self, button: QPushButton) -> None:
         """Removes the starter weapon row containing button."""
@@ -3690,7 +3876,7 @@ class NewGameTemplateManagerDialog(QDialog):
         )
 
     def _load_starter_armor_rows(self, items: list[dict[str, Any]]) -> None:
-        """Loads exact starter armor while reusing existing row editors."""
+        """Loads exact starter items while reusing existing row editors."""
 
         self._resize_template_table(
             self.starter_armor_table,
@@ -3700,29 +3886,31 @@ class NewGameTemplateManagerDialog(QDialog):
         for row, item in enumerate(items):
             name = self.starter_armor_table.cellWidget(row, 0)
             quantity = self.starter_armor_table.cellWidget(row, 1)
-            covers = self.starter_armor_table.cellWidget(row, 2)
-            armor_rating = self.starter_armor_table.cellWidget(row, 3)
+            category = self.starter_armor_table.cellWidget(row, 2)
+            description = self.starter_armor_table.cellWidget(row, 3)
             value = self.starter_armor_table.cellWidget(row, 4)
-            raw_covers = item.get("covers_body_parts")
-            if not isinstance(raw_covers, list) and isinstance(
-                item.get("metadata"), dict
-            ):
-                raw_covers = item["metadata"].get("covers_body_parts")
-            covers_parts = raw_covers if isinstance(raw_covers, list) else []
+            storage = self.starter_armor_table.cellWidget(row, 5)
+            _set_starter_mobility_controls(self.starter_armor_table, row, 6, item)
             if isinstance(name, QLineEdit):
+                name.setProperty("starterItemSource", dict(item))
                 name.setText(str(item.get("name", "")))
             if isinstance(quantity, QSpinBox):
                 quantity.setValue(_safe_int(item.get("quantity", 1), 1))
-            if isinstance(covers, QLineEdit):
-                covers.setText(
-                    ", ".join(str(part) for part in covers_parts if part is not None)
-                )
-            if isinstance(armor_rating, QSpinBox):
-                armor_rating.setValue(
-                    max(0, _metadata_int(item, "armor_rating", 1))
-                )
+            if isinstance(category, QLineEdit):
+                category.setText(str(item.get("category", "Item") or "Item"))
+            if isinstance(description, QLineEdit):
+                description.setText(str(item.get("description", "")))
             if isinstance(value, QSpinBox):
                 value.setValue(_safe_int(item.get("value_base_units", 0), 0))
+            if isinstance(storage, QComboBox):
+                storage_value = str(
+                    item.get("storage_location", "actively_carried")
+                    or "actively_carried"
+                ).strip()
+                if storage.findData(storage_value) >= 0:
+                    _set_combo_to_data(storage, storage_value)
+                else:
+                    storage.setEditText(storage_value)
 
     def _load_starter_suggestion_rows(
         self,
@@ -4304,6 +4492,8 @@ class InventoryItemDetailsDialog(QDialog):
         on_select_image: Callable[[], Any] | None = None,
         on_create_image: Callable[[], Any] | None = None,
         show_structured_details: bool = False,
+        on_move: Callable[[], Any] | None = None,
+        move_disabled_reason: str = "",
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -4337,6 +4527,17 @@ class InventoryItemDetailsDialog(QDialog):
         title.setText(f"{name}{quantity_suffix}")
         self.setWindowTitle(title.text())
         summary = QFormLayout()
+        item_metadata = item.get("metadata") or {}
+        weight = item_metadata.get("weight_lb")
+        summary.addRow("Weight:", _selectable_label("Unspecified" if weight is None else f"{weight:g} lb per {quantity_unit}; {weight * quantity:g} lb total (empty weight for containers)"))
+        if isinstance(item_metadata.get("container"), dict):
+            capacity = item_metadata.get("carrying_capacity_lb")
+            summary.addRow("Cargo capacity:", _selectable_label("Unspecified" if capacity is None else f"{capacity:g} lb"))
+            if item_metadata.get("item_type") == "Vehicle":
+                summary.addRow("Carrying:", _selectable_label("Independent vehicle cargo pool"))
+            elif capacity is not None:
+                summary.addRow("Carried bonus:", _selectable_label(f"+{capacity:g} lb while directly carried or worn"))
+
         if any(item_is_valid_for_slot(item, slot) for slot in EQUIPMENT_SLOTS):
             summary.addRow(
                 "Equipped:",
@@ -4378,6 +4579,12 @@ class InventoryItemDetailsDialog(QDialog):
             )
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
         buttons.rejected.connect(self.reject)
+        self.move_button = buttons.addButton("Move", QDialogButtonBox.ButtonRole.ActionRole)
+        self.move_button.setObjectName("inventoryMoveButton")
+        self.move_button.setEnabled(on_move is not None and not move_disabled_reason)
+        self.move_button.setToolTip(move_disabled_reason or "Move this item to an accessible container")
+        if on_move is not None:
+            self.move_button.clicked.connect(on_move)
 
         layout = QVBoxLayout()
         layout.addWidget(title)

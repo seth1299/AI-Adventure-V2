@@ -146,7 +146,7 @@ class RepositoryTransactionTests(unittest.TestCase):
             repository=lambda: self.repository,
             _pending_conversation_mode="live_game",
             _pending_message_id="ui-failure",
-            _pending_skill_check_event_results=[],
+            _pending_d20_test_event_results=[],
             narration_player=None,
             _handle_persistence_failure=Mock(),
             _reveal_story_with_narration=Mock(),

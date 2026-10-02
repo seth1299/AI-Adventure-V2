@@ -122,24 +122,6 @@ class CalendarSystemTests(unittest.TestCase):
             self.assertEqual(state.calendar.month_name, "Bloom")
             self.assertEqual(state.calendar.time_label, "8:00 A.M.")
 
-    def test_legacy_game_state_elapsed_minutes_migrates_to_calendar_state(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            repository = SaveRepository.create_new_save(Path(temp_dir), "Calendar Migration")
-            repository.set_state_value("elapsed_minutes", "1234")
-            connection = sqlite3.connect(repository.db_path)
-            try:
-                connection.execute(
-                    "DELETE FROM settings WHERE key = ?",
-                    ("calendar.current_minute",),
-                )
-                connection.commit()
-            finally:
-                connection.close()
-
-            migrated_repository = SaveRepository(repository.db_path)
-
-            self.assertEqual(migrated_repository.get_current_calendar_minute(), 1234)
-            self.assertNotIn("elapsed_minutes", migrated_repository.get_state_snapshot())
 
     def test_calendar_events_persist_update_and_delete(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

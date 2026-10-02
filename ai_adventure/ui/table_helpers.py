@@ -336,6 +336,9 @@ def _configure_auto_height_table(
         return
 
     def refresh_height() -> None:
+        from shiboken6 import isValid
+        if not isValid(table):
+            return
         visible_row_count = min(
             max(1, table.rowCount()),
             max(1, maximum_visible_rows),

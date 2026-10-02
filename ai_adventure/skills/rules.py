@@ -1,6 +1,15 @@
 from __future__ import annotations
 
 
+SKILL_DESCRIPTION_RULE = (
+    "Skill descriptions must describe the skill's uses and scope independently of the "
+    "player's current training level. Do not describe current proficiency with wording "
+    "such as 'basic capability', 'novice understanding', or 'expert mastery'; the level "
+    "field records proficiency separately. For example, use 'Enduring harsh conditions "
+    "and finding shelter' rather than 'Basic capability to endure harsh conditions'."
+)
+MAX_SKILL_XP_RULE = "Master (level 5) skills cannot gain further XP or levels. Do not propose XP awards for them."
+
 MAX_SKILL_LEVEL = 5
 XP_THRESHOLDS_BY_LEVEL = {
     1: 0,
@@ -10,14 +19,14 @@ XP_THRESHOLDS_BY_LEVEL = {
     5: 32,
 }
 DIFFICULTY_DCS = {
-    "trivial": 6,
+    "trivial": 5,
     "easy": 10,
-    "normal": 14,
-    "moderate": 14,
-    "hard": 18,
-    "very hard": 22,
-    "severe": 22,
-    "extreme": 26,
+    "normal": 15,
+    "moderate": 15,
+    "hard": 20,
+    "very hard": 25,
+    "severe": 25,
+    "extreme": 30,
 }
 
 
@@ -30,7 +39,7 @@ def clamp_skill_level(level: int) -> int:
 def bonus_for_level(level: int) -> int:
     """Returns the clear skill bonus for a level."""
 
-    return clamp_skill_level(level) * 2
+    return clamp_skill_level(level)
 
 
 def level_for_xp(current_level: int, xp: int) -> int:

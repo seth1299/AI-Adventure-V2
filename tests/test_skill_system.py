@@ -19,14 +19,14 @@ from ai_adventure.skills.rules import (
 
 class SkillSystemTests(unittest.TestCase):
     def test_skill_rule_math_is_simple_and_predictable(self) -> None:
-        self.assertEqual(bonus_for_level(1), 2)
-        self.assertEqual(bonus_for_level(5), 10)
+        self.assertEqual(bonus_for_level(1), 1)
+        self.assertEqual(bonus_for_level(5), 5)
         level_two_threshold = XP_THRESHOLDS_BY_LEVEL[2]
         self.assertEqual(level_for_xp(1, level_two_threshold - 1), 1)
         self.assertEqual(level_for_xp(1, level_two_threshold), 2)
         self.assertEqual(level_for_xp(2, 70), 5)
         self.assertEqual(dc_for_difficulty("easy"), 10)
-        self.assertEqual(dc_for_difficulty("hard"), 18)
+        self.assertEqual(dc_for_difficulty("hard"), 20)
 
     def test_skill_upsert_and_xp_events_persist_progression(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -37,7 +37,7 @@ class SkillSystemTests(unittest.TestCase):
                 [
                     {
                         "type": "SkillUpsertedEvent",
-                        "payload": {
+                        "payload": {"reason": "Meaningful instruction and practice",
                             "name": "Stealth",
                             "description": "Moving quietly and avoiding notice.",
                             "level": 1,
@@ -57,7 +57,7 @@ class SkillSystemTests(unittest.TestCase):
             assert skill is not None
             self.assertEqual(skill["level"], 2)
             self.assertEqual(skill["xp"], 10)
-            self.assertEqual(skill["bonus"], 4)
+            self.assertEqual(skill["bonus"], 2)
 
     def test_skill_xp_event_without_amount_defaults_to_one_xp(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -110,7 +110,7 @@ class SkillSystemTests(unittest.TestCase):
                 " ".join(str(skill["description"]) for skill in skills),
             )
 
-    def test_skill_check_event_rolls_and_records_result(self) -> None:
+    def test_d20_test_event_rolls_and_records_result(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             repository = SaveRepository.create_new_save(Path(temp_dir), "Skill Test")
             repository.upsert_skill("Athletics", "Physical effort and movement.", 2)
@@ -118,50 +118,31 @@ class SkillSystemTests(unittest.TestCase):
 
             result = applier.apply_event(
                 {
-                    "type": "SkillCheckRequestedEvent",
-                    "payload": {"skill_name": "Athletics", "dc": 12},
+                    "type": "D20TestRequestedEvent",
+                    "payload": {"attribute": 'Strength', "test_kind": "check", "reason": "A consequential uncertain action", "skill_name": "Athletics", "dc": 12},
                 }
             )
-            checks = repository.list_skill_checks()
+            checks = repository.list_d20_tests()
             history = repository.list_history()
 
             self.assertEqual(result.status, "applied")
             self.assertEqual(len(checks), 1)
             self.assertEqual(checks[0]["skill_name"], "Athletics")
-            self.assertEqual(checks[0]["bonus"], 4)
+            self.assertEqual(checks[0]["bonus"], 2)
             self.assertEqual(checks[0]["roll"], 2)
-            self.assertEqual(checks[0]["total"], 6)
+            self.assertEqual(checks[0]["total"], 4)
             self.assertEqual(checks[0]["outcome"], "failure")
             self.assertFalse(
                 any("d20" in str(entry.get("content", "")) for entry in history)
             )
 
-    def test_unknown_skill_check_requires_and_persists_description(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            repository = SaveRepository.create_new_save(Path(temp_dir), "Skill Test")
-            applier = EventApplier(repository, rng=random.Random(2))
-
-            missing_description = applier.apply_event(
-                {"type": "SkillCheckRequestedEvent", "payload": {"skill_name": "Sailing"}}
-            )
-            created = applier.apply_event(
-                {
-                    "type": "SkillCheckRequestedEvent",
-                    "payload": {
-                        "skill_name": "Sailing",
-                        "skill_description": "Operating and navigating watercraft.",
-                        "dc": 10,
-                    },
-                }
-            )
-
-            self.assertEqual(missing_description.status, "skipped")
-            self.assertEqual(created.status, "applied")
-            skill = repository.get_skill("Sailing")
-            self.assertIsNotNone(skill)
-            assert skill is not None
-            self.assertEqual(skill["level"], 1)
-            self.assertEqual(skill["description"], "Operating and navigating watercraft.")
+    def test_unknown_skill_is_not_created_by_a_test(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repository = SaveRepository.create_new_save(Path(directory), "Untrained")
+            result = EventApplier(repository).apply_event({"type": "D20TestRequestedEvent", "payload": {
+                "attribute": "Dexterity", "test_kind": "check", "skill_name": "Sailing", "reason": "Navigate stormy water", "dc": 15}})
+            self.assertEqual(result.status, "skipped")
+            self.assertIsNone(repository.get_skill("Sailing"))
 
     def test_state_manager_and_context_include_skills(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -169,8 +150,8 @@ class SkillSystemTests(unittest.TestCase):
             repository.upsert_skill("Alchemy", "Preparing and combining reagents.", 3)
             EventApplier(repository, rng=random.Random(5)).apply_event(
                 {
-                    "type": "SkillCheckRequestedEvent",
-                    "payload": {"skill_name": "Alchemy", "difficulty": "easy"},
+                    "type": "D20TestRequestedEvent",
+                    "payload": {"attribute": 'Intelligence', "test_kind": "check", "reason": "A consequential uncertain action", "skill_name": "Alchemy", "difficulty": "easy"},
                 }
             )
 
@@ -181,13 +162,13 @@ class SkillSystemTests(unittest.TestCase):
             )
 
             self.assertEqual(state.skills.skills[0].name, "Alchemy")
-            self.assertEqual(state.skills.skills[0].bonus, 6)
+            self.assertEqual(state.skills.skills[0].bonus, 3)
             self.assertEqual(state.skills.recent_checks[0].skill_name, "Alchemy")
             self.assertIn("skill", infer_context_tags("Roll a skill check"))
             self.assertEqual(packet["state"]["skills"]["known_skills"][0]["name"], "Alchemy")
-            self.assertEqual(packet["state"]["skills"]["rules"]["bonus_formula"], "level * 2")
+            self.assertEqual(packet["state"]["skills"]["rules"]["bonus_formula"], "skill level (+1 per level)")
             self.assertIn(
-                "SkillCheckRequestedEvent",
+                "D20TestRequestedEvent",
                 packet["state"]["skills"]["rules"]["uncertain_action_rule"],
             )
             self.assertIn(

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from ai_adventure.audio.tts_settings import DEFAULT_TTS_VOLUME_PERCENT
+
 import importlib
 import logging
 import re
@@ -25,12 +27,13 @@ from ai_adventure.application.audio_preferences_service import AudioPreferencesS
 from ai_adventure.application.save_game_service import SaveGameService
 from ai_adventure.audio.pronunciation import apply_pronunciation_map
 from ai_adventure.audio.tts_settings import (
+    read_tts_audio_settings,
+    active_player_voice_spec_from_audio,
     DEFAULT_TTS_SPEED_PERCENT,
     active_voice_spec_from_audio,
     merge_custom_voices,
     normalize_custom_voices,
     normalize_narrator_voice_spec,
-    normalize_tts_audio_fields,
     normalize_tts_speed_percent,
     normalize_tts_voice_mode,
     normalize_voice_blend,
@@ -48,7 +51,7 @@ from ai_adventure.ui.primitives import _set_combo_to_data
 
 LOGGER = logging.getLogger(__name__)
 THEME_NAMES = {"Light", "Dark"}
-SampleVoiceCallback = Callable[[str, int, int], bool]
+SampleVoiceCallback = Callable[..., bool]
 
 class SoundManagerProtocol(Protocol):
     def get_valid_track_names(self) -> list[str]: ...
@@ -128,6 +131,9 @@ def apply_application_theme(
         return
 
     clean_theme = _normalize_theme_name(theme)
+    # Qt's stylesheet repolish resolves widget fonts from the application font.
+    # Set it first, or existing styled widgets retain the previous selection.
+    _apply_application_font(app, appearance)
 
     if clean_theme == "Dark":
         app.setPalette(_dark_theme_palette())
@@ -138,8 +144,6 @@ def apply_application_theme(
     else:
         app.setPalette(_light_theme_palette())
         app.setStyleSheet(_light_theme_stylesheet())
-
-    _apply_application_font(app, appearance)
 
 
 def _apply_application_font(
@@ -272,17 +276,7 @@ def _apply_audio_settings_to_managers(
         0,
         100,
     )
-    tts_audio = normalize_tts_audio_fields(
-        {
-            "narrator_enabled": narrator_enabled,
-            "tts_volume": repository.get_setting("audio.tts_volume", 90),
-            "tts_voice": repository.get_setting("audio.tts_voice", DEFAULT_NARRATOR_VOICE),
-            "tts_speed": repository.get_setting("audio.tts_speed", DEFAULT_TTS_SPEED_PERCENT),
-            "tts_voice_mode": repository.get_setting("audio.tts_voice_mode", "preset"),
-            "tts_voice_blend": repository.get_setting("audio.tts_voice_blend", {}),
-            "tts_custom_voices": repository.get_setting("audio.tts_custom_voices", []),
-        }
-    )
+    tts_audio = read_tts_audio_settings(repository.get_setting)
     tts_volume = int(tts_audio["tts_volume"])
     tts_voice = active_voice_spec_from_audio(tts_audio)
     tts_speed = int(tts_audio["tts_speed"])
@@ -326,7 +320,9 @@ def _apply_audio_settings_to_managers(
     if narration_player is not None and hasattr(narration_player, "set_voice"):
         narration_player.set_voice(tts_voice)
     if narration_player is not None and hasattr(narration_player, "set_enabled"):
-        narration_player.set_enabled(narrator_enabled)
+        narration_player.set_enabled(tts_audio["narrator_enabled"] or tts_audio["player_enabled"])
+        if hasattr(narration_player, "set_speaker_preferences"):
+            narration_player.set_speaker_preferences(tts_audio)
 
 
 def _resolve_speaker_cues_for_repository(
@@ -336,22 +332,7 @@ def _resolve_speaker_cues_for_repository(
 ) -> list[dict[str, str]]:
     """Assigns installed voices and persists stable speaker-to-voice IDs."""
 
-    tts_audio = normalize_tts_audio_fields(
-        {
-            "tts_voice": repository.get_setting(
-                "audio.tts_voice", DEFAULT_NARRATOR_VOICE
-            ),
-            "tts_voice_mode": repository.get_setting(
-                "audio.tts_voice_mode", "preset"
-            ),
-            "tts_voice_blend": repository.get_setting(
-                "audio.tts_voice_blend", {}
-            ),
-            "player_tts_voice": repository.get_setting(
-                "audio.player_tts_voice", "ai"
-            ),
-        }
-    )
+    tts_audio = read_tts_audio_settings(repository.get_setting)
     voice_options = _narrator_voice_options(narration_player)
     existing_assignments = repository.get_setting(
         "audio.speaker_voice_assignments",
@@ -368,7 +349,7 @@ def _resolve_speaker_cues_for_repository(
             str(repository.get_setting("player_name", "")).casefold(),
         },
         player_pronouns=repository.get_setting("player.pronouns", "They/Them"),
-        player_voice=tts_audio["player_tts_voice"],
+        player_voice=active_player_voice_spec_from_audio(tts_audio),
     )
     if assignments != existing_assignments:
         repository.set_setting("audio.speaker_voice_assignments", assignments)
@@ -752,12 +733,15 @@ def _invoke_sample_voice_callback(
     voice: str,
     volume: int,
     speed: int,
+    *, text: str | None = None,
 ) -> bool:
     """Calls a sample-voice callback with its complete voice settings."""
 
     if callback is None:
         return False
 
+    if text is not None:
+        return bool(callback(voice, volume, speed, text=text))
     return bool(callback(voice, volume, speed))
 
 

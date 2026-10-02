@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+from ai_adventure.audio.tts_settings import DEFAULT_TTS_VOLUME_PERCENT
+
 from typing import Any, Protocol
 
 from ai_adventure.audio.tts_settings import (
+    read_tts_audio_settings,
+    active_player_voice_spec_from_audio,
     DEFAULT_TTS_SPEED_PERCENT,
     active_voice_spec_from_audio,
-    normalize_tts_audio_fields,
 )
 from ai_adventure.audio.voices import DEFAULT_NARRATOR_VOICE
 from ai_adventure.infrastructure.sqlite import SaveRepository
@@ -76,20 +79,11 @@ class AudioPreferencesService:
             elif hasattr(sound_manager, "stop_background_ambience"):
                 sound_manager.stop_background_ambience(clear_current=False)
 
-        tts_audio = normalize_tts_audio_fields(
-            {
-                "narrator_enabled": narrator_enabled,
-                "tts_volume": get("audio.tts_volume", 90),
-                "tts_voice": get("audio.tts_voice", DEFAULT_NARRATOR_VOICE),
-                "player_tts_voice": get("audio.player_tts_voice", "ai"),
-                "tts_speed": get("audio.tts_speed", DEFAULT_TTS_SPEED_PERCENT),
-                "tts_voice_mode": get("audio.tts_voice_mode", "preset"),
-                "tts_voice_blend": get("audio.tts_voice_blend", {}),
-                "tts_custom_voices": get("audio.tts_custom_voices", []),
-            }
-        )
+        tts_audio = read_tts_audio_settings(get)
         if narration_player is not None:
             narration_player.set_volume(int(tts_audio["tts_volume"]))
             narration_player.set_speed(int(tts_audio["tts_speed"]))
             narration_player.set_voice(active_voice_spec_from_audio(tts_audio))
-            narration_player.set_enabled(narrator_enabled)
+            narration_player.set_enabled(tts_audio["narrator_enabled"] or tts_audio["player_enabled"])
+            if hasattr(narration_player, "set_speaker_preferences"):
+                narration_player.set_speaker_preferences(tts_audio)

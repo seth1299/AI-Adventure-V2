@@ -4,6 +4,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Any
 
 from ai_adventure.locations import KnownLocation
+from ai_adventure.stats import ATTRIBUTES
 
 
 @dataclass
@@ -31,7 +32,14 @@ class PlayerState:
     notes: str = ""
     health_current: int = 20
     health_max: int = 20
-    armor_rating: int = 10
+    attributes: dict[str, int] = field(default_factory=lambda: dict.fromkeys(ATTRIBUTES, 10))
+    modifiers: dict[str, int] = field(default_factory=lambda: dict.fromkeys(ATTRIBUTES, 0))
+    level: int = 1
+    xp: int = 0
+    progression_records: list[dict[str, Any]] = field(default_factory=list)
+    reward_choices: int = 0
+    skill_advances: int = 0
+    carrying_capacity_lb: float = 50.0
     equipment: dict[str, str] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -304,7 +312,7 @@ class Skill:
     description: str = ""
     level: int = 1
     xp: int = 0
-    bonus: int = 2
+    bonus: int = 1
 
     def to_dict(self) -> dict[str, Any]:
         """Returns a JSON-serializable skill dictionary."""
@@ -313,16 +321,22 @@ class Skill:
 
 
 @dataclass
-class SkillCheck:
-    """One resolved skill check."""
+class D20Test:
+    """One resolved d20 test."""
 
     id: int | None = None
+    attribute: str = "Strength"
+    test_kind: str = "check"
+    attribute_modifier: int = 0
+    skill_bonus: int = 0
+    rolls: list[int] = field(default_factory=list)
+    reason: str = ""
     skill_name: str = ""
-    level: int = 1
-    bonus: int = 2
+    level: int = 0
+    bonus: int = 1
     roll: int = 0
     total: int = 0
-    dc: int = 14
+    dc: int = 15
     outcome: str = "failure"
     created_at: str = ""
 
@@ -334,10 +348,10 @@ class SkillCheck:
 
 @dataclass
 class SkillsState:
-    """Player skills and recent skill checks."""
+    """Player skills and recent d20 tests."""
 
     skills: list[Skill] = field(default_factory=list)
-    recent_checks: list[SkillCheck] = field(default_factory=list)
+    recent_checks: list[D20Test] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         """Returns a JSON-serializable skills-state dictionary."""

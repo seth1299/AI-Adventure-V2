@@ -2,14 +2,14 @@
 
 from ai_adventure.ui.workers.gemini import (
     GeminiNewGameWorker,
-    GeminiSkillCheckPlanWorker,
+    GeminiD20TestPlanWorker,
     GeminiStoryWorker,
     GeminiVisualAssetWorker,
 )
 
 __all__ = [
     "GeminiNewGameWorker",
-    "GeminiSkillCheckPlanWorker",
+    "GeminiD20TestPlanWorker",
     "GeminiStoryWorker",
     "GeminiVisualAssetWorker",
 ]
