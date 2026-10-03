@@ -11,6 +11,82 @@ from ai_adventure.ai.request_metrics import CURRENT_METRICS, measured_operation
 
 
 class GeminiContractTests(unittest.TestCase):
+    def test_stats_schemas_allow_untrained_tests_and_reject_retired_contracts(self):
+        from ai_adventure.context.context_builder import AiContextBuilder
+        from ai_adventure.core.models import AdventureState
+
+        packet = AiContextBuilder.from_default_library().build_story_context(
+            AdventureState(), player_command="Climb a dangerous cliff",
+        )
+        event = {"type": "D20TestRequestedEvent", "payload": {
+            "attribute": "Strength", "test_kind": "check", "reason": "Climb the cliff", "dc": 15,
+        }}
+        for for_api in (False, True):
+            schema = g.build_story_response_schema(packet, for_api=for_api)
+            response = {"response": "The cliff rises above you.", "suggested_actions": [],
+                        "events": [event], "out_of_game": False}
+            self.assertEqual(g._json_schema_shape_errors(response, schema), [])
+            self.assertNotIn("SkillCheckRequestedEvent", json.dumps(schema))
+            self.assertNotIn("skill_description", json.dumps(schema["properties"]["events"]["items"]))
+            invalid = {**response, "events": [{**event, "type": "SkillCheckRequestedEvent"}]}
+            self.assertTrue(g._json_schema_shape_errors(invalid, schema))
+        plan = {"checks": [event["payload"]], "relevant_tags": []}
+        self.assertEqual(g._json_schema_shape_errors(plan, g.D20_TEST_PLAN_RESPONSE_JSON_SCHEMA), [])
+        plan["checks"] = [{**event["payload"], "skill_description": "Climb surfaces"}]
+        self.assertTrue(g._json_schema_shape_errors(plan, g.D20_TEST_PLAN_RESPONSE_JSON_SCHEMA))
+
+    def test_packaged_stats_guidance_matches_progression_contracts(self):
+        from ai_adventure.context.reference_loader import ContextReferenceLoader
+        from ai_adventure.skills.rules import SKILL_TRAINING_SOURCE_RULE
+        from ai_adventure.stats import PLAYER_ACHIEVEMENT_RULE
+
+        sections = {section.id: section for section in ContextReferenceLoader().load_default_library().sections}
+        guidance = sections["skills.default_guidance"].content["guidelines"]
+        text = " ".join(guidance)
+        self.assertIn("omit skill_name", text)
+        self.assertIn("Tests never create skills", text)
+        self.assertNotIn("so Python can create", text)
+        self.assertNotIn("event.combat_started", sections)
+        self.assertIn(SKILL_TRAINING_SOURCE_RULE, guidance)
+        training = sections["event.add_xp"].content
+        self.assertIn("source_id", training["payload_fields"])
+        self.assertIn(SKILL_TRAINING_SOURCE_RULE, training["rules"])
+        self.assertIn(PLAYER_ACHIEVEMENT_RULE, sections["events.player_achievement"].content["rules"])
+
+    def test_story_and_planner_prompts_preserve_stats_authority_without_duplicates(self):
+        from ai_adventure.context.context_builder import AiContextBuilder
+        from ai_adventure.core.models import AdventureState
+        from ai_adventure.skills.rules import SKILL_TRAINING_SOURCE_RULE
+        from ai_adventure.stats import PLAYER_ACHIEVEMENT_RULE, STATS_RULE
+        from ai_adventure.story_preferences import FIGHTING_FOCUS_INSTRUCTIONS
+
+        state = AdventureState()
+        state.settings.values["fighting.focus"] = "low"
+        state.player.attributes["Strength"] = 14
+        state.player.modifiers["Strength"] = 2
+        for command in ("Fight the guard", "Climb a dangerous cliff", "Finish the rescue quest"):
+            with self.subTest(command=command):
+                packet = AiContextBuilder.from_default_library().build_story_context(state, player_command=command)
+                prompt = g.build_gemini_story_prompt(packet)
+                self.assertEqual(prompt.count(STATS_RULE), 1)
+                self.assertNotIn('"narrative_fighting"', prompt)
+                self.assertIn(PLAYER_ACHIEVEMENT_RULE, prompt)
+                self.assertIn(SKILL_TRAINING_SOURCE_RULE, prompt)
+                self.assertIn("PlayerHealthChangedEvent", prompt)
+                projected = g._story_prompt_packet(packet)["state"]
+                self.assertEqual(projected["player"]["attributes"]["Strength"], 14)
+                self.assertEqual(projected["player"]["modifiers"]["Strength"], 2)
+                if "fighting" in projected:
+                    self.assertEqual(projected["fighting"]["focus"], "low")
+                    self.assertIn(FIGHTING_FOCUS_INSTRUCTIONS["low"], prompt)
+                planner = g._d20_test_planning_packet(packet)
+                self.assertEqual(planner["player"]["attributes"]["Strength"], 14)
+                self.assertIn(STATS_RULE, g._build_xml_d20_test_plan_prompt(packet))
+        schema = g.build_story_response_schema(packet, for_api=False)
+        self.assertIn(PLAYER_ACHIEVEMENT_RULE, json.dumps(schema))
+        self.assertIn(SKILL_TRAINING_SOURCE_RULE,
+                      json.dumps(g.EVENT_RESPONSE_SCHEMA))
+
     def test_saved_scenario_evaluations(self):
         fixture = json.loads((Path(__file__).parent / "fixtures/gemini_scenarios.json").read_text(encoding="utf-8"))
         self.assertEqual(fixture["version"], 1)

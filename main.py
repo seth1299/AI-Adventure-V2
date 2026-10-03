@@ -9,6 +9,7 @@ from PySide6.QtWidgets import QApplication
 from ai_adventure.app.app_paths import AppPaths
 from ai_adventure.app.logging_setup import configure_logging
 from ai_adventure.ui.main_window import MainWindow
+from ai_adventure.ui.widgets.inputs import install_plain_text_paste
 
 
 def main() -> int:
@@ -25,6 +26,7 @@ def main() -> int:
     logging.info("Starting AI Adventure application.")
 
     app = QApplication(sys.argv)
+    install_plain_text_paste(app)
 
     if app_paths.app_icon_path.exists():
         app_icon = QIcon(str(app_paths.app_icon_path))

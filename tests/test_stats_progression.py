@@ -163,10 +163,6 @@ class StatsProgressionTests(unittest.TestCase):
         required = D20_TEST_PLAN_RESPONSE_JSON_SCHEMA["properties"]["checks"]["items"]["required"]
         self.assertNotIn("skill_name", required)
 
-
-if __name__ == "__main__":
-    unittest.main()
-
     def test_turn_retry_does_not_duplicate_health_xp_or_inventory(self):
         from types import SimpleNamespace
         from ai_adventure.application.story_turn_service import StoryTurnService
@@ -204,15 +200,57 @@ if __name__ == "__main__":
         self.assertFalse(self.repo.get_player_equipment()["Back"])
 
     def test_completed_objective_award_and_message_free_roll_retry(self):
-        objective_id = self.repo.upsert_active_task("Rescue", "Quest", "Rescue the traveler")
+        task = self.repo.upsert_active_task(name="Rescue", category="Quest", description="Rescue the traveler")
+        objective_id = task["id"]
         with self.assertRaises(ValueError):
             self.repo.record_player_achievement(str(objective_id), "standard", "Rescue incomplete", source_kind="objective")
+        self.assertEqual(self.repo.player_stats()["xp"], 0)
+        self.assertFalse(self.repo.list_progression_records())
         self.repo.complete_active_task("Rescue")
         self.repo.record_player_achievement(str(objective_id), "standard", "Rescue completed", source_kind="objective")
+        duplicate = self.repo.record_player_achievement(str(objective_id), "standard", "Retell the rescue", source_kind="objective")
+        self.assertEqual(duplicate["status"], "duplicate")
         self.assertEqual(self.repo.player_stats()["xp"], 25)
         first = self.event({"request_id": "without-message"}, 15, message=None)
         retried = self.event({"request_id": "without-message"}, message=None)
         self.assertEqual(first.payload["roll"], retried.payload["roll"])
+
+    def test_objective_completion_and_award_commit_and_roll_back_together(self):
+        task = self.repo.upsert_active_task(name="Rescue", category="Quest", description="Rescue the traveler")
+        events = [
+            {"type": "ActiveTaskCompletedEvent", "payload": {"name": "Rescue"}},
+            {"type": "PlayerAchievementRecordedEvent", "payload": {
+                "source_id": task["id"], "source_kind": "objective", "significance": "standard",
+                "reason": "Rescue the traveler",
+            }},
+        ]
+        with self.assertRaises(RuntimeError):
+            with self.repo.transaction():
+                results = EventApplier(self.repo, message_id="rescue").apply_events(events)
+                self.assertEqual([result.status for result in results], ["applied", "applied"])
+                raise RuntimeError("Abort the story commit")
+        self.assertEqual(self.repo.player_stats()["xp"], 0)
+        self.assertFalse(self.repo.list_progression_records())
+        self.assertEqual(self.repo.list_active_tasks()[0]["id"], task["id"])
+        self.assertIsNone(self.repo.event_receipt("rescue", "story_commit"))
+        results = EventApplier(self.repo, message_id="rescue").apply_events(events)
+        self.assertEqual([result.status for result in results], ["applied", "applied"])
+        self.assertEqual(self.repo.player_stats()["xp"], 25)
+        self.assertFalse(self.repo.list_active_tasks())
+        EventApplier(self.repo, message_id="rescue").apply_events(events)
+        self.assertEqual(self.repo.player_stats()["xp"], 25)
+
+    def test_training_source_and_message_fallback_deduplication(self):
+        self.repo.upsert_skill("Sailing", "Operate sailing vessels", 1)
+        training = {"type": "SkillXpAddedEvent", "payload": {"skill_name": "Sailing", "xp_amount": 2}}
+        for message, expected in (("lesson", "applied"), ("lesson", "skipped"), ("next-lesson", "applied")):
+            result = EventApplier(self.repo, message_id=message).apply_event(training)
+            self.assertEqual(result.status, expected)
+        training["payload"]["source_id"] = "sailing-instruction"
+        for message, expected in (("instruction", "applied"), ("retelling", "skipped")):
+            result = EventApplier(self.repo, message_id=message).apply_event(training)
+            self.assertEqual(result.status, expected)
+        self.assertEqual(self.repo.get_skill("Sailing")["xp"], 6)
 
     def test_purchased_master_level_preserves_already_earned_partial_training(self):
         self.repo.set_setting("player.skill_advances", 1)
@@ -245,3 +283,7 @@ if __name__ == "__main__":
         StoryTurnService.commit_response(self.repo, result, message_id="healing")
         self.assertEqual(self.repo.player_stats()["health_current"], 15)
         self.assertFalse(self.repo.list_inventory_items())
+
+
+if __name__ == "__main__":
+    unittest.main()

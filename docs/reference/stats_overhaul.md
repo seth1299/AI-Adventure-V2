@@ -8,6 +8,8 @@ Fighting is narrative. Gemini proposes attribute-based checks, attacks, saves, h
 
 - `player_stats.py` owns Player XP, banked rewards, purchased skill advances, health, and d20 history.
 - `progression_records` deduplicates achievements and health consequences using persistent source IDs, and distinguishes purchased skill advances from training XP.
+- Objective achievements use the completed task's exact persistent ID. In a response that completes a task and awards XP, `ActiveTaskCompletedEvent` precedes `PlayerAchievementRecordedEvent`. Milestones retain stable identifiers across retries and retellings.
+- `SkillXpAddedEvent.source_id` is optional and identifies a particular skill training award. Without it, messages deduplicate one award per skill per message; calls without a message ID have no fallback deduplication.
 - `event_receipts` reuses committed event and story results on retries. Receipts, inventory effects, health, rewards, and narration share the repository transaction and message snapshot.
 - Purchased skill advances shift cumulative XP by eight, retaining partial training even when reaching Master. Master skills gain no subsequent training XP or levels.
 - Equipping accessible gear moves it into actively carried inventory. Dropping or storing it clears equipment. Carried containers add capacity; grounded containers and vehicles use their own storage rules.
@@ -21,11 +23,12 @@ The retired mechanical engine and its behavior are preserved in [mechanical_comb
 
 ## Validation on October 2, 2026
 
-Using the project `.venv` with PySide6:
+Contract cleanup validation used the project `.venv` with PySide6 and `QT_QPA_PLATFORM=offscreen`:
 
-- Full offscreen unittest discovery: **653 tests passed** in 260.817 seconds.
-- Regression run after the final supply and Master-training fixes: **231 tests passed** in 73.451 seconds. It covered Stats, point buy, progression, inventory/container capacity and access, provider contracts, story retries, and repository transactions.
-- Native Windows Qt: **three GUI walkthrough tests passed**, covering point buy and rank previews, Stats and reward spending, equipment pickup, and the item's Move dialog. Native widget captures were visually reviewed.
-- Python compilation and `git diff --check` passed. A source audit found no live retired combat events, engine imports, resolution settings, initiative/damage/armor fields, or SkillCheck request contracts.
+- Before cleanup, full discovery passed **653 tests** in 244.787 seconds, but omitted five progression tests defined below the `__main__` guard. That result did not cover those five cases.
+- All five tests now belong to `StatsProgressionTests`; the objective fixture uses keyword arguments and the returned task ID. Five additional regressions cover progression transactions, training deduplication, schemas, packaged defaults, and prompt projection.
+- Focused validation: **257 tests passed** in 38.990 seconds, covering progression, provider contracts, prompt/context construction, skill auditing, New Game, Stats UI, and repository transactions.
+- Full offscreen unittest discovery after cleanup: **663 tests passed** in 246.738 seconds, including the five restored cases and five new regressions.
+- Python compilation and `git diff --check` passed. Story prompts transmit one canonical Stats contract while retaining health/progression guidance, authoritative player attributes, and fighting-focus preferences. Packaged references no longer instruct tests to create skills or contain the obsolete combat-started shell.
 
-Provider contract tests used local responses and mocks; no live Gemini gameplay session was run.
+The earlier overhaul notes reported three native Windows Qt walkthroughs and reviewed widget captures. Those native checks were not rerun during this cleanup; current UI validation was offscreen. Provider contract tests used local responses and mocks; no live Gemini gameplay session was run.

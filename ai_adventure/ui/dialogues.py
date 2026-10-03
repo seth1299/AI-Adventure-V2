@@ -1792,6 +1792,8 @@ class NewGameTemplateManagerDialog(QDialog):
         duplicate_button.clicked.connect(self._duplicate_template)
         save_button = QPushButton("Update Template")
         save_button.clicked.connect(self._save_template)
+        self._template_duplicate_button = duplicate_button
+        self._template_save_button = save_button
         delete_button = QPushButton("Delete")
         delete_button.clicked.connect(self._delete_template)
 
@@ -2112,6 +2114,7 @@ class NewGameTemplateManagerDialog(QDialog):
         left_panel.setMinimumWidth(260)
 
         tabs = QTabWidget()
+        self._template_editor_tabs = tabs
         tabs.addTab(_scrollable_widget(self._build_overview_tab()), "Overview")
         tabs.addTab(_scrollable_widget(self._build_character_tab()), "Character")
         tabs.addTab(_scrollable_widget(self._build_skills_tab()), "Stats")
@@ -2131,6 +2134,13 @@ class NewGameTemplateManagerDialog(QDialog):
         close_row.addWidget(close_button)
 
         editor_layout = QVBoxLayout()
+        self._template_compatibility_label = QLabel(
+            "This older template is incompatible with Stats. You can delete it, "
+            "or use New to create a Stats template."
+        )
+        self._template_compatibility_label.setWordWrap(True)
+        self._template_compatibility_label.hide()
+        editor_layout.addWidget(self._template_compatibility_label)
         editor_layout.addWidget(tabs)
         editor_layout.addLayout(close_row)
 
@@ -2614,11 +2624,15 @@ class NewGameTemplateManagerDialog(QDialog):
 
         self.active_template_name = None
         self.active_setup = {}
+        self._set_template_editable(True)
+        self.template_list.setCurrentRow(-1)
         self.template_list.clearSelection()
         self._load_setup_into_editor("New Template", {})
 
     def _duplicate_template(self) -> None:
         """Creates and selects a copy of the current template."""
+        if not self._template_editor_tabs.isEnabled():
+            return
         source_name = self.active_template_name or self.template_name_input.text().strip()
         if not source_name:
             return
@@ -2684,12 +2698,22 @@ class NewGameTemplateManagerDialog(QDialog):
 
         template = self.templates[row]
         if not template.compatible:
-            QMessageBox.information(self, "Older rules template", "This template is kept unchanged for reference and is incompatible with Stats. Use New Template to create a Stats template.")
-            self._new_template()
+            self._load_setup_into_editor(template.name, {})
+            self.active_template_name = template.name
+            self.active_setup = deepcopy(template.setup)
+            self._set_template_editable(False)
             return
+        self._set_template_editable(True)
         self.active_template_name = template.name
         self.active_setup = deepcopy(template.setup)
         self._load_setup_into_editor(template.name, deepcopy(template.setup))
+
+    def _set_template_editable(self, editable: bool) -> None:
+        """Keeps older templates selectable for deletion without allowing conversion."""
+        self._template_editor_tabs.setEnabled(editable)
+        self._template_save_button.setEnabled(editable)
+        self._template_duplicate_button.setEnabled(editable)
+        self._template_compatibility_label.setVisible(not editable)
 
     @staticmethod
     def _resize_template_table(
@@ -3085,6 +3109,8 @@ class NewGameTemplateManagerDialog(QDialog):
 
     def _save_template(self) -> None:
         """Saves the current editor contents as a reusable template."""
+        if not self._template_editor_tabs.isEnabled():
+            return
 
         template_name = self.template_name_input.text().strip()
 
@@ -3116,7 +3142,11 @@ class NewGameTemplateManagerDialog(QDialog):
     def _delete_template(self) -> None:
         """Deletes the selected reusable template."""
 
-        template_name = self.active_template_name or self.template_name_input.text().strip()
+        row = self.template_list.currentRow()
+        template_name = (
+            self.templates[row].name if 0 <= row < len(self.templates)
+            else self.active_template_name or self.template_name_input.text().strip()
+        )
 
         if not template_name:
             return
@@ -3130,7 +3160,9 @@ class NewGameTemplateManagerDialog(QDialog):
         if result != QMessageBox.StandardButton.Yes:
             return
 
-        if not delete_new_game_template(self.template_path, template_name):
+        if not delete_new_game_template(
+            self.template_path, template_name, legacy_template_path=self.legacy_template_path,
+        ):
             QMessageBox.warning(self, "Template Not Deleted", "Could not delete the template.")
             return
 

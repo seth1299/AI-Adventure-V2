@@ -86,7 +86,9 @@ def save_new_game_template(
     return write_new_game_templates(template_path, templates)
 
 
-def delete_new_game_template(template_path: Path, template_name: str) -> bool:
+def delete_new_game_template(
+    template_path: Path, template_name: str, *, legacy_template_path: Path | None = None,
+) -> bool:
     """Removes a reusable new-game setup template by display name."""
 
     clean_name = str(template_name or "").strip().casefold()
@@ -96,7 +98,9 @@ def delete_new_game_template(template_path: Path, template_name: str) -> bool:
 
     templates = [
         template
-        for template in load_new_game_templates(template_path, normalize_setups=False)
+        for template in load_new_game_templates(
+            template_path, legacy_template_path=legacy_template_path, normalize_setups=False,
+        )
         if template.name.casefold() != clean_name
     ]
     return write_new_game_templates(template_path, templates)

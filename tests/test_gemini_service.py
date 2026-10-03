@@ -1489,8 +1489,8 @@ class GeminiServiceTests(unittest.TestCase):
                         },
                         "skills": {
                             "known_skills": [
-                                {"name": "Foraging", "level": 2, "bonus": 4},
-                                {"name": "Investigation", "level": 1, "bonus": 2},
+                                {"name": "Foraging", "level": 2, "bonus": 2},
+                                {"name": "Investigation", "level": 1, "bonus": 1},
                             ],
                             "recent_checks": [],
                         },

@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-from ai_adventure.stats import STATS_RULE
+from ai_adventure.stats import PLAYER_ACHIEVEMENT_RULE, STATS_RULE
 
 from ai_adventure.container_flow import CONTAINER_FLOW_RULE
 from ai_adventure.inventory_storage import inventory_access, inventory_load
 
-from ai_adventure.skills.rules import SKILL_DESCRIPTION_RULE, MAX_SKILL_XP_RULE
+from ai_adventure.skills.rules import SKILL_DESCRIPTION_RULE, MAX_SKILL_XP_RULE, SKILL_TRAINING_SOURCE_RULE
 
 import re
 from typing import Any
@@ -887,7 +887,8 @@ class AiContextBuilder:
                             "Suggest SkillXpAddedEvent only after meaningful use, "
                             "training, study, or practice; do not use XP as a "
                             "substitute for a check. Always include xp_amount; use "
-                            "1 for a tiny meaningful gain if no stronger amount is obvious."
+                            "1 for a tiny meaningful gain if no stronger amount is obvious. "
+                            + SKILL_TRAINING_SOURCE_RULE
                         ),
                     },
                     "known_skills": [
@@ -1322,9 +1323,9 @@ class AiContextBuilder:
                     "rain, snow, fog, or any other different current weather, set "
                     "weather to that actual condition instead of AUTO or the old value."
                 ),
-                "d20_tests": (
-                    STATS_RULE
-                ),
+                "d20_tests": STATS_RULE,
+                "player_achievements": PLAYER_ACHIEVEMENT_RULE,
+                "skill_training": SKILL_TRAINING_SOURCE_RULE,
                 "calendar_time": (
                     "Use state.calendar.current for date, day names, seasons, and "
                     "displayed time. Advance time only by suggesting "

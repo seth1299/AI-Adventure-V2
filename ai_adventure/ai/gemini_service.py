@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from ai_adventure.stats import ATTRIBUTES, STATS_RULE
+from ai_adventure.stats import ATTRIBUTES, PLAYER_ACHIEVEMENT_RULE, STATS_RULE
 
-from ai_adventure.skills.rules import SKILL_DESCRIPTION_RULE, MAX_SKILL_XP_RULE
+from ai_adventure.skills.rules import SKILL_DESCRIPTION_RULE, MAX_SKILL_XP_RULE, SKILL_TRAINING_SOURCE_RULE
 
 import copy
 import json
@@ -602,7 +602,7 @@ EVENT_RESPONSE_SCHEMA: dict[str, Any] = {
         _event_response_schema("PlayerAchievementRecordedEvent", {
             "source_id": {"type": "string"}, "source_kind": {"type": "string", "enum": ["objective", "milestone"]},
             "significance": {"type": "string", "enum": ["minor", "standard", "major"]}, "reason": {"type": "string"}
-        }, ["source_id", "source_kind", "significance", "reason"], description="A distinct completed objective or milestone, never an individual roll."),
+        }, ["source_id", "source_kind", "significance", "reason"], description=PLAYER_ACHIEVEMENT_RULE),
         _event_response_schema(
             "SkillUpsertedEvent",
             {
@@ -618,7 +618,7 @@ EVENT_RESPONSE_SCHEMA: dict[str, Any] = {
             {
                 "skill_name": {"type": "string"},
                 "xp_amount": {"type": "integer", "minimum": 1},
-                "source_id": {"type": "string"},
+                "source_id": {"type": "string", "description": SKILL_TRAINING_SOURCE_RULE},
             },
             ["skill_name", "xp_amount"],
             description="Awards XP to an existing skill. Do not use skill_id.",
@@ -3434,7 +3434,8 @@ def _story_prompt_packet(context_packet: dict[str, Any]) -> dict[str, Any]:
 
     always = {
         "response", "suggested_actions", "events", "status_event", "d20_tests",
-        "player_ai_preferences", "creative_ideas", "speaker_cues", "narrative_fighting",
+        "player_ai_preferences", "creative_ideas", "speaker_cues",
+        "player_achievements", "skill_training",
     }
     tags_by_contract = {
         "calendar_time": {"time", "events"},
@@ -3447,13 +3448,13 @@ def _story_prompt_packet(context_packet: dict[str, Any]) -> dict[str, Any]:
         "npc_memory": {"dialogue", "events", "lore"},
         "secret_memory": {"events", "lore"},
         "currency_transactions": {"currency", "merchant"},
-        "narrative_fighting": {"combat"},
     }
     filtered_contract = {
         key: value
         for key, value in contract.items()
-        if key in always
-        or bool(tags_by_contract.get(key, set()) & selected_tags)
+        if key != "narrative_fighting" and (
+            key in always or bool(tags_by_contract.get(key, set()) & selected_tags)
+        )
     }
     if "miscellaneous" in projected_state and "miscellaneous_memory" in contract:
         filtered_contract["miscellaneous_memory"] = contract["miscellaneous_memory"]

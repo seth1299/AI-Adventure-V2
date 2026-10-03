@@ -386,7 +386,8 @@
         "event_type": "SkillXpAddedEvent",
         "payload_fields": [
           "skill_name",
-          "xp_amount"
+          "xp_amount",
+          "source_id"
         ],
         "purpose": "Awards experience to an existing skill.",
         "rules": [
@@ -397,7 +398,8 @@
           "Master (level 5) skills cannot gain further XP or levels. Do not propose XP awards for them.",
           "Most study sessions should award 2-3 XP.",
           "Do not award very large XP amounts.",
-          "Do not use this event to create a new skill. Use SkillUpsertedEvent for that."
+          "Do not use this event to create a new skill. Use SkillUpsertedEvent for that.",
+          "SkillXpAddedEvent may include an optional source_id identifying this particular skill training award. Reuse it on retries and retellings. When omitted and a message ID exists, Python deduplicates one training award per skill per message; without a message ID there is no fallback deduplication."
         ]
       }
     },
@@ -641,16 +643,6 @@
           "Python rejects closed containers and ignores repeat attempts after contents_taken is true."
         ]
       }
-    },
-    {
-      "id": "event.combat_started",
-      "title": "Six attributes use floor((score-10)/2) modifiers. A d20 test is an app-rolled d20 + attribute modifier + at most one existing relevant skill's level (+1 per level). Choose the most directly relevant known skill by its description; its attribute can vary with the action. For locating or gathering wild plants, choose known Foraging rather than Investigation or Perception when applicable. Untrained tests have zero skill bonus and never automatically learn a skill. Checks, attacks, and saves all compare totals to DC; natural 1 and 20 are not automatic outcomes. Advantage/disadvantage use two fair dice, do not stack, and cancel each other. DCs: trivial 5, easy 10, moderate 15, hard 20, very hard 25, extreme 30. Request tests only for meaningful uncertainty and consequences, before narrating the outcome; use authoritative resolved tests, do not request duplicate checks, and never reroll them. Fighting is narrative: no initiative, turns, encounter engine, armor ratings, damage dice, or enemy stat blocks. Health changes require PlayerHealthChangedEvent with delta, reason and source_id. Max health is twice Constitution; zero health incapacitates without automatic death. Base carrying capacity is five times Strength in pounds; carried bags add bonuses, vehicles remain separate. Player XP rewards distinct completed objectives/milestones once: minor 10, standard 25, major 50. Individual rolls never earn Player XP. Reuse persistent source IDs; do not relabel old achievements. Every 100 Player XP gains a level, capped at 20, banking a choice of +1 attribute or two skill advances. Only the player spends rewards. Attributes cap at 20; skills cap at 5 with separate training XP. Meaningful instruction/practice may unlock a level-1 skill; upserts cannot directly promote skills.",
-      "category": "event_contract",
-      "tags": [
-        "events",
-        "combat"
-      ],
-      "priority": 75
     },
     {
       "id": "event.recipe",
@@ -1220,13 +1212,14 @@
       "priority": 55,
       "content": {
         "payload": {
-          "source_id": "Stable completed objective task_id or distinct milestone identifier.",
+          "source_id": "Exact persistent completed task ID for an objective, or stable distinct milestone identifier.",
           "source_kind": "objective or milestone",
           "significance": "minor, standard, or major",
           "reason": "Concrete completed accomplishment."
         },
         "rules": [
-          "Propose achievements only for completed objectives or distinct exploration, social, crafting, or fighting milestones. Never for individual dice rolls. Reuse the same source_id for the same accomplishment, including retries and retellings. Python awards 10/25/50 Player XP, prevents repeats, and banks level rewards. Never propose arbitrary XP or directly raise attributes or skill levels."
+          "Propose achievements only for completed objectives or distinct exploration, social, crafting, or fighting milestones. Never for individual dice rolls. Reuse the same source_id for the same accomplishment, including retries and retellings. Python awards 10/25/50 Player XP, prevents repeats, and banks level rewards. Never propose arbitrary XP or directly raise attributes or skill levels.",
+          "For PlayerAchievementRecordedEvent with source_kind=objective, source_id must be the exact persistent ID of the completed task, never its name. Emit ActiveTaskCompletedEvent before its achievement award in the same response. For source_kind=milestone, use a stable identifier for the distinct completed accomplishment. Reuse the same source_id on retries and retellings; never relabel an old achievement or award Player XP for individual rolls."
         ],
         "event_type": "PlayerAchievementRecordedEvent",
         "payload_fields": [

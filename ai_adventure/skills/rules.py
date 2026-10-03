@@ -10,6 +10,13 @@ SKILL_DESCRIPTION_RULE = (
 )
 MAX_SKILL_XP_RULE = "Master (level 5) skills cannot gain further XP or levels. Do not propose XP awards for them."
 
+SKILL_TRAINING_SOURCE_RULE = (
+    "SkillXpAddedEvent may include an optional source_id identifying this particular "
+    "skill training award. Reuse it on retries and retellings. When omitted and a "
+    "message ID exists, Python deduplicates one training award per skill per message; "
+    "without a message ID there is no fallback deduplication."
+)
+
 MAX_SKILL_LEVEL = 5
 XP_THRESHOLDS_BY_LEVEL = {
     1: 0,

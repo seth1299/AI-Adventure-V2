@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import json
 import os
 import tempfile
 import threading
@@ -656,6 +657,62 @@ class InventoryUiTests(unittest.TestCase):
             )
             self.assertEqual(saved_mystery.setup["specified_genre"], "Thriller")
             dialog.close()
+
+    def test_incompatible_templates_can_be_deleted_without_editing_or_conversion(self) -> None:
+        for use_legacy_path in (False, True):
+            with self.subTest(legacy_path=use_legacy_path), tempfile.TemporaryDirectory() as temp_dir:
+                template_path = Path(temp_dir) / "templates.json"
+                legacy_path = Path(temp_dir) / "legacy.json"
+                records = [
+                    {"name": "A Older", "setup": {"specified_genre": "Old mystery"}},
+                    {"name": "B Older", "setup": {"rules_version": "older", "custom": ["Keep raw"]}},
+                    {"name": "C Current", "setup": {"rules_version": "stats-v1", "specified_genre": "Current"}},
+                ]
+                source = legacy_path if use_legacy_path else template_path
+                source.write_text(json.dumps({"schema_version": 3, "templates": records}), encoding="utf-8")
+                original = source.read_bytes()
+                with patch.object(QMessageBox, "information") as information:
+                    dialog = NewGameTemplateManagerDialog(
+                        template_path=template_path, legacy_template_path=legacy_path, tts_enabled=False,
+                    )
+                    self.assertEqual(dialog.template_list.currentRow(), 0)
+                    self.assertEqual(dialog.active_template_name, "A Older")
+                    self.assertFalse(dialog._template_editor_tabs.isEnabled())
+                    self.assertFalse(dialog._template_save_button.isEnabled())
+                    self.assertFalse(dialog._template_duplicate_button.isEnabled())
+                    self.assertFalse(dialog._template_compatibility_label.isHidden())
+                    dialog._save_template()
+                    dialog._duplicate_template()
+                    self.assertEqual(source.read_bytes(), original)
+                    dialog.template_list.setCurrentRow(2)
+                    self.assertTrue(dialog._template_editor_tabs.isEnabled())
+                    self.assertTrue(dialog._template_save_button.isEnabled())
+                    dialog.template_list.setCurrentRow(1)
+                    information.assert_not_called()
+                delete_button = next(button for button in dialog.findChildren(QPushButton) if button.text() == "Delete")
+                self.assertTrue(delete_button.isEnabled())
+                with patch.object(QMessageBox, "question", return_value=QMessageBox.StandardButton.No):
+                    delete_button.click()
+                self.assertEqual(source.read_bytes(), original)
+                self.assertEqual(dialog.active_template_name, "B Older")
+                with patch.object(QMessageBox, "question", return_value=QMessageBox.StandardButton.Yes) as question:
+                    delete_button.click()
+                self.assertIn("B Older", question.call_args.args[2])
+                remaining = load_new_game_templates(template_path, normalize_setups=False)
+                self.assertEqual([template.name for template in remaining], ["A Older", "C Current"])
+                self.assertEqual([template.setup for template in remaining], [records[0]["setup"], records[2]["setup"]])
+                if use_legacy_path:
+                    self.assertEqual(legacy_path.read_bytes(), original)
+                with patch.object(QMessageBox, "question", return_value=QMessageBox.StandardButton.Yes):
+                    delete_button.click()
+                    self.assertEqual(dialog.active_template_name, "C Current")
+                    self.assertTrue(dialog._template_editor_tabs.isEnabled())
+                    delete_button.click()
+                self.assertEqual(load_new_game_templates(template_path), [])
+                self.assertEqual(dialog.template_list.currentRow(), -1)
+                self.assertIsNone(dialog.active_template_name)
+                self.assertTrue(dialog._template_editor_tabs.isEnabled())
+                dialog.close()
 
     def test_lightweight_template_manager_omits_tts_controls(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

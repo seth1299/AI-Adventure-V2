@@ -8,6 +8,15 @@ DEFAULT_PLAYER_MAX_HEALTH = 20
 POINT_COSTS = dict(zip(range(8, 19), (0, 1, 2, 3, 4, 5, 7, 9, 12, 15, 19)))
 RANK_STATS = {"blank": (12, 1), "beginner": (18, 1), "average": (27, 3), "experienced": (36, 6), "professional": (45, 10)}
 PLAYER_XP_AWARDS = {"minor": 10, "standard": 25, "major": 50}
+PLAYER_ACHIEVEMENT_RULE = (
+    "For PlayerAchievementRecordedEvent with source_kind=objective, source_id must be "
+    "the exact persistent ID of the completed task, never its name. Emit "
+    "ActiveTaskCompletedEvent before its achievement award in the same response. "
+    "For source_kind=milestone, use a stable identifier for the distinct completed "
+    "accomplishment. Reuse the same source_id on retries and retellings; never relabel "
+    "an old achievement or award Player XP for individual rolls."
+)
+
 STATS_RULE = (
     "Six attributes use floor((score-10)/2) modifiers. A d20 test is an app-rolled "
     "d20 + attribute modifier + at most one existing relevant skill's level (+1 per level). "

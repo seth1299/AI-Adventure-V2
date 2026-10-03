@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from ai_adventure.ui.widgets.inputs import configure_wrapped_text
+
 import json
 import re
 import sys
@@ -618,6 +620,7 @@ def _set_markdown_text(
     Markdown has been parsed without sacrificing headings, emphasis, or lists.
     """
 
+    configure_wrapped_text(text_edit)
     if hasattr(text_edit, "setMarkdown"):
         text_edit.setMarkdown(str(markdown_text or ""))
         if preserve_blank_lines:
