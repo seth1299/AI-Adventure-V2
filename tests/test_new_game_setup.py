@@ -36,6 +36,25 @@ from ai_adventure.persistence.save_repository import (
 
 
 class NewGameSetupTests(unittest.TestCase):
+    def test_generated_calendar_rejects_placeholder_or_duplicate_names_as_a_whole(self) -> None:
+        from copy import deepcopy
+        from ai_adventure.calendar_system import normalize_calendar_settings
+        from ai_adventure.new_game_setup import AI_GENERATED_CALENDAR_FALLBACK_SETTINGS
+        expected = normalize_calendar_settings(AI_GENERATED_CALENDAR_FALLBACK_SETTINGS)
+        for field in ("day_names", "month_names", "seasons"):
+            for invalid in ("the city", "Month 1", "unknown"):
+                calendar = deepcopy(expected)
+                if field == "seasons":
+                    calendar[field][0]["name"] = invalid
+                else:
+                    calendar[field][0] = invalid
+                self.assertEqual(ai_generated_calendar_settings_or_fallback(calendar), expected)
+        calendar = deepcopy(expected)
+        calendar["day_names"][0] = calendar["day_names"][1]
+        self.assertEqual(ai_generated_calendar_settings_or_fallback(calendar), expected)
+        calendar["day_names"][0] = "Oakhaven"
+        self.assertEqual(ai_generated_calendar_settings_or_fallback(calendar)["day_names"][0], "Oakhaven")
+
     def test_character_pronouns_are_normalized_as_canonical_setup_data(self) -> None:
         self.assertEqual(
             normalize_new_game_setup({})["character"]["pronouns"],

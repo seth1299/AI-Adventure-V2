@@ -94,6 +94,40 @@ def _container_metadata() -> dict[str, object]:
 
 
 class GeminiServiceTests(unittest.TestCase):
+    def test_staged_calendar_names_are_exempt_from_name_sanitization_and_repair(self) -> None:
+        from ai_adventure.ai.gemini_service import _sanitize_gemini_creative_terms, _repair_gemini_creative_terms
+        calendar = {"day_names": ["Oakhaven", "Kaldor", "Valas", "Orinday", "Vespar", "Theris", "Aunox"]}
+        original = {"calendar_settings": calendar, "world_summary": "Oakhaven is a city."}
+        for label in ("new-game response", "new-game world_skeleton"):
+            clean = _sanitize_gemini_creative_terms(original, label, terms=["Oakhaven"])
+            self.assertEqual(clean["calendar_settings"], calendar)
+            self.assertNotIn("Oakhaven", clean["world_summary"])
+            repaired = {"calendar_settings": {"day_names": ["the city"]}, "world_summary": "Brassgate is a city."}
+            with patch("ai_adventure.ai.gemini_service._generate_content_with_retry", return_value=types.SimpleNamespace(text=json.dumps(repaired))):
+                result = _repair_gemini_creative_terms(None, "test", json.dumps(original), label, {}, additional_forbidden_terms=["Oakhaven"])
+            self.assertEqual(json.loads(result)["calendar_settings"], calendar)
+            self.assertEqual(json.loads(result)["world_summary"], "Brassgate is a city.")
+
+    def test_new_game_opening_focuses_on_scene_without_losing_setup_state(self) -> None:
+        from html import unescape
+        from ai_adventure.new_game_setup import OPENING_SCENE_RULE, build_new_game_setup_packet
+        packet = build_new_game_setup_packet({
+            "rules_version": "stats-v1",
+            "character": {"name": "Kit", "backstory": "A traveler."},
+            "starter_items": [{"name": "Trail Rations", "category": "Food", "quantity": 1}],
+            "opening_scene_request": "A storm interrupts the journey.",
+        })
+        self.assertIn(OPENING_SCENE_RULE, packet["requirements"]["opening_scene"])
+        self.assertIn("Trail Rations", json.dumps(packet["setup"]))
+        self.assertEqual(packet["setup"]["opening_scene_request"], "A storm interrupts the journey.")
+        for prompt in (
+            build_gemini_new_game_prompt(packet),
+            build_gemini_new_game_phase_prompt(packet, "opening_prose"),
+        ):
+            self.assertEqual(unescape(prompt).count(OPENING_SCENE_RULE), 1)
+        schema = build_new_game_phase_schema(packet, "opening_prose", for_api=False)
+        self.assertEqual(schema["properties"]["introductory_message"]["description"], OPENING_SCENE_RULE)
+
     def test_new_game_schema_lets_gemini_set_only_basic_starting_wealth(self) -> None:
         basic_schema = build_new_game_response_schema(
             {
@@ -3623,6 +3657,7 @@ class GeminiServiceTests(unittest.TestCase):
                             "source_index": -1,
                             "is_sublocation": False,
                             "parent_location": "",
+                            "location_scope": "specific",
                         }
                     ],
                     "gm_secrets": [],

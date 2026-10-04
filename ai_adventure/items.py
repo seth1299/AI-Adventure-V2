@@ -420,18 +420,21 @@ def item_is_valid_for_slot(item: dict[str, Any], slot: str) -> bool:
     metadata = item_metadata(item)
     item_type = str(metadata.get("item_type", "")).casefold()
 
+    if not metadata.get("moveable") or not metadata.get("storable"):
+        return False
+
     if slot == "Back":
         return item_type == "container" and metadata.get("equipment_slot") == "Back"
 
     if slot == "Main Hand":
-        return item_type not in {"vehicle", "armor"} and bool(metadata.get("moveable")) and bool(metadata.get("storable"))
+        return item_type == "weapon"
 
     if slot == "Off Hand":
         if item_type == "weapon":
             return str(metadata.get("weapon_hands", "")).casefold() == "one-handed"
         if item_type == "armor":
             return "Off Hand" in list(metadata.get("covers_body_parts", []))
-        return item_type != "vehicle" and bool(metadata.get("moveable")) and bool(metadata.get("storable"))
+        return False
 
     if item_type != "armor":
         return False

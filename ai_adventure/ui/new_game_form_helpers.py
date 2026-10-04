@@ -6,6 +6,7 @@ import uuid
 from typing import Any, Callable
 
 from PySide6.QtCore import Qt
+from PySide6.QtGui import QBrush, QColor
 from PySide6.QtWidgets import (
     QAbstractSpinBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QCheckBox, QComboBox, QFormLayout, QHeaderView, QLineEdit,
     QPushButton, QSizePolicy, QSpinBox, QTableWidget, QTableWidgetItem, QTextEdit,
@@ -56,12 +57,31 @@ STARTER_ITEM_COLUMN_WIDTHS = (140, 132, 140, 220, 132, 150, 100, 100, 100)
 STARTER_WEAPON_COLUMN_WIDTHS = (150, 132, 100, 96, 120, 120, 132, 132, 100, 100, 100)
 STARTER_ARMOR_COLUMN_WIDTHS = (150, 132, 220, 132, 132, 100, 100, 100)
 STARTING_NPC_COLUMN_WIDTHS = (150, 160, 260, 132, 100)
-STARTING_LOCATION_COLUMN_WIDTHS = (180, 320, 132, 110, 180, 120)
+STARTING_LOCATION_COLUMN_WIDTHS = (180, 320, 132, 110, 180, 120, 190)
 CURRENCY_COLUMN_WIDTHS = (150, 160, 132, 100)
 ECONOMY_EXAMPLE_COLUMN_WIDTHS = (220, 132, 100)
 STARTING_WEALTH_COLUMN_WIDTHS = (220, 132, 100)
 TABLE_INLINE_EDITOR_HEIGHT = 30
 TABLE_INLINE_EDITOR_MIN_WIDTH = 132
+
+
+class _LocationParentComboBox(_NoWheelComboBox):
+    """Keep inactive dropdowns hidden when the table refreshes editor geometry."""
+
+    def showEvent(self, event: Any) -> None:
+        super().showEvent(event)
+        if not self.property("sublocation_active"):
+            self.hide()
+
+
+def _sync_sublocation_cell_style(checkbox: QCheckBox, within_item: QTableWidgetItem) -> None:
+    """Give both dependent cells a stable background independent of row focus."""
+    checked = checkbox.isChecked()
+    checkbox.setStyleSheet(
+        "QCheckBox { background-color: palette(base); }" if checked
+        else "QCheckBox { background-color: #808080; }"
+    )
+    within_item.setBackground(QBrush() if checked else QBrush(QColor("#808080")))
 
 def _append_starting_location_table_row(
     table: QTableWidget,
@@ -84,7 +104,8 @@ def _append_starting_location_table_row(
     )
     sublocation_input = QCheckBox()
     sublocation_input.setChecked(bool(location.get("is_sublocation", False)))
-    parent_input = _NoWheelComboBox()
+    parent_input = _LocationParentComboBox()
+    parent_input.setProperty("sublocation_active", sublocation_input.isChecked())
     parent_input.setMinimumWidth(TABLE_INLINE_EDITOR_MIN_WIDTH)
     parent_input.setMinimumHeight(TABLE_INLINE_EDITOR_HEIGHT)
     parent_input.setProperty(
@@ -93,11 +114,32 @@ def _append_starting_location_table_row(
     )
     parent_input.setVisible(sublocation_input.isChecked())
 
+    if table.columnCount() < 7:
+        table.setColumnCount(7)
+    scope_input = _table_combo_box(
+        {"broad": "Broad / general", "specific": "Specific storage site"},
+        str(location.get("location_scope", "broad")),
+    )
+    scope_input.setToolTip("Specific: a room, campsite or hideout where items can be recovered. Broad: a city, region or continent.")
+    table.setCellWidget(row, 6, scope_input)
     table.setCellWidget(row, 0, name_input)
     table.setCellWidget(row, 1, description_input)
     table.setCellWidget(row, 2, mode_input)
     table.setCellWidget(row, 3, sublocation_input)
     table.setCellWidget(row, 4, parent_input)
+    within_item = QTableWidgetItem()
+    within_item.setFlags(Qt.ItemFlag.NoItemFlags)
+    table.setItem(row, 4, within_item)
+
+    def sync_sublocation_cells(checked: bool) -> None:
+        # Paint the whole checkbox cell, rather than exposing alternating-row
+        # or focus backgrounds through a transparent checkbox.
+        _sync_sublocation_cell_style(sublocation_input, within_item)
+        parent_input.setProperty("sublocation_active", checked)
+        parent_input.setVisible(checked)
+
+    sublocation_input.toggled.connect(sync_sublocation_cells)
+    sync_sublocation_cells(sublocation_input.isChecked())
     _set_remove_row_button(
         table,
         row,
@@ -154,6 +196,7 @@ def _starting_locations_from_table(table: QTableWidget) -> list[dict[str, Any]]:
                 "location_mode": location_mode,
                 "is_sublocation": is_sublocation,
                 "parent_location": parent_location if is_sublocation else "",
+                "location_scope": str(table.cellWidget(row, 6).currentData()) if isinstance(table.cellWidget(row, 6), QComboBox) else "broad",
                 "requires_ai_invention": (
                     location_mode == "suggestion" or not name or not description
                 ),
@@ -284,6 +327,9 @@ def _sync_starting_location_parent_dropdowns(
             _set_combo_to_data(parent_widget, str(parent_selected))
 
         parent_widget.blockSignals(False)
+        if isinstance(sublocation_widget, QCheckBox) and table.item(row, 4) is not None:
+            _sync_sublocation_cell_style(sublocation_widget, table.item(row, 4))
+        parent_widget.setProperty("sublocation_active", is_sublocation)
         parent_widget.setVisible(is_sublocation)
 
 
@@ -642,7 +688,7 @@ def _set_starter_mobility_controls(table: QTableWidget, row: int, first_column: 
     table.setHorizontalHeaderItem(column, QTableWidgetItem("Weight / Capacity"))
     button = table.cellWidget(row, column)
     if not isinstance(button, QPushButton):
-        button = QPushButton("Weight / Capacity…")
+        button = QPushButton("Weight / Capacityâ€¦")
         button.setToolTip("Set pounds per quantity unit and container/vehicle cargo capacity; leave unspecified for Gemini.")
         button.clicked.connect(lambda: _edit_starter_weight(table, button))
         table.setCellWidget(row, column, button)

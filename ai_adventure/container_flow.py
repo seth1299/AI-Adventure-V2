@@ -126,8 +126,9 @@ def container_event_issues(
     )} if re.search(r"\b(open|unlock|inspect|search|take|loot|empty|contents|inside)\b", command) else set()
     blocked_access = False
     state = context_packet.get("state", {})
+    locations = deepcopy(state.get("travel", {}).get("locations", []))
     current_location = state.get("scene", {}).get("location", state.get("world", {}).get("location"))
-    access = inventory_access(item_records, current_location) if isinstance(current_location, str) else {}
+    access = inventory_access(item_records, current_location, locations) if isinstance(current_location, str) else {}
     accessible_items = [item for item in item_records if access.get(str(item.get("id", item.get("database_id", ""))), {}).get("available", item.get("available", True))]
     if re.search(r"\b(open|unlock|inspect|search|take|loot|empty)\b", command):
         for name, container in containers.items():
@@ -155,7 +156,20 @@ def container_event_issues(
         name = str(payload.get("container_name", "")).strip().casefold()
         before_event = deepcopy(item_records)
         try:
-            if kind in {"InventoryItemModifiedEvent", "ItemModifiedEvent"} and not payload.get("owner_npc_id"):
+            if kind == "LocationUpsertedEvent":
+                from ai_adventure.locations import normalize_known_location
+                location = normalize_known_location(payload)
+                if location is not None:
+                    locations = [row for row in locations if str(row.get("name", "")).casefold() != location.name.casefold()]
+                    locations.append(location.to_dict())
+                    access = inventory_access(item_records, current_location or "", locations)
+            elif kind == "StatusUpdatedEvent":
+                updated_location = payload.get("location", "")
+                if isinstance(updated_location, str) and updated_location.strip() and updated_location.upper() not in {"AUTO", "SAME", "SKIP"}:
+                    from ai_adventure.locations import clean_player_location_name
+                    current_location = clean_player_location_name(updated_location)
+                    access = inventory_access(item_records, current_location, locations)
+            elif kind in {"InventoryItemModifiedEvent", "ItemModifiedEvent"} and not payload.get("owner_npc_id"):
                 destination = str(payload.get("new_storage_location", payload.get("storage_location", "")) or "").strip()
                 if destination and destination.upper() not in {"SAME", "SKIP"} and isinstance(current_location, str):
                     target_name = str(payload.get("target_name", payload.get("item_name", ""))).casefold()
@@ -169,7 +183,7 @@ def container_event_issues(
                                          or str(item.get("name", "")).casefold() == destination.casefold()
                                          or str(item.get("name", "")).casefold().endswith(" " + destination.casefold()))]
                     destination_id = str(destinations[0]["id"]) if len(destinations) == 1 else destination
-                    error = move_error(str(target["id"]), destination_id, item_records, current_location, base_capacity)
+                    error = move_error(str(target["id"]), destination_id, item_records, current_location, base_capacity, locations)
                     if error:
                         raise ContainerFlowError(error)
                     old_parent = str(target["metadata"].pop("container_id", "") or "")
@@ -186,7 +200,7 @@ def container_event_issues(
                     else:
                         target["storage_location"] = destination
                     target["metadata"]["storage_location"] = target["storage_location"]
-                    access = inventory_access(item_records, current_location)
+                    access = inventory_access(item_records, current_location, locations)
                 target_name = str(payload.get("target_name", payload.get("item_name", ""))).casefold()
                 target = next((item for item in item_records if str(item.get("name", "")).casefold() == target_name), None)
                 if target:
@@ -271,7 +285,7 @@ def container_event_issues(
                         authoritative_item["metadata"]["container"] = container
                         item_records = [authoritative_item if str(item.get("id", item.get("database_id", ""))) == item_id else item for item in item_records]
                         if isinstance(current_location, str):
-                            access = inventory_access(item_records, current_location)
+                            access = inventory_access(item_records, current_location, locations)
                     container["is_locked"] = container["is_trapped"] = False
                     revealed_currency += int(container.get("contents", {}).get("currency_base_units", 0))
                 else:
@@ -291,7 +305,7 @@ def container_event_issues(
                         selected_id = str(selected.get("id", ""))
                         if not selected_id:
                             continue  # First-opening definitions are materialized by the repository.
-                        error = move_error(selected_id, "actively_carried", prospective, current_location or "", base_capacity)
+                        error = move_error(selected_id, "actively_carried", prospective, current_location or "", base_capacity, locations)
                         if error:
                             raise ContainerFlowError(error)
                         moved = next(item for item in prospective if str(item["id"]) == selected_id)

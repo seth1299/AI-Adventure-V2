@@ -905,15 +905,15 @@ class SaveRepository(PlayerStatsRepository):
             raise ValueError(error)
 
     def inventory_access(self) -> dict[str, dict[str, Any]]:
-        return inventory_access(self.list_inventory_items(), self.get_state_value("location", ""))
+        return inventory_access(self.list_inventory_items(), self.get_state_value("location", ""), self.get_travel_locations())
 
     def list_accessible_inventory_items(self) -> list[dict[str, Any]]:
         items = self.list_inventory_items()
-        access = inventory_access(items, self.get_state_value("location", ""))
+        access = inventory_access(items, self.get_state_value("location", ""), self.get_travel_locations())
         return [item for item in items if access[str(item["id"])]["available"] and access[str(item["id"])]["known"]]
 
     def inventory_move_destinations(self, item_id: str) -> list[tuple[str, str]]:
-        return move_destinations(item_id, self.list_inventory_items(), self.get_state_value("location", ""), self.player_carrying_capacity_lb())
+        return move_destinations(item_id, self.list_inventory_items(), self.get_state_value("location", ""), self.player_carrying_capacity_lb(), self.get_travel_locations())
 
     def move_inventory_item(self, item_id: str, destination: str) -> None:
         """Atomically move one existing stack, preserving its catalog identity."""
@@ -924,7 +924,7 @@ class SaveRepository(PlayerStatsRepository):
                 named = [item for item in items if item["name"].casefold() == destination.casefold() and "container" in item["metadata"]]
                 if len(named) == 1:
                     destination = str(named[0]["id"])
-            error = move_error(item_id, destination, items, self.get_state_value("location", ""), self.player_carrying_capacity_lb())
+            error = move_error(item_id, destination, items, self.get_state_value("location", ""), self.player_carrying_capacity_lb(), self.get_travel_locations())
             if error:
                 raise ValueError(error)
             item = by_id[item_id]
@@ -5338,6 +5338,9 @@ class SaveRepository(PlayerStatsRepository):
                 "terrain",
                 "travel_multiplier",
                 "travel_notes",
+                "location_scope",
+                "is_sublocation",
+                "parent_location",
             ):
                 aliases = {
                     "x_miles": ("x_miles", "x"),

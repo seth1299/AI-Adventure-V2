@@ -237,6 +237,7 @@ class StoryTurnService:
                 issues = container_event_issues(list(result.suggested_events), {
                     "state": {"inventory": {"items": inventory, "container_authority": inventory, "container_items": inventory, "carrying": repository.inventory_load()},
                               "world": {"location": repository.get_state_value("location", "")},
+                              "travel": {"locations": repository.get_travel_locations()},
                               "skills": {"resolved_checks_this_turn": checks}},
                 }, narrative_text=result.narrative_text)
                 if issues:

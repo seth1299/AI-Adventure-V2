@@ -1858,9 +1858,9 @@ class NewGameTemplateManagerDialog(QDialog):
         self.start_location_combo.currentIndexChanged.connect(
             lambda _index: self._sync_template_start_location_from_locations_combo()
         )
-        self.starting_locations_table = _AppTableWidget(0, 6)
+        self.starting_locations_table = _AppTableWidget(0, 7)
         self.starting_locations_table.setHorizontalHeaderLabels(
-            ["Name", "Description", "Location Mode", "Sublocation?", "Within", "Remove"]
+            ["Name", "Description", "Location Mode", "Sublocation?", "Within", "Remove", "Location Scope"]
         )
         _configure_inline_table(
             self.starting_locations_table,
@@ -3552,6 +3552,9 @@ class NewGameTemplateManagerDialog(QDialog):
     ) -> None:
         """Updates one existing location row without replacing its widgets."""
 
+        scope_widget = self.starting_locations_table.cellWidget(row, 6)
+        if isinstance(scope_widget, QComboBox):
+            _set_combo_to_data(scope_widget, str(location.get("location_scope", "broad")))
         name_widget = self.starting_locations_table.cellWidget(row, 0)
         description_widget = self.starting_locations_table.cellWidget(row, 1)
         mode_widget = self.starting_locations_table.cellWidget(row, 2)

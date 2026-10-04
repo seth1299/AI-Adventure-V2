@@ -33,6 +33,7 @@ class KnownLocation:
     travel_notes: str = ""
     is_sublocation: bool = False
     parent_location: str = ""
+    location_scope: str = "broad"
 
     def to_dict(self) -> dict[str, Any]:
         """Returns JSON-serializable location data."""
@@ -137,6 +138,7 @@ def normalize_known_location(raw_location: Any) -> KnownLocation | None:
 
     return KnownLocation(
         name=name,
+        location_scope="specific" if raw_location.get("location_scope") == "specific" else "broad",
         location_id=_clean_text(raw_location.get("location_id")),
         description=_clean_text(raw_location.get("description")),
         x_miles=_optional_coordinate(raw_location.get("x_miles", raw_location.get("x"))),
@@ -177,6 +179,8 @@ def normalize_known_locations(raw_locations: Any) -> list[KnownLocation]:
             locations.append(location)
             continue
 
+        if "location_scope" not in raw_location:
+            location = replace(location, location_scope=locations[existing_index].location_scope)
         locations[existing_index] = _merge_locations(locations[existing_index], location)
 
     return locations
@@ -311,6 +315,7 @@ def _merge_locations(existing: KnownLocation, incoming: KnownLocation) -> KnownL
         travel_notes=incoming.travel_notes or existing.travel_notes,
         is_sublocation=incoming.is_sublocation or existing.is_sublocation,
         parent_location=incoming.parent_location or existing.parent_location,
+        location_scope=incoming.location_scope,
     )
 
 

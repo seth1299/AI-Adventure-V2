@@ -97,6 +97,7 @@ class StatsUiTests(unittest.TestCase):
     def test_equipment_pickup_and_item_modal_move(self):
         with tempfile.TemporaryDirectory() as directory:
             repository = SaveRepository.create_new_save(Path(directory), "Equipment")
+            repository.upsert_travel_location({"name": "Store", "location_scope": "specific"})
             repository.set_state_value("location", "Store")
             repository.replace_inventory_items([
                 {"name": "Backpack", "quantity": 1, "category": "Container", "description": "A wearable pack", "storage_location": "Store", "weight_lb": 2, "carrying_capacity_lb": 20,

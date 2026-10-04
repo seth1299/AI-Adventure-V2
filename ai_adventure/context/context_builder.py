@@ -302,7 +302,7 @@ class AiContextBuilder:
         }
         storage_aliases = _inventory_storage_aliases(state.inventory.items)
         inventory_rows = [item.to_dict() for item in state.inventory.items]
-        inventory_status = inventory_access(inventory_rows, state.world.location)
+        inventory_status = inventory_access(inventory_rows, state.world.location, [location.to_dict() for location in state.travel.locations])
         carrying = inventory_load(inventory_rows, state.settings.values.get("player.carrying_capacity_lb", 50))
         carrying["cargo"] = {key: cargo for key, cargo in carrying["cargo"].items() if inventory_status[key]["known"]}
         known_inventory = [item for item in state.inventory.items if inventory_status[str(item.id)]["known"]]
@@ -572,6 +572,7 @@ class AiContextBuilder:
                     "locations": [
                         {
                             "name": location.name,
+                            "location_scope": location.location_scope,
                             "description": _compact_text(location.description),
                             "x_miles": location.x_miles,
                             "y_miles": location.y_miles,

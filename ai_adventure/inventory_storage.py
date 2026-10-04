@@ -8,6 +8,21 @@ import math
 
 DEFAULT_CARRYING_CAPACITY_LB = 50.0
 
+LOCATION_STORAGE_RULE = (
+    "Every known location has location_scope: broad or specific. Broad covers continents, "
+    "regions, cities and districts; specific identifies a room, campsite, hideout or similarly "
+    "precise recoverable storage site. Unknown scope is broad. Sublocation status does not "
+    "imply specific scope. Never leave items at a broad location or make items there "
+    "immediately accessible on arrival. Establish a specific site with LocationUpsertedEvent "
+    "and move the player there before storing or retrieving items. Preserve authored scope."
+)
+
+
+def location_allows_storage(name: str, locations: Iterable[dict[str, Any]]) -> bool:
+    return any(str(row.get("name", "")).strip().casefold() == name.strip().casefold()
+               and row.get("location_scope") == "specific" for row in locations)
+
+
 
 def pounds(value: Any, default: float = 0.0) -> float:
     """Accept finite, nonnegative pounds; legacy missing weights remain unknown."""
@@ -77,13 +92,14 @@ def carry_priority(item: dict[str, Any], cargo: dict[str, Any]) -> float:
 
 
 INVENTORY_STORAGE_RULE = (
+    LOCATION_STORAGE_RULE + " " +
     "Containers are physical items, including ordinary empty boxes and bags. "
     "Their saved contents.items contain only database IDs referencing item_catalog; "
     "quantities and definitions belong to the referenced inventory records. "
     "An item's container_id identifies its parent; moving a container moves its entire "
     "contents with it. available=false means remembered possession, not usable equipment, "
     "ingredients, keys, or sale stock. Physical access requires actively_carried or the "
-    "player's exact current Location, and every enclosing container must be open, "
+    "player's exact current specific storage site, and every enclosing container must be open, "
     "unlocked, and safe. Never use or move remote items. moveable=false prevents moving "
     "or storing; storable=false prevents putting the item in a container. A forge or "
     "other fixed installation should have both flags false. Move existing items with "
@@ -92,8 +108,7 @@ INVENTORY_STORAGE_RULE = (
     "contents_known becomes true only after a permitted opening or deliberate storage "
     "in an already accessible container. Closing it preserves remembered contents."
     " Record realistic weight_lb in pounds per quantity unit, and carrying_capacity_lb "
-    "for Containers and Vehicles (0 for ordinary items). Player base capacity is 50 lb "
-    "unless configured otherwise. All carried weight, including nested contents and "
+    "for Containers and Vehicles (0 for ordinary items). Player base capacity is five times Strength in pounds. All carried weight, including nested contents and "
     "empty containers, counts. Only directly carried/worn containers add their cargo "
     "capacity to player capacity; nested containers do not add bonuses. Every container "
     "also has its own cargo limit. Vehicle cargo and chassis never count against the "
@@ -106,7 +121,7 @@ INVENTORY_STORAGE_RULE = (
 
 NEW_GAME_STORAGE_RULE = (
     "moveable/storable flags; forges false. Storage: actively_carried, container, "
-    "exact Location. Containers: known empty or private; IDs only. weight_lb per "
+    "specific Location. Containers: known empty/private; IDs only. weight_lb per "
     "unit; carrying_capacity_lb cargo/bag bonus. Vehicles separate. Obey capacity."
 )
 
@@ -124,8 +139,9 @@ def storage_location(item: dict[str, Any]) -> str:
     return str(item.get("storage_location", metadata(item).get("storage_location", "actively_carried")) or "actively_carried").strip()
 
 
-def inventory_access(items: Iterable[dict[str, Any]], current_location: str) -> dict[str, dict[str, Any]]:
+def inventory_access(items: Iterable[dict[str, Any]], current_location: str, locations: Iterable[dict[str, Any]] = ()) -> dict[str, dict[str, Any]]:
     """Resolve nesting without trusting display labels as container identity."""
+    storage_allowed = location_allows_storage(current_location, locations)
     rows = {str(item.get("id", item.get("database_id", ""))): item for item in items}
     results: dict[str, dict[str, Any]] = {}
 
@@ -147,9 +163,13 @@ def inventory_access(items: Iterable[dict[str, Any]], current_location: str) -> 
         else:
             location = storage_location(item)
             carried = location.casefold() in {"actively_carried", "actively carried", "on_person", "on person"}
-            available = carried or bool(current_location.strip() and location.casefold() == current_location.strip().casefold())
+            available = carried or bool(storage_allowed and current_location.strip() and location.casefold() == current_location.strip().casefold())
             result = {"known": True, "available": available, "physical_location": current_location if carried else location,
-                      "access_reason": "" if available else f"Stored at {location}; you are at {current_location or 'an unknown location'}."}
+                      "access_reason": "" if available else (
+                          "This broad or unclassified area is not a specific storage site."
+                          if location.casefold() == current_location.strip().casefold() and not storage_allowed
+                          else f"Stored at {location}; you are at {current_location or 'an unknown location'}."
+                      )}
         results[item_id] = result
         return result
 
@@ -158,11 +178,11 @@ def inventory_access(items: Iterable[dict[str, Any]], current_location: str) -> 
     return results
 
 
-def move_error(item_id: str, destination: str, items: list[dict[str, Any]], current_location: str, base_capacity_lb: float = DEFAULT_CARRYING_CAPACITY_LB) -> str:
+def move_error(item_id: str, destination: str, items: list[dict[str, Any]], current_location: str, base_capacity_lb: float = DEFAULT_CARRYING_CAPACITY_LB, locations: Iterable[dict[str, Any]] = ()) -> str:
     """Validate a whole-stack move, including source access and nesting."""
     rows = {str(item["id"]): item for item in items}
     item = rows.get(item_id)
-    access = inventory_access(items, current_location)
+    access = inventory_access(items, current_location, locations)
     if item is None:
         return "This item is no longer in inventory."
     if metadata(item).get("moveable", True) is not True:
@@ -191,6 +211,8 @@ def move_error(item_id: str, destination: str, items: list[dict[str, Any]], curr
             cursor = str(metadata(rows.get(cursor, {})).get("container_id", "") or "")
     elif destination.casefold() not in {"actively_carried", "on_person"} and destination.casefold() != current_location.strip().casefold():
         return "Destination is not the player's current location."
+    elif destination.casefold() not in {"actively_carried", "on_person"} and not location_allows_storage(destination, locations):
+        return "Choose a specific storage site; broad or unclassified locations cannot store items."
     # Carrying a box must not bypass the restrictions on a fixed item inside it.
     for child_id, child in rows.items():
         cursor = str(metadata(child).get("container_id", "") or "")
@@ -209,7 +231,7 @@ def move_error(item_id: str, destination: str, items: list[dict[str, Any]], curr
     return capacity_error(items, after, base_capacity_lb)
 
 
-def move_destinations(item_id: str, items: list[dict[str, Any]], current_location: str, base_capacity_lb: float = DEFAULT_CARRYING_CAPACITY_LB) -> list[tuple[str, str]]:
+def move_destinations(item_id: str, items: list[dict[str, Any]], current_location: str, base_capacity_lb: float = DEFAULT_CARRYING_CAPACITY_LB, locations: Iterable[dict[str, Any]] = ()) -> list[tuple[str, str]]:
     """Return labels and stable IDs for the player's accessible destinations."""
     item = next((item for item in items if str(item["id"]) == item_id), {})
     parent_id = str(metadata(item).get("container_id", "") or "")
@@ -222,4 +244,4 @@ def move_destinations(item_id: str, items: list[dict[str, Any]], current_locatio
         container_id = str(container["id"])
         if is_container(container) and container_id != parent_id:
             destinations.append((str(container["name"]), container_id))
-    return [(label, value) for label, value in destinations if not move_error(item_id, value, items, current_location, base_capacity_lb)]
+    return [(label, value) for label, value in destinations if not move_error(item_id, value, items, current_location, base_capacity_lb, locations)]

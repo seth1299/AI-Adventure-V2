@@ -1314,9 +1314,9 @@ class NewGameWizard(QWizard):
             lambda _index: self._sync_start_location_from_locations_combo()
         )
 
-        self.starting_locations_table = _AppTableWidget(0, 6)
+        self.starting_locations_table = _AppTableWidget(0, 7)
         self.starting_locations_table.setHorizontalHeaderLabels(
-            ["Name", "Description", "Location Mode", "Sublocation?", "Within", "Remove"]
+            ["Name", "Description", "Location Mode", "Sublocation?", "Within", "Remove", "Location Scope"]
         )
         _configure_inline_table(
             self.starting_locations_table,
@@ -2087,7 +2087,8 @@ class NewGameWizard(QWizard):
         for key in ("professional", "experienced", "average", "beginner", "blank"):
             self.rank_baseline_combo.addItem(key.title(), key)
         self.rank_baseline_combo.currentIndexChanged.connect(self._reset_point_buy)
-        layout.addWidget(QLabel("Custom rank baseline"))
+        self.rank_baseline_label = QLabel("Custom rank baseline")
+        layout.addWidget(self.rank_baseline_label)
         layout.addWidget(self.rank_baseline_combo)
         self.attribute_inputs = {}
         attribute_form = QFormLayout()
@@ -2241,12 +2242,15 @@ class NewGameWizard(QWizard):
             control.blockSignals(True)
             control.setValue(attributes[a])
             control.blockSignals(False)
-        self.rank_baseline_combo.setEnabled(self.skill_preset_combo.currentData() == "custom")
         self._refresh_point_buy()
 
     def _refresh_point_buy(self, _value=None) -> None:
         if not hasattr(self, "point_buy_summary"):
             return
+        custom_rank = self.skill_preset_combo.currentData() == "custom"
+        self.rank_baseline_label.setVisible(custom_rank)
+        self.rank_baseline_combo.setVisible(custom_rank)
+        self.rank_baseline_combo.setEnabled(custom_rank)
         attributes = {a: w.value() for a, w in self.attribute_inputs.items()}
         budget, level = rank_stats(str(self.skill_preset_combo.currentData()), str(self.rank_baseline_combo.currentData()))
         remaining = self._point_buy_remaining()

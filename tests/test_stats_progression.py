@@ -180,6 +180,7 @@ class StatsProgressionTests(unittest.TestCase):
         self.assertEqual(len(self.repo.list_history(kinds=("story",))), 1)
 
     def test_untrained_container_test_and_equipped_carried_bag(self):
+        self.repo.upsert_travel_location({"name": "Store", "location_scope": "specific"})
         self.repo.set_state_value("location", "Store")
         self.repo.replace_inventory_items([
             {"name": "Locked Box", "quantity": 1, "category": "Container", "description": "A locked box.", "storage_location": "Store", "container": {"is_locked": True, "lockpick_dc": 10, "contents_initialized": True, "contents": {"items": [], "currency_base_units": 0}}},
@@ -266,6 +267,7 @@ class StatsProgressionTests(unittest.TestCase):
         from ai_adventure.application.story_turn_service import StoryTurnService
         from ai_adventure.container_flow import ContainerFlowError
         self.repo.change_player_health(-10, "A wound", "wound")
+        self.repo.upsert_travel_location({"name": "Store", "location_scope": "specific"})
         self.repo.set_state_value("location", "Store")
         self.repo.replace_inventory_items([{"name": "Potion", "category": "Item", "quantity": 1, "description": "A healing potion", "storage_location": "Store"}])
         for name, amount, location in (("Ghost Potion", 1, "Store"), ("Potion", 2, "Store"), ("Potion", 1, "Road")):
@@ -279,6 +281,7 @@ class StatsProgressionTests(unittest.TestCase):
             self.assertEqual(self.repo.player_stats()["health_current"], 10)
             self.assertEqual(len(self.repo.list_inventory_items()), 1)
             self.assertIsNone(self.repo.event_receipt("healing", "story_commit"))
+        self.repo.upsert_travel_location({"name": "Store", "location_scope": "specific"})
         self.repo.set_state_value("location", "Store")
         StoryTurnService.commit_response(self.repo, result, message_id="healing")
         self.assertEqual(self.repo.player_stats()["health_current"], 15)

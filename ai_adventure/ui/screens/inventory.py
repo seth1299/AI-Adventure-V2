@@ -414,7 +414,7 @@ class InventoryScreen(RepositoryBackedWidget):
             return
 
         items = repository.list_inventory_items()
-        access = inventory_access(items, repository.get_state_value("location", ""))
+        access = repository.inventory_access()
         load = repository.inventory_load()
         lines = [f"Carrying: {load['weight_lb']:g} / {load['capacity_lb']:g} lb (base {load['base_capacity_lb']:g} + containers {load['container_bonus_lb']:g}); remaining {load['remaining_lb']:g} lb"]
         for key, cargo in load['cargo'].items():
@@ -630,7 +630,7 @@ class InventoryScreen(RepositoryBackedWidget):
         if repository is None:
             return "No save is open."
         if not repository.inventory_move_destinations(str(item["id"])):
-            error = move_error(str(item["id"]), "actively_carried", repository.list_inventory_items(), repository.get_state_value("location", ""), repository.player_carrying_capacity_lb())
+            error = move_error(str(item["id"]), "actively_carried", repository.list_inventory_items(), repository.get_state_value("location", ""), repository.player_carrying_capacity_lb(), repository.get_travel_locations())
             return error or "No accessible destinations with enough cargo capacity. Open a nearby container first."
         return ""
 

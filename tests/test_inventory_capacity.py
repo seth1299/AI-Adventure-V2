@@ -36,6 +36,8 @@ class InventoryCapacityTests(unittest.TestCase):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         self.repo = SaveRepository.create_new_save(Path(directory.name), "Capacity")
+        self.repo.upsert_travel_location({"name": "Store", "location_scope": "specific"})
+        self.repo.upsert_travel_location({"name": "Road", "location_scope": "specific", "description": "A marked wagon parking spot by the road."})
         self.repo.set_state_value("location", "Store")
         self.repo.replace_inventory_items([cargo("Pack"), cargo("Wagon", capacity=200, weight=300, vehicle=True),
             {"name": "Ingots", "category": "Material", "quantity": 6, "description": "Heavy metal.", "weight_lb": 10, "storage_location": "Store"}])
@@ -176,7 +178,7 @@ class InventoryCapacityTests(unittest.TestCase):
         self.assertIn('capacity exceeded', result.message)
         self.assertEqual(before, self.repo.list_inventory_items())
         issues = container_event_issues([{'type': 'ContainerContentsTakenEvent', 'payload': {'container_name': 'Wagon'}}],
-            {'state': {'inventory': {'items': before, 'container_authority': before, 'container_items': before, 'carrying': self.repo.inventory_load()}, 'world': {'location': 'Store'}}})
+            {'state': {'inventory': {'items': before, 'container_authority': before, 'container_items': before, 'carrying': self.repo.inventory_load()}, 'world': {'location': 'Store'}, 'travel': {'locations': self.repo.get_travel_locations()}}})
         self.assertTrue(any('capacity exceeded' in issue for issue in issues))
 
     def test_taking_bag_and_heavy_cargo_succeeds_regardless_of_manifest_order(self):
@@ -188,7 +190,7 @@ class InventoryCapacityTests(unittest.TestCase):
 
     def test_model_preflight_rejects_additions_and_quantity_changes(self):
         items = self.repo.list_inventory_items()
-        context = {'state': {'inventory': {'items': items, 'capacity_items': items, 'carrying': self.repo.inventory_load()}, 'world': {'location': 'Store'}}}
+        context = {'state': {'inventory': {'items': items, 'capacity_items': items, 'carrying': self.repo.inventory_load()}, 'world': {'location': 'Store'}, 'travel': {'locations': self.repo.get_travel_locations()}}}
         issues = container_event_issues([{'type': 'InventoryItemAddedEvent', 'payload': {'item_name': 'Anvil', 'category': 'Tool', 'amount': 1, 'weight_lb': 80}}], context)
         self.assertTrue(any('capacity exceeded' in issue for issue in issues))
         self.repo.modify_inventory_item(target_name='Ingots', quantity=4)

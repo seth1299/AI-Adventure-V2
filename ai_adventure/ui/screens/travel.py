@@ -25,6 +25,11 @@ class TravelScreen(RepositoryBackedWidget):
             self._display_selected_location
         )
 
+        self.scope_selector = _NoWheelComboBox()
+        self.scope_selector.addItem("Broad / general", "broad")
+        self.scope_selector.addItem("Specific storage site", "specific")
+        self.scope_selector.setToolTip("Use specific only for a room, campsite, hideout or similarly precise site. Cities and regions are broad.")
+        self.scope_selector.currentIndexChanged.connect(self._change_location_scope)
         self.details_output = MarkdownDisplay()
         self.details_output.setObjectName("travelLocationDetails")
 
@@ -49,6 +54,10 @@ class TravelScreen(RepositoryBackedWidget):
         selector_layout.addWidget(QLabel("Known Locations:"))
         selector_layout.addWidget(self.location_selector, 1)
         details_layout.addLayout(selector_layout)
+        scope_layout = QHBoxLayout()
+        scope_layout.addWidget(QLabel("Location Scope:"))
+        scope_layout.addWidget(self.scope_selector, 1)
+        details_layout.addLayout(scope_layout)
         details_layout.addWidget(self.location_image_label)
         details_layout.addWidget(
             _button_row(self.select_image_button, self.create_image_button)
@@ -62,6 +71,15 @@ class TravelScreen(RepositoryBackedWidget):
         layout.addLayout(details_layout)
         layout.addWidget(self.location_list)
         self.setLayout(layout)
+
+    def _change_location_scope(self, _index: int) -> None:
+        repository = self.repository()
+        location = self._selected_location_data()
+        if repository is None or not location:
+            return
+        repository.upsert_travel_location({"name": location["name"], "location_scope": self.scope_selector.currentData()})
+        self.refresh()
+        self.notify_repository_changed()
 
     def refresh(self) -> None:
         """Reloads known locations while preserving the visible selection."""
@@ -187,7 +205,12 @@ class TravelScreen(RepositoryBackedWidget):
             speed_multiplier=state.travel.speed_multiplier,
         )
 
-        sections = [f"# {destination.name}"]
+        self.scope_selector.blockSignals(True)
+        self.scope_selector.setCurrentIndex(self.scope_selector.findData(destination.location_scope))
+        self.scope_selector.blockSignals(False)
+        sections = [f"# {destination.name}",
+                    "**Storage:** Specific site; items can be left here." if destination.location_scope == "specific"
+                    else "**Storage:** Broad / general area; choose a specific site before leaving items."]
 
         if destination.description:
             sections.append(destination.description)

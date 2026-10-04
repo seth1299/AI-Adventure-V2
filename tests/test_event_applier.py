@@ -495,7 +495,7 @@ class EventApplierTests(unittest.TestCase):
             repository.set_state_value("location", "Car")
             repository.set_travel_locations(
                 [
-                    {"name": "Car", "x_miles": 0, "y_miles": 0},
+                    {"name": "Car", "x_miles": 0, "y_miles": 0, "location_scope": "specific"},
                     {"name": "Home", "x_miles": 10, "y_miles": 0},
                 ]
             )

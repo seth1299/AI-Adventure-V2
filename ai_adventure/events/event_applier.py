@@ -909,7 +909,7 @@ class EventApplier:
         cargo = self.repository.inventory_load()["cargo"]
         selected_items.sort(key=lambda selected: carry_priority(selected, cargo), reverse=True)
         for selected in selected_items:
-            error = move_error(str(selected["id"]), "actively_carried", prospective, self.repository.get_state_value("location", ""), self.repository.player_carrying_capacity_lb())
+            error = move_error(str(selected["id"]), "actively_carried", prospective, self.repository.get_state_value("location", ""), self.repository.player_carrying_capacity_lb(), self.repository.get_travel_locations())
             if error:
                 return _invalid(event_type, payload, error)
             moved = next(row for row in prospective if str(row["id"]) == str(selected["id"]))
@@ -1189,6 +1189,7 @@ class EventApplier:
             "travel_notes": _first_text(payload, "travel_notes", "route_notes"),
             "is_sublocation": bool(payload.get("is_sublocation")),
             "parent_location": _first_text(payload, "parent_location"),
+            "location_scope": payload.get("location_scope", "broad"),
         }
 
         if not self.repository.upsert_travel_location(location):
@@ -2338,53 +2339,14 @@ def _storage_location_is_accessible(
     repository: SaveRepository,
     destination: str,
 ) -> bool:
-    """Checks that an item move does not target a known remote location.
-
-    Storage labels are intentionally free text, so an unregistered label such as
-    ``car`` may still describe a nearby object.  When a label resolves to a
-    player-known Travel location, however, it must be the current location (or
-    effectively co-located); this prevents remote actions such as putting an
-    item back at Home while the player is elsewhere.
-    """
-
-    target = clean_player_location_name(destination)
-    if not target or target.casefold() in {"actively_carried", "on_person"}:
+    """Only carried inventory or the exact current specific site is accessible."""
+    from ai_adventure.inventory_storage import location_allows_storage
+    if destination.casefold() in {"actively_carried", "on_person"}:
         return True
+    current = repository.get_state_value("location", "")
+    return (destination.strip().casefold() == current.strip().casefold()
+            and location_allows_storage(destination, repository.get_travel_locations()))
 
-    current = clean_player_location_name(
-        repository.get_state_value("location", "")
-    )
-    if current and target.casefold() == current.casefold():
-        return True
-
-    locations = normalize_known_locations(repository.get_travel_locations())
-    target_location = next(
-        (location for location in locations if location.name.casefold() == target.casefold()),
-        None,
-    )
-    current_location = next(
-        (location for location in locations if location.name.casefold() == current.casefold()),
-        None,
-    )
-    if target_location is not None:
-        if current_location is None:
-            return False
-        estimate = calculate_travel_estimate(
-            current_location,
-            target_location,
-            move_speed_mph=repository.get_setting("travel.move_speed_mph", 3.0),
-            travel_mode=repository.get_setting("travel.mode", "On Foot"),
-            speed_multiplier=repository.get_setting("travel.speed_multiplier", 1.0),
-        )
-        return estimate.distance_miles is not None and estimate.distance_miles <= 0.1
-
-    # Common home labels are meaningful even when an older save has no map row.
-    # Do not allow them from a plainly different current location.
-    home_label = target.casefold()
-    if home_label in {"home", "house", "at home", "display case at home"}:
-        return any(token in current.casefold() for token in ("home", "house"))
-
-    return True
 
 
 def _canonical_inventory_storage_location(

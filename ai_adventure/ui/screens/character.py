@@ -1,5 +1,6 @@
 from __future__ import annotations
 from typing import cast
+from PySide6.QtWidgets import QLayout
 
 from ai_adventure.ui.common import *  # noqa: F401,F403
 from ai_adventure.ui.dialogues import *  # noqa: F401,F403
@@ -84,6 +85,7 @@ class CharacterScreen(RepositoryBackedWidget):
                     "either hand; an owned copy can occupy only one slot."
                 )
                 if slot in {"Main Hand", "Off Hand"}
+                else "Backpacks and satchels declared for the Back slot." if slot == "Back"
                 else (
                     "Forced armor slot. Equipping armor fills every body slot "
                     "listed in that item's coverage metadata."
@@ -115,6 +117,9 @@ class CharacterScreen(RepositoryBackedWidget):
         self.stats_group = QGroupBox("Vitals")
         stats_layout = QFormLayout()
         stats_layout.addRow("Health:", _spin_pair_row(self.health_current_input, self.health_max_input))
+        self.carrying_summary_label = QLabel()
+        self.carrying_summary_label.setWordWrap(True)
+        stats_layout.addRow("Carrying:", self.carrying_summary_label)
         self.stats_group.setLayout(stats_layout)
 
         self.equipment_group = QGroupBox("Equipment")
@@ -232,8 +237,8 @@ class CharacterScreen(RepositoryBackedWidget):
         header_layout.addWidget(self.profile_pages)
 
         secondary_layout = QHBoxLayout()
-        secondary_layout.addWidget(self.stats_group)
-        secondary_layout.addWidget(self.equipment_group)
+        secondary_layout.addWidget(self.stats_group, 1, Qt.AlignmentFlag.AlignTop)
+        secondary_layout.addWidget(self.equipment_group, 1, Qt.AlignmentFlag.AlignTop)
 
         sheet_layout = QVBoxLayout()
         sheet_layout.addLayout(header_layout)
@@ -243,7 +248,17 @@ class CharacterScreen(RepositoryBackedWidget):
         edit_button_layout.addWidget(self.edit_profile_button)
         sheet_layout.addLayout(edit_button_layout)
 
-        self.setLayout(sheet_layout)
+        sheet_layout.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
+        sheet = QWidget()
+        sheet.setLayout(sheet_layout)
+        self.sheet_scroll = QScrollArea()
+        self.sheet_scroll.setWidgetResizable(True)
+        self.sheet_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.sheet_scroll.setWidget(sheet)
+        layout = QVBoxLayout()
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self.sheet_scroll)
+        self.setLayout(layout)
         self._set_pronouns(DEFAULT_CHARACTER_PRONOUNS)
         self._sync_contextual_controls(None)
         self._set_profile_editing(False)
@@ -788,5 +803,16 @@ class CharacterScreen(RepositoryBackedWidget):
             self.health_current_input.setValue(self.health_max_input.value())
 
     def _sync_equipment_summary(self) -> None:
-        """Equipment capabilities are descriptive, with no numeric fighting ratings."""
+        """Show authoritative load and explain the carried bag contribution."""
         self._sync_health_bounds()
+        repository = self.repository()
+        if repository is None:
+            self.carrying_summary_label.clear()
+            return
+        load = repository.inventory_load()
+        self.carrying_summary_label.setText(
+            f"{load['weight_lb']:g} / {load['capacity_lb']:g} lb\n"
+            f"Base {load['base_capacity_lb']:g} lb + carried bags {load['container_bonus_lb']:g} lb.\n"
+            "Bag bonuses apply while carried, including before equipping. "
+            "A bag without a carrying capacity bonus adds no capacity."
+        )

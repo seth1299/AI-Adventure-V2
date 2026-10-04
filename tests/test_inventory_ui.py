@@ -2697,7 +2697,7 @@ class InventoryUiTests(unittest.TestCase):
             self.assertIsNone(dialog.findChild(QPlainTextEdit, "inventoryAsciiArt"))
             dialog_labels = [label.text() for label in dialog.findChildren(QLabel)]
             self.assertNotIn("Item Art", dialog_labels)
-            self.assertIn("Equipped:", dialog_labels)
+            self.assertNotIn("Equipped:", dialog_labels)  # A compass has no equipment slot.
             self.assertNotIn("Category:", dialog_labels)
             self.assertNotIn("Quantity:", dialog_labels)
             self.assertNotIn("Stored at:", dialog_labels)

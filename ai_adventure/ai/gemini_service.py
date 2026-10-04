@@ -45,6 +45,7 @@ from ai_adventure.ai.model_catalog import (
 from ai_adventure.calendar_system import normalize_calendar_settings
 from ai_adventure.container_access import has_immediate_container_unlock_method
 from ai_adventure.inventory_storage import NEW_GAME_STORAGE_RULE
+from ai_adventure.new_game_setup import OPENING_SCENE_RULE
 from ai_adventure.context.context_builder import CONTAINER_ACCESS_RULE
 from ai_adventure.context.creative_guardrails import (
     default_banned_creative_terms,
@@ -460,7 +461,7 @@ CONTAINER_CONTENT_ITEM_SCHEMA: dict[str, Any] = {
         "moveable": {"type": "boolean", "description": "False for fixed or impractical-to-relocate items."},
         "storable": {"type": "boolean", "description": "False for items that cannot be put inside a container."},
         "weight_lb": {"type": "number", "minimum": 0, "description": "Pounds per quantity unit, including the empty weight of a container or vehicle."},
-        "carrying_capacity_lb": {"type": "number", "minimum": 0, "description": "Container/Vehicle cargo limit in pounds; directly carried containers also add this to player capacity. Use 0 for ordinary items."},
+        "carrying_capacity_lb": {"type": "number", "minimum": 0, "description": "Container/Vehicle cargo limit in pounds; directly carried containers also add this to player capacity even before equipping. Provide a realistic positive capacity for usable backpacks and storage containers. Use 0 for ordinary items."},
         "contents_initialized": {
             "type": "boolean",
             "description": "For a nested Container item, true records an empty vessel; false leaves its contents undecided.",
@@ -650,7 +651,7 @@ EVENT_RESPONSE_SCHEMA: dict[str, Any] = {
                 "moveable": {"type": "boolean", "description": "False for fixed installations such as a large forge; prevents moving and storing."},
                 "storable": {"type": "boolean", "description": "Whether this item can be placed inside a container."},
                 "weight_lb": {"type": "number", "minimum": 0, "description": "Pounds per quantity unit, including the empty weight of a container or vehicle."},
-                "carrying_capacity_lb": {"type": "number", "minimum": 0, "description": "Container/Vehicle cargo limit in pounds; directly carried containers also add this to player capacity. Use 0 for ordinary items."},
+                "carrying_capacity_lb": {"type": "number", "minimum": 0, "description": "Container/Vehicle cargo limit in pounds; directly carried containers also add this to player capacity even before equipping. Provide a realistic positive capacity for usable backpacks and storage containers. Use 0 for ordinary items."},
                 "quantity_unit": {"type": "string", "description": "Unit for the amount, such as each, bottle, vial, gram, kilogram, liter, or meter."},
                 "storage_location": {
                     "type": "string",
@@ -735,7 +736,7 @@ EVENT_RESPONSE_SCHEMA: dict[str, Any] = {
                 "moveable": {"type": "boolean"},
                 "storable": {"type": "boolean"},
                 "weight_lb": {"type": "number", "minimum": 0, "description": "Pounds per quantity unit, including the empty weight of a container or vehicle."},
-                "carrying_capacity_lb": {"type": "number", "minimum": 0, "description": "Container/Vehicle cargo limit in pounds; directly carried containers also add this to player capacity. Use 0 for ordinary items."},
+                "carrying_capacity_lb": {"type": "number", "minimum": 0, "description": "Container/Vehicle cargo limit in pounds; directly carried containers also add this to player capacity even before equipping. Provide a realistic positive capacity for usable backpacks and storage containers. Use 0 for ordinary items."},
                 "item_uuid": {"type": "string"},
                 "quantity_unit": {"type": "string", "description": "Replacement unit measured by new_amount, such as each, grams, mL, bottle, or vial."},
                 "weapon_hands": {
@@ -939,7 +940,7 @@ EVENT_RESPONSE_SCHEMA: dict[str, Any] = {
                 "moveable": {"type": "boolean"},
                 "storable": {"type": "boolean"},
                 "weight_lb": {"type": "number", "minimum": 0, "description": "Pounds per quantity unit, including the empty weight of a container or vehicle."},
-                "carrying_capacity_lb": {"type": "number", "minimum": 0, "description": "Container/Vehicle cargo limit in pounds; directly carried containers also add this to player capacity. Use 0 for ordinary items."},
+                "carrying_capacity_lb": {"type": "number", "minimum": 0, "description": "Container/Vehicle cargo limit in pounds; directly carried containers also add this to player capacity even before equipping. Provide a realistic positive capacity for usable backpacks and storage containers. Use 0 for ordinary items."},
                 "description": {"type": "string"},
                 "value_base_units": {"type": "integer", "minimum": 0},
                 "quantity": {"type": "integer", "minimum": 0},
@@ -958,7 +959,7 @@ EVENT_RESPONSE_SCHEMA: dict[str, Any] = {
                 "moveable": {"type": "boolean"},
                 "storable": {"type": "boolean"},
                 "weight_lb": {"type": "number", "minimum": 0, "description": "Pounds per quantity unit, including the empty weight of a container or vehicle."},
-                "carrying_capacity_lb": {"type": "number", "minimum": 0, "description": "Container/Vehicle cargo limit in pounds; directly carried containers also add this to player capacity. Use 0 for ordinary items."},
+                "carrying_capacity_lb": {"type": "number", "minimum": 0, "description": "Container/Vehicle cargo limit in pounds; directly carried containers also add this to player capacity even before equipping. Provide a realistic positive capacity for usable backpacks and storage containers. Use 0 for ordinary items."},
                 "description": {"type": "string"},
                 "value_base_units": {"type": "integer", "minimum": 0},
                 "unit_price_base_units": {"type": "integer", "minimum": 0},
@@ -1041,6 +1042,7 @@ EVENT_RESPONSE_SCHEMA: dict[str, Any] = {
                 "travel_notes": {"type": "string"},
                 "is_sublocation": {"type": "boolean"},
                 "parent_location": {"type": "string"},
+                "location_scope": {"type": "string", "enum": ["broad", "specific"], "description": "Broad: continent, region, city or district. Specific: precise recoverable storage site such as a room, campsite or hideout. Preserve authored scope; sublocation alone does not imply specific."},
             },
             [
                 "name",
@@ -1050,6 +1052,7 @@ EVENT_RESPONSE_SCHEMA: dict[str, Any] = {
                 "terrain",
                 "travel_multiplier",
                 "travel_notes",
+                "location_scope",
             ],
         ),
         _event_response_schema(
@@ -1555,6 +1558,7 @@ STORY_EVENT_TYPE_NAMES_BY_CONTEXT_TAG: dict[str, tuple[str, ...]] = {
         "SecretUpsertedEvent",
     ),
     "inventory": (
+        "LocationUpsertedEvent",
         "InventoryItemAddedEvent",
         "InventoryItemRemovedEvent",
         "InventoryItemModifiedEvent",
@@ -1720,10 +1724,8 @@ NEW_GAME_RESPONSE_JSON_SCHEMA: dict[str, Any] = {
                     "description": {
                         "type": "string",
                         "description": (
-                            "Generic player-facing description of one representative "
-                            "item. Describe its form, materials, visible traits, and "
-                            "condition without mentioning the stack quantity, a count, "
-                            "plural batch, or image-generation instructions."
+                            "Player-facing location description identifying its extent "
+                            "and distinguishing a broad area from a specific site."
                         ),
                     },
                     "x_miles": {"type": "number"},
@@ -1733,6 +1735,7 @@ NEW_GAME_RESPONSE_JSON_SCHEMA: dict[str, Any] = {
                     "travel_notes": {"type": "string"},
                     "is_sublocation": {"type": "boolean"},
                     "parent_location": {"type": "string"},
+                    "location_scope": {"type": "string", "enum": ["broad", "specific"], "description": "Broad: continent, region, city or district. Specific: precise recoverable storage site such as a room, campsite or hideout. Preserve authored scope; sublocation alone does not imply specific."},
                     "source_index": {"type": "integer", "minimum": -1},
                 },
                 "required": [
@@ -1746,6 +1749,7 @@ NEW_GAME_RESPONSE_JSON_SCHEMA: dict[str, Any] = {
                     "source_index",
                     "is_sublocation",
                     "parent_location",
+                    "location_scope",
                 ],
                 "additionalProperties": False,
             },
@@ -1939,7 +1943,7 @@ NEW_GAME_RESPONSE_JSON_SCHEMA: dict[str, Any] = {
                     "moveable": {"type": "boolean", "description": "False for fixed installations or items too large to relocate normally."},
                     "storable": {"type": "boolean", "description": "Whether this item can be put in a physical container."},
                     "weight_lb": {"type": "number", "minimum": 0, "description": "Pounds per quantity unit, including the empty weight of a container or vehicle."},
-                    "carrying_capacity_lb": {"type": "number", "minimum": 0, "description": "Container/Vehicle cargo limit in pounds; directly carried containers also add this to player capacity. Use 0 for ordinary items."},
+                    "carrying_capacity_lb": {"type": "number", "minimum": 0, "description": "Container/Vehicle cargo limit in pounds; directly carried containers also add this to player capacity even before equipping. Provide a realistic positive capacity for usable backpacks and storage containers. Use 0 for ordinary items."},
                     "container": CONTAINER_METADATA_SCHEMA,
                     "description": {"type": "string"},
                     "value_base_units": {"type": "integer", "minimum": 0},
@@ -2021,7 +2025,7 @@ NEW_GAME_RESPONSE_JSON_SCHEMA: dict[str, Any] = {
                 "as base currency units."
             ),
         },
-        "introductory_message": {"type": "string"},
+        "introductory_message": {"type": "string", "description": OPENING_SCENE_RULE},
         "suggested_actions": {
             "type": "array",
             "description": "Three or four short player-facing action options for the opening scene.",
@@ -3299,7 +3303,7 @@ def _build_xml_story_prompt(context_packet: dict[str, Any]) -> str:
 
 
 _STORY_STATE_TAGS: dict[str, set[str]] = {
-    "travel": {"travel", "exploration", "scene"},
+    "travel": {"travel", "exploration", "scene", "inventory"},
     "inventory": {"inventory", "alchemy", "crafting", "reagent", "recipe", "combat", "merchant"},
     "item_catalog": {"inventory", "alchemy", "crafting", "reagent", "recipe", "combat", "merchant"},
     "currency": {"currency", "merchant"},
@@ -3763,6 +3767,7 @@ def build_gemini_new_game_phase_prompt(
             "setup_scope_counts",
         },
         "opening_prose": {
+            "opening_scene",
             "speaker_cues",
             "starting_music",
             "starting_sound_effect",
@@ -4042,6 +4047,13 @@ def _repair_gemini_creative_terms(
                 CREATIVE_TERM_REPAIR_ATTEMPTS,
             )
             continue
+
+        if _creative_guardrail_excluded_paths(response_label):
+            previous = _json_data_or_original(candidate_text)
+            repaired = _json_data_or_original(repaired_text)
+            if isinstance(previous, dict) and isinstance(repaired, dict) and "calendar_settings" in previous:
+                repaired["calendar_settings"] = copy.deepcopy(previous["calendar_settings"])
+                repaired_text = json.dumps(repaired, ensure_ascii=False)
 
         if _new_game_response_quality_score(repaired_text, schema) > (
             _new_game_response_quality_score(candidate_text, schema)
@@ -4718,7 +4730,8 @@ def _creative_terms_repair_prompt(
         f"Repair AI Adventure {response_label} JSON. Attempt {attempt}.\n\n"
         "Hard rule: the repaired JSON must not contain any forbidden term, close "
         "spelling variant, hyphenation variant, or obvious reskin anywhere in a "
-        "string key or value.\n"
+        "string key or value, except calendar_settings in New Game responses. "
+        "Preserve that calendar_settings object exactly; its names are exempt.\n"
         "When replacing a forbidden NPC, location, faction, item, skill, calendar, "
         "or other proper noun, invent a fresh genre-appropriate name from scratch. "
         "Do not use placeholders such as unnamed place, unnamed person, the city, "
@@ -5299,7 +5312,7 @@ def _creative_guardrail_excluded_paths(
 ) -> tuple[tuple[str, ...], ...]:
     """Returns structured response paths exempt from creative-name bans."""
 
-    if response_label == "new-game response":
+    if response_label.startswith("new-game "):
         return (("calendar_settings",),)
     return ()
 
@@ -7210,6 +7223,12 @@ def parse_gemini_new_game_response(
     )
     start_weather = str(data.get("weather", data.get("start_weather", ""))).strip()
     locations = _parse_new_game_locations(data.get("locations"), start_location)
+    requested_locations = setup.get("starting_locations", [])
+    for location in locations:
+        source_index = location.get("source_index", -1)
+        if isinstance(source_index, int) and 0 <= source_index < len(requested_locations):
+            authored = requested_locations[source_index]
+            location["location_scope"] = "specific" if authored.get("location_scope") == "specific" else "broad"
     gm_secrets = _parse_new_game_gm_secrets(data.get("gm_secrets"))
     miscellaneous = _parse_new_game_miscellaneous(data.get("miscellaneous"))
     bestiary = _parse_new_game_bestiary(data.get("bestiary"))

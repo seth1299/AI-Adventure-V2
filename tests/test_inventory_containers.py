@@ -46,6 +46,7 @@ class InventoryContainerTests(unittest.TestCase):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
         self.repo = SaveRepository.create_new_save(Path(self.directory.name), "Storage")
+        self.repo.set_travel_locations([{"name": "Player Store", "location_scope": "specific"}])
         self.repo.set_state_value("location", "Player Store")
         self.repo.replace_inventory_items([
             box("Oak Box"), box("Blue Box"), box("Remote Box", "Blacksmith"),

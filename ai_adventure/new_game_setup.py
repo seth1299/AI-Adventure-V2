@@ -35,6 +35,12 @@ from ai_adventure.items import normalize_item_metadata
 from ai_adventure.story_preferences import FIGHTING_FOCUS_INSTRUCTIONS, normalize_fighting_preferences
 from ai_adventure.inventory_storage import NEW_GAME_STORAGE_RULE
 
+OPENING_SCENE_RULE = (
+    "Focus on the area and immediate situation. Omit starting gear and character-sheet "
+    "details unless the opening request explicitly needs them or they cause the scene. "
+    "No incidental strap adjustments, weapon touching, outfit recaps or inventory-check suggestions."
+)
+
 
 SKILL_PRESET_LEVEL_PLANS: dict[str, list[int]] = {
     "professional": [5, 4, 4, 3, 3, 3, 2, 2, 2, 2, 1, 1, 1, 1, 1],
@@ -524,15 +530,11 @@ def build_new_game_setup_packet(
                 "readability."
             ),
             "opening_scene": (
-                "Write an introductory player-facing scene at the requested "
-                "starting location. Use setup.narration.tense_label and "
-                "setup.narration.style_label for the prose. Light Markdown is "
-                "allowed for italics, bold important names, and readable lists. "
-                "If setup.opening_scene_request is non-empty, use it as player-"
-                "authored creative direction for the situation, mood, event, or "
-                "hook at that starting location. Honor its intent when coherent, "
-                "but turn it into finalized in-world narration rather than copying "
-                "the request or exposing meta-instructions. Keep the result "
+                OPENING_SCENE_RULE + " "
+                "Use setup.narration.tense_label and setup.narration.style_label. "
+                "Light Markdown is allowed. Honor setup.opening_scene_request as "
+                "creative direction, using finalized in-world narration rather "
+                "than copying the request or exposing meta-instructions. Stay "
                 "consistent with the finalized start_location, character, world, "
                 "and player knowledge. End with the prompt in setup.turn_prompt."
             ),
@@ -823,6 +825,7 @@ def build_new_game_setup_packet(
                 "travel_notes, NPC details, tasks, "
                 "secrets, and opening prose; never reuse the superseded setup "
                 "placeholder or suggestion name. "
+                "Preserve authored location_scope. "
                 "If is_sublocation is true and parent_location is set, preserve "
                 "those structured fields and do not repeat the relationship in the "
                 "description or travel_notes; the application displays it separately. "
@@ -1739,6 +1742,7 @@ def _normalize_starting_locations(raw_locations: Any) -> list[dict[str, Any]]:
                 "location_mode": location_mode,
                 "is_sublocation": is_sublocation,
                 "parent_location": parent_location if is_sublocation else "",
+                "location_scope": "specific" if raw_location.get("location_scope") == "specific" else "broad",
                 "requires_ai_invention": (
                     location_mode == "suggestion" or not name or not description
                 ),
@@ -2137,6 +2141,20 @@ def ai_generated_calendar_settings_or_fallback(
         return _copy_calendar_settings(fallback)
 
     clean_calendar = normalize_calendar_settings(raw_calendar)
+
+    # Name sanitizers and incomplete responses must not become calendar labels.
+    placeholder_names = {"the city", "the person", "unnamed place", "unnamed person",
+                         "local item", "local skill", "unknown", "unnamed", "placeholder"}
+    name_groups = [clean_calendar["day_names"], clean_calendar["month_names"],
+                   [season["name"] for season in clean_calendar["seasons"]]]
+    for names in name_groups:
+        folded = [str(name).strip().casefold() for name in names]
+        if len(set(folded)) != len(folded) or any(
+            name in placeholder_names or name.isdecimal()
+            or (name.startswith(("day ", "month ", "season ")) and name.split()[-1].isdecimal())
+            for name in folded
+        ):
+            return _copy_calendar_settings(fallback)
 
     if calendar_looks_like_default_gregorian(
         clean_calendar
