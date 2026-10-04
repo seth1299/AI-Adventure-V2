@@ -2,6 +2,12 @@
   "version": 1,
   "scenarios": [
     {
+      "id": "malformed_status_payload_rejected_after_contract_repair",
+      "context": {"player_command": "Look around the market."},
+      "response": {"response": "You look over the quiet stalls.", "suggested_actions": [], "events": [{"type": "StatusUpdatedEvent", "payload": {"location": "Market", "minutes_passed": 1}}], "out_of_game": false},
+      "reject": true
+    },
+    {
       "id": "failed_check_not_rerolled", "context": {"player_command": "Pick the locked door.", "selection": {"tags": ["skill"]}, "state": {"skills": {"known_skills": [{"name": "Lockpicking"}], "resolved_checks_this_turn": [{"skill_name": "Lockpicking", "success": false, "attribute": "Dexterity", "test_kind": "check"}]}}},
       "response": {"response": "The lock remains shut.", "suggested_actions": [], "events": [{"type": "D20TestRequestedEvent", "payload": {"skill_name": "Lockpicking", "difficulty": "hard", "attribute": "Dexterity", "test_kind": "check", "reason": "Pick the locked door."}}], "out_of_game": false},
       "forbidden_events": ["D20TestRequestedEvent"]

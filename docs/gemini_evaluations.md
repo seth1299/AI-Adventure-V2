@@ -35,15 +35,27 @@ Request-specific context, UI mode, preferences, examples, and task remain in
 `contents`. Embedded context tags are never promoted into system instructions.
 System instructions reinforce authority; Python still enforces it.
 
-The API receives a compact schema. After repairs, the service validates the full
-request-specific local schema before permissive parsing or event normalization.
+The story API schema constrains the response envelope, enabled event type names,
+and object payloads. The complete per-event payload schema is included in the
+application system instruction, avoiding compilation of a large nested event union
+by Gemini. The detailed schema builder remains available for prompt guidance and
+validation. After repairs, the service validates the full request-specific local
+schema before permissive parsing or event normalization.
 Staged new games validate each phase and the merged result. Invalid responses raise
 `GeminiRequestError`; they do not produce a result for committing generated changes.
 Standalone parsers retain their normalization behavior for imported/manual data.
 
-A schema rejection can trigger one schema-free retry. This is logged as degraded,
-keeps JSON MIME mode and system rules, and validates against the original schema.
-It must also pass full local validation at the service boundary. Exhausted new-game
+A 400 INVALID_ARGUMENT with a configured schema can trigger one schema-free retry.
+This is a diagnostic fallback: a generic 400 alone does not prove the schema was the
+cause. The retry is logged as degraded, keeps JSON MIME mode and system rules, and
+receives the original response schema in its system instruction. Responses with
+locally enforced payloads or degraded responses get one complete regeneration when
+contract validation fails. Regeneration keeps the authoritative request context and
+receives bounded validation feedback, without replaying the rejected response text.
+There are at most two transport attempts plus one contract repair per transport call.
+Repairs must pass the same validation; missing or malformed payloads are never
+silently accepted. Story requests use the full local contract for these checks.
+They must also pass full local validation at the service boundary. Exhausted new-game
 quality retries fail validation rather than saving the most complete invalid candidate.
 This follows Google's guidance to [validate structured output in the application](https://ai.google.dev/gemini-api/docs/structured-output).
 
@@ -70,12 +82,18 @@ Normal application logs include content-free request and operation metrics:
   `usage_metadata`. Missing counts are `null`, never estimates or zero. Aggregated
   counts are totals of reported values; `usage_missing_count` identifies attempts
   with no metadata, including failures whose billing is unknown.
-- Degraded count records attempts made without the rejected server schema.
+- Degraded count records attempts made without the rejected server schema,
+  including contract repairs in JSON MIME mode. Compact story envelope requests
+  retain server schema enforcement and do not count as degraded.
   Success/failure is recorded for both the SDK call and complete operation.
 
 Operation metrics are isolated by execution context so concurrent workers do not
 mix counts. These metrics do not include generated audio or image API usage.
 Raw prompts/responses remain restricted to the existing playtesting debug logging.
+Contract failures log bounded field paths and validation reasons. Event union
+diagnostics select the branch matching the proposed type rather than reporting
+unrelated event payload requirements. Request diagnostics include server-schema
+character count without logging prompt or response text.
 
 ## Container consistency
 

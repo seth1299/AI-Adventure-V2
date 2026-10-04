@@ -1,10 +1,12 @@
 """Maintained offline scenarios for Gemini authority, contracts, and recovery."""
 
 import json
+import copy
+import re
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from ai_adventure.ai import gemini_service as g
 from ai_adventure.ai.request_metrics import CURRENT_METRICS, measured_operation
@@ -127,8 +129,7 @@ class GeminiContractTests(unittest.TestCase):
         for raw, accepted in [("{}", False), ('{"answer":1}', True)]:
             with self.subTest(raw=raw):
                 client = SimpleNamespace(models=SimpleNamespace())
-                from unittest.mock import Mock
-                client.models.generate_content = Mock(side_effect=[RuntimeError("400 INVALID_ARGUMENT invalid schema"), SimpleNamespace(text=raw)])
+                client.models.generate_content = Mock(side_effect=[RuntimeError("400 INVALID_ARGUMENT invalid schema"), SimpleNamespace(text=raw), SimpleNamespace(text=raw)])
                 with self.assertLogs("ai_adventure.ai.request_metrics", level="INFO") as logs:
                     if accepted:
                         g._generate_content_with_retry(client, model=g.DEFAULT_GEMINI_MODEL, contents="Generate", config={"response_json_schema": schema}, request_label="story request")
@@ -137,6 +138,116 @@ class GeminiContractTests(unittest.TestCase):
                             g._generate_content_with_retry(client, model=g.DEFAULT_GEMINI_MODEL, contents="Generate", config={"response_json_schema": schema}, request_label="story request")
                 self.assertIn('"degraded": true', "\n".join(logs.output))
                 self.assertIn("system_instruction", client.models.generate_content.call_args.kwargs["config"])
+                fallback = client.models.generate_content.call_args_list[1].kwargs["config"]
+                self.assertIn(json.dumps(schema, separators=(",", ":")), fallback["system_instruction"])
+                self.assertEqual(client.models.generate_content.call_count, 2 if accepted else 3)
+
+    def test_story_transport_is_small_and_preserves_payload_contract_in_prompt(self):
+        packet = {"selection": {"tags": ["inventory", "currency", "magic", "crafting", "music"]},
+                  "state": {"audio": {"valid_music_tracks": ["Market.mp3"], "current_music": "Market.mp3"}}}
+        schema = g.build_story_response_schema(packet)
+        original = copy.deepcopy(schema)
+        response = {"response": "The market is quiet.", "suggested_actions": [], "events": [],
+                    "out_of_game": False, "music_filename": "Market.mp3"}
+        client = SimpleNamespace(models=SimpleNamespace(generate_content=Mock(return_value=SimpleNamespace(text=json.dumps(response)))))
+        g._generate_content_with_retry(client, model=g.DEFAULT_GEMINI_MODEL, contents="Look around",
+                                       config={"response_json_schema": schema}, request_label="story request")
+        config = client.models.generate_content.call_args.kwargs["config"]
+        transport = config["response_json_schema"]
+        self.assertLess(len(json.dumps(transport)), len(json.dumps(schema)) / 5)
+        self.assertEqual(transport["required"], schema["required"])
+        self.assertEqual(transport["properties"]["music_filename"], schema["properties"]["music_filename"])
+        types = transport["properties"]["events"]["items"]["properties"]["type"]["enum"]
+        self.assertEqual(types, [branch["properties"]["type"]["enum"][0]
+                                 for branch in schema["properties"]["events"]["items"]["anyOf"]])
+        self.assertIn(json.dumps(schema, separators=(",", ":")), config["system_instruction"])
+        self.assertEqual(schema, original)
+        self.assertEqual(client.models.generate_content.call_count, 1)
+
+    def test_degraded_story_contract_repair_restores_full_response_and_metrics(self):
+        from google import genai
+        packet = {"player_command": "Look around", "state": {"scene": {"location": "Market"}}}
+        invalid = {"response": "private generated prose", "suggested_actions": [], "events": [
+            {"type": "StatusUpdatedEvent", "payload": {"location": "Market", "minutes_passed": 1}}],
+            "out_of_game": False}
+        repaired = copy.deepcopy(invalid)
+        repaired["response"] = "Stalls line the market."
+        repaired["events"][0]["payload"]["weather"] = "Clear"
+        with patch.object(genai, "Client") as client, self.assertLogs(level="INFO") as logs:
+            generate = client.return_value.models.generate_content
+            generate.side_effect = [RuntimeError("400 INVALID_ARGUMENT"),
+                                    SimpleNamespace(text=json.dumps(invalid)), SimpleNamespace(text=json.dumps(repaired))]
+            result = g.GeminiNarrationService(g.GeminiSettings(api_key="test-key")).generate_story_response(packet)
+        self.assertIn("Stalls line the market.", result.narrative_text)
+        self.assertEqual(generate.call_count, 3)
+        fallback = generate.call_args_list[1].kwargs
+        repair = generate.call_args_list[2].kwargs
+        self.assertNotIn("response_json_schema", fallback["config"])
+        self.assertEqual(fallback["config"]["response_mime_type"], "application/json")
+        self.assertEqual(repair["config"], fallback["config"])
+        self.assertIn("$.events[0].payload.weather is required", repair["contents"])
+        self.assertNotIn("private generated prose", repair["contents"])
+        self.assertNotIn("private generated prose", "\n".join(logs.output))
+        metrics = json.loads(next(line.split("Gemini operation metrics: ")[1] for line in logs.output
+                                  if "Gemini operation metrics:" in line))
+        self.assertEqual((metrics["request_count"], metrics["retry_count"], metrics["repair_count"]), (3, 1, 1))
+        self.assertEqual(metrics["degraded_count"], 2)
+        self.assertTrue(metrics["succeeded"])
+
+    def test_compact_story_rejects_bad_payloads_after_one_contract_repair(self):
+        from google import genai
+        for payload in ({"location": "Market", "minutes_passed": 0},
+                        {"location": "Market", "minutes_passed": 0, "weather": "Clear", "extra": True}):
+            with self.subTest(payload=payload), patch.object(genai, "Client") as client:
+                generate = client.return_value.models.generate_content
+                raw = json.dumps({"response": "Quiet stalls.", "suggested_actions": [], "out_of_game": False,
+                                  "events": [{"type": "StatusUpdatedEvent", "payload": payload}]})
+                generate.return_value = SimpleNamespace(text=raw)
+                with self.assertRaisesRegex(g.GeminiRequestError, "No generated changes were saved"):
+                    g.GeminiNarrationService(g.GeminiSettings(api_key="test-key")).generate_story_response({})
+                self.assertEqual(generate.call_count, 2)
+
+    def test_story_contract_repair_uses_full_local_bounds(self):
+        from google import genai
+        valid = {"response": "Quiet stalls.", "suggested_actions": [], "out_of_game": False, "events": []}
+        invalid = {**valid, "suggested_actions": ["Look"] * 20}
+        with patch.object(genai, "Client") as client:
+            generate = client.return_value.models.generate_content
+            generate.side_effect = [SimpleNamespace(text=json.dumps(invalid)), SimpleNamespace(text=json.dumps(valid))]
+            g.GeminiNarrationService(g.GeminiSettings(api_key="test-key")).generate_story_response({})
+            self.assertEqual(generate.call_count, 2)
+            self.assertIn("$.suggested_actions expected at most", generate.call_args.kwargs["contents"])
+
+    def test_contract_repair_rejects_invalid_json_and_does_not_expand_transport_retries(self):
+        schema = g.build_story_response_schema({})
+        valid = json.dumps({"response": "Quiet stalls.", "suggested_actions": [], "events": [], "out_of_game": False})
+        for raw in ("{", '{"response":"A","response":"B"}', '{"events":[NaN]}'):
+            with self.subTest(raw=raw):
+                client = SimpleNamespace(models=SimpleNamespace(generate_content=Mock(return_value=SimpleNamespace(text=raw))))
+                with self.assertRaisesRegex(g.GeminiRequestError, "invalid JSON"):
+                    g._generate_content_with_retry(client, model=g.DEFAULT_GEMINI_MODEL, contents="Look around",
+                        config={"response_json_schema": schema}, request_label="story request")
+                self.assertEqual(client.models.generate_content.call_count, 2)
+        client = SimpleNamespace(models=SimpleNamespace(generate_content=Mock(side_effect=[
+            RuntimeError("503 UNAVAILABLE"), SimpleNamespace(text="{}"), SimpleNamespace(text=valid)])))
+        with patch.object(g.time, "sleep"):
+            result = g._generate_content_with_retry(client, model=g.DEFAULT_GEMINI_MODEL, contents="Look around",
+                config={"response_json_schema": schema}, request_label="story request")
+        self.assertEqual(result.text, valid)
+        self.assertEqual(client.models.generate_content.call_count, 3)
+        client.models.generate_content = Mock(side_effect=[SimpleNamespace(text="{}"), RuntimeError("503 UNAVAILABLE")])
+        with patch.object(g.time, "sleep") as sleep, self.assertRaisesRegex(g.GeminiRequestError, "temporarily unavailable"):
+            g._generate_content_with_retry(client, model=g.DEFAULT_GEMINI_MODEL, contents="Look around",
+                config={"response_json_schema": schema}, request_label="story request")
+        sleep.assert_not_called()
+        self.assertEqual(client.models.generate_content.call_count, 2)
+
+    def test_story_prompt_item_example_matches_payload_contract(self):
+        packet = {"selection": {"tags": ["inventory"]}}
+        prompt = g.build_gemini_story_prompt(packet)
+        examples = json.loads(re.search(r"<examples>\n(.*?)\n</examples>", prompt, re.DOTALL).group(1))
+        for example in examples:
+            self.assertEqual(g._response_contract_errors(json.dumps(example["output"]), g.build_story_response_schema(packet)), [])
 
     def test_final_validation_rejects_invalid_repair(self):
         from google import genai

@@ -2749,6 +2749,7 @@ class GeminiNarrationService:
                 apply_response_length=True,
             ),
             request_label="story request",
+            response_contract=build_story_response_schema(context_packet, for_api=False),
         )
         if is_playtesting_build():
             LOGGER.debug(
@@ -3293,7 +3294,7 @@ def _build_xml_story_prompt(context_packet: dict[str, Any]) -> str:
                     },
                     {
                         "situation": "Player receives one ordinary item",
-                        "output": {"response": "The courier hands over the sealed letter.", "suggested_actions": ["Inspect the seal.", "Ask who sent it.", "Put the letter away."], "events": [{"type": "InventoryItemAddedEvent", "payload": {"item_name": "Sealed Letter", "item_type": "Document", "description": "A folded letter closed with a red wax seal.", "amount": 1, "quantity_unit": "each", "storage_location": "actively_carried", "value_base_units": 1}}], "out_of_game": False},
+                        "output": {"response": "The courier hands over the sealed letter.", "suggested_actions": ["Inspect the seal.", "Ask who sent it.", "Put the letter away."], "events": [{"type": "InventoryItemAddedEvent", "payload": {"item_name": "Sealed Letter", "item_type": "Document", "description": "A folded letter closed with a red wax seal.", "amount": 1, "quantity_unit": "each", "storage_location": "actively_carried", "value_base_units": 1, "moveable": True, "storable": True, "weight_lb": 0.02, "carrying_capacity_lb": 0}}], "out_of_game": False},
                     },
                 ],
             ),
@@ -3889,16 +3890,24 @@ def _separate_system_rules(contents: str, config: dict[str, Any]) -> tuple[str, 
     return "\n\n".join([*request_sections, remaining]), prepared
 
 
-def _validate_response_contract(raw_text: str, schema: dict[str, Any], label: str) -> None:
-    """Fail closed before permissive parsing or normalizers can create events."""
+def _response_contract_errors(raw_text: str, schema: dict[str, Any]) -> list[str]:
+    """Check strict JSON and its shape without normalizing generated proposals."""
     try:
         data = json.loads(_strip_json_fence(raw_text),
                           parse_constant=_reject_json_constant, object_pairs_hook=_unique_json_object)
     except (ValueError, TypeError):
-        raise GeminiRequestError(f"Gemini returned invalid JSON for {label}. No generated changes were saved.") from None
-    errors = _json_schema_shape_errors(data, schema)
+        return ["response was not valid JSON (including duplicate keys or non-finite numbers)"]
+    return _json_schema_shape_errors(data, schema)
+
+
+def _validate_response_contract(raw_text: str, schema: dict[str, Any], label: str) -> None:
+    """Fail closed before permissive parsing or normalizers can create events."""
+    errors = _response_contract_errors(raw_text, schema)
     if errors:
-        LOGGER.warning("Gemini %s failed response contract validation (%s issue(s)).", label, len(errors))
+        LOGGER.warning("Gemini %s failed response contract validation (%s issue(s)): %s",
+                       label, len(errors), _safe_model_log_json(errors[:8], max_chars=1600))
+        if errors[0].startswith("response was not valid JSON"):
+            raise GeminiRequestError(f"Gemini returned invalid JSON for {label}. No generated changes were saved.")
         raise GeminiRequestError(f"Gemini returned an invalid response contract for {label}. No generated changes were saved.")
 
 
@@ -4936,6 +4945,49 @@ def _new_game_response_quality_score(
     return len(errors)
 
 
+def _compact_story_transport_schema(schema: dict[str, Any]) -> dict[str, Any]:
+    """Keep the story envelope constrained without compiling every event payload."""
+    properties = schema.get("properties", {})
+    if not {"response", "events", "out_of_game"} <= properties.keys():
+        return schema
+    items = properties["events"].get("items", {})
+    branches = items.get("anyOf", [items])
+    event_types: list[str] = []
+    for branch in branches:
+        branch_properties = branch.get("properties", {})
+        names = branch_properties.get("type", {}).get("enum", [])
+        if len(names) != 1 or "payload" not in branch_properties:
+            return schema
+        event_types.extend(names)
+    if not event_types:
+        return schema
+    compact = copy.deepcopy(schema)
+    compact["properties"]["events"]["items"] = {
+        "type": "object",
+        "properties": {
+            "type": {"type": "string", "enum": event_types},
+            "payload": {"type": "object", "additionalProperties": True},
+        },
+        "required": ["type", "payload"],
+        "additionalProperties": False,
+    }
+    return compact
+
+
+def _with_prompt_response_schema(config: dict[str, Any], schema: dict[str, Any]) -> dict[str, Any]:
+    """Supply the contract when payloads or the entire schema are enforced locally."""
+    prepared = dict(config)
+    prepared["system_instruction"] = (
+        str(config.get("system_instruction", APPLICATION_SYSTEM_INSTRUCTION))
+        + "\n\nReturn one complete JSON object matching this response schema. "
+        "Each event payload must match the branch selected by its exact type. "
+        "Omit optional fields when unknown; do not add undeclared fields. "
+        "Python validates this entire schema before accepting any generated changes.\n"
+        + json.dumps(schema, ensure_ascii=True, separators=(",", ":"))
+    )
+    return prepared
+
+
 def _generate_content_with_retry(
     client: Any,
     *,
@@ -4944,8 +4996,9 @@ def _generate_content_with_retry(
     config: dict[str, Any],
     request_label: str,
     allow_schema_fallback: bool = True,
+    response_contract: dict[str, Any] | None = None,
 ) -> Any:
-    """Calls Gemini with one bounded retry for temporary service failures."""
+    """Bound transport retries and regenerate one invalid locally enforced response."""
 
     contents = sanitize_english_text(contents)
 
@@ -4963,7 +5016,17 @@ def _generate_content_with_retry(
     contents, prepared_config = _separate_system_rules(contents, config)
     active_config = _tool_free_text_generation_config(prepared_config)
     contract = config.get("response_json_schema")
+    validation_schema = response_contract if response_contract is not None else contract
+    compacted = False
+    if isinstance(contract, dict):
+        transport_schema = _compact_story_transport_schema(contract)
+        compacted = transport_schema != contract
+        if compacted:
+            active_config["response_json_schema"] = transport_schema
+            active_config = _with_prompt_response_schema(active_config, contract)
     degraded = False
+    contract_repair = False
+    original_contents = contents
     if is_playtesting_build():
         LOGGER.debug(
             "Gemini %s request diagnostics: %s",
@@ -4974,7 +5037,10 @@ def _generate_content_with_retry(
                 config=active_config,
             ),
         )
-    for attempt in range(1, MODEL_REQUEST_ATTEMPTS + 1):
+    # The extra slot is only for one contract regeneration, never an extra API retry.
+    for attempt in range(1, MODEL_REQUEST_ATTEMPTS + 2):
+        attempt_label = f"{request_label} contract repair" if contract_repair else request_label
+        metric_attempt = 1 if contract_repair else attempt
         started = time.perf_counter()
         try:
             response = client.models.generate_content(
@@ -4983,7 +5049,7 @@ def _generate_content_with_retry(
                 config=active_config,
             )
         except Exception as error:
-            record_attempt(label=request_label, model=model, attempt=attempt, started=started, degraded=degraded)
+            record_attempt(label=attempt_label, model=model, attempt=metric_attempt, started=started, degraded=degraded)
             transient = _is_transient_model_error(error)
             LOGGER.warning(
                 "Gemini %s attempt %s error diagnostics: %s",
@@ -4998,7 +5064,7 @@ def _generate_content_with_retry(
                 and attempt < MODEL_REQUEST_ATTEMPTS
             ):
                 LOGGER.warning(
-                    "Gemini %s rejected the structured-output schema. Retrying "
+                    "Gemini %s returned INVALID_ARGUMENT while using a structured-output schema. Retrying "
                     "once with JSON MIME mode and local response validation. "
                     "request_diagnostics=%s",
                     request_label,
@@ -5013,6 +5079,9 @@ def _generate_content_with_retry(
                     for key, value in active_config.items()
                     if key != "response_json_schema"
                 }
+                active_config["response_mime_type"] = "application/json"
+                if isinstance(contract, dict) and not compacted:
+                    active_config = _with_prompt_response_schema(active_config, contract)
                 degraded = True
                 continue
             if transient and attempt < MODEL_REQUEST_ATTEMPTS:
@@ -5048,11 +5117,28 @@ def _generate_content_with_retry(
                 f"Gemini could not complete the request: {summary}"
             ) from None
 
-        record_attempt(label=request_label, model=model, attempt=attempt, started=started,
+        record_attempt(label=attempt_label, model=model, attempt=metric_attempt, started=started,
                        response=response, degraded=degraded)
-        if degraded and isinstance(contract, dict):
-            _validate_response_contract(str(getattr(response, "text", "") or ""), contract,
-                                        f"degraded {request_label}")
+        if (degraded or compacted) and isinstance(validation_schema, dict):
+            raw_text = str(getattr(response, "text", "") or "").strip()
+            errors = _response_contract_errors(raw_text, validation_schema)
+            if errors and not contract_repair:
+                LOGGER.warning(
+                    "Gemini %s failed response contract validation (%s issue(s)): %s. "
+                    "Requesting one complete contract repair.",
+                    attempt_label, len(errors), _safe_model_log_json(errors[:8], max_chars=1600),
+                )
+                # Regenerate from authoritative context. Never promote rejected text to instructions.
+                contents = original_contents + "\n\n" + _xml_json_section(
+                    "contract_repair_feedback", {
+                        "instruction": "Regenerate the entire JSON response from the original context. Fix these validation errors; do not continue a previous response.",
+                        "validation_errors": errors[:8],
+                    },
+                )
+                contract_repair = True
+                continue
+            _validate_response_contract(raw_text, validation_schema,
+                                        f"degraded {request_label}" if degraded else request_label)
         return response
 
     raise GeminiRequestError("Gemini could not complete the request.")
@@ -5189,6 +5275,7 @@ def _model_request_diagnostics(
         "thinking_config": config.get("thinking_config"),
         "max_output_tokens": config.get("max_output_tokens"),
         "schema_type": schema.get("type") if isinstance(schema, dict) else None,
+        "schema_json_chars": len(json.dumps(schema, separators=(",", ":"))) if isinstance(schema, dict) else 0,
         "schema_top_level_properties": sorted(str(key) for key in schema_properties),
         "schema_required": (
             schema.get("required", []) if isinstance(schema, dict) else []
@@ -6742,6 +6829,7 @@ def _repair_container_reward_flow(
                 config=_structured_output_config(response_schema, model=model,
                     ai_preferences=ai_preferences, apply_response_length=True),
                 request_label="container consistency repair",
+                response_contract=build_story_response_schema(context_packet, for_api=False),
             )
             raw_text = _repair_gemini_creative_terms(
                 client, model, str(getattr(response, "text", "") or "").strip(),
@@ -8325,6 +8413,13 @@ def _json_schema_shape_errors(
     any_of = schema.get("anyOf")
 
     if isinstance(any_of, list):
+        # A recognized discriminator identifies the relevant payload contract.
+        # Reporting arbitrary first branches hides the actual missing/invalid fields.
+        if isinstance(value, dict) and isinstance(value.get("type"), str):
+            matching = [branch for branch in any_of if isinstance(branch, dict)
+                        and branch.get("properties", {}).get("type", {}).get("enum") == [value["type"]]]
+            if len(matching) == 1:
+                return _json_schema_shape_errors(value, matching[0], path)
         branch_errors = [
             _json_schema_shape_errors(value, branch_schema, path)
             for branch_schema in any_of

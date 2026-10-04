@@ -45,6 +45,7 @@ from ai_adventure.ai.gemini_service import (
     _generate_new_game_response_with_quality_retry,
     _prefer_clearly_relevant_known_skill,
     _generate_content_with_retry,
+    _compact_story_transport_schema,
     _model_error_diagnostics,
     _model_request_diagnostics,
     _new_game_prompt_packet_for_schema,
@@ -1014,7 +1015,7 @@ class GeminiServiceTests(unittest.TestCase):
         self.assertEqual(call["config"]["response_mime_type"], "application/json")
         self.assertEqual(
             call["config"]["response_json_schema"],
-            build_story_response_schema({"packet_type": "story_turn"}),
+            _compact_story_transport_schema(build_story_response_schema({"packet_type": "story_turn"})),
         )
         self.assertEqual(
             call["config"]["safety_settings"][0]["threshold"],
@@ -1815,7 +1816,7 @@ class GeminiServiceTests(unittest.TestCase):
             [],
         )
         self.assertIn(
-            "$.events[0] did not match any allowed schema",
+            "$.events[0].payload.base_unit_amount is required",
             _json_schema_shape_errors(invalid_response, STORY_RESPONSE_JSON_SCHEMA),
         )
 
@@ -1893,11 +1894,11 @@ class GeminiServiceTests(unittest.TestCase):
             [],
         )
         self.assertIn(
-            "$.events[0] did not match any allowed schema",
+            "$.events[0].payload.value_base_units is required",
             _json_schema_shape_errors(missing_value_response, STORY_RESPONSE_JSON_SCHEMA),
         )
         self.assertIn(
-            "$.events[0] did not match any allowed schema",
+            "$.events[0].payload.value_base_units expected at least 1",
             _json_schema_shape_errors(zero_value_response, STORY_RESPONSE_JSON_SCHEMA),
         )
         self.assertEqual(
@@ -2783,7 +2784,7 @@ class GeminiServiceTests(unittest.TestCase):
         }
 
         self.assertIn(
-            "$.events[0] did not match any allowed schema",
+            "$.events[0].payload.skill_name is required",
             _json_schema_shape_errors(invalid_response, STORY_RESPONSE_JSON_SCHEMA),
         )
         self.assertEqual(
@@ -2860,7 +2861,7 @@ class GeminiServiceTests(unittest.TestCase):
             "out_of_game": False,
         }
         self.assertIn(
-            "$.events[0] did not match any allowed schema",
+            "$.events[0].payload.Notes is not allowed",
             _json_schema_shape_errors(extra_notes_response, STORY_RESPONSE_JSON_SCHEMA),
         )
 
@@ -2934,11 +2935,11 @@ class GeminiServiceTests(unittest.TestCase):
             [],
         )
         self.assertIn(
-            "$.events[0] did not match any allowed schema",
+            "$.events[0].payload.role is required",
             _json_schema_shape_errors(missing_role_response, STORY_RESPONSE_JSON_SCHEMA),
         )
         self.assertIn(
-            "$.events[0] did not match any allowed schema",
+            "$.events[0].payload.disposition is not allowed",
             _json_schema_shape_errors(extra_disposition_response, STORY_RESPONSE_JSON_SCHEMA),
         )
 
@@ -2976,7 +2977,7 @@ class GeminiServiceTests(unittest.TestCase):
         }
 
         self.assertIn(
-            "$.events[0] did not match any allowed schema",
+            "$.events[0].payload.description is required",
             _json_schema_shape_errors(invalid_response, STORY_RESPONSE_JSON_SCHEMA),
         )
         self.assertEqual(
