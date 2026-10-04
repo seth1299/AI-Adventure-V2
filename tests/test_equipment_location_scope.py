@@ -67,7 +67,7 @@ class EquipmentLocationScopeTests(unittest.TestCase):
     def test_broad_storage_is_rejected_and_specific_site_round_trip_works(self):
         dagger = self.repo.list_inventory_items()[0]
         self.assertNotIn(("Leave at North America", "North America"), self.repo.inventory_move_destinations(dagger["id"]))
-        with self.assertRaisesRegex(ValueError, "specific storage site"):
+        with self.assertRaisesRegex(ValueError, "precise place"):
             self.repo.move_inventory_item(dagger["id"], "North America")
         self.repo.set_state_value("location", "Hideout")
         self.repo.move_inventory_item(dagger["id"], "Hideout")
@@ -115,7 +115,7 @@ class EquipmentLocationScopeTests(unittest.TestCase):
         self.assertEqual(reopened.find_travel_location("Hideout")["location_scope"], "specific")
 
     def test_travel_scope_can_be_marked_explicitly(self):
-        screen = TravelScreen()
+        screen = TravelScreen(playtesting_tools=True)
         self.addCleanup(screen.close)
         screen.set_repository(self.repo)
         screen.scope_selector.setCurrentIndex(screen.scope_selector.findData("specific"))

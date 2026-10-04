@@ -640,9 +640,8 @@ def _travel_locations_for_save(
             ).strip().casefold() in {"", "starting location."}:
                 matched_location["description"] = requested_description
 
-            matched_location["location_scope"] = (
-                "specific" if raw_requested_location.get("location_scope") == "specific" else "broad"
-            )
+            if raw_requested_location.get("location_scope") in ("specific", "broad"):
+                matched_location["location_scope"] = raw_requested_location["location_scope"]
             parent_location = str(
                 raw_requested_location.get("parent_location", "") or ""
             ).strip()

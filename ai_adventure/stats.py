@@ -36,7 +36,9 @@ STATS_RULE = (
     "Individual rolls never earn Player XP. Reuse persistent source IDs; do not relabel old achievements. "
     "Every 100 Player XP gains a level, capped at 20, banking a choice of +1 attribute or two skill advances. "
     "Only the player spends rewards. Attributes cap at 20; skills cap at 5 with separate training XP. "
-    "Meaningful instruction/practice may unlock a level-1 skill; upserts cannot directly promote skills."
+    "Meaningful use of a known skill earns 1 training XP per skill per message, success or failure. "
+    "Meaningful instruction/practice may unlock a level-1 skill without a successful roll; "
+    "upserts cannot directly promote skills."
 )
 
 

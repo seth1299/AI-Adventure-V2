@@ -512,11 +512,11 @@ class ContextBuilderTests(unittest.TestCase):
         self.assertIn("background_music", packet["response_contract"])
         self.assertIn("MusicChangedEvent", packet["response_contract"]["known_event_types"])
         self.assertIn(
-            "MusicChangedEvent is optional",
+            "return music_filename",
             packet["state"]["audio"]["rules"]["music_change_rule"],
         )
         self.assertIn(
-            "keep the current music playing",
+            "Keep the current filename",
             packet["state"]["audio"]["rules"]["music_change_rule"],
         )
         self.assertNotIn("WorldLoreUpsertedEvent", packet["response_contract"]["known_event_types"])

@@ -10,10 +10,25 @@ SKILL_DESCRIPTION_RULE = (
 )
 MAX_SKILL_XP_RULE = "Master (level 5) skills cannot gain further XP or levels. Do not propose XP awards for them."
 
+SKILL_TRAINING_RULE = (
+    "Python awards 1 training XP for meaningful resolved use of an existing skill, "
+    "once per skill per message, whether the test succeeds or fails. Do not emit "
+    "SkillXpAddedEvent for that same use. Training XP is separate from Player XP. "
+    "For meaningful instruction, study or practice without an already rewarded skill "
+    "test, emit SkillXpAddedEvent for a known skill with an explicit positive xp_amount "
+    "(normally 1). A failed roll does not prevent learning from practice. Meaningful "
+    "practice or instruction can teach a new level-1 skill through SkillUpsertedEvent "
+    "with a scope description and training reason, even when an associated test failed. "
+    "Do not require proficiency or a successful test to learn; safe routine practice "
+    "does not need a roll. Risky untrained actions still use an attribute-only test and "
+    "do not automatically create skills. Upserts cannot directly promote existing skills."
+)
+
 SKILL_TRAINING_SOURCE_RULE = (
     "SkillXpAddedEvent may include an optional source_id identifying this particular "
     "skill training award. Reuse it on retries and retellings. When omitted and a "
     "message ID exists, Python deduplicates one training award per skill per message; "
+    "this per-message limit also applies when an explicit source_id is supplied. "
     "without a message ID there is no fallback deduplication."
 )
 

@@ -825,7 +825,11 @@ def build_new_game_setup_packet(
                 "travel_notes, NPC details, tasks, "
                 "secrets, and opening prose; never reuse the superseded setup "
                 "placeholder or suggestion name. "
-                "Preserve authored location_scope. "
+                "Preserve authored location_scope; otherwise classify extent automatically "
+                "as broad for cities, districts, regions and continents, or specific for "
+                "rooms, campsites, hideouts and similarly precise recoverable sites. "
+                "Keep this as backend metadata without displaying those labels "
+                "or asking the player to choose them. "
                 "If is_sublocation is true and parent_location is set, preserve "
                 "those structured fields and do not repeat the relationship in the "
                 "description or travel_notes; the application displays it separately. "
@@ -1742,7 +1746,8 @@ def _normalize_starting_locations(raw_locations: Any) -> list[dict[str, Any]]:
                 "location_mode": location_mode,
                 "is_sublocation": is_sublocation,
                 "parent_location": parent_location if is_sublocation else "",
-                "location_scope": "specific" if raw_location.get("location_scope") == "specific" else "broad",
+                **({"location_scope": raw_location["location_scope"]}
+                   if raw_location.get("location_scope") in ("specific", "broad") else {}),
                 "requires_ai_invention": (
                     location_mode == "suggestion" or not name or not description
                 ),

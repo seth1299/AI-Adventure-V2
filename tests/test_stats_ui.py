@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import random
 import tempfile
 import unittest
 from pathlib import Path
@@ -12,6 +13,7 @@ from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QComboBox, QDialog, QPushButton
 
 from ai_adventure.persistence.save_repository import SaveRepository
+from ai_adventure.events.event_applier import EventApplier
 from ai_adventure.stats import RANK_STATS
 from ai_adventure.ui.screens.stats import StatsScreen
 from ai_adventure.ui.screens.character import CharacterScreen
@@ -32,6 +34,82 @@ class StatsUiTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication([])
+
+    def test_recent_d20_audit_is_playtesting_only_and_uses_persisted_details(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository = SaveRepository.create_new_save(Path(directory), "Audit")
+            reason = "Sneak past <alert guards> without being noticed."
+            result = EventApplier(repository, rng=random.Random(7), message_id="story-message-123").apply_event({
+                "type": "D20TestRequestedEvent",
+                "payload": {"attribute": "Dexterity", "test_kind": "check", "dc": 15, "reason": reason},
+            })
+            self.assertEqual(result.status, "applied")
+            reopened = SaveRepository(repository.db_path)
+            for playtesting in (False, True):
+                screen = StatsScreen(playtesting_tools=playtesting)
+                self.addCleanup(screen.close)
+                screen.set_repository(reopened)
+                screen.resize(900, 650)
+                screen.show()
+                self.app.processEvents()
+                self.assertEqual(screen.tests_group.isVisible(), playtesting)
+                if playtesting:
+                    self.assertFalse(screen.tests_scroll.isVisible())
+                    screen.tests_group.setChecked(True)
+                    self.app.processEvents()
+                    self.assertTrue(screen.tests_scroll.isVisible())
+                    self.assertIn("Dexterity check:", screen.tests_label.text())
+                    self.assertIn(f"Reason: {reason}", screen.tests_label.text())
+                    self.assertIn("Associated message_ID: story-message-123", screen.tests_label.text())
+                    self.assertEqual(screen.tests_label.textFormat(), Qt.TextFormat.PlainText)
+                    screen.tests_group.setChecked(False)
+                    self.assertFalse(screen.tests_scroll.isVisible())
+                else:
+                    self.assertEqual(screen.tests_label.text(), "")
+                screen.close()
+
+    def test_playtesting_d20_audit_empty_state_and_scrollable_history(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository = SaveRepository.create_new_save(Path(directory), "Audit")
+            screen = StatsScreen(playtesting_tools=True)
+            self.addCleanup(screen.close)
+            screen.set_repository(repository)
+            self.assertEqual(screen.tests_label.text(), "No d20 tests recorded yet.")
+            for number in range(10):
+                EventApplier(repository, rng=random.Random(number)).apply_event({
+                    "type": "D20TestRequestedEvent",
+                    "payload": {"attribute": "Wisdom", "dc": 10, "reason": "Search the unfamiliar terrain. " * 40,
+                                "request_id": f"audit-test-{number}"},
+                })
+            screen.refresh()
+            screen.resize(900, 650)
+            screen.show()
+            screen.tests_group.setChecked(True)
+            self.app.processEvents()
+            self.assertIn("Associated message_ID: Not associated", screen.tests_label.text())
+            self.assertLessEqual(screen.tests_scroll.height(), 240)
+            self.assertGreater(screen.tests_scroll.verticalScrollBar().maximum(), 0)
+            self.assertEqual(screen.tests_scroll.horizontalScrollBarPolicy(), Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            screen.set_repository(None)
+            self.assertEqual(screen.tests_label.text(), "")
+
+    def test_skill_use_updates_visible_xp_progress(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository = SaveRepository.create_new_save(Path(directory), "Training")
+            repository.upsert_skill("Stealth", "Move unseen", 1)
+            screen = StatsScreen()
+            self.addCleanup(screen.close)
+            screen.set_repository(repository)
+            row = next(i for i in range(screen.skills_table.rowCount())
+                       if screen.skills_table.item(i, 0).text() == "Stealth")
+            self.assertEqual(screen.skills_table.cellWidget(row, 2).value(), 0)
+            EventApplier(repository, rng=random.Random(2), message_id="practice").apply_events([
+                {"type": "D20TestRequestedEvent", "payload": {"attribute": "Dexterity", "skill_name": "Stealth",
+                  "dc": 20, "reason": "Sneak past vigilant sentries"}},
+            ])
+            screen.refresh()
+            self.assertEqual(repository.get_skill("Stealth")["xp"], 1)
+            self.assertEqual(screen.skills_table.cellWidget(row, 2).value(), 12)
 
     def test_rank_point_buy_previews_and_incomplete_allocation(self):
         with tempfile.TemporaryDirectory() as directory:

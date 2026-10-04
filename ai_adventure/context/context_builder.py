@@ -5,7 +5,7 @@ from ai_adventure.stats import PLAYER_ACHIEVEMENT_RULE, STATS_RULE
 from ai_adventure.container_flow import CONTAINER_FLOW_RULE
 from ai_adventure.inventory_storage import inventory_access, inventory_load
 
-from ai_adventure.skills.rules import SKILL_DESCRIPTION_RULE, MAX_SKILL_XP_RULE, SKILL_TRAINING_SOURCE_RULE
+from ai_adventure.skills.rules import SKILL_DESCRIPTION_RULE, MAX_SKILL_XP_RULE, SKILL_TRAINING_RULE, SKILL_TRAINING_SOURCE_RULE
 
 import re
 from typing import Any
@@ -15,7 +15,7 @@ from ai_adventure.alchemy.ingredients import (
     CRAFTING_INGREDIENT_CATEGORY_NAMES,
 )
 from ai_adventure.ai.modes import ai_mode_preferences_from_settings
-from ai_adventure.audio.catalog import distinct_audio_track_catalogs_with_ambience
+from ai_adventure.audio.catalog import MUSIC_SELECTION_RULE, distinct_audio_track_catalogs_with_ambience
 from ai_adventure.context.creative_ideas import CreativeIdeasLibrary
 from ai_adventure.context.models import ContextLibrary
 from ai_adventure.context.naming import GENERIC_PROPER_NOUN_PLACEHOLDER_RULE
@@ -111,6 +111,10 @@ KEYWORD_TAGS: dict[str, set[str]] = {
         "check",
         "difficulty",
         "practice",
+        "learn",
+        "study",
+        "instruction",
+        "lesson",
         "roll",
         "skill",
         "train",
@@ -291,6 +295,9 @@ class AiContextBuilder:
             if planner_context_tags is None
             else _normalize_planner_context_tags(planner_context_tags)
         )
+        if re.search(r"\b(?:learn\w*|train\w*|practic\w*|study|studying|instruction|lesson)\b",
+                     clean_command, re.IGNORECASE):
+            selected_tags.add("skill")
         referenced_items = [
             *state.inventory.items[:MAX_INVENTORY_CONTEXT_ITEMS],
             *state.item_catalog.items,
@@ -370,16 +377,7 @@ class AiContextBuilder:
         ]
         audio_transition_rules: list[str] = []
         if clean_music_tracks:
-            audio_transition_rules.append(
-                "MusicChangedEvent is optional, not required whenever the scene or "
-                "location changes. Compare state.audio.current_music with every entry "
-                "in state.audio.valid_music_tracks and include MusicChangedEvent "
-                "before the final StatusUpdatedEvent only when a listed replacement "
-                "is clearly a better fit for the new environment or mood. If none of "
-                "the available tracks is clearly better, omit the event and leave the "
-                "current track playing; never change music merely because the scene "
-                "changed."
-            )
+            audio_transition_rules.append(MUSIC_SELECTION_RULE)
         if clean_sound_effect_tracks:
             audio_transition_rules.append(
                 "Use SoundEffectChangedEvent only for a brief, meaningful sound "
@@ -884,13 +882,7 @@ class AiContextBuilder:
                             "faster, or more advantageous result. Never mention dice "
                             "or roll numbers in player-facing narration."
                         ),
-                        "xp_rule": (
-                            "Suggest SkillXpAddedEvent only after meaningful use, "
-                            "training, study, or practice; do not use XP as a "
-                            "substitute for a check. Always include xp_amount; use "
-                            "1 for a tiny meaningful gain if no stronger amount is obvious. "
-                            + SKILL_TRAINING_SOURCE_RULE
-                        ),
+                        "xp_rule": SKILL_TRAINING_RULE + " " + SKILL_TRAINING_SOURCE_RULE,
                     },
                     "known_skills": [
                         skill.to_dict() for skill in state.skills.skills
@@ -1028,15 +1020,7 @@ class AiContextBuilder:
                     "current_background_ambience": clean_current_background_ambience,
                     "valid_background_ambience_tracks": clean_background_ambience_tracks,
                     "rules": {
-                        "music_change_rule": (
-                            "MusicChangedEvent is optional. When scene mood, location, "
-                            "danger level, or environment changes, compare the current "
-                            "track with every entry in valid_music_tracks. Suggest the "
-                            "event only when a listed replacement is clearly a better "
-                            "fit; if none is clearly better, omit it and keep the "
-                            "current music playing. Do not change tracks merely because "
-                            "the scene changed."
-                        ),
+                        "music_change_rule": MUSIC_SELECTION_RULE,
                         "filename_rule": (
                             "MusicChangedEvent.filename must exactly match one entry "
                             "from valid_music_tracks. If valid_music_tracks is empty, "
@@ -1326,7 +1310,7 @@ class AiContextBuilder:
                 ),
                 "d20_tests": STATS_RULE,
                 "player_achievements": PLAYER_ACHIEVEMENT_RULE,
-                "skill_training": SKILL_TRAINING_SOURCE_RULE,
+                "skill_training": SKILL_TRAINING_RULE + " " + SKILL_TRAINING_SOURCE_RULE,
                 "calendar_time": (
                     "Use state.calendar.current for date, day names, seasons, and "
                     "displayed time. Advance time only by suggesting "

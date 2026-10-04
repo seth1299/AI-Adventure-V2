@@ -192,6 +192,7 @@ class GameShell(QWidget):
         )
         self.travel_screen = TravelScreen(
             on_travel_requested=self._submit_travel_request,
+            playtesting_tools=self.playtesting_tools,
         )
         self.bestiary_screen = BestiaryScreen()
         self.calendar_screen = CalendarScreen(playtesting_tools=self.playtesting_tools)
@@ -202,7 +203,7 @@ class GameShell(QWidget):
         self.npcs_screen = NpcsScreen()
         self.party_screen = PartyScreen()
         self.active_tasks_screen = ActiveTasksScreen()
-        self.stats_screen = StatsScreen()
+        self.stats_screen = StatsScreen(playtesting_tools=self.playtesting_tools)
         self.magic_screen = MagicScreen()
         self.alchemy_screen = AlchemyNotebookScreen(
             playtesting_tools=self.playtesting_tools,

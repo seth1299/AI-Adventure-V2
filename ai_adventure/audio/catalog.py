@@ -2,6 +2,20 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 
+MUSIC_SELECTION_RULE = (
+    "When music tracks are available, return music_filename as the exact catalog filename "
+    "that best fits the final narrated scene. Evaluate the destination environment, mood "
+    "and danger, not just the starting location. Entering a forest from a town calls for "
+    "forest music instead of town music when both are listed; the forest track also fits "
+    "daytime woodland even if its filename mentions nighttime. Leaving combat calls for "
+    "replacing battle music with suitable peaceful music. Keep the current filename when "
+    "it still fits or no listed replacement fits better; minor actions do not require changes. "
+    "For out-of-game answers keep the current selection. Use an empty string only if no "
+    "music is currently selected and no listed track fits. Python converts a changed "
+    "selection into MusicChangedEvent before the final StatusUpdatedEvent; do not also "
+    "emit a competing MusicChangedEvent. Never invent filenames."
+)
+
 
 def distinct_audio_track_catalogs(
     music_tracks: Iterable[object] | None,

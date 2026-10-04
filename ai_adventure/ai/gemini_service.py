@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from ai_adventure.stats import ATTRIBUTES, PLAYER_ACHIEVEMENT_RULE, STATS_RULE
 
-from ai_adventure.skills.rules import SKILL_DESCRIPTION_RULE, MAX_SKILL_XP_RULE, SKILL_TRAINING_SOURCE_RULE
+from ai_adventure.skills.rules import SKILL_DESCRIPTION_RULE, MAX_SKILL_XP_RULE, SKILL_TRAINING_RULE, SKILL_TRAINING_SOURCE_RULE
 
 import copy
 import json
@@ -613,6 +613,7 @@ EVENT_RESPONSE_SCHEMA: dict[str, Any] = {
                 "reason": {"type": "string"},
             },
             ["name", "description", "level", "reason"],
+            description=SKILL_TRAINING_RULE,
         ),
         _event_response_schema(
             "SkillXpAddedEvent",
@@ -622,7 +623,7 @@ EVENT_RESPONSE_SCHEMA: dict[str, Any] = {
                 "source_id": {"type": "string", "description": SKILL_TRAINING_SOURCE_RULE},
             },
             ["skill_name", "xp_amount"],
-            description="Awards XP to an existing skill. Do not use skill_id.",
+            description=SKILL_TRAINING_RULE + " " + SKILL_TRAINING_SOURCE_RULE,
         ),
         _event_response_schema(
             "InventoryItemAddedEvent",
@@ -1488,6 +1489,7 @@ STORY_RESPONSE_JSON_SCHEMA: dict[str, Any] = {
             "description": "True only when the response is fully out-of-game.",
         },
         "speaker_cues": SPEAKER_CUE_RESPONSE_SCHEMA,
+        "music_filename": {"type": "string"},
     },
     "required": [
         "response",
@@ -1725,7 +1727,7 @@ NEW_GAME_RESPONSE_JSON_SCHEMA: dict[str, Any] = {
                         "type": "string",
                         "description": (
                             "Player-facing location description identifying its extent "
-                            "and distinguishing a broad area from a specific site."
+                            "without exposing internal location_scope classifications."
                         ),
                     },
                     "x_miles": {"type": "number"},
@@ -2381,6 +2383,9 @@ def _story_event_type_names(context_packet: dict[str, Any]) -> tuple[str, ...]:
         selected_tags.add("inventory")
     for tag in selected_tags:
         enabled_event_types.update(STORY_EVENT_TYPE_NAMES_BY_CONTEXT_TAG.get(tag, ()))
+    if re.search(r"\b(?:learn\w*|train\w*|practic\w*|study|studying|instruction|lesson)\b",
+                 str(context_packet.get("player_command", "")), re.IGNORECASE):
+        enabled_event_types.update({"SkillUpsertedEvent", "SkillXpAddedEvent"})
     audio = _state_subpacket(context_packet, "audio")
     (
         valid_music_tracks,
@@ -2428,6 +2433,16 @@ def build_story_response_schema(
         if branch["properties"]["type"]["enum"][0] in enabled_event_types
     ]
     schema = copy.deepcopy(STORY_RESPONSE_JSON_SCHEMA)
+    audio = _state_subpacket(context_packet, "audio")
+    music_tracks, _, _ = distinct_audio_track_catalogs_with_ambience(
+        audio.get("valid_music_tracks", []), [], []
+    )
+    if "MusicChangedEvent" in enabled_event_types and music_tracks:
+        choices = music_tracks if audio.get("current_music") in music_tracks else ["", *music_tracks]
+        schema["properties"]["music_filename"] = {"type": "string", "enum": choices}
+        schema["required"].append("music_filename")
+    else:
+        schema["properties"].pop("music_filename", None)
     schema["properties"]["events"]["items"] = (
         event_branches[0]
         if len(event_branches) == 1
@@ -6242,6 +6257,19 @@ def parse_gemini_story_response(
     suggested_events = [
         event for event in raw_events if isinstance(event, dict)
     ]
+    audio = _state_subpacket(context_packet or {}, "audio")
+    tracks, _, _ = distinct_audio_track_catalogs_with_ambience(
+        audio.get("valid_music_tracks", []), [], []
+    )
+    selected_music = data.get("music_filename")
+    if selected_music in tracks:
+        # The explicit scene selection is authoritative over duplicate event suggestions.
+        suggested_events = [e for e in suggested_events if e.get("type") != "MusicChangedEvent"]
+        if not data.get("out_of_game") and selected_music != audio.get("current_music"):
+            music_event = {"type": "MusicChangedEvent", "payload": {"filename": selected_music}}
+            status_index = next((i for i, e in enumerate(suggested_events)
+                                 if e.get("type") == "StatusUpdatedEvent"), len(suggested_events))
+            suggested_events.insert(status_index, music_event)
     suggested_events = _filter_audio_events_for_catalogs(
         suggested_events,
         context_packet,

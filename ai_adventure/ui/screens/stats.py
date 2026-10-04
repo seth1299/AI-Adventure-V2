@@ -9,8 +9,9 @@ from ai_adventure.ui.dialogues import *  # noqa: F401,F403
 class StatsScreen(RepositoryBackedWidget):
     """Attributes, derived stats, progression rewards, and learned skills."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, playtesting_tools: bool = False) -> None:
         super().__init__()
+        self.playtesting_tools = bool(playtesting_tools)
 
         self._sort_column = 0
         self._sort_order = Qt.SortOrder.AscendingOrder
@@ -37,11 +38,20 @@ class StatsScreen(RepositoryBackedWidget):
         self.tests_group.setCheckable(True)
         self.tests_group.setChecked(False)
         self.tests_label = QLabel()
+        self.tests_label.setTextFormat(Qt.TextFormat.PlainText)
+        self.tests_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self.tests_label.setWordWrap(True)
-        self.tests_label.hide()
-        self.tests_group.toggled.connect(self.tests_label.setVisible)
+        self.tests_label.setAlignment(Qt.AlignmentFlag.AlignTop)
+        self.tests_scroll = QScrollArea()
+        self.tests_scroll.setWidgetResizable(True)
+        self.tests_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.tests_scroll.setMaximumHeight(240)
+        self.tests_scroll.setWidget(self.tests_label)
+        self.tests_scroll.hide()
+        self.tests_group.toggled.connect(self.tests_scroll.setVisible)
         tests_layout = QVBoxLayout(self.tests_group)
-        tests_layout.addWidget(self.tests_label)
+        tests_layout.addWidget(self.tests_scroll)
+        self.tests_group.setVisible(self.playtesting_tools)
         layout.addWidget(self.summary_label)
         layout.addWidget(self.attributes_label)
         layout.addWidget(self.spend_rewards_button)
@@ -58,6 +68,7 @@ class StatsScreen(RepositoryBackedWidget):
 
         if repository is None:
             self.skills_table.setRowCount(0)
+            self.tests_label.clear()
             return
 
         stats = repository.player_stats()
@@ -69,10 +80,14 @@ class StatsScreen(RepositoryBackedWidget):
             f"Unused rewards: {stats['reward_choices']} choices · {stats['skill_advances']} skill advances")
         self.attributes_label.setText("   |   ".join(f"{a}: {stats['attributes'][a]} ({stats['modifiers'][a]:+d})" for a in ATTRIBUTES))
         self.spend_rewards_button.setEnabled(bool(stats["reward_choices"] or stats["skill_advances"]))
-        self.tests_label.setText("\n".join(
-            f"{t['attribute']} {t['test_kind']}" + (f" ({t['skill_name']})" if t['skill_name'] else "") +
-            f": {t['rolls']} {t['bonus']:+d} = {t['total']} vs DC {t['dc']} — {t['outcome']}"
-            for t in repository.list_d20_tests()))
+        if self.playtesting_tools:
+            self.tests_label.setText("\n\n".join(
+                f"{t['attribute']} {t['test_kind']}" + (f" ({t['skill_name']})" if t['skill_name'] else "") +
+                f": {t['rolls']} {t['bonus']:+d} = {t['total']} vs DC {t['dc']} — {t['outcome']}\n"
+                f"Reason: {t.get('reason') or 'Not recorded'}\n"
+                f"Associated message_ID: {t.get('message_id') or 'Not associated'}"
+                for t in repository.list_d20_tests()
+            ) or "No d20 tests recorded yet.")
         skills = repository.list_skills()
         skills.sort(
             key=self._sort_key,

@@ -52,7 +52,6 @@ _D20_TEST_GATED_EVENT_TYPES = {
     "ItemAddedEvent",
     "ReagentDiscoveredEvent",
     "RecipeDiscoveredEvent",
-    "SkillXpAddedEvent",
     "CharacterSpellLearnedEvent",
     "MagicAdvancementRecordedEvent",
 }
@@ -1044,8 +1043,10 @@ class EventApplier:
         if existing_skill is not None and int(existing_skill["level"]) >= MAX_SKILL_LEVEL:
             return _invalid(event_type, payload, f"{name} is already at Max Level and cannot gain XP.")
 
-        source_id = _first_text(payload, "source_id") or (f"{self.message_id}:{name.casefold()}:training" if self.message_id else "")
-        if source_id and self.repository._has_progression_record("skill_training", source_id):
+        message_source = f"{self.message_id}:{name.casefold()}:training" if self.message_id else ""
+        source_id = _first_text(payload, "source_id") or message_source
+        if any(self.repository._has_progression_record("skill_training", key)
+               for key in {source_id, message_source} if key):
             return AppliedEventResult(event_type, "skipped", "Training XP already recorded for this source.", payload)
         skill = self.repository.add_skill_xp(name, xp_amount)
 
@@ -1054,6 +1055,8 @@ class EventApplier:
 
         if source_id:
             self.repository._progression_record("skill_training", source_id, {"skill_name": name, "xp": xp_amount})
+        if message_source and message_source != source_id:
+            self.repository._progression_record("skill_training", message_source, {"skill_name": name, "xp": xp_amount})
         return AppliedEventResult(
             event_type,
             "applied",
@@ -1097,7 +1100,17 @@ class EventApplier:
                     "bonus": modifier + level, "roll": roll, "rolls": rolls, "total": total, "dc": dc,
                     "outcome": "success" if total >= dc else "failure", "reason": reason,
                     "message_id": self.message_id or "", "request_id": source}
-        self.repository.record_d20_test(**resolved)
+        with self.repository.transaction():
+            self.repository.record_d20_test(**resolved)
+            if skill and level < MAX_SKILL_LEVEL:
+                training = self._apply_skill_xp_added("SkillXpAddedEvent", {
+                    "skill_name": skill["name"], "xp_amount": 1,
+                    "source_id": (f"{self.message_id}:{skill['name'].casefold()}:training"
+                                  if self.message_id else f"d20:{source}:training"),
+                })
+                if training.status == "applied":
+                    LOGGER.info("Awarded 1 training XP to %s for d20 test %s (%s), message_ID=%s.",
+                                skill["name"], source, resolved["outcome"], self.message_id or "")
         return AppliedEventResult(event_type, "applied", f"{attribute} {kind}: {total} vs DC {dc} ({resolved['outcome']}).", resolved)
 
     def _apply_player_achievement(self, event_type: str, payload: dict[str, Any]) -> AppliedEventResult:

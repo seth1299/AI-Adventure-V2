@@ -4,6 +4,7 @@ import json
 import sqlite3
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 from ai_adventure.stats import ATTRIBUTES, POINT_COSTS, RANK_STATS, attribute_modifier, point_buy_cost, starting_attributes
@@ -252,6 +253,77 @@ class StatsProgressionTests(unittest.TestCase):
             result = EventApplier(self.repo, message_id=message).apply_event(training)
             self.assertEqual(result.status, expected)
         self.assertEqual(self.repo.get_skill("Sailing")["xp"], 6)
+
+    def test_skill_use_awards_xp_on_success_and_failure_and_reuses_retries(self):
+        self.repo.upsert_skill("Stealth", "Move unseen", 1)
+        first = self.event({"skill_name": "Stealth", "request_id": "first", "dc": 15}, 20, message="success")
+        second = self.event({"skill_name": "Stealth", "request_id": "second", "dc": 15}, 1, message="failure")
+        self.assertEqual((first.payload["outcome"], second.payload["outcome"]), ("success", "failure"))
+        self.assertEqual(self.repo.get_skill("Stealth")["xp"], 2)
+        self.event({"skill_name": "Stealth", "request_id": "first", "dc": 15}, message="retelling")
+        self.assertEqual(SaveRepository(self.path).get_skill("Stealth")["xp"], 2)
+        self.assertEqual(self.repo.player_stats()["xp"], 0)
+
+    def test_skill_use_and_explicit_training_do_not_double_award_same_message(self):
+        self.repo.upsert_skill("Stealth", "Move unseen", 1)
+        for number in range(2):
+            self.event({"skill_name": "Stealth", "request_id": str(number)}, 15, message="one-turn")
+        explicit = EventApplier(self.repo, message_id="one-turn").apply_events([
+            {"type": "SkillXpAddedEvent", "payload": {"skill_name": "Stealth", "xp_amount": 3, "source_id": "model-award"}}
+        ])[0]
+        self.assertEqual(explicit.status, "skipped")
+        self.assertEqual(self.repo.get_skill("Stealth")["xp"], 1)
+        self.event({"skill_name": "Stealth"}, 15, message="next-turn")
+        self.assertEqual(self.repo.get_skill("Stealth")["xp"], 2)
+
+    def test_failed_untrained_practice_can_learn_and_train_but_cannot_award_objective(self):
+        failed = self.event({"attribute": "Wisdom", "dc": 20}, 1, message="lesson")
+        results = EventApplier(self.repo, message_id="lesson").apply_events([
+            {"type": "SkillUpsertedEvent", "payload": {"name": "Tracking", "level": 1,
+                "description": "Follow animal tracks", "reason": "Practice interpreting tracks and learn from mistakes"}},
+            {"type": "SkillXpAddedEvent", "payload": {"skill_name": "Tracking", "xp_amount": 1}},
+            {"type": "PlayerAchievementRecordedEvent", "payload": {"source_id": "catch-prey",
+                "source_kind": "milestone", "significance": "standard", "reason": "Catch the prey"}},
+        ], prior_results=[failed])
+        self.assertEqual([r.status for r in results], ["applied", "applied", "skipped"])
+        self.assertEqual((self.repo.get_skill("Tracking")["level"], self.repo.get_skill("Tracking")["xp"]), (1, 1))
+        self.assertEqual(self.repo.player_stats()["xp"], 0)
+
+    def test_skill_use_levels_up_after_roll_and_stops_at_cap(self):
+        self.repo.upsert_skill("Stealth", "Move unseen", 1)
+        self.repo.add_skill_xp("Stealth", 7)
+        result = self.event({"skill_name": "Stealth"}, 10, message="level-up")
+        self.assertEqual(result.payload["skill_bonus"], 1)
+        self.assertEqual((self.repo.get_skill("Stealth")["level"], self.repo.get_skill("Stealth")["xp"]), (2, 8))
+        self.repo.upsert_skill("Master", "A mastered scope", 5)
+        self.event({"skill_name": "Master"}, 10, message="master")
+        self.assertEqual(self.repo.get_skill("Master")["xp"], 32)
+
+    def test_skill_use_roll_and_training_rollback_together(self):
+        self.repo.upsert_skill("Stealth", "Move unseen", 1)
+        with patch.object(self.repo, "add_skill_xp", side_effect=RuntimeError("Training write failed")):
+            with self.assertRaisesRegex(RuntimeError, "Training write failed"):
+                self.event({"skill_name": "Stealth"}, 15)
+        self.assertEqual(self.repo.list_d20_tests(), [])
+        self.assertEqual(self.repo.get_skill("Stealth")["xp"], 0)
+
+    def test_training_contract_survives_prompt_projection_and_schema_routing(self):
+        from ai_adventure.ai.gemini_service import build_story_response_schema, build_gemini_story_prompt
+        from ai_adventure.context.context_builder import AiContextBuilder
+        from ai_adventure.context.reference_loader import ContextReferenceLoader
+        from ai_adventure.core.models import AdventureState
+        from ai_adventure.skills.rules import SKILL_TRAINING_RULE, SKILL_TRAINING_SOURCE_RULE
+        packet = AiContextBuilder(ContextReferenceLoader().load_default_library()).build_story_context(
+            AdventureState(), player_command="I learn Tracking through instruction and practice.")
+        self.assertEqual(build_gemini_story_prompt(packet).count(SKILL_TRAINING_RULE), 1)
+        packet["selection"]["tags"] = ["story"]
+        schema = build_story_response_schema(packet)
+        events = {b["properties"]["type"]["enum"][0] for b in schema["properties"]["events"]["items"]["anyOf"]}
+        self.assertTrue({"SkillUpsertedEvent", "SkillXpAddedEvent"} <= events)
+        defaults = json.loads((Path(__file__).parents[1]/"ai_adventure/data/context/default_rules.json").read_text(encoding="utf-8"))
+        xp = next(s["content"] for s in defaults["sections"] if s["content"].get("event_type") == "SkillXpAddedEvent")
+        self.assertIn(SKILL_TRAINING_RULE, xp["rules"])
+        self.assertIn(SKILL_TRAINING_SOURCE_RULE, xp["rules"])
 
     def test_purchased_master_level_preserves_already_earned_partial_training(self):
         self.repo.set_setting("player.skill_advances", 1)

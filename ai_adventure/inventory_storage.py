@@ -14,7 +14,10 @@ LOCATION_STORAGE_RULE = (
     "precise recoverable storage site. Unknown scope is broad. Sublocation status does not "
     "imply specific scope. Never leave items at a broad location or make items there "
     "immediately accessible on arrival. Establish a specific site with LocationUpsertedEvent "
-    "and move the player there before storing or retrieving items. Preserve authored scope."
+    "and move the player there before storing or retrieving items. Preserve authored scope. "
+    "Classify locations automatically from their described extent. This is backend metadata: "
+    "never announce scope labels or ask the player to select a classification. Describe "
+    "a concrete storage place naturally when one is needed."
 )
 
 
@@ -166,7 +169,7 @@ def inventory_access(items: Iterable[dict[str, Any]], current_location: str, loc
             available = carried or bool(storage_allowed and current_location.strip() and location.casefold() == current_location.strip().casefold())
             result = {"known": True, "available": available, "physical_location": current_location if carried else location,
                       "access_reason": "" if available else (
-                          "This broad or unclassified area is not a specific storage site."
+                          "Choose a precise place here, such as a room or campsite, to store and retrieve items."
                           if location.casefold() == current_location.strip().casefold() and not storage_allowed
                           else f"Stored at {location}; you are at {current_location or 'an unknown location'}."
                       )}
@@ -212,7 +215,7 @@ def move_error(item_id: str, destination: str, items: list[dict[str, Any]], curr
     elif destination.casefold() not in {"actively_carried", "on_person"} and destination.casefold() != current_location.strip().casefold():
         return "Destination is not the player's current location."
     elif destination.casefold() not in {"actively_carried", "on_person"} and not location_allows_storage(destination, locations):
-        return "Choose a specific storage site; broad or unclassified locations cannot store items."
+        return "Choose a precise place, such as a room or campsite, before leaving items here."
     # Carrying a box must not bypass the restrictions on a fixed item inside it.
     for child_id, child in rows.items():
         cursor = str(metadata(child).get("container_id", "") or "")

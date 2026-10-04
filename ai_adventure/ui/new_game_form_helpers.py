@@ -23,6 +23,7 @@ from ai_adventure.alchemy.ingredients import (
     normalize_recipe_ingredients,
 )
 from ai_adventure.calendar_system import format_time_of_day
+from ai_adventure.app.features import is_playtesting_build
 from ai_adventure.items import EQUIPMENT_SLOTS
 from ai_adventure.currency import describe_currency_denominations, format_currency_amount
 from ai_adventure.new_game_setup import (
@@ -121,6 +122,8 @@ def _append_starting_location_table_row(
         str(location.get("location_scope", "broad")),
     )
     scope_input.setToolTip("Specific: a room, campsite or hideout where items can be recovered. Broad: a city, region or continent.")
+    scope_input.setProperty("authored_scope", "location_scope" in location)
+    table.setColumnHidden(6, not is_playtesting_build())
     table.setCellWidget(row, 6, scope_input)
     table.setCellWidget(row, 0, name_input)
     table.setCellWidget(row, 1, description_input)
@@ -196,7 +199,10 @@ def _starting_locations_from_table(table: QTableWidget) -> list[dict[str, Any]]:
                 "location_mode": location_mode,
                 "is_sublocation": is_sublocation,
                 "parent_location": parent_location if is_sublocation else "",
-                "location_scope": str(table.cellWidget(row, 6).currentData()) if isinstance(table.cellWidget(row, 6), QComboBox) else "broad",
+                **({"location_scope": str(table.cellWidget(row, 6).currentData())}
+                   if isinstance(table.cellWidget(row, 6), QComboBox) and (
+                       is_playtesting_build() or table.cellWidget(row, 6).property("authored_scope")
+                   ) else {}),
                 "requires_ai_invention": (
                     location_mode == "suggestion" or not name or not description
                 ),

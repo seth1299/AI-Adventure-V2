@@ -1315,6 +1315,7 @@ class NewGameWizard(QWizard):
         )
 
         self.starting_locations_table = _AppTableWidget(0, 7)
+        self.starting_locations_table.setColumnHidden(6, not is_playtesting_build())
         self.starting_locations_table.setHorizontalHeaderLabels(
             ["Name", "Description", "Location Mode", "Sublocation?", "Within", "Remove", "Location Scope"]
         )

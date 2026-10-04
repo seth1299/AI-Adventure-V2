@@ -11,10 +11,12 @@ class TravelScreen(RepositoryBackedWidget):
         self,
         *,
         on_travel_requested: Callable[[dict[str, Any], str], bool] | None = None,
+        playtesting_tools: bool = False,
     ) -> None:
         super().__init__()
 
         self.on_travel_requested = on_travel_requested
+        self.playtesting_tools = playtesting_tools
         # Keep the historical list as a hidden compatibility surface; the
         # player-facing control is the compact selector above the details.
         self.location_list = QListWidget()
@@ -54,10 +56,13 @@ class TravelScreen(RepositoryBackedWidget):
         selector_layout.addWidget(QLabel("Known Locations:"))
         selector_layout.addWidget(self.location_selector, 1)
         details_layout.addLayout(selector_layout)
-        scope_layout = QHBoxLayout()
+        scope_controls = QWidget()
+        scope_layout = QHBoxLayout(scope_controls)
+        scope_layout.setContentsMargins(0, 0, 0, 0)
         scope_layout.addWidget(QLabel("Location Scope:"))
         scope_layout.addWidget(self.scope_selector, 1)
-        details_layout.addLayout(scope_layout)
+        scope_controls.setVisible(self.playtesting_tools)
+        details_layout.addWidget(scope_controls)
         details_layout.addWidget(self.location_image_label)
         details_layout.addWidget(
             _button_row(self.select_image_button, self.create_image_button)
@@ -73,6 +78,8 @@ class TravelScreen(RepositoryBackedWidget):
         self.setLayout(layout)
 
     def _change_location_scope(self, _index: int) -> None:
+        if not self.playtesting_tools:
+            return
         repository = self.repository()
         location = self._selected_location_data()
         if repository is None or not location:
@@ -208,9 +215,12 @@ class TravelScreen(RepositoryBackedWidget):
         self.scope_selector.blockSignals(True)
         self.scope_selector.setCurrentIndex(self.scope_selector.findData(destination.location_scope))
         self.scope_selector.blockSignals(False)
-        sections = [f"# {destination.name}",
-                    "**Storage:** Specific site; items can be left here." if destination.location_scope == "specific"
-                    else "**Storage:** Broad / general area; choose a specific site before leaving items."]
+        sections = [f"# {destination.name}"]
+        if self.playtesting_tools:
+            sections.append(
+                "**Storage:** Specific site; items can be left here." if destination.location_scope == "specific"
+                else "**Storage:** Broad / general area; choose a specific site before leaving items."
+            )
 
         if destination.description:
             sections.append(destination.description)
