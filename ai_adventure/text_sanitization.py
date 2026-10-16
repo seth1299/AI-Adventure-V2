@@ -14,8 +14,8 @@ _ASCII_PUNCTUATION_TRANSLATION = str.maketrans(
         "\u2011": "-",
         "\u2012": "-",
         "\u2013": "-",
-        "\u2014": "-",
-        "\u2015": "-",
+        "\u2014": " - ",
+        "\u2015": " - ",
         "\u2018": "'",
         "\u2019": "'",
         "\u201a": "'",
@@ -42,6 +42,9 @@ def sanitize_english_text(
     """Returns readable ASCII English text with foreign scripts removed."""
 
     translated = str(raw_text or "").replace("\r\n", "\n").replace("\r", "\n")
+    # En dashes are clause separators except in numeric ranges. Real Unicode
+    # hyphens and figure dashes retain their existing word/number-joining behavior.
+    translated = re.sub(r"(?<!\d)\u2013|\u2013(?!\d)", " - ", translated)
     translated = translated.translate(_ASCII_PUNCTUATION_TRANSLATION)
     decomposed = unicodedata.normalize("NFKD", translated)
 

@@ -474,6 +474,17 @@ def prepare_ssmd_tts_text(text: str) -> str:
     if not clean_text:
         return ""
 
+    # Spaced or doubled dashes separate clauses; an internal word hyphen does not.
+    clean_text = re.sub(
+        r"(?<=[\w\)\]\"'])(?:[ \t]+-+[ \t]*|-+[ \t]+|--+)(?=[A-Za-z\"'])",
+        ", ", clean_text,
+    )
+    # Older saved narration lost Unicode dash spacing. Recover the common
+    # article-led clause form without splitting fully hyphenated compounds.
+    clean_text = re.sub(
+        r"\b([A-Za-z][A-Za-z']*)-(a|an|the)(?=[ \t]+[A-Za-z])",
+        r"\1, \2", clean_text, flags=re.IGNORECASE,
+    )
     return apply_ssmd_say_as_tags(apply_structural_pause_markers(clean_text)).strip()
 
 

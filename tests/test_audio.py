@@ -440,6 +440,27 @@ class AudioTests(unittest.TestCase):
         self.assertIn("seven in the morning", plain_text)
         self.assertIn("six oh five in the evening", plain_text)
 
+    def test_clause_dashes_create_a_speech_pause(self) -> None:
+        for dash in ("\u2013", "\u2014", "\u2015", " - ", "- ", " -", "--"):
+            with self.subTest(dash=dash):
+                text = sanitize_tts_text(f"You recognize wild brierroot{dash}a safe botanical specimen.")
+                self.assertEqual(text, "You recognize wild brierroot, a safe botanical specimen.")
+                self.assertEqual(strip_ssmd_markup_for_plain_tts(text), text)
+
+    def test_saved_collapsed_article_clause_dash_gets_a_speech_pause(self) -> None:
+        text = sanitize_tts_text("You recognize wild brierroot-a safe, highly beneficial botanical specimen.")
+        self.assertEqual(text, "You recognize wild brierroot, a safe, highly beneficial botanical specimen.")
+
+    def test_clause_pause_normalization_preserves_compounds_ranges_and_negative_numbers(self) -> None:
+        text = "A low-level beast. Mother-in-law. Once-a-day doses of 3-5 leaves at -5 degrees."
+        self.assertEqual(sanitize_tts_text(text), text)
+
+    def test_narration_chunks_keep_visible_dash_and_speak_a_comma(self) -> None:
+        chunks = build_narration_chunks("Wild brierroot\u2014a safe botanical specimen.")
+        self.assertEqual(len(chunks), 1)
+        self.assertEqual(chunks[0].display_text, "Wild brierroot - a safe botanical specimen.")
+        self.assertEqual(chunks[0].tts_text, "Wild brierroot, a safe botanical specimen.")
+
     def test_sanitize_tts_text_pronounces_leading_decimal_calibers(self) -> None:
         text = sanitize_tts_text("She carries a .38 Special beside a 3.8 vial.")
 
