@@ -1,12 +1,39 @@
 from __future__ import annotations
 
-from ai_adventure.stats import ATTRIBUTES, RULES_VERSION, rank_stats, point_buy_cost, starting_attributes, attribute_modifier
+from ai_adventure.stats import ATTRIBUTES, POINT_COSTS, RULES_VERSION, rank_stats, point_buy_cost, starting_attributes, attribute_modifier
 
 from ai_adventure.ui.widgets.inputs import FeatureToggleCheckBox
 from ai_adventure.audio.tts_settings import DEFAULT_TTS_VOLUME_PERCENT
 
 from ai_adventure.ui.common import *  # noqa: F401,F403
 from ai_adventure.ui.dialogues import *  # noqa: F401,F403
+
+
+DEFAULT_STARTING_SKILLS = (
+    ("Acrobatics", "Balance, tumbling, and controlled movement through hazards."),
+    ("Animal Handling", "Calm, guide, or read the behavior of animals."),
+    ("Appraisal", "Estimate an object's value, quality, or authenticity."),
+    ("Athletics", "Climb, jump, swim, lift, and perform feats of physical strength."),
+    ("Bluff", "Mislead others through convincing lies, feints, or concealment of intent."),
+    ("Crafting", "Make, repair, or assess objects using appropriate tools and materials."),
+    ("Deception", "Create a false impression or conceal the truth through speech or action."),
+    ("Empathy", "Read another person's emotional state, motives, or sincerity."),
+    ("First Aid", "Stabilize injuries and provide immediate practical medical care."),
+    ("Foraging", "Find and identify useful food, water, and natural materials in the wild."),
+    ("History", "Recall significant events, customs, lineages, and historical context."),
+    ("Insight", "Interpret behavior and infer a person's likely intentions."),
+    ("Investigation", "Search carefully, connect clues, and draw conclusions from evidence."),
+    ("Medicine", "Diagnose illness or injury and choose appropriate treatment."),
+    ("Perception", "Notice nearby details, changes, sounds, or hidden activity."),
+    ("Persuasion", "Influence others with clear reasoning, tact, or a compelling appeal."),
+    ("Research", "Locate, compare, and evaluate information in records or other sources."),
+    ("Sleight of Hand", "Perform delicate manual tasks without drawing attention."),
+    ("Stealth", "Move or act without being detected."),
+    ("Survival", "Navigate and endure outdoors, using the environment safely."),
+    ("Technology", "Operate, understand, or troubleshoot devices and technical systems."),
+    ("Tracking", "Follow a trail and infer direction or activity from traces."),
+    ("Weapons", "Use, maintain, and handle a chosen class of weapons."),
+)
 
 
 class _StatsWizardPage(QWizardPage):
@@ -16,6 +43,55 @@ class _StatsWizardPage(QWizardPage):
 
     def isComplete(self) -> bool:
         return self.owner._point_buy_remaining() == 0
+
+
+class _StartingSkillCombo(QWidget):
+    """A skill dropdown with an explicit custom-name entry."""
+
+    CUSTOM_DATA = "__custom_skill__"
+
+    def __init__(self, choices: list[tuple[str, str]], parent: QWidget | None = None):
+        super().__init__(parent)
+        self.combo = QComboBox()
+        self.combo.addItem("Select a skill…", "")
+        for name, description in choices:
+            self.combo.addItem(name, (name, description))
+        self.combo.addItem("[Custom skill…]", self.CUSTOM_DATA)
+        self.custom_input = QLineEdit()
+        self.custom_input.setPlaceholderText("Custom skill name")
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(2)
+        layout.addWidget(self.combo)
+        layout.addWidget(self.custom_input)
+        self.combo.currentIndexChanged.connect(self._sync_custom_visibility)
+        self._sync_custom_visibility()
+
+    def _sync_custom_visibility(self, _index: int = -1) -> None:
+        self.custom_input.setVisible(self.combo.currentData() == self.CUSTOM_DATA)
+
+    def text(self) -> str:
+        data = self.combo.currentData()
+        if data == self.CUSTOM_DATA:
+            return self.custom_input.text()
+        return str(data[0]) if isinstance(data, tuple) else ""
+
+    def setText(self, value: str) -> None:
+        wanted = str(value or "").strip()
+        for index in range(1, self.combo.count() - 1):
+            data = self.combo.itemData(index)
+            if isinstance(data, tuple) and data[0].casefold() == wanted.casefold():
+                self.combo.setCurrentIndex(index)
+                return
+        if wanted:
+            self.combo.setCurrentIndex(self.combo.count() - 1)
+            self.custom_input.setText(wanted)
+        else:
+            self.combo.setCurrentIndex(0)
+
+    def selected_description(self) -> str | None:
+        data = self.combo.currentData()
+        return str(data[1]) if isinstance(data, tuple) else None
 
 
 class _GeminiApiKeyWizardPage(QWizardPage):
@@ -216,6 +292,7 @@ class NewGameWizard(QWizard):
         parent: QWidget | None = None,
         *,
         template_setup: dict[str, Any] | None = None,
+        skill_catalog: list[dict[str, Any]] | None = None,
         tts_enabled: bool = True,
         audio_defaults: dict[str, Any] | None = None,
         voice_options: dict[str, str] | None = None,
@@ -236,6 +313,7 @@ class NewGameWizard(QWizard):
         self.custom_voice_storage_path = custom_voice_storage_path
         self.sound_manager = sound_manager
         self.on_save_and_exit = on_save_and_exit
+        self.skill_catalog = self._merge_skill_catalog(skill_catalog or [])
         self.api_key_path = (
             Path(api_key_path).expanduser().resolve()
             if api_key_path is not None
@@ -327,6 +405,25 @@ class NewGameWizard(QWizard):
         for editor_type in (QTextEdit, QPlainTextEdit):
             for editor in self.findChildren(editor_type):
                 editor.setTabChangesFocus(True)
+
+    @staticmethod
+    def _merge_skill_catalog(saved_skills: list[dict[str, Any]]) -> list[tuple[str, str]]:
+        """Combines built-in and template skills, keeping the fullest description."""
+        merged: dict[str, tuple[str, str]] = {}
+        for name, description in DEFAULT_STARTING_SKILLS:
+            merged[name.casefold()] = (name, description)
+        for skill in saved_skills:
+            if not isinstance(skill, dict):
+                continue
+            name = str(skill.get("name", "")).strip()
+            description = str(skill.get("description", "")).strip()
+            if not name:
+                continue
+            key = name.casefold()
+            existing = merged.get(key)
+            if existing is None or len(description) > len(existing[1]):
+                merged[key] = (name, description)
+        return sorted(merged.values(), key=lambda item: item[0].casefold())
 
     def _configure_save_and_exit_button(self) -> None:
         """Adds the partial-template save action when persistence is available."""
@@ -2064,7 +2161,7 @@ class NewGameWizard(QWizard):
         page.setTitle("Stats and Skills")
         page.setSubTitle("Choose a starting experience profile, then name and describe its skills.")
 
-        self.skill_inputs: list[tuple[int, QLineEdit, QLineEdit]] = []
+        self.skill_inputs: list[tuple[int, _StartingSkillCombo, QLineEdit]] = []
         self.skill_tables: dict[int, _AppTableWidget] = {}
         self.skill_table_controls: dict[int, QWidget] = {}
         content = QWidget()
@@ -2092,17 +2189,42 @@ class NewGameWizard(QWizard):
         layout.addWidget(self.rank_baseline_label)
         layout.addWidget(self.rank_baseline_combo)
         self.attribute_inputs = {}
-        attribute_form = QFormLayout()
-        for attribute in ATTRIBUTES:
+        attribute_grid = QGridLayout()
+        attribute_grid.setHorizontalSpacing(18)
+        attribute_grid.setVerticalSpacing(8)
+        self.attribute_previews = {}
+        for index, attribute in enumerate(ATTRIBUTES):
             control = _NoWheelSpinBox()
             control.setRange(8, 18)
             control.setValue(8)
             control.valueChanged.connect(self._refresh_point_buy)
             self.attribute_inputs[attribute] = control
-            attribute_form.addRow(attribute, control)
+            control.setFixedWidth(68)
+            control.setToolTip(f"{attribute} score (8–18)")
+
+            row_widget = QWidget()
+            row_layout = QHBoxLayout(row_widget)
+            row_layout.setContentsMargins(0, 0, 0, 0)
+            row_layout.setSpacing(6)
+            name = QLabel(attribute)
+            name.setMinimumWidth(88)
+            refund_preview = QLabel()
+            refund_preview.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            refund_preview.setMinimumWidth(76)
+            refund_preview.setToolTip("Remaining points after decreasing this attribute by 1")
+            increase_preview = QLabel()
+            increase_preview.setMinimumWidth(76)
+            increase_preview.setToolTip("Remaining points after increasing this attribute by 1")
+            self.attribute_previews[attribute] = (refund_preview, increase_preview)
+            row_layout.addWidget(name)
+            row_layout.addWidget(refund_preview)
+            row_layout.addWidget(control)
+            row_layout.addWidget(increase_preview)
+            row_layout.addStretch(1)
+            attribute_grid.addWidget(row_widget, index % 2, index // 2)
         self.point_buy_summary = QLabel()
         self.point_buy_summary.setWordWrap(True)
-        layout.addLayout(attribute_form)
+        layout.addLayout(attribute_grid)
         layout.addWidget(self.point_buy_summary)
         reset = QPushButton("Reset attributes to 8")
         reset.clicked.connect(lambda: self._reset_point_buy(blank=True))
@@ -2184,13 +2306,29 @@ class NewGameWizard(QWizard):
             ),
             name_column=1,
         )
-        skill_input = QLineEdit(name)
-        skill_input.setPlaceholderText("Skill name")
+        skill_input = _StartingSkillCombo(self.skill_catalog)
+        skill_input.setText(name)
         description_input = QLineEdit(description)
         description_input.setPlaceholderText("What this skill covers and when it applies")
+        skill_input.combo.currentIndexChanged.connect(
+            lambda _index, name_widget=skill_input, description_widget=description_input:
+                self._sync_starting_skill_description(name_widget, description_widget)
+        )
+        if not description and skill_input.selected_description() is not None:
+            description_input.setText(skill_input.selected_description() or "")
         table.setCellWidget(row, 1, skill_input)
         table.setCellWidget(row, 2, description_input)
         self._sync_starting_skill_inputs()
+
+    @staticmethod
+    def _sync_starting_skill_description(
+        skill_input: _StartingSkillCombo, description_input: QLineEdit
+    ) -> None:
+        description = skill_input.selected_description()
+        if description is not None:
+            description_input.setText(description)
+        elif skill_input.combo.currentData() == skill_input.CUSTOM_DATA:
+            description_input.clear()
 
     def _remove_starting_skill_row(
         self,
@@ -2210,7 +2348,7 @@ class NewGameWizard(QWizard):
             for row in range(table.rowCount()):
                 name_input = table.cellWidget(row, 1)
                 description_input = table.cellWidget(row, 2)
-                if isinstance(name_input, QLineEdit) and isinstance(description_input, QLineEdit):
+                if isinstance(name_input, _StartingSkillCombo) and isinstance(description_input, QLineEdit):
                     self.skill_inputs.append((level, name_input, description_input))
 
     def _apply_starting_skill_preset(self, _index: int = -1) -> None:
@@ -2255,6 +2393,13 @@ class NewGameWizard(QWizard):
         attributes = {a: w.value() for a, w in self.attribute_inputs.items()}
         budget, level = rank_stats(str(self.skill_preset_combo.currentData()), str(self.rank_baseline_combo.currentData()))
         remaining = self._point_buy_remaining()
+        for attribute, value in attributes.items():
+            refund_preview, increase_preview = self.attribute_previews[attribute]
+            current_cost = POINT_COSTS[value]
+            refund = current_cost - POINT_COSTS[value - 1] if value > 8 else 0
+            increase_cost = POINT_COSTS[value + 1] - current_cost if value < 18 else 0
+            refund_preview.setText(f"−1: {remaining + refund} left" if value > 8 else "−1: —")
+            increase_preview.setText(f"+1: {remaining - increase_cost} left" if value < 18 else "+1: —")
         self.point_buy_summary.setText(f"Budget {budget} · Remaining {remaining} · Starting Player Level {level}\n"
             + " | ".join(f"{a} {attribute_modifier(v):+d}" for a, v in attributes.items())
             + f"\nHealth {2 * attributes['Constitution']} · Base capacity {5 * attributes['Strength']} lb")

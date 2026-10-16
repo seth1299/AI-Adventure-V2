@@ -329,9 +329,21 @@ class MainWindow(QMainWindow):
         if not should_continue:
             return
 
+        skill_catalog = [
+            skill
+            for template in load_new_game_templates(
+                self.app_paths.new_game_templates_path,
+                legacy_template_path=self.app_paths.legacy_new_game_template_path,
+                normalize_setups=False,
+            )
+            for skill in template.setup.get("skills", [])
+            if isinstance(skill, dict)
+        ]
+
         wizard = NewGameWizard(
             self,
             template_setup=template_setup,
+            skill_catalog=skill_catalog,
             tts_enabled=self.tts_enabled,
             audio_defaults=self.app_settings["audio"],
             voice_options=_narrator_voice_options(self.narration_player),
