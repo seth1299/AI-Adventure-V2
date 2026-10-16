@@ -74,6 +74,8 @@ class SoundManagerProtocol(Protocol):
         self,
         source_path: str | Path,
         category: str,
+        *,
+        genre: str | None = None,
     ) -> tuple[bool, str]: ...
 
 class NarrationPlayerProtocol(Protocol):

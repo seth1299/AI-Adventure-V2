@@ -15,7 +15,11 @@ from ai_adventure.alchemy.ingredients import (
     CRAFTING_INGREDIENT_CATEGORY_NAMES,
 )
 from ai_adventure.ai.modes import ai_mode_preferences_from_settings
-from ai_adventure.audio.catalog import MUSIC_SELECTION_RULE, distinct_audio_track_catalogs_with_ambience
+from ai_adventure.audio.catalog import (
+    MUSIC_SELECTION_RULE,
+    distinct_audio_track_catalogs_with_ambience,
+    music_track_context,
+)
 from ai_adventure.context.creative_ideas import CreativeIdeasLibrary
 from ai_adventure.context.models import ContextLibrary
 from ai_adventure.context.naming import GENERIC_PROPER_NOUN_PLACEHOLDER_RULE
@@ -341,7 +345,7 @@ class AiContextBuilder:
             current_music
             or state.settings.values.get("audio.current_music", "")
             or ""
-        ).strip()
+        ).strip().replace("\\", "/")
         if clean_current_music.casefold() not in {
             track.casefold() for track in clean_music_tracks
         }:
@@ -1016,6 +1020,7 @@ class AiContextBuilder:
                 "audio": {
                     "current_music": clean_current_music,
                     "valid_music_tracks": clean_music_tracks,
+                    "music_track_context": music_track_context(clean_music_tracks),
                     "valid_sound_effect_tracks": clean_sound_effect_tracks,
                     "current_background_ambience": clean_current_background_ambience,
                     "valid_background_ambience_tracks": clean_background_ambience_tracks,
@@ -1023,7 +1028,9 @@ class AiContextBuilder:
                         "music_change_rule": MUSIC_SELECTION_RULE,
                         "filename_rule": (
                             "MusicChangedEvent.filename must exactly match one entry "
-                            "from valid_music_tracks. If valid_music_tracks is empty, "
+                            "from valid_music_tracks. Use music_track_context as "
+                            "descriptive genre/style guidance, not as a track filter. "
+                            "If valid_music_tracks is empty, "
                             "or no available track is clearly a better fit than the "
                             "current track, do not suggest MusicChangedEvent."
                         ),

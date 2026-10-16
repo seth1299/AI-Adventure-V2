@@ -27,7 +27,14 @@ from ai_adventure.ui.screens.magic import MagicScreen
 from ai_adventure.ui.screens.alchemy import AlchemyNotebookScreen
 from ai_adventure.ui.screens.notes import NotesScreen
 from ai_adventure.ui.screens.settings import SettingsScreen
-from ai_adventure.ui.wizards.new_game import NewGameWizard
+from ai_adventure.ui.wizards.new_game import (
+    DEFAULT_GAME_GENRES,
+    DEFAULT_GAME_QUESTS,
+    DEFAULT_GAME_QUEST_DESCRIPTIONS,
+    DEFAULT_MAGIC_TRADITIONS,
+    DEFAULT_MAGIC_TRADITION_DESCRIPTIONS,
+    NewGameWizard,
+)
 from ai_adventure.ui.workers.gemini import (
     GeminiNewGameWorker as _GeminiNewGameWorker,
     GeminiD20TestPlanWorker as _GeminiD20TestPlanWorker,
@@ -329,21 +336,141 @@ class MainWindow(QMainWindow):
         if not should_continue:
             return
 
-        skill_catalog = [
-            skill
-            for template in load_new_game_templates(
-                self.app_paths.new_game_templates_path,
-                legacy_template_path=self.app_paths.legacy_new_game_template_path,
-                normalize_setups=False,
+        skill_catalog: list[dict[str, Any]] = []
+        starter_item_catalog: list[dict[str, Any]] = []
+        choice_catalogs: dict[str, list[str]] = {
+            "genres": list(DEFAULT_GAME_GENRES),
+            "traditions": list(DEFAULT_MAGIC_TRADITIONS),
+            "locations": [],
+            "npcs": [],
+            "quests": list(DEFAULT_GAME_QUESTS),
+            "calendar_days": list(GREGORIAN_CALENDAR_SETTINGS["day_names"]),
+            "calendar_months": list(GREGORIAN_CALENDAR_SETTINGS["month_names"]),
+            "calendar_seasons": [
+                str(season["name"]) for season in GREGORIAN_CALENDAR_SETTINGS["seasons"]
+            ],
+            "calendar_weather": [
+                "clear", "cloudy", "rain", "snow", "fog", "windy", "stormy", "dry", "humid",
+                *[
+                    str(season["weather_hint"])
+                    for season in GREGORIAN_CALENDAR_SETTINGS["seasons"]
+                ],
+            ],
+        }
+        choice_descriptions: dict[str, dict[str, str]] = {
+            "locations": {}, "npcs": {}, "quests": {}, "traditions": {},
+        }
+
+        def add_catalog_description(category: str, name: Any, description: Any) -> None:
+            clean_name = str(name or "").strip()
+            clean_description = str(description or "").strip()
+            if not clean_name:
+                return
+            key = clean_name.casefold()
+            existing = choice_descriptions[category].get(key, "")
+            if len(clean_description) > len(existing):
+                choice_descriptions[category][key] = clean_description
+
+        saved_templates = load_new_game_templates(
+            self.app_paths.new_game_templates_path,
+            legacy_template_path=self.app_paths.legacy_new_game_template_path,
+            normalize_setups=False,
+        )
+
+        def template_rows(setup: dict[str, Any], key: str) -> list[Any]:
+            value = setup.get(key, [])
+            return value if isinstance(value, list) else []
+
+        for saved_template in saved_templates:
+            setup = saved_template.setup
+            if not isinstance(setup, dict):
+                continue
+            skill_catalog.extend(
+                skill for skill in template_rows(setup, "skills")
+                if isinstance(skill, dict)
             )
-            for skill in template.setup.get("skills", [])
-            if isinstance(skill, dict)
-        ]
+            genre = str(setup.get("specified_genre", "") or "")
+            choice_catalogs["genres"].extend(
+                part.strip() for part in genre.replace(";", ",").split(",") if part.strip()
+            )
+            template_genres = [
+                part.strip()
+                for part in genre.replace(";", ",").split(",")
+                if part.strip()
+            ]
+            for item in template_rows(setup, "starter_items"):
+                if not isinstance(item, dict):
+                    continue
+                item_name = str(item.get("item_request") or item.get("name") or "").strip()
+                if item_name:
+                    starter_item_catalog.append(
+                        {
+                            "name": item_name,
+                            "description": str(item.get("description", "") or "").strip(),
+                            "genres": template_genres or ["*"],
+                        }
+                    )
+            for row in template_rows(setup, "starting_locations"):
+                if isinstance(row, dict) and str(row.get("name", "")).strip():
+                    choice_catalogs["locations"].append(str(row["name"]).strip())
+                    add_catalog_description("locations", row.get("name"), row.get("description"))
+            for row in template_rows(setup, "starting_npcs"):
+                if isinstance(row, dict) and str(row.get("name", "")).strip():
+                    choice_catalogs["npcs"].append(str(row["name"]).strip())
+                    add_catalog_description("npcs", row.get("name"), row.get("description"))
+            task = setup.get("starting_task", {})
+            task = task if isinstance(task, dict) else {}
+            task_body = task.get("task", {})
+            if isinstance(task_body, dict) and str(task_body.get("name", "")).strip():
+                choice_catalogs["quests"].append(str(task_body["name"]).strip())
+                add_catalog_description("quests", task_body.get("name"), task_body.get("description"))
+            magic = setup.get("magic", {})
+            magic = magic if isinstance(magic, dict) else {}
+            raw_traditions = magic.get("traditions", [])
+            if isinstance(raw_traditions, list):
+                choice_catalogs["traditions"].extend(
+                    str(item.get("name", "")).strip()
+                    for item in raw_traditions
+                    if isinstance(item, dict) and str(item.get("name", "")).strip()
+                )
+                for item in raw_traditions:
+                    if isinstance(item, dict):
+                        add_catalog_description(
+                            "traditions", item.get("name"), item.get("description")
+                        )
+            legacy_tradition = str(magic.get("tradition", "") or "")
+            choice_catalogs["traditions"].extend(
+                part.strip() for part in legacy_tradition.split(",") if part.strip()
+            )
+            calendar = setup.get("calendar", {})
+            calendar = calendar if isinstance(calendar, dict) else {}
+            for name in template_rows(calendar, "day_names"):
+                choice_catalogs["calendar_days"].append(str(name))
+            for name in template_rows(calendar, "month_names"):
+                choice_catalogs["calendar_months"].append(str(name))
+            seasons = calendar.get("seasons", [])
+            if isinstance(seasons, list):
+                for season in seasons:
+                    if isinstance(season, dict):
+                        choice_catalogs["calendar_seasons"].append(str(season.get("name", "")))
+                        choice_catalogs["calendar_weather"].append(str(season.get("weather_hint", "")))
+        for key, values in choice_catalogs.items():
+            choice_catalogs[key] = sorted(
+                {str(value).strip() for value in values if str(value).strip()},
+                key=str.casefold,
+            )
+        for name, description in DEFAULT_GAME_QUEST_DESCRIPTIONS.items():
+            add_catalog_description("quests", name, description)
+        for name, description in DEFAULT_MAGIC_TRADITION_DESCRIPTIONS.items():
+            add_catalog_description("traditions", name, description)
 
         wizard = NewGameWizard(
             self,
             template_setup=template_setup,
             skill_catalog=skill_catalog,
+            starter_item_catalog=starter_item_catalog,
+            choice_catalogs=choice_catalogs,
+            choice_descriptions=choice_descriptions,
             tts_enabled=self.tts_enabled,
             audio_defaults=self.app_settings["audio"],
             voice_options=_narrator_voice_options(self.narration_player),

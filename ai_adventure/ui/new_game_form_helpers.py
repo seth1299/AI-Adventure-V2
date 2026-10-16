@@ -31,6 +31,7 @@ from ai_adventure.new_game_setup import (
     normalize_economy_examples,
 )
 from ai_adventure.ui.primitives import (
+    _CatalogComboBox,
     _NoWheelComboBox,
     _safe_int,
     _set_combo_to_data,
@@ -89,6 +90,8 @@ def _append_starting_location_table_row(
     location: dict[str, Any],
     row_id: int,
     remove_callback: Callable[[QPushButton], None],
+    *,
+    name_options: list[str] | None = None,
 ) -> None:
     """Adds one editable starting location row to table."""
 
@@ -96,7 +99,15 @@ def _append_starting_location_table_row(
     table.insertRow(row)
     table.setRowHeight(row, 36)
 
-    name_input = _table_line_edit(str(location.get("name", "")))
+    name_input = (
+        _CatalogComboBox(
+            name_options,
+            str(location.get("name", "")),
+            placeholder="Choose a saved location or select Custom",
+        )
+        if name_options is not None
+        else _table_line_edit(str(location.get("name", "")))
+    )
     name_input.setProperty("starting_location_row_id", str(row_id))
     description_input = _table_line_edit(str(location.get("description", "")))
     mode_input = _table_combo_box(
@@ -167,7 +178,11 @@ def _starting_locations_from_table(table: QTableWidget) -> list[dict[str, Any]]:
         mode_widget = table.cellWidget(row, 2)
         sublocation_widget = table.cellWidget(row, 3)
         parent_widget = table.cellWidget(row, 4)
-        name = name_widget.text().strip() if isinstance(name_widget, QLineEdit) else ""
+        name = (
+            name_widget.text().strip()
+            if isinstance(name_widget, (QLineEdit, _CatalogComboBox))
+            else ""
+        )
         description = (
             description_widget.text().strip()
             if isinstance(description_widget, QLineEdit)
@@ -217,7 +232,7 @@ def _starting_location_row_id_for_row(table: QTableWidget, row: int) -> str:
 
     name_widget = table.cellWidget(row, 0)
 
-    if not isinstance(name_widget, QLineEdit):
+    if not isinstance(name_widget, (QLineEdit, _CatalogComboBox)):
         return ""
 
     return str(name_widget.property("starting_location_row_id") or "")
@@ -247,7 +262,11 @@ def _starting_location_options_from_table(
             continue
         row_id = _starting_location_row_id_for_row(table, row)
         name_widget = table.cellWidget(row, 0)
-        name = name_widget.text().strip() if isinstance(name_widget, QLineEdit) else ""
+        name = (
+            name_widget.text().strip()
+            if isinstance(name_widget, (QLineEdit, _CatalogComboBox))
+            else ""
+        )
 
         if row_id and name:
             options.append((row_id, name))
@@ -346,6 +365,7 @@ def _append_starting_npc_table_row(
     *,
     location_options: list[tuple[str, str]] | None = None,
     change_callback: Callable[[], None] | None = None,
+    name_options: list[str] | None = None,
 ) -> None:
     """Adds one editable starting NPC row to table."""
 
@@ -353,7 +373,16 @@ def _append_starting_npc_table_row(
     table.insertRow(row)
     table.setRowHeight(row, 36)
 
-    name_input = _table_line_edit(str(npc.get("name", npc.get("display_name", ""))))
+    npc_name = str(npc.get("name", npc.get("display_name", "")))
+    name_input = (
+        _CatalogComboBox(
+            name_options,
+            npc_name,
+            placeholder="Choose a saved NPC or select Custom",
+        )
+        if name_options is not None
+        else _table_line_edit(npc_name)
+    )
     name_input.setProperty(
         "npc_id",
         str(npc.get("npc_id", "")).strip() or f"starting_npc_{uuid.uuid4().hex}",
@@ -376,7 +405,10 @@ def _append_starting_npc_table_row(
         str(npc.get("description_mode", "suggestion") or "suggestion"),
     )
     if change_callback is not None:
-        name_input.textChanged.connect(change_callback)
+        if isinstance(name_input, _CatalogComboBox):
+            name_input.lineEdit().textChanged.connect(change_callback)
+        else:
+            name_input.textChanged.connect(change_callback)
         location_input.currentIndexChanged.connect(change_callback)
 
     table.setCellWidget(row, 0, name_input)
@@ -405,10 +437,14 @@ def _starting_npcs_from_table(table: QTableWidget) -> list[dict[str, Any]]:
         location_widget = table.cellWidget(row, 1)
         description_widget = table.cellWidget(row, 2)
         mode_widget = table.cellWidget(row, 3)
-        name = name_widget.text().strip() if isinstance(name_widget, QLineEdit) else ""
+        name = (
+            name_widget.text().strip()
+            if isinstance(name_widget, (QLineEdit, _CatalogComboBox))
+            else ""
+        )
         npc_id = (
             str(name_widget.property("npc_id") or "").strip()
-            if isinstance(name_widget, QLineEdit)
+            if isinstance(name_widget, (QLineEdit, _CatalogComboBox))
             else ""
         )
         location = (

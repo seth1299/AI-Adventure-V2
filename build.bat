@@ -86,4 +86,5 @@ if errorlevel 1 (
 
 echo.
 echo Build complete: "dist\%APP_NAME%.exe"
+powershell -c "[System.Media.SystemSounds]::Asterisk.Play()"
 exit /b 0

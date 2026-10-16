@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from PySide6.QtWidgets import QWidgetAction
+
 from ai_adventure.stats import ATTRIBUTES, POINT_COSTS, RULES_VERSION, rank_stats, point_buy_cost, starting_attributes, attribute_modifier
 
 from ai_adventure.ui.widgets.inputs import FeatureToggleCheckBox
@@ -34,6 +36,56 @@ DEFAULT_STARTING_SKILLS = (
     ("Tracking", "Follow a trail and infer direction or activity from traces."),
     ("Weapons", "Use, maintain, and handle a chosen class of weapons."),
 )
+DEFAULT_GAME_GENRES = (
+    "Fantasy", "Science fiction", "Mystery", "Detective", "Horror",
+    "Survival", "Historical", "Adventure", "Romance", "Western",
+    "Post-apocalyptic", "Political intrigue", "Space opera", "Cozy life",
+)
+DEFAULT_STARTER_ITEM_SUGGESTIONS = (
+    ("Backpack", "A practical pack for carrying everyday travel gear.", ("*",)),
+    ("Notebook", "A small book for notes, sketches, clues, or records.", ("*",)),
+    ("Gloves", "Protective handwear suited to the setting and its hazards.", ("*",)),
+    ("Boots", "Sturdy footwear chosen for the local terrain.", ("*",)),
+    ("Rope", "A length of strong cord useful for climbing, hauling, or tying.", ("*",)),
+    ("Lantern", "A portable light source with fuel or power appropriate to the world.", ("*",)),
+    ("Water Bottle", "A reusable container for carrying drinking water.", ("*",)),
+    ("First Aid Kit", "Basic supplies for cleaning and dressing minor injuries.", ("*",)),
+    ("Sword", "A bladed hand weapon suited to the world's materials and fighting style.", ("fantasy", "historical", "western")),
+    ("Alembic", "A small distilling vessel used for careful chemical or alchemical work.", ("fantasy", "historical", "steampunk")),
+    ("Alchemy Flasks", "A padded set of small containers for prepared reagents and mixtures.", ("fantasy", "historical", "steampunk")),
+    ("Spellbook", "A personal volume of magical notes, formulae, or rituals.", ("fantasy",)),
+    ("Pistol", "A compact firearm with ammunition appropriate to the setting.", ("western", "historical", "detective", "science fiction", "cyberpunk", "steampunk", "post-apocalyptic")),
+    ("Datapad", "A handheld electronic device for notes, records, and reference material.", ("science fiction", "space opera", "cyberpunk")),
+    ("Comms Device", "A portable device for sending and receiving messages.", ("science fiction", "space opera", "cyberpunk", "post-apocalyptic")),
+    ("Repair Kit", "A compact collection of tools and supplies for field repairs.", ("science fiction", "space opera", "cyberpunk", "steampunk", "post-apocalyptic")),
+)
+DEFAULT_GAME_QUESTS = (
+    "Find the Missing Courier",
+    "Investigate a Disturbance",
+    "Deliver a Sealed Letter",
+    "Recover a Stolen Item",
+)
+DEFAULT_GAME_QUEST_DESCRIPTIONS = {
+    "find the missing courier": "Locate a traveler carrying news or supplies before the trail goes cold.",
+    "investigate a disturbance": "Learn what caused a recent disruption and decide how to respond.",
+    "deliver a sealed letter": "Carry a private message to its intended recipient and learn whether it arrives safely.",
+    "recover a stolen item": "Trace a missing possession and return it to the person who needs it.",
+}
+DEFAULT_MAGIC_TRADITIONS = (
+    "Arcane", "Divine", "Primal", "Psychic", "Elemental", "Shadow",
+    "Spirit-binding", "Rune craft", "Alchemy",
+)
+DEFAULT_MAGIC_TRADITION_DESCRIPTIONS = {
+    "arcane": "Magic shaped through study, patterns, symbols, and deliberate technique.",
+    "divine": "Power granted or mediated through faith, vows, sacred forces, or deities.",
+    "primal": "Magic drawn from living nature, weather, beasts, and the cycles of the world.",
+    "psychic": "Power expressed through perception, emotion, memory, and mental force.",
+    "elemental": "Magic that channels forces such as flame, tide, stone, wind, or lightning.",
+    "shadow": "Practices that work through darkness, concealment, fear, or the unseen.",
+    "spirit-binding": "Ritual relationships with spirits, ancestors, or other unseen beings.",
+    "rune craft": "Power encoded in marks, spoken formulas, and carefully prepared objects.",
+    "alchemy": "Transformative work using ingredients, reactions, and prepared mixtures.",
+}
 
 
 class _StatsWizardPage(QWizardPage):
@@ -92,6 +144,77 @@ class _StartingSkillCombo(QWidget):
     def selected_description(self) -> str | None:
         data = self.combo.currentData()
         return str(data[1]) if isinstance(data, tuple) else None
+
+
+class _MultiChoiceInput(QWidget):
+    """A checkable dropdown for short values that may be selected together."""
+
+    selection_changed = Signal()
+
+    def __init__(
+        self,
+        choices: list[str] | tuple[str, ...],
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.button = QPushButton("Choose one or more…")
+        self.button.setMinimumHeight(32)
+        self.menu = QMenu(self.button)
+        self.button.setMenu(self.menu)
+        self._checks: dict[str, QCheckBox] = {}
+        for choice in choices:
+            self._add_choice(str(choice), checked=False)
+        self.menu.addSeparator()
+        self.custom_action = self.menu.addAction("[Custom…]")
+        self.custom_action.triggered.connect(self._add_custom_choice)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self.button)
+
+    def _add_choice(self, choice: str, *, checked: bool) -> None:
+        clean = str(choice or "").strip()
+        if not clean or clean.casefold() in {name.casefold() for name in self._checks}:
+            if clean and checked:
+                for name, checkbox in self._checks.items():
+                    if name.casefold() == clean.casefold():
+                        checkbox.setChecked(True)
+                        break
+            return
+        checkbox = QCheckBox(clean)
+        checkbox.setChecked(checked)
+        checkbox.toggled.connect(self._refresh_label)
+        action = QWidgetAction(self.menu)
+        action.setDefaultWidget(checkbox)
+        if hasattr(self, "custom_action"):
+            self.menu.insertAction(self.custom_action, action)
+        else:
+            self.menu.addAction(action)
+        self._checks[clean] = checkbox
+
+    def _add_custom_choice(self) -> None:
+        value, accepted = QInputDialog.getText(self, "Custom Genre", "Genre:")
+        if accepted and value.strip():
+            self._add_choice(value, checked=True)
+            self._refresh_label()
+
+    def _refresh_label(self, _checked: bool = False) -> None:
+        selected = self.text()
+        self.button.setText(selected or "Choose one or more…")
+        self.button.setToolTip(selected)
+        self.selection_changed.emit()
+
+    def text(self) -> str:
+        return ", ".join(
+            name for name, checkbox in self._checks.items() if checkbox.isChecked()
+        )
+
+    def setText(self, value: str) -> None:
+        selected = [item.strip() for item in str(value or "").split(",") if item.strip()]
+        for checkbox in self._checks.values():
+            checkbox.setChecked(False)
+        for item in selected:
+            self._add_choice(item, checked=True)
+        self._refresh_label()
 
 
 class _GeminiApiKeyWizardPage(QWizardPage):
@@ -293,6 +416,9 @@ class NewGameWizard(QWizard):
         *,
         template_setup: dict[str, Any] | None = None,
         skill_catalog: list[dict[str, Any]] | None = None,
+        starter_item_catalog: list[dict[str, Any]] | None = None,
+        choice_catalogs: dict[str, list[str]] | None = None,
+        choice_descriptions: dict[str, dict[str, str]] | None = None,
         tts_enabled: bool = True,
         audio_defaults: dict[str, Any] | None = None,
         voice_options: dict[str, str] | None = None,
@@ -314,6 +440,47 @@ class NewGameWizard(QWizard):
         self.sound_manager = sound_manager
         self.on_save_and_exit = on_save_and_exit
         self.skill_catalog = self._merge_skill_catalog(skill_catalog or [])
+        self.starter_item_catalog = self._merge_starter_item_catalog(starter_item_catalog or [])
+        self.choice_catalogs = {
+            key: list(values)
+            for key, values in (choice_catalogs or {}).items()
+            if isinstance(values, list)
+        }
+        self.choice_catalogs.setdefault("genres", list(DEFAULT_GAME_GENRES))
+        self.choice_catalogs.setdefault("quests", list(DEFAULT_GAME_QUESTS))
+        self.choice_catalogs.setdefault("traditions", list(DEFAULT_MAGIC_TRADITIONS))
+        self.choice_catalogs.setdefault(
+            "calendar_days", list(GREGORIAN_CALENDAR_SETTINGS["day_names"])
+        )
+        self.choice_catalogs.setdefault(
+            "calendar_months", list(GREGORIAN_CALENDAR_SETTINGS["month_names"])
+        )
+        self.choice_catalogs.setdefault(
+            "calendar_seasons",
+            [str(season["name"]) for season in GREGORIAN_CALENDAR_SETTINGS["seasons"]],
+        )
+        self.choice_catalogs.setdefault(
+            "calendar_weather",
+            [
+                "clear", "cloudy", "rain", "snow", "fog", "windy", "stormy",
+                "dry", "humid",
+                *[
+                    str(season["weather_hint"])
+                    for season in GREGORIAN_CALENDAR_SETTINGS["seasons"]
+                ],
+            ],
+        )
+        self.choice_descriptions = {
+            key: {str(name).casefold(): str(description) for name, description in values.items()}
+            for key, values in (choice_descriptions or {}).items()
+        }
+        self.choice_descriptions.setdefault(
+            "traditions", dict(DEFAULT_MAGIC_TRADITION_DESCRIPTIONS)
+        )
+        default_quest_descriptions = self.choice_descriptions.setdefault("quests", {})
+        for name, description in DEFAULT_GAME_QUEST_DESCRIPTIONS.items():
+            if len(description) > len(default_quest_descriptions.get(name, "")):
+                default_quest_descriptions[name] = description
         self.api_key_path = (
             Path(api_key_path).expanduser().resolve()
             if api_key_path is not None
@@ -424,6 +591,77 @@ class NewGameWizard(QWizard):
             if existing is None or len(description) > len(existing[1]):
                 merged[key] = (name, description)
         return sorted(merged.values(), key=lambda item: item[0].casefold())
+
+    @staticmethod
+    def _merge_starter_item_catalog(
+        saved_items: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Combines built-in and template item ideas, retaining genre tags."""
+        merged: dict[str, dict[str, Any]] = {}
+        for name, description, genres in DEFAULT_STARTER_ITEM_SUGGESTIONS:
+            merged[name.casefold()] = {
+                "name": name,
+                "description": description,
+                "genres": set(genres),
+            }
+        for item in saved_items:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name", "")).strip()
+            description = str(item.get("description", "")).strip()
+            genres = item.get("genres", [])
+            if isinstance(genres, str):
+                genres = [part.strip() for part in genres.replace(";", ",").split(",")]
+            if not name:
+                continue
+            key = name.casefold()
+            current = merged.get(key)
+            if current is None:
+                current = {"name": name, "description": description, "genres": set()}
+                merged[key] = current
+            elif len(description) > len(current["description"]):
+                current["description"] = description
+            current["genres"].update(str(genre).strip().casefold() for genre in genres if str(genre).strip())
+        return [
+            {**item, "genres": tuple(sorted(item["genres"]))}
+            for item in sorted(merged.values(), key=lambda entry: entry["name"].casefold())
+        ]
+
+    def _refresh_starter_item_suggestions(self, *_args: Any) -> None:
+        """Refreshes the item picker for the genres currently selected."""
+        combo = getattr(self, "starter_item_suggestion_combo", None)
+        if combo is None:
+            return
+        selected_genres = {
+            genre.strip().casefold()
+            for genre in self.genre_input.text().split(",")
+            if genre.strip()
+        }
+        combo.blockSignals(True)
+        combo.clear()
+        combo.addItem("Choose a suggested item…", None)
+        for item in self.starter_item_catalog:
+            genres = item["genres"]
+            if "*" not in genres and not selected_genres.intersection(genres):
+                continue
+            name, description = item["name"], item["description"]
+            combo.addItem(name, (name, description))
+            combo.setItemData(combo.count() - 1, description, Qt.ItemDataRole.ToolTipRole)
+        combo.setCurrentIndex(0)
+        combo.blockSignals(False)
+
+    def _add_selected_starter_item_suggestion(self) -> None:
+        """Copies a catalog item into the editable starter item idea table."""
+        data = self.starter_item_suggestion_combo.currentData()
+        if not isinstance(data, tuple) or len(data) != 2:
+            return
+        name, description = (str(value) for value in data)
+        _append_starter_suggestion_table_row(
+            self.starter_item_suggestions_table,
+            "Item",
+            f"{name}: {description}",
+        )
+        self.starter_item_suggestion_combo.setCurrentIndex(0)
 
     def _configure_save_and_exit_button(self) -> None:
         """Adds the partial-template save action when persistence is available."""
@@ -1353,10 +1591,7 @@ class NewGameWizard(QWizard):
             "Tone, realism, pacing, themes, or playstyle preferences..."
         )
 
-        self.genre_input = QLineEdit()
-        self.genre_input.setPlaceholderText(
-            "Optional: survival, detective mystery, post-apocalyptic, space frontier..."
-        )
+        self.genre_input = _MultiChoiceInput(self.choice_catalogs["genres"])
 
         self.start_location_input = QLineEdit()
         self.start_location_input.setPlaceholderText(
@@ -1381,7 +1616,7 @@ class NewGameWizard(QWizard):
         layout = QFormLayout()
         _configure_responsive_form(layout)
         layout.addRow("Game Name:", self.title_input)
-        layout.addRow("Genre:", self.genre_input)
+        layout.addRow("Genres (select all that apply):", self.genre_input)
         layout.addRow("Game Style:", self.game_style_input)
         layout.addRow("World Details:", self.world_context_input)
         page.setLayout(layout)
@@ -1462,13 +1697,18 @@ class NewGameWizard(QWizard):
             location,
             self._starting_location_row_id_counter,
             self._remove_starting_location_row,
+            name_options=self.choice_catalogs.get("locations", []),
         )
         row = self.starting_locations_table.rowCount() - 1
         name_widget = self.starting_locations_table.cellWidget(row, 0)
         sublocation_widget = self.starting_locations_table.cellWidget(row, 3)
         parent_widget = self.starting_locations_table.cellWidget(row, 4)
 
-        if isinstance(name_widget, QLineEdit):
+        if isinstance(name_widget, _CatalogComboBox):
+            name_widget.lineEdit().textChanged.connect(
+                lambda _text: self._refresh_starting_location_dropdowns()
+            )
+        elif isinstance(name_widget, QLineEdit):
             name_widget.textChanged.connect(
                 lambda _text: self._refresh_starting_location_dropdowns()
             )
@@ -1482,6 +1722,14 @@ class NewGameWizard(QWizard):
             parent_widget.currentIndexChanged.connect(
                 lambda _index: self._refresh_starting_location_dropdowns()
             )
+        description_widget = self.starting_locations_table.cellWidget(row, 1)
+        if isinstance(name_widget, _CatalogComboBox) and isinstance(description_widget, QLineEdit):
+            name_widget.currentIndexChanged.connect(
+                lambda _index, source=name_widget, target=description_widget:
+                    self._apply_catalog_description(source, target, "locations")
+            )
+            if not description_widget.text().strip():
+                self._apply_catalog_description(name_widget, description_widget, "locations")
 
         self._refresh_starting_location_dropdowns()
 
@@ -1490,6 +1738,24 @@ class NewGameWizard(QWizard):
 
         _remove_table_row_by_button(self.starting_locations_table, button)
         self._refresh_starting_location_dropdowns()
+
+    def _apply_catalog_description(
+        self, name_input: _CatalogComboBox, description_input: QLineEdit, category: str
+    ) -> None:
+        name = name_input.text().strip().casefold()
+        description = self.choice_descriptions.get(category, {}).get(name, "")
+        description_input.setText(description)
+
+    def _apply_catalog_text_description(
+        self, name_input: _CatalogComboBox, description_input: QWidget, category: str
+    ) -> None:
+        description = self.choice_descriptions.get(
+            category, {}
+        ).get(name_input.text().strip().casefold(), "")
+        if isinstance(description_input, QTextEdit):
+            description_input.setPlainText(description)
+        elif isinstance(description_input, QLineEdit):
+            description_input.setText(description)
 
     def _starting_locations_from_table(self) -> list[dict[str, Any]]:
         """Reads requested starting location rows from the wizard table."""
@@ -1514,7 +1780,11 @@ class NewGameWizard(QWizard):
 
         name_widget = self.starting_locations_table.cellWidget(row, 0)
         mode_widget = self.starting_locations_table.cellWidget(row, 2)
-        name = name_widget.text().strip() if isinstance(name_widget, QLineEdit) else ""
+        name = (
+            name_widget.text().strip()
+            if isinstance(name_widget, (QLineEdit, _CatalogComboBox))
+            else ""
+        )
 
         if not name:
             return {}
@@ -1545,7 +1815,11 @@ class NewGameWizard(QWizard):
 
         name_widget = self.starting_locations_table.cellWidget(row, 0)
         mode_widget = self.starting_locations_table.cellWidget(row, 2)
-        name = name_widget.text().strip() if isinstance(name_widget, QLineEdit) else ""
+        name = (
+            name_widget.text().strip()
+            if isinstance(name_widget, (QLineEdit, _CatalogComboBox))
+            else ""
+        )
 
         if not name:
             return
@@ -1652,19 +1926,21 @@ class NewGameWizard(QWizard):
         guidance_layout.addWidget(self.starting_task_guidance_input)
         self.starting_task_guidance_group.setLayout(guidance_layout)
 
-        self.starting_task_name_input = QLineEdit()
-        self.starting_task_name_input.setPlaceholderText("Optional quest name")
+        self.starting_task_name_input = _CatalogComboBox(
+            self.choice_catalogs.get("quests", []),
+            placeholder="Choose a saved quest or select Custom",
+        )
         self.starting_task_description_input = QTextEdit()
         self.starting_task_description_input.setPlaceholderText(
             "What the quest is about. Leave blanks for the A.I. to complete."
         )
-        self.starting_task_requester_input = QLineEdit()
-        self.starting_task_requester_input.setPlaceholderText(
-            "NPC, faction, shop, Self, or blank"
+        self.starting_task_requester_input = _CatalogComboBox(
+            ["Self", "A local faction", "A shopkeeper", *self.choice_catalogs.get("npcs", [])],
+            placeholder="Choose a saved NPC or select Custom",
         )
-        self.starting_task_location_input = QLineEdit()
-        self.starting_task_location_input.setPlaceholderText(
-            "Where the quest is picked up, done, or turned in"
+        self.starting_task_location_input = _CatalogComboBox(
+            self.choice_catalogs.get("locations", []),
+            placeholder="Choose a saved location or select Custom",
         )
         self.starting_task_reward_input = QLineEdit()
         self.starting_task_reward_input.setPlaceholderText("Reward, N/A, or blank")
@@ -1681,6 +1957,13 @@ class NewGameWizard(QWizard):
         custom_form.addRow("Reward:", self.starting_task_reward_input)
         custom_form.addRow("Due:", self.starting_task_due_date_input)
         self.starting_task_custom_group.setLayout(custom_form)
+        self.starting_task_name_input.currentIndexChanged.connect(
+            lambda _index: self._apply_catalog_text_description(
+                self.starting_task_name_input,
+                self.starting_task_description_input,
+                "quests",
+            )
+        )
 
         layout = QVBoxLayout()
         layout.addWidget(QLabel("Opening quest mode"))
@@ -1810,7 +2093,18 @@ class NewGameWizard(QWizard):
                 self.starting_locations_table
             ),
             change_callback=self._sync_starting_party_choices,
+            name_options=self.choice_catalogs.get("npcs", []),
         )
+        row = self.starting_npcs_table.rowCount() - 1
+        name_widget = self.starting_npcs_table.cellWidget(row, 0)
+        description_widget = self.starting_npcs_table.cellWidget(row, 2)
+        if isinstance(name_widget, _CatalogComboBox) and isinstance(description_widget, QLineEdit):
+            name_widget.currentIndexChanged.connect(
+                lambda _index, source=name_widget, target=description_widget:
+                    self._apply_catalog_description(source, target, "npcs")
+            )
+            if not description_widget.text().strip():
+                self._apply_catalog_description(name_widget, description_widget, "npcs")
         self._sync_starting_party_choices()
 
     def _remove_starting_npc_row(self, button: QPushButton) -> None:
@@ -1925,7 +2219,7 @@ class NewGameWizard(QWizard):
         for row in range(self.starting_npcs_table.rowCount()):
             name_widget = self.starting_npcs_table.cellWidget(row, 0)
             location_widget = self.starting_npcs_table.cellWidget(row, 1)
-            if not isinstance(name_widget, QLineEdit):
+            if not isinstance(name_widget, (QLineEdit, _CatalogComboBox)):
                 continue
             npc_id = str(name_widget.property("npc_id") or "").strip()
             if not npc_id:
@@ -2423,9 +2717,27 @@ class NewGameWizard(QWizard):
         self.magic_casting_mode_combo = QComboBox()
         for mode in MAGIC_CASTING_MODES:
             self.magic_casting_mode_combo.addItem(MAGIC_CASTING_MODE_LABELS[mode], mode)
+        # Retained as a compatibility seam for older integrations; new setup uses
+        # the structured tradition table below.
         self.magic_tradition_input = QLineEdit()
-        self.magic_tradition_input.setPlaceholderText(
-            "Arcane, Divine, Psychic, Elemental, or another setting-appropriate tradition"
+        self.magic_tradition_input.setVisible(False)
+        self.magic_traditions_table = _AppTableWidget(0, 3)
+        self.magic_traditions_table.setHorizontalHeaderLabels(
+            ["Tradition", "Description", "Remove"]
+        )
+        _configure_inline_table(
+            self.magic_traditions_table,
+            (240, 520, 90),
+            minimum_height=110,
+        )
+        _configure_responsive_table(
+            self.magic_traditions_table,
+            stretch_columns={0, 1},
+            compact_columns={2},
+        )
+        self.magic_add_tradition_button = QPushButton("Add Tradition")
+        self.magic_add_tradition_button.clicked.connect(
+            lambda: self._append_magic_tradition_row({})
         )
         self.magic_mana_maximum_input = _NoWheelSpinBox()
         self.magic_mana_maximum_input.setRange(1, 9999)
@@ -2506,7 +2818,12 @@ class NewGameWizard(QWizard):
         form = QFormLayout()
         _configure_responsive_form(form)
         form.addRow("Casting Model:", self.magic_casting_mode_combo)
-        form.addRow("Tradition / Style:", self.magic_tradition_input)
+        traditions_widget = QWidget()
+        traditions_layout = QVBoxLayout(traditions_widget)
+        traditions_layout.setContentsMargins(0, 0, 0, 0)
+        traditions_layout.addWidget(self.magic_traditions_table)
+        traditions_layout.addWidget(_button_row(self.magic_add_tradition_button))
+        form.addRow("Magic Traditions:", traditions_widget)
 
         basic_spells_layout = QVBoxLayout()
         basic_spells_explanation = QLabel(
@@ -2903,6 +3220,37 @@ class NewGameWizard(QWizard):
 
         _remove_table_row_by_button(self.starting_spells_table, button)
 
+    def _append_magic_tradition_row(self, tradition: dict[str, Any]) -> None:
+        row = self.magic_traditions_table.rowCount()
+        self.magic_traditions_table.insertRow(row)
+        self.magic_traditions_table.setRowHeight(row, 38)
+        name_input = _CatalogComboBox(
+            self.choice_catalogs.get("traditions", []),
+            str(tradition.get("name", "")),
+            placeholder="Choose a tradition or select Custom",
+        )
+        description_input = QLineEdit(str(tradition.get("description", "")))
+        description_input.setPlaceholderText("Describe this tradition for the AI")
+        name_input.currentIndexChanged.connect(
+            lambda _index, source=name_input, target=description_input:
+                self._apply_catalog_description(source, target, "traditions")
+        )
+        if not description_input.text().strip():
+            self._apply_catalog_description(name_input, description_input, "traditions")
+        self.magic_traditions_table.setCellWidget(row, 0, name_input)
+        self.magic_traditions_table.setCellWidget(row, 1, description_input)
+        _set_remove_row_button(
+            self.magic_traditions_table,
+            row,
+            2,
+            "tradition",
+            self._remove_magic_tradition_row,
+        )
+
+    def _remove_magic_tradition_row(self, button: QPushButton) -> None:
+        _remove_table_row_by_button(self.magic_traditions_table, button)
+        self.magic_tradition_input.clear()
+
     def _magic_setup_from_controls(self) -> dict[str, Any]:
         """Serializes the Wizard's authoritative magic configuration."""
 
@@ -2913,6 +3261,24 @@ class NewGameWizard(QWizard):
         starting_spells_mode = self._starting_spells_mode()
         starting_spell_requests: list[dict[str, Any]] = []
         starting_spells: list[dict[str, Any]] = []
+        traditions: list[dict[str, str]] = []
+        for row in range(self.magic_traditions_table.rowCount()):
+            name_widget = self.magic_traditions_table.cellWidget(row, 0)
+            description_widget = self.magic_traditions_table.cellWidget(row, 1)
+            if not isinstance(name_widget, _CatalogComboBox):
+                continue
+            name = name_widget.text()
+            if name:
+                traditions.append(
+                    {
+                        "name": name,
+                        "description": (
+                            description_widget.text().strip()
+                            if isinstance(description_widget, QLineEdit)
+                            else ""
+                        ),
+                    }
+                )
         if player_magic_enabled and starting_spells_mode == "basic":
             for row in range(self.starting_spell_requests_table.rowCount()):
                 request_input = self.starting_spell_requests_table.cellWidget(row, 0)
@@ -2976,7 +3342,16 @@ class NewGameWizard(QWizard):
             "casting_mode": str(
                 self.magic_casting_mode_combo.currentData() or "narrative"
             ),
-            "tradition": self.magic_tradition_input.text(),
+            "tradition": (
+                "; ".join(
+                    f"{item['name']}: {item['description']}"
+                    if item["description"]
+                    else item["name"]
+                    for item in traditions
+                )
+                or self.magic_tradition_input.text().strip()
+            ),
+            "traditions": traditions,
             "mana_maximum": self.magic_mana_maximum_input.value(),
             "tier_slots": {
                 tier: slot_input.value()
@@ -3018,6 +3393,15 @@ class NewGameWizard(QWizard):
             str(magic.get("casting_mode", "narrative")),
         )
         self.magic_tradition_input.setText(str(magic.get("tradition", "")))
+        self.magic_traditions_table.setRowCount(0)
+        traditions = magic.get("traditions", [])
+        if isinstance(traditions, list) and traditions:
+            for tradition in traditions:
+                if isinstance(tradition, dict):
+                    self._append_magic_tradition_row(tradition)
+        elif str(magic.get("tradition", "")).strip():
+            for name in _split_list(str(magic.get("tradition", ""))):
+                self._append_magic_tradition_row({"name": name, "description": ""})
         self.magic_mana_maximum_input.setValue(
             max(1, _safe_int(magic.get("mana_maximum", 10), 10))
         )
@@ -3113,7 +3497,16 @@ class NewGameWizard(QWizard):
         add_item_button.clicked.connect(lambda: self._append_starter_item_row({}))
 
         self.starter_item_suggestions_table = _build_starter_suggestion_table("Item")
-        add_item_suggestion_button = QPushButton("Add Item Idea")
+        self.starter_item_suggestion_combo = _NoWheelComboBox()
+        self.starter_item_suggestion_combo.setMinimumWidth(260)
+        self.starter_item_suggestion_combo.setToolTip(
+            "Suggestions update to match the selected game genres."
+        )
+        self._refresh_starter_item_suggestions()
+        self.genre_input.selection_changed.connect(self._refresh_starter_item_suggestions)
+        add_suggested_item_button = QPushButton("Add Suggested Item")
+        add_suggested_item_button.clicked.connect(self._add_selected_starter_item_suggestion)
+        add_item_suggestion_button = QPushButton("Add Custom Item Idea")
         add_item_suggestion_button.clicked.connect(
             lambda: _append_starter_suggestion_table_row(
                 self.starter_item_suggestions_table, "Item"
@@ -3259,6 +3652,7 @@ class NewGameWizard(QWizard):
         _configure_responsive_form(basic_inventory_layout)
         _configure_responsive_table(self.starter_item_suggestions_table, stretch_columns={0}, compact_columns={1})
         basic_inventory_layout.addRow("Item / equipment ideas:", self.starter_item_suggestions_table)
+        basic_inventory_layout.addRow("Genre suggestions:", _button_row(self.starter_item_suggestion_combo, add_suggested_item_button))
         basic_inventory_layout.addRow("", _button_row(add_item_suggestion_button))
         basic_inventory_widget = QWidget()
         basic_inventory_widget.setLayout(basic_inventory_layout)
@@ -3896,9 +4290,9 @@ class NewGameWizard(QWizard):
             lambda _index: self._sync_calendar_settings_button()
         )
 
-        self.calendar_start_season_input = QLineEdit()
-        self.calendar_start_season_input.setPlaceholderText(
-            "Optional season name, such as Spring or Autumn"
+        self.calendar_start_season_input = _CatalogComboBox(
+            self.choice_catalogs.get("calendar_seasons", []),
+            placeholder="Choose a saved season or select Custom",
         )
         self.calendar_start_year_input = QSpinBox()
         self.calendar_start_year_input.setRange(0, 9999)
@@ -3917,9 +4311,9 @@ class NewGameWizard(QWizard):
         self.calendar_start_time_input = QTimeEdit(QTime(8, 0))
         self.calendar_start_time_input.setDisplayFormat("h:mm AP")
         self.calendar_start_time_input.setVisible(False)
-        self.calendar_start_weather_input = QLineEdit()
-        self.calendar_start_weather_input.setPlaceholderText(
-            "Optional exact weather, such as Clear, Rain, Snow, or Fog"
+        self.calendar_start_weather_input = _CatalogComboBox(
+            self.choice_catalogs.get("calendar_weather", []),
+            placeholder="Choose saved weather or select Custom",
         )
 
         self.calendar_generation_guidance_label = QLabel("AI Calendar Details:")
@@ -3994,9 +4388,22 @@ class NewGameWizard(QWizard):
     def _open_wizard_calendar_settings(self) -> None:
         """Opens the shared calendar settings dialog for the custom wizard calendar."""
 
-        dialog = _main_window_override("CalendarSettingsDialog", CalendarSettingsDialog)(self._custom_calendar_settings, self)
+        dialog = _main_window_override("CalendarSettingsDialog", CalendarSettingsDialog)(
+            self._custom_calendar_settings,
+            self,
+            name_catalogs={
+                "days": self.choice_catalogs.get("calendar_days", []),
+                "months": self.choice_catalogs.get("calendar_months", []),
+                "seasons": self.choice_catalogs.get("calendar_seasons", []),
+                "weather": self.choice_catalogs.get("calendar_weather", []),
+            },
+        )
 
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
 
         self._custom_calendar_settings = dialog.build_settings()
+        for season in self._custom_calendar_settings.get("seasons", []):
+            if isinstance(season, dict):
+                self.calendar_start_season_input.addChoice(str(season.get("name", "")))
+                self.calendar_start_weather_input.addChoice(str(season.get("weather_hint", "")))

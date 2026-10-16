@@ -389,8 +389,25 @@ class SettingsScreen(RepositoryBackedWidget):
             )
             return
 
+        music_genre: str | None = None
+        if category == "music":
+            music_genre, accepted = QInputDialog.getText(
+                self,
+                "Music Track Genre",
+                "Genre or style folder (for example, fantasy or futuristic):",
+                text="general",
+            )
+            if not accepted:
+                return
+            music_genre = music_genre.strip() or "general"
+
         try:
-            success, result = importer(Path(file_path), category)
+            if category == "music":
+                success, result = importer(
+                    Path(file_path), category, genre=music_genre
+                )
+            else:
+                success, result = importer(Path(file_path), category)
         except Exception as error:
             LOGGER.exception(
                 "Audio upload crashed in Settings: category=%s file=%s.",

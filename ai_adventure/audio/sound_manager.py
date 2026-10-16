@@ -36,7 +36,7 @@ def prepare_sound_directory(app_paths: Any) -> Path:
         return managed_sounds_dir
 
     package_music_tracks_dir = Path(app_paths.package_music_tracks_dir)
-    if _contains_audio_files(package_music_tracks_dir):
+    if _contains_audio_files(package_music_tracks_dir, recursive=True):
         return package_music_tracks_dir
 
     repo_sounds_dir = Path(app_paths.repo_root) / "sounds"
@@ -190,7 +190,8 @@ class SoundManager:
                 self.user_music_directory,
                 self.sounds_directory,
                 *([self.packaged_music_directory] if self.packaged_music_directory else []),
-            )
+            ),
+            recursive=True,
         )
         self._sound_effect_track_cache = _audio_file_cache(
             self._audio_directories(
@@ -215,7 +216,7 @@ class SoundManager:
             ),
         )
         music_names, effect_names, ambience_names = distinct_audio_track_catalogs_with_ambience(
-            (path.name for path in self._music_track_cache.values()),
+            self._music_track_cache.keys(),
             (path.name for path in self._sound_effect_track_cache.values()),
             (path.name for path in self._background_ambience_track_cache.values()),
         )
@@ -225,7 +226,7 @@ class SoundManager:
         self._music_track_cache = {
             key: path
             for key, path in self._music_track_cache.items()
-            if key in music_keys
+            if key.casefold() in music_keys
         }
         self._sound_effect_track_cache = {
             key: path
@@ -257,6 +258,8 @@ class SoundManager:
         self,
         source_path: str | Path,
         category: str,
+        *,
+        genre: str | None = None,
     ) -> tuple[bool, str]:
         """Copies one supported user audio file into the managed catalog."""
 
@@ -279,6 +282,11 @@ class SoundManager:
         try:
             if source.stat().st_size <= 0:
                 return False, "The selected audio file is empty."
+            if clean_category == "music" and genre and genre.strip():
+                genre_parts = _safe_music_genre_path(genre)
+                if not genre_parts:
+                    return False, "Enter a valid music genre folder name."
+                target_directory = target_directory.joinpath(*genre_parts)
             target_directory.mkdir(parents=True, exist_ok=True)
             target_path = target_directory / source.name
             if source.resolve() != target_path.resolve():
@@ -287,14 +295,19 @@ class SoundManager:
         except (OSError, ValueError) as error:
             LOGGER.warning("Could not import user audio %s: %s", source, error)
             return False, f"Could not import that audio file: {error}"
-        LOGGER.info("Imported user %s audio: %s", clean_category, target_path.name)
-        return True, target_path.name
+        imported_name = (
+            target_path.relative_to(self.user_music_directory).as_posix()
+            if clean_category == "music"
+            else target_path.name
+        )
+        LOGGER.info("Imported user %s audio: %s", clean_category, imported_name)
+        return True, imported_name
 
     def get_valid_track_names(self) -> list[str]:
         """Returns known playable audio filenames."""
 
         self.refresh_tracks()
-        return sorted(path.name for path in self._music_track_cache.values())
+        return sorted(self._music_track_cache)
 
     def get_valid_sound_effect_names(self) -> list[str]:
         """Returns audio files that may play as one-shot narration cues."""
@@ -348,8 +361,9 @@ class SoundManager:
             return
 
         try:
+            track_identifier = _cached_track_identifier(track_path, self._music_track_cache)
             if (
-                self.current_music == track_path.name
+                self.current_music == track_identifier
                 and self._pygame.mixer.music.get_busy()
             ):
                 return
@@ -358,8 +372,8 @@ class SoundManager:
             self._pygame.mixer.music.load(str(track_path))
             self._pygame.mixer.music.set_volume(self.music_volume)
             self._pygame.mixer.music.play(-1)
-            self.current_music = track_path.name
-            LOGGER.info("Playing background music: %s", track_path.name)
+            self.current_music = track_identifier
+            LOGGER.info("Playing background music: %s", track_identifier)
         except Exception as error:
             LOGGER.warning("Failed to play background music %s: %s", track_path, error)
 
@@ -382,8 +396,8 @@ class SoundManager:
             self._pygame.mixer.music.load(str(track_path))
             self._pygame.mixer.music.set_volume(self.music_volume)
             self._pygame.mixer.music.play(0)
-            self.current_music = track_path.name
-            LOGGER.info("Playing music preview: %s", track_path.name)
+            self.current_music = _cached_track_identifier(track_path, self._music_track_cache)
+            LOGGER.info("Playing music preview: %s", self.current_music)
         except Exception as error:
             LOGGER.warning("Failed to play music preview %s: %s", track_path, error)
 
@@ -552,8 +566,20 @@ class SoundManager:
         ):
             return raw_path
 
+        refresh_music_cache = cache is self._music_track_cache
         self.refresh_tracks()
-        cached_path = cache.get(raw_path.name.lower())
+        if refresh_music_cache:
+            cache = self._music_track_cache
+        identifier = raw_path.as_posix().lstrip("./")
+        cached_path = next(
+            (path for name, path in cache.items() if name.casefold() == identifier.casefold()),
+            None,
+        )
+        if cached_path is None:
+            cached_path = next(
+                (path for name, path in cache.items() if Path(name).name.casefold() == raw_path.name.casefold()),
+                None,
+            )
 
         if cached_path is None:
             LOGGER.warning("%s not found: %s", label, track_name_or_path)
@@ -580,19 +606,24 @@ def _normalized_volume(value: float | int | None, *, label: str) -> float | None
     return max(0.0, min(1.0, parsed_volume))
 
 
-def _contains_audio_files(directory: Path) -> bool:
+def _contains_audio_files(directory: Path, *, recursive: bool = False) -> bool:
     """Returns True if a directory contains at least one supported audio file."""
 
     try:
-        return directory.exists() and directory.is_dir() and any(
+        if not directory.exists() or not directory.is_dir():
+            return False
+        candidates = directory.rglob("*") if recursive else directory.iterdir()
+        return any(
             child.is_file() and child.suffix.lower() in SUPPORTED_AUDIO_EXTENSIONS
-            for child in directory.iterdir()
+            for child in candidates
         )
     except OSError:
         return False
 
 
-def _audio_file_cache(directory: Path | tuple[Path, ...]) -> dict[str, Path]:
+def _audio_file_cache(
+    directory: Path | tuple[Path, ...], *, recursive: bool = False
+) -> dict[str, Path]:
     """Returns supported audio files in one catalog directory."""
 
     directories = directory if isinstance(directory, tuple) else (directory,)
@@ -601,12 +632,25 @@ def _audio_file_cache(directory: Path | tuple[Path, ...]) -> dict[str, Path]:
         try:
             if not current_directory.exists() or not current_directory.is_dir():
                 continue
-            for file_path in current_directory.iterdir():
+            candidates = current_directory.rglob("*") if recursive else current_directory.iterdir()
+            for file_path in candidates:
                 if (
                     file_path.is_file()
                     and file_path.suffix.casefold() in SUPPORTED_AUDIO_EXTENSIONS
                 ):
-                    result.setdefault(file_path.name.casefold(), file_path)
+                    relative_path = file_path.relative_to(current_directory)
+                    if recursive and any(
+                        part.casefold() in {"sound_effects", "background_ambience_tracks"}
+                        for part in relative_path.parts[:-1]
+                    ):
+                        continue
+                    identifier = (
+                        relative_path.as_posix()
+                        if recursive
+                        else file_path.name
+                    )
+                    if not any(existing.casefold() == identifier.casefold() for existing in result):
+                        result[identifier] = file_path
         except OSError as error:
             LOGGER.warning(
                 "Failed to refresh audio directory %s: %s",
@@ -614,6 +658,28 @@ def _audio_file_cache(directory: Path | tuple[Path, ...]) -> dict[str, Path]:
                 error,
             )
     return result
+
+
+def _cached_track_identifier(track_path: Path, cache: dict[str, Path]) -> str:
+    """Returns the catalog identifier used to select a cached track."""
+    for identifier, cached_path in cache.items():
+        if cached_path == track_path:
+            return identifier
+    return track_path.name
+
+
+def _safe_music_genre_path(genre: str) -> tuple[str, ...]:
+    """Normalizes a user-entered genre into safe folder components."""
+    parts: list[str] = []
+    for part in str(genre).replace("\\", "/").split("/"):
+        clean = "".join(
+            character
+            for character in part.strip()
+            if character.isalnum() or character in " _-"
+        ).strip(" .")
+        if clean and clean not in {".", ".."}:
+            parts.append(clean.replace(" ", "_"))
+    return tuple(parts)
 
 
 def _extract_sounds_zip(zip_path: Path, target_directory: Path) -> None:

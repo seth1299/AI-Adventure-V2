@@ -18,7 +18,10 @@ from ai_adventure.calendar_system import (
     resolve_starting_calendar_minute,
 )
 from ai_adventure.audio.tts_settings import normalize_tts_audio_fields
-from ai_adventure.audio.catalog import distinct_audio_track_catalogs_with_ambience
+from ai_adventure.audio.catalog import (
+    distinct_audio_track_catalogs_with_ambience,
+    music_track_context,
+)
 from ai_adventure.audio.pronunciation import (
     normalize_pronunciation_map,
     set_authoritative_pronunciation,
@@ -718,7 +721,9 @@ def build_new_game_setup_packet(
             ),
             "starting_music": (
                 "Return one opening_cues record with kind music and one exact filename "
-                "from audio.valid_music_tracks when a listed track fits the opening; "
+                "from audio.valid_music_tracks when a listed track fits the opening. "
+                "Use audio.music_track_context to interpret each track's genre/style "
+                "folder as descriptive guidance, without excluding any listed track; "
                 "otherwise return no music cue."
             ),
             "starting_sound_effect": (
@@ -1140,6 +1145,7 @@ def build_new_game_setup_packet(
             "enabled": clean_setup["magic"]["enabled"],
             "casting_mode": clean_setup["magic"]["casting_mode"],
             "tradition": clean_setup["magic"]["tradition"],
+            "traditions": clean_setup["magic"]["traditions"],
             "starting_spells_mode": clean_setup["magic"]["starting_spells_mode"],
             "starting_spell_request_count": starting_spell_request_count,
             "starting_spell_count": len(clean_setup["magic"]["starting_spells"]),
@@ -1157,6 +1163,7 @@ def build_new_game_setup_packet(
         "genre_generation_guidance": _genre_generation_guidance(clean_setup),
         "audio": {
             "valid_music_tracks": clean_music_tracks,
+            "music_track_context": music_track_context(clean_music_tracks),
             "current_music": "",
             "valid_sound_effect_tracks": clean_sound_effect_tracks,
             "valid_background_ambience_tracks": clean_background_ambience_tracks,

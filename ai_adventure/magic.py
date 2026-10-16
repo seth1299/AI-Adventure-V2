@@ -79,12 +79,37 @@ def normalize_magic_setup(raw_magic: Any) -> dict[str, Any]:
     if not enabled:
         starting_spell_requests = []
         starting_spells = []
+    raw_traditions = source.get("traditions", [])
+    if not isinstance(raw_traditions, list):
+        raw_traditions = []
+    traditions_by_name: dict[str, dict[str, str]] = {}
+    for raw_tradition in raw_traditions:
+        if not isinstance(raw_tradition, dict):
+            continue
+        name = str(raw_tradition.get("name", "")).strip()
+        description = str(raw_tradition.get("description", "")).strip()
+        if not name:
+            continue
+        key = name.casefold()
+        current = traditions_by_name.get(key)
+        if current is None or len(description) > len(current["description"]):
+            traditions_by_name[key] = {"name": name, "description": description}
+    traditions = list(traditions_by_name.values())
+    legacy_tradition = str(source.get("tradition", "")).strip()
+    if not legacy_tradition and traditions:
+        legacy_tradition = "; ".join(
+            f"{item['name']}: {item['description']}"
+            if item["description"]
+            else item["name"]
+            for item in traditions
+        )
     return {
         "world_contains_magic": world_contains_magic,
         "player_magic_enabled": player_magic_enabled,
         "enabled": enabled,
         "casting_mode": casting_mode,
-        "tradition": str(source.get("tradition", "")).strip(),
+        "tradition": legacy_tradition,
+        "traditions": traditions,
         "mana_maximum": _bounded_int(source.get("mana_maximum", 10), 1, 9999),
         "tier_slots": tier_slots,
         "starting_spells_mode": starting_spells_mode,

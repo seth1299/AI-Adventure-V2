@@ -41,6 +41,74 @@ class _NoWheelComboBox(QComboBox):
         event.ignore()
 
 
+class _CatalogComboBox(_NoWheelComboBox):
+    """A single-choice dropdown that also accepts a clearly marked custom value."""
+
+    CUSTOM_DATA = "__custom_choice__"
+    EMPTY_LABEL = "Select or enter a value"
+
+    def __init__(
+        self,
+        choices: list[str] | tuple[str, ...] = (),
+        value: str = "",
+        *,
+        placeholder: str = "Select a saved value or choose Custom",
+        custom_label: str = "[Custom…]",
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.empty_label = placeholder
+        self.addItem(self.empty_label, "")
+        seen: set[str] = set()
+        for choice in choices:
+            label = str(choice or "").strip()
+            key = label.casefold()
+            if label and key not in seen:
+                self.addItem(label, label)
+                seen.add(key)
+        self.addItem(custom_label, self.CUSTOM_DATA)
+        self.setEditable(True)
+        self.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        self.lineEdit().setPlaceholderText(placeholder)
+        self.activated.connect(self._handle_activation)
+        self.setText(value)
+
+    def _handle_activation(self, index: int) -> None:
+        if self.itemData(index) == self.CUSTOM_DATA:
+            self.setEditText("")
+            self.lineEdit().setFocus()
+
+    def text(self) -> str:
+        if self.currentData() == self.CUSTOM_DATA:
+            return ""
+        if self.currentData() == "" and self.currentText() == self.empty_label:
+            return ""
+        return self.currentText().strip()
+
+    def setText(self, value: str) -> None:
+        wanted = str(value or "").strip()
+        if not wanted:
+            self.setCurrentIndex(0)
+            return
+        for index in range(1, self.count() - 1):
+            if str(self.itemData(index) or "").casefold() == wanted.casefold():
+                self.setCurrentIndex(index)
+                return
+        self.setEditText(wanted)
+
+    def addChoice(self, value: str) -> None:
+        """Adds a catalog value while keeping the Custom option at the end."""
+        clean = str(value or "").strip()
+        if not clean:
+            return
+        if any(
+            str(self.itemData(index) or "").casefold() == clean.casefold()
+            for index in range(1, self.count() - 1)
+        ):
+            return
+        self.insertItem(self.count() - 1, clean, clean)
+
+
 class _NoWheelSpinBox(QSpinBox):
     """Spin box that does not change value from mouse-wheel scrolling."""
 
@@ -850,6 +918,7 @@ def _main_window_override(name: str, default: _T) -> _T:
 
 
 __all__ = [
+    "_CatalogComboBox",
     "_NoWheelComboBox",
     "_NoWheelSpinBox",
     "RepositoryBackedWidget",

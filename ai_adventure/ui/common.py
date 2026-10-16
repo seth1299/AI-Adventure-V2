@@ -534,6 +534,7 @@ __all__ = [
     "MAX_UI_FONT_SIZE",
     "MIN_UI_FONT_SIZE",
     "XP_THRESHOLDS_BY_LEVEL",
+    "_CatalogComboBox",
     "_AppTableWidget",
     "_DeselectSelectedRowFilter",
     "_INVENTORY_INVARIANT_PLURALS",

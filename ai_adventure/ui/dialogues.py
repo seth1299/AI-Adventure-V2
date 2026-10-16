@@ -5,6 +5,7 @@ from ai_adventure.stats import ATTRIBUTES, RULES_VERSION, rank_stats, starting_a
 from ai_adventure.ui.widgets.inputs import FeatureToggleCheckBox
 from ai_adventure.audio.tts_settings import DEFAULT_TTS_VOLUME_PERCENT, active_player_voice_spec_from_audio
 from ai_adventure.audio.voices import PLAYER_SAMPLE_TEXT
+from ai_adventure.calendar_system import DEFAULT_CALENDAR_SETTINGS, normalize_calendar_settings
 
 from PySide6.QtWidgets import QFileDialog
 
@@ -1774,6 +1775,8 @@ class NewGameTemplateManagerDialog(QDialog):
         self.active_template_name: str | None = None
         self.active_setup: dict[str, Any] = {}
         self._loading_template_setup = False
+        self._magic_traditions_original: list[dict[str, Any]] = []
+        self._magic_tradition_original_text = ""
 
         self.setWindowTitle("New Game Templates")
         self.setWindowFlags(
@@ -2503,6 +2506,12 @@ class NewGameTemplateManagerDialog(QDialog):
 
     def _load_template_magic(self, raw_magic: Any) -> None:
         magic = raw_magic if isinstance(raw_magic, dict) else {}
+        self._magic_traditions_original = [
+            dict(item)
+            for item in magic.get("traditions", [])
+            if isinstance(item, dict)
+        ] if isinstance(magic.get("traditions", []), list) else []
+        self._magic_tradition_original_text = str(magic.get("tradition", "") or "")
         self.magic_no_world_checkbox.setChecked(
             not bool(magic.get("world_contains_magic", True))
         )
@@ -3268,12 +3277,19 @@ class NewGameTemplateManagerDialog(QDialog):
         setup["fighting"] = {
             "focus": self.combat_focus_combo.currentData() or "balanced",
         }
+        magic_tradition = self.magic_tradition_input.text().strip()
+        preserved_traditions = (
+            self._magic_traditions_original
+            if magic_tradition == self._magic_tradition_original_text
+            else ([{"name": magic_tradition, "description": ""}] if magic_tradition else [])
+        )
         setup["magic"] = {
             "world_contains_magic": not self.magic_no_world_checkbox.isChecked(),
             "player_magic_enabled": self.magic_enabled_checkbox.isChecked(),
             "enabled": self.magic_enabled_checkbox.isChecked(),
             "casting_mode": self.magic_casting_mode_combo.currentData() or "narrative",
-            "tradition": self.magic_tradition_input.text().strip(),
+            "tradition": magic_tradition,
+            "traditions": preserved_traditions,
             "mana_maximum": self.magic_mana_input.value(),
             "starting_spells_mode": self.magic_starting_spells_mode_combo.currentData() or "basic",
             "starting_spell_requests": [
@@ -4429,11 +4445,17 @@ class CalendarSettingsDialog(QDialog):
         self,
         settings: dict[str, Any],
         parent: QWidget | None = None,
+        *,
+        name_catalogs: dict[str, list[str]] | None = None,
     ) -> None:
         super().__init__(parent)
 
         self.setWindowTitle("Calendar Settings")
-        calendar_settings = dict(settings or DEFAULT_CALENDAR_SETTINGS)
+        self.resize(760, 760)
+        calendar_settings = normalize_calendar_settings(
+            settings or DEFAULT_CALENDAR_SETTINGS
+        )
+        self.name_catalogs = name_catalogs or {}
 
         self.days_per_week_input = _NoWheelSpinBox()
         self.days_per_week_input.setRange(1, 14)
@@ -4451,19 +4473,36 @@ class CalendarSettingsDialog(QDialog):
         self.seasons_per_year_input.setRange(1, 12)
         self.seasons_per_year_input.setValue(int(calendar_settings["seasons_per_year"]))
 
-        self.day_names_input = QLineEdit(
-            ", ".join(str(name) for name in calendar_settings["day_names"])
+        day_catalog = list(self.name_catalogs.get("days", []))
+        month_catalog = list(self.name_catalogs.get("months", []))
+        season_catalog = list(self.name_catalogs.get("seasons", []))
+        weather_catalog = list(self.name_catalogs.get("weather", []))
+        self.day_names_table = self._calendar_table(["Day Name", "Remove"])
+        self.month_names_table = self._calendar_table(["Month Name", "Remove"])
+        self.seasons_table = self._calendar_table(
+            ["Season Name", "Weather Hint", "Remove"]
         )
-        self.month_names_input = QLineEdit(
-            ", ".join(str(name) for name in calendar_settings["month_names"])
-        )
-        self.season_names_input = QLineEdit(
-            ", ".join(str(season["name"]) for season in calendar_settings["seasons"])
-        )
-        self.season_hints_input = QLineEdit(
-            ", ".join(
-                str(season["weather_hint"]) for season in calendar_settings["seasons"]
+        for name in calendar_settings["day_names"]:
+            self._append_calendar_row(self.day_names_table, str(name), day_catalog, "day")
+        for name in calendar_settings["month_names"]:
+            self._append_calendar_row(self.month_names_table, str(name), month_catalog, "month")
+        for season in calendar_settings["seasons"]:
+            self._append_calendar_row(
+                self.seasons_table,
+                str(season["name"]),
+                season_catalog,
+                "season",
+                str(season["weather_hint"]),
+                weather_catalog,
             )
+        self.days_per_week_input.valueChanged.connect(
+            lambda count: self._sync_calendar_row_count(self.day_names_table, count, day_catalog, "day")
+        )
+        self.months_per_year_input.valueChanged.connect(
+            lambda count: self._sync_calendar_row_count(self.month_names_table, count, month_catalog, "month")
+        )
+        self.seasons_per_year_input.valueChanged.connect(
+            lambda count: self._sync_calendar_row_count(self.seasons_table, count, season_catalog, "season", weather_catalog)
         )
 
         self.time_display_combo = _NoWheelComboBox()
@@ -4480,11 +4519,32 @@ class CalendarSettingsDialog(QDialog):
         form.addRow("Weeks Per Month:", self.weeks_per_month_input)
         form.addRow("Months Per Year:", self.months_per_year_input)
         form.addRow("Seasons Per Year:", self.seasons_per_year_input)
-        form.addRow("Day Names:", self.day_names_input)
-        form.addRow("Month Names:", self.month_names_input)
-        form.addRow("Season Names:", self.season_names_input)
-        form.addRow("Season Weather Hints:", self.season_hints_input)
         form.addRow("Time Display:", self.time_display_combo)
+
+        day_group = QGroupBox("Days of the Week")
+        day_layout = QVBoxLayout(day_group)
+        add_day_button = QPushButton("Add a Day")
+        add_day_button.clicked.connect(
+            lambda: self._change_calendar_count(self.days_per_week_input, 1, 14)
+        )
+        day_layout.addWidget(add_day_button)
+        day_layout.addWidget(self.day_names_table)
+        month_group = QGroupBox("Months of the Year")
+        month_layout = QVBoxLayout(month_group)
+        add_month_button = QPushButton("Add a Month")
+        add_month_button.clicked.connect(
+            lambda: self._change_calendar_count(self.months_per_year_input, 1, 24)
+        )
+        month_layout.addWidget(add_month_button)
+        month_layout.addWidget(self.month_names_table)
+        season_group = QGroupBox("Seasons")
+        season_layout = QVBoxLayout(season_group)
+        add_season_button = QPushButton("Add a Season")
+        add_season_button.clicked.connect(
+            lambda: self._change_calendar_count(self.seasons_per_year_input, 1, 12)
+        )
+        season_layout.addWidget(add_season_button)
+        season_layout.addWidget(self.seasons_table)
 
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok
@@ -4495,8 +4555,134 @@ class CalendarSettingsDialog(QDialog):
 
         layout = QVBoxLayout()
         layout.addLayout(form)
+        content = QWidget()
+        sections = QVBoxLayout(content)
+        sections.addWidget(day_group)
+        sections.addWidget(month_group)
+        sections.addWidget(season_group)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(content)
+        layout.addWidget(scroll, 1)
         layout.addWidget(buttons)
         self.setLayout(layout)
+
+    @staticmethod
+    def _calendar_table(headers: list[str]) -> _AppTableWidget:
+        table = _AppTableWidget(0, len(headers))
+        table.setHorizontalHeaderLabels(headers)
+        table.verticalHeader().setVisible(False)
+        table.verticalHeader().setDefaultSectionSize(36)
+        _configure_responsive_table(
+            table,
+            stretch_columns=set(range(max(0, len(headers) - 1))),
+            compact_columns={len(headers) - 1},
+        )
+        return table
+
+    def _append_calendar_row(
+        self,
+        table: _AppTableWidget,
+        name: str,
+        name_choices: list[str],
+        kind: str,
+        weather_hint: str = "",
+        weather_choices: list[str] | None = None,
+    ) -> None:
+        row = table.rowCount()
+        table.insertRow(row)
+        table.setCellWidget(
+            row,
+            0,
+            _CatalogComboBox(
+                name_choices,
+                name,
+                placeholder=f"Choose a saved {kind} name or select Custom",
+            ),
+        )
+        remove_column = table.columnCount() - 1
+        if table is self.seasons_table:
+            table.setCellWidget(
+                row,
+                1,
+                _CatalogComboBox(
+                    weather_choices or [],
+                    weather_hint,
+                    placeholder="Choose a saved weather hint or select Custom",
+                ),
+            )
+            remove_column = 2
+        _set_remove_row_button(
+            table,
+            row,
+            remove_column,
+            kind,
+            lambda button, target=table, name_list=name_choices, row_kind=kind, weather_list=weather_choices:
+                self._remove_calendar_row(target, button, name_list, row_kind, weather_list),
+        )
+        self._refresh_calendar_remove_buttons(table)
+
+    def _sync_calendar_row_count(
+        self,
+        table: _AppTableWidget,
+        count: int,
+        choices: list[str],
+        kind: str,
+        weather_choices: list[str] | None = None,
+    ) -> None:
+        while table.rowCount() < count:
+            index = table.rowCount()
+            defaults = DEFAULT_CALENDAR_SETTINGS["day_names"] if kind == "day" else (
+                DEFAULT_CALENDAR_SETTINGS["month_names"] if kind == "month" else
+                [season["name"] for season in DEFAULT_CALENDAR_SETTINGS["seasons"]]
+            )
+            name = defaults[index] if index < len(defaults) else f"{kind.title()} {index + 1}"
+            weather = (
+                DEFAULT_CALENDAR_SETTINGS["seasons"][index]["weather_hint"]
+                if kind == "season" and index < len(DEFAULT_CALENDAR_SETTINGS["seasons"])
+                else "temperate"
+            )
+            self._append_calendar_row(
+                table, name, choices, kind, weather, weather_choices
+            )
+        while table.rowCount() > count:
+            table.removeRow(table.rowCount() - 1)
+        self._refresh_calendar_remove_buttons(table)
+
+    @staticmethod
+    def _refresh_calendar_remove_buttons(table: _AppTableWidget) -> None:
+        remove_column = table.columnCount() - 1
+        for row in range(table.rowCount()):
+            button = table.cellWidget(row, remove_column)
+            if isinstance(button, QPushButton):
+                button.setEnabled(table.rowCount() > 1)
+
+    @staticmethod
+    def _change_calendar_count(control: QSpinBox, delta: int, maximum: int) -> None:
+        control.setValue(min(maximum, control.value() + delta))
+
+    def _remove_calendar_row(
+        self,
+        table: _AppTableWidget,
+        button: QPushButton,
+        choices: list[str],
+        kind: str,
+        weather_choices: list[str] | None = None,
+    ) -> None:
+        _remove_table_row_by_button(table, button)
+        count_control = {
+            "day": self.days_per_week_input,
+            "month": self.months_per_year_input,
+            "season": self.seasons_per_year_input,
+        }[kind]
+        count_control.setValue(max(count_control.minimum(), table.rowCount()))
+        self._sync_calendar_row_count(
+            table,
+            count_control.value(),
+            choices,
+            kind,
+            weather_choices,
+        )
 
     def build_settings(self) -> dict[str, Any]:
         """Builds normalized calendar settings from dialog controls."""
@@ -4506,13 +4692,28 @@ class CalendarSettingsDialog(QDialog):
             "weeks_per_month": self.weeks_per_month_input.value(),
             "months_per_year": self.months_per_year_input.value(),
             "seasons_per_year": self.seasons_per_year_input.value(),
-            "day_names": _split_list(self.day_names_input.text()),
-            "month_names": _split_list(self.month_names_input.text()),
-            "seasons": _build_season_settings(
-                names=_split_list(self.season_names_input.text()),
-                hints=_split_list(self.season_hints_input.text()),
-                count=self.seasons_per_year_input.value(),
-            ),
+            "day_names": [
+                widget.text()
+                for row in range(self.day_names_table.rowCount())
+                if isinstance((widget := self.day_names_table.cellWidget(row, 0)), _CatalogComboBox)
+                and widget.text()
+            ],
+            "month_names": [
+                widget.text()
+                for row in range(self.month_names_table.rowCount())
+                if isinstance((widget := self.month_names_table.cellWidget(row, 0)), _CatalogComboBox)
+                and widget.text()
+            ],
+            "seasons": [
+                {
+                    "name": name_widget.text(),
+                    "weather_hint": weather_widget.text() or name_widget.text().casefold(),
+                }
+                for row in range(self.seasons_table.rowCount())
+                if isinstance((name_widget := self.seasons_table.cellWidget(row, 0)), _CatalogComboBox)
+                and isinstance((weather_widget := self.seasons_table.cellWidget(row, 1)), _CatalogComboBox)
+                and name_widget.text()
+            ],
             "time_display": self.time_display_combo.currentData() or "narrative",
         }
 

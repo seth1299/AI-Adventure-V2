@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+from pathlib import PurePosixPath
 
 MUSIC_SELECTION_RULE = (
     "When music tracks are available, return music_filename as the exact catalog filename "
     "that best fits the final narrated scene. Evaluate the destination environment, mood "
-    "and danger, not just the starting location. Entering a forest from a town calls for "
+    "and danger, as well as the genre/style folder shown for each track, not just the "
+    "filename. Use that folder as descriptive guidance, but keep every listed track "
+    "available regardless of genre. Entering a forest from a town calls for "
     "forest music instead of town music when both are listed; the forest track also fits "
     "daytime woodland even if its filename mentions nighttime. Leaving combat calls for "
     "replacing battle music with suitable peaceful music. Keep the current filename when "
@@ -62,9 +65,19 @@ def _unique_track_names(tracks: Iterable[object] | None) -> list[str]:
     result: list[str] = []
     seen: set[str] = set()
     for raw_track in tracks or ():
-        track = str(raw_track or "").strip()
+        track = str(raw_track or "").strip().replace("\\", "/")
         key = track.casefold()
         if track and key not in seen:
             result.append(track)
             seen.add(key)
+    return result
+
+
+def music_track_context(tracks: Iterable[object] | None) -> list[dict[str, str]]:
+    """Describes each track's folder genre while retaining its exact identifier."""
+    result: list[dict[str, str]] = []
+    for track in _unique_track_names(tracks):
+        parent = PurePosixPath(track).parent
+        genre = " / ".join(part.replace("_", " ").replace("-", " ") for part in parent.parts)
+        result.append({"filename": track, "genre": genre if genre != "." else ""})
     return result
