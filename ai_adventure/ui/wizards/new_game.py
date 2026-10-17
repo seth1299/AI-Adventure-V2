@@ -440,6 +440,8 @@ class NewGameWizard(QWizard):
         self.custom_voice_storage_path = custom_voice_storage_path
         self.sound_manager = sound_manager
         self.on_save_and_exit = on_save_and_exit
+        self._music_preview_active = False
+        self._last_page_id = -1
         self.skill_catalog = self._merge_skill_catalog(skill_catalog or [])
         self.starter_item_catalog = self._merge_starter_item_catalog(starter_item_catalog or [])
         self.choice_catalogs = {
@@ -561,8 +563,12 @@ class NewGameWizard(QWizard):
         self._configure_save_and_exit_button()
 
         self.currentIdChanged.connect(self._schedule_page_heading_style)
+        self._last_page_id = self.currentId()
+        self.currentIdChanged.connect(self._handle_wizard_page_changed)
         self._style_current_page_headings()
-        self._bind_music_preview_stop_buttons()
+        self._music_preview_timer = QTimer(self)
+        self._music_preview_timer.setInterval(250)
+        self._music_preview_timer.timeout.connect(self._check_music_preview_finished)
 
         if template_setup is not None:
             self.load_setup(template_setup)
@@ -1729,18 +1735,21 @@ class NewGameWizard(QWizard):
             )
         description_widget = self.starting_locations_table.cellWidget(row, 1)
         if isinstance(description_widget, QLineEdit):
+            def location_name_is_present() -> bool:
+                if isinstance(name_widget, _CatalogComboBox):
+                    # text() deliberately returns an empty value for the Custom
+                    # menu entry; the editor text is still the user's location name.
+                    return bool(name_widget.lineEdit().text().strip())
+                if isinstance(name_widget, QLineEdit):
+                    return bool(name_widget.text().strip())
+                return False
+
             description_widget.setEnabled(
-                bool(name_widget.text().strip())
-                if isinstance(name_widget, (_CatalogComboBox, QLineEdit))
-                else False
+                location_name_is_present()
             )
 
             def sync_description_enabled(*_args: Any) -> None:
-                description_widget.setEnabled(
-                    bool(name_widget.text().strip())
-                    if isinstance(name_widget, (_CatalogComboBox, QLineEdit))
-                    else False
-                )
+                description_widget.setEnabled(location_name_is_present())
 
             if isinstance(name_widget, _CatalogComboBox):
                 name_widget.lineEdit().textChanged.connect(sync_description_enabled)
@@ -3910,7 +3919,7 @@ class NewGameWizard(QWizard):
             layout, self.background_ambience_volume_slider, self.background_ambience_test_button,
             self.background_ambience_upload_button,
         )
-        self.addPage(page)
+        self.audio_page_id = self.addPage(page)
 
     def _upload_audio_file(self, category: str) -> None:
         """Imports one user-selected audio file into the shared runtime catalog."""
@@ -3942,6 +3951,8 @@ class NewGameWizard(QWizard):
 
         self.sound_manager.set_music_volume(self.music_volume_slider.value())
         self.sound_manager.play_music_preview(random.choice(tracks))
+        self._music_preview_active = True
+        self._music_preview_timer.start()
 
     def _test_sound_effects_preview(self) -> None:
         if self.sound_manager is None:
@@ -3969,19 +3980,31 @@ class NewGameWizard(QWizard):
         )
         self.sound_manager.play_background_ambience(random.choice(ambience_tracks))
 
-    def _bind_music_preview_stop_buttons(self) -> None:
-        for button in self.findChildren(QPushButton):
-            if button not in {
-                self.music_test_button,
-                self.background_ambience_test_button,
-            }:
-                button.clicked.connect(self._stop_audio_previews)
+    def _handle_wizard_page_changed(self, page_id: int) -> None:
+        previous_page_id = self._last_page_id
+        self._last_page_id = page_id
+        if previous_page_id == getattr(self, "audio_page_id", -1) and page_id != previous_page_id:
+            self._stop_audio_previews()
+
+    def _check_music_preview_finished(self) -> None:
+        is_playing = getattr(self.sound_manager, "is_music_playing", None)
+        if not callable(is_playing) or is_playing():
+            return
+        self._music_preview_timer.stop()
+        self._music_preview_active = False
+        self.sound_manager.play_music("Main_Menu.mp3")
 
     def _stop_audio_previews(self) -> None:
         if self.sound_manager is not None:
-            self.sound_manager.stop_music()
+            if self._music_preview_active:
+                self._music_preview_timer.stop()
+                self.sound_manager.stop_music()
+                self._music_preview_active = False
+                self.sound_manager.play_music("Main_Menu.mp3")
             if hasattr(self.sound_manager, "stop_background_ambience"):
                 self.sound_manager.stop_background_ambience()
+            if hasattr(self.sound_manager, "stop_sound_effect"):
+                self.sound_manager.stop_sound_effect()
 
     def _build_tts_page(self) -> None:
         """Builds the dedicated starting TTS preferences page."""

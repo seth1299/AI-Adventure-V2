@@ -135,7 +135,10 @@ def build_report(records: list[dict[str, Any]], *, since: date | None = None,
             ("candidates_token_count", "candidate_tokens"),
             ("thoughts_token_count", "thought_tokens"),
         ):
-            token_value = tokens.get(token_key)
+            if tokens != None:
+                token_value = tokens.get(token_key)
+            else:
+                token_value = -999999
             if isinstance(token_value, int) and not isinstance(token_value, bool):
                 type_row[total_key] += token_value
         for attempt in record.get("attempts", []):
