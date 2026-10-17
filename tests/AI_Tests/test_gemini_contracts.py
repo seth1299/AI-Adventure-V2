@@ -90,7 +90,7 @@ class GeminiContractTests(unittest.TestCase):
                       json.dumps(g.EVENT_RESPONSE_SCHEMA))
 
     def test_saved_scenario_evaluations(self):
-        fixture = json.loads((Path(__file__).parent / "fixtures/gemini_scenarios.json").read_text(encoding="utf-8"))
+        fixture = json.loads((Path(__file__).resolve().parents[1] / "fixtures/gemini_scenarios.json").read_text(encoding="utf-8"))
         self.assertEqual(fixture["version"], 1)
         self.assertEqual(len({case["id"] for case in fixture["scenarios"]}), len(fixture["scenarios"]))
         from google import genai

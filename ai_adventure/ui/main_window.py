@@ -269,6 +269,9 @@ class MainWindow(QMainWindow):
 
         self.stack = CurrentPageStackedWidget()
         self.setCentralWidget(self.stack)
+        self._menu_music_watchdog = QTimer(self)
+        self._menu_music_watchdog.setInterval(1000)
+        self._menu_music_watchdog.timeout.connect(self._ensure_main_menu_music)
 
         self.main_menu = _ExtractedMainMenuScreen(
             saves_dir=self.app_paths.saves_dir,
@@ -1437,6 +1440,7 @@ class MainWindow(QMainWindow):
             else None,
             self.stack.currentIndex(),
         )
+        self._menu_music_watchdog.stop()
         self.active_repository = repository
         self.game_shell.set_repository(
             repository,
@@ -1584,7 +1588,20 @@ class MainWindow(QMainWindow):
                 )
 
             if not audio["music_enabled"]:
+                self._menu_music_watchdog.stop()
                 self.sound_manager.stop_music(clear_current=False)
+            else:
+                available_music = getattr(
+                    self.sound_manager, "get_valid_track_names", lambda: []
+                )()
+                if any(
+                    str(track).casefold() == "main_menu.mp3"
+                    for track in available_music
+                ):
+                    self.sound_manager.play_music("Main_Menu.mp3")
+                    self._menu_music_watchdog.start()
+                else:
+                    self._menu_music_watchdog.stop()
             # Background ambience belongs to the active save's scene. It must not
             # continue looping while the app is showing the save-independent menu.
             if hasattr(self.sound_manager, "stop_background_ambience"):
@@ -1599,6 +1616,21 @@ class MainWindow(QMainWindow):
             self.narration_player.set_enabled(audio["narrator_enabled"] or audio["player_enabled"])
             if hasattr(self.narration_player, "set_speaker_preferences"):
                 self.narration_player.set_speaker_preferences(audio)
+
+    def _ensure_main_menu_music(self) -> None:
+        """Restarts the menu soundtrack if playback ends while the menu is active."""
+        if (
+            self.stack.currentWidget() is not self.main_menu
+            or QApplication.activeModalWidget() is not None
+            or self.active_repository is not None
+            or not self.app_settings["audio"]["music_enabled"]
+            or self.sound_manager is None
+        ):
+            return
+        is_music_playing = getattr(self.sound_manager, "is_music_playing", None)
+        if callable(is_music_playing) and not is_music_playing():
+            LOGGER.info("Main Menu soundtrack stopped; restarting Main_Menu.mp3.")
+            self.sound_manager.play_music("Main_Menu.mp3")
 
     def _play_narrator_sample(
         self,

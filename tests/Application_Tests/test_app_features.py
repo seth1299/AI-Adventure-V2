@@ -61,7 +61,7 @@ class AppFeatureTests(unittest.TestCase):
             )
 
     def test_playtesting_build_uses_minimal_dependencies_and_no_env_file(self) -> None:
-        project_root = Path(__file__).resolve().parents[1]
+        project_root = Path(__file__).resolve().parents[2]
         build_script = (project_root / "playtesting_build.bat").read_text(
             encoding="utf-8"
         )

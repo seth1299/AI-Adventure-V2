@@ -34,7 +34,8 @@ DEFAULT_STARTING_SKILLS = (
     ("Survival", "Navigate and endure outdoors, using the environment safely."),
     ("Technology", "Operate, understand, or troubleshoot devices and technical systems."),
     ("Tracking", "Follow a trail and infer direction or activity from traces."),
-    ("Weapons", "Use, maintain, and handle a chosen class of weapons."),
+    ("Melee Weapons", "Use, maintain, and handle close-combat weapons such as swords, axes, and knives."),
+    ("Ranged Weapons", "Use, maintain, and handle ranged weapons such as bows, crossbows, and firearms."),
 )
 DEFAULT_GAME_GENRES = (
     "Fantasy", "Science fiction", "Mystery", "Detective", "Horror",
@@ -818,6 +819,10 @@ class NewGameWizard(QWizard):
 
             QWizard#newGameWizard QSpinBox {
                 padding-right: 36px;
+            }
+
+            QWizard#newGameWizard QSpinBox#attributePointBuySpinBox {
+                padding-right: 4px;
             }
 
             QWizard#newGameWizard QLineEdit::placeholder,
@@ -1723,6 +1728,25 @@ class NewGameWizard(QWizard):
                 lambda _index: self._refresh_starting_location_dropdowns()
             )
         description_widget = self.starting_locations_table.cellWidget(row, 1)
+        if isinstance(description_widget, QLineEdit):
+            description_widget.setEnabled(
+                bool(name_widget.text().strip())
+                if isinstance(name_widget, (_CatalogComboBox, QLineEdit))
+                else False
+            )
+
+            def sync_description_enabled(*_args: Any) -> None:
+                description_widget.setEnabled(
+                    bool(name_widget.text().strip())
+                    if isinstance(name_widget, (_CatalogComboBox, QLineEdit))
+                    else False
+                )
+
+            if isinstance(name_widget, _CatalogComboBox):
+                name_widget.lineEdit().textChanged.connect(sync_description_enabled)
+                name_widget.currentIndexChanged.connect(sync_description_enabled)
+            elif isinstance(name_widget, QLineEdit):
+                name_widget.textChanged.connect(sync_description_enabled)
         if isinstance(name_widget, _CatalogComboBox) and isinstance(description_widget, QLineEdit):
             name_widget.currentIndexChanged.connect(
                 lambda _index, source=name_widget, target=description_widget:
@@ -2483,6 +2507,7 @@ class NewGameWizard(QWizard):
         layout.addWidget(self.rank_baseline_label)
         layout.addWidget(self.rank_baseline_combo)
         self.attribute_inputs = {}
+        self._last_valid_attributes = {attribute: 8 for attribute in ATTRIBUTES}
         attribute_grid = QGridLayout()
         attribute_grid.setHorizontalSpacing(18)
         attribute_grid.setVerticalSpacing(8)
@@ -2491,9 +2516,15 @@ class NewGameWizard(QWizard):
             control = _NoWheelSpinBox()
             control.setRange(8, 18)
             control.setValue(8)
-            control.valueChanged.connect(self._refresh_point_buy)
+            control.setObjectName("attributePointBuySpinBox")
+            control.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            control.valueChanged.connect(
+                lambda value, name=attribute: self._handle_attribute_point_buy_change(
+                    name, value
+                )
+            )
             self.attribute_inputs[attribute] = control
-            control.setFixedWidth(68)
+            control.setFixedWidth(80)
             control.setToolTip(f"{attribute} score (8–18)")
 
             row_widget = QWidget()
@@ -2675,6 +2706,26 @@ class NewGameWizard(QWizard):
             control.blockSignals(True)
             control.setValue(attributes[a])
             control.blockSignals(False)
+        self._last_valid_attributes = dict(attributes)
+        self._refresh_point_buy()
+
+    def _handle_attribute_point_buy_change(
+        self, attribute: str, _value: int
+    ) -> None:
+        """Rejects attribute increases that would overspend the point budget."""
+        attributes = {name: widget.value() for name, widget in self.attribute_inputs.items()}
+        budget, _level = rank_stats(
+            str(self.skill_preset_combo.currentData()),
+            str(self.rank_baseline_combo.currentData()),
+        )
+        if point_buy_cost(attributes) > budget:
+            control = self.attribute_inputs[attribute]
+            control.blockSignals(True)
+            control.setValue(self._last_valid_attributes.get(attribute, 8))
+            control.blockSignals(False)
+            attributes[attribute] = control.value()
+        else:
+            self._last_valid_attributes = dict(attributes)
         self._refresh_point_buy()
 
     def _refresh_point_buy(self, _value=None) -> None:
@@ -2693,7 +2744,11 @@ class NewGameWizard(QWizard):
             refund = current_cost - POINT_COSTS[value - 1] if value > 8 else 0
             increase_cost = POINT_COSTS[value + 1] - current_cost if value < 18 else 0
             refund_preview.setText(f"−1: {remaining + refund} left" if value > 8 else "−1: —")
-            increase_preview.setText(f"+1: {remaining - increase_cost} left" if value < 18 else "+1: —")
+            increase_preview.setText(
+                f"+1: {remaining - increase_cost} left"
+                if value < 18 and increase_cost <= remaining
+                else "+1: —"
+            )
         self.point_buy_summary.setText(f"Budget {budget} · Remaining {remaining} · Starting Player Level {level}\n"
             + " | ".join(f"{a} {attribute_modifier(v):+d}" for a, v in attributes.items())
             + f"\nHealth {2 * attributes['Constitution']} · Base capacity {5 * attributes['Strength']} lb")

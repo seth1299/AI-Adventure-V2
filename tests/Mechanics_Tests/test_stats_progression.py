@@ -301,9 +301,17 @@ class StatsProgressionTests(unittest.TestCase):
 
     def test_skill_use_roll_and_training_rollback_together(self):
         self.repo.upsert_skill("Stealth", "Move unseen", 1)
-        with patch.object(self.repo, "add_skill_xp", side_effect=RuntimeError("Training write failed")):
-            with self.assertRaisesRegex(RuntimeError, "Training write failed"):
-                self.event({"skill_name": "Stealth"}, 15)
+        with self.assertLogs("ai_adventure.events.event_applier", level="ERROR") as logs:
+            with patch.object(
+                self.repo,
+                "add_skill_xp",
+                side_effect=RuntimeError("Training write failed"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "Training write failed"):
+                    self.event({"skill_name": "Stealth"}, 15)
+        self.assertEqual(len(logs.records), 1)
+        self.assertIn("Failed to apply event D20TestRequestedEvent", logs.output[0])
+        self.assertIsInstance(logs.records[0].exc_info[1], RuntimeError)
         self.assertEqual(self.repo.list_d20_tests(), [])
         self.assertEqual(self.repo.get_skill("Stealth")["xp"], 0)
 
@@ -320,7 +328,7 @@ class StatsProgressionTests(unittest.TestCase):
         schema = build_story_response_schema(packet)
         events = {b["properties"]["type"]["enum"][0] for b in schema["properties"]["events"]["items"]["anyOf"]}
         self.assertTrue({"SkillUpsertedEvent", "SkillXpAddedEvent"} <= events)
-        defaults = json.loads((Path(__file__).parents[1]/"ai_adventure/data/context/default_rules.json").read_text(encoding="utf-8"))
+        defaults = json.loads((Path(__file__).resolve().parents[2]/"ai_adventure/data/context/default_rules.json").read_text(encoding="utf-8"))
         xp = next(s["content"] for s in defaults["sections"] if s["content"].get("event_type") == "SkillXpAddedEvent")
         self.assertIn(SKILL_TRAINING_RULE, xp["rules"])
         self.assertIn(SKILL_TRAINING_SOURCE_RULE, xp["rules"])

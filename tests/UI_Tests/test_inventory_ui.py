@@ -767,9 +767,16 @@ class InventoryUiTests(unittest.TestCase):
             dialog_type.return_value.exec.return_value = 0
             wizard.calendar_settings_button.click()
 
+        expected_name_catalogs = {
+            "days": wizard.choice_catalogs.get("calendar_days", []),
+            "months": wizard.choice_catalogs.get("calendar_months", []),
+            "seasons": wizard.choice_catalogs.get("calendar_seasons", []),
+            "weather": wizard.choice_catalogs.get("calendar_weather", []),
+        }
         dialog_type.assert_called_once_with(
             wizard._custom_calendar_settings,
             wizard,
+            name_catalogs=expected_name_catalogs,
         )
         wizard.close()
 
@@ -1115,9 +1122,10 @@ class InventoryUiTests(unittest.TestCase):
         self.assertEqual(location_combo.currentText(), "Old Road")
 
         old_road_name = wizard.starting_locations_table.cellWidget(0, 0)
-        self.assertIsInstance(old_road_name, QLineEdit)
-        assert isinstance(old_road_name, QLineEdit)
-        old_road_name.setText("North Road")
+        self.assertIsInstance(old_road_name, QComboBox)
+        assert isinstance(old_road_name, QComboBox)
+        self.assertTrue(old_road_name.isEditable())
+        old_road_name.setEditText("North Road")
         self.app.processEvents()
 
         self.assertEqual(location_combo.currentText(), "North Road")

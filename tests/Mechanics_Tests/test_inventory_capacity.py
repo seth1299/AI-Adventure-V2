@@ -210,7 +210,7 @@ class InventoryCapacityTests(unittest.TestCase):
             elif isinstance(value, list):
                 for child in value: definitions(child)
         definitions(schema)
-        rules = Path(__file__).resolve().parents[1] / 'ai_adventure/data/context/default_rules.json'
+        rules = Path(__file__).resolve().parents[2] / 'ai_adventure/data/context/default_rules.json'
         self.assertIn(CONTAINER_FLOW_RULE, json.dumps(json.loads(rules.read_text(encoding='utf-8'))))
 
     def test_gui_summary_details_and_authored_weights_roundtrip(self):

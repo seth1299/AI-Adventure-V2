@@ -74,9 +74,17 @@ class RepositoryTransactionTests(unittest.TestCase):
 
         before_settings = repository.get_setting("tts.pronunciation_map")
         before_inventory = repository.list_inventory_items()
-        with patch.object(repository, "add_inventory_item", side_effect=failing_add):
-            with self.assertRaisesRegex(RuntimeError, "injected failure"):
-                StoryTurnService.commit_response(repository, self.response(events), message_id="atomic")
+        with self.assertLogs("ai_adventure.events.event_applier", level="ERROR") as logs:
+            with patch.object(repository, "add_inventory_item", side_effect=failing_add):
+                with self.assertRaisesRegex(RuntimeError, "injected failure"):
+                    StoryTurnService.commit_response(
+                        repository,
+                        self.response(events),
+                        message_id="atomic",
+                    )
+        self.assertEqual(len(logs.records), 1)
+        self.assertIn("Failed to apply event InventoryItemAddedEvent", logs.output[0])
+        self.assertIsInstance(logs.records[0].exc_info[1], sqlite3.OperationalError)
         self.assertEqual(repository.list_inventory_items(), before_inventory)
         self.assertEqual(repository.list_history(), self.initial_history)
         self.assertEqual(repository.list_mechanical_events(), [])

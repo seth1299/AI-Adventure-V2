@@ -52,7 +52,7 @@ class SkillPresentationTests(unittest.TestCase):
         self.assertIn(SKILL_DESCRIPTION_RULE, APPLICATION_SYSTEM_INSTRUCTION)
         self.assertIn(MAX_SKILL_XP_RULE, APPLICATION_SYSTEM_INSTRUCTION)
         self.assertIn(SKILL_DESCRIPTION_RULE, json.dumps(build_new_game_setup_packet({})))
-        data = Path(__file__).resolve().parents[1] / "ai_adventure/data/context"
+        data = Path(__file__).resolve().parents[2] / "ai_adventure/data/context"
         for filename in ("default_context.json", "default_rules.json"):
             content = json.loads((data / filename).read_text(encoding="utf-8"))
             self.assertIn(SKILL_DESCRIPTION_RULE, json.dumps(content))

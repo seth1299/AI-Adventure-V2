@@ -3170,7 +3170,7 @@ class GeminiServiceTests(unittest.TestCase):
 
     def test_default_rule_event_contracts_are_schema_supported(self) -> None:
         rules_path = (
-            Path(__file__).resolve().parents[1]
+            Path(__file__).resolve().parents[2]
             / "ai_adventure"
             / "data"
             / "context"

@@ -231,12 +231,12 @@ class SoundManager:
         self._sound_effect_track_cache = {
             key: path
             for key, path in self._sound_effect_track_cache.items()
-            if key in effect_keys
+            if key.casefold() in effect_keys
         }
         self._background_ambience_track_cache = {
             key: path
             for key, path in self._background_ambience_track_cache.items()
-            if key in ambience_keys
+            if key.casefold() in ambience_keys
         }
 
     @staticmethod
@@ -342,6 +342,14 @@ class SoundManager:
 
         if self._initialized and self._pygame is not None:
             self._pygame.mixer.music.set_volume(self.music_volume)
+
+    def is_music_playing(self) -> bool:
+        """Returns whether the music stream is currently active."""
+        return bool(
+            self._initialized
+            and self._pygame is not None
+            and self._pygame.mixer.music.get_busy()
+        )
 
     def play_music(self, track_name_or_path: str | Path | None) -> None:
         """Plays background music, replacing the currently playing track."""
