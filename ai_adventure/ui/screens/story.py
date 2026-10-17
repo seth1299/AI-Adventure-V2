@@ -1264,7 +1264,9 @@ class StoryScreen(RepositoryBackedWidget):
         """Starts one background pre-narration skill-check planning request."""
 
         thread = QThread(self)
-        worker = _GeminiD20TestPlanWorker(context_packet, self.api_key_path)
+        worker = _GeminiD20TestPlanWorker(
+            context_packet, self.api_key_path, message_id=self._pending_message_id
+        )
         worker.moveToThread(thread)
 
         thread.started.connect(worker.run)
@@ -1354,7 +1356,9 @@ class StoryScreen(RepositoryBackedWidget):
         """Starts one background Gemini story request."""
 
         thread = QThread(self)
-        worker = _GeminiStoryWorker(context_packet, self.api_key_path)
+        worker = _GeminiStoryWorker(
+            context_packet, self.api_key_path, message_id=self._pending_message_id
+        )
         worker.moveToThread(thread)
 
         thread.started.connect(worker.run)

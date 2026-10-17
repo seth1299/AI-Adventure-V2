@@ -7,6 +7,7 @@ import logging
 from pathlib import Path
 import re
 import sqlite3
+import time
 from typing import Any, Protocol
 
 from PIL import Image
@@ -29,6 +30,7 @@ from ai_adventure.ai.image_styles import (
     normalize_image_style,
 )
 from ai_adventure.ai.model_catalog import DEFAULT_IMAGE_MODEL, normalize_image_model
+from ai_adventure.ai.request_metrics import measured_operation, record_attempt
 from ai_adventure.context.creative_guardrails import (
     default_banned_creative_terms,
     find_banned_creative_terms,
@@ -253,6 +255,7 @@ class GeminiVisualAssetService:
         self.api_key_path = api_key_path.expanduser().resolve()
         self.model = normalize_image_model(model)
 
+    @measured_operation
     def generate(self, request: VisualAssetRequest) -> tuple[bytes, str]:
         """Generates exactly one image and returns its bytes and MIME type."""
 
@@ -269,17 +272,25 @@ class GeminiVisualAssetService:
             ) from error
 
         client = genai.Client(api_key=api_key)
-        response = client.models.generate_content(
-            model=self.model,
-            contents=request.prompt,
-            config=types.GenerateContentConfig(
-                response_modalities=["IMAGE"],
-                image_config=types.ImageConfig(
-                    aspect_ratio=request.aspect_ratio,
-                    image_size=request.image_size,
+        started = time.perf_counter()
+        try:
+            response = client.models.generate_content(
+                model=self.model,
+                contents=request.prompt,
+                config=types.GenerateContentConfig(
+                    response_modalities=["IMAGE"],
+                    image_config=types.ImageConfig(
+                        aspect_ratio=request.aspect_ratio,
+                        image_size=request.image_size,
+                    ),
                 ),
-            ),
-        )
+            )
+        except Exception:
+            record_attempt(
+                label="image generation", model=self.model, attempt=1,
+                started=started, response=None,
+            )
+            raise
         for part in getattr(response, "parts", []) or []:
             inline_data = getattr(part, "inline_data", None)
             data = getattr(inline_data, "data", None)
@@ -289,9 +300,21 @@ class GeminiVisualAssetService:
                 import base64
 
                 data = base64.b64decode(data)
+            record_attempt(
+                label="image generation", model=self.model, attempt=1,
+                started=started, response=response,
+                details={"generated_image_count": 1, "image_size": request.image_size,
+                         "cost_complete": True},
+            )
             return bytes(data), str(
                 getattr(inline_data, "mime_type", "image/png") or "image/png"
             )
+        record_attempt(
+            label="image generation", model=self.model, attempt=1,
+            started=started, response=response,
+            details={"generated_image_count": 0, "image_size": request.image_size,
+                     "cost_complete": False},
+        )
         raise RuntimeError("Gemini returned no image data.")
 
 

@@ -13,6 +13,7 @@ from typing import Any
 from PySide6.QtCore import QObject, Signal, Slot
 
 from ai_adventure.ai.model_catalog import normalize_text_model
+from ai_adventure.ai.request_metrics import benchmark_message
 from ai_adventure.application.story_turn_service import StoryTurnService
 from ai_adventure.app.features import is_ai_enabled
 from ai_adventure.infrastructure.images import GeminiVisualAssetService, VisualAssetRequest
@@ -49,20 +50,23 @@ class GeminiStoryWorker(QObject):
     failed = Signal()
     finished = Signal()
 
-    def __init__(self, context_packet: dict[str, Any], api_key_path: Path | None = None) -> None:
+    def __init__(self, context_packet: dict[str, Any], api_key_path: Path | None = None,
+                 message_id: str | None = None) -> None:
         super().__init__()
         self._context_packet = context_packet
         self._api_key_path = api_key_path
+        self._message_id = message_id
 
     @Slot()
     def run(self) -> None:
         try:
             if GeminiNarrationService is None:
                 raise GeminiConfigurationError("AI generation is disabled in this build.")
-            result = StoryTurnService(
-                api_key_path=self._api_key_path,
-                model=_text_model_from_ai_packet(self._context_packet),
-            ).generate_response(self._context_packet)
+            with benchmark_message(self._message_id):
+                result = StoryTurnService(
+                    api_key_path=self._api_key_path,
+                    model=_text_model_from_ai_packet(self._context_packet),
+                ).generate_response(self._context_packet)
         except GeminiConfigurationError as error:
             LOGGER.warning("Gemini narration skipped: %s", error)
             self.configuration_error.emit(str(error))
@@ -86,20 +90,23 @@ class GeminiD20TestPlanWorker(QObject):
     failed = Signal()
     finished = Signal()
 
-    def __init__(self, context_packet: dict[str, Any], api_key_path: Path | None = None) -> None:
+    def __init__(self, context_packet: dict[str, Any], api_key_path: Path | None = None,
+                 message_id: str | None = None) -> None:
         super().__init__()
         self._context_packet = context_packet
         self._api_key_path = api_key_path
+        self._message_id = message_id
 
     @Slot()
     def run(self) -> None:
         try:
             if GeminiNarrationService is None:
                 raise GeminiConfigurationError("AI generation is disabled in this build.")
-            result = StoryTurnService(
-                api_key_path=self._api_key_path,
-                model=_text_model_from_ai_packet(self._context_packet),
-            ).plan_d20_tests(self._context_packet)
+            with benchmark_message(self._message_id):
+                result = StoryTurnService(
+                    api_key_path=self._api_key_path,
+                    model=_text_model_from_ai_packet(self._context_packet),
+                ).plan_d20_tests(self._context_packet)
         except GeminiConfigurationError as error:
             LOGGER.warning("Gemini skill-check planning skipped: %s", error)
             self.configuration_error.emit(str(error))
@@ -179,10 +186,11 @@ class GeminiVisualAssetWorker(QObject):
     @Slot()
     def run(self) -> None:
         try:
-            image_bytes, mime_type = GeminiVisualAssetService(
-                api_key_path=self._api_key_path,
-                model=self._model,
-            ).generate(self._request)
+            with benchmark_message(None, message_type="Image Generation"):
+                image_bytes, mime_type = GeminiVisualAssetService(
+                    api_key_path=self._api_key_path,
+                    model=self._model,
+                ).generate(self._request)
         except Exception as error:
             LOGGER.warning(
                 "Gemini visual asset generation failed for %s %r: %s",

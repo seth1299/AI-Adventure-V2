@@ -27,6 +27,12 @@ class AppPaths:
     local_app_data_dir: Path | None = None
 
     @property
+    def benchmark_log_file(self) -> Path:
+        """Append-only JSON Lines log containing Gemini benchmark metrics."""
+
+        return self.logs_dir / "gemini_benchmark.jsonl"
+
+    @property
     def repo_root(self) -> Path:
         """Returns the local project root when running from source."""
 
