@@ -4,13 +4,29 @@ from __future__ import annotations
 import json
 import uuid
 from datetime import datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any, ContextManager
+
+if TYPE_CHECKING:
+    import sqlite3
 
 from ai_adventure.stats import (ATTRIBUTES, MAX_PLAYER_LEVEL, PLAYER_XP_AWARDS,
                                 attribute_modifier, carrying_capacity, health_max, normalize_attributes)
 
 
 class PlayerStatsRepository:
+    if TYPE_CHECKING:
+        # SaveRepository supplies these persistence operations at runtime; declaring
+        # the mixin contract here lets type checkers resolve its inherited methods.
+        def _connect(self) -> ContextManager[sqlite3.Connection]: ...
+        def transaction(self) -> ContextManager[sqlite3.Connection]: ...
+        def set_setting(self, key: str, value: Any) -> None: ...
+        def get_setting(self, key: str, default: Any = None) -> Any: ...
+        def list_active_tasks(self, *, include_completed: bool = False) -> list[dict[str, Any]]: ...
+        def get_state_value(self, key: str, default: str = "") -> str: ...
+        def set_state_value(self, key: str, value: str) -> None: ...
+        def get_skill(self, name: str) -> dict[str, Any] | None: ...
+        def upsert_skill(self, name: str, description: str, level: int) -> None: ...
+
     def event_receipt(self, message_id: str, event_key: str) -> dict[str, Any] | None:
         with self._connect() as connection:
             row = connection.execute("SELECT result_json FROM event_receipts WHERE message_id = ? AND event_key = ?", (message_id, event_key)).fetchone()

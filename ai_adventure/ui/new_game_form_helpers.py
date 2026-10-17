@@ -207,6 +207,13 @@ def _starting_locations_from_table(table: QTableWidget) -> list[dict[str, Any]]:
             else ""
         )
 
+        scope_widget = table.cellWidget(row, 6)
+        location_scope = (
+            str(scope_widget.currentData())
+            if isinstance(scope_widget, QComboBox)
+            and (is_playtesting_build() or scope_widget.property("authored_scope"))
+            else None
+        )
         locations.append(
             {
                 "name": name,
@@ -214,10 +221,7 @@ def _starting_locations_from_table(table: QTableWidget) -> list[dict[str, Any]]:
                 "location_mode": location_mode,
                 "is_sublocation": is_sublocation,
                 "parent_location": parent_location if is_sublocation else "",
-                **({"location_scope": str(table.cellWidget(row, 6).currentData())}
-                   if isinstance(table.cellWidget(row, 6), QComboBox) and (
-                       is_playtesting_build() or table.cellWidget(row, 6).property("authored_scope")
-                   ) else {}),
+                **({"location_scope": location_scope} if location_scope is not None else {}),
                 "requires_ai_invention": (
                     location_mode == "suggestion" or not name or not description
                 ),
@@ -352,8 +356,9 @@ def _sync_starting_location_parent_dropdowns(
             _set_combo_to_data(parent_widget, str(parent_selected))
 
         parent_widget.blockSignals(False)
-        if isinstance(sublocation_widget, QCheckBox) and table.item(row, 4) is not None:
-            _sync_sublocation_cell_style(sublocation_widget, table.item(row, 4))
+        sublocation_item = table.item(row, 4)
+        if isinstance(sublocation_widget, QCheckBox) and sublocation_item is not None:
+            _sync_sublocation_cell_style(sublocation_widget, sublocation_item)
         parent_widget.setProperty("sublocation_active", is_sublocation)
         parent_widget.setVisible(is_sublocation)
 
@@ -406,7 +411,9 @@ def _append_starting_npc_table_row(
     )
     if change_callback is not None:
         if isinstance(name_input, _CatalogComboBox):
-            name_input.lineEdit().textChanged.connect(change_callback)
+            line_edit = name_input.lineEdit()
+            if line_edit is not None:
+                line_edit.textChanged.connect(change_callback)
         else:
             name_input.textChanged.connect(change_callback)
         location_input.currentIndexChanged.connect(change_callback)
@@ -782,9 +789,11 @@ def _edit_starter_weight(table: QTableWidget, button: QPushButton) -> None:
 
 
 def _starter_mobility_values(table: QTableWidget, row: int, first_column: int) -> dict[str, bool]:
-    return {field: table.cellWidget(row, first_column + offset).isChecked()
-            if isinstance(table.cellWidget(row, first_column + offset), QCheckBox) else True
-            for offset, field in enumerate(("moveable", "storable"))}
+    values: dict[str, bool] = {}
+    for offset, field in enumerate(("moveable", "storable")):
+        control = table.cellWidget(row, first_column + offset)
+        values[field] = control.isChecked() if isinstance(control, QCheckBox) else True
+    return values
 
 
 def _append_currency_table_row(

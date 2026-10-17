@@ -1649,7 +1649,7 @@ class MainWindow(QMainWindow):
                 voice=normalize_narrator_voice_spec(voice),
                 volume=volume,
                 speed=speed,
-                **({"text": text} if text is not None else {}),
+                text=text,
             )
         )
 

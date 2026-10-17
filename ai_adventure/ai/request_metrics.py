@@ -20,7 +20,9 @@ TOKEN_FIELDS = (
     "prompt_token_count", "candidates_token_count", "total_token_count",
     "thoughts_token_count", "cached_content_token_count", "tool_use_prompt_token_count",
 )
-CURRENT_BENCHMARK_MESSAGE_ID = ContextVar("gemini_benchmark_message_id", default=None)
+CURRENT_BENCHMARK_MESSAGE_ID: ContextVar[str | None] = ContextVar(
+    "gemini_benchmark_message_id", default=None
+)
 _BENCHMARK_LOG_LOCK = threading.Lock()
 
 # Standard paid Gemini API text rates, USD per million tokens, last reviewed
@@ -54,8 +56,12 @@ class RequestMetrics:
     attempts: list[dict] = field(default_factory=list)
 
 
-CURRENT_METRICS = ContextVar("gemini_request_metrics", default=None)
-CURRENT_BENCHMARK_MESSAGE_TYPE = ContextVar("gemini_benchmark_message_type", default=None)
+CURRENT_METRICS: ContextVar[RequestMetrics | None] = ContextVar(
+    "gemini_request_metrics", default=None
+)
+CURRENT_BENCHMARK_MESSAGE_TYPE: ContextVar[str | None] = ContextVar(
+    "gemini_benchmark_message_type", default=None
+)
 
 
 def message_type_for_operation(operation: str) -> str:
@@ -169,6 +175,8 @@ def benchmark_message(message_id, message_type=None):
 
 def _attempt_cost(attempt: dict, *, timestamp: str) -> tuple[float | None, dict | None]:
     model = attempt.get("model")
+    if not isinstance(model, str):
+        return None, None
     image_rates = _GEMINI_IMAGE_RATES.get(model)
     if image_rates is not None and isinstance(attempt.get("generated_image_count"), int):
         prompt = attempt.get("prompt_token_count")

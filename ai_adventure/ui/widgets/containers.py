@@ -11,7 +11,9 @@ class CurrentPageStackedWidget(QStackedWidget):
         super().__init__(parent)
         # The default stacked layout otherwise imposes the largest hidden page's
         # minimum size, even when our public size hints describe the visible one.
-        self.layout().setSizeConstraint(QLayout.SizeConstraint.SetNoConstraint)
+        layout = self.layout()
+        if layout is not None:
+            layout.setSizeConstraint(QLayout.SizeConstraint.SetNoConstraint)
         self.currentChanged.connect(lambda _index: self.updateGeometry())
 
     def _current_size_hint(self, *, minimum: bool) -> QSize:

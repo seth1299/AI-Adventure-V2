@@ -185,7 +185,7 @@ class StoryTurnService:
     def generate_response(self, context_packet: dict[str, Any]) -> Any:
         service = GeminiNarrationService(
             api_key_path=self.api_key_path,
-            **({"model": self.model} if self.model else {}),
+            model=self.model,
         )
         return service.generate_story_response(context_packet)
 
@@ -194,7 +194,7 @@ class StoryTurnService:
 
         service = GeminiNarrationService(
             api_key_path=self.api_key_path,
-            **({"model": self.model} if self.model else {}),
+            model=self.model,
         )
         return service.plan_story_d20_tests(context_packet)
 

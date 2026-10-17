@@ -34,13 +34,20 @@ class ContainerFlowError(ValueError):
     """An inconsistent container turn must be repaired rather than committed."""
 
 
-def selected_contents(contents: dict[str, Any], payload: dict[str, Any], item_records: list[dict[str, Any]] | None = None) -> tuple[int, list[dict], dict]:
+def selected_contents(
+    contents: dict[str, Any],
+    payload: dict[str, Any],
+    item_records: list[dict[str, Any]] | None = None,
+) -> tuple[int, list[dict[str, Any]], dict[str, Any]]:
     """Select whole stored item records, returning an immutable remainder."""
     items = contents.get("items", [])
     records = {str(item.get("id", item.get("database_id", ""))): item for item in item_records or []}
-    resolved = [records.get(item) if isinstance(item, str) else item for item in items]
-    if any(not isinstance(item, dict) for item in resolved):
-        raise ContainerFlowError("Container contents reference a missing catalog item.")
+    resolved: list[dict[str, Any]] = []
+    for item in items:
+        record = records.get(item) if isinstance(item, str) else item
+        if not isinstance(record, dict):
+            raise ContainerFlowError("Container contents reference a missing catalog item.")
+        resolved.append(record)
     requested_ids = payload.get("item_ids")
     if requested_ids is not None:
         if "item_names" in payload or not isinstance(requested_ids, list) or any(not isinstance(value, str) or not value for value in requested_ids):
@@ -52,9 +59,16 @@ def selected_contents(contents: dict[str, Any], payload: dict[str, Any], item_re
         if not isinstance(requested, list) or any(not isinstance(name, str) or not name.strip() for name in requested):
             raise ContainerFlowError("item_names must be a list of nonblank stored item names.")
         wanted = {name.strip().casefold() for name in requested}
-        available = [{str(item.get("name", "")).strip().casefold(),
-                      str(item.get("metadata", {}).get("manifest_name", "")).strip().casefold()} - {""}
-                     for item in resolved]
+        available = []
+        for item in resolved:
+            metadata = item.get("metadata")
+            metadata = metadata if isinstance(metadata, dict) else {}
+            available.append(
+                {
+                    str(item.get("name", "")).strip().casefold(),
+                    str(metadata.get("manifest_name", "")).strip().casefold(),
+                } - {""}
+            )
         if any(not any(name in names for names in available) for name in wanted):
             raise ContainerFlowError("Requested item_names are not in the stored container contents.")
         if any(sum(name in names for names in available) != 1 for name in wanted):
@@ -65,9 +79,22 @@ def selected_contents(contents: dict[str, Any], payload: dict[str, Any], item_re
     if not isinstance(take_currency, bool):
         raise ContainerFlowError("take_currency must be a boolean.")
     currency = int(contents.get("currency_base_units", 0)) if take_currency else 0
-    mask = [str(item.get("id", item.get("database_id", ""))) in requested_ids if requested_ids is not None else
-            bool(wanted & {str(item.get("name", "")).strip().casefold(), str(item.get("metadata", {}).get("manifest_name", "")).strip().casefold()})
-            for item in resolved]
+    mask = []
+    for item in resolved:
+        if requested_ids is not None:
+            mask.append(str(item.get("id", item.get("database_id", ""))) in requested_ids)
+            continue
+        metadata = item.get("metadata")
+        metadata = metadata if isinstance(metadata, dict) else {}
+        mask.append(
+            bool(
+                wanted
+                & {
+                    str(item.get("name", "")).strip().casefold(),
+                    str(metadata.get("manifest_name", "")).strip().casefold(),
+                }
+            )
+        )
     taken = [deepcopy(item) for item, selected in zip(resolved, mask) if selected]
     remaining = {
         "currency_base_units": 0 if take_currency else int(contents.get("currency_base_units", 0)),

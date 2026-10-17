@@ -6124,7 +6124,7 @@ def _prefer_clearly_relevant_known_skill(
 
     corrected_checks: list[dict[str, Any]] = []
     corrected_names: list[str] = []
-    seen_names: set[str] = set()
+    seen_names: set[tuple[str, str, str, str]] = set()
     for check in result.checks:
         check_name = str(check.get("skill_name", "") or "").strip()
         folded_name = check_name.casefold()

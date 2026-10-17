@@ -1124,7 +1124,14 @@ class EventApplier:
 
     def _apply_player_health(self, event_type: str, payload: dict[str, Any]) -> AppliedEventResult:
         try:
-            result = self.repository.change_player_health(payload.get("delta"), _first_text(payload, "reason"), _first_text(payload, "source_id"))
+            delta = payload.get("delta")
+            if type(delta) is not int:
+                raise ValueError("Health delta must be an integer with a reason.")
+            result = self.repository.change_player_health(
+                delta,
+                _first_text(payload, "reason"),
+                _first_text(payload, "source_id"),
+            )
             return AppliedEventResult(event_type, "applied" if result["status"] == "applied" else "skipped", "Player health updated.", {**payload, **result})
         except ValueError as exc:
             return _invalid(event_type, payload, str(exc))

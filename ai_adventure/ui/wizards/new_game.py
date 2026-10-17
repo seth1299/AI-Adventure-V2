@@ -6,6 +6,7 @@ from ai_adventure.stats import ATTRIBUTES, POINT_COSTS, RULES_VERSION, rank_stat
 
 from ai_adventure.ui.widgets.inputs import FeatureToggleCheckBox
 from ai_adventure.audio.tts_settings import DEFAULT_TTS_VOLUME_PERCENT
+from ai_adventure.ui.themes_audio import SoundManagerProtocol
 
 from ai_adventure.ui.common import *  # noqa: F401,F403
 from ai_adventure.ui.dialogues import *  # noqa: F401,F403
@@ -1716,9 +1717,11 @@ class NewGameWizard(QWizard):
         parent_widget = self.starting_locations_table.cellWidget(row, 4)
 
         if isinstance(name_widget, _CatalogComboBox):
-            name_widget.lineEdit().textChanged.connect(
-                lambda _text: self._refresh_starting_location_dropdowns()
-            )
+            name_editor = name_widget.lineEdit()
+            if name_editor is not None:
+                name_editor.textChanged.connect(
+                    lambda _text: self._refresh_starting_location_dropdowns()
+                )
         elif isinstance(name_widget, QLineEdit):
             name_widget.textChanged.connect(
                 lambda _text: self._refresh_starting_location_dropdowns()
@@ -1739,7 +1742,8 @@ class NewGameWizard(QWizard):
                 if isinstance(name_widget, _CatalogComboBox):
                     # text() deliberately returns an empty value for the Custom
                     # menu entry; the editor text is still the user's location name.
-                    return bool(name_widget.lineEdit().text().strip())
+                    name_editor = name_widget.lineEdit()
+                    return bool(name_editor is not None and name_editor.text().strip())
                 if isinstance(name_widget, QLineEdit):
                     return bool(name_widget.text().strip())
                 return False
@@ -1752,7 +1756,9 @@ class NewGameWizard(QWizard):
                 description_widget.setEnabled(location_name_is_present())
 
             if isinstance(name_widget, _CatalogComboBox):
-                name_widget.lineEdit().textChanged.connect(sync_description_enabled)
+                name_editor = name_widget.lineEdit()
+                if name_editor is not None:
+                    name_editor.textChanged.connect(sync_description_enabled)
                 name_widget.currentIndexChanged.connect(sync_description_enabled)
             elif isinstance(name_widget, QLineEdit):
                 name_widget.textChanged.connect(sync_description_enabled)
@@ -3935,7 +3941,11 @@ class NewGameWizard(QWizard):
         )
         if not file_path:
             return
-        success, result = importer(Path(file_path), category)
+        import_result = importer(Path(file_path), category)
+        if not isinstance(import_result, tuple) or len(import_result) != 2:
+            QMessageBox.warning(self, "Audio Import Failed", "The audio importer returned an invalid result.")
+            return
+        success, result = import_result
         if success:
             self.audio_upload_status_label.setText(f"Available in this game: {result}")
         else:
@@ -3987,12 +3997,17 @@ class NewGameWizard(QWizard):
             self._stop_audio_previews()
 
     def _check_music_preview_finished(self) -> None:
-        is_playing = getattr(self.sound_manager, "is_music_playing", None)
+        sound_manager = self.sound_manager
+        if sound_manager is None:
+            self._music_preview_timer.stop()
+            self._music_preview_active = False
+            return
+        is_playing = getattr(sound_manager, "is_music_playing", None)
         if not callable(is_playing) or is_playing():
             return
         self._music_preview_timer.stop()
         self._music_preview_active = False
-        self.sound_manager.play_music("Main_Menu.mp3")
+        sound_manager.play_music("Main_Menu.mp3")
 
     def _stop_audio_previews(self) -> None:
         if self.sound_manager is not None:

@@ -69,14 +69,18 @@ class _CatalogComboBox(_NoWheelComboBox):
         self.addItem(custom_label, self.CUSTOM_DATA)
         self.setEditable(True)
         self.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
-        self.lineEdit().setPlaceholderText(placeholder)
+        line_edit = self.lineEdit()
+        if line_edit is not None:
+            line_edit.setPlaceholderText(placeholder)
         self.activated.connect(self._handle_activation)
         self.setText(value)
 
     def _handle_activation(self, index: int) -> None:
         if self.itemData(index) == self.CUSTOM_DATA:
             self.setEditText("")
-            self.lineEdit().setFocus()
+            line_edit = self.lineEdit()
+            if line_edit is not None:
+                line_edit.setFocus()
 
     def text(self) -> str:
         if self.currentData() == self.CUSTOM_DATA:

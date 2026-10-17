@@ -207,7 +207,7 @@ class NarrationPlayer:
         voice: str | None = None,
         volume: float | int | None = None,
         speed: float | int | None = None,
-        text: str = NARRATOR_SAMPLE_TEXT,
+        text: str | None = None,
         sound_effect_cues: list[dict[str, str]] | None = None,
         speaker_cues: list[dict[str, str]] | None = None,
         tts_text_transform: Callable[[str], str] | None = None,
@@ -215,6 +215,8 @@ class NarrationPlayer:
     ) -> bool:
         """Plays local narration without contacting the AI."""
 
+        if text is None:
+            text = NARRATOR_SAMPLE_TEXT
         previous_enabled = self.enabled
 
         sample_volume = self.volume

@@ -788,7 +788,10 @@ class TTSSettingsWidget(QWidget):
 
         field.setVisible(visible)
 
-        layout = field.parentWidget().layout()
+        parent = field.parentWidget()
+        if parent is None:
+            return
+        layout = parent.layout()
 
         if not isinstance(layout, QFormLayout):
             return
@@ -1728,11 +1731,15 @@ class MainMenuSettingsDialog(QDialog):
         if not file_path:
             return
         try:
-            success, result = importer(Path(file_path), category)
+            import_result = importer(Path(file_path), category)
         except Exception as error:
             LOGGER.exception("Main-menu audio upload failed: category=%s", category)
             QMessageBox.warning(self, "Audio Import Failed", str(error))
             return
+        if not isinstance(import_result, tuple) or len(import_result) != 2:
+            QMessageBox.warning(self, "Audio Import Failed", "The audio importer returned an invalid result.")
+            return
+        success, result = import_result
         if not success:
             QMessageBox.warning(self, "Audio Import Failed", str(result))
             return

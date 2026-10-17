@@ -2,28 +2,31 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, cast
 
 from PySide6.QtCore import QEvent, QObject, Qt
-from PySide6.QtGui import QTextCharFormat, QTextCursor, QTextOption
+from PySide6.QtGui import QKeyEvent, QTextCharFormat, QTextCursor, QTextOption
 from PySide6.QtWidgets import QApplication, QCheckBox, QComboBox, QFormLayout, QLineEdit, QPlainTextEdit, QSpinBox, QTextEdit, QWidget
 
 
 def configure_wrapped_text(editor: QTextEdit | QPlainTextEdit) -> None:
     """Bound multiline text to its viewport, including rich preformatted blocks."""
-    editor.setLineWrapMode(type(editor).LineWrapMode.WidgetWidth)
+    if isinstance(editor, QTextEdit):
+        editor.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
+    else:
+        editor.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
     editor.setWordWrapMode(QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere)
     editor.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
     if isinstance(editor, QTextEdit) and not editor.isReadOnly():
         editor.setAcceptRichText(False)
-    if getattr(editor, "_bounded_text_configured", False):
+    if editor.property("_bounded_text_configured"):
         return
-    editor._bounded_text_configured = True
+    editor.setProperty("_bounded_text_configured", True)
 
     def wrap_blocks() -> None:
-        if getattr(editor, "_normalizing_text_wrap", False):
+        if editor.property("_normalizing_text_wrap"):
             return
-        editor._normalizing_text_wrap = True
+        editor.setProperty("_normalizing_text_wrap", True)
         try:
             block = editor.document().begin()
             while block.isValid():
@@ -33,7 +36,7 @@ def configure_wrapped_text(editor: QTextEdit | QPlainTextEdit) -> None:
                     QTextCursor(block).setBlockFormat(block_format)
                 block = block.next()
         finally:
-            editor._normalizing_text_wrap = False
+            editor.setProperty("_normalizing_text_wrap", False)
 
     editor.document().contentsChanged.connect(wrap_blocks)
     wrap_blocks()
@@ -48,8 +51,13 @@ class _PlainTextPasteFilter(QObject):
         if (
             event.type() not in {QEvent.Type.ShortcutOverride, QEvent.Type.KeyPress}
             or not isinstance(watched, (QLineEdit, QTextEdit, QPlainTextEdit))
-            or event.key() != Qt.Key.Key_V
-            or event.modifiers() != (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.ShiftModifier)
+            or not isinstance(event, QKeyEvent)
+        ):
+            return False
+        if (
+            event.key() != Qt.Key.Key_V
+            or event.modifiers()
+            != (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.ShiftModifier)
         ):
             return False
         event.accept()
@@ -80,9 +88,8 @@ class _PlainTextPasteFilter(QObject):
 
 def install_plain_text_paste(app: QApplication) -> None:
     """Install once, including editors created later by tables and dialogs."""
-    if getattr(app, "_plain_text_paste_filter", None) is None:
-        app._plain_text_paste_filter = _PlainTextPasteFilter(app)
-        app.installEventFilter(app._plain_text_paste_filter)
+    if app.findChild(_PlainTextPasteFilter) is None:
+        app.installEventFilter(_PlainTextPasteFilter(app))
 
 
 class FeatureToggleCheckBox(QCheckBox):
@@ -112,7 +119,8 @@ class FeatureToggleCheckBox(QCheckBox):
         for control in controls:
             field = control
             while field is not None:
-                row, _role = form.getWidgetPosition(field)
+                position = cast(tuple[int, QFormLayout.ItemRole], form.getWidgetPosition(field))
+                row = position[0]
                 if row >= 0:
                     rows.add(row)
                     break
