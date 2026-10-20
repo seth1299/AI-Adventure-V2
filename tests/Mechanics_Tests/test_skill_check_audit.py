@@ -22,13 +22,17 @@ class D20TestAuditTests(unittest.TestCase):
         return {"packet_type": "story_turn", "player_command": command,
                 "selection": {"tags": ["skill"]}}
 
-    def generate(self, packet):
+    def generate(self, packet, repair_response=None):
         from google import genai
         response = {"response": "You observe the square.", "suggested_actions": ["Look around."],
                     "out_of_game": False, "events": [{"type": "D20TestRequestedEvent",
                     "payload": {"attribute": 'Wisdom', "test_kind": "check", "skill_name": "Perception", "dc": 13, "reason": "Look around."}}]}
         with patch.object(genai, "Client") as client:
             client.return_value.models.generate_content.return_value = SimpleNamespace(text=json.dumps(response))
+            if repair_response:
+                client.return_value.models.generate_content.side_effect = [
+                    SimpleNamespace(text=json.dumps(value)) for value in (response, repair_response)
+                ]
             return g.GeminiNarrationService(g.GeminiSettings(api_key="test-key")).generate_story_response(packet)
 
     def test_actual_lift_and_escape_preserves_planned_checks(self):
@@ -80,8 +84,12 @@ class D20TestAuditTests(unittest.TestCase):
         packet = self.packet("Observe the merchant.")
         packet["state"] = {"skills": {"resolved_checks_this_turn": [
             {"attribute": 'Wisdom', "test_kind": "check", "reason": "A consequential uncertain action", "skill_name": "Perception", "outcome": "success", "total": 15, "dc": 13}]}}
-        result = self.generate(packet)
+        result = self.generate(packet, repair_response={
+            "response": "You spot the merchant slipping a letter beneath the counter.",
+            "suggested_actions": ["Ask about the letter."], "events": [], "out_of_game": False,
+        })
         self.assertFalse(any(event["type"] == "D20TestRequestedEvent" for event in result.suggested_events))
+        self.assertIn("slipping a letter", result.narrative_text)
         StoryTurnService.commit_response(self.repository, result, message_id="duplicate-drop")
         event = next(event for event in self.repository.list_mechanical_events() if event["status"] == "dropped")
         self.assertIn("already resolved", event["message"])

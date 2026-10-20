@@ -10,6 +10,7 @@
     {
       "id": "failed_check_not_rerolled", "context": {"player_command": "Pick the locked door.", "selection": {"tags": ["skill"]}, "state": {"skills": {"known_skills": [{"name": "Lockpicking"}], "resolved_checks_this_turn": [{"skill_name": "Lockpicking", "success": false, "attribute": "Dexterity", "test_kind": "check"}]}}},
       "response": {"response": "The lock remains shut.", "suggested_actions": [], "events": [{"type": "D20TestRequestedEvent", "payload": {"skill_name": "Lockpicking", "difficulty": "hard", "attribute": "Dexterity", "test_kind": "check", "reason": "Pick the locked door."}}], "out_of_game": false},
+      "repair_response": {"response": "The pins refuse to turn; your attempt fails and the door remains locked.", "suggested_actions": ["Look for another entrance."], "events": [], "out_of_game": false},
       "forbidden_events": ["D20TestRequestedEvent"]
     },
     {

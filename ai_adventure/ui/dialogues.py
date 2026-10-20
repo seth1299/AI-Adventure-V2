@@ -2982,7 +2982,7 @@ class NewGameTemplateManagerDialog(QDialog):
             exact_items: list[dict[str, Any]] = []
             exact_weapons: list[dict[str, Any]] = []
             exact_armor: list[dict[str, Any]] = []
-            item_suggestions: list[str] = []
+            item_suggestions: list[dict[str, Any]] = []
             weapon_suggestions: list[str] = []
             armor_suggestions: list[str] = []
             for item in self._starter_items_for_editor(setup.get("starter_items", [])):
@@ -2994,7 +2994,7 @@ class NewGameTemplateManagerDialog(QDialog):
                     elif kind == "Armor":
                         armor_suggestions.append(suggestion)
                     else:
-                        item_suggestions.append(suggestion)
+                        item_suggestions.append(item)
                 elif kind == "Weapon":
                     exact_weapons.append(item)
                 elif kind == "Armor":
@@ -3976,7 +3976,7 @@ class NewGameTemplateManagerDialog(QDialog):
         self,
         table: QTableWidget,
         kind: str,
-        suggestions: list[str],
+        suggestions: list[str | dict[str, Any]],
     ) -> None:
         """Loads starter suggestions while reusing existing row editors."""
 
@@ -3988,7 +3988,16 @@ class NewGameTemplateManagerDialog(QDialog):
         for row, suggestion in enumerate(suggestions):
             editor = table.cellWidget(row, 0)
             if isinstance(editor, QLineEdit):
-                editor.setText(suggestion)
+                editor.setText(
+                    str(suggestion.get("item_request", ""))
+                    if isinstance(suggestion, dict)
+                    else suggestion
+                )
+            magic_checkbox = table.cellWidget(row, 1)
+            if isinstance(magic_checkbox, QCheckBox) and isinstance(suggestion, dict):
+                magic_checkbox.setChecked(
+                    bool(suggestion.get("magic_related", False))
+                )
 
     def _remove_starter_armor_row(self, button: QPushButton) -> None:
         """Removes the starter armor row containing button."""

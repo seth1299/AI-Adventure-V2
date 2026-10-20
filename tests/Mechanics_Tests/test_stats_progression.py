@@ -46,7 +46,7 @@ class StatsProgressionTests(unittest.TestCase):
                 setup = normalize_new_game_setup({"skill_preset": rank})
                 self.assertEqual(setup["point_buy_budget"], budget)
                 self.assertEqual(setup["starting_player_level"], level)
-                self.assertEqual(point_buy_cost(setup["character"]["attributes"]), budget)
+                self.assertLessEqual(point_buy_cost(setup["character"]["attributes"]), budget)
         self.assertEqual(list(POINT_COSTS.values()), [0, 1, 2, 3, 4, 5, 7, 9, 12, 15, 19])
         self.assertEqual(attribute_modifier(8), -1)
         self.assertEqual(attribute_modifier(20), 5)

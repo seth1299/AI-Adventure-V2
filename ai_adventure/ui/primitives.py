@@ -54,11 +54,14 @@ class _CatalogComboBox(_NoWheelComboBox):
         *,
         placeholder: str = "Select a saved value or choose Custom",
         custom_label: str = "[Custom…]",
+        require_custom_selection: bool = False,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
         self.empty_label = placeholder
+        self._require_custom_selection = bool(require_custom_selection)
         self.addItem(self.empty_label, "")
+        self.addItem(custom_label, self.CUSTOM_DATA)
         seen: set[str] = set()
         for choice in choices:
             label = str(choice or "").strip()
@@ -66,21 +69,30 @@ class _CatalogComboBox(_NoWheelComboBox):
             if label and key not in seen:
                 self.addItem(label, label)
                 seen.add(key)
-        self.addItem(custom_label, self.CUSTOM_DATA)
-        self.setEditable(True)
+        self.setEditable(not self._require_custom_selection)
         self.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
         line_edit = self.lineEdit()
         if line_edit is not None:
+            line_edit.setFont(self.font())
             line_edit.setPlaceholderText(placeholder)
         self.activated.connect(self._handle_activation)
         self.setText(value)
 
+    def _set_custom_editable(self) -> None:
+        self.setEditable(True)
+        line_edit = self.lineEdit()
+        if line_edit is not None:
+            line_edit.setFont(self.font())
+
     def _handle_activation(self, index: int) -> None:
         if self.itemData(index) == self.CUSTOM_DATA:
+            self._set_custom_editable()
             self.setEditText("")
             line_edit = self.lineEdit()
             if line_edit is not None:
                 line_edit.setFocus()
+        elif self._require_custom_selection:
+            self.setEditable(False)
 
     def text(self) -> str:
         if self.currentData() == self.CUSTOM_DATA:
@@ -92,25 +104,28 @@ class _CatalogComboBox(_NoWheelComboBox):
     def setText(self, value: str) -> None:
         wanted = str(value or "").strip()
         if not wanted:
+            self.setEditable(not self._require_custom_selection)
             self.setCurrentIndex(0)
             return
-        for index in range(1, self.count() - 1):
+        for index in range(2, self.count()):
             if str(self.itemData(index) or "").casefold() == wanted.casefold():
+                self.setEditable(not self._require_custom_selection)
                 self.setCurrentIndex(index)
                 return
+        self._set_custom_editable()
         self.setEditText(wanted)
 
     def addChoice(self, value: str) -> None:
-        """Adds a catalog value while keeping the Custom option at the end."""
+        """Adds a catalog value after the default and Custom choices."""
         clean = str(value or "").strip()
         if not clean:
             return
         if any(
             str(self.itemData(index) or "").casefold() == clean.casefold()
-            for index in range(1, self.count() - 1)
+            for index in range(2, self.count())
         ):
             return
-        self.insertItem(self.count() - 1, clean, clean)
+        self.addItem(clean, clean)
 
 
 class _NoWheelSpinBox(QSpinBox):

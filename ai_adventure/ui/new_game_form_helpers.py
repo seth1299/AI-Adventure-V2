@@ -104,10 +104,18 @@ def _append_starting_location_table_row(
             name_options,
             str(location.get("name", "")),
             placeholder="Choose a saved location or select Custom",
+            require_custom_selection=True,
         )
         if name_options is not None
         else _table_line_edit(str(location.get("name", "")))
     )
+    if isinstance(name_input, _CatalogComboBox):
+        # The wizard stylesheet adds padding to both the combo and its editor.
+        # Remove the editor's extra left padding so catalog and Custom names
+        # start at the same inset as the plain line-edit path.
+        name_editor = name_input.lineEdit()
+        if name_editor is not None:
+            name_editor.setStyleSheet("padding-left: 0px;")
     name_input.setProperty("starting_location_row_id", str(row_id))
     description_input = _table_line_edit(str(location.get("description", "")))
     mode_input = _table_combo_box(
@@ -178,11 +186,7 @@ def _starting_locations_from_table(table: QTableWidget) -> list[dict[str, Any]]:
         mode_widget = table.cellWidget(row, 2)
         sublocation_widget = table.cellWidget(row, 3)
         parent_widget = table.cellWidget(row, 4)
-        name = (
-            name_widget.text().strip()
-            if isinstance(name_widget, (QLineEdit, _CatalogComboBox))
-            else ""
-        )
+        name = _starting_location_name_from_widget(name_widget)
         description = (
             description_widget.text().strip()
             if isinstance(description_widget, QLineEdit)
@@ -242,6 +246,19 @@ def _starting_location_row_id_for_row(table: QTableWidget, row: int) -> str:
     return str(name_widget.property("starting_location_row_id") or "")
 
 
+def _starting_location_name_from_widget(widget: QWidget | None) -> str:
+    """Reads catalog and Custom names consistently from a location editor."""
+
+    if isinstance(widget, _CatalogComboBox):
+        if widget.currentData() == widget.CUSTOM_DATA:
+            editor = widget.lineEdit()
+            return editor.text().strip() if editor is not None else ""
+        return widget.text().strip()
+    if isinstance(widget, QLineEdit):
+        return widget.text().strip()
+    return ""
+
+
 def _starting_location_row_for_id(table: QTableWidget, row_id: Any) -> int:
     """Returns the row matching row_id, or -1."""
 
@@ -266,11 +283,7 @@ def _starting_location_options_from_table(
             continue
         row_id = _starting_location_row_id_for_row(table, row)
         name_widget = table.cellWidget(row, 0)
-        name = (
-            name_widget.text().strip()
-            if isinstance(name_widget, (QLineEdit, _CatalogComboBox))
-            else ""
-        )
+        name = _starting_location_name_from_widget(name_widget)
 
         if row_id and name:
             options.append((row_id, name))
@@ -503,13 +516,13 @@ def _starting_npcs_from_table(table: QTableWidget) -> list[dict[str, Any]]:
 def _build_starter_suggestion_table(kind: str) -> _AppTableWidget:
     """Builds the compact single-column table used for AI item concepts."""
 
-    table = _AppTableWidget(0, 2)
-    table.setHorizontalHeaderLabels(["Suggestion", "Remove"])
+    table = _AppTableWidget(0, 3)
+    table.setHorizontalHeaderLabels(["Suggestion", "Magic-related?", "Remove"])
     # Give the table a real viewport.  With the old 70px minimum, the header
     # consumed nearly all available space and the suggestion editor was
     # effectively unreadable.  The maximum keeps the wizard compact while
     # allowing the table's own vertical scrollbar to handle longer lists.
-    _configure_inline_table(table, (520, 90), minimum_height=190)
+    _configure_inline_table(table, (420, 120, 90), minimum_height=190)
     table.setMaximumHeight(240)
     table.setToolTip(
         f"Enter a {kind.lower()} concept such as 'Iron Sword'. Gemini will create "
@@ -523,6 +536,8 @@ def _append_starter_suggestion_table_row(
     kind: str,
     suggestion: str = "",
     remove_callback: Callable[[QPushButton], None] | None = None,
+    *,
+    magic_related: bool = False,
 ) -> None:
     """Adds one natural-language starter-item suggestion row."""
 
@@ -532,6 +547,10 @@ def _append_starter_suggestion_table_row(
     suggestion_input = _table_line_edit(suggestion)
     suggestion_input.setPlaceholderText(f"e.g. {'Iron Sword' if kind == 'Weapon' else 'Leather Satchel'}")
     table.setCellWidget(row, 0, suggestion_input)
+    magic_checkbox = QCheckBox()
+    magic_checkbox.setChecked(bool(magic_related))
+    magic_checkbox.setToolTip("Exclude this item from suggestions when the world has no magic.")
+    table.setCellWidget(row, 1, magic_checkbox)
     callback: Callable[[QPushButton], None]
     if remove_callback is None:
         def remove_default(button: QPushButton) -> None:
@@ -542,7 +561,7 @@ def _append_starter_suggestion_table_row(
     _set_remove_row_button(
         table,
         row,
-        1,
+        2,
         f"{kind.lower()} idea",
         callback,
     )
@@ -569,6 +588,11 @@ def _starter_suggestions_from_table(
             "description": "",
             "value_base_units": 0,
             "item_request": suggestion,
+            "magic_related": (
+                table.cellWidget(row, 1).isChecked()
+                if isinstance(table.cellWidget(row, 1), QCheckBox)
+                else False
+            ),
             "requires_ai_invention": True,
         }
         if kind in {"Weapon", "Armor"}:
@@ -1020,6 +1044,7 @@ def _crafting_ingredient_catalog_choices(
 
 __all__ = [
     "_append_starting_location_table_row",
+    "_starting_location_name_from_widget",
     "_starting_locations_from_table",
     "_starting_location_row_id_for_row",
     "_starting_location_row_for_id",

@@ -323,8 +323,8 @@ def normalize_new_game_setup(raw_setup: Any) -> dict[str, Any]:
     rank_baseline = _normalize_skill_preset(raw_setup.get("rank_baseline", "professional"))
     budget, starting_level = rank_stats(skill_preset, rank_baseline)
     attributes = normalize_attributes(character.get("attributes", starting_attributes(budget)), maximum=18)
-    if point_buy_cost(attributes) != budget:
-        raise ValueError(f"Allocate exactly {budget} attribute points for this rank.")
+    if point_buy_cost(attributes) > budget:
+        raise ValueError(f"Attribute points cannot exceed the {budget}-point budget for this rank.")
 
     return {
         "title": _clean_text(raw_setup.get("title")) or "New Adventure",
@@ -962,8 +962,13 @@ def build_new_game_setup_packet(
                 "verbatim. Set source_index to the zero-based setup.starter_items "
                 "index for any item based on that setup entry; for extra items not "
                 "based on a specific setup.starter_items entry, set source_index to "
-                "-1. Do not "
-                "downgrade setup weapons or armor into generic items: preserve "
+                "-1. "
+                "For a countable stack, always use a singular item name and put "
+                "the requested count in quantity. For example, six glass alchemy "
+                "flasks means name='Glass Alchemy Flask' and quantity=6, never "
+                "name='Glass Alchemy Flasks' and quantity=1. Do not pluralize "
+                "the item name just to represent a count. "
+                "Do not downgrade setup weapons or armor into generic items: preserve "
                 "Weapon hand requirements and descriptive capabilities; "
                 "descriptive capabilities, and preserve Armor body coverage such as "
                 "covers_body_parts. "
@@ -1617,18 +1622,20 @@ def _normalize_starter_items(raw_items: Any) -> list[dict[str, Any]]:
         if not name and not item_request:
             continue
 
-        items.append(
-            _starter_item_with_metadata(
-                raw_item,
-                name=name,
-                category=_clean_text(raw_item.get("category")) or "Item",
-                quantity=max(1, _safe_int(raw_item.get("quantity"), 1)),
-                description=_clean_text(raw_item.get("description")),
-                value_base_units=max(0, _safe_int(raw_item.get("value_base_units"), 0)),
-                item_request=item_request,
-                requires_ai_invention=requires_ai_invention,
-            )
+        normalized_item = _starter_item_with_metadata(
+            raw_item,
+            name=name,
+            category=_clean_text(raw_item.get("category")) or "Item",
+            quantity=max(1, _safe_int(raw_item.get("quantity"), 1)),
+            description=_clean_text(raw_item.get("description")),
+            value_base_units=max(0, _safe_int(raw_item.get("value_base_units"), 0)),
+            item_request=item_request,
+            requires_ai_invention=requires_ai_invention,
         )
+        normalized_item["magic_related"] = _safe_bool(
+            raw_item.get("magic_related"), False
+        )
+        items.append(normalized_item)
 
     return items
 

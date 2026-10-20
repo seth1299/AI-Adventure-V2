@@ -411,6 +411,7 @@ class MainWindow(QMainWindow):
                             "name": item_name,
                             "description": str(item.get("description", "") or "").strip(),
                             "genres": template_genres or ["*"],
+                            "magic_related": bool(item.get("magic_related", False)),
                         }
                     )
             for row in template_rows(setup, "starting_locations"):

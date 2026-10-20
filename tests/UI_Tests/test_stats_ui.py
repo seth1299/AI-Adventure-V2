@@ -118,7 +118,7 @@ class StatsUiTests(unittest.TestCase):
                                    custom_voice_storage_path=Path(directory) / "voices.json")
             for rank, (budget, level) in RANK_STATS.items():
                 wizard.skill_preset_combo.setCurrentIndex(wizard.skill_preset_combo.findData(rank))
-                self.assertEqual(wizard._point_buy_remaining(), 0)
+                self.assertGreaterEqual(wizard._point_buy_remaining(), 0)
                 self.assertTrue(wizard.stats_page.isComplete())
                 setup = wizard.build_setup()
                 self.assertEqual((setup["point_buy_budget"], setup["starting_player_level"]), (budget, level))

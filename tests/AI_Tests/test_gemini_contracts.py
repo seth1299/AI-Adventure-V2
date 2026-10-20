@@ -99,6 +99,11 @@ class GeminiContractTests(unittest.TestCase):
                 raw = case.get("raw_response", json.dumps(case.get("response")))
                 with patch.object(genai, "Client") as client:
                     client.return_value.models.generate_content.return_value = SimpleNamespace(text=raw)
+                    if "repair_response" in case:
+                        client.return_value.models.generate_content.side_effect = [
+                            SimpleNamespace(text=raw),
+                            SimpleNamespace(text=json.dumps(case["repair_response"])),
+                        ]
                     service = g.GeminiNarrationService(g.GeminiSettings(api_key="test-key", model=g.DEFAULT_GEMINI_MODEL))
                     if case.get("reject"):
                         with self.assertRaises(g.GeminiRequestError):

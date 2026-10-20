@@ -651,6 +651,7 @@ __all__ = [
     "_starter_suggestions_from_table",
     "_starter_weapons_from_table",
     "_starting_location_options_from_table",
+    "_starting_location_name_from_widget",
     "_starting_location_row_for_id",
     "_starting_location_row_id_for_row",
     "_starting_locations_from_table",

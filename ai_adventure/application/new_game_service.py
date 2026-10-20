@@ -999,9 +999,22 @@ def _starter_items_for_save(
         if source_index is None or not (0 <= source_index < len(setup_items)):
             continue
         setup_item = setup_items[source_index]
-        if not isinstance(setup_item, dict) or bool(
-            setup_item.get("requires_ai_invention")
-        ):
+        if not isinstance(setup_item, dict):
+            continue
+        if bool(setup_item.get("requires_ai_invention")):
+            requested_quantity = _explicit_starter_item_quantity(
+                str(setup_item.get("item_request", ""))
+            )
+            if requested_quantity is not None:
+                item["quantity"] = requested_quantity
+                if requested_quantity > 1:
+                    item["name"] = _singularize_stack_item_name(
+                        str(item.get("name", ""))
+                    )
+                    if item.get("basic_name"):
+                        item["basic_name"] = _singularize_stack_item_name(
+                            str(item["basic_name"])
+                        )
             continue
         item["storage_location"] = (
             " ".join(
@@ -1052,6 +1065,99 @@ def _starter_items_for_save(
     return completed_items
 
 
+def _explicit_starter_item_quantity(item_request: str) -> int | None:
+    """Reads a clear leading count from a natural-language item request."""
+
+    text = str(item_request or "").strip()
+    text = re.sub(
+        r"^(?:(?:please\s+)?(?:add|include|provide)\s+|"
+        r"(?:i\s+)?(?:want|need)\s+|i(?:\s+would)?\s+like\s+|"
+        r"i['’]d\s+like\s+|(?:please\s+)?give\s+me\s+)+",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    number_words = {
+        "a pair": 2,
+        "pair": 2,
+        "a couple": 2,
+        "couple": 2,
+        "a dozen": 12,
+        "dozen": 12,
+        "one": 1,
+        "two": 2,
+        "three": 3,
+        "four": 4,
+        "five": 5,
+        "six": 6,
+        "seven": 7,
+        "eight": 8,
+        "nine": 9,
+        "ten": 10,
+        "eleven": 11,
+        "twelve": 12,
+    }
+    numeric_match = re.match(r"^(\d{1,3})\s*(?:x|×\s*|\s+)", text, re.IGNORECASE)
+    if numeric_match:
+        quantity = int(numeric_match.group(1))
+        return quantity if quantity > 0 else None
+    numeric_suffix_match = re.search(r"(?:\bx|×)\s*(\d{1,3})\s*$", text, re.IGNORECASE)
+    if numeric_suffix_match:
+        quantity = int(numeric_suffix_match.group(1))
+        return quantity if quantity > 0 else None
+
+    word_match = re.match(
+        r"^(a\s+pair|pair|a\s+couple|couple|a\s+dozen|dozen|"
+        r"one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)"
+        r"\b(?:\s+of)?(?:\s+the)?\s+",
+        text,
+        re.IGNORECASE,
+    )
+    if word_match:
+        return number_words[word_match.group(1).casefold()]
+    return None
+
+
+def _singularize_stack_item_name(name: str) -> str:
+    """Converts a plural stack label to a singular label conservatively."""
+
+    match = re.match(r"^(.*\s)?([^\s]+)([.,;:]*)$", str(name or "").strip())
+    if not match:
+        return str(name or "").strip()
+    prefix, word, punctuation = match.groups()
+    lower = word.casefold()
+    invariant_plurals = {
+        "binoculars", "glasses", "jeans", "scissors", "series", "species",
+        "tongs", "trousers",
+    }
+    irregular = {
+        "calves": "calf", "children": "child", "elves": "elf", "feet": "foot",
+        "geese": "goose", "halves": "half", "knives": "knife", "leaves": "leaf",
+        "lives": "life", "loaves": "loaf", "men": "man", "mice": "mouse",
+        "selves": "self", "shelves": "shelf", "teeth": "tooth", "wives": "wife",
+        "wolves": "wolf", "women": "woman",
+    }
+    if lower in invariant_plurals:
+        return str(name or "").strip()
+    singular = irregular.get(lower)
+    if singular is None:
+        if lower.endswith("ies") and len(word) > 3:
+            singular = word[:-3] + "y"
+        elif lower.endswith(("ches", "shes", "sses", "xes", "zes")):
+            singular = word[:-2]
+        elif lower.endswith("ves"):
+            singular = word[:-3] + "f"
+        elif lower.endswith("s") and not lower.endswith(("ss", "us", "is", "ous")):
+            singular = word[:-1]
+        else:
+            singular = word
+    if word.isupper():
+        singular = singular.upper()
+    elif word.istitle():
+        singular = singular.title()
+    return f"{prefix or ''}{singular}{punctuation}"
+
+
 def _fallback_starter_item_from_setup(
     raw_item: Any, *, source_index: int = -1
 ) -> dict[str, Any] | None:
@@ -1062,15 +1168,19 @@ def _fallback_starter_item_from_setup(
     name = str(raw_item.get("name", "")).strip()
     item_request = str(raw_item.get("item_request", "")).strip()
     description = str(raw_item.get("description", "")).strip()
+    requested_quantity = _explicit_starter_item_quantity(item_request)
+    quantity = requested_quantity or max(1, _safe_int(raw_item.get("quantity"), 1))
     if not name:
         name = _starter_item_name_from_request(item_request)
+    if quantity > 1:
+        name = _singularize_stack_item_name(name)
     if not name:
         return None
     item = {
         "name": name,
         "basic_name": str(raw_item.get("basic_name", name) or name).strip()[:120],
         "category": str(raw_item.get("category", "Item")).strip() or "Item",
-        "quantity": max(1, _safe_int(raw_item.get("quantity"), 1)),
+        "quantity": quantity,
         "description": description
         or item_request
         or "Player-requested starter item awaiting AI detail.",
@@ -1145,6 +1255,24 @@ def _starter_item_name_from_request(item_request: str) -> str:
     candidate = str(item_request or "").strip()
     if not candidate:
         return ""
+    candidate = re.sub(
+        r"^(?:(?:please\s+)?(?:add|include|provide)\s+|"
+        r"(?:i\s+)?(?:want|need)\s+|i(?:\s+would)?\s+like\s+|"
+        r"i['’]d\s+like\s+|(?:please\s+)?give\s+me\s+)+",
+        "",
+        candidate,
+        flags=re.IGNORECASE,
+    )
+    candidate = re.sub(
+        r"^(?:\d{1,3}\s*(?:x|×)\s*|\d{1,3}\s+|"
+        r"a\s+pair|pair|a\s+couple|couple|a\s+dozen|dozen|"
+        r"one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)"
+        r"\b(?:\s+of)?(?:\s+the)?\s*",
+        "",
+        candidate,
+        flags=re.IGNORECASE,
+    )
+    candidate = re.sub(r"\s+(?:x|×)\s*\d{1,3}\s*$", "", candidate, flags=re.IGNORECASE)
     for separator in [
         " that ", " which ", " with ", " used ", " for ", ".", ",", ";", ":"
     ]:

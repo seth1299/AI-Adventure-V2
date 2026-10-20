@@ -66,22 +66,13 @@ def point_buy_cost(attributes: dict[str, int]) -> int:
 
 
 def starting_attributes(budget: int) -> dict[str, int]:
-    """Pick an exact, balanced default allocation; ties follow attribute order."""
-    states: dict[int, tuple[int, ...]] = {0: ()}
-    for _ in ATTRIBUTES:
-        next_states = {}
-        for spent, scores in states.items():
-            for score, cost in POINT_COSTS.items():
-                total = spent + cost
-                if total > budget:
-                    continue
-                candidate = scores + (score,)
-                old = next_states.get(total)
-                key = lambda seq: (sum(s*s for s in seq) - sum(seq)**2 / len(seq), -sum(seq), tuple(-s for s in seq))
-                if old is None or key(candidate) < key(old):
-                    next_states[total] = candidate
-        states = next_states
-    return dict(zip(ATTRIBUTES, states[budget]))
+    """Pick the highest equal score affordable for every attribute."""
+    score = max(
+        value
+        for value, cost in POINT_COSTS.items()
+        if cost * len(ATTRIBUTES) <= budget
+    )
+    return dict.fromkeys(ATTRIBUTES, score)
 
 
 def health_max(attributes: dict[str, int]) -> int:

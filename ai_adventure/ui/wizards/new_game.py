@@ -44,22 +44,22 @@ DEFAULT_GAME_GENRES = (
     "Post-apocalyptic", "Political intrigue", "Space opera", "Cozy life",
 )
 DEFAULT_STARTER_ITEM_SUGGESTIONS = (
-    ("Backpack", "A practical pack for carrying everyday travel gear.", ("*",)),
-    ("Notebook", "A small book for notes, sketches, clues, or records.", ("*",)),
-    ("Gloves", "Protective handwear suited to the setting and its hazards.", ("*",)),
-    ("Boots", "Sturdy footwear chosen for the local terrain.", ("*",)),
-    ("Rope", "A length of strong cord useful for climbing, hauling, or tying.", ("*",)),
-    ("Lantern", "A portable light source with fuel or power appropriate to the world.", ("*",)),
-    ("Water Bottle", "A reusable container for carrying drinking water.", ("*",)),
-    ("First Aid Kit", "Basic supplies for cleaning and dressing minor injuries.", ("*",)),
-    ("Sword", "A bladed hand weapon suited to the world's materials and fighting style.", ("fantasy", "historical", "western")),
-    ("Alembic", "A small distilling vessel used for careful chemical or alchemical work.", ("fantasy", "historical", "steampunk")),
-    ("Alchemy Flasks", "A padded set of small containers for prepared reagents and mixtures.", ("fantasy", "historical", "steampunk")),
-    ("Spellbook", "A personal volume of magical notes, formulae, or rituals.", ("fantasy",)),
-    ("Pistol", "A compact firearm with ammunition appropriate to the setting.", ("western", "historical", "detective", "science fiction", "cyberpunk", "steampunk", "post-apocalyptic")),
-    ("Datapad", "A handheld electronic device for notes, records, and reference material.", ("science fiction", "space opera", "cyberpunk")),
-    ("Comms Device", "A portable device for sending and receiving messages.", ("science fiction", "space opera", "cyberpunk", "post-apocalyptic")),
-    ("Repair Kit", "A compact collection of tools and supplies for field repairs.", ("science fiction", "space opera", "cyberpunk", "steampunk", "post-apocalyptic")),
+    ("Backpack", "A practical pack for carrying everyday travel gear.", ("*",), False),
+    ("Notebook", "A small book for notes, sketches, clues, or records.", ("*",), False),
+    ("Gloves", "Protective handwear suited to the setting and its hazards.", ("*",), False),
+    ("Boots", "Sturdy footwear chosen for the local terrain.", ("*",), False),
+    ("Rope", "A length of strong cord useful for climbing, hauling, or tying.", ("*",), False),
+    ("Lantern", "A portable light source with fuel or power appropriate to the world.", ("*",), False),
+    ("Water Bottle", "A reusable container for carrying drinking water.", ("*",), False),
+    ("First Aid Kit", "Basic supplies for cleaning and dressing minor injuries.", ("*",), False),
+    ("Sword", "A bladed hand weapon suited to the world's materials and fighting style.", ("fantasy", "historical", "western"), False),
+    ("Alembic", "A small distilling vessel used for careful chemical or alchemical work.", ("fantasy", "historical", "steampunk"), False),
+    ("Alchemy Flasks", "A padded set of small containers for prepared reagents and mixtures.", ("fantasy", "historical", "steampunk"), False),
+    ("Spellbook", "A personal volume of magical notes, formulae, or rituals.", ("fantasy",), True),
+    ("Pistol", "A compact firearm with ammunition appropriate to the setting.", ("western", "historical", "detective", "science fiction", "cyberpunk", "steampunk", "post-apocalyptic"), False),
+    ("Datapad", "A handheld electronic device for notes, records, or reference material.", ("science fiction", "space opera", "cyberpunk"), False),
+    ("Comms Device", "A portable device for sending and receiving messages.", ("science fiction", "space opera", "cyberpunk", "post-apocalyptic"), False),
+    ("Repair Kit", "A compact collection of tools and supplies for field repairs.", ("science fiction", "space opera", "cyberpunk", "steampunk", "post-apocalyptic"), False),
 )
 DEFAULT_GAME_QUESTS = (
     "Find the Missing Courier",
@@ -96,7 +96,7 @@ class _StatsWizardPage(QWizardPage):
         self.owner = owner
 
     def isComplete(self) -> bool:
-        return self.owner._point_buy_remaining() == 0
+        return self.owner._point_buy_remaining() >= 0
 
 
 class _StartingSkillCombo(QWidget):
@@ -107,43 +107,71 @@ class _StartingSkillCombo(QWidget):
     def __init__(self, choices: list[tuple[str, str]], parent: QWidget | None = None):
         super().__init__(parent)
         self.combo = QComboBox()
+        self.combo.setEditable(False)
+        self.combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
         self.combo.addItem("Select a skill…", "")
+        self.combo.addItem("[Custom skill…]", self.CUSTOM_DATA)
         for name, description in choices:
             self.combo.addItem(name, (name, description))
-        self.combo.addItem("[Custom skill…]", self.CUSTOM_DATA)
-        self.custom_input = QLineEdit()
-        self.custom_input.setPlaceholderText("Custom skill name")
+        self._custom_active = False
+        line_edit = self.combo.lineEdit()
+        if line_edit is not None:
+            line_edit.setReadOnly(True)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(2)
         layout.addWidget(self.combo)
-        layout.addWidget(self.custom_input)
         self.combo.currentIndexChanged.connect(self._sync_custom_visibility)
+        self.combo.activated.connect(self._focus_custom_input)
         self._sync_custom_visibility()
 
     def _sync_custom_visibility(self, _index: int = -1) -> None:
-        self.custom_input.setVisible(self.combo.currentData() == self.CUSTOM_DATA)
+        if self.combo.currentData() == self.CUSTOM_DATA:
+            self._custom_active = True
+        elif self.combo.currentIndex() >= 0:
+            self._custom_active = False
+        self.combo.setEditable(self._custom_active)
+        line_edit = self.combo.lineEdit()
+        if line_edit is not None:
+            line_edit.setFont(self.combo.font())
+            line_edit.setReadOnly(not self._custom_active)
+            line_edit.setPlaceholderText(
+                "Custom skill name" if self._custom_active else ""
+            )
+            if self._custom_active and self.combo.currentData() == self.CUSTOM_DATA:
+                line_edit.clear()
+
+    def _focus_custom_input(self, index: int) -> None:
+        if self.combo.itemData(index) == self.CUSTOM_DATA:
+            line_edit = self.combo.lineEdit()
+            if line_edit is not None:
+                line_edit.setFocus()
 
     def text(self) -> str:
+        if self._custom_active:
+            line_edit = self.combo.lineEdit()
+            return line_edit.text() if line_edit is not None else ""
         data = self.combo.currentData()
-        if data == self.CUSTOM_DATA:
-            return self.custom_input.text()
         return str(data[0]) if isinstance(data, tuple) else ""
 
     def setText(self, value: str) -> None:
         wanted = str(value or "").strip()
-        for index in range(1, self.combo.count() - 1):
+        for index in range(2, self.combo.count()):
             data = self.combo.itemData(index)
             if isinstance(data, tuple) and data[0].casefold() == wanted.casefold():
                 self.combo.setCurrentIndex(index)
                 return
         if wanted:
-            self.combo.setCurrentIndex(self.combo.count() - 1)
-            self.custom_input.setText(wanted)
+            custom_index = self.combo.findData(self.CUSTOM_DATA)
+            self.combo.setCurrentIndex(custom_index)
+            line_edit = self.combo.lineEdit()
+            if line_edit is not None:
+                line_edit.setText(wanted)
         else:
             self.combo.setCurrentIndex(0)
 
     def selected_description(self) -> str | None:
+        if self._custom_active:
+            return None
         data = self.combo.currentData()
         return str(data[1]) if isinstance(data, tuple) else None
 
@@ -606,11 +634,12 @@ class NewGameWizard(QWizard):
     ) -> list[dict[str, Any]]:
         """Combines built-in and template item ideas, retaining genre tags."""
         merged: dict[str, dict[str, Any]] = {}
-        for name, description, genres in DEFAULT_STARTER_ITEM_SUGGESTIONS:
+        for name, description, genres, magic_related in DEFAULT_STARTER_ITEM_SUGGESTIONS:
             merged[name.casefold()] = {
                 "name": name,
                 "description": description,
                 "genres": set(genres),
+                "magic_related": magic_related,
             }
         for item in saved_items:
             if not isinstance(item, dict):
@@ -618,6 +647,7 @@ class NewGameWizard(QWizard):
             name = str(item.get("name", "")).strip()
             description = str(item.get("description", "")).strip()
             genres = item.get("genres", [])
+            magic_related = bool(item.get("magic_related", False))
             if isinstance(genres, str):
                 genres = [part.strip() for part in genres.replace(";", ",").split(",")]
             if not name:
@@ -625,10 +655,16 @@ class NewGameWizard(QWizard):
             key = name.casefold()
             current = merged.get(key)
             if current is None:
-                current = {"name": name, "description": description, "genres": set()}
+                current = {
+                    "name": name,
+                    "description": description,
+                    "genres": set(),
+                    "magic_related": magic_related,
+                }
                 merged[key] = current
             elif len(description) > len(current["description"]):
                 current["description"] = description
+            current["magic_related"] = current["magic_related"] or magic_related
             current["genres"].update(str(genre).strip().casefold() for genre in genres if str(genre).strip())
         return [
             {**item, "genres": tuple(sorted(item["genres"]))}
@@ -645,15 +681,21 @@ class NewGameWizard(QWizard):
             for genre in self.genre_input.text().split(",")
             if genre.strip()
         }
+        world_contains_magic = not self.no_world_magic_checkbox.isChecked()
         combo.blockSignals(True)
         combo.clear()
         combo.addItem("Choose a suggested item…", None)
         for item in self.starter_item_catalog:
             genres = item["genres"]
+            if not world_contains_magic and item["magic_related"]:
+                continue
             if "*" not in genres and not selected_genres.intersection(genres):
                 continue
             name, description = item["name"], item["description"]
-            combo.addItem(name, (name, description))
+            combo.addItem(
+                name,
+                (name, description, bool(item["magic_related"])),
+            )
             combo.setItemData(combo.count() - 1, description, Qt.ItemDataRole.ToolTipRole)
         combo.setCurrentIndex(0)
         combo.blockSignals(False)
@@ -661,13 +703,15 @@ class NewGameWizard(QWizard):
     def _add_selected_starter_item_suggestion(self) -> None:
         """Copies a catalog item into the editable starter item idea table."""
         data = self.starter_item_suggestion_combo.currentData()
-        if not isinstance(data, tuple) or len(data) != 2:
+        if not isinstance(data, tuple) or len(data) not in {2, 3}:
             return
-        name, description = (str(value) for value in data)
+        name, description = str(data[0]), str(data[1])
+        magic_related = bool(data[2]) if len(data) == 3 else False
         _append_starter_suggestion_table_row(
             self.starter_item_suggestions_table,
             "Item",
             f"{name}: {description}",
+            magic_related=magic_related,
         )
         self.starter_item_suggestion_combo.setCurrentIndex(0)
 
@@ -678,16 +722,25 @@ class NewGameWizard(QWizard):
             return
         self.setOption(QWizard.WizardOption.HaveCustomButton1, True)
         self.setButtonText(QWizard.WizardButton.CustomButton1, "Save + Exit")
+        self.setOption(QWizard.WizardOption.HaveCustomButton2, True)
+        self.setButtonText(QWizard.WizardButton.CustomButton2, "Save")
         self.customButtonClicked.connect(self._handle_custom_wizard_button)
 
     def _handle_custom_wizard_button(self, button: Any) -> None:
-        """Saves the current form as a template before closing the wizard."""
+        """Saves the current form as a template, optionally closing the wizard."""
 
         button_value = getattr(button, "value", button)
-        if button_value != QWizard.WizardButton.CustomButton1.value:
+        if button_value not in {
+            QWizard.WizardButton.CustomButton1.value,
+            QWizard.WizardButton.CustomButton2.value,
+        }:
             return
         callback = self.on_save_and_exit
-        if callback is not None and callback(self.build_template_setup()):
+        if callback is None:
+            return
+        if not callback(self.build_template_setup()):
+            return
+        if button_value == QWizard.WizardButton.CustomButton1.value:
             self.reject()
 
     def nextId(self) -> int:
@@ -1321,7 +1374,12 @@ class NewGameWizard(QWizard):
         self._set_starter_inventory_mode(clean_setup["starter_inventory_mode"])
         for item in clean_setup["starter_items"]:
             if item.get("requires_ai_invention") and item.get("item_request"):
-                _append_starter_suggestion_table_row(self.starter_item_suggestions_table, "Item", str(item["item_request"]))
+                _append_starter_suggestion_table_row(
+                    self.starter_item_suggestions_table,
+                    "Item",
+                    str(item["item_request"]),
+                    magic_related=bool(item.get("magic_related", False)),
+                )
             else:
                 self._append_starter_item_row(item)
 
@@ -1717,11 +1775,9 @@ class NewGameWizard(QWizard):
         parent_widget = self.starting_locations_table.cellWidget(row, 4)
 
         if isinstance(name_widget, _CatalogComboBox):
-            name_editor = name_widget.lineEdit()
-            if name_editor is not None:
-                name_editor.textChanged.connect(
-                    lambda _text: self._refresh_starting_location_dropdowns()
-                )
+            name_widget.editTextChanged.connect(
+                lambda _text: self._refresh_starting_location_dropdowns()
+            )
         elif isinstance(name_widget, QLineEdit):
             name_widget.textChanged.connect(
                 lambda _text: self._refresh_starting_location_dropdowns()
@@ -1740,10 +1796,10 @@ class NewGameWizard(QWizard):
         if isinstance(description_widget, QLineEdit):
             def location_name_is_present() -> bool:
                 if isinstance(name_widget, _CatalogComboBox):
-                    # text() deliberately returns an empty value for the Custom
-                    # menu entry; the editor text is still the user's location name.
-                    name_editor = name_widget.lineEdit()
-                    return bool(name_editor is not None and name_editor.text().strip())
+                    if name_widget.currentData() == name_widget.CUSTOM_DATA:
+                        name_editor = name_widget.lineEdit()
+                        return bool(name_editor is not None and name_editor.text().strip())
+                    return bool(name_widget.text().strip())
                 if isinstance(name_widget, QLineEdit):
                     return bool(name_widget.text().strip())
                 return False
@@ -1756,9 +1812,7 @@ class NewGameWizard(QWizard):
                 description_widget.setEnabled(location_name_is_present())
 
             if isinstance(name_widget, _CatalogComboBox):
-                name_editor = name_widget.lineEdit()
-                if name_editor is not None:
-                    name_editor.textChanged.connect(sync_description_enabled)
+                name_widget.editTextChanged.connect(sync_description_enabled)
                 name_widget.currentIndexChanged.connect(sync_description_enabled)
             elif isinstance(name_widget, QLineEdit):
                 name_widget.textChanged.connect(sync_description_enabled)
@@ -1819,11 +1873,7 @@ class NewGameWizard(QWizard):
 
         name_widget = self.starting_locations_table.cellWidget(row, 0)
         mode_widget = self.starting_locations_table.cellWidget(row, 2)
-        name = (
-            name_widget.text().strip()
-            if isinstance(name_widget, (QLineEdit, _CatalogComboBox))
-            else ""
-        )
+        name = _starting_location_name_from_widget(name_widget)
 
         if not name:
             return {}
@@ -1854,11 +1904,7 @@ class NewGameWizard(QWizard):
 
         name_widget = self.starting_locations_table.cellWidget(row, 0)
         mode_widget = self.starting_locations_table.cellWidget(row, 2)
-        name = (
-            name_widget.text().strip()
-            if isinstance(name_widget, (QLineEdit, _CatalogComboBox))
-            else ""
-        )
+        name = _starting_location_name_from_widget(name_widget)
 
         if not name:
             return
@@ -3574,6 +3620,9 @@ class NewGameWizard(QWizard):
         )
         self._refresh_starter_item_suggestions()
         self.genre_input.selection_changed.connect(self._refresh_starter_item_suggestions)
+        self.no_world_magic_checkbox.toggled.connect(
+            self._refresh_starter_item_suggestions
+        )
         add_suggested_item_button = QPushButton("Add Suggested Item")
         add_suggested_item_button.clicked.connect(self._add_selected_starter_item_suggestion)
         add_item_suggestion_button = QPushButton("Add Custom Item Idea")

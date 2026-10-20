@@ -1901,7 +1901,15 @@ NEW_GAME_RESPONSE_JSON_SCHEMA: dict[str, Any] = {
             "items": {
                 "type": "object",
                 "properties": {
-                    "name": {"type": "string"},
+                    "name": {
+                        "type": "string",
+                        "description": (
+                            "Singular inventory label for a countable item stack. "
+                            "Represent multiples in quantity, e.g. name 'Glass "
+                            "Alchemy Flask' with quantity 6, not a plural name "
+                            "with quantity 1."
+                        ),
+                    },
                     "basic_name": {
                         "type": "string",
                         "description": (
@@ -1923,7 +1931,14 @@ NEW_GAME_RESPONSE_JSON_SCHEMA: dict[str, Any] = {
                         "is stored in a vial and was crafted from ingredients."
                         ),
                     },
-                    "quantity": {"type": "integer", "minimum": 1},
+                    "quantity": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": (
+                            "Count of items represented by this stack. Preserve any "
+                            "explicit count in the player's request here, not in the name."
+                        ),
+                    },
                     "quantity_unit": {
                         "type": "string",
                         "minLength": 1,
@@ -2772,6 +2787,10 @@ class GeminiNarrationService:
             raw_text, build_story_response_schema(context_packet, for_api=False), "story response",
         )
         result = parse_gemini_story_response(raw_text, context_packet=context_packet)
+        result = _repair_resolved_check_narration(
+            client, self.settings.model, result, context_packet, response_schema,
+            ai_preferences=ai_preferences,
+        )
         response_pronunciation_map = result.pronunciation_map
         result = _apply_story_guard(result, context_packet, _enforce_explicit_conversation_mode)
         result = _apply_story_guard(result, context_packet, _drop_unwarranted_d20_test_events)
@@ -3247,6 +3266,7 @@ def _build_xml_story_prompt(context_packet: dict[str, Any]) -> str:
         prompt_packet,
         excluded_keys={"schema_version", "packet_type", "player_command"},
     )
+    resolved_checks = _state_subpacket(context_packet, "skills").get("resolved_checks_this_turn", [])
     return "\n\n".join(
         [
             _xml_text_section(
@@ -3264,6 +3284,21 @@ def _build_xml_story_prompt(context_packet: dict[str, Any]) -> str:
                 "answer; do not invent player-character dialogue, decisions, or "
                 "unrequested actions.",
             ),
+            *([_xml_text_section(
+                "resolved_check_narration",
+                "The checks in state.skills.resolved_checks_this_turn have ALREADY been "
+                "rolled and applied for this command. Narrate their concrete consequences "
+                "now; never request those checks again or merely describe beginning or "
+                "continuing the attempt. A successful search must reveal a specific useful "
+                "finding consistent with the scene; a failed search must explicitly resolve "
+                "what was not found, or describe its setback or cost. For other actions, "
+                "likewise show what the success or failure changes. Respect each outcome; "
+                "a high success should be especially advantageous within the action's scope. "
+                "Do not require another player action to receive the already-earned result. "
+                "Include events for actual state changes, including items actually collected, "
+                "without inventing collection or other unrequested player actions. Keep "
+                "dice and roll numbers out of player-facing prose.",
+            )] if resolved_checks else []),
             _xml_text_section(
                 "conversation_mode",
                 (
@@ -3354,6 +3389,11 @@ def _project_story_state(context_packet: dict[str, Any]) -> dict[str, Any]:
         value = source.get(key)
         if tags.intersection(required_tags) and value not in (None, "", [], {}):
             projected[key] = value
+
+    # A completed roll is mandatory narration input, regardless of relevance tags.
+    skills = source.get("skills")
+    if isinstance(skills, dict) and skills.get("resolved_checks_this_turn"):
+        projected["skills"] = skills
 
     for key in ("npcs", "party", "gm_secrets", "bestiary", "merchant"):
         value = source.get(key)
@@ -3877,7 +3917,7 @@ def _separate_system_rules(contents: str, config: dict[str, Any]) -> tuple[str, 
     request_sections: list[str] = []
     remaining = contents.lstrip()
     while True:
-        match = re.match(r"<(identity|critical_constraints|constraints|phase|shared_rules)>\n(.*?)\n</\1>\s*", remaining, re.DOTALL)
+        match = re.match(r"<(identity|critical_constraints|resolved_check_narration|constraints|phase|shared_rules)>\n(.*?)\n</\1>\s*", remaining, re.DOTALL)
         if match is None:
             break
         if match.group(1) == "phase":
@@ -6839,6 +6879,10 @@ def _repair_container_reward_flow(
             _validate_response_contract(raw_text,
                 build_story_response_schema(context_packet, for_api=False), "container repair response")
             result = replace(parse_gemini_story_response(raw_text, context_packet=context_packet), dropped_events=result.dropped_events)
+            result = _repair_resolved_check_narration(
+                client, model, result, context_packet, response_schema,
+                ai_preferences=ai_preferences,
+            )
             result = _apply_story_guard(result, context_packet, _enforce_explicit_conversation_mode)
             result = _apply_story_guard(result, context_packet, _drop_unwarranted_d20_test_events)
             result = _apply_story_guard(result, context_packet, _drop_duplicate_resolved_d20_test_events)
@@ -6877,6 +6921,60 @@ def _text_indicates_unopened_container(text: str) -> bool:
             folded,
         )
     )
+
+
+def _repair_resolved_check_narration(
+    client: Any, model: str, result: AiNarrationResult,
+    context_packet: dict[str, Any], response_schema: dict[str, Any],
+    *, ai_preferences: dict[str, Any],
+) -> AiNarrationResult:
+    """Rewrite a response that treats a completed check as a pending attempt.
+
+    Repair only narration and proposed events. No rolls or persistence happen here.
+    Preserve the rejected duplicate proposals in the normal event audit trail.
+    """
+    for attempt in range(3):
+        filtered = _apply_story_guard(result, context_packet, _drop_duplicate_resolved_d20_test_events)
+        if len(filtered.suggested_events) == len(result.suggested_events):
+            return result
+        if attempt == 2:
+            raise GeminiRequestError(
+                "The narrator repeatedly requested an already-resolved check instead of "
+                "describing its outcome. The check result remains saved; this narration "
+                "and its proposed state changes were not accepted."
+            )
+        LOGGER.warning("Resolved-check narration repair %s required.", attempt + 1)
+        repair_packet = copy.deepcopy(context_packet)
+        repair_packet["resolved_check_repair"] = {
+            "rejected_response": result.raw_text,
+            "instruction": (
+                "Rewrite the entire response to resolve the current player command using "
+                "state.skills.resolved_checks_this_turn. These results are authoritative "
+                "and already applied. Do not request these checks again. Show the concrete "
+                "success or failure and its immediate consequences in the response itself, "
+                "rather than atmosphere or another invitation to attempt the same action. "
+                "Include the events warranted by those consequences."
+            ),
+        }
+        response = _generate_content_with_retry(
+            client, model=model, contents=build_gemini_story_prompt(repair_packet),
+            config=_structured_output_config(response_schema, model=model,
+                ai_preferences=ai_preferences, apply_response_length=True),
+            request_label="resolved-check narration repair",
+            response_contract=build_story_response_schema(context_packet, for_api=False),
+        )
+        raw_text = _repair_gemini_creative_terms(
+            client, model, str(getattr(response, "text", "") or "").strip(),
+            "resolved-check narration repair", response_schema,
+            ai_preferences=ai_preferences, apply_response_length=True,
+        )
+        _validate_response_contract(raw_text,
+            build_story_response_schema(context_packet, for_api=False), "resolved-check repair response")
+        result = replace(
+            parse_gemini_story_response(raw_text, context_packet=context_packet),
+            dropped_events=filtered.dropped_events,
+        )
+    return result
 
 
 def _drop_duplicate_resolved_d20_test_events(
