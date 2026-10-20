@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from ai_adventure.container_flow import ContainerFlowError
+from ai_adventure.suggested_actions import compose_action_prompt
 
 from ai_adventure.ui.common import *  # noqa: F401,F403
 from ai_adventure.ui.dialogues import *  # noqa: F401,F403
@@ -152,6 +153,12 @@ class StoryScreen(RepositoryBackedWidget):
         location_image_row.addStretch()
         layout.addLayout(location_image_row)
         layout.addWidget(self.conversation_scroll, 1)
+        self.suggested_actions_box = QWidget()
+        self.suggested_actions_layout = QGridLayout(self.suggested_actions_box)
+        self.suggested_actions_layout.setContentsMargins(0, 0, 0, 0)
+        self.suggested_action_buttons: list[QPushButton] = []
+        self.suggested_actions_box.hide()
+        layout.addWidget(self.suggested_actions_box)
         layout.addLayout(input_row)
 
         self.setLayout(layout)
@@ -177,6 +184,7 @@ class StoryScreen(RepositoryBackedWidget):
         super().resizeEvent(event)
         QTimer.singleShot(
             0,
+            self,
             lambda: self._finish_conversation_resize(old_value, follow_bottom),
         )
 
@@ -281,6 +289,12 @@ class StoryScreen(RepositoryBackedWidget):
                     if is_revealing
                     else content
                 )
+                actions = entry.get("suggested_actions", [])
+                if actions and not is_revealing:
+                    footer = "\n".join(f"- {action['label']}" for action in actions)
+                    if visible_content.endswith(footer):
+                        before_choices = visible_content[:-len(footer)].rstrip()
+                        visible_content = before_choices.rsplit("\n\n", 1)[0]
                 if not visible_content:
                     continue
                 mode = "out_of_game" if kind == "story_oog" else "live_game"
@@ -356,7 +370,7 @@ class StoryScreen(RepositoryBackedWidget):
             if render_generation == self._conversation_render_generation:
                 bar.setValue(old_value + max(0, bar.maximum() - old_maximum))
 
-        QTimer.singleShot(0, restore_position)
+        QTimer.singleShot(0, self, restore_position)
 
     def _clear_conversation_messages(self) -> None:
         """Removes all rendered conversation bubbles while preserving the stretch."""
@@ -472,6 +486,7 @@ class StoryScreen(RepositoryBackedWidget):
             )
         QTimer.singleShot(
             0,
+            self,
             lambda: self._finish_conversation_render(
                 render_generation,
                 old_value,
@@ -1093,6 +1108,45 @@ class StoryScreen(RepositoryBackedWidget):
             conversation_mode=self._conversation_mode(),
         )
 
+    def _refresh_suggested_action_buttons(self) -> None:
+        while self.suggested_actions_layout.count():
+            item = self.suggested_actions_layout.takeAt(0)
+            if item.widget() is not None:
+                item.widget().deleteLater()
+        self.suggested_action_buttons = []
+        repository = self.repository()
+        latest = repository.list_history(limit=1, kinds=self.CONVERSATION_KINDS) if repository else []
+        entry = latest[0] if latest else {}
+        actions = entry.get("suggested_actions", []) if entry.get("kind") == "story" and not entry.get("hidden") else []
+        visible = bool(actions) and self._conversation_mode() == "live_game"
+        self.suggested_actions_box.setVisible(visible)
+        if not visible:
+            return
+        for index, action in enumerate(actions[:4]):
+            button = QPushButton(str(action["label"]))
+            button.setObjectName("suggestedActionButton")
+            button.setToolTip(str(action["prompt"]))
+            button.setEnabled(not self._waiting_for_gm and self._revealing_story_id is None)
+            button.clicked.connect(lambda _checked=False, entry_id=entry["id"], prompt=action["prompt"]:
+                                   self._submit_suggested_action(entry_id, prompt))
+            self.suggested_actions_layout.addWidget(button, index // 2, index % 2)
+            self.suggested_action_buttons.append(button)
+
+    def _submit_suggested_action(self, entry_id: int, prompt: str) -> None:
+        repository = self.repository()
+        if repository is None or self._waiting_for_gm or self._revealing_story_id is not None or self._conversation_mode() != "live_game":
+            return
+        latest = repository.list_history(limit=1, kinds=self.CONVERSATION_KINDS)
+        if not latest or latest[0]["id"] != entry_id or latest[0].get("hidden"):
+            return
+        if not any(action["prompt"] == prompt for action in latest[0].get("suggested_actions", [])):
+            return
+        command = compose_action_prompt(prompt,
+            style=repository.get_setting("ai.narration_style", "second_person_limited"),
+            player_name=repository.get_setting("player_name", ""))
+        self.player_input.setText(command)
+        self._submit_player_action()
+
     def submit_travel_request(
         self,
         raw_destination: dict[str, Any],
@@ -1590,6 +1644,7 @@ class StoryScreen(RepositoryBackedWidget):
         self.player_input.setEnabled(can_submit)
         self.submit_button.setEnabled(can_submit)
         self.mode_button.setEnabled(not self._waiting_for_gm)
+        self._refresh_suggested_action_buttons()
 
         if self._waiting_for_gm:
             self._apply_thinking_indicator_text()
@@ -1749,6 +1804,7 @@ class StoryScreen(RepositoryBackedWidget):
         ):
             QTimer.singleShot(
                 STORY_REVEAL_STALL_TIMEOUT_MS,
+                self,
                 lambda: self._recover_stalled_story_reveal(
                     story_id,
                     reveal_generation,

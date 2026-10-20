@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from ai_adventure.stats import PLAYER_ACHIEVEMENT_RULE, STATS_RULE
+from ai_adventure.suggested_actions import ACTION_RULE
 
 from ai_adventure.container_flow import CONTAINER_FLOW_RULE
 from ai_adventure.inventory_storage import inventory_access, inventory_load
@@ -1259,6 +1260,7 @@ class AiContextBuilder:
                     "code fences, HTML, or hidden text."
                 ),
                 "suggested_actions": (
+                    ACTION_RULE + " " +
                     "Array of 3-4 suggested player actions for in-game turns. "
                     "Use an empty array for fully out-of-game answers."
                 ),
@@ -1566,6 +1568,7 @@ def _history_entry_context(entry) -> dict[str, Any]:
     """Returns a compact history entry for AI context."""
 
     data = entry.to_dict()
+    data.pop("suggested_actions", None)
     data["content"] = _compact_text(data.get("content", ""))
     return data
 

@@ -1,6 +1,7 @@
 """Application workflow for new-game setup and world generation."""
 
 from __future__ import annotations
+from ai_adventure.suggested_actions import saved_actions
 
 from dataclasses import dataclass
 import logging
@@ -238,6 +239,11 @@ class NewGameService:
                 introductory_message,
                 sound_effect_cues=getattr(result, "sound_effect_cues", []),
                 speaker_cues=speaker_cues,
+                suggested_actions=saved_actions(
+                    getattr(result, "suggested_actions", []), getattr(result, "suggested_action_prompts", {}),
+                    style=repository.get_setting("ai.narration_style", "second_person_limited"),
+                    player_name=repository.get_setting("player_name", ""),
+                ),
             )
             event_results: list[AppliedEventResult] = []
             suggested_events = getattr(result, "suggested_events", [])

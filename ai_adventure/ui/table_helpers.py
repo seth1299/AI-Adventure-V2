@@ -359,7 +359,10 @@ def _configure_auto_height_table(
         table.setMaximumHeight(target_height)
 
     def schedule_refresh(*_args: Any) -> None:
-        QTimer.singleShot(0, refresh_height)
+        from shiboken6 import isValid
+        if not isValid(table):
+            return
+        QTimer.singleShot(0, table, refresh_height)
 
     model = table.model()
     model.rowsInserted.connect(schedule_refresh)

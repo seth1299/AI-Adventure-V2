@@ -20,9 +20,10 @@ from ai_adventure.app.user_settings import (
 from ai_adventure.ui.dialogues import MainMenuSettingsDialog
 from ai_adventure.ui.main_window import MainWindow
 from ai_adventure.ui.themes_audio import apply_application_theme
+from tests.qt_test_case import QtTestCase
 
 
-class UiAppearanceTests(unittest.TestCase):
+class UiAppearanceTests(QtTestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.app = QApplication.instance() or QApplication([])

@@ -4278,6 +4278,9 @@ class SaveRepository(PlayerStatsRepository):
         message_id: str | None = None,
         sound_effect_cues: list[dict[str, str]] | None = None,
         speaker_cues: list[dict[str, str]] | None = None,
+        subjects: list[dict[str, str]] | None = None,
+        turn_id: str = "",
+        suggested_actions: list[dict[str, str]] | None = None,
     ) -> str:
         """
         Appends an entry to the adventure history.
@@ -4288,6 +4291,8 @@ class SaveRepository(PlayerStatsRepository):
             message_id: Optional conversation message ID.
             sound_effect_cues: Exact one-shot narration cue anchors for replay.
             speaker_cues: Exact anchored speaker/voice assignments for replay.
+            subjects: Optional stable subject references, e.g. type=npc and id=npc_mara.
+            turn_id: Shared exchange ID; each history row retains its own message ID.
 
         Returns:
             The associated conversation message ID.
@@ -4334,7 +4339,7 @@ class SaveRepository(PlayerStatsRepository):
         ]
 
         with self._connect() as connection:
-            connection.execute(
+            cursor = connection.execute(
                 """
                 INSERT INTO history_entries (
                     message_id,
@@ -4343,9 +4348,9 @@ class SaveRepository(PlayerStatsRepository):
                     sound_effect_cues_json,
                     speaker_cues_json,
                     hidden,
-                    created_at
+                    created_at, turn_id, suggested_actions_json
                 )
-                VALUES (?, ?, ?, ?, ?, 0, ?)
+                VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?)
                 """,
                 (
                     resolved_message_id,
@@ -4354,9 +4359,103 @@ class SaveRepository(PlayerStatsRepository):
                     json.dumps(clean_sound_effect_cues, ensure_ascii=False),
                     json.dumps(clean_speaker_cues, ensure_ascii=False),
                     datetime.now().isoformat(timespec="seconds"),
+                    turn_id,
+                    json.dumps(suggested_actions or [], ensure_ascii=False),
                 ),
             )
+            inferred = self.find_history_subjects(clean_content, speaker_cues=speaker_cues) if kind in {"player", "story"} else []
+            for subject in [*(subjects or []), *inferred]:
+                subject_type = str(subject.get("type", "")).strip()
+                subject_id = str(subject.get("id", "")).strip()
+                if subject_type and subject_id:
+                    connection.execute(
+                        "INSERT OR IGNORE INTO history_subjects VALUES (?, ?, ?)",
+                        (cursor.lastrowid, subject_type, subject_id),
+                    )
         return resolved_message_id
+
+    def find_history_subjects(
+        self, text: str, *, speaker_cues: list[dict[str, str]] | None = None,
+    ) -> list[dict[str, str]]:
+        """Match known stable IDs or unambiguous full names, never private NPC facts."""
+        with self._connect() as connection:
+            candidates = [
+                ("npc", str(row["id"]), (row["name"], row["display_name"]))
+                for row in connection.execute("SELECT id, name, display_name FROM npcs")
+            ] + [
+                ("item", str(row["id"]), (row["name"],))
+                for row in connection.execute("SELECT id, name FROM item_catalog")
+            ]
+        names: dict[str, set[tuple[str, str]]] = {}
+        for kind, subject_id, aliases in candidates:
+            for alias in aliases:
+                if str(alias or "").strip():
+                    names.setdefault(str(alias).strip().casefold(), set()).add((kind, subject_id))
+        folded = text.casefold()
+        found = {
+            next(iter(identities)) for name, identities in names.items()
+            if len(identities) == 1 and re.search(r"(?<!\w)" + re.escape(name) + r"(?!\w)", folded)
+        }
+        speaker_ids = {str(cue.get("speaker_id", "")).casefold() for cue in speaker_cues or []}
+        for kind, subject_id, _ in candidates:
+            if (kind == "npc" and subject_id.casefold() in speaker_ids) or re.search(
+                r"(?<!\w)" + re.escape(subject_id.casefold()) + r"(?!\w)", folded
+            ):
+                found.add((kind, subject_id))
+        return [{"type": kind, "id": subject_id} for kind, subject_id in sorted(found)]
+
+    def link_history_turn_subjects(
+        self, turn_id: str, *, text: str = "", speaker_cues: list[dict[str, str]] | None = None,
+    ) -> None:
+        """Share subjects across a completed player/narrator exchange atomically."""
+        if not turn_id:
+            return
+        inferred = self.find_history_subjects(text, speaker_cues=speaker_cues)
+        with self._connect() as connection:
+            rows = connection.execute("SELECT id FROM history_entries WHERE turn_id = ?", (turn_id,)).fetchall()
+            existing = connection.execute(
+                "SELECT DISTINCT s.subject_type, s.subject_id FROM history_subjects s "
+                "JOIN history_entries h ON h.id = s.history_id WHERE h.turn_id = ?", (turn_id,),
+            ).fetchall()
+            subjects = {(row[0], row[1]) for row in existing} | {(s["type"], s["id"]) for s in inferred}
+            connection.executemany("INSERT OR IGNORE INTO history_subjects VALUES (?, ?, ?)",
+                                   [(row[0], kind, sid) for row in rows for kind, sid in subjects])
+
+    def recall_subject_history(
+        self, subjects: list[dict[str, str]], *, before_id: int | None = None,
+        per_subject: int = 4, limit: int = 6, max_chars: int = 6000,
+    ) -> list[dict[str, Any]]:
+        """Indexed, bounded recall of older live conversation excerpts only."""
+        if per_subject <= 0 or limit <= 0 or max_chars <= 0:
+            return []
+        max_chars = min(max_chars, 6000)
+        pools = []
+        with self._connect() as connection:
+            for subject in subjects[:3]:
+                pools.append(connection.execute(
+                    "SELECT h.id, h.message_id, h.kind, h.content, h.created_at FROM history_subjects s "
+                    "JOIN history_entries h ON h.id = s.history_id "
+                    "WHERE s.subject_type = ? AND s.subject_id = ? AND h.hidden = 0 "
+                    "AND h.kind IN ('player', 'story') AND (? IS NULL OR h.id < ?) "
+                    "ORDER BY s.history_id DESC LIMIT ?",
+                    (subject["type"], subject["id"], before_id, before_id, min(per_subject, 4)),
+                ).fetchall())
+        selected = {}
+        # Round-robin so one busy subject cannot consume the whole budget.
+        for offset in range(min(per_subject, 4)):
+            for pool in pools:
+                if offset >= len(pool) or len(selected) >= min(limit, 6) or max_chars <= 0:
+                    continue
+                entry = dict(pool[offset])
+                if entry["id"] in selected:
+                    continue
+                text = sanitize_english_text(entry["content"])
+                cap = min(1200, max_chars)
+                entry["content"] = text if len(text) <= cap else text[:max(0, cap - 1)] + "…"
+                entry["excerpted"] = len(text) > cap
+                max_chars -= len(entry["content"])
+                selected[entry["id"]] = entry
+        return sorted(selected.values(), key=lambda entry: entry["id"])
 
     def append_mechanical_event(
         self,
@@ -4468,7 +4567,7 @@ class SaveRepository(PlayerStatsRepository):
             rows = connection.execute(
                 """
                 SELECT id, message_id, kind, content, sound_effect_cues_json,
-                       speaker_cues_json, hidden, created_at
+                       speaker_cues_json, hidden, created_at, turn_id, suggested_actions_json
                 FROM history_entries
                 """ + where + (" ORDER BY id DESC LIMIT ?" if limit is not None else " ORDER BY id ASC"),
                 (*parameters, limit) if limit is not None else parameters,
@@ -4477,8 +4576,24 @@ class SaveRepository(PlayerStatsRepository):
             rows.reverse()
 
         history: list[dict[str, Any]] = []
+        subjects_by_id: dict[int, list[dict[str, str]]] = {}
+        with self._connect() as connection:
+            for offset in range(0, len(rows), 400):
+                ids = [row["id"] for row in rows[offset:offset + 400]]
+                for subject in connection.execute(
+                    "SELECT history_id, subject_type, subject_id FROM history_subjects WHERE history_id IN ("
+                    + ",".join("?" for _ in ids) + ") ORDER BY subject_type, subject_id", ids,
+                ):
+                    subjects_by_id.setdefault(subject[0], []).append({"type": subject[1], "id": subject[2]})
         for row in rows:
             entry = dict(row)
+            try:
+                actions = json.loads(entry.pop("suggested_actions_json", "[]"))
+            except (TypeError, json.JSONDecodeError):
+                actions = []
+            entry["suggested_actions"] = [action for action in actions if isinstance(action, dict)
+                                           and action.get("label") and action.get("prompt")][:4] if isinstance(actions, list) else []
+            entry["subjects"] = subjects_by_id.get(entry["id"], [])
             entry["hidden"] = bool(entry.get("hidden", 0))
             entry["content"] = sanitize_english_text(entry.get("content", ""))
             try:
@@ -4870,6 +4985,10 @@ class SaveRepository(PlayerStatsRepository):
             if not isinstance(snapshot, dict):
                 return False
 
+            # Regenerating a story must not undo the player's current UI layout.
+            tab_layout = connection.execute(
+                "SELECT value_json FROM settings WHERE key = 'ui.tab_layout'"
+            ).fetchone()
             # Restore the complete snapshot before checking relationships. The
             # snapshot's alphabetical table order can put children before parents.
             connection.execute("PRAGMA defer_foreign_keys = ON")
@@ -4899,6 +5018,9 @@ class SaveRepository(PlayerStatsRepository):
                     [tuple(row) for row in rows if isinstance(row, list)],
                 )
 
+            if tab_layout is not None:
+                connection.execute("INSERT OR REPLACE INTO settings(key, value_json) VALUES ('ui.tab_layout', ?)",
+                                   (tab_layout[0],))
             synchronize_container_records(connection, _upsert_item_catalog_entry)
             if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
                 raise sqlite3.IntegrityError("Snapshot contains invalid record relationships.")
@@ -6068,8 +6190,18 @@ class SaveRepository(PlayerStatsRepository):
                     sound_effect_cues_json TEXT NOT NULL DEFAULT '[]',
                     speaker_cues_json TEXT NOT NULL DEFAULT '[]',
                     hidden INTEGER NOT NULL DEFAULT 0,
-                    created_at TEXT NOT NULL
+                    created_at TEXT NOT NULL,
+                    turn_id TEXT NOT NULL DEFAULT ''
                 );
+
+                CREATE TABLE IF NOT EXISTS history_subjects (
+                    history_id INTEGER NOT NULL REFERENCES history_entries(id) ON DELETE CASCADE,
+                    subject_type TEXT NOT NULL,
+                    subject_id TEXT NOT NULL,
+                    PRIMARY KEY (history_id, subject_type, subject_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_history_subject_lookup
+                ON history_subjects(subject_type, subject_id, history_id DESC);
 
                 CREATE TABLE IF NOT EXISTS mechanical_events (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -6254,6 +6386,9 @@ class SaveRepository(PlayerStatsRepository):
                 "message_id",
                 "TEXT NOT NULL DEFAULT ''",
             )
+            _ensure_column(connection, "history_entries", "turn_id", "TEXT NOT NULL DEFAULT ''")
+            _ensure_column(connection, "history_entries", "suggested_actions_json", "TEXT NOT NULL DEFAULT '[]'")
+            connection.execute("CREATE INDEX IF NOT EXISTS idx_history_turn ON history_entries(turn_id)")
             _ensure_column(
                 connection,
                 "history_entries",

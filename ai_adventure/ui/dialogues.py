@@ -963,7 +963,7 @@ class ContentCategoryComboBox(_NoWheelComboBox):
             self._refresh_summary()
 
         self.selection_changed.emit()
-        QTimer.singleShot(0, self._refresh_summary)
+        QTimer.singleShot(0, self, self._refresh_summary)
 
     def _sync_no_restrictions_item(self) -> None:
         all_item = self._model.item(0)

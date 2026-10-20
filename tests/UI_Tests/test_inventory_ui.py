@@ -76,9 +76,10 @@ from ai_adventure.ui.main_window import (
     _inventory_item_display_name,
     _inventory_quantity_display,
 )
+from tests.qt_test_case import QtTestCase
 
 
-class InventoryUiTests(unittest.TestCase):
+class InventoryUiTests(QtTestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.app_data_temp_dir = tempfile.TemporaryDirectory(
@@ -1124,9 +1125,10 @@ class InventoryUiTests(unittest.TestCase):
         old_road_name = wizard.starting_locations_table.cellWidget(0, 0)
         self.assertIsInstance(old_road_name, QComboBox)
         assert isinstance(old_road_name, QComboBox)
-        self.assertFalse(old_road_name.isEditable())
+        self.assertTrue(old_road_name.isEditable())
         custom_index = old_road_name.findData("__custom_choice__")
         self.assertGreaterEqual(custom_index, 0)
+        old_road_name.setCurrentIndex(custom_index)
         old_road_name.activated.emit(custom_index)
         self.assertTrue(old_road_name.isEditable())
         old_road_name.setEditText("North Road")

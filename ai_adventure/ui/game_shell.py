@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from functools import wraps
 
 from ai_adventure.ui.common import *  # noqa: F401,F403
 from ai_adventure.ui.dialogues import *  # noqa: F401,F403
@@ -23,6 +24,19 @@ from ai_adventure.ui.screens.travel import *  # noqa: F401,F403
 
 
 LOGGER = logging.getLogger(__name__)
+
+
+def _persist_tab_changes(method):
+    """Save once after a complete tab operation, including nested operations."""
+    @wraps(method)
+    def changed(self, *args, **kwargs):
+        self._tab_layout_depth += 1
+        try:
+            return method(self, *args, **kwargs)
+        finally:
+            self._tab_layout_depth -= 1
+            self._persist_tab_layout()
+    return changed
 
 
 class _DetachableTabBar(QTabBar):
@@ -141,6 +155,8 @@ class GameShell(QWidget):
         self.playtesting_tools = bool(playtesting_tools)
         self.ai_enabled = bool(ai_enabled)
         self.repository: SaveRepository | None = None
+        self._tab_layout_depth = 0
+        self._saved_tab_layout: dict[str, Any] | None = None
         self.visual_asset_coordinator = _VisualAssetCoordinator(
             images_dir=self.generated_images_dir,
             api_key_path=(
@@ -294,7 +310,7 @@ class GameShell(QWidget):
 
         self.tabs.tabCloseRequested.connect(self._close_tab)
         self.tab_bar.detach_requested.connect(self._detach_tab)
-        self.tab_bar.tabMoved.connect(lambda _from, _to: self._sync_protected_tab_button())
+        self.tab_bar.tabMoved.connect(self._handle_tab_moved)
         self.tabs.currentChanged.connect(self._handle_tab_changed)
         self._sync_protected_tab_button()
 
@@ -475,6 +491,7 @@ class GameShell(QWidget):
                 )
 
     @Slot(int)
+    @_persist_tab_changes
     def _close_tab(self, index: int) -> None:
         """Hides one closable tab until the player restores it from the plus menu."""
 
@@ -511,6 +528,7 @@ class GameShell(QWidget):
                 lambda _checked=False, key=tab_key: self._restore_tab(key)
             )
 
+    @_persist_tab_changes
     def _restore_tab(self, tab_key: str) -> None:
         """Returns one closed or detached screen to the main tab strip."""
 
@@ -534,6 +552,7 @@ class GameShell(QWidget):
         self._sync_protected_tab_button()
 
     @Slot(str, QPoint)
+    @_persist_tab_changes
     def _detach_tab(self, tab_key: str, global_position: QPoint) -> None:
         """Moves one docked tab into an independent, maximizable window."""
 
@@ -557,6 +576,7 @@ class GameShell(QWidget):
         window.show()
 
     @Slot(str)
+    @_persist_tab_changes
     def _return_detached_tab(self, tab_key: str) -> None:
         """Redocks a screen when its independent window is closed."""
 
@@ -582,6 +602,7 @@ class GameShell(QWidget):
     def hideEvent(self, event: Any) -> None:
         """Hides detached screens when the game shell itself leaves view."""
 
+        self._persist_tab_layout()
         for window in self._detached_windows.values():
             window.hide()
         super().hideEvent(event)
@@ -593,7 +614,97 @@ class GameShell(QWidget):
         for window in self._detached_windows.values():
             window.show()
 
+    def _persist_tab_layout(self) -> None:
+        if self.repository is None or self._tab_layout_depth:
+            return
+        layout = {
+            "version": 1,
+            "known_tabs": list(self._tab_order),
+            "open_tabs": [str(self.tab_bar.tabData(i)) for i in range(self.tabs.count())],
+            "detached_tabs": list(self._detached_windows),
+            "active_tab": str(self.tab_bar.tabData(self.tabs.currentIndex()) or ""),
+            "smart_hidden_tabs": sorted(self._smart_hidden_tabs),
+        }
+        if layout == self._saved_tab_layout:
+            return
+        try:
+            self.repository.set_setting("ui.tab_layout", layout)
+        except Exception:
+            LOGGER.exception("Could not persist the adventure tab layout.")
+        else:
+            self._saved_tab_layout = layout
+
+    @Slot(int, int)
+    def _handle_tab_moved(self, _from: int, _to: int) -> None:
+        self._sync_protected_tab_button()
+        self._persist_tab_layout()
+
+    def _reset_tab_layout(self) -> None:
+        """Reparent screens safely before applying another save's layout."""
+        for window in list(self._detached_windows.values()):
+            screen = window.takeCentralWidget()
+            if screen is not None:
+                screen.setParent(self)
+            window.blockSignals(True)
+            window.hide()
+            window.deleteLater()
+        self._detached_windows.clear()
+        self.tabs.clear()
+        self._smart_hidden_tabs.clear()
+        for key in self._tab_order:
+            screen, label, _closable = self._tab_specs[key]
+            index = self.tabs.addTab(screen, label)
+            self.tab_bar.setTabData(index, key)
+
+    def _apply_saved_tab_layout(self, layout: dict[str, Any]) -> None:
+        def keys(field):
+            raw = layout.get(field, [])
+            return list(dict.fromkeys(key for key in raw if isinstance(key, str) and key in self._tab_specs)) if isinstance(raw, list) else []
+        opened = keys("open_tabs")
+        detached = [key for key in keys("detached_tabs") if key not in opened]
+        known = keys("known_tabs")
+        for key in self._tab_order:
+            if key not in opened and key not in detached and (key not in known or not self._tab_specs[key][2]):
+                opened.append(key)
+        self.tabs.clear()
+        for key in opened:
+            screen, label, _closable = self._tab_specs[key]
+            index = self.tabs.addTab(screen, label)
+            self.tab_bar.setTabData(index, key)
+        for key in detached:
+            screen, label, _closable = self._tab_specs[key]
+            index = self.tabs.addTab(screen, label)
+            self.tab_bar.setTabData(index, key)
+            self._detach_tab(key, QPoint(120, 120))
+        self._smart_hidden_tabs = set(keys("smart_hidden_tabs")) - set(opened) - set(detached)
+        active = self._tab_index_for_key(str(layout.get("active_tab", "")))
+        if active >= 0:
+            self.tabs.setCurrentIndex(active)
+        self._sync_protected_tab_button()
+        self._rebuild_add_tab_menu()
+
     def set_repository(
+        self, repository: SaveRepository | None, *, initially_hide_empty_tabs: bool = False,
+        defer_music_playback: bool = False, defer_visual_scan: bool = False,
+    ) -> None:
+        self._persist_tab_layout()
+        self._tab_layout_depth += 1
+        try:
+            saved = repository.get_setting("ui.tab_layout", None) if repository is not None else None
+            valid = isinstance(saved, dict) and saved.get("version") == 1 and isinstance(saved.get("open_tabs"), list)
+            if repository is not None:
+                self._reset_tab_layout()
+            self._bind_repository(repository,
+                initially_hide_empty_tabs=initially_hide_empty_tabs and not valid,
+                defer_music_playback=defer_music_playback, defer_visual_scan=defer_visual_scan)
+            if valid:
+                self._apply_saved_tab_layout(saved)
+            self._saved_tab_layout = saved if valid else None
+        finally:
+            self._tab_layout_depth -= 1
+        self._persist_tab_layout()
+
+    def _bind_repository(
         self,
         repository: SaveRepository | None,
         *,
@@ -645,6 +756,7 @@ class GameShell(QWidget):
             )
             QTimer.singleShot(
                 100,
+                self,
                 lambda repository=repository: self._scan_visual_assets_if_active(
                     repository
                 ),
@@ -702,6 +814,7 @@ class GameShell(QWidget):
             self._dock_smart_hidden_tab(tab_key)
         self._smart_hidden_tabs.clear()
 
+    @_persist_tab_changes
     def _dock_smart_hidden_tab(self, tab_key: str) -> None:
         """Docks a smart-hidden tab without stealing focus from the player."""
 
@@ -805,6 +918,7 @@ class GameShell(QWidget):
         screen = self.tabs.widget(index)
         if isinstance(screen, RepositoryBackedWidget) and tab_key:
             self._tab_content_signatures[tab_key] = _screen_content_signature(screen)
+        self._persist_tab_layout()
 
     def _submit_travel_request(
         self,

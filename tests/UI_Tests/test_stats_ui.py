@@ -19,9 +19,10 @@ from ai_adventure.ui.screens.stats import StatsScreen
 from ai_adventure.ui.screens.character import CharacterScreen
 from ai_adventure.ui.screens.inventory import InventoryScreen
 from ai_adventure.ui.wizards.new_game import NewGameWizard
+from tests.qt_test_case import QtTestCase
 
 
-class StatsUiTests(unittest.TestCase):
+class StatsUiTests(QtTestCase):
     @staticmethod
     def capture(widget, name):
         directory = os.environ.get("AI_ADVENTURE_UI_CAPTURE_DIR")
@@ -123,7 +124,8 @@ class StatsUiTests(unittest.TestCase):
                 setup = wizard.build_setup()
                 self.assertEqual((setup["point_buy_budget"], setup["starting_player_level"]), (budget, level))
             wizard._reset_point_buy(blank=True)
-            self.assertFalse(wizard.stats_page.isComplete())
+            # Unspent points are allowed; only allocations over budget are invalid.
+            self.assertTrue(wizard.stats_page.isComplete())
             self.assertIn("Remaining 45", wizard.point_buy_summary.text())
             wizard._reset_point_buy()
             wizard.show()

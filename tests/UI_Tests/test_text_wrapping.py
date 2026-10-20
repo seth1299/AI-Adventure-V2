@@ -8,9 +8,10 @@ from PySide6.QtWidgets import QApplication, QPlainTextEdit, QTextEdit
 
 from ai_adventure.ui.widgets.inputs import install_plain_text_paste
 from ai_adventure.ui.primitives import _set_markdown_text
+from tests.qt_test_case import QtTestCase
 
 
-class TextWrappingTests(unittest.TestCase):
+class TextWrappingTests(QtTestCase):
     @classmethod
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication([])

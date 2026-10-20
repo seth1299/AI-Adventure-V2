@@ -1089,7 +1089,10 @@ class NewGameWizard(QWizard):
     def _schedule_page_heading_style(self, _page_id: int) -> None:
         """Restyles Qt's shared title labels after the page text changes."""
 
-        QTimer.singleShot(0, self._style_current_page_headings)
+        from shiboken6 import isValid
+        if not isValid(self):
+            return
+        QTimer.singleShot(0, self, self._style_current_page_headings)
 
     def _style_current_page_headings(self) -> None:
         """Makes the current page title and subtitle visibly distinct."""

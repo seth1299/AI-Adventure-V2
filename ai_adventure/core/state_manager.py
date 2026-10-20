@@ -438,6 +438,9 @@ class StateManager:
             entries.append(
                 HistoryEntry(
                     id=_read_optional_int(row, "id"),
+                    turn_id=_read_string(row, "turn_id", ""),
+                    subjects=row.get("subjects", []),
+                    suggested_actions=row.get("suggested_actions", []),
                     message_id=_read_string(row, "message_id", ""),
                     kind=_read_string(row, "kind", "misc"),
                     content=_read_string(row, "content", ""),

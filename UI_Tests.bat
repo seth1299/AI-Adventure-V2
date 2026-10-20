@@ -7,7 +7,7 @@ pushd "%REPO_ROOT%"
 echo ============================================================
 echo UI_Tests - verbose unittest discovery
 echo Started: %DATE% %TIME%
-echo Command: .venv\Scripts\python.exe -u -m unittest discover -s tests\UI_Tests -t . -v
+echo Command: .venv\Scripts\python.exe -u -m unittest discover -s tests\UI_Tests -t . -v --durations 15
 echo ============================================================
 if not exist ".venv\Scripts\python.exe" (
     echo ERROR: Project interpreter not found at .venv\Scripts\python.exe
@@ -16,7 +16,7 @@ if not exist ".venv\Scripts\python.exe" (
 )
 set "PYTHONUNBUFFERED=1"
 set "PYTHONUTF8=1"
-".venv\Scripts\python.exe" -u -m unittest discover -s "tests\UI_Tests" -t . -v
+".venv\Scripts\python.exe" -u -m unittest discover -s "tests\UI_Tests" -t . -v --durations 15
 set "TEST_EXIT=%ERRORLEVEL%"
 echo.
 echo Finished: %DATE% %TIME%

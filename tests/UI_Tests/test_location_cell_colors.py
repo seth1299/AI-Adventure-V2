@@ -16,9 +16,10 @@ from ai_adventure.ui.table_helpers import _AppTableWidget, _configure_inline_tab
 from ai_adventure.ui.themes_audio import (
     _dark_theme_palette, _dark_theme_stylesheet, _light_theme_palette, _light_theme_stylesheet,
 )
+from tests.qt_test_case import QtTestCase
 
 
-class LocationCellColorTests(unittest.TestCase):
+class LocationCellColorTests(QtTestCase):
     @classmethod
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication([])

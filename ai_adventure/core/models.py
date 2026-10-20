@@ -284,6 +284,9 @@ class HistoryEntry:
     speaker_cues: list[dict[str, str]] = field(default_factory=list)
     hidden: bool = False
     created_at: str = ""
+    turn_id: str = ""
+    subjects: list[dict[str, str]] = field(default_factory=list)
+    suggested_actions: list[dict[str, str]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         """Returns a JSON-serializable history-entry dictionary."""

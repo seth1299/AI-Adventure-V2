@@ -8,10 +8,11 @@ from PySide6.QtCore import QMimeData, Qt
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QComboBox, QLineEdit, QPlainTextEdit, QTextEdit
 
-from ai_adventure.ui.widgets.inputs import install_plain_text_paste
+from ai_adventure.ui.widgets.inputs import install_plain_text_paste, _PlainTextPasteFilter
+from tests.qt_test_case import QtTestCase
 
 
-class PlainTextPasteTests(unittest.TestCase):
+class PlainTextPasteTests(QtTestCase):
     @classmethod
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication([])
@@ -79,9 +80,10 @@ class PlainTextPasteTests(unittest.TestCase):
         combo.close()
 
     def test_empty_clipboard_does_not_erase_selection_and_install_is_idempotent(self):
-        handler = self.app._plain_text_paste_filter
+        handler = self.app.findChild(_PlainTextPasteFilter)
+        self.assertIsNotNone(handler)
         install_plain_text_paste(self.app)
-        self.assertIs(handler, self.app._plain_text_paste_filter)
+        self.assertIs(handler, self.app.findChild(_PlainTextPasteFilter))
         self.clipboard.clear()
         editor = QTextEdit()
         editor.setPlainText("Keep me")

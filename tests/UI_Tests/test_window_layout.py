@@ -10,9 +10,10 @@ from ai_adventure.ui.game_shell import GameShell
 from ai_adventure.ui.screens.main_menu import MainMenuScreen
 from ai_adventure.ui.themes_audio import apply_application_theme
 from ai_adventure.ui.widgets.containers import CurrentPageStackedWidget
+from tests.qt_test_case import QtTestCase
 
 
-class WindowLayoutTests(unittest.TestCase):
+class WindowLayoutTests(QtTestCase):
     @classmethod
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication([])

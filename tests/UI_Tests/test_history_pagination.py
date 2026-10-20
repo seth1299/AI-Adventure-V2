@@ -10,9 +10,10 @@ from ai_adventure.core.state_manager import StateManager
 from ai_adventure.context.context_builder import AiContextBuilder
 from ai_adventure.persistence.save_repository import SaveRepository
 from ai_adventure.ui.screens.story import StoryScreen
+from tests.qt_test_case import QtTestCase
 
 
-class HistoryPaginationTests(unittest.TestCase):
+class HistoryPaginationTests(QtTestCase):
     @classmethod
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication([])

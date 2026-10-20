@@ -11,9 +11,10 @@ from PySide6.QtWidgets import QApplication, QDialog, QFileDialog, QLabel
 
 from ai_adventure.ui.image_sources import NewGameImageSourceDialog
 from ai_adventure.visual_assets import VisualAssetRequest
+from tests.qt_test_case import QtTestCase
 
 
-class NewGameImageSourceDialogTests(unittest.TestCase):
+class NewGameImageSourceDialogTests(QtTestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.app = QApplication.instance() or QApplication([])

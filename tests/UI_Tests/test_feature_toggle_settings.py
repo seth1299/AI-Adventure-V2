@@ -16,9 +16,10 @@ from ai_adventure.ui.dialogues import TTSSettingsWidget
 from ai_adventure.ui.screens.settings import SettingsScreen
 from ai_adventure.ui.widgets.inputs import FeatureToggleCheckBox
 from ai_adventure.ui.wizards.new_game import NewGameWizard
+from tests.qt_test_case import QtTestCase
 
 
-class FeatureToggleSettingsTests(unittest.TestCase):
+class FeatureToggleSettingsTests(QtTestCase):
     @classmethod
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication([])
