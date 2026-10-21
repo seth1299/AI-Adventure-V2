@@ -427,6 +427,20 @@ def build_visual_asset_requests(
             )
         )
 
+    inventory_keys = {r.subject_key for r in requests if r.subject_type == "inventory"}
+    for item in getattr(repository, "list_crafting_items", lambda: [])():
+        name = str(item.get("name", "")).strip()
+        key = str(item.get("item_uuid", "") or name.casefold())
+        if not name or key in inventory_keys:
+            continue
+        description = _item_visual_description(item, item_catalog) or name
+        requests.append(VisualAssetRequest(
+            subject_type="inventory", subject_key=key, display_name=name,
+            description=f"{item.get('category', 'Item')}. {description}",
+            basic_name=_item_basic_name(item, item_catalog, fallback=name),
+            world_context=world_context, image_style=image_style, banned_terms=banned_terms,
+        ))
+
     for npc in repository.list_player_visible_npcs(limit=500):
         npc_id = str(npc.get("npc_id") or npc.get("id") or "").strip().casefold()
         display_name = str(npc.get("display_name", "Unknown NPC") or "").strip()
@@ -953,21 +967,26 @@ def save_scaled_png(
     target_path: Path,
     *,
     max_pixels: int = STANDARD_IMAGE_MAX_PIXELS,
+    allow_upscale: bool = True,
 ) -> tuple[int, int]:
-    """Writes a forward-compatible RGB PNG and returns the final dimensions.
+    """Writes an RGB or alpha-preserving RGBA PNG and returns its dimensions.
 
     ``max_pixels`` is the retained longest edge, not the preview size.  The
     image is allowed to scale up so a provider response that is smaller than
     the requested tier still receives a consistent on-disk contract.  Native
     Gemini 1K/2K responses should already match the requested tier, so this is
-    primarily a defensive fallback.
+    primarily a defensive fallback. Uploads pass ``allow_upscale=False`` so
+    smaller source images keep their original pixel dimensions.
     """
 
     target_path.parent.mkdir(parents=True, exist_ok=True)
     with Image.open(BytesIO(image_bytes)) as source:
-        image = source.convert("RGB")
+        has_alpha = "A" in source.getbands() or "transparency" in source.info
+        image = source.convert("RGBA" if has_alpha else "RGB")
         target_longest_edge = max(64, int(max_pixels))
         source_longest_edge = max(image.size)
+        if not allow_upscale:
+            target_longest_edge = min(target_longest_edge, source_longest_edge)
         if source_longest_edge != target_longest_edge:
             scale = target_longest_edge / source_longest_edge
             image = image.resize(

@@ -119,6 +119,7 @@ class _VisualAssetCoordinator(QObject):
                 source_path.read_bytes(),
                 target_path,
                 max_pixels=request.maximum_pixels,
+                allow_upscale=False,
             )
             repository.set_visual_asset_status(
                 request.asset_id,

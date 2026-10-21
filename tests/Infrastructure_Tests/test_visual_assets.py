@@ -555,7 +555,7 @@ class VisualAssetTests(unittest.TestCase):
                 self.assertEqual(saved.size, (width, height))
 
     def test_scaled_cache_is_a_1k_rgb_png(self) -> None:
-        source = Image.new("RGBA", (1200, 800), (240, 220, 30, 255))
+        source = Image.new("RGB", (1200, 800), (240, 220, 30))
         image_bytes = BytesIO()
         source.save(image_bytes, format="PNG")
 
@@ -571,6 +571,48 @@ class VisualAssetTests(unittest.TestCase):
                 self.assertEqual(saved.format, "PNG")
                 self.assertEqual(saved.mode, "RGB")
                 self.assertEqual(saved.size, (width, height))
+
+    def test_png_cache_preserves_transparent_and_translucent_pixels(self) -> None:
+        source = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+        source.putpixel((32, 32), (255, 20, 10, 128))
+        data = BytesIO()
+        source.save(data, format="PNG")
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "icon.png"
+            save_scaled_png(data.getvalue(), target, max_pixels=64)
+            with Image.open(target) as saved:
+                self.assertEqual(saved.mode, "RGBA")
+                self.assertEqual(saved.getpixel((0, 0)), (0, 0, 0, 0))
+                self.assertEqual(saved.getpixel((32, 32)), (255, 20, 10, 128))
+
+    def test_upload_scaling_keeps_small_images_and_shrinks_large_images(self) -> None:
+        for source_size, expected_size in [((32, 32), (32, 32)), ((600, 400), (600, 400)), ((2048, 1024), (1024, 512))]:
+            with self.subTest(source_size=source_size), tempfile.TemporaryDirectory() as directory:
+                original = Path(directory) / "original.png"
+                target = Path(directory) / "cache" / "copy.png"
+                Image.new("RGBA", source_size, (200, 10, 50, 100)).save(original)
+                original_bytes = original.read_bytes()
+                dimensions = save_scaled_png(original_bytes, target, allow_upscale=False)
+                self.assertEqual(dimensions, expected_size)
+                self.assertEqual(original.read_bytes(), original_bytes)
+                with Image.open(target) as saved:
+                    self.assertEqual(saved.mode, "RGBA")
+                    self.assertEqual(saved.getpixel((0, 0))[3], 100)
+
+    def test_png_cache_preserves_palette_transparency_when_resized(self) -> None:
+        source = Image.new("P", (32, 32), 0)
+        source.putpalette([0, 0, 0, 255, 0, 0] + [0] * 762)
+        source.paste(1, (8, 8, 24, 24))
+        data = BytesIO()
+        source.save(data, format="PNG", transparency=0)
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "icon.png"
+            save_scaled_png(data.getvalue(), target, max_pixels=128)
+            with Image.open(target) as saved:
+                self.assertEqual(saved.mode, "RGBA")
+                self.assertEqual(saved.size, (128, 128))
+                self.assertEqual(saved.getpixel((0, 0))[3], 0)
+                self.assertEqual(saved.getpixel((64, 64))[3], 255)
 
     def test_repository_persists_structured_visual_asset_metadata(self) -> None:
         request = VisualAssetRequest(

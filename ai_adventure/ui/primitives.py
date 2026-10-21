@@ -818,13 +818,16 @@ def _skill_level_label(level: int) -> str:
 
 
 def _skill_xp_progress_label(skill: dict[str, Any]) -> str:
-    """Formats cumulative skill XP against the next level threshold."""
+    """Shows progress within this level, excluding its starting XP baseline."""
 
     level = max(1, min(MAX_SKILL_LEVEL, _safe_int(skill.get("level", 1), 1)))
     xp = max(0, _safe_int(skill.get("xp", 0), 0))
     if level >= MAX_SKILL_LEVEL:
         return "Max Level; no further XP or levels"
-    return f"{xp} / {XP_THRESHOLDS_BY_LEVEL[level + 1]}"
+    floor = XP_THRESHOLDS_BY_LEVEL[level]
+    required = XP_THRESHOLDS_BY_LEVEL[level + 1] - floor
+    progress = min(required, max(0, xp - floor))
+    return f"{progress} / {required} XP toward level {level + 1}"
 
 
 def _calendar_event_time_label(

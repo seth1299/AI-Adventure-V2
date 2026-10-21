@@ -259,12 +259,9 @@ def _skill_xp_progress_bar(skill: dict[str, Any]) -> QProgressBar:
 
     level = max(1, min(MAX_SKILL_LEVEL, _safe_int(skill.get("level", 1), 1)))
     xp = max(0, _safe_int(skill.get("xp", 0), 0))
-    target_xp = XP_THRESHOLDS_BY_LEVEL[MAX_SKILL_LEVEL]
-    if level < MAX_SKILL_LEVEL:
-        target_xp = XP_THRESHOLDS_BY_LEVEL[level + 1]
-
     floor = XP_THRESHOLDS_BY_LEVEL[level]
-    percentage = min(100, max(0, round((xp - floor) * 100 / 8)))
+    required = XP_THRESHOLDS_BY_LEVEL[min(level + 1, MAX_SKILL_LEVEL)] - floor
+    percentage = min(100, max(0, round((xp - floor) * 100 / required))) if required else 0
     bar = QProgressBar()
     bar.setObjectName("skillXpProgressBar")
     bar.setRange(0, 100)

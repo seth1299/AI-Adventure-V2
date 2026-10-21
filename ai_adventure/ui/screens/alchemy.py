@@ -289,8 +289,22 @@ class AlchemyNotebookScreen(RepositoryBackedWidget):
         if repository is None or not 0 <= row < len(self._reagent_rows):
             return
         item = self._reagent_rows[row]
-        CraftingDetailsDialog(
+        key = str(item.get("item_uuid") or str(item.get("name", "")).casefold())
+
+        def select_image():
+            if self.choose_visual_asset("inventory", key):
+                asset = repository.get_visual_asset("inventory", key)
+                _set_generated_image(dialog.image_preview, self.visual_asset_path(asset),
+                                     maximum_width=256, maximum_height=192,
+                                     accessible_name=f"{item.get('name', 'Item')} image")
+
+        asset = repository.get_visual_asset("inventory", key)
+        dialog = CraftingDetailsDialog(
             title=str(item.get("name", "Crafting Item")),
+            image_path=self.visual_asset_path(asset),
+            on_select_image=select_image,
+            on_create_image=(lambda: self.create_visual_asset("inventory", key))
+                if self.visual_asset_generation_enabled() else None,
             sections=[
                 ("Category", str(item.get("category", ""))),
                 ("Rarity", str(item.get("rarity", ""))),
@@ -304,7 +318,8 @@ class AlchemyNotebookScreen(RepositoryBackedWidget):
                 ("Notes", str(item.get("notes", ""))),
             ],
             parent=self,
-        ).exec()
+        )
+        dialog.exec()
 
     def _open_recipe_details(self, row: int, _column: int) -> None:
         repository = self.repository()

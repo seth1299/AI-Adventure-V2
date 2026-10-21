@@ -18,6 +18,7 @@ from ai_adventure.new_game_setup import build_new_game_setup_packet
 from ai_adventure.persistence.save_repository import SaveRepository
 from ai_adventure.skills.rules import SKILL_DESCRIPTION_RULE, MAX_SKILL_XP_RULE
 from ai_adventure.ui.screens.stats import _skill_xp_progress_bar
+from ai_adventure.ui.primitives import _skill_xp_progress_label
 from tests.qt_test_case import QtTestCase
 
 
@@ -33,6 +34,24 @@ class SkillPresentationTests(QtTestCase):
             self.assertIn("no further XP", bar.toolTip())
             self.assertIn("Max Level", bar.accessibleName())
         self.assertEqual(_skill_xp_progress_bar({"level": 1, "xp": 4}).format(), "50%")
+
+    def test_starting_level_baseline_is_not_displayed_as_earned_progress(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository = SaveRepository.create_new_save(Path(directory), "Starting skill XP")
+            repository.upsert_skill("Customer Relations", "Interact with patrons.", 3)
+            skill = repository.get_skill("Customer Relations")
+            self.assertEqual(skill["xp"], 16)
+            self.assertEqual(_skill_xp_progress_label(skill), "0 / 8 XP toward level 4")
+            self.assertEqual(_skill_xp_progress_bar(skill).value(), 0)
+            repository.add_skill_xp("Customer Relations", 2)
+            skill = repository.get_skill("Customer Relations")
+            self.assertEqual(_skill_xp_progress_label(skill), "2 / 8 XP toward level 4")
+            self.assertEqual(_skill_xp_progress_bar(skill).value(), 25)
+            repository.add_skill_xp("Customer Relations", 6)
+            skill = repository.get_skill("Customer Relations")
+            self.assertEqual(skill["level"], 4)
+            self.assertEqual(_skill_xp_progress_label(skill), "0 / 8 XP toward level 5")
+            self.assertEqual(_skill_xp_progress_bar(skill).value(), 0)
 
     def test_xp_stops_after_reaching_master(self):
         with tempfile.TemporaryDirectory() as directory:
