@@ -1128,11 +1128,12 @@ class StoryScreen(RepositoryBackedWidget):
             button.setToolTip(str(action["prompt"]))
             button.setEnabled(not self._waiting_for_gm and self._revealing_story_id is None)
             button.clicked.connect(lambda _checked=False, entry_id=entry["id"], prompt=action["prompt"]:
-                                   self._submit_suggested_action(entry_id, prompt))
+                                   self._compose_suggested_action(entry_id, prompt))
             self.suggested_actions_layout.addWidget(button, index // 2, index % 2)
             self.suggested_action_buttons.append(button)
 
-    def _submit_suggested_action(self, entry_id: int, prompt: str) -> None:
+    def _compose_suggested_action(self, entry_id: int, prompt: str) -> None:
+        """Fill an editable draft; only Submit/Enter sends the player's action."""
         repository = self.repository()
         if repository is None or self._waiting_for_gm or self._revealing_story_id is not None or self._conversation_mode() != "live_game":
             return
@@ -1145,7 +1146,8 @@ class StoryScreen(RepositoryBackedWidget):
             style=repository.get_setting("ai.narration_style", "second_person_limited"),
             player_name=repository.get_setting("player_name", ""))
         self.player_input.setText(command)
-        self._submit_player_action()
+        self.player_input.setCursorPosition(len(command))
+        self.player_input.setFocus()
 
     def submit_travel_request(
         self,

@@ -1,4 +1,5 @@
 from __future__ import annotations
+from ai_adventure.item_names import singularize_item_name
 
 import logging
 import json
@@ -352,7 +353,7 @@ class EventApplier:
     ) -> AppliedEventResult:
         """Applies InventoryItemAddedEvent."""
 
-        name = _first_text(payload, "item_name", "name")
+        name = singularize_item_name(_first_text(payload, "item_name", "name"))
 
         if not name:
             return _invalid(event_type, payload, "Inventory item name is required.")
@@ -374,6 +375,9 @@ class EventApplier:
         )
         if catalog_entry is not None:
             name = str(catalog_entry.get("name", name)).strip() or name
+        payload = {**payload, "item_name": name}
+        if payload.get("basic_name"):
+            payload["basic_name"] = singularize_item_name(str(payload["basic_name"]))
 
         quantity = _first_int(payload, 1, "amount", "quantity")
         category = (
@@ -1007,7 +1011,7 @@ class EventApplier:
             return _invalid(event_type, payload, "Skills advance through training XP or player rewards, not upserts.")
         if not existing and (not description or not _first_text(payload, "reason")):
             return _invalid(event_type, payload, "Learning requires a scope description and meaningful training reason.")
-        self.repository.upsert_skill(name, description, level)
+        self.repository.upsert_skill(name, description, level, attribute=payload.get("attribute"))
 
         skill = self.repository.get_skill(name)
         bonus = skill["bonus"] if skill is not None else bonus_for_level(level)

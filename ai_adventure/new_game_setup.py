@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from ai_adventure.skills.attributes import skill_attribute
+
 from ai_adventure.stats import RULES_VERSION, STATS_RULE, rank_stats, starting_attributes, normalize_attributes, point_buy_cost, carrying_capacity
 
 from ai_adventure.inventory_storage import pounds
@@ -910,7 +912,8 @@ def build_new_game_setup_packet(
             ),
             "skill_generation": (
                 "Return exactly the starting skill slots supplied in setup.skills, "
-                "preserving every slot's level. If setup.skills is empty for Blank "
+                "preserving every slot's level and selected attribute. Always return attribute as one "
+                "of Strength, Dexterity, Constitution, Intelligence, Wisdom, Charisma. If setup.skills is empty for Blank "
                 "Slate / Hardcore Mode, return no starting skills. "
                 "If a setup.skills entry has a nonblank name, copy that exact name "
                 "unchanged and fill only missing description text for that slot. "
@@ -1573,6 +1576,7 @@ def _normalize_skills(raw_skills: Any, level_plan: list[int]) -> list[dict[str, 
         normalized[target_index] = {
             "name": name,
             "description": description,
+            "attribute": skill_attribute(raw_skill.get("attribute"), name),
             "level": level,
             "requires_ai_invention": requires_ai_invention,
         }
@@ -1585,6 +1589,7 @@ def _normalize_skills(raw_skills: Any, level_plan: list[int]) -> list[dict[str, 
         normalized[index] = {
             "name": "",
             "description": "",
+            "attribute": "Intelligence",
             "level": level,
             "requires_ai_invention": True,
         }

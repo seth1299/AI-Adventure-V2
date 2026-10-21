@@ -20,7 +20,7 @@ PLAYER_ACHIEVEMENT_RULE = (
 STATS_RULE = (
     "Six attributes use floor((score-10)/2) modifiers. A d20 test is an app-rolled "
     "d20 + attribute modifier + at most one existing relevant skill's level (+1 per level). "
-    "Choose the most directly relevant known skill by its description; its attribute can vary with the action. "
+    "Choose the most directly relevant known skill by its description; use its saved attribute as the default related stat. An explicitly different attribute can be used when the action justifies it. "
     "For locating or gathering wild plants, choose known Foraging rather than Investigation or Perception when applicable. "
     "Untrained tests have zero skill bonus and never automatically learn a skill. "
     "Checks, attacks, and saves all compare totals to DC; natural 1 and 20 are not automatic outcomes. "

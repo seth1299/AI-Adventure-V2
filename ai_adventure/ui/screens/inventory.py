@@ -416,9 +416,13 @@ class InventoryScreen(RepositoryBackedWidget):
         items = repository.list_inventory_items()
         access = repository.inventory_access()
         load = repository.inventory_load()
+        current_location = str(repository.get_state_value("location", "")).strip().casefold()
         lines = [f"Carrying: {load['weight_lb']:g} / {load['capacity_lb']:g} lb (base {load['base_capacity_lb']:g} + containers {load['container_bonus_lb']:g}); remaining {load['remaining_lb']:g} lb"]
         for key, cargo in load['cargo'].items():
-            if access.get(key, {}).get('known') and cargo['capacity_lb'] is not None:
+            container_access = access.get(key, {})
+            if (container_access.get('known')
+                    and str(container_access.get('physical_location', '')).strip().casefold() == current_location
+                    and cargo['capacity_lb'] is not None and cargo['capacity_lb'] > 0):
                 lines.append(f"{cargo['name']}: {cargo['weight_lb']:g} / {cargo['capacity_lb']:g} lb cargo")
         if load['unweighed_item_count']:
             lines.append(f"{load['unweighed_item_count']} inventory record(s) have unspecified weights; totals exclude those weights.")

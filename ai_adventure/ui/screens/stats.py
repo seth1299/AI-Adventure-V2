@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from ai_adventure.stats import ATTRIBUTES
+from ai_adventure.ui.skill_details import SkillDetailsDialog
 
 from ai_adventure.ui.common import *  # noqa: F401,F403
 from ai_adventure.ui.dialogues import *  # noqa: F401,F403
@@ -15,9 +16,12 @@ class StatsScreen(RepositoryBackedWidget):
 
         self._sort_column = 0
         self._sort_order = Qt.SortOrder.AscendingOrder
-        self.skills_table = _AppTableWidget(0, 4)
+        self._skill_rows: list[dict[str, Any]] = []
+        self.skills_table = _AppTableWidget(0, 5)
+        self.skills_table.setIconSize(QSize(32, 32))
+        self.skills_table.cellClicked.connect(self._open_skill_details)
         self.skills_table.setHorizontalHeaderLabels(
-            ["Skill", "Training", "XP Progress", "Description"]
+            ["Skill", "Related Stat", "Training", "XP Progress", "Description"]
         )
         self.skills_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         _configure_wrapping_table(self.skills_table, set())
@@ -67,6 +71,7 @@ class StatsScreen(RepositoryBackedWidget):
         repository = self.repository()
 
         if repository is None:
+            self._skill_rows = []
             self.skills_table.setRowCount(0)
             self.tests_label.clear()
             return
@@ -93,28 +98,65 @@ class StatsScreen(RepositoryBackedWidget):
             key=self._sort_key,
             reverse=_sort_descending(self._sort_order),
         )
+        self._skill_rows = skills
         self.skills_table.setRowCount(len(skills))
 
         for row_index, skill in enumerate(skills):
             level = int(skill.get("level", 1))
-            self.skills_table.setItem(row_index, 0, _table_item(str(skill.get("name", ""))))
+            name_item = _table_item(str(skill.get("name", "")))
+            name_item.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_FileIcon))
+            asset = repository.get_visual_asset("skill", str(skill["id"]).casefold())
+            path = self.visual_asset_path(asset)
+            if path is not None and path.is_file():
+                name_item.setIcon(QIcon(str(path)))
+            self.skills_table.setItem(row_index, 0, name_item)
+            self.skills_table.setItem(row_index, 1, _table_item(str(skill.get("attribute", "Intelligence"))))
             self.skills_table.setItem(
                 row_index,
-                1,
+                2,
                 _table_item(_skill_level_label(level), level),
             )
             self.skills_table.setCellWidget(
                 row_index,
-                2,
+                3,
                 _skill_xp_progress_bar(skill),
             )
             self.skills_table.setItem(
                 row_index,
-                3,
+                4,
                 _table_item(str(skill.get("description", ""))),
             )
 
         _resize_wrapping_table_rows(self.skills_table)
+        for row in range(self.skills_table.rowCount()):
+            self.skills_table.setRowHeight(row, max(38, self.skills_table.rowHeight(row)))
+
+    def _open_skill_details(self, row: int, _column: int) -> None:
+        repository = self.repository()
+        if repository is None or not 0 <= row < len(self._skill_rows):
+            return
+        skill = self._skill_rows[row]
+        key = str(skill["id"]).casefold()
+        asset = repository.get_visual_asset("skill", key)
+        def select_icon():
+            if self.choose_visual_asset("skill", key):
+                from ai_adventure.ui.primitives import _set_generated_image
+                asset = repository.get_visual_asset("skill", key)
+                _set_generated_image(dialog.icon_preview, self.visual_asset_path(asset),
+                                     maximum_width=128, maximum_height=128,
+                                     accessible_name=f"{skill['name']} icon")
+                self.refresh()
+
+        dialog = SkillDetailsDialog(
+            skill=skill,
+            modifier=repository.player_stats()["modifiers"][skill["attribute"]],
+            image_path=self.visual_asset_path(asset),
+            on_select_image=select_icon,
+            on_create_image=(lambda: self.create_visual_asset("skill", key))
+                if self.visual_asset_generation_enabled() else None,
+            parent=self,
+        )
+        dialog.exec()
 
     def _spend_rewards(self) -> None:
         repository = self.repository()
@@ -197,13 +239,16 @@ class StatsScreen(RepositoryBackedWidget):
 
         name = str(skill.get("name", "")).casefold()
 
-        if self._sort_column == 1:
+        if self._sort_column == 2:
             return _safe_int(skill.get("level", 1), 1), name
 
-        if self._sort_column == 2:
+        if self._sort_column == 3:
             return _safe_int(skill.get("xp", 0), 0), name
 
-        if self._sort_column == 3:
+        if self._sort_column == 1:
+            return str(skill.get("attribute", "")).casefold(), name
+
+        if self._sort_column == 4:
             return str(skill.get("description", "")).casefold(), name
 
         return name, name

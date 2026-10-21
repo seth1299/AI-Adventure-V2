@@ -11,6 +11,9 @@ SKILL_DESCRIPTION_RULE = (
 MAX_SKILL_XP_RULE = "Master (level 5) skills cannot gain further XP or levels. Do not propose XP awards for them."
 
 SKILL_TRAINING_RULE = (
+    "Each skill stores an attribute naming its default related stat, one of Strength, Dexterity, "
+    "Constitution, Intelligence, Wisdom, Charisma. Include attribute when learning a skill and "
+    "preserve an existing skill's saved attribute. "
     "Python awards 1 training XP for meaningful resolved use of an existing skill, "
     "once per skill per message, whether the test succeeds or fails. Do not emit "
     "SkillXpAddedEvent for that same use. Training XP is separate from Player XP. "

@@ -316,6 +316,7 @@ class Skill:
     level: int = 1
     xp: int = 0
     bonus: int = 1
+    attribute: str = "Intelligence"
 
     def to_dict(self) -> dict[str, Any]:
         """Returns a JSON-serializable skill dictionary."""

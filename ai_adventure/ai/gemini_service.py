@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from ai_adventure.skills.attributes import skill_attribute
+
 from ai_adventure.stats import ATTRIBUTES, PLAYER_ACHIEVEMENT_RULE, STATS_RULE
 
 from ai_adventure.skills.rules import SKILL_DESCRIPTION_RULE, MAX_SKILL_XP_RULE, SKILL_TRAINING_RULE, SKILL_TRAINING_SOURCE_RULE
@@ -611,11 +613,12 @@ EVENT_RESPONSE_SCHEMA: dict[str, Any] = {
             "SkillUpsertedEvent",
             {
                 "name": {"type": "string"},
+                "attribute": {"type": "string", "enum": list(ATTRIBUTES)},
                 "description": {"type": "string"},
                 "level": {"type": "integer", "minimum": 1, "maximum": 5},
                 "reason": {"type": "string"},
             },
-            ["name", "description", "level", "reason"],
+            ["name", "description", "level", "reason", "attribute"],
             description=SKILL_TRAINING_RULE,
         ),
         _event_response_schema(
@@ -632,7 +635,11 @@ EVENT_RESPONSE_SCHEMA: dict[str, Any] = {
             "InventoryItemAddedEvent",
             {
                 "item_type": {"type": "string"},
-                "item_name": {"type": "string"},
+                "item_name": {"type": "string", "description": (
+                    "Singular stack label for countable objects, e.g. Glass Alchemy Flask; "
+                    "put the count in amount. Preserve plural-only and invariant nouns "
+                    "such as pants, scissors, and fish. Do not pluralize names when adding multiples."
+                )},
                 "basic_name": {
                     "type": "string",
                     "description": (
@@ -1876,10 +1883,11 @@ NEW_GAME_RESPONSE_JSON_SCHEMA: dict[str, Any] = {
                 "type": "object",
                 "properties": {
                     "name": {"type": "string"},
+                    "attribute": {"type": "string", "enum": list(ATTRIBUTES)},
                     "description": {"type": "string"},
                     "level": {"type": "integer", "minimum": 1},
                 },
-                "required": ["name", "description", "level"],
+                "required": ["name", "description", "level", "attribute"],
                 "additionalProperties": False,
             },
         },
@@ -5658,7 +5666,7 @@ def _d20_test_planning_packet(context_packet: dict[str, Any]) -> dict[str, Any]:
     compact_skills = [
         {
             key: skill.get(key)
-            for key in ("name", "level", "xp", "description")
+            for key in ("name", "level", "xp", "description", "attribute")
             if key in skill
         }
         for skill in skills.get("known_skills", [])
@@ -8147,6 +8155,7 @@ def _parse_new_game_skills(raw_skills: Any) -> list[dict[str, Any]]:
                 {
                     "name": name,
                     "description": description,
+                    "attribute": skill_attribute(raw_skill.get("attribute"), name),
                     "level": level,
                 }
             )

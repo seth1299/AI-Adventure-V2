@@ -1409,12 +1409,12 @@ class InventoryUiTests(QtTestCase):
                     row_index = row
                     break
             self.assertGreaterEqual(row_index, 0)
-            progress_bar = screen.skills_table.cellWidget(row_index, 2)
+            progress_bar = screen.skills_table.cellWidget(row_index, 3)
             self.assertIsInstance(progress_bar, QProgressBar)
             assert isinstance(progress_bar, QProgressBar)
             self.assertEqual(progress_bar.value(), 50)
             self.assertEqual(progress_bar.format(), "50%")
-            self.assertIsNone(screen.skills_table.item(row_index, 2))
+            self.assertIsNone(screen.skills_table.item(row_index, 3))
             self.assertIn("4 / 8", progress_bar.toolTip())
 
             screen.close()

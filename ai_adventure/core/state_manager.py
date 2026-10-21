@@ -313,6 +313,7 @@ class StateManager:
                     level=_read_int(row, "level", 1),
                     xp=_read_int(row, "xp", 0),
                     bonus=_read_int(row, "bonus", 1),
+                    attribute=_read_string(row, "attribute", "Intelligence"),
                 )
             )
 

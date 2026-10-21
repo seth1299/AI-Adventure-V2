@@ -103,14 +103,14 @@ class StatsUiTests(QtTestCase):
             screen.set_repository(repository)
             row = next(i for i in range(screen.skills_table.rowCount())
                        if screen.skills_table.item(i, 0).text() == "Stealth")
-            self.assertEqual(screen.skills_table.cellWidget(row, 2).value(), 0)
+            self.assertEqual(screen.skills_table.cellWidget(row, 3).value(), 0)
             EventApplier(repository, rng=random.Random(2), message_id="practice").apply_events([
                 {"type": "D20TestRequestedEvent", "payload": {"attribute": "Dexterity", "skill_name": "Stealth",
                   "dc": 20, "reason": "Sneak past vigilant sentries"}},
             ])
             screen.refresh()
             self.assertEqual(repository.get_skill("Stealth")["xp"], 1)
-            self.assertEqual(screen.skills_table.cellWidget(row, 2).value(), 12)
+            self.assertEqual(screen.skills_table.cellWidget(row, 3).value(), 12)
 
     def test_rank_point_buy_previews_and_incomplete_allocation(self):
         with tempfile.TemporaryDirectory() as directory:

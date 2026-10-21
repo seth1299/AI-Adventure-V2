@@ -51,6 +51,7 @@ ASSET_DIRECTORY_BY_SUBJECT_TYPE = {
     "location": "locations",
     "inventory": "inventory",
     "npc": "npcs",
+    "skill": "skills",
     "bestiary": "bestiary",
 }
 
@@ -71,6 +72,8 @@ class VisualAssetRepository(Protocol):
     def list_player_visible_npcs(self, limit: int = 50) -> list[dict[str, Any]]: ...
 
     def list_bestiary_entries(self) -> list[dict[str, Any]]: ...
+
+    def list_skills(self) -> list[dict[str, Any]]: ...
 
 
 @dataclass(frozen=True)
@@ -159,6 +162,11 @@ class VisualAssetRequest:
             "player": (
                 "Create a single player-character portrait, waist-up, with the face, "
                 "clothing, carried equipment, and other visible traits matching the description."
+            ),
+            "skill": (
+                "Create a square skill icon with one bold, recognizable symbol representing this skill. "
+                "Use a simple silhouette, strong contrast, generous padding and minimal detail so it "
+                "stays readable at 32 by 32 pixels. No text, letters, numbers or decorative frame."
             ),
             "npc": (
                 "Create a single NPC portrait, waist-up, with the face, clothing, role, "
@@ -463,6 +471,15 @@ def build_visual_asset_requests(
                 banned_terms=banned_terms,
             )
         )
+
+    for skill in getattr(repository, "list_skills", lambda: [])():
+        name = str(skill.get("name", "")).strip()
+        if name:
+            requests.append(VisualAssetRequest(
+                subject_type="skill", subject_key=str(skill["id"]).casefold(),
+                display_name=name, description=str(skill.get("description", "") or name),
+                world_context=world_context, image_style=image_style, banned_terms=banned_terms,
+            ))
 
     deduplicated: dict[str, VisualAssetRequest] = {}
     for request in requests:

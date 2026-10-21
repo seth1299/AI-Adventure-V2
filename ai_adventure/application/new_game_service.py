@@ -1,6 +1,8 @@
 """Application workflow for new-game setup and world generation."""
 
 from __future__ import annotations
+
+from ai_adventure.item_names import singularize_item_name as _singularize_stack_item_name
 from ai_adventure.suggested_actions import saved_actions
 
 from dataclasses import dataclass
@@ -897,7 +899,7 @@ def _finalized_skills_for_save(
         setup_name = str(raw_setup_skill.get("name", "") or "").strip()
         if not setup_name:
             ai_skill = ai_skills[index] if index < len(ai_skills) else {}
-            merged_skills.append(dict(ai_skill) if isinstance(ai_skill, dict) else {})
+            merged_skills.append({**dict(ai_skill), "attribute": raw_setup_skill.get("attribute") or ai_skill.get("attribute")} if isinstance(ai_skill, dict) else {})
             continue
         ai_skill = ai_by_name.get(setup_name.casefold())
         if ai_skill is None and index < len(ai_skills) and isinstance(ai_skills[index], dict):
@@ -913,6 +915,7 @@ def _finalized_skills_for_save(
             {
                 **dict(ai_skill),
                 "name": setup_name,
+                "attribute": raw_setup_skill.get("attribute") or ai_skill.get("attribute"),
                 "description": description,
                 "level": _safe_int(
                     raw_setup_skill.get("level"),
@@ -1001,6 +1004,9 @@ def _starter_items_for_save(
         if isinstance(item, dict) and str(item.get("name", "")).strip()
     ]
     for item in completed_items:
+        item["name"] = _singularize_stack_item_name(str(item["name"]))
+        if item.get("basic_name"):
+            item["basic_name"] = _singularize_stack_item_name(str(item["basic_name"]))
         source_index = _optional_int(item.get("source_index"))
         if source_index is None or not (0 <= source_index < len(setup_items)):
             continue
@@ -1013,14 +1019,6 @@ def _starter_items_for_save(
             )
             if requested_quantity is not None:
                 item["quantity"] = requested_quantity
-                if requested_quantity > 1:
-                    item["name"] = _singularize_stack_item_name(
-                        str(item.get("name", ""))
-                    )
-                    if item.get("basic_name"):
-                        item["basic_name"] = _singularize_stack_item_name(
-                            str(item["basic_name"])
-                        )
             continue
         item["storage_location"] = (
             " ".join(
@@ -1124,44 +1122,6 @@ def _explicit_starter_item_quantity(item_request: str) -> int | None:
     return None
 
 
-def _singularize_stack_item_name(name: str) -> str:
-    """Converts a plural stack label to a singular label conservatively."""
-
-    match = re.match(r"^(.*\s)?([^\s]+)([.,;:]*)$", str(name or "").strip())
-    if not match:
-        return str(name or "").strip()
-    prefix, word, punctuation = match.groups()
-    lower = word.casefold()
-    invariant_plurals = {
-        "binoculars", "glasses", "jeans", "scissors", "series", "species",
-        "tongs", "trousers",
-    }
-    irregular = {
-        "calves": "calf", "children": "child", "elves": "elf", "feet": "foot",
-        "geese": "goose", "halves": "half", "knives": "knife", "leaves": "leaf",
-        "lives": "life", "loaves": "loaf", "men": "man", "mice": "mouse",
-        "selves": "self", "shelves": "shelf", "teeth": "tooth", "wives": "wife",
-        "wolves": "wolf", "women": "woman",
-    }
-    if lower in invariant_plurals:
-        return str(name or "").strip()
-    singular = irregular.get(lower)
-    if singular is None:
-        if lower.endswith("ies") and len(word) > 3:
-            singular = word[:-3] + "y"
-        elif lower.endswith(("ches", "shes", "sses", "xes", "zes")):
-            singular = word[:-2]
-        elif lower.endswith("ves"):
-            singular = word[:-3] + "f"
-        elif lower.endswith("s") and not lower.endswith(("ss", "us", "is", "ous")):
-            singular = word[:-1]
-        else:
-            singular = word
-    if word.isupper():
-        singular = singular.upper()
-    elif word.istitle():
-        singular = singular.title()
-    return f"{prefix or ''}{singular}{punctuation}"
 
 
 def _fallback_starter_item_from_setup(

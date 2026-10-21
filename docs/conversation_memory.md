@@ -49,7 +49,9 @@ History stores the final label/prompt pairs in `suggested_actions_json`. First- 
 second-person player submissions use "I will"; third-person submissions use the
 character's name plus "will". The current saved preference is also applied at click
 time. The latest live narrator response supplies up to four buttons above the text
-input. Hovering shows the submitted prompt; clicking sends it through the ordinary
-player-action path, including check planning, persistence, and subject tagging.
-Stale, hidden, out-of-game, pending, and still-revealing choices cannot submit.
+input. Hovering shows the composed prompt; clicking fills and focuses the editable
+player input without sending it. Submit or Enter sends the edited draft through
+the ordinary player-action path, including check planning, persistence, and subject
+tagging. Stale, hidden, out-of-game, pending, and still-revealing choices cannot
+replace a draft.
 The hidden prompts are omitted from recent-history context to avoid repeating them.

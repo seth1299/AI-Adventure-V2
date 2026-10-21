@@ -3,6 +3,7 @@ from __future__ import annotations
 from ai_adventure.ui.common import *  # noqa: F401,F403
 from ai_adventure.ui.dialogues import *  # noqa: F401,F403
 from ai_adventure.crafting import evaluate_recipe_craftability, recipe_estimated_time
+from ai_adventure.ui.crafting_details import CraftingDetailsDialog
 
 
 class AlchemyNotebookScreen(RepositoryBackedWidget):
@@ -24,6 +25,8 @@ class AlchemyNotebookScreen(RepositoryBackedWidget):
 
         self._setup_reagents_tab()
         self._setup_recipes_tab()
+        self.reagent_table.cellClicked.connect(self._open_reagent_details)
+        self.recipe_table.cellClicked.connect(self._open_recipe_details)
 
         layout = QVBoxLayout()
         layout.addWidget(self.tabs)
@@ -280,6 +283,54 @@ class AlchemyNotebookScreen(RepositoryBackedWidget):
             QTimer.singleShot(0, self._show_recipe_reagent_choices)
 
         return super().eventFilter(watched, event)
+
+    def _open_reagent_details(self, row: int, _column: int) -> None:
+        repository = self.repository()
+        if repository is None or not 0 <= row < len(self._reagent_rows):
+            return
+        item = self._reagent_rows[row]
+        CraftingDetailsDialog(
+            title=str(item.get("name", "Crafting Item")),
+            sections=[
+                ("Category", str(item.get("category", ""))),
+                ("Rarity", str(item.get("rarity", ""))),
+                ("Estimated Value", format_currency_amount(
+                    _safe_int(item.get("value_base_units", 0), 0),
+                    repository.get_currency_denominations(),
+                )),
+                ("Description", str(item.get("description", ""))),
+                ("Typical Areas", str(item.get("location", ""))),
+                ("Uses", _join_list(item.get("uses", []))),
+                ("Notes", str(item.get("notes", ""))),
+            ],
+            parent=self,
+        ).exec()
+
+    def _open_recipe_details(self, row: int, _column: int) -> None:
+        repository = self.repository()
+        if repository is None or not 0 <= row < len(self._recipe_rows):
+            return
+        recipe = self._recipe_rows[row]
+        estimate = recipe_estimated_time(recipe, repository.list_skills())
+        self._update_recipe_craftability()
+        CraftingDetailsDialog(
+            title=str(recipe.get("name", "Recipe")),
+            sections=[
+                ("Ingredients", format_recipe_ingredients(recipe.get("ingredients", []))),
+                ("Required Tools", _join_list(recipe.get("required_tool_item_names", []))),
+                ("Skill", str(recipe.get("skill_name", "Crafting"))),
+                ("Estimated Value", format_currency_amount(
+                    _safe_int(recipe.get("value_base_units", 0), 0),
+                    repository.get_currency_denominations(),
+                )),
+                ("Estimated Time", _format_crafting_time(
+                    int(estimate["active_minutes"]), int(estimate["passive_minutes"]),
+                )),
+                ("Availability", self.recipe_craftability_label.text()),
+                ("Notes", str(recipe.get("notes", ""))),
+            ],
+            parent=self,
+        ).exec()
 
     def _refresh_reagents(self, repository: SaveRepository) -> None:
         """Reloads the known crafting item/material table."""

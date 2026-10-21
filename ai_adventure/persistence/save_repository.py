@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-
+from ai_adventure.skills.attributes import skill_attribute
 from ai_adventure.audio.tts_settings import DEFAULT_TTS_VOLUME_PERCENT
 
 import json
@@ -384,6 +384,7 @@ class SaveRepository(PlayerStatsRepository):
                     skill["name"],
                     skill["description"],
                     int(skill["level"]),
+                    attribute=skill.get("attribute"),
                 )
 
         self.set_magic_configuration(clean_setup["magic"])
@@ -2546,7 +2547,7 @@ class SaveRepository(PlayerStatsRepository):
             rows = connection.execute(query, parameters).fetchall()
         return [dict(row) for row in rows]
 
-    def upsert_skill(self, name: str, description: str, level: int) -> None:
+    def upsert_skill(self, name: str, description: str, level: int, attribute: str | None = None) -> None:
         """
         Creates or updates a player skill.
 
@@ -2554,6 +2555,7 @@ class SaveRepository(PlayerStatsRepository):
             name: Skill name.
             description: Skill description.
             level: Skill level from 1 to 5.
+            attribute: Default related stat; omitted updates retain the saved value.
         """
 
         clean_name = name.strip()
@@ -2564,19 +2566,24 @@ class SaveRepository(PlayerStatsRepository):
 
         clean_level = clamp_skill_level(level)
         bonus = bonus_for_level(clean_level)
+        related_stat = skill_attribute(
+            attribute or (self.get_skill(clean_name) or {}).get("attribute"), clean_name
+        )
 
         with self._connect() as connection:
             connection.execute(
                 """
-                INSERT INTO skills (name, description, level, xp, bonus)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO skills (name, description, level, xp, bonus, attribute)
+                VALUES (?, ?, ?, ?, ?, ?)
                 ON CONFLICT(name) DO UPDATE SET
                     description = excluded.description,
+                    attribute = excluded.attribute,
                     level = MAX(skills.level, excluded.level),
                     bonus = MAX(skills.bonus, excluded.bonus),
                     xp = MAX(skills.xp, excluded.xp)
                 """,
-                (clean_name, description.strip(), clean_level, XP_THRESHOLDS_BY_LEVEL[clean_level], bonus),
+                (clean_name, description.strip(), clean_level, XP_THRESHOLDS_BY_LEVEL[clean_level], bonus,
+                 related_stat),
             )
 
         self.append_history("skill", f"Skill updated: {clean_name} Level {clean_level}.")
@@ -2618,6 +2625,7 @@ class SaveRepository(PlayerStatsRepository):
                     "description": description,
                     "level": clean_level,
                     "bonus": bonus_for_level(clean_level),
+                    "attribute": skill_attribute(raw_skill.get("attribute"), name),
                 }
             )
             seen_names.add(name.casefold())
@@ -2630,8 +2638,8 @@ class SaveRepository(PlayerStatsRepository):
             connection.execute("DELETE FROM skills")
             connection.executemany(
                 """
-                INSERT INTO skills (name, description, level, xp, bonus)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO skills (name, description, level, xp, bonus, attribute)
+                VALUES (?, ?, ?, ?, ?, ?)
                 """,
                 [
                     (
@@ -2640,6 +2648,7 @@ class SaveRepository(PlayerStatsRepository):
                         skill["level"],
                         XP_THRESHOLDS_BY_LEVEL[skill["level"]],
                         skill["bonus"],
+                        skill["attribute"],
                     )
                     for skill in clean_skills
                 ],
@@ -2719,7 +2728,7 @@ class SaveRepository(PlayerStatsRepository):
         with self._connect() as connection:
             row = connection.execute(
                 """
-                SELECT id, name, description, level, xp, bonus
+                SELECT id, name, description, level, xp, bonus, attribute
                 FROM skills
                 WHERE name = ?
                 """,
@@ -2742,7 +2751,7 @@ class SaveRepository(PlayerStatsRepository):
         with self._connect() as connection:
             rows = connection.execute(
                 """
-                SELECT id, name, description, level, xp, bonus
+                SELECT id, name, description, level, xp, bonus, attribute
                 FROM skills
                 ORDER BY name COLLATE NOCASE
                 """
@@ -4696,7 +4705,7 @@ class SaveRepository(PlayerStatsRepository):
         if (
             not clean_asset_id
             or clean_subject_type
-            not in {"player", "location", "inventory", "npc", "bestiary"}
+            not in {"player", "location", "inventory", "npc", "bestiary", "skill"}
             or not clean_subject_key
             or not clean_filename
             or filename_path.is_absolute()
@@ -5953,7 +5962,8 @@ class SaveRepository(PlayerStatsRepository):
                     description TEXT NOT NULL DEFAULT '',
                     level INTEGER NOT NULL DEFAULT 1,
                     xp INTEGER NOT NULL DEFAULT 0,
-                    bonus INTEGER NOT NULL DEFAULT 1
+                    bonus INTEGER NOT NULL DEFAULT 1,
+                    attribute TEXT NOT NULL DEFAULT 'Intelligence'
                 );
 
                 CREATE TABLE IF NOT EXISTS event_receipts (
@@ -6272,6 +6282,7 @@ class SaveRepository(PlayerStatsRepository):
                 DROP TABLE IF EXISTS alchemy_recipes;
                 """
             )
+            _ensure_column(connection, "skills", "attribute", "TEXT NOT NULL DEFAULT 'Intelligence'")
             _ensure_column(
                 connection,
                 "visual_assets",

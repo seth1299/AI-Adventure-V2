@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from PySide6.QtWidgets import QWidgetAction
 
+from ai_adventure.skills.attributes import skill_attribute
 from ai_adventure.stats import ATTRIBUTES, POINT_COSTS, RULES_VERSION, rank_stats, point_buy_cost, starting_attributes, attribute_modifier
 
 from ai_adventure.ui.widgets.inputs import FeatureToggleCheckBox
@@ -106,6 +107,7 @@ class _StartingSkillCombo(QWidget):
 
     def __init__(self, choices: list[tuple[str, str]], parent: QWidget | None = None):
         super().__init__(parent)
+        self.attribute_input: QComboBox
         self.combo = QComboBox()
         self.combo.setEditable(False)
         self.combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
@@ -472,6 +474,12 @@ class NewGameWizard(QWizard):
         self._music_preview_active = False
         self._last_page_id = -1
         self.skill_catalog = self._merge_skill_catalog(skill_catalog or [])
+        self.skill_attributes = {
+            str(item.get("name", "")).casefold(): skill_attribute(
+                item.get("attribute"), str(item.get("name", ""))
+            )
+            for item in (skill_catalog or []) if isinstance(item, dict)
+        }
         self.starter_item_catalog = self._merge_starter_item_catalog(starter_item_catalog or [])
         self.choice_catalogs = {
             key: list(values)
@@ -1178,6 +1186,7 @@ class NewGameWizard(QWizard):
             {
                 "name": skill_input.text(),
                 "description": description_input.text(),
+                "attribute": skill_input.attribute_input.currentText(),
                 "level": level,
                 "requires_ai_invention": (
                     not skill_input.text().strip()
@@ -1360,12 +1369,14 @@ class NewGameWizard(QWizard):
                     _safe_int(skill.get("level"), 1),
                     str(skill.get("name", "")),
                     str(skill.get("description", "")),
+                    str(skill.get("attribute", "")),
                 )
         else:
             for index, (_, skill_input, description_input) in enumerate(self.skill_inputs):
                 skill = clean_setup["skills"][index] if index < len(clean_setup["skills"]) else {}
                 skill_input.setText(str(skill.get("name", "")))
                 description_input.setText(str(skill.get("description", "")))
+                skill_input.attribute_input.setCurrentText(skill_attribute(skill.get("attribute"), skill_input.text()))
 
         _set_combo_to_data(self.rank_baseline_combo, clean_setup["rank_baseline"])
         for attribute, value in character["attributes"].items():
@@ -2629,8 +2640,9 @@ class NewGameWizard(QWizard):
             meaning_label = QLabel(SKILL_LEVEL_DESCRIPTIONS[level])
             meaning_label.setWordWrap(True)
             group_layout.addWidget(meaning_label)
-            table = _AppTableWidget(0, 3)
-            table.setHorizontalHeaderLabels(["Remove", "Skill", "Description for AI"])
+            table = _AppTableWidget(0, 4)
+            table.setHorizontalHeaderLabels(["Remove", "Skill", "Description for AI", "Related Stat"])
+            table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
             table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
             table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
             table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
@@ -2680,6 +2692,7 @@ class NewGameWizard(QWizard):
         level: int,
         name: str = "",
         description: str = "",
+        attribute: str | None = None,
     ) -> None:
         table = self.skill_tables[level]
         row = table.rowCount()
@@ -2696,6 +2709,9 @@ class NewGameWizard(QWizard):
             name_column=1,
         )
         skill_input = _StartingSkillCombo(self.skill_catalog)
+        skill_input.attribute_input = _NoWheelComboBox()
+        skill_input.attribute_input.addItems(list(ATTRIBUTES))
+        skill_input.attribute_input.setCurrentText(skill_attribute(attribute or self.skill_attributes.get(name.casefold()), name))
         skill_input.setText(name)
         description_input = QLineEdit(description)
         description_input.setPlaceholderText("What this skill covers and when it applies")
@@ -2707,13 +2723,15 @@ class NewGameWizard(QWizard):
             description_input.setText(skill_input.selected_description() or "")
         table.setCellWidget(row, 1, skill_input)
         table.setCellWidget(row, 2, description_input)
+        table.setCellWidget(row, 3, skill_input.attribute_input)
         self._sync_starting_skill_inputs()
 
-    @staticmethod
     def _sync_starting_skill_description(
-        skill_input: _StartingSkillCombo, description_input: QLineEdit
+        self, skill_input: _StartingSkillCombo, description_input: QLineEdit
     ) -> None:
         description = skill_input.selected_description()
+        name = skill_input.text()
+        skill_input.attribute_input.setCurrentText(skill_attribute(self.skill_attributes.get(name.casefold()), name))
         if description is not None:
             description_input.setText(description)
         elif skill_input.combo.currentData() == skill_input.CUSTOM_DATA:
