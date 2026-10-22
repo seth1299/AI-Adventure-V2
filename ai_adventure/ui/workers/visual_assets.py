@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from ai_adventure.template_images import template_image_bytes
+
 from ai_adventure.ui.common import *  # noqa: F401,F403
 from ai_adventure.ui.workers.gemini import GeminiVisualAssetWorker as _GeminiVisualAssetWorker
 
@@ -100,6 +102,27 @@ class _VisualAssetCoordinator(QObject):
         repository_key = str(repository.db_path)
         self._initial_batch_repositories.discard(repository_key)
         self._initial_batch_repository_objects.pop(repository_key, None)
+
+    def restore_initial_template_images(self, repository, requests, images):
+        """Restore matching uploads before asking for the remaining image sources."""
+        remaining = []
+        for request in requests:
+            data = template_image_bytes(images, request)
+            if data is None:
+                remaining.append(request)
+                continue
+            try:
+                target = AssetGenerationService.target_path(repository, request, self.images_dir)
+                width, height = save_scaled_png(data, target, max_pixels=request.maximum_pixels,
+                                                allow_upscale=False)
+                repository.set_visual_asset_status(request.asset_id, "ready", width=width, height=height)
+                self.asset_status_changed.emit(request.asset_id, "ready", "")
+            except Exception:
+                LOGGER.exception("Could not restore template image for %s.", request.display_name)
+                remaining.append(request)
+        if len(remaining) != len(requests):
+            self.assets_changed.emit()
+        return remaining
 
     def upload_initial_image(
         self,

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from ai_adventure.template_images import normalize_template_images
+
 from PySide6.QtWidgets import QWidgetAction
 
 from ai_adventure.skills.attributes import skill_attribute
@@ -464,6 +466,7 @@ class NewGameWizard(QWizard):
     ) -> None:
         super().__init__(parent)
 
+        self._template_images = []
         self.tts_enabled = bool(tts_enabled)
         self.voice_options = voice_options or available_narrator_voices()
         self.on_sample_voice = on_sample_voice
@@ -1269,11 +1272,14 @@ class NewGameWizard(QWizard):
             "world_context": self.world_context_input.toPlainText(),
         }
 
+        if self._template_images:
+            setup["template_images"] = normalize_template_images(self._template_images)
         return setup
 
     def load_setup(self, setup: dict[str, Any]) -> None:
         """Populates wizard fields from a reusable setup template."""
 
+        self._template_images = normalize_template_images(setup.get("template_images"))
         if setup.get("rules_version") != RULES_VERSION:
             raise ValueError("This template uses older rules. Create a new Stats template; no conversion is performed.")
         # Partial templates can be completed in the wizard.

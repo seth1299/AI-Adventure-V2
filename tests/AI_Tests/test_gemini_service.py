@@ -4685,6 +4685,7 @@ class GeminiServiceTests(unittest.TestCase):
         self.assertNotIn("copper coins' worth of silver", normalized.narrative_text)
         self.assertNotIn("base units", normalized.narrative_text)
 
+    @patch("ai_adventure.ai.gemini_service.bundled_image_prompt_context", new=lambda: {})
     def test_build_and_parse_new_game_response(self) -> None:
         prompt = build_gemini_new_game_prompt(
             {

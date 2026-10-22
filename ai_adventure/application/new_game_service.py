@@ -795,6 +795,7 @@ def _apply_new_game_crafting_knowledge(
             notes=str(raw_item.get("notes", "") or "").strip(),
             value_base_units=max(0, _safe_int(raw_item.get("value_base_units", 0), 0)),
             item_uuid=str(raw_item.get("item_uuid", "") or "").strip(),
+            default_image=raw_item.get("default_image"),
         )
         repository.upsert_item_catalog_entry(
             name=name,

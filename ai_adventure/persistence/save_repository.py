@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from ai_adventure.skills.attributes import skill_attribute
+from ai_adventure.bundled_images import valid_default_image
 from ai_adventure.audio.tts_settings import DEFAULT_TTS_VOLUME_PERCENT
 
 import json
@@ -1331,6 +1332,7 @@ class SaveRepository(PlayerStatsRepository):
         rarity: str = "Common",
         value_base_units: int = 0,
         item_uuid: str = "",
+        default_image: str | None = None,
     ) -> None:
         """
         Adds or updates a discovered useful crafting item/material.
@@ -1401,7 +1403,7 @@ class SaveRepository(PlayerStatsRepository):
                 category=clean_category,
                 description=clean_description,
                 value_base_units=clean_value,
-                metadata={"item_uuid": item_uuid},
+                metadata={"item_uuid": item_uuid, **({"default_image": default_image} if default_image is not None else {})},
             )
 
         self.append_history("crafting", f"Discovered crafting item/material: {clean_name}.")
@@ -2547,7 +2549,7 @@ class SaveRepository(PlayerStatsRepository):
             rows = connection.execute(query, parameters).fetchall()
         return [dict(row) for row in rows]
 
-    def upsert_skill(self, name: str, description: str, level: int, attribute: str | None = None) -> None:
+    def upsert_skill(self, name: str, description: str, level: int, attribute: str | None = None, default_image: str | None = None) -> None:
         """
         Creates or updates a player skill.
 
@@ -2566,24 +2568,27 @@ class SaveRepository(PlayerStatsRepository):
 
         clean_level = clamp_skill_level(level)
         bonus = bonus_for_level(clean_level)
+        existing_skill = self.get_skill(clean_name) or {}
+        default_image = valid_default_image(default_image if default_image is not None else existing_skill.get("default_image"), "skills")
         related_stat = skill_attribute(
-            attribute or (self.get_skill(clean_name) or {}).get("attribute"), clean_name
+            attribute or existing_skill.get("attribute"), clean_name
         )
 
         with self._connect() as connection:
             connection.execute(
                 """
-                INSERT INTO skills (name, description, level, xp, bonus, attribute)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO skills (name, description, level, xp, bonus, attribute, default_image)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(name) DO UPDATE SET
                     description = excluded.description,
                     attribute = excluded.attribute,
+                    default_image = excluded.default_image,
                     level = MAX(skills.level, excluded.level),
                     bonus = MAX(skills.bonus, excluded.bonus),
                     xp = MAX(skills.xp, excluded.xp)
                 """,
                 (clean_name, description.strip(), clean_level, XP_THRESHOLDS_BY_LEVEL[clean_level], bonus,
-                 related_stat),
+                 related_stat, default_image),
             )
 
         self.append_history("skill", f"Skill updated: {clean_name} Level {clean_level}.")
@@ -2626,6 +2631,7 @@ class SaveRepository(PlayerStatsRepository):
                     "level": clean_level,
                     "bonus": bonus_for_level(clean_level),
                     "attribute": skill_attribute(raw_skill.get("attribute"), name),
+                    "default_image": valid_default_image(raw_skill.get("default_image"), "skills"),
                 }
             )
             seen_names.add(name.casefold())
@@ -2638,8 +2644,8 @@ class SaveRepository(PlayerStatsRepository):
             connection.execute("DELETE FROM skills")
             connection.executemany(
                 """
-                INSERT INTO skills (name, description, level, xp, bonus, attribute)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO skills (name, description, level, xp, bonus, attribute, default_image)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
                     (
@@ -2649,6 +2655,7 @@ class SaveRepository(PlayerStatsRepository):
                         XP_THRESHOLDS_BY_LEVEL[skill["level"]],
                         skill["bonus"],
                         skill["attribute"],
+                        skill["default_image"],
                     )
                     for skill in clean_skills
                 ],
@@ -2728,7 +2735,7 @@ class SaveRepository(PlayerStatsRepository):
         with self._connect() as connection:
             row = connection.execute(
                 """
-                SELECT id, name, description, level, xp, bonus, attribute
+                SELECT id, name, description, level, xp, bonus, attribute, default_image
                 FROM skills
                 WHERE name = ?
                 """,
@@ -2751,7 +2758,7 @@ class SaveRepository(PlayerStatsRepository):
         with self._connect() as connection:
             rows = connection.execute(
                 """
-                SELECT id, name, description, level, xp, bonus, attribute
+                SELECT id, name, description, level, xp, bonus, attribute, default_image
                 FROM skills
                 ORDER BY name COLLATE NOCASE
                 """
@@ -4841,7 +4848,27 @@ class SaveRepository(PlayerStatsRepository):
                     str(subject_key or "").strip().casefold(),
                 ),
             ).fetchone()
-        return dict(row) if row is not None else None
+        asset = dict(row) if row is not None else None
+        default_image = ""
+        subject_type = str(subject_type).strip().casefold()
+        if subject_type == "skill":
+            with self._connect() as connection:
+                skill = connection.execute(
+                    "SELECT default_image FROM skills WHERE lower(id) = ? OR name = ? COLLATE NOCASE",
+                    (str(subject_key).casefold(), subject_key),
+                ).fetchone()
+            default_image = valid_default_image(skill[0], "skills") if skill else ""
+        elif subject_type == "inventory":
+            with self._connect() as connection:
+                item = connection.execute(
+                    "SELECT metadata_json FROM item_catalog WHERE lower(json_extract(metadata_json, '$.item_uuid')) = ? OR name = ? COLLATE NOCASE",
+                    (str(subject_key).casefold(), subject_key),
+                ).fetchone()
+            metadata = _decode_json_dict(item[0], "default image metadata") if item else {}
+            default_image = valid_default_image(metadata.get("default_image"), "items")
+        if default_image:
+            asset = {**(asset or {}), "subject_type": subject_type, "default_image": default_image}
+        return asset
 
     def list_visual_assets_for_message(self, message_id: str) -> list[dict[str, Any]]:
         """Returns ready images linked to one conversation turn."""
@@ -5963,7 +5990,8 @@ class SaveRepository(PlayerStatsRepository):
                     level INTEGER NOT NULL DEFAULT 1,
                     xp INTEGER NOT NULL DEFAULT 0,
                     bonus INTEGER NOT NULL DEFAULT 1,
-                    attribute TEXT NOT NULL DEFAULT 'Intelligence'
+                    attribute TEXT NOT NULL DEFAULT 'Intelligence',
+                    default_image TEXT NOT NULL DEFAULT ''
                 );
 
                 CREATE TABLE IF NOT EXISTS event_receipts (
@@ -6283,6 +6311,7 @@ class SaveRepository(PlayerStatsRepository):
                 """
             )
             _ensure_column(connection, "skills", "attribute", "TEXT NOT NULL DEFAULT 'Intelligence'")
+            _ensure_column(connection, "skills", "default_image", "TEXT NOT NULL DEFAULT ''")
             _ensure_column(
                 connection,
                 "visual_assets",
@@ -7128,7 +7157,7 @@ def _upsert_item_catalog_entry(
         row["metadata_json"],
         "item catalog metadata",
     )
-    for field in ("moveable", "storable", "weight_lb", "carrying_capacity_lb"):
+    for field in ("moveable", "storable", "weight_lb", "carrying_capacity_lb", "default_image"):
         if field not in raw_metadata and field in existing_metadata:
             clean_metadata[field] = existing_metadata[field]
     if not str(raw_metadata.get("item_uuid", "")).strip():

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from ai_adventure.bundled_images import bundled_image_prompt_context, valid_default_image
+
 from ai_adventure.skills.attributes import skill_attribute
 
 from ai_adventure.stats import ATTRIBUTES, PLAYER_ACHIEVEMENT_RULE, STATS_RULE
@@ -376,6 +378,7 @@ CRAFTING_STAGE_SCHEMA: dict[str, Any] = {
 NEW_GAME_CRAFTING_ITEM_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
+        "default_image": {"type": "string", "description": "Optional exact matching bundled catalog filename; omit or empty when none fits."},
         "name": {"type": "string"},
         "category": {
             "type": "string",
@@ -612,6 +615,7 @@ EVENT_RESPONSE_SCHEMA: dict[str, Any] = {
         _event_response_schema(
             "SkillUpsertedEvent",
             {
+                "default_image": {"type": "string", "description": "Optional exact matching bundled catalog filename; omit or empty when none fits."},
                 "name": {"type": "string"},
                 "attribute": {"type": "string", "enum": list(ATTRIBUTES)},
                 "description": {"type": "string"},
@@ -634,6 +638,7 @@ EVENT_RESPONSE_SCHEMA: dict[str, Any] = {
         _event_response_schema(
             "InventoryItemAddedEvent",
             {
+                "default_image": {"type": "string", "description": "Optional exact matching bundled catalog filename; omit or empty when none fits."},
                 "item_type": {"type": "string"},
                 "item_name": {"type": "string", "description": (
                     "Singular stack label for countable objects, e.g. Glass Alchemy Flask; "
@@ -874,6 +879,7 @@ EVENT_RESPONSE_SCHEMA: dict[str, Any] = {
         _event_response_schema(
             "ReagentDiscoveredEvent",
             {
+                "default_image": {"type": "string", "description": "Optional exact matching bundled catalog filename; omit or empty when none fits."},
                 "name": {"type": "string"},
                 "item_uuid": {"type": "string"},
                 "description": {"type": "string"},
@@ -1882,6 +1888,7 @@ NEW_GAME_RESPONSE_JSON_SCHEMA: dict[str, Any] = {
             "items": {
                 "type": "object",
                 "properties": {
+                    "default_image": {"type": "string", "description": "Optional exact matching bundled catalog filename; omit or empty when none fits."},
                     "name": {"type": "string"},
                     "attribute": {"type": "string", "enum": list(ATTRIBUTES)},
                     "description": {"type": "string"},
@@ -1912,6 +1919,7 @@ NEW_GAME_RESPONSE_JSON_SCHEMA: dict[str, Any] = {
             "items": {
                 "type": "object",
                 "properties": {
+                    "default_image": {"type": "string", "description": "Optional exact matching bundled catalog filename; omit or empty when none fits."},
                     "name": {
                         "type": "string",
                         "description": (
@@ -3510,6 +3518,7 @@ def _story_prompt_packet(context_packet: dict[str, Any]) -> dict[str, Any]:
     """Returns a prompt-only projection with relevant contracts and state."""
 
     packet = dict(context_packet)
+    packet.update(bundled_image_prompt_context())
     projected_state = _project_story_state(context_packet)
     contract = context_packet.get("response_contract", {})
     selection = context_packet.get("selection", {})
@@ -3598,7 +3607,7 @@ def _build_xml_new_game_prompt(setup_packet: dict[str, Any]) -> str:
     """Builds a concise XML-delimited new-game synthesis prompt."""
 
     banned_terms = _banned_terms_from_context(setup_packet)
-    prompt_packet = dict(setup_packet)
+    prompt_packet = {**setup_packet, **bundled_image_prompt_context()}
     if isinstance(prompt_packet.get("requirements"), dict):
         prompt_packet["requirements"] = {key: value for key, value in prompt_packet["requirements"].items() if key != "inventory_storage"}
     creative_ideas = prompt_packet.get("creative_ideas")
@@ -8154,6 +8163,7 @@ def _parse_new_game_skills(raw_skills: Any) -> list[dict[str, Any]]:
             skills.append(
                 {
                     "name": name,
+                    "default_image": valid_default_image(raw_skill.get("default_image"), "skills"),
                     "description": description,
                     "attribute": skill_attribute(raw_skill.get("attribute"), name),
                     "level": level,
@@ -8250,6 +8260,7 @@ def _parse_new_game_starter_items(raw_items: Any) -> list[dict[str, Any]]:
         items.append(
             {
                 "name": name,
+                "default_image": valid_default_image(raw_item.get("default_image"), "items"),
                 "basic_name": str(raw_item.get("basic_name", name) or name).strip()[:120],
                 "category": _normalize_starter_item_category(raw_item),
                 "quantity": max(1, quantity),
@@ -8328,6 +8339,7 @@ def _parse_new_game_crafting_items(raw_items: Any) -> list[dict[str, Any]]:
         items.append(
             {
                 "name": name,
+                "default_image": valid_default_image(raw_item.get("default_image"), "items"),
                 "category": category,
                 "description": str(raw_item.get("description", "")).strip(),
                 "location": str(raw_item.get("location", "")).strip(),

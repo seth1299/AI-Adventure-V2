@@ -8,10 +8,11 @@ from typing import Any
 
 from ai_adventure.new_game_setup import normalize_new_game_setup
 from ai_adventure.stats import RULES_VERSION
+from ai_adventure.template_images import normalize_template_images
 
 
 LOGGER = logging.getLogger(__name__)
-TEMPLATE_SCHEMA_VERSION = 3
+TEMPLATE_SCHEMA_VERSION = 4
 
 
 @dataclass(frozen=True)
@@ -302,3 +303,18 @@ def _template_name(template_name: Any, setup: dict[str, Any]) -> str:
             return clean_candidate
 
     return "New Game Template"
+
+
+def save_template_image(template_path: Path, template_name: str, image: dict[str, str]) -> bool:
+    """Update only attachments on an existing template, retaining its form data."""
+    templates = load_new_game_templates(template_path, normalize_setups=False)
+    for template in templates:
+        if template.name.casefold() != template_name.casefold():
+            continue
+        existing = normalize_template_images(template.setup.get("template_images"))
+        images = normalize_template_images([*existing, image])
+        return save_new_game_template(
+            template_path, {**template.setup, "template_images": images},
+            template_name=template.name, normalize_setup=False,
+        )
+    return False

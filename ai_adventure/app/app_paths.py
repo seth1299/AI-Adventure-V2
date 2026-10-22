@@ -75,6 +75,11 @@ class AppPaths:
         return self.repo_root / "ai_adventure" / "audio"
 
     @property
+    def package_default_images_dir(self) -> Path:
+        """Returns the discoverable packaged item and skill artwork directory."""
+        return self.repo_root / "ai_adventure" / "images"
+
+    @property
     def package_data_dir(self) -> Path:
         """Returns the packaged source-tree data asset directory."""
 

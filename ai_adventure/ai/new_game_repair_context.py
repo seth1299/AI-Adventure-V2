@@ -3,6 +3,8 @@ import copy
 import re
 from typing import Any
 
+from ai_adventure.bundled_images import bundled_image_prompt_context
+
 # (setup inputs, previously generated context, applicable requirements)
 REPAIR_DEPENDENCIES = {
     "bestiary": (("magic",), ("world_summary", "selected_genre", "locations"), ("bestiary",)),
@@ -68,6 +70,7 @@ def repair_context(setup_packet, approved_state, candidate, fields, errors, atte
         selected_context[key] = value
     requirements = setup_packet.get("requirements", {})
     return {
+        **(bundled_image_prompt_context() if set(fields) & {"skills", "starting_items", "known_crafting_items"} else {}),
         "attempt": attempt, "repair_fields": fields, "validation_errors": errors,
         "setup": selected_setup, "related_state": selected_context,
         "requirements": {key: requirements[key] for key in rule_keys if key in requirements},

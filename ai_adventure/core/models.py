@@ -317,6 +317,7 @@ class Skill:
     xp: int = 0
     bonus: int = 1
     attribute: str = "Intelligence"
+    default_image: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         """Returns a JSON-serializable skill dictionary."""

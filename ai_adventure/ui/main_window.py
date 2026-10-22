@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from ai_adventure.template_images import capture_template_image
+from ai_adventure.new_game_templates import save_template_image
+
 from ai_adventure.ui.widgets.containers import CurrentPageStackedWidget
 
 import logging
@@ -499,6 +502,7 @@ class MainWindow(QMainWindow):
 
             clean_setup = wizard.build_setup()
             template_save_name: str | None = None
+            image_template_name: str | None = None
             if (
                 loaded_template_name
                 and loaded_template_baseline is not None
@@ -517,6 +521,9 @@ class MainWindow(QMainWindow):
                     )
                     if template_save_name is None:
                         continue
+            elif loaded_template_name:
+                # Unchanged forms still retain new uploads chosen in the final step.
+                image_template_name = loaded_template_name
 
             while True:
                 clean_setup = wizard.build_setup()
@@ -524,6 +531,7 @@ class MainWindow(QMainWindow):
                     self._create_new_game_from_setup(
                         clean_setup,
                         template_save_name=template_save_name,
+                        image_template_name=image_template_name,
                         auto_save_template_if_available=loaded_template_name is None,
                     )
                     return
@@ -912,6 +920,7 @@ class MainWindow(QMainWindow):
         clean_setup: dict[str, Any],
         *,
         template_save_name: str | None = None,
+        image_template_name: str | None = None,
         auto_save_template_if_available: bool = False,
     ) -> None:
         """Creates a new save from normalized setup and opens the shell."""
@@ -939,16 +948,21 @@ class MainWindow(QMainWindow):
                 legacy_template_path=self.app_paths.legacy_new_game_template_path,
             )
 
-        if effective_template_name and not save_new_game_template(
-            self.app_paths.new_game_templates_path,
-            {**clean_setup, "title": effective_template_name},
-            template_name=effective_template_name,
-        ):
-            QMessageBox.warning(
-                self,
-                "Template Not Saved",
-                "The game was created, but the template could not be saved.",
+        if effective_template_name:
+            saved = save_new_game_template(
+                self.app_paths.new_game_templates_path,
+                {**clean_setup, "title": effective_template_name},
+                template_name=effective_template_name,
             )
+            if saved:
+                repository.set_setting("new_game.template_name", effective_template_name)
+            else:
+                QMessageBox.warning(
+                    self, "Template Not Saved",
+                    "The game was created, but the template could not be saved.",
+                )
+        elif image_template_name:
+            repository.set_setting("new_game.template_name", image_template_name)
         self.open_repository(repository, new_game=True)
 
         if not self.ai_enabled:
@@ -1194,6 +1208,10 @@ class MainWindow(QMainWindow):
             requests = self.game_shell.visual_asset_coordinator.prepare_initial_batch(
                 repository
             )
+            setup = repository.get_setting("new_game.setup", {})
+            requests = self.game_shell.visual_asset_coordinator.restore_initial_template_images(
+                repository, requests, setup.get("template_images", []),
+            )
         except Exception:
             LOGGER.exception("Initial visual asset source selection could not start.")
             self.game_shell.visual_asset_coordinator.finish_initial_batch(repository)
@@ -1206,6 +1224,28 @@ class MainWindow(QMainWindow):
             return
 
         self._show_new_game_image_source_dialog(repository, requests)
+
+    def _upload_new_game_image(self, repository, request, source_path):
+        """Store the upload and retain a portable copy on its associated template."""
+        coordinator = self.game_shell.visual_asset_coordinator
+        success, message = coordinator.upload_initial_image(repository, request, source_path)
+        if not success:
+            return success, message
+        template_name = repository.get_setting("new_game.template_name", "")
+        if template_name:
+            try:
+                cached_path = AssetGenerationService.target_path(repository, request, coordinator.images_dir)
+                image = capture_template_image(request, cached_path)
+                saved = save_template_image(self.app_paths.new_game_templates_path, template_name, image)
+            except Exception:
+                LOGGER.exception("Could not retain uploaded template image.")
+                saved = False
+            if not saved:
+                QMessageBox.warning(
+                    self, "Template Image Not Saved",
+                    "The image was added to this game, but could not be saved in the New Game Template.",
+                )
+        return success, message
 
     def _show_new_game_image_source_dialog(
         self,
@@ -1221,10 +1261,8 @@ class MainWindow(QMainWindow):
         )
         dialog = NewGameImageSourceDialog(
             requests,
-            choose_file=lambda request, source_path: coordinator.upload_initial_image(
-                repository,
-                request,
-                source_path,
+            choose_file=lambda request, source_path: self._upload_new_game_image(
+                repository, request, source_path,
             ),
             create_image=(
                 lambda request: coordinator.create_initial_image(repository, request)

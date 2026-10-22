@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from ai_adventure.template_images import normalize_template_images
+
 from ai_adventure.skills.attributes import skill_attribute
 
 from ai_adventure.stats import RULES_VERSION, STATS_RULE, rank_stats, starting_attributes, normalize_attributes, point_buy_cost, carrying_capacity
@@ -373,6 +375,7 @@ def normalize_new_game_setup(raw_setup: Any) -> dict[str, Any]:
             "additional_context": custom_ai_context,
         },
         "images": image_preferences,
+        "template_images": normalize_template_images(raw_setup.get("template_images")),
         "time_display": calendar_settings["time_display"],
         "currency_denominations": currency_denominations,
         "starting_wealth": starting_wealth,
@@ -492,6 +495,8 @@ def build_new_game_setup_packet(
     """Builds a compact AI-facing setup packet for world synthesis."""
 
     clean_setup = normalize_new_game_setup(setup)
+    # Uploaded artwork is local template data, never Gemini prompt content.
+    clean_setup.pop("template_images", None)
     calendar_is_ai_generated = bool(clean_setup["calendar"].get("ai_generated"))
     packet_setup = dict(clean_setup)
     if calendar_is_ai_generated:

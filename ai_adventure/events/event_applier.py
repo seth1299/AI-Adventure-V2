@@ -1011,7 +1011,7 @@ class EventApplier:
             return _invalid(event_type, payload, "Skills advance through training XP or player rewards, not upserts.")
         if not existing and (not description or not _first_text(payload, "reason")):
             return _invalid(event_type, payload, "Learning requires a scope description and meaningful training reason.")
-        self.repository.upsert_skill(name, description, level, attribute=payload.get("attribute"))
+        self.repository.upsert_skill(name, description, level, attribute=payload.get("attribute"), default_image=payload.get("default_image"))
 
         skill = self.repository.get_skill(name)
         bonus = skill["bonus"] if skill is not None else bonus_for_level(level)
@@ -1442,6 +1442,7 @@ class EventApplier:
             notes=notes,
             value_base_units=value_base_units,
             item_uuid=_first_text(payload, "item_uuid"),
+            default_image=payload.get("default_image"),
         )
         self.repository.upsert_item_catalog_entry(
             name=name,
