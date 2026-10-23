@@ -29,23 +29,20 @@ class GeminiModelCatalogTests(unittest.TestCase):
         self.assertEqual(
             KNOWN_TEXT_MODELS,
             {
+                "gemini-3.8-flash",
                 "gemini-3.7-flash",
                 "gemini-3.6-flash",
                 "gemini-3.5-flash",
                 "gemini-3.5-flash-lite",
                 "gemini-3.1-flash-lite",
-                "gemini-2.5-pro",
-                "gemini-2.5-flash",
-                "gemini-2.5-flash-lite",
             },
         )
         self.assertEqual(
             KNOWN_IMAGE_MODELS,
             {
-                "gemini-3.1-flash-image",
+                "gemini-nano-banana-2.1",
                 "gemini-3.1-flash-lite-image",
                 "gemini-3-pro-image",
-                "gemini-2.5-flash-image",
             },
         )
         for option in (*TEXT_MODEL_OPTIONS, *IMAGE_MODEL_OPTIONS):
@@ -58,8 +55,8 @@ class GeminiModelCatalogTests(unittest.TestCase):
         self.assertEqual(normalize_text_model("models/gemini-3.7-flash"), "gemini-3.7-flash")
         self.assertEqual(normalize_image_model("gemini-3.7-flash"), DEFAULT_IMAGE_MODEL)
         self.assertEqual(
-            normalize_image_model("models/gemini-3.1-flash-image"),
-            "gemini-3.1-flash-image",
+            normalize_image_model("models/gemini-nano-banana-2.1"),
+            "gemini-nano-banana-2.1",
         )
 
     def test_thinking_control_matches_each_model_generation(self) -> None:
@@ -75,13 +72,19 @@ class GeminiModelCatalogTests(unittest.TestCase):
             thinking_config_for_text_model("gemini-3.1-flash-lite", smarter=True),
             {"thinking_level": "high"},
         )
+
+    def test_existing_model_choices_migrate_to_current_equivalents(self) -> None:
+        self.assertEqual(normalize_text_model("models/gemini-2.5-pro"), "gemini-3.8-flash")
+        self.assertEqual(normalize_image_model("gemini-3.1-flash-image"), "gemini-nano-banana-2.1")
+        self.assertEqual(normalize_image_model("gemini-2.5-flash-image"), "gemini-nano-banana-2.1")
+        self.assertEqual(normalize_text_model("gemini-2.5-flash-image"), DEFAULT_TEXT_MODEL)
         self.assertEqual(
             thinking_config_for_text_model("gemini-2.5-pro", smarter=False),
-            {"thinking_budget": 1024},
+            {"thinking_level": "minimal"},
         )
         self.assertEqual(
             thinking_config_for_text_model("gemini-2.5-flash", smarter=True),
-            {"thinking_budget": 24576},
+            {"thinking_level": "high"},
         )
 
     def test_structured_requests_omit_non_universal_sampling_arguments(self) -> None:
@@ -96,7 +99,7 @@ class GeminiModelCatalogTests(unittest.TestCase):
                 self.assertNotIn("top_p", config)
                 self.assertNotIn("top_k", config)
                 self.assertNotIn("candidate_count", config)
-                thinking = config["thinking_config"]
+                thinking = config["generation_config"]
                 self.assertNotEqual(
                     "thinking_level" in thinking,
                     "thinking_budget" in thinking,

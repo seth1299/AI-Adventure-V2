@@ -111,10 +111,10 @@ class LoggingSetupTests(unittest.TestCase):
                 with patch.dict(os.environ, {"AI_ADVENTURE_PLAYTESTING_BUILD": build}):
                     configure_logging(path)
                     with patch.object(genai, "Client"), patch(
-                        "ai_adventure.ai.gemini_service._generate_content_with_retry",
-                        return_value=SimpleNamespace(text=raw),
+                        "ai_adventure.ai.gemini_service._create_interaction_with_retry",
+                        return_value=SimpleNamespace(output_text=raw),
                     ), patch("ai_adventure.ai.gemini_service._repair_gemini_creative_terms", return_value=raw):
-                        GeminiNarrationService(GeminiSettings(api_key="test-key", model="gemini-2.5-flash")).generate_story_response(
+                        GeminiNarrationService(GeminiSettings(api_key="test-key", model="gemini-3.8-flash")).generate_story_response(
                             {"conversation_mode": "out_of_game", "player_command": "Ask a question"}
                         )
                 contents = path.read_text(encoding="utf-8")

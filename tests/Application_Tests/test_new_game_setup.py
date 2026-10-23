@@ -491,7 +491,7 @@ class NewGameSetupTests(unittest.TestCase):
                     },
                     "images": {
                         "enabled": False,
-                        "model": "gemini-3.1-flash-image",
+                        "model": "gemini-nano-banana-2.1",
                         "style": "crayon",
                     },
                 }
@@ -545,7 +545,7 @@ class NewGameSetupTests(unittest.TestCase):
             self.assertFalse(state.settings.values["images.enabled"])
             self.assertEqual(
                 state.settings.values["images.model"],
-                "gemini-3.1-flash-image",
+                "gemini-nano-banana-2.1",
             )
             self.assertEqual(state.settings.values["images.style"], "crayon")
             self.assertEqual(state.settings.values["ai.model_tone"], "friendly")

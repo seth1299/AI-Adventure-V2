@@ -63,9 +63,9 @@ class ContainerConsistencyTests(unittest.TestCase):
     def generate(self, responses, *, packet=None):
         import google.genai
         client = Mock()
-        client.models.generate_content.side_effect = [SimpleNamespace(text=json.dumps(response)) for response in responses]
+        client.interactions.create.side_effect = [SimpleNamespace(output_text=json.dumps(response)) for response in responses]
         with patch.object(google.genai, "Client", return_value=client):
-            result = GeminiNarrationService(GeminiSettings(api_key="test-key", model="gemini-2.5-flash")).generate_story_response(packet or self.packet())
+            result = GeminiNarrationService(GeminiSettings(api_key="test-key", model="gemini-3.8-flash")).generate_story_response(packet or self.packet())
         return result, client
 
     def test_unknown_is_distinct_from_explicit_empty(self):
@@ -77,7 +77,7 @@ class ContainerConsistencyTests(unittest.TestCase):
 
     def test_original_failure_is_repaired_before_any_commit(self):
         result, client = self.generate([broken_response(), corrected_response()])
-        self.assertEqual(client.models.generate_content.call_count, 2)
+        self.assertEqual(client.interactions.create.call_count, 2)
         self.assertEqual(self.repository.get_state_value("currency.balance"), "20")
         StoryTurnService.commit_response(self.repository, result, message_id="repaired-turn")
         self.assertEqual(self.repository.get_state_value("currency.balance"), "70")
@@ -96,7 +96,7 @@ class ContainerConsistencyTests(unittest.TestCase):
 
     def test_valid_single_response_needs_no_extra_request(self):
         result, client = self.generate([corrected_response()])
-        self.assertEqual(client.models.generate_content.call_count, 1)
+        self.assertEqual(client.interactions.create.call_count, 1)
         self.assertIn("take the coins and vial", result.narrative_text)
 
     def test_repair_metrics_record_additional_request(self):
@@ -118,7 +118,7 @@ class ContainerConsistencyTests(unittest.TestCase):
         response["events"] = response["events"][2:]
         self.assertTrue(container_event_issues(response["events"], self.packet(), narrative_text=response["response"]))
         result, client = self.generate([response, corrected_response()])
-        self.assertEqual(client.models.generate_content.call_count, 2)
+        self.assertEqual(client.interactions.create.call_count, 2)
         self.assertTrue(any(event["type"] == "ContainerOpenedEvent" for event in result.suggested_events))
 
     def test_nested_empty_vial_remains_known_empty_after_transfer(self):
@@ -167,7 +167,7 @@ class ContainerConsistencyTests(unittest.TestCase):
             "description": "A newly acquired satchel.", "value_base_units": 50,
         }})
         result, client = self.generate([response])
-        self.assertEqual(client.models.generate_content.call_count, 1)
+        self.assertEqual(client.interactions.create.call_count, 1)
         StoryTurnService.commit_response(self.repository, result, message_id="new-container")
         self.assertEqual(self.repository.get_state_value("currency.balance"), "70")
         satchel = next(item for item in self.repository.list_inventory_items() if item["name"] == "New Satchel")
@@ -182,7 +182,7 @@ class ContainerConsistencyTests(unittest.TestCase):
         packet = self.packet()
         packet["selection"]["tags"].append("currency")
         result, client = self.generate([invalid, response], packet=packet)
-        self.assertEqual(client.models.generate_content.call_count, 2)
+        self.assertEqual(client.interactions.create.call_count, 2)
         StoryTurnService.commit_response(self.repository, result, message_id="known-container-repair")
         self.assertEqual(self.repository.get_state_value("currency.balance"), "70")
 
@@ -195,11 +195,11 @@ class ContainerConsistencyTests(unittest.TestCase):
     def test_invalid_repair_is_bounded_and_does_not_change_the_save(self):
         import google.genai
         client = Mock()
-        client.models.generate_content.return_value = SimpleNamespace(text=json.dumps(broken_response()))
+        client.interactions.create.return_value = SimpleNamespace(output_text=json.dumps(broken_response()))
         with patch.object(google.genai, "Client", return_value=client):
             with self.assertRaisesRegex(GeminiRequestError, "not saved"):
                 GeminiNarrationService(GeminiSettings(api_key="test-key")).generate_story_response(self.packet())
-        self.assertEqual(client.models.generate_content.call_count, 3)
+        self.assertEqual(client.interactions.create.call_count, 3)
         self.assertEqual(self.repository.get_state_value("currency.balance"), "20")
         self.assertFalse(self.repository.list_mechanical_events())
 

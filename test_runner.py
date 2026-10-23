@@ -43,7 +43,7 @@ class TestRunnerApp:
         ).pack(anchor=tk.W)
         ttk.Label(
             outer,
-            text="Run one package or the full suite; verbose unittest output appears below.",
+            text="All Tests isolates packages and aggregates results. Passing-test output is buffered; failures show details.",
         ).pack(anchor=tk.W, pady=(3, 10))
 
         button_area = ttk.Frame(outer)

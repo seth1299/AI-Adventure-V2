@@ -31,6 +31,7 @@ from ai_adventure.alchemy.ingredients import (
 )
 from ai_adventure.app.api_key_store import read_api_key
 from ai_adventure.ai.request_metrics import measured_operation, record_attempt
+from ai_adventure.ai.gemini_client import create_gemini_client
 from ai_adventure.container_flow import CONTAINER_FLOW_RULE, ContainerFlowError, container_event_issues
 from ai_adventure.app.features import is_playtesting_build
 from ai_adventure.app.app_paths import AppPaths
@@ -2742,7 +2743,7 @@ class GeminiNarrationService:
             )
 
         try:
-            from google import genai
+            client = create_gemini_client(self.settings.api_key)
         except ImportError as error:
             raise GeminiConfigurationError(
                 "google-genai is not installed. Install project requirements first."
@@ -2751,7 +2752,6 @@ class GeminiNarrationService:
         ai_preferences = ai_mode_preferences_from_context_packet(context_packet)
         response_schema = build_story_response_schema(context_packet)
         prompt = build_gemini_story_prompt(context_packet)
-        client = genai.Client(api_key=self.settings.api_key)
 
         if is_playtesting_build():
             LOGGER.debug(
@@ -2774,7 +2774,7 @@ class GeminiNarrationService:
             ],
             len(json.dumps(response_schema, separators=(",", ":"))),
         )
-        response = _generate_content_with_retry(
+        response = _create_interaction_with_retry(
             client,
             model=self.settings.model,
             contents=prompt,
@@ -2795,7 +2795,7 @@ class GeminiNarrationService:
         raw_text = _repair_gemini_creative_terms(
             client,
             self.settings.model,
-            str(getattr(response, "text", "") or "").strip(),
+            str(getattr(response, "output_text", "") or "").strip(),
             "story response",
             response_schema,
             ai_preferences=ai_preferences,
@@ -2856,7 +2856,7 @@ class GeminiNarrationService:
             )
 
         try:
-            from google import genai
+            client = create_gemini_client(self.settings.api_key)
         except ImportError as error:
             raise GeminiConfigurationError(
                 "google-genai is not installed. Install project requirements first."
@@ -2864,7 +2864,6 @@ class GeminiNarrationService:
 
         ai_preferences = ai_mode_preferences_from_context_packet(context_packet)
         prompt = build_d20_test_plan_prompt(context_packet)
-        client = genai.Client(api_key=self.settings.api_key)
 
         if is_playtesting_build():
             LOGGER.debug(
@@ -2875,7 +2874,7 @@ class GeminiNarrationService:
                 ),
             )
         LOGGER.info("Sending skill-check planning packet to Gemini model %s.", self.settings.model)
-        response = _generate_content_with_retry(
+        response = _create_interaction_with_retry(
             client,
             model=self.settings.model,
             contents=prompt,
@@ -2889,7 +2888,7 @@ class GeminiNarrationService:
         raw_text = _repair_gemini_creative_terms(
             client,
             self.settings.model,
-            str(getattr(response, "text", "") or "").strip(),
+            str(getattr(response, "output_text", "") or "").strip(),
             "skill-check plan response",
             D20_TEST_PLAN_RESPONSE_JSON_SCHEMA,
             ai_preferences=ai_preferences,
@@ -2928,7 +2927,7 @@ class GeminiNarrationService:
             )
 
         try:
-            from google import genai
+            client = create_gemini_client(self.settings.api_key)
         except ImportError as error:
             raise GeminiConfigurationError(
                 "google-genai is not installed. Install project requirements first."
@@ -2941,7 +2940,6 @@ class GeminiNarrationService:
             response_schema,
         )
         prompt = build_gemini_new_game_prompt(prompt_packet)
-        client = genai.Client(api_key=self.settings.api_key)
 
         LOGGER.info("Sending new-game setup packet to Gemini model %s.", self.settings.model)
         if is_playtesting_build():
@@ -3028,7 +3026,7 @@ class GeminiNarrationService:
             )
 
         try:
-            from google import genai
+            client = create_gemini_client(self.settings.api_key)
         except ImportError as error:
             raise GeminiConfigurationError(
                 "google-genai is not installed. Install project requirements first."
@@ -3039,7 +3037,6 @@ class GeminiNarrationService:
             setup_packet
         )
         ai_preferences = ai_mode_preferences_from_context_packet(setup_packet)
-        client = genai.Client(api_key=self.settings.api_key)
         merged_data: dict[str, Any] = {}
 
         _notify_new_game_progress(progress_callback, "setup_compilation")
@@ -3173,14 +3170,15 @@ def load_gemini_settings(
         )
         model = DEFAULT_GEMINI_MODEL
     elif model not in KNOWN_TEXT_MODELS:
+        replacement = normalize_text_model(model)
         LOGGER.error(
             "Refusing unapproved Gemini model '%s' for narration; using %s. "
             "Approved text models: %s.",
             model,
-            DEFAULT_GEMINI_MODEL,
+            replacement,
             ", ".join(sorted(KNOWN_TEXT_MODELS)),
         )
-        model = DEFAULT_GEMINI_MODEL
+        model = replacement
 
     return GeminiSettings(
         api_key=read_api_key(key_path),
@@ -4015,12 +4013,11 @@ def _structured_output_config(
     preferences = normalize_ai_mode_preferences(ai_preferences)
     config: dict[str, Any] = {
         "system_instruction": APPLICATION_SYSTEM_INSTRUCTION,
-        "response_mime_type": "application/json",
-        "response_json_schema": schema,
+        "response_format": [{"type": "text", "mime_type": "application/json", "schema": schema}],
         "safety_settings": _content_safety_settings(
             preferences["allowed_content_categories"]
         ),
-        "thinking_config": _thinking_config(
+        "generation_config": _thinking_config(
             model,
             str(preferences["thinking_level"]),
         ),
@@ -4032,7 +4029,7 @@ def _structured_output_config(
         else preferences["max_output_tokens"]
     )
     if apply_response_length and max_output_tokens is not None:
-        config["max_output_tokens"] = int(max_output_tokens)
+        config["generation_config"]["max_output_tokens"] = int(max_output_tokens)
 
     return config
 
@@ -4054,11 +4051,11 @@ def _content_safety_settings(
     allowed = set(allowed_categories)
     return [
         {
-            "category": category,
+            "type": category.removeprefix("HARM_CATEGORY_").lower(),
             "threshold": (
-                "OFF"
+                "off"
                 if category in allowed
-                else "BLOCK_LOW_AND_ABOVE"
+                else "block_low_and_above"
             ),
         }
         for category in TEXT_SAFETY_HARM_CATEGORIES
@@ -4114,7 +4111,7 @@ def _repair_gemini_creative_terms(
         )
 
         try:
-            response = _generate_content_with_retry(
+            response = _create_interaction_with_retry(
                 client,
                 model=CREATIVE_TERM_REPAIR_MODEL,
                 contents=repair_prompt,
@@ -4139,7 +4136,7 @@ def _repair_gemini_creative_terms(
                 )
             )
 
-        repaired_text = str(getattr(response, "text", "") or "").strip()
+        repaired_text = str(getattr(response, "output_text", "") or "").strip()
 
         if not repaired_text:
             LOGGER.warning(
@@ -4262,7 +4259,7 @@ def _repair_gemini_suggested_setup_fields(
         )
 
         try:
-            response = _generate_content_with_retry(
+            response = _create_interaction_with_retry(
                 client,
                 model=CREATIVE_TERM_REPAIR_MODEL,
                 contents=repair_prompt,
@@ -4280,7 +4277,7 @@ def _repair_gemini_suggested_setup_fields(
             )
             break
 
-        repaired_text = str(getattr(response, "text", "") or "").strip()
+        repaired_text = str(getattr(response, "output_text", "") or "").strip()
         if repaired_text:
             if merge_partial:
                 candidate_data = _parse_new_game_phase_object(
@@ -4862,11 +4859,11 @@ def _creative_term_repair_config(
 
     preferences = normalize_ai_mode_preferences(ai_preferences)
     return {
-        "response_mime_type": "application/json",
+        "response_format": [{"type": "text", "mime_type": "application/json"}],
         "safety_settings": _content_safety_settings(
             preferences["allowed_content_categories"]
         ),
-        "thinking_config": _thinking_config(
+        "generation_config": _thinking_config(
             CREATIVE_TERM_REPAIR_MODEL,
             "minimal",
         ),
@@ -4906,7 +4903,10 @@ def _generate_new_game_response_with_quality_retry(
             # A response-length preference must not prevent required setup state from
             # being returned. Recovery attempts keep the prose guidance but remove the
             # hard token cap and explicitly ask for a fresh, concise, complete object.
-            request_config.pop("max_output_tokens", None)
+            request_config["generation_config"] = {
+                key: value for key, value in config.get("generation_config", {}).items()
+                if key != "max_output_tokens"
+            }
             attempt_label = f"{request_label} contract repair {attempt - 1}"
             request_contents = _new_game_quality_retry_prompt(
                 prompt,
@@ -4914,7 +4914,10 @@ def _generate_new_game_response_with_quality_retry(
                 attempt=attempt,
             )
             if scoped_fields and candidate is not None and setup_packet is not None:
-                request_config["response_json_schema"] = section_schema(response_schema, scoped_fields)
+                request_config["response_format"] = [{
+                    "type": "text", "mime_type": "application/json",
+                    "schema": section_schema(response_schema, scoped_fields),
+                }]
                 request_contents = "\n\n".join([
                     _xml_text_section("identity", "You repair selected sections of an AI Adventure New Game response."),
                     _xml_text_section("critical_constraints",
@@ -4931,11 +4934,11 @@ def _generate_new_game_response_with_quality_retry(
                     len(request_contents), len(prompt))
 
         try:
-            response = _generate_content_with_retry(
+            response = _create_interaction_with_retry(
                 client, model=model, contents=request_contents, config=request_config,
                 request_label=attempt_label, validate_response=False,
             )
-            candidate_text = str(getattr(response, "text", "") or "").strip()
+            candidate_text = str(getattr(response, "output_text", "") or "").strip()
             active_contract = section_schema(contract, scoped_fields) if scoped_fields else contract
             candidate_errors = _response_contract_errors(candidate_text, active_contract)
             # Strict parsing: never merge malformed, duplicate-key, or non-finite JSON.
@@ -5115,7 +5118,15 @@ def _with_prompt_response_schema(config: dict[str, Any], schema: dict[str, Any])
     return prepared
 
 
-def _generate_content_with_retry(
+def _text_response_format(config: dict[str, Any]) -> dict[str, Any]:
+    """Return the text format used by our unary, locally managed requests."""
+    formats = config.get("response_format", [])
+    if isinstance(formats, dict):
+        formats = [formats]
+    return next((item for item in formats if item.get("type") == "text"), {})
+
+
+def _create_interaction_with_retry(
     client: Any,
     *,
     model: str,
@@ -5143,14 +5154,16 @@ def _generate_content_with_retry(
 
     contents, prepared_config = _separate_system_rules(contents, config)
     active_config = _tool_free_text_generation_config(prepared_config)
-    contract = config.get("response_json_schema")
+    contract = _text_response_format(config).get("schema")
     validation_schema = response_contract if response_contract is not None else contract
     compacted = False
     if isinstance(contract, dict):
         transport_schema = _compact_story_transport_schema(contract)
         compacted = transport_schema != contract
         if compacted:
-            active_config["response_json_schema"] = transport_schema
+            active_config["response_format"] = [{
+                **_text_response_format(active_config), "schema": transport_schema,
+            }]
             active_config = _with_prompt_response_schema(active_config, contract)
     degraded = False
     contract_repair = False
@@ -5171,10 +5184,11 @@ def _generate_content_with_retry(
         metric_attempt = 1 if contract_repair else attempt
         started = time.perf_counter()
         try:
-            response = client.models.generate_content(
+            response = client.interactions.create(
                 model=model,
-                contents=contents,
-                config=active_config,
+                input=contents,
+                store=False,
+                **active_config,
             )
         except Exception as error:
             record_attempt(label=attempt_label, model=model, attempt=metric_attempt, started=started, degraded=degraded)
@@ -5187,7 +5201,7 @@ def _generate_content_with_retry(
             )
             if (
                 _is_invalid_argument_model_error(error)
-                and "response_json_schema" in active_config
+                and "schema" in _text_response_format(active_config)
                 and allow_schema_fallback
                 and attempt < MODEL_REQUEST_ATTEMPTS
             ):
@@ -5202,12 +5216,7 @@ def _generate_content_with_retry(
                         config=active_config,
                     ),
                 )
-                active_config = {
-                    key: value
-                    for key, value in active_config.items()
-                    if key != "response_json_schema"
-                }
-                active_config["response_mime_type"] = "application/json"
+                active_config["response_format"] = [{"type": "text", "mime_type": "application/json"}]
                 if isinstance(contract, dict) and not compacted:
                     active_config = _with_prompt_response_schema(active_config, contract)
                 degraded = True
@@ -5247,8 +5256,13 @@ def _generate_content_with_retry(
 
         record_attempt(label=attempt_label, model=model, attempt=metric_attempt, started=started,
                        response=response, degraded=degraded)
+        if getattr(response, "status", "completed") != "completed":
+            raise GeminiRequestError(
+                "Gemini did not complete the interaction. No generated changes were saved; "
+                "please try again."
+            )
         if validate_response and (degraded or compacted) and isinstance(validation_schema, dict):
-            raw_text = str(getattr(response, "text", "") or "").strip()
+            raw_text = str(getattr(response, "output_text", "") or "").strip()
             errors = _response_contract_errors(raw_text, validation_schema)
             if errors and not contract_repair:
                 LOGGER.warning(
@@ -5278,35 +5292,21 @@ def _tool_free_text_generation_config(config: dict[str, Any]) -> dict[str, Any]:
     prohibited: list[str] = []
     if config.get("tools"):
         prohibited.append("tools")
-    if config.get("tool_config"):
-        prohibited.append("tool_config")
-
-    automatic = config.get("automatic_function_calling")
-    if automatic:
-        automatic_disabled = (
-            isinstance(automatic, dict) and automatic.get("disable") is True
-        )
-        if not automatic_disabled:
-            prohibited.append("automatic_function_calling")
-
-    modalities = config.get("response_modalities")
-    if modalities is not None:
-        raw_modalities = (
-            [modalities]
-            if isinstance(modalities, str)
-            else list(modalities)
-            if isinstance(modalities, (list, tuple, set))
-            else []
-        )
-        if not raw_modalities or any(
-            str(modality).strip().casefold() != "text"
-            for modality in raw_modalities
-        ):
-            prohibited.append("response_modalities")
-
-    for key in ("image_config", "speech_config"):
-        if key in config and config.get(key) is not None:
+    for key in ("tool_config", "automatic_function_calling", "response_modalities",
+                "image_config", "speech_config"):
+        if key in config:
             prohibited.append(key)
+
+    generation = dict(config.get("generation_config", {}))
+    if generation.get("tool_choice", "none") != "none":
+        prohibited.append("generation_config.tool_choice")
+    if any(key in generation for key in ("image_config", "speech_config", "video_config")):
+        prohibited.append("generation_config")
+    formats = config.get("response_format", [{"type": "text"}])
+    if isinstance(formats, dict):
+        formats = [formats]
+    if not formats or any(item.get("type") != "text" for item in formats):
+        prohibited.append("response_format")
 
     if prohibited:
         raise GeminiConfigurationError(
@@ -5316,11 +5316,9 @@ def _tool_free_text_generation_config(config: dict[str, Any]) -> dict[str, Any]:
 
     active_config = dict(config)
     active_config["tools"] = []
-    active_config["tool_config"] = {
-        "function_calling_config": {"mode": "NONE"},
-    }
-    active_config["automatic_function_calling"] = {"disable": True}
-    active_config["response_modalities"] = ["TEXT"]
+    generation["tool_choice"] = "none"
+    active_config["generation_config"] = generation
+    active_config.setdefault("response_format", [{"type": "text"}])
     return active_config
 
 
@@ -5343,6 +5341,18 @@ def _is_invalid_argument_model_error(error: Exception) -> bool:
 
     text = str(error).casefold()
     status_code = getattr(error, "status_code", getattr(error, "code", None))
+    body = getattr(error, "body", None)
+    if isinstance(body, str):
+        try:
+            body = json.loads(body)
+        except ValueError:
+            body = None
+    if isinstance(body, dict):
+        details = body.get("error", body)
+        if isinstance(details, dict) and details.get("code") in {
+            "safety", "jailbreak", "prohibited_content", "blocklist",
+        }:
+            return False
     return status_code == 400 or (
         "400" in text and ("invalid_argument" in text or "invalid argument" in text)
     )
@@ -5376,7 +5386,7 @@ def _model_request_diagnostics(
 ) -> str:
     """Returns safe request metadata useful for diagnosing API rejections."""
 
-    schema = config.get("response_json_schema")
+    schema = _text_response_format(config).get("schema")
     schema_properties = (
         schema.get("properties", {})
         if isinstance(schema, dict)
@@ -5387,21 +5397,13 @@ def _model_request_diagnostics(
         "contents_chars": len(contents),
         "config_keys": sorted(str(key) for key in config),
         "tools_enabled": bool(config.get("tools")),
-        "function_calling_mode": _nested_value(
-            config,
-            "tool_config",
-            "function_calling_config",
-            "mode",
-        ),
-        "automatic_function_calling_disabled": _nested_value(
-            config,
-            "automatic_function_calling",
-            "disable",
-        ),
-        "response_modalities": config.get("response_modalities"),
-        "response_mime_type": config.get("response_mime_type"),
-        "thinking_config": config.get("thinking_config"),
-        "max_output_tokens": config.get("max_output_tokens"),
+        "tool_choice": config.get("generation_config", {}).get("tool_choice"),
+        "response_format_types": [item.get("type") for item in (
+            [config["response_format"]] if isinstance(config.get("response_format"), dict)
+            else config.get("response_format", [])
+        )],
+        "response_mime_type": _text_response_format(config).get("mime_type"),
+        "generation_config": config.get("generation_config"),
         "schema_type": schema.get("type") if isinstance(schema, dict) else None,
         "schema_json_chars": len(json.dumps(schema, separators=(",", ":"))) if isinstance(schema, dict) else 0,
         "schema_top_level_properties": sorted(str(key) for key in schema_properties),
@@ -6959,7 +6961,7 @@ def _repair_container_reward_flow(
                     "Do not use extra event fields to bypass the contract.",
             }
             prompt = build_gemini_story_prompt(repair_packet)
-            response = _generate_content_with_retry(
+            response = _create_interaction_with_retry(
                 client, model=model, contents=prompt,
                 config=_structured_output_config(response_schema, model=model,
                     ai_preferences=ai_preferences, apply_response_length=True),
@@ -6967,7 +6969,7 @@ def _repair_container_reward_flow(
                 response_contract=build_story_response_schema(context_packet, for_api=False),
             )
             raw_text = _repair_gemini_creative_terms(
-                client, model, str(getattr(response, "text", "") or "").strip(),
+                client, model, str(getattr(response, "output_text", "") or "").strip(),
                 "container consistency repair", response_schema,
                 ai_preferences=ai_preferences, apply_response_length=True,
             )
@@ -7051,7 +7053,7 @@ def _repair_resolved_check_narration(
                 "Include the events warranted by those consequences."
             ),
         }
-        response = _generate_content_with_retry(
+        response = _create_interaction_with_retry(
             client, model=model, contents=build_gemini_story_prompt(repair_packet),
             config=_structured_output_config(response_schema, model=model,
                 ai_preferences=ai_preferences, apply_response_length=True),
@@ -7059,7 +7061,7 @@ def _repair_resolved_check_narration(
             response_contract=build_story_response_schema(context_packet, for_api=False),
         )
         raw_text = _repair_gemini_creative_terms(
-            client, model, str(getattr(response, "text", "") or "").strip(),
+            client, model, str(getattr(response, "output_text", "") or "").strip(),
             "resolved-check narration repair", response_schema,
             ai_preferences=ai_preferences, apply_response_length=True,
         )

@@ -79,7 +79,8 @@ Normal application logs include content-free request and operation metrics:
 - Latency uses a monotonic clock. Per-attempt latency measures the SDK call;
   operation latency also includes backoff, repairs, parsing, and validation.
 - Prompt, candidate, thinking, cached, and total token counts come from SDK
-  `usage_metadata`. Missing counts are `null`, never estimates or zero. Aggregated
+  `interaction.usage`. Interactions input/output/thought/cache fields are mapped
+  to the existing benchmark field names. Missing counts are `null`, never estimates or zero. Aggregated
   counts are totals of reported values; `usage_missing_count` identifies attempts
   with no metadata, including failures whose billing is unknown.
 - Degraded count records attempts made without the rejected server schema,
@@ -88,7 +89,8 @@ Normal application logs include content-free request and operation metrics:
   Success/failure is recorded for both the SDK call and complete operation.
 
 Operation metrics are isolated by execution context so concurrent workers do not
-mix counts. These metrics do not include generated audio or image API usage.
+mix counts. Image generation has its own operation metrics and message category. Speech
+uses local engines and has no Gemini API usage.
 Raw prompts/responses remain restricted to the existing playtesting debug logging.
 Contract failures log bounded field paths and validation reasons. Event union
 diagnostics select the branch matching the proposed type rather than reporting

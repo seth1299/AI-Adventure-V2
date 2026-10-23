@@ -1970,6 +1970,11 @@ class NewGameWizard(QWizard):
             _sync_starting_npc_location_dropdowns(
                 self.starting_npcs_table,
                 locations,
+                existing_location_ids={
+                    _starting_location_row_id_for_row(self.starting_locations_table, row)
+                    for row in range(self.starting_locations_table.rowCount())
+                    if not self.starting_locations_table.isRowHidden(row)
+                },
             )
         if hasattr(self, "starting_party_table"):
             self._sync_starting_party_choices()

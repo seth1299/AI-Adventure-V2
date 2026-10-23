@@ -90,38 +90,24 @@ class VisualAssetTests(unittest.TestCase):
     def test_image_service_uses_image_only_model_request(self) -> None:
         captured: dict[str, object] = {}
 
-        class _ImageConfig:
-            def __init__(self, **kwargs):
-                self.values = kwargs
-
-        class _GenerateContentConfig:
-            def __init__(self, **kwargs):
-                self.values = kwargs
-
-        class _Models:
-            def generate_content(self, **kwargs):
+        class _Interactions:
+            sdk_configuration = types.SimpleNamespace(retry_config=types.SimpleNamespace(max_retries=4))
+            def create(self, **kwargs):
                 captured.update(kwargs)
+                import base64
                 return types.SimpleNamespace(
-                    parts=[
-                        types.SimpleNamespace(
-                            inline_data=types.SimpleNamespace(
-                                data=b"image-bytes",
-                                mime_type="image/png",
-                            )
-                        )
-                    ]
+                    status="completed",
+                    output_image=types.SimpleNamespace(
+                        data=base64.b64encode(b"image-bytes").decode(), mime_type="image/png",
+                    ),
                 )
 
         fake_genai = types.ModuleType("google.genai")
         setattr(
             fake_genai,
             "Client",
-            lambda **_kwargs: types.SimpleNamespace(models=_Models()),
+            lambda **_kwargs: types.SimpleNamespace(interactions=_Interactions()),
         )
-        fake_types = types.ModuleType("google.genai.types")
-        setattr(fake_types, "ImageConfig", _ImageConfig)
-        setattr(fake_types, "GenerateContentConfig", _GenerateContentConfig)
-        setattr(fake_genai, "types", fake_types)
         fake_google = types.ModuleType("google")
         setattr(fake_google, "genai", fake_genai)
         request = VisualAssetRequest(
@@ -137,7 +123,6 @@ class VisualAssetTests(unittest.TestCase):
                 {
                     "google": fake_google,
                     "google.genai": fake_genai,
-                    "google.genai.types": fake_types,
                 },
             ),
             patch("ai_adventure.visual_assets.read_api_key", return_value="key"),
@@ -149,10 +134,11 @@ class VisualAssetTests(unittest.TestCase):
         self.assertEqual(data, b"image-bytes")
         self.assertEqual(mime_type, "image/png")
         self.assertEqual(captured["model"], "gemini-3.1-flash-lite-image")
-        config = cast(Any, captured["config"])
-        self.assertEqual(config.values["response_modalities"], ["IMAGE"])
-        self.assertEqual(config.values["image_config"].values["aspect_ratio"], "1:1")
-        self.assertEqual(config.values["image_config"].values["image_size"], "1K")
+        self.assertFalse(captured["store"])
+        self.assertEqual(captured["input"], request.prompt)
+        self.assertEqual(captured["response_format"], [{
+            "type": "image", "aspect_ratio": "1:1", "image_size": "1K",
+        }])
 
     def test_new_game_contract_mentions_visual_quality_without_image_schema_fields(self) -> None:
         prompt = build_gemini_new_game_prompt(

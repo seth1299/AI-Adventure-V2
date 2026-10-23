@@ -5,10 +5,10 @@ set "SCRIPT_DIR=%~dp0"
 for %%I in ("%SCRIPT_DIR%.") do set "REPO_ROOT=%%~fI"
 pushd "%REPO_ROOT%"
 echo ============================================================
-echo All_Tests - complete unittest discovery
+echo All_Tests - isolated unittest packages
 echo Started: %DATE% %TIME%
-echo Command: .venv\Scripts\python.exe -u -m unittest discover -s tests -t . -v
-echo Includes every unittest package under tests\.
+echo Runs every test package in its own process and aggregates results.
+echo Python fault handler is enabled; remaining packages run after failures.
 echo ============================================================
 if not exist ".venv\Scripts\python.exe" (
     echo ERROR: Project interpreter not found at .venv\Scripts\python.exe
@@ -17,7 +17,8 @@ if not exist ".venv\Scripts\python.exe" (
 )
 set "PYTHONUNBUFFERED=1"
 set "PYTHONUTF8=1"
-".venv\Scripts\python.exe" -u -m unittest discover -s "tests" -t . -v
+set "PYTHONFAULTHANDLER=1"
+".venv\Scripts\python.exe" -X faulthandler -u run_test_packages.py
 set "TEST_EXIT=%ERRORLEVEL%"
 echo.
 echo Finished: %DATE% %TIME%

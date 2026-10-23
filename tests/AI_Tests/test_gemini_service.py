@@ -44,7 +44,7 @@ from ai_adventure.ai.gemini_service import (
     _filter_unwarranted_planned_d20_tests,
     _generate_new_game_response_with_quality_retry,
     _prefer_clearly_relevant_known_skill,
-    _generate_content_with_retry,
+    _create_interaction_with_retry,
     _compact_story_transport_schema,
     _model_error_diagnostics,
     _model_request_diagnostics,
@@ -104,7 +104,7 @@ class GeminiServiceTests(unittest.TestCase):
             self.assertEqual(clean["calendar_settings"], calendar)
             self.assertNotIn("Oakhaven", clean["world_summary"])
             repaired = {"calendar_settings": {"day_names": ["the city"]}, "world_summary": "Brassgate is a city."}
-            with patch("ai_adventure.ai.gemini_service._generate_content_with_retry", return_value=types.SimpleNamespace(text=json.dumps(repaired))):
+            with patch("ai_adventure.ai.gemini_service._create_interaction_with_retry", return_value=types.SimpleNamespace(output_text=json.dumps(repaired))):
                 result = _repair_gemini_creative_terms(None, "test", json.dumps(original), label, {}, additional_forbidden_terms=["Oakhaven"])
             self.assertEqual(json.loads(result)["calendar_settings"], calendar)
             self.assertEqual(json.loads(result)["world_summary"], "Brassgate is a city.")
@@ -892,7 +892,7 @@ class GeminiServiceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             env_path = Path(temp_dir) / ".env"
             env_path.write_text(
-                "GEMINI_API_KEY=test-key\nGEMINI_MODEL=gemini-2.5-pro\n",
+                "GEMINI_API_KEY=test-key\nGEMINI_MODEL=gemini-3.8-flash\n",
                 encoding="utf-8",
             )
             key_path = Path(temp_dir) / "gemini_api_key.txt"
@@ -913,7 +913,7 @@ class GeminiServiceTests(unittest.TestCase):
                     os.environ["GEMINI_MODEL"] = old_model
 
             self.assertEqual(settings.api_key, "local-key")
-            self.assertEqual(settings.model, "gemini-2.5-pro")
+            self.assertEqual(settings.model, "gemini-3.8-flash")
 
     def test_load_gemini_settings_ignores_api_key_in_model_file(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1000,32 +1000,32 @@ class GeminiServiceTests(unittest.TestCase):
 
         try:
             service = GeminiNarrationService(
-                GeminiSettings(api_key="test-key", model="gemini-2.5-flash")
+                GeminiSettings(api_key="test-key", model="gemini-3.8-flash")
             )
             result = service.generate_story_response({"packet_type": "story_turn"})
         finally:
             self._remove_fake_genai_client()
 
-        call = fake_client_class.last_client.models.calls[0]
+        call = fake_client_class.last_client.interactions.calls[0]
 
         self.assertIn("The road bends into fog.", result.narrative_text)
         self.assertIn("What do you do now?", result.narrative_text)
         self.assertEqual(len(result.suggested_actions), 3)
-        self.assertEqual(call["model"], "gemini-2.5-flash")
-        self.assertEqual(call["config"]["response_mime_type"], "application/json")
+        self.assertEqual(call["model"], "gemini-3.8-flash")
+        self.assertEqual(call["response_format"][0]["mime_type"], "application/json")
         self.assertEqual(
-            call["config"]["response_json_schema"],
+            call["response_format"][0]["schema"],
             _compact_story_transport_schema(build_story_response_schema({"packet_type": "story_turn"})),
         )
         self.assertEqual(
-            call["config"]["safety_settings"][0]["threshold"],
-            "OFF",
+            call["safety_settings"][0]["threshold"],
+            "off",
         )
         self.assertEqual(
-            call["config"]["thinking_config"]["thinking_budget"],
-            1024,
+            call["generation_config"]["thinking_level"],
+            "minimal",
         )
-        self.assertNotIn("max_output_tokens", call["config"])
+        self.assertNotIn("max_output_tokens", call["generation_config"])
 
     def test_story_dynamic_schema_keeps_only_turn_relevant_event_types(self) -> None:
         schema = build_story_response_schema(
@@ -1467,25 +1467,25 @@ class GeminiServiceTests(unittest.TestCase):
         finally:
             self._remove_fake_genai_client()
 
-        call = fake_client_class.last_client.models.calls[0]
+        call = fake_client_class.last_client.interactions.calls[0]
         safety_by_category = {
-            setting["category"]: setting["threshold"]
-            for setting in call["config"]["safety_settings"]
+            setting["type"]: setting["threshold"]
+            for setting in call["safety_settings"]
         }
 
         self.assertEqual(
-            call["config"]["thinking_config"],
-            {"thinking_level": "high"},
+            call["generation_config"]["thinking_level"],
+            "high",
         )
-        self.assertEqual(call["config"]["max_output_tokens"], 1536)
-        self.assertEqual(safety_by_category["HARM_CATEGORY_HARASSMENT"], "OFF")
+        self.assertEqual(call["generation_config"]["max_output_tokens"], 1536)
+        self.assertEqual(safety_by_category["harassment"], "off")
         self.assertEqual(
-            safety_by_category["HARM_CATEGORY_DANGEROUS_CONTENT"],
-            "BLOCK_LOW_AND_ABOVE",
+            safety_by_category["dangerous_content"],
+            "block_low_and_above",
         )
-        self.assertIn("cold, restrained, serious voice", call["contents"])
-        self.assertIn("as short as practical", call["contents"])
-        self.assertIn("unchecked categories", call["contents"])
+        self.assertIn("cold, restrained, serious voice", call["input"])
+        self.assertIn("as short as practical", call["input"])
+        self.assertIn("unchecked categories", call["input"])
 
     def test_d20_test_plan_request_uses_lightweight_schema(self) -> None:
         fake_client_class = self._install_fake_genai_client(
@@ -1505,7 +1505,7 @@ class GeminiServiceTests(unittest.TestCase):
 
         try:
             service = GeminiNarrationService(
-                GeminiSettings(api_key="test-key", model="gemini-2.5-flash")
+                GeminiSettings(api_key="test-key", model="gemini-3.8-flash")
             )
             result = service.plan_story_d20_tests(
                 {
@@ -1538,24 +1538,24 @@ class GeminiServiceTests(unittest.TestCase):
         finally:
             self._remove_fake_genai_client()
 
-        call = fake_client_class.last_client.models.calls[0]
+        call = fake_client_class.last_client.interactions.calls[0]
 
         self.assertEqual(result.checks[0]["skill_name"], "Foraging")
         self.assertEqual(result.checks[0]["difficulty"], "hard")
         self.assertEqual(result.relevant_tags, ["exploration", "skill", "uncertainty"])
-        self.assertEqual(call["config"]["response_mime_type"], "application/json")
+        self.assertEqual(call["response_format"][0]["mime_type"], "application/json")
         self.assertEqual(
-            call["config"]["response_json_schema"],
+            call["response_format"][0]["schema"],
             D20_TEST_PLAN_RESPONSE_JSON_SCHEMA,
         )
-        self.assertIn("d20_test_planning", call["contents"])
-        self.assertNotIn("<inventory>", call["contents"].casefold())
-        self.assertNotIn("<miscellaneous>", call["contents"].casefold())
-        self.assertIn("cliff_is_trapped", call["contents"])
-        self.assertIn("concealed wire", call["contents"])
-        self.assertIn("<available_tags>", call["contents"])
-        self.assertIn('"relevant_tags"', call["contents"])
-        self.assertIn("Use skill_rules", call["config"]["system_instruction"])
+        self.assertIn("d20_test_planning", call["input"])
+        self.assertNotIn("<inventory>", call["input"].casefold())
+        self.assertNotIn("<miscellaneous>", call["input"].casefold())
+        self.assertIn("cliff_is_trapped", call["input"])
+        self.assertIn("concealed wire", call["input"])
+        self.assertIn("<available_tags>", call["input"])
+        self.assertIn('"relevant_tags"', call["input"])
+        self.assertIn("Use skill_rules", call["system_instruction"])
 
     def test_parse_d20_test_plan_response_normalizes_checks(self) -> None:
         result = parse_d20_test_plan_response(
@@ -1970,7 +1970,7 @@ class GeminiServiceTests(unittest.TestCase):
 
         try:
             service = GeminiNarrationService(
-                GeminiSettings(api_key="test-key", model="gemini-2.5-flash")
+                GeminiSettings(api_key="test-key", model="gemini-3.8-flash")
             )
             result = service.generate_story_response(
                 {
@@ -2027,7 +2027,7 @@ class GeminiServiceTests(unittest.TestCase):
 
         try:
             service = GeminiNarrationService(
-                GeminiSettings(api_key="test-key", model="gemini-2.5-flash")
+                GeminiSettings(api_key="test-key", model="gemini-3.8-flash")
             )
             result = service.generate_story_response(
                 {
@@ -2078,7 +2078,7 @@ class GeminiServiceTests(unittest.TestCase):
 
         try:
             service = GeminiNarrationService(
-                GeminiSettings(api_key="test-key", model="gemini-2.5-flash")
+                GeminiSettings(api_key="test-key", model="gemini-3.8-flash")
             )
             result = service.generate_story_response(
                 {
@@ -2136,7 +2136,7 @@ class GeminiServiceTests(unittest.TestCase):
 
         try:
             service = GeminiNarrationService(
-                GeminiSettings(api_key="test-key", model="gemini-2.5-flash")
+                GeminiSettings(api_key="test-key", model="gemini-3.8-flash")
             )
             with self.assertRaisesRegex(GeminiRequestError, "not saved"):
                 service.generate_story_response(
@@ -2198,7 +2198,7 @@ class GeminiServiceTests(unittest.TestCase):
 
         try:
             result = GeminiNarrationService(
-                GeminiSettings(api_key="test-key", model="gemini-2.5-flash")
+                GeminiSettings(api_key="test-key", model="gemini-3.8-flash")
             ).generate_story_response(
                 {
                     "selection": {"tags": ['inventory']},
@@ -2315,7 +2315,7 @@ class GeminiServiceTests(unittest.TestCase):
 
         try:
             result = GeminiNarrationService(
-                GeminiSettings(api_key="test-key", model="gemini-2.5-flash")
+                GeminiSettings(api_key="test-key", model="gemini-3.8-flash")
             ).generate_story_response(
                 {
                     "selection": {"tags": ['inventory', 'reagent']},
@@ -2388,7 +2388,7 @@ class GeminiServiceTests(unittest.TestCase):
         try:
             with self.assertRaisesRegex(GeminiRequestError, "not saved"):
                 GeminiNarrationService(
-                    GeminiSettings(api_key="test-key", model="gemini-2.5-flash")
+                    GeminiSettings(api_key="test-key", model="gemini-3.8-flash")
                 ).generate_story_response(
                     {
                         "selection": {"tags": ['inventory', 'currency']},
@@ -2425,7 +2425,7 @@ class GeminiServiceTests(unittest.TestCase):
 
         try:
             service = GeminiNarrationService(
-                GeminiSettings(api_key="test-key", model="gemini-2.5-flash")
+                GeminiSettings(api_key="test-key", model="gemini-3.8-flash")
             )
             result = service.generate_story_response(
                 {
@@ -2481,7 +2481,7 @@ class GeminiServiceTests(unittest.TestCase):
 
         try:
             service = GeminiNarrationService(
-                GeminiSettings(api_key="test-key", model="gemini-2.5-flash")
+                GeminiSettings(api_key="test-key", model="gemini-3.8-flash")
             )
             result = service.generate_story_response(
                 {
@@ -2530,7 +2530,7 @@ class GeminiServiceTests(unittest.TestCase):
 
         try:
             service = GeminiNarrationService(
-                GeminiSettings(api_key="test-key", model="gemini-2.5-flash")
+                GeminiSettings(api_key="test-key", model="gemini-3.8-flash")
             )
             result = service.generate_story_response(
                 {
@@ -2572,7 +2572,7 @@ class GeminiServiceTests(unittest.TestCase):
 
         try:
             service = GeminiNarrationService(
-                GeminiSettings(api_key="test-key", model="gemini-2.5-flash")
+                GeminiSettings(api_key="test-key", model="gemini-3.8-flash")
             )
             result = service.generate_story_response(
                 {
@@ -2626,7 +2626,7 @@ class GeminiServiceTests(unittest.TestCase):
 
         try:
             service = GeminiNarrationService(
-                GeminiSettings(api_key="test-key", model="gemini-2.5-flash")
+                GeminiSettings(api_key="test-key", model="gemini-3.8-flash")
             )
             result = service.generate_story_response(
                 {
@@ -2686,7 +2686,7 @@ class GeminiServiceTests(unittest.TestCase):
 
         try:
             service = GeminiNarrationService(
-                GeminiSettings(api_key="test-key", model="gemini-2.5-flash")
+                GeminiSettings(api_key="test-key", model="gemini-3.8-flash")
             )
             result = service.generate_story_response(
                 {
@@ -2742,7 +2742,7 @@ class GeminiServiceTests(unittest.TestCase):
 
         try:
             service = GeminiNarrationService(
-                GeminiSettings(api_key="test-key", model="gemini-2.5-flash")
+                GeminiSettings(api_key="test-key", model="gemini-3.8-flash")
             )
             result = service.generate_story_response(
                 {
@@ -3250,23 +3250,23 @@ class GeminiServiceTests(unittest.TestCase):
 
         try:
             service = GeminiNarrationService(
-                GeminiSettings(api_key="test-key", model="gemini-2.5-flash")
+                GeminiSettings(api_key="test-key", model="gemini-3.8-flash")
             )
             result = service.generate_new_game_world({"packet_type": "new_game_setup"})
         finally:
             self._remove_fake_genai_client()
 
-        call = fake_client_class.last_client.models.calls[0]
+        call = fake_client_class.last_client.interactions.calls[0]
 
         self.assertEqual(result.world_summary, "A city under glass.")
-        self.assertEqual(call["config"]["response_mime_type"], "application/json")
+        self.assertEqual(call["response_format"][0]["mime_type"], "application/json")
         self.assertEqual(
-            call["config"]["response_json_schema"],
+            call["response_format"][0]["schema"],
             build_new_game_response_schema({"packet_type": "new_game_setup"}),
         )
         self.assertEqual(
-            call["config"]["safety_settings"][0]["threshold"],
-            "OFF",
+            call["safety_settings"][0]["threshold"],
+            "off",
         )
 
     def test_new_game_request_uses_condensed_schema_for_completed_setup(self) -> None:
@@ -3334,21 +3334,21 @@ class GeminiServiceTests(unittest.TestCase):
 
         try:
             result = GeminiNarrationService(
-                GeminiSettings(api_key="test-key", model="gemini-2.5-flash")
+                GeminiSettings(api_key="test-key", model="gemini-3.8-flash")
             ).generate_new_game_world(packet)
         finally:
             self._remove_fake_genai_client()
 
-        call = fake_client_class.last_client.models.calls[0]
-        schema = call["config"]["response_json_schema"]
+        call = fake_client_class.last_client.interactions.calls[0]
+        schema = call["response_format"][0]["schema"]
         self.assertEqual(result.selected_genre, "Urban fantasy")
         self.assertEqual(result.start_location, "Kit's Hideout")
         self.assertNotIn("character", schema["properties"])
         self.assertNotIn("skills", schema["properties"])
         self.assertNotIn("currency_denominations", schema["properties"])
         self.assertNotIn("events", schema["properties"])
-        self.assertIn('"required_output_fields"', call["contents"])
-        self.assertNotIn('"character_generation"', call["contents"])
+        self.assertIn('"required_output_fields"', call["input"])
+        self.assertNotIn('"character_generation"', call["input"])
 
     def test_staged_new_game_generation_uses_three_canonical_phases(self) -> None:
         packet = self._completed_new_game_packet(start_location_mode="exact")
@@ -3402,7 +3402,7 @@ class GeminiServiceTests(unittest.TestCase):
         finally:
             self._remove_fake_genai_client()
 
-        calls = fake_client_class.last_client.models.calls
+        calls = fake_client_class.last_client.interactions.calls
         self.assertEqual(len(calls), 3)
         self.assertEqual(
             progress,
@@ -3423,11 +3423,11 @@ class GeminiServiceTests(unittest.TestCase):
             "Useful Item 0",
         )
         self.assertIn(opening_response["introductory_message"], result.introductory_message)
-        self.assertIn("world_skeleton", calls[0]["contents"])
-        self.assertIn("entities_mechanics", calls[1]["contents"])
-        self.assertIn("opening_prose", calls[2]["contents"])
-        self.assertIn("approved_state", calls[1]["contents"])
-        self.assertIn("approved_state", calls[2]["contents"])
+        self.assertIn("world_skeleton", calls[0]["input"])
+        self.assertIn("entities_mechanics", calls[1]["input"])
+        self.assertIn("opening_prose", calls[2]["input"])
+        self.assertIn("approved_state", calls[1]["input"])
+        self.assertIn("approved_state", calls[2]["input"])
 
     def test_new_game_phase_prompt_requires_directionally_consistent_map(self) -> None:
         prompt = build_gemini_new_game_phase_prompt(
@@ -3511,15 +3511,15 @@ class GeminiServiceTests(unittest.TestCase):
         finally:
             self._remove_fake_genai_client()
 
-        calls = fake_client_class.last_client.models.calls
+        calls = fake_client_class.last_client.interactions.calls
         self.assertEqual(len(calls), 2)
-        self.assertEqual(calls[0]["config"]["max_output_tokens"], 12288)
-        self.assertNotIn("max_output_tokens", calls[1]["config"])
-        self.assertIn("<retry_feedback>", calls[1]["contents"])
-        self.assertIn("$.introductory_message is required", calls[1]["contents"])
+        self.assertEqual(calls[0]["generation_config"]["max_output_tokens"], 12288)
+        self.assertNotIn("max_output_tokens", calls[1]["generation_config"])
+        self.assertIn("<retry_feedback>", calls[1]["input"])
+        self.assertIn("$.introductory_message is required", calls[1]["input"])
         self.assertEqual(
-            calls[1]["config"]["response_json_schema"],
-            calls[0]["config"]["response_json_schema"],
+            calls[1]["response_format"][0]["schema"],
+            calls[0]["response_format"][0]["schema"],
         )
         self.assertIn("Requesting a full regeneration", "\n".join(logs.output))
         self.assertIn("Morning light reaches the loft.", result.introductory_message)
@@ -3538,10 +3538,10 @@ class GeminiServiceTests(unittest.TestCase):
         finally:
             self._remove_fake_genai_client()
 
-        calls = fake_client_class.last_client.models.calls
+        calls = fake_client_class.last_client.interactions.calls
         self.assertEqual(len(calls), 1)
-        self.assertNotIn("ascii_art", json.dumps(calls[0]["config"]["response_json_schema"]))
-        self.assertNotIn("ascii_art", calls[0]["contents"])
+        self.assertNotIn("ascii_art", json.dumps(calls[0]["response_format"][0]["schema"]))
+        self.assertNotIn("ascii_art", calls[0]["input"])
 
     def test_new_game_parser_drops_legacy_art_field(self) -> None:
         parsed = _parse_new_game_starter_items(
@@ -3579,7 +3579,7 @@ class GeminiServiceTests(unittest.TestCase):
         finally:
             self._remove_fake_genai_client()
 
-        calls = fake_client_class.last_client.models.calls
+        calls = fake_client_class.last_client.interactions.calls
         self.assertEqual(len(calls), 5)
         self.assertEqual(result.world_summary, complete_response["world_summary"])
         self.assertIn("Morning light reaches the loft.", result.introductory_message)
@@ -3612,27 +3612,27 @@ class GeminiServiceTests(unittest.TestCase):
         finally:
             self._remove_fake_genai_client()
 
-        call = fake_client_class.last_client.models.calls[0]
+        call = fake_client_class.last_client.interactions.calls[0]
         safety_by_category = {
-            setting["category"]: setting["threshold"]
-            for setting in call["config"]["safety_settings"]
+            setting["type"]: setting["threshold"]
+            for setting in call["safety_settings"]
         }
 
         self.assertEqual(
-            call["config"]["thinking_config"],
-            {"thinking_level": "high"},
+            call["generation_config"]["thinking_level"],
+            "high",
         )
-        self.assertEqual(call["config"]["max_output_tokens"], 6144)
+        self.assertEqual(call["generation_config"]["max_output_tokens"], 6144)
         self.assertEqual(
-            safety_by_category["HARM_CATEGORY_DANGEROUS_CONTENT"],
-            "OFF",
+            safety_by_category["dangerous_content"],
+            "off",
         )
         self.assertEqual(
-            safety_by_category["HARM_CATEGORY_HARASSMENT"],
-            "BLOCK_LOW_AND_ABOVE",
+            safety_by_category["harassment"],
+            "block_low_and_above",
         )
-        self.assertIn("playful, occasionally zany voice", call["contents"])
-        self.assertIn("Response length - Super Brief", call["contents"])
+        self.assertIn("playful, occasionally zany voice", call["input"])
+        self.assertIn("Response length - Super Brief", call["input"])
 
     def test_new_game_repairs_banned_terms_until_response_is_clean(self) -> None:
         def response_for(
@@ -3729,7 +3729,7 @@ class GeminiServiceTests(unittest.TestCase):
 
         try:
             service = GeminiNarrationService(
-                GeminiSettings(api_key="test-key", model="gemini-2.5-flash")
+                GeminiSettings(api_key="test-key", model="gemini-3.8-flash")
             )
             with self.assertLogs("ai_adventure.ai.gemini_service", level="WARNING") as logs:
                 result = service.generate_new_game_world(
@@ -3743,9 +3743,9 @@ class GeminiServiceTests(unittest.TestCase):
         finally:
             self._remove_fake_genai_client()
 
-        calls = fake_client_class.last_client.models.calls
-        first_repair_prompt = str(calls[1]["contents"])
-        second_repair_prompt = str(calls[2]["contents"])
+        calls = fake_client_class.last_client.interactions.calls
+        first_repair_prompt = str(calls[1]["input"])
+        second_repair_prompt = str(calls[2]["input"])
         combined_output = json.dumps(
             {
                 "world_summary": result.world_summary,
@@ -3773,10 +3773,10 @@ class GeminiServiceTests(unittest.TestCase):
         for repair_call in calls[1:]:
             self.assertEqual(repair_call["model"], CREATIVE_TERM_REPAIR_MODEL)
             self.assertEqual(
-                repair_call["config"]["thinking_config"],
-                {"thinking_level": "minimal"},
+                repair_call["generation_config"]["thinking_level"],
+                "minimal",
             )
-            self.assertNotIn("response_json_schema", repair_call["config"])
+            self.assertNotIn("schema", repair_call["response_format"][0])
         self.assertIn("Brassgate", result.world_summary)
         for term in ("Oakhaven", "Elias", "Silas", "Vane"):
             self.assertNotIn(term, combined_output)
@@ -3786,7 +3786,7 @@ class GeminiServiceTests(unittest.TestCase):
             def __init__(self) -> None:
                 self.calls = 0
 
-            def generate_content(self, **_kwargs: object) -> object:
+            def create(self, **_kwargs: object) -> object:
                 self.calls += 1
                 if self.calls == 1:
                     raise RuntimeError("503 UNAVAILABLE: high demand")
@@ -3794,11 +3794,11 @@ class GeminiServiceTests(unittest.TestCase):
 
         models = Models()
         with patch("ai_adventure.ai.gemini_service.time.sleep") as sleep:
-            result = _generate_content_with_retry(
-                types.SimpleNamespace(models=models),
+            result = _create_interaction_with_retry(
+                types.SimpleNamespace(interactions=models),
                 model="gemini-3.1-flash-lite",
                 contents="{}",
-                config={"response_mime_type": "application/json"},
+                config={'response_format': [{'type': 'text', 'mime_type': 'application/json'}]},
                 request_label="test request",
             )
 
@@ -3811,13 +3811,13 @@ class GeminiServiceTests(unittest.TestCase):
             def __init__(self) -> None:
                 self.calls: list[dict[str, object]] = []
 
-            def generate_content(self, **kwargs: object) -> object:
+            def create(self, **kwargs: object) -> object:
                 self.calls.append(dict(kwargs))
                 return object()
 
         models = Models()
-        _generate_content_with_retry(
-            types.SimpleNamespace(models=models),
+        _create_interaction_with_retry(
+            types.SimpleNamespace(interactions=models),
             model=DEFAULT_GEMINI_MODEL,
             contents="Describe the café العربية — briefly.",
             config={},
@@ -3825,24 +3825,24 @@ class GeminiServiceTests(unittest.TestCase):
         )
 
         self.assertEqual(
-            models.calls[0]["contents"],
+            models.calls[0]["input"],
             "Describe the cafe - briefly.",
         )
-        self.assertTrue(str(models.calls[0]["contents"]).isascii())
+        self.assertTrue(str(models.calls[0]["input"]).isascii())
 
     def test_model_request_refuses_embedding_model_without_api_call(self) -> None:
         class Models:
             def __init__(self) -> None:
                 self.calls = 0
 
-            def generate_content(self, **_kwargs: object) -> object:
+            def create(self, **_kwargs: object) -> object:
                 self.calls += 1
                 return object()
 
         models = Models()
         with self.assertRaisesRegex(GeminiConfigurationError, "embedding-only"):
-            _generate_content_with_retry(
-                types.SimpleNamespace(models=models),
+            _create_interaction_with_retry(
+                types.SimpleNamespace(interactions=models),
                 model="gemini-embedding-2",
                 contents="{}",
                 config={},
@@ -3856,61 +3856,46 @@ class GeminiServiceTests(unittest.TestCase):
             def __init__(self) -> None:
                 self.calls: list[dict[str, object]] = []
 
-            def generate_content(self, **kwargs: object) -> object:
+            def create(self, **kwargs: object) -> object:
                 self.calls.append(dict(kwargs))
                 return object()
 
         models = Models()
-        _generate_content_with_retry(
-            types.SimpleNamespace(models=models),
+        _create_interaction_with_retry(
+            types.SimpleNamespace(interactions=models),
             model=DEFAULT_GEMINI_MODEL,
             contents="{}",
-            config={"response_mime_type": "application/json"},
+            config={'response_format': [{'type': 'text', 'mime_type': 'application/json'}]},
             request_label="test request",
         )
 
-        sent_config = models.calls[0]["config"]
+        sent_config = models.calls[0]
         self.assertIsInstance(sent_config, dict)
         assert isinstance(sent_config, dict)
         self.assertEqual(sent_config["tools"], [])  # type: ignore[index]
-        self.assertEqual(  # type: ignore[index]
-            sent_config["tool_config"],
-            {"function_calling_config": {"mode": "NONE"}},
-        )
-        self.assertEqual(  # type: ignore[index]
-            sent_config["automatic_function_calling"],
-            {"disable": True},
-        )
-        self.assertEqual(  # type: ignore[index]
-            sent_config["response_modalities"],
-            ["TEXT"],
-        )
-        diagnostics = _model_request_diagnostics(
-            model=DEFAULT_GEMINI_MODEL,
-            contents="{}",
-            config=sent_config,  # type: ignore[arg-type]
-        )
+        self.assertEqual(sent_config["generation_config"]["tool_choice"], "none")
+        self.assertEqual(sent_config["response_format"], [{"type": "text", "mime_type": "application/json"}])
+        self.assertFalse(sent_config["store"])
+        self.assertNotIn("previous_interaction_id", sent_config)
+        self.assertNotIn("automatic_function_calling", sent_config)
+        diagnostics = _model_request_diagnostics(model=DEFAULT_GEMINI_MODEL, contents="{}", config=sent_config)
         self.assertIn('"tools_enabled": false', diagnostics)
-        self.assertIn('"function_calling_mode": "NONE"', diagnostics)
-        self.assertIn(
-            '"automatic_function_calling_disabled": true',
-            diagnostics,
-        )
-        self.assertIn('"response_modalities": ["TEXT"]', diagnostics)
+        self.assertIn('"tool_choice": "none"', diagnostics)
+        self.assertIn('"response_format_types": ["text"]', diagnostics)
 
     def test_model_request_refuses_google_search_tool_without_api_call(self) -> None:
         class Models:
             def __init__(self) -> None:
                 self.calls = 0
 
-            def generate_content(self, **_kwargs: object) -> object:
+            def create(self, **_kwargs: object) -> object:
                 self.calls += 1
                 return object()
 
         models = Models()
         with self.assertRaisesRegex(GeminiConfigurationError, "tools"):
-            _generate_content_with_retry(
-                types.SimpleNamespace(models=models),
+            _create_interaction_with_retry(
+                types.SimpleNamespace(interactions=models),
                 model=DEFAULT_GEMINI_MODEL,
                 contents="{}",
                 config={"tools": [{"google_search": {}}]},
@@ -3924,17 +3909,17 @@ class GeminiServiceTests(unittest.TestCase):
             def __init__(self) -> None:
                 self.calls = 0
 
-            def generate_content(self, **_kwargs: object) -> object:
+            def create(self, **_kwargs: object) -> object:
                 self.calls += 1
                 return object()
 
         models = Models()
-        with self.assertRaisesRegex(GeminiConfigurationError, "response_modalities"):
-            _generate_content_with_retry(
-                types.SimpleNamespace(models=models),
+        with self.assertRaisesRegex(GeminiConfigurationError, "response_format"):
+            _create_interaction_with_retry(
+                types.SimpleNamespace(interactions=models),
                 model=DEFAULT_GEMINI_MODEL,
                 contents="{}",
-                config={"response_modalities": ["IMAGE"]},
+                config={"response_format": [{"type": "image"}]},
                 request_label="test request",
             )
 
@@ -3942,12 +3927,12 @@ class GeminiServiceTests(unittest.TestCase):
 
     def test_model_request_raises_clean_error_without_sdk_traceback(self) -> None:
         class Models:
-            def generate_content(self, **_kwargs: object) -> object:
+            def create(self, **_kwargs: object) -> object:
                 raise RuntimeError("400 INVALID_ARGUMENT: bad request")
 
         with self.assertRaisesRegex(GeminiRequestError, "could not complete"):
-            _generate_content_with_retry(
-                types.SimpleNamespace(models=Models()),
+            _create_interaction_with_retry(
+                types.SimpleNamespace(interactions=Models()),
                 model="gemini-3.1-flash-lite",
                 contents="{}",
                 config={},
@@ -3958,23 +3943,7 @@ class GeminiServiceTests(unittest.TestCase):
         diagnostics = _model_request_diagnostics(
             model="gemini-3.5-flash-lite",
             contents="secret prompt text",
-            config={
-                "response_mime_type": "application/json",
-                "response_json_schema": {
-                    "type": "object",
-                    "properties": {
-                        "events": {
-                            "type": "array",
-                            "items": {
-                                "type": "object",
-                                "properties": {"status": {"type": "string"}},
-                            },
-                        }
-                    },
-                    "required": ["events"],
-                },
-                "thinking_config": {"thinking_level": "minimal"},
-            },
+            config={'response_format': [{'type': 'text', 'mime_type': 'application/json', 'schema': {'type': 'object', 'properties': {'events': {'type': 'array', 'items': {'type': 'object', 'properties': {'status': {'type': 'string'}}}}}, 'required': ['events']}}], 'generation_config': {'thinking_level': 'minimal'}},
         )
 
         self.assertIn('"model": "gemini-3.5-flash-lite"', diagnostics)
@@ -4001,34 +3970,30 @@ class GeminiServiceTests(unittest.TestCase):
             def __init__(self) -> None:
                 self.configs: list[dict[str, object]] = []
 
-            def generate_content(self, **kwargs: object) -> object:
-                raw_config = kwargs.get("config", {})
+            def create(self, **kwargs: object) -> object:
+                raw_config = kwargs
                 config: dict[str, object] = (
                     dict(raw_config) if isinstance(raw_config, dict) else {}
                 )
                 self.configs.append(config)
                 if len(self.configs) == 1:
                     raise RuntimeError("400 INVALID_ARGUMENT: invalid argument")
-                return types.SimpleNamespace(text="{}")
+                return types.SimpleNamespace(output_text="{}")
 
         models = Models()
-        result = _generate_content_with_retry(
-            types.SimpleNamespace(models=models),
+        result = _create_interaction_with_retry(
+            types.SimpleNamespace(interactions=models),
             model="gemini-3.1-flash-lite",
             contents="{}",
-            config={
-                "response_mime_type": "application/json",
-                "response_json_schema": {"type": "object"},
-                "thinking_config": {"thinking_level": "minimal"},
-            },
+            config={'response_format': [{'type': 'text', 'mime_type': 'application/json', 'schema': {'type': 'object'}}], 'generation_config': {'thinking_level': 'minimal'}},
             request_label="story request",
         )
 
         self.assertIsNotNone(result)
-        self.assertIn("response_json_schema", models.configs[0])
-        self.assertNotIn("response_json_schema", models.configs[1])
+        self.assertIn("schema", models.configs[0]["response_format"][0])
+        self.assertNotIn("schema", models.configs[1]["response_format"][0])
         self.assertEqual(
-            models.configs[1]["response_mime_type"],
+            models.configs[1]["response_format"][0]["mime_type"],
             "application/json",
         )
 
@@ -4041,31 +4006,28 @@ class GeminiServiceTests(unittest.TestCase):
             def __init__(self) -> None:
                 self.configs: list[dict[str, object]] = []
 
-            def generate_content(self, **kwargs: object) -> object:
-                raw_config = kwargs.get("config", {})
+            def create(self, **kwargs: object) -> object:
+                raw_config = kwargs
                 self.configs.append(
                     dict(raw_config) if isinstance(raw_config, dict) else {}
                 )
                 if len(self.configs) == 1:
                     raise RuntimeError("400 INVALID_ARGUMENT: invalid schema")
-                return types.SimpleNamespace(text=complete_response)
+                return types.SimpleNamespace(output_text=complete_response)
 
         models = Models()
         result = _generate_new_game_response_with_quality_retry(
-            types.SimpleNamespace(models=models),
+            types.SimpleNamespace(interactions=models),
             model="gemini-3.5-flash-lite",
             prompt="Return the complete new-game JSON object.",
             response_schema=response_schema,
-            config={
-                "response_mime_type": "application/json",
-                "response_json_schema": response_schema,
-            },
+            config={'response_format': [{'type': 'text', 'mime_type': 'application/json', 'schema': response_schema}]},
         )
 
         self.assertEqual(json.loads(result), json.loads(complete_response))
         self.assertEqual(len(models.configs), 2)
-        self.assertIn("response_json_schema", models.configs[0])
-        self.assertNotIn("response_json_schema", models.configs[1])
+        self.assertIn("schema", models.configs[0]["response_format"][0])
+        self.assertNotIn("schema", models.configs[1]["response_format"][0])
 
     def test_build_prompt_contains_strict_json_contract(self) -> None:
         prompt = build_gemini_story_prompt(
@@ -4488,7 +4450,7 @@ class GeminiServiceTests(unittest.TestCase):
 
         try:
             service = GeminiNarrationService(
-                GeminiSettings(api_key="test-key", model="gemini-2.5-flash")
+                GeminiSettings(api_key="test-key", model="gemini-3.8-flash")
             )
             result = service.generate_story_response(
                 {
@@ -4532,7 +4494,7 @@ class GeminiServiceTests(unittest.TestCase):
 
         try:
             service = GeminiNarrationService(
-                GeminiSettings(api_key="test-key", model="gemini-2.5-flash")
+                GeminiSettings(api_key="test-key", model="gemini-3.8-flash")
             )
             result = service.generate_story_response(
                 {
@@ -5511,19 +5473,20 @@ class GeminiServiceTests(unittest.TestCase):
 
         class FakeModels:
             def __init__(self) -> None:
+                self.sdk_configuration = types.SimpleNamespace(retry_config=types.SimpleNamespace(max_retries=4))
                 self.calls: list[dict[str, object]] = []
 
-            def generate_content(self, **kwargs: object) -> object:
+            def create(self, **kwargs: object) -> object:
                 response_index = min(len(self.calls), len(response_texts) - 1)
                 self.calls.append(kwargs)
-                return types.SimpleNamespace(text=response_texts[response_index])
+                return types.SimpleNamespace(output_text=response_texts[response_index])
 
         class FakeClient:
             last_client: object | None = None
 
-            def __init__(self, api_key: str) -> None:
+            def __init__(self, api_key: str, **_kwargs: object) -> None:
                 self.api_key = api_key
-                self.models = FakeModels()
+                self.interactions = FakeModels()
                 FakeClient.last_client = self
 
         google_module = types.ModuleType("google")

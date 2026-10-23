@@ -234,7 +234,12 @@ class InventoryCapacityTests(unittest.TestCase):
             return QDialog.DialogCode.Accepted
         with patch.object(QDialog, 'exec', accept_weight):
             _edit_starter_weight(table, button)
-        setup = normalize_new_game_setup({'character': {'carrying_capacity_lb': 75}, 'starter_items': _starter_items_from_table(table)})
+        # Base capacity comes from Strength, not a legacy authored capacity or
+        # the current rank's default attribute allocation.
+        attributes = dict.fromkeys(('Strength', 'Dexterity', 'Constitution', 'Intelligence', 'Wisdom', 'Charisma'), 10)
+        attributes['Strength'] = 16
+        setup = normalize_new_game_setup({'character': {'attributes': attributes, 'carrying_capacity_lb': 75}, 'starter_items': _starter_items_from_table(table)})
+        self.assertEqual(setup['character']['attributes']['Strength'], 16)
         self.assertEqual(setup['character']['carrying_capacity_lb'], 80)
         self.assertEqual((setup['starter_items'][0]['weight_lb'], setup['starter_items'][0]['carrying_capacity_lb']), (4.5, 45))
 

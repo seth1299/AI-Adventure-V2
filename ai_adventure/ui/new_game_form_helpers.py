@@ -294,6 +294,8 @@ def _starting_location_options_from_table(
 def _sync_starting_npc_location_dropdowns(
     npc_table: QTableWidget,
     locations: list[tuple[str, str]],
+    *,
+    existing_location_ids: set[str] | None = None,
 ) -> None:
     """Keeps NPC location choices tied to the live starting-location rows."""
 
@@ -304,7 +306,11 @@ def _sync_starting_npc_location_dropdowns(
         location_widget = npc_table.cellWidget(row, 1)
         if not isinstance(location_widget, QComboBox):
             continue
-        selected_id = str(location_widget.currentData() or "")
+        selected_id = str(location_widget.currentData() or location_widget.property("pending_location_id") or "")
+        # Custom-name editing briefly empties a location's label. Retain the
+        # row identity through that edit, but discard it when the row is removed.
+        pending_id = selected_id if existing_location_ids is not None and selected_id in existing_location_ids else ""
+        location_widget.setProperty("pending_location_id", pending_id)
         location_widget.blockSignals(True)
         location_widget.clear()
         location_widget.addItem("Select a location", "")
@@ -421,6 +427,9 @@ def _append_starting_npc_table_row(
     mode_input = _table_combo_box(
         {"suggestion": "Suggestion", "exact": "Exact"},
         str(npc.get("description_mode", "suggestion") or "suggestion"),
+    )
+    location_input.currentIndexChanged.connect(
+        lambda _index: location_input.setProperty("pending_location_id", "")
     )
     if change_callback is not None:
         if isinstance(name_input, _CatalogComboBox):

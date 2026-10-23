@@ -9,12 +9,21 @@ from ai_adventure.ai.image_styles import DEFAULT_IMAGE_STYLE, normalize_image_st
 # Curated from the stable (GA) entries on Google's Gemini API model pages.
 # Ratings are comparative ten-point UI guidance, not exact pricing or benchmarks.
 # Preview, experimental, audio-only, embedding, and video-only models are excluded.
-MODEL_CATALOG_REVIEWED_DATE = "2026-08-31"
+MODEL_CATALOG_REVIEWED_DATE = "2026-10-22"
 
 DEFAULT_TEXT_MODEL = "gemini-3.5-flash-lite"
 DEFAULT_IMAGE_MODEL = "gemini-3.1-flash-lite-image"
 
 TEXT_MODEL_OPTIONS: tuple[dict[str, Any], ...] = (
+    {
+        "value": "gemini-3.8-flash",
+        "label": "Gemini 3.8 Flash",
+        "description": "Gemini 3.8 Flash supports reasoning, multimodal tasks, and structured output.",
+        "cost_rating": 6,
+        "intelligence_rating": 10,
+        "speed_rating": 8,
+        "url": "https://ai.google.dev/gemini-api/docs/models/gemini-3.8-flash",
+    },
     {
         "value": "gemini-3.7-flash",
         "label": "Gemini 3.7 Flash",
@@ -75,56 +84,20 @@ TEXT_MODEL_OPTIONS: tuple[dict[str, Any], ...] = (
         "speed_rating": 9,
         "url": "https://ai.google.dev/gemini-api/docs/models/gemini-3.1-flash-lite",
     },
-    {
-        "value": "gemini-2.5-pro",
-        "label": "Gemini 2.5 Pro",
-        "description": (
-            "Our state-of-the-art thinking model, capable of reasoning over "
-            "complex problems in code, math, and STEM."
-        ),
-        "cost_rating": 10,
-        "intelligence_rating": 9,
-        "speed_rating": 4,
-        "url": "https://ai.google.dev/gemini-api/docs/models/gemini-2.5-pro",
-    },
-    {
-        "value": "gemini-2.5-flash",
-        "label": "Gemini 2.5 Flash",
-        "description": (
-            "Our best model in terms of price-performance, offering well-rounded "
-            "capabilities."
-        ),
-        "cost_rating": 5,
-        "intelligence_rating": 7,
-        "speed_rating": 8,
-        "url": "https://ai.google.dev/gemini-api/docs/models/gemini-2.5-flash",
-    },
-    {
-        "value": "gemini-2.5-flash-lite",
-        "label": "Gemini 2.5 Flash-Lite",
-        "description": (
-            "Our most cost-efficient multimodal model, offering the fastest "
-            "performance for high-frequency, lightweight tasks."
-        ),
-        "cost_rating": 1,
-        "intelligence_rating": 4,
-        "speed_rating": 10,
-        "url": "https://ai.google.dev/gemini-api/docs/models/gemini-2.5-flash-lite",
-    },
 )
 
 IMAGE_MODEL_OPTIONS: tuple[dict[str, Any], ...] = (
     {
-        "value": "gemini-3.1-flash-image",
-        "label": "Gemini 3.1 Flash Image (Nano Banana 2)",
+        "value": "gemini-nano-banana-2.1",
+        "label": "Gemini Nano Banana 2.1",
         "description": (
-            "Nano Banana 2 provides high-quality image generation and "
+            "Nano Banana 2.1 provides high-quality image generation and "
             "conversational editing at a mainstream price point and low latency."
         ),
         "cost_rating": 6,
         "quality_rating": 8,
         "speed_rating": 8,
-        "url": "https://ai.google.dev/gemini-api/docs/models/gemini-3.1-flash-image",
+        "url": "https://ai.google.dev/gemini-api/docs/models/gemini-nano-banana-2.1",
     },
     {
         "value": "gemini-3.1-flash-lite-image",
@@ -153,18 +126,6 @@ IMAGE_MODEL_OPTIONS: tuple[dict[str, Any], ...] = (
         "speed_rating": 4,
         "url": "https://ai.google.dev/gemini-api/docs/models/gemini-3-pro-image",
     },
-    {
-        "value": "gemini-2.5-flash-image",
-        "label": "Gemini 2.5 Flash Image (Nano Banana)",
-        "description": (
-            "Our best engine for high-velocity visual creation, offering "
-            "state-of-the-art speed and efficiency."
-        ),
-        "cost_rating": 4,
-        "quality_rating": 6,
-        "speed_rating": 8,
-        "url": "https://ai.google.dev/gemini-api/docs/models/gemini-2.5-flash-image",
-    },
 )
 
 KNOWN_TEXT_MODELS = frozenset(option["value"] for option in TEXT_MODEL_OPTIONS)
@@ -178,6 +139,11 @@ def normalize_text_model(value: Any) -> str:
     """Returns an approved GA text-output model id."""
 
     model = _normalize_model_id(value)
+    if model in {
+        "gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.5-flash-lite",
+        "gemini-2.0-flash", "gemini-2.0-flash-lite", "gemini-1.5-pro", "gemini-1.5-flash",
+    }:
+        return "gemini-3.8-flash"
     return model if model in KNOWN_TEXT_MODELS else DEFAULT_TEXT_MODEL
 
 
@@ -185,6 +151,8 @@ def normalize_image_model(value: Any) -> str:
     """Returns an approved GA image-output model id."""
 
     model = _normalize_model_id(value)
+    if model in {"gemini-3.1-flash-image", "gemini-2.5-flash-image"}:
+        return "gemini-nano-banana-2.1"
     return model if model in KNOWN_IMAGE_MODELS else DEFAULT_IMAGE_MODEL
 
 
@@ -203,13 +171,11 @@ def image_model_metadata(value: Any) -> Mapping[str, Any]:
 def thinking_config_for_text_model(model: Any, *, smarter: bool) -> dict[str, Any]:
     """Returns the supported thinking control for one GA text model.
 
-    Gemini 2.5 accepts the legacy numeric budget, while Gemini 3 uses the level
-    enum. Gemini 3.7 rejects ``minimal``, so its low-latency setting is ``low``.
+    Interactions uses thinking levels. Gemini 3.7 rejects ``minimal``, so its
+    low-latency setting is ``low``.
     """
 
     clean_model = normalize_text_model(model)
-    if clean_model.startswith("gemini-2.5"):
-        return {"thinking_budget": 24576 if smarter else 1024}
     return {
         "thinking_level": (
             "high"

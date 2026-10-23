@@ -28,10 +28,10 @@ class D20TestAuditTests(unittest.TestCase):
                     "out_of_game": False, "events": [{"type": "D20TestRequestedEvent",
                     "payload": {"attribute": 'Wisdom', "test_kind": "check", "skill_name": "Perception", "dc": 13, "reason": "Look around."}}]}
         with patch.object(genai, "Client") as client:
-            client.return_value.models.generate_content.return_value = SimpleNamespace(text=json.dumps(response))
+            client.return_value.interactions.create.return_value = SimpleNamespace(output_text=json.dumps(response))
             if repair_response:
-                client.return_value.models.generate_content.side_effect = [
-                    SimpleNamespace(text=json.dumps(value)) for value in (response, repair_response)
+                client.return_value.interactions.create.side_effect = [
+                    SimpleNamespace(output_text=json.dumps(value)) for value in (response, repair_response)
                 ]
             return g.GeminiNarrationService(g.GeminiSettings(api_key="test-key")).generate_story_response(packet)
 

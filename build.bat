@@ -66,7 +66,7 @@ if errorlevel 1 (
     --collect-all "onnxruntime" ^
     --collect-all "soundfile" ^
     --hidden-import "ai_adventure.audio.tts.tts_manager" ^
-    --hidden-import "google.genai" ^
+    --collect-submodules "google.genai._gaos" --hidden-import "google.genai" ^
     --hidden-import "PySide6.QtCore" ^
     --hidden-import "PySide6.QtGui" ^
     --hidden-import "PySide6.QtWidgets" ^

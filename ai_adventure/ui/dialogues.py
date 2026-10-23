@@ -3555,6 +3555,10 @@ class NewGameTemplateManagerDialog(QDialog):
             name_widget.textChanged.connect(
                 lambda _text: self._refresh_starting_location_dropdowns()
             )
+        elif isinstance(name_widget, QComboBox):
+            name_widget.editTextChanged.connect(
+                lambda _text: self._refresh_starting_location_dropdowns()
+            )
 
         if isinstance(sublocation_widget, QCheckBox):
             sublocation_widget.toggled.connect(
@@ -3682,6 +3686,11 @@ class NewGameTemplateManagerDialog(QDialog):
         _sync_starting_npc_location_dropdowns(
             self.starting_npcs_table,
             locations,
+            existing_location_ids={
+                _starting_location_row_id_for_row(self.starting_locations_table, row)
+                for row in range(self.starting_locations_table.rowCount())
+                if not self.starting_locations_table.isRowHidden(row)
+            },
         )
         valid_ids = {row_id for row_id, _name in locations}
 

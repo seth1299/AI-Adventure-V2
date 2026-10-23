@@ -34,8 +34,8 @@ class ResolvedCheckNarrationTests(unittest.TestCase):
     def generate(self, packet, responses):
         from google import genai
         with patch.object(genai, "Client"), patch.object(
-            g, "_generate_content_with_retry",
-            side_effect=[SimpleNamespace(text=value) for value in responses],
+            g, "_create_interaction_with_retry",
+            side_effect=[SimpleNamespace(output_text=value) for value in responses],
         ) as request:
             result = g.GeminiNarrationService(g.GeminiSettings(api_key="test-key")).generate_story_response(packet)
         return result, request
@@ -85,8 +85,8 @@ class ResolvedCheckNarrationTests(unittest.TestCase):
     def test_repeated_duplicate_fails_after_two_repairs(self):
         from google import genai
         with patch.object(genai, "Client"), patch.object(
-            g, "_generate_content_with_retry",
-            return_value=SimpleNamespace(text=self.response(duplicate=True)),
+            g, "_create_interaction_with_retry",
+            return_value=SimpleNamespace(output_text=self.response(duplicate=True)),
         ) as request:
             with self.assertRaisesRegex(g.GeminiRequestError, "already-resolved check"):
                 g.GeminiNarrationService(g.GeminiSettings(api_key="test-key")).generate_story_response(self.packet())
@@ -98,8 +98,8 @@ class ResolvedCheckNarrationTests(unittest.TestCase):
         corrected = self.response(duplicate=True)
         with patch.object(g, "_enforce_container_reward_flow", side_effect=[
             g.ContainerFlowError("inconsistent contents"), original,
-        ]), patch.object(g, "_generate_content_with_retry", side_effect=[
-            SimpleNamespace(text=corrected), SimpleNamespace(text=self.response()),
+        ]), patch.object(g, "_create_interaction_with_retry", side_effect=[
+            SimpleNamespace(output_text=corrected), SimpleNamespace(output_text=self.response()),
         ]) as request:
             result = g._repair_container_reward_flow(
                 object(), "gemini-3.5-flash-lite", original, packet,

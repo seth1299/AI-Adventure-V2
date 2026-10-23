@@ -30,6 +30,7 @@ from ai_adventure.ai.image_styles import (
     normalize_image_style,
 )
 from ai_adventure.ai.model_catalog import DEFAULT_IMAGE_MODEL, normalize_image_model
+from ai_adventure.ai.gemini_client import create_gemini_client
 from ai_adventure.ai.request_metrics import measured_operation, record_attempt
 from ai_adventure.context.creative_guardrails import (
     default_banned_creative_terms,
@@ -272,26 +273,23 @@ class GeminiVisualAssetService:
             raise RuntimeError("A Google Gemini API key is not configured.")
 
         try:
-            from google import genai
-            from google.genai import types
+            client = create_gemini_client(api_key)
         except ImportError as error:
             raise RuntimeError(
                 "google-genai is not installed. Install project requirements first."
             ) from error
 
-        client = genai.Client(api_key=api_key)
         started = time.perf_counter()
         try:
-            response = client.models.generate_content(
+            response = client.interactions.create(
                 model=self.model,
-                contents=request.prompt,
-                config=types.GenerateContentConfig(
-                    response_modalities=["IMAGE"],
-                    image_config=types.ImageConfig(
-                        aspect_ratio=request.aspect_ratio,
-                        image_size=request.image_size,
-                    ),
-                ),
+                input=request.prompt,
+                store=False,
+                response_format=[{
+                    "type": "image",
+                    "aspect_ratio": request.aspect_ratio,
+                    "image_size": request.image_size,
+                }],
             )
         except Exception:
             record_attempt(
@@ -299,31 +297,28 @@ class GeminiVisualAssetService:
                 started=started, response=None,
             )
             raise
-        for part in getattr(response, "parts", []) or []:
-            inline_data = getattr(part, "inline_data", None)
-            data = getattr(inline_data, "data", None)
-            if not data:
-                continue
+        image = getattr(response, "output_image", None)
+        data = None
+        if getattr(response, "status", "completed") == "completed" and image is not None:
+            data = getattr(image, "data", None)
             if isinstance(data, str):
                 import base64
+                import binascii
 
-                data = base64.b64decode(data)
-            record_attempt(
-                label="image generation", model=self.model, attempt=1,
-                started=started, response=response,
-                details={"generated_image_count": 1, "image_size": request.image_size,
-                         "cost_complete": True},
-            )
-            return bytes(data), str(
-                getattr(inline_data, "mime_type", "image/png") or "image/png"
-            )
+                try:
+                    data = base64.b64decode(data, validate=True)
+                except (ValueError, binascii.Error):
+                    data = None
         record_attempt(
             label="image generation", model=self.model, attempt=1,
             started=started, response=response,
-            details={"generated_image_count": 0, "image_size": request.image_size,
-                     "cost_complete": False},
+            details={"generated_image_count": int(bool(data)), "image_size": request.image_size,
+                     "cost_complete": bool(data)},
         )
-        raise RuntimeError("Gemini returned no image data.")
+        if not data:
+            raise RuntimeError("Gemini returned no completed image data.")
+        return bytes(data), str(getattr(image, "mime_type", "image/png") or "image/png")
+
 
 
 def build_visual_asset_requests(

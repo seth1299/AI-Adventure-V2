@@ -29,11 +29,11 @@ class NewGameRepairScopeTests(unittest.TestCase):
         self.good = {"bestiary": [{"creature_id": "wolf", "name": "Forest wolf"}]}
 
     def run_helper(self, responses):
-        request = Mock(side_effect=[SimpleNamespace(text=value if isinstance(value, str) else json.dumps(value))
+        request = Mock(side_effect=[SimpleNamespace(output_text=value if isinstance(value, str) else json.dumps(value))
                                     for value in responses])
-        with patch.object(g, "_generate_content_with_retry", request):
+        with patch.object(g, "_create_interaction_with_retry", request):
             result = g._generate_new_game_response_with_quality_retry(object(), model=g.DEFAULT_GEMINI_MODEL,
-                prompt=self.prompt, response_schema=self.schema, config={"response_json_schema": self.schema},
+                prompt=self.prompt, response_schema=self.schema, config={'response_format': [{'type': 'text', 'mime_type': 'application/json', 'schema': self.schema}]},
                 validation_schema=self.schema, setup_packet=self.setup)
         return json.loads(result), request
 
@@ -42,7 +42,7 @@ class NewGameRepairScopeTests(unittest.TestCase):
         self.prompt = "FULL_PHASE_CONTEXT " + json.dumps(self.candidate)
         result, request = self.run_helper([self.candidate, self.good])
         repair = request.call_args.kwargs
-        self.assertEqual(set(repair["config"]["response_json_schema"]["properties"]), {"bestiary"})
+        self.assertEqual(set(repair["config"]["response_format"][0]["schema"]["properties"]), {"bestiary"})
         self.assertIn("$.bestiary[0].name is required", repair["contents"])
         self.assertIn("A misty forest", repair["contents"])
         for unrelated in ("PRIVATE_CHARACTER_SENTINEL", "UNRELATED_ITEM_SENTINEL", "UNRELATED_ITEM_RULE", "FULL_PHASE_CONTEXT"):
@@ -55,7 +55,7 @@ class NewGameRepairScopeTests(unittest.TestCase):
         self.assertEqual(request.call_count, 3)
         self.assertIn("$.character is not allowed", request.call_args.kwargs["contents"])
         self.assertEqual(result["character"], self.candidate["character"])
-        self.assertEqual(set(request.call_args.kwargs["config"]["response_json_schema"]["properties"]), {"bestiary"})
+        self.assertEqual(set(request.call_args.kwargs["config"]["response_format"][0]["schema"]["properties"]), {"bestiary"})
 
     def test_multiple_known_fields_select_union_of_relevant_dependencies(self):
         fields = repair_fields(["$.bestiary[0].name is required", "$.known_crafting_recipes[0].stages[1].work_amount expected at least 1"],
@@ -80,13 +80,13 @@ class NewGameRepairScopeTests(unittest.TestCase):
             self.assertIsNone(repair_fields(errors, self.schema["properties"]))
 
     def test_four_failed_scoped_repairs_exhaust_budget_without_accepting_partial_data(self):
-        with patch.object(g, "_generate_content_with_retry", side_effect=[
-            SimpleNamespace(text=json.dumps(self.candidate)),
-            *[SimpleNamespace(text=json.dumps({"bestiary": [{"creature_id": "wolf"}]})) for _ in range(4)],
+        with patch.object(g, "_create_interaction_with_retry", side_effect=[
+            SimpleNamespace(output_text=json.dumps(self.candidate)),
+            *[SimpleNamespace(output_text=json.dumps({"bestiary": [{"creature_id": "wolf"}]})) for _ in range(4)],
         ]) as request:
             with self.assertRaisesRegex(g.GeminiRequestError, "4 repair attempts"):
                 g._generate_new_game_response_with_quality_retry(object(), model=g.DEFAULT_GEMINI_MODEL,
-                    prompt=self.prompt, response_schema=self.schema, config={"response_json_schema": self.schema},
+                    prompt=self.prompt, response_schema=self.schema, config={'response_format': [{'type': 'text', 'mime_type': 'application/json', 'schema': self.schema}]},
                     setup_packet=self.setup)
         self.assertEqual(request.call_count, 5)
         self.assertTrue(all("PRIVATE_CHARACTER_SENTINEL" not in call.kwargs["contents"] for call in request.call_args_list[1:]))

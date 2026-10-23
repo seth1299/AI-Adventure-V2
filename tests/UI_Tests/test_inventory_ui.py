@@ -365,8 +365,8 @@ class InventoryUiTests(QtTestCase):
 
         self.assertEqual(page_titles[:2], ["Adventure", "A.I. Settings"])
         self.assertFalse(hasattr(wizard, "ai_settings_button"))
-        self.assertEqual(wizard.text_model_combo.count(), 8)
-        self.assertEqual(wizard.image_model_combo.count(), 4)
+        self.assertEqual(wizard.text_model_combo.count(), 6)
+        self.assertEqual(wizard.image_model_combo.count(), 3)
         self.assertEqual(wizard.image_style_combo.count(), 12)
 
         text_index = wizard.text_model_combo.findData("gemini-3.7-flash")
@@ -401,12 +401,12 @@ class InventoryUiTests(QtTestCase):
         self.assertTrue(wizard.image_style_field.isHidden())
 
         wizard.generated_images_enabled_checkbox.setChecked(True)
-        lite_25_index = wizard.text_model_combo.findData("gemini-2.5-flash-lite")
-        wizard.text_model_combo.setCurrentIndex(lite_25_index)
+        lite_31_index = wizard.text_model_combo.findData("gemini-3.1-flash-lite")
+        wizard.text_model_combo.setCurrentIndex(lite_31_index)
         self.app.processEvents()
         self.assertEqual(
             [bar.format() for bar in text_bars],
-            ["Cost: 1/10", "Intelligence: 4/10", "Speed: 10/10"],
+            ["Cost: 3/10", "Intelligence: 5/10", "Speed: 9/10"],
         )
         lite_35_index = wizard.text_model_combo.findData("gemini-3.5-flash-lite")
         wizard.text_model_combo.setCurrentIndex(lite_35_index)
@@ -1143,6 +1143,12 @@ class InventoryUiTests(QtTestCase):
             wizard.build_setup()["starting_npcs"][0]["location_source_index"],
             0,
         )
+
+        selected_location_id = location_combo.currentData()
+        location_combo.setCurrentIndex(0)
+        wizard._refresh_starting_location_dropdowns()
+        self.assertEqual(location_combo.currentData(), "")
+        location_combo.setCurrentIndex(location_combo.findData(selected_location_id))
 
         wizard.starting_locations_table.removeRow(0)
         wizard._refresh_starting_location_dropdowns()

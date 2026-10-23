@@ -16,6 +16,10 @@ class RepositoryRelationshipTests(unittest.TestCase):
     def populate(self):
         repo = self.repository
         repo.upsert_npc(name="Merchant", npc_id="merchant")
+        repo.append_history(
+            "story", "The Merchant offers a letter.", message_id="opening",
+            subjects=[{"type": "npc", "id": "merchant"}],
+        )
         repo.upsert_party_member("merchant")
         repo.add_party_inventory_item("merchant", name="Bag", category="Container", quantity=1, description="A bag")
         repo.upsert_merchant_profile("merchant", can_sell=True, can_buy=True)
@@ -61,10 +65,14 @@ class RepositoryRelationshipTests(unittest.TestCase):
             ]
         for table, column in relationships:
             with self.subTest(table=table, column=column):
-                with self.assertRaises(sqlite3.IntegrityError):
+                with self.repository._connect() as connection:
+                    self.assertGreater(
+                        connection.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()[0],
+                        0, f"Fixture must populate {table} before testing {column}",
+                    )
+                with self.assertRaisesRegex(sqlite3.IntegrityError, "FOREIGN KEY constraint failed"):
                     with self.repository._connect() as connection:
-                        cursor = connection.execute(f'UPDATE "{table}" SET "{column}" = ?', ("missing-parent",))
-                        self.assertGreater(cursor.rowcount, 0)
+                        connection.execute(f'UPDATE "{table}" SET "{column}" = ?', ("missing-parent",))
 
     def test_deleting_owner_removes_only_its_dependent_records(self):
         self.populate()

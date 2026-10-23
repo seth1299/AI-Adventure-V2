@@ -20,6 +20,10 @@ TOKEN_FIELDS = (
     "prompt_token_count", "candidates_token_count", "total_token_count",
     "thoughts_token_count", "cached_content_token_count", "tool_use_prompt_token_count",
 )
+INTERACTION_TOKEN_FIELDS = dict(zip(TOKEN_FIELDS, (
+    "total_input_tokens", "total_output_tokens", "total_tokens",
+    "total_thought_tokens", "total_cached_tokens", "total_tool_use_tokens",
+)))
 CURRENT_BENCHMARK_MESSAGE_ID: ContextVar[str | None] = ContextVar(
     "gemini_benchmark_message_id", default=None
 )
@@ -124,11 +128,12 @@ def measured_operation(function):
 def record_attempt(*, label, model, attempt, started, response=None, degraded=False, details=None):
     """Record SDK-reported tokens; missing usage is unknown, never zero."""
     metrics = CURRENT_METRICS.get()
-    metadata = getattr(response, "usage_metadata", None)
+    metadata = getattr(response, "usage", None)
     usage = {
-        key: (metadata.get(key) if isinstance(metadata, dict) else getattr(metadata, key, None))
-        for key in TOKEN_FIELDS
+        key: (metadata.get(source) if isinstance(metadata, dict) else getattr(metadata, source, None))
+        for key, source in INTERACTION_TOKEN_FIELDS.items()
     }
+    succeeded = response is not None and getattr(response, "status", "completed") == "completed"
     latency_ms = round((time.perf_counter() - started) * 1000, 2)
     if metrics is not None:
         metrics.request_count += 1
@@ -145,7 +150,10 @@ def record_attempt(*, label, model, attempt, started, response=None, degraded=Fa
             "model": model,
             "attempt": attempt,
             "latency_ms": latency_ms,
-            "succeeded": response is not None,
+            "succeeded": succeeded,
+            "api": "interactions",
+            "interaction_id": getattr(response, "id", None),
+            "interaction_status": getattr(response, "status", None),
             "degraded": degraded,
             **(details or {}),
             **usage,
@@ -157,7 +165,7 @@ def record_attempt(*, label, model, attempt, started, response=None, degraded=Fa
         "operation_id": metrics.operation_id if metrics else None,
         "request_label": label, "model": model, "attempt": attempt,
         "latency_ms": latency_ms,
-        "succeeded": response is not None, "degraded": degraded, **usage,
+        "succeeded": succeeded, "degraded": degraded, **usage,
     }, sort_keys=True))
 
 
