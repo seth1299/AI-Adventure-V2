@@ -98,11 +98,13 @@ class NewGameService:
         setup: dict[str, Any],
         *,
         theme: str | None = None,
+        defer_starting_inventory: bool = False,
     ) -> SaveRepository:
         repository = SaveRepository.create_new_save(
             saves_dir,
             str(setup.get("title", "New Adventure")),
             setup,
+            defer_starting_inventory=defer_starting_inventory,
         )
         if theme is not None:
             repository.set_setting("theme", theme)
@@ -294,6 +296,7 @@ class NewGameService:
                 travel_locations,
                 setup,
             )
+            repository.set_setting("travel.location_aliases", finalized_location_aliases)
             repository.set_travel_locations(
                 _replace_location_aliases_in_travel_locations(
                     travel_locations,
@@ -494,11 +497,17 @@ class NewGameService:
                     len(starting_spell_requests),
                 )
 
-        finalized_starter_items = _starter_items_for_save(
-            getattr(result, "finalized_starter_items", []),
-            setup,
+        approved_items = getattr(result, "approved_starter_items", None)
+        finalized_starter_items = (
+            approved_items if approved_items is not None else _starter_items_for_save(
+                getattr(result, "finalized_starter_items", []), setup,
+            )
         )
-        repository.replace_inventory_items(finalized_starter_items)
+        for item in finalized_starter_items:
+            item["storage_location"] = _replace_location_aliases(
+                item.get("storage_location", "actively_carried"), finalized_location_aliases,
+            )
+        repository.replace_inventory_items(finalized_starter_items, allow_empty=True)
 
         LOGGER.info(
             "Committed new-game starting state: inventory_items=%s, skills=%s, "
@@ -671,24 +680,18 @@ def _travel_locations_for_save(
     for location in locations:
         name = str(location.get("name", "") or "").strip()
         is_ai_start = bool(ai_location) and name.casefold() == ai_location.casefold()
-        is_origin = (
-            _coerce_float(location.get("x_miles")) == 0.0
-            and _coerce_float(location.get("y_miles")) == 0.0
-        )
-        if is_ai_start or is_origin:
+        if is_ai_start or name.casefold() == requested_location.casefold():
             location["name"] = requested_location
             if not str(location.get("description", "") or "").strip():
                 location["description"] = "Starting location."
-            location["x_miles"] = 0.0
-            location["y_miles"] = 0.0
             return locations
 
     return [
         {
             "name": requested_location,
             "description": "Starting location.",
-            "x_miles": 0.0,
-            "y_miles": 0.0,
+            "x_miles": None,
+            "y_miles": None,
             "terrain": "",
             "travel_multiplier": 1.0,
             "travel_notes": "",
@@ -752,7 +755,7 @@ def _replace_location_aliases_in_travel_locations(
     if not aliases:
         return locations
     for location in locations:
-        for field_name in ("description", "travel_notes"):
+        for field_name in ("description", "travel_notes", "parent_location"):
             location[field_name] = _replace_location_aliases(
                 location.get(field_name, ""), aliases
             )
@@ -1020,6 +1023,12 @@ def _starter_items_for_save(
             )
             if requested_quantity is not None:
                 item["quantity"] = requested_quantity
+            requested_storage = str(setup_item.get("storage_location", "actively_carried"))
+            if requested_storage.casefold() not in {"actively_carried", "actively carried", "on_person", "on person"}:
+                item["storage_location"] = requested_storage
+            for field_name in ("moveable", "storable"):
+                if setup_item.get(field_name) is False:
+                    item[field_name] = False
             continue
         item["storage_location"] = (
             " ".join(

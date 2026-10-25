@@ -156,6 +156,7 @@ class StatsScreen(RepositoryBackedWidget):
                 if self.visual_asset_generation_enabled() else None,
             parent=self,
         )
+        self.add_copy_image_prompt_button(dialog, "skill", key)
         dialog.exec()
 
     def _spend_rewards(self) -> None:

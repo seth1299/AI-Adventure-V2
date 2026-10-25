@@ -35,6 +35,15 @@ if not exist "%TTS_VOICES%" (
     exit /b 1
 )
 
+rem pygame and pygame-ce share an import namespace; remove the old provider first.
+"%PYTHON%" -m pip show pygame >nul 2>&1
+if not errorlevel 1 (
+    "%PYTHON%" -m pip uninstall -y pygame
+    if errorlevel 1 exit /b 1
+    "%PYTHON%" -m pip install --force-reinstall --no-deps "pygame-ce==2.5.8"
+    if errorlevel 1 exit /b 1
+)
+
 "%PYTHON%" -m pip install --disable-pip-version-check --no-input --quiet -r requirements.txt
 if errorlevel 1 (
     echo ERROR: Failed to install requirements.txt.

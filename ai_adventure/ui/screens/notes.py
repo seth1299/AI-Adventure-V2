@@ -13,6 +13,7 @@ class NotesScreen(RepositoryBackedWidget):
         self._loading_notes = False
         self._saving_notes = False
         self._editing_note = False
+        self._notes_dirty = False
         self._autosave_timer = QTimer(self)
         self._autosave_timer.setSingleShot(True)
         self._autosave_timer.setInterval(900)
@@ -78,14 +79,18 @@ class NotesScreen(RepositoryBackedWidget):
         self.entry_pages.addWidget(self.entry_preview)
         self.entry_pages.addWidget(self.entry_editor)
 
+        self.entry_share_with_ai_checkbox = QCheckBox("Send this note to AI")
+        self.entry_share_with_ai_checkbox.toggled.connect(self._entry_sharing_changed)
+        note_layout = QVBoxLayout()
+        note_layout.addWidget(self.entry_share_with_ai_checkbox)
+        note_layout.addWidget(self.entry_pages)
+
         entries_layout = QHBoxLayout()
         entries_layout.addWidget(self.entry_tree, 1)
-        entries_layout.addWidget(self.entry_pages, 3)
+        entries_layout.addLayout(note_layout, 3)
 
-        self.share_with_ai_checkbox = QCheckBox("Send these notes to the AI")
-        self.share_with_ai_checkbox.toggled.connect(
-            lambda _checked: self._schedule_notes_autosave()
-        )
+        self.share_with_ai_checkbox = QCheckBox("Send all notes to AI")
+        self.share_with_ai_checkbox.toggled.connect(self._all_notes_sharing_changed)
 
         layout = QVBoxLayout()
         layout.addWidget(self.share_with_ai_checkbox)
@@ -170,6 +175,12 @@ class NotesScreen(RepositoryBackedWidget):
         """Reloads notes, tag groups, and sharing preference."""
 
         repository = self.repository()
+        # Other tabs and background images can request a refresh while the
+        # player types. Do not replace the editor or cancel its pending save.
+        if repository is not None and (self._editing_note or self._notes_dirty or self._saving_notes):
+            return
+        selected = self._selected_entry()
+        selected_id = str(selected["entry_id"]) if selected else ""
         self._autosave_timer.stop()
         self._loading_notes = True
         try:
@@ -180,14 +191,50 @@ class NotesScreen(RepositoryBackedWidget):
                 self.share_with_ai_checkbox.setChecked(False)
                 return
             self._note_entries = repository.get_note_entries()
-            self._refresh_entry_list()
+            self._refresh_entry_list(selected_entry_id=selected_id)
             self.share_with_ai_checkbox.setChecked(repository.get_notes_share_with_ai())
         finally:
             self._loading_notes = False
 
     def _schedule_notes_autosave(self) -> None:
         if not self._loading_notes and not self._saving_notes:
+            self._notes_dirty = True
             self._autosave_timer.start()
+
+    def _all_notes_sharing_changed(self, checked: bool) -> None:
+        self.entry_share_with_ai_checkbox.setVisible(not checked)
+        self._schedule_notes_autosave()
+
+    def _entry_sharing_changed(self, checked: bool) -> None:
+        if self._loading_notes:
+            return
+        entry = self._selected_entry()
+        if entry is not None:
+            entry["share_with_ai"] = checked
+            self._schedule_notes_autosave()
+
+    def flush_pending_notes(self) -> None:
+        """Save immediately when leaving Notes or switching saves."""
+        self._autosave_timer.stop()
+        if self._notes_dirty:
+            self._persist_notes()
+
+    def set_repository(self, repository: SaveRepository | None) -> None:
+        if repository is self.repository():
+            self.refresh()
+            return
+        self.flush_pending_notes()
+        self._editing_note = False
+        self._notes_dirty = False
+        super().set_repository(repository)
+
+    def hideEvent(self, event) -> None:
+        self.flush_pending_notes()
+        super().hideEvent(event)
+
+    def closeEvent(self, event) -> None:
+        self.flush_pending_notes()
+        super().closeEvent(event)
 
     def _autosave_notes(self) -> None:
         self._autosave_timer.stop()
@@ -195,12 +242,14 @@ class NotesScreen(RepositoryBackedWidget):
 
     def _persist_notes(self) -> None:
         repository = self.repository()
-        if repository is None or self._loading_notes or self._saving_notes:
+        if repository is None or self._loading_notes or self._saving_notes or not self._notes_dirty:
             return
         self._saving_notes = True
         try:
-            repository.set_note_entries(self._note_entries)
-            repository.set_notes_share_with_ai(self.share_with_ai_checkbox.isChecked())
+            with repository.transaction():
+                repository.set_note_entries(self._note_entries)
+                repository.set_notes_share_with_ai(self.share_with_ai_checkbox.isChecked())
+            self._notes_dirty = False
             self.notify_repository_changed()
         finally:
             self._saving_notes = False
@@ -311,6 +360,8 @@ class NotesScreen(RepositoryBackedWidget):
         self._set_note_mode(not self._editing_note)
         if self._editing_note:
             self.entry_body_input.setFocus()
+        else:
+            self.flush_pending_notes()
 
     def _set_note_mode(self, editing: bool) -> None:
         """Selects the note page and keeps the edit control state in sync."""
@@ -350,6 +401,10 @@ class NotesScreen(RepositoryBackedWidget):
             for button in self._markdown_buttons:
                 button.setEnabled(enabled)
             self.delete_entry_button.setEnabled(enabled)
+            self.entry_share_with_ai_checkbox.setEnabled(enabled)
+            self.entry_share_with_ai_checkbox.setChecked(
+                bool(entry.get("share_with_ai", False)) if entry else False
+            )
             self.entry_heading_input.setText(entry["heading"] if entry else "")
             self.entry_body_input.setPlainText(entry["body"] if entry else "")
             self.entry_tags_input.setText(", ".join(entry["tags"]) if entry else "")

@@ -1,6 +1,7 @@
 """Discover packaged fallback art without maintaining a filename registry."""
 
 from pathlib import Path
+import re
 from typing import Any
 
 
@@ -58,3 +59,15 @@ def resolve_bundled_image(filename: Any, kind: str | None = None) -> Path | None
 
 def valid_default_image(filename: Any, kind: str) -> str:
     return str(filename) if resolve_bundled_image(filename, kind) is not None else ""
+
+
+def matching_skill_image(name: str) -> str:
+    """Use an unambiguous name match without depending on generated metadata."""
+    def normalize(value: str) -> str:
+        value = re.sub(r"[_-]+", " ", value).casefold().strip()
+        return re.sub(r"\s+(?:skill\s+)?icon$", "", value).strip()
+
+    target = normalize(name)
+    matches = [filename for filename in bundled_image_catalog()["skills"]
+               if normalize(Path(filename).stem) == target]
+    return matches[0] if target and len(matches) == 1 else ""

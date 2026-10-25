@@ -25,6 +25,9 @@ class BestiaryScreen(RepositoryBackedWidget):
         self.creature_image_label.setMargin(4)
         self.select_image_button = QPushButton("Select Image...")
         self.select_image_button.clicked.connect(self._select_creature_image)
+        self.copy_image_prompt_button = QPushButton("Copy Image Prompt")
+        self.copy_image_prompt_button.clicked.connect(
+            lambda: self.copy_visual_asset_prompt("bestiary", self._selected_creature_image_key()))
         self.create_image_button = QPushButton("Create new image for me")
         self.create_image_button.clicked.connect(self._create_creature_image)
 
@@ -42,7 +45,7 @@ class BestiaryScreen(RepositoryBackedWidget):
             Qt.AlignmentFlag.AlignHCenter,
         )
         details_layout.addWidget(
-            _button_row(self.select_image_button, self.create_image_button)
+            _button_row(self.select_image_button, self.create_image_button, self.copy_image_prompt_button)
         )
         details_layout.addWidget(self.details_output)
 

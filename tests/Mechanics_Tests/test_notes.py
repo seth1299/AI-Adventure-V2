@@ -49,7 +49,38 @@ class NotesTests(unittest.TestCase):
 
             repository.set_note_entries(entries)
 
-            self.assertEqual(repository.get_note_entries(), entries)
+            self.assertEqual(repository.get_note_entries(), [
+                dict(entry, share_with_ai=False) for entry in entries
+            ])
+
+    def test_individual_sharing_filters_private_notes_and_survives_reload(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = SaveRepository.create_new_save(Path(temp_dir), "Notes Test")
+            repository.set_note_entries([
+                {"entry_id": "private", "heading": "Private", "body": "Secret theory"},
+                {"entry_id": "shared", "heading": "Shared", "body": "Useful clue",
+                 "share_with_ai": True},
+            ])
+            self.assertFalse(repository.get_note_entries()[0]["share_with_ai"])
+            self.assertTrue(repository.get_note_entries()[1]["share_with_ai"])
+
+            def context_notes():
+                return self._builder().build_story_context(
+                    StateManager(repository).load_state(), player_command="Look around",
+                )["state"]["notes"]
+
+            notes = context_notes()
+            self.assertTrue(notes["share_with_ai"])
+            self.assertEqual([entry["body"] for entry in notes["entries"]], ["Useful clue"])
+            packet = self._builder().build_story_context(
+                StateManager(repository).load_state(), player_command="Look around",
+            )
+            self.assertNotIn("Secret theory", json.dumps(packet))
+            repository.set_notes_share_with_ai(True)
+            self.assertEqual(len(context_notes()["entries"]), 2)
+            repository.set_notes_share_with_ai(False)
+            self.assertEqual(len(context_notes()["entries"]), 1)
+            self.assertTrue(repository.get_note_entries()[1]["share_with_ai"])
 
     def test_tags_are_clean_unique_and_case_insensitive(self) -> None:
         self.assertEqual(

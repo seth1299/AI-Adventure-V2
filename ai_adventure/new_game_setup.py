@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from ai_adventure.template_images import normalize_template_images
+from ai_adventure.locations import MAP_COORDINATE_RULE
 
 from ai_adventure.skills.attributes import skill_attribute
 
@@ -834,7 +835,7 @@ def build_new_game_setup_packet(
                 "fields; never copy either suggestion unchanged. Once "
                 "a suggested location name is finalized, use that finalized name "
                 "consistently in every other returned field, including descriptions, "
-                "travel_notes, NPC details, tasks, "
+                "parent_location, travel_notes, NPC details, tasks, "
                 "secrets, and opening prose; never reuse the superseded setup "
                 "placeholder or suggestion name. "
                 "Preserve authored location_scope; otherwise classify extent automatically "
@@ -853,10 +854,11 @@ def build_new_game_setup_packet(
                 "prose rather than an image-generation prompt or keyword list. "
                 "For an unknown crash-landing, isolated survival, amnesia, or "
                 "new-arrival premise, it is valid for the only known location to "
-                "be the finalized starting location at x_miles=0 and y_miles=0. "
+                "be the finalized starting location without revealing other places. "
                 "For a ranger, courier, trader, local resident, or well-traveled "
                 "character, include every important place they would reasonably "
-                "know, even six or more. Coordinates are relative map miles. Each "
+                "know, even six or more. "
+                + MAP_COORDINATE_RULE + " Each "
                 "returned location needs player-facing description, terrain, "
                 "travel_multiplier, and route notes. Do not include hidden routes, "
                 "secrets, or GM-only information, and do not include the name of "
@@ -1094,6 +1096,7 @@ def build_new_game_setup_packet(
         },
         "fields_requiring_ai_invention": _fields_requiring_ai_invention(clean_setup),
         "starter_inventory_contract": {
+            "base_carrying_capacity_lb": clean_setup["character"]["carrying_capacity_lb"],
             "mode": clean_setup["starter_inventory_mode"],
             "requested_item_count": starter_item_count,
             "minimum_finalized_item_count": STARTER_INVENTORY_MIN_ITEMS,

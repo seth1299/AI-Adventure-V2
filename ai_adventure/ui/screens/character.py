@@ -142,10 +142,13 @@ class CharacterScreen(RepositoryBackedWidget):
         portrait_layout.addWidget(self.portrait_label, 0, Qt.AlignmentFlag.AlignHCenter)
         self.select_portrait_button = QPushButton("Select Image...")
         self.select_portrait_button.clicked.connect(self._select_portrait_image)
+        self.copy_image_prompt_button = QPushButton("Copy Image Prompt")
+        self.copy_image_prompt_button.clicked.connect(
+            lambda: self.copy_visual_asset_prompt("player", self.repository().get_player_id() if self.repository() else ""))
         self.create_portrait_button = QPushButton("Create new image for me")
         self.create_portrait_button.clicked.connect(self._create_portrait_image)
         portrait_layout.addWidget(
-            _button_row(self.select_portrait_button, self.create_portrait_button)
+            _button_row(self.select_portrait_button, self.create_portrait_button, self.copy_image_prompt_button)
         )
         self.portrait_group.setLayout(portrait_layout)
         self.portrait_group.hide()

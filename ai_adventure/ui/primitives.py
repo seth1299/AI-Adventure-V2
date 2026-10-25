@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from ai_adventure.bundled_images import resolve_bundled_image
+from ai_adventure.ui.image_file_dialog import ImageFileDialog, image_picker_directory
 
 from ai_adventure.ui.widgets.inputs import configure_wrapped_text
 
@@ -429,7 +430,10 @@ class RepositoryBackedWidget(QWidget):
         if self.on_visual_asset_upload is None:
             QMessageBox.warning(self, "Images Unavailable", "Image selection is unavailable.")
             return False
-        dialog = QFileDialog(self, "Select Image")
+        repository = self.repository()
+        dialog = ImageFileDialog(self, "Select Image", image_picker_directory(
+            self._visual_assets_dir, repository.db_path.parent if repository else None,
+        ))
         dialog.setFileMode(QFileDialog.FileMode.ExistingFile)
         dialog.setNameFilters(
             ["Images (*.png *.jpg *.jpeg *.webp *.bmp)", "All Files (*)"]
@@ -448,6 +452,29 @@ class RepositoryBackedWidget(QWidget):
         if not success:
             QMessageBox.warning(self, "Image Selection Failed", message)
         return success
+
+    def copy_visual_asset_prompt(self, subject_type: str, subject_key: str) -> bool:
+        """Copy the same portable art brief used by the New Game Wizard."""
+        from PySide6.QtWidgets import QApplication
+        from ai_adventure.application.asset_generation_service import AssetGenerationService
+        repository = self.repository()
+        if repository is None:
+            return False
+        request = next((r for r in AssetGenerationService.requests_for(repository)
+                        if r.subject_type == subject_type
+                        and r.subject_key.casefold() == str(subject_key).casefold()), None)
+        if request is None:
+            QMessageBox.information(self, "Image Prompt Unavailable",
+                                    "No image description is available for this subject yet.")
+            return False
+        QApplication.clipboard().setText(request.external_prompt)
+        return True
+
+    def add_copy_image_prompt_button(self, dialog, subject_type: str, subject_key: str) -> None:
+        button = QPushButton("Copy Image Prompt")
+        button.setObjectName("copyImagePromptButton")
+        button.clicked.connect(lambda: self.copy_visual_asset_prompt(subject_type, subject_key))
+        dialog.layout().addWidget(button)
 
     def create_visual_asset(self, subject_type: str, subject_key: str) -> bool:
         """Queues an explicit AI image request for one visible entity."""
@@ -524,7 +551,11 @@ def _set_generated_image(
             label.setProperty("imageViewerConnected", True)
     else:
         label.setToolTip(accessible_name)
-    label.show()
+    # Several refresh paths prepare portraits before adding them to a layout
+    # or table. Showing a parentless label creates a fleeting native window.
+    # Qt will show a newly parented preview with its containing layout.
+    if label.parentWidget() is not None:
+        label.show()
     return True
 
 

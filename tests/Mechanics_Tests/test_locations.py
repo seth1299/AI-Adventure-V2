@@ -13,6 +13,28 @@ from ai_adventure.locations import (
 
 
 class LocationTests(unittest.TestCase):
+    def test_different_locations_at_default_origin_are_not_already_there(self):
+        estimate = calculate_travel_estimate(
+            KnownLocation(name="Fern Glen", x_miles=0, y_miles=0),
+            KnownLocation(name="Stonevault", x_miles=0, y_miles=0),
+        )
+        self.assertFalse(estimate.is_available)
+        self.assertNotEqual(format_travel_time(estimate.estimated_minutes), "Already there")
+
+    def test_current_location_is_already_there_even_without_coordinates(self):
+        here = KnownLocation(name="Fern Glen", location_id="fern")
+        self.assertEqual(calculate_travel_estimate(here, here).estimated_minutes, 0)
+
+    def test_child_at_unrelated_city_origin_is_unmapped_without_moving_parent(self):
+        locations = normalize_known_locations([
+            {"name": "Stonevault", "x_miles": 0, "y_miles": 0},
+            {"name": "Deercross Wilds", "x_miles": 2.5, "y_miles": 1.5},
+            {"name": "Fern Glen", "x_miles": 0, "y_miles": 0,
+             "is_sublocation": True, "parent_location": "Deercross Wilds"},
+        ])
+        self.assertIsNone(locations[2].x_miles)
+        self.assertEqual((locations[1].x_miles, locations[1].y_miles), (2.5, 1.5))
+
     def test_clean_player_location_name_removes_scenic_details(self) -> None:
         self.assertEqual(
             clean_player_location_name(

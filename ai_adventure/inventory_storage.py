@@ -112,7 +112,10 @@ INVENTORY_STORAGE_RULE = (
     "in an already accessible container. Closing it preserves remembered contents."
     " Record realistic weight_lb in pounds per quantity unit, and carrying_capacity_lb "
     "for Containers and Vehicles (0 for ordinary items). Player base capacity is five times Strength in pounds. All carried weight, including nested contents and "
-    "empty containers, counts. Only directly carried/worn containers add their cargo "
+    "empty containers, counts. Only items actively carried by the player, including contents of carried "
+    "containers, count toward player carried weight. Items at a shop, home, workshop or other "
+    "specific Location and the contents of containers stored there contribute zero, even while "
+    "the player is at that site. Only directly carried/worn containers add their cargo "
     "capacity to player capacity; nested containers do not add bonuses. Every container "
     "also has its own cargo limit. Vehicle cargo and chassis never count against the "
     "player: actively_carried means the vehicle accompanies them; an exact Location "
@@ -123,9 +126,18 @@ INVENTORY_STORAGE_RULE = (
 )
 
 NEW_GAME_STORAGE_RULE = (
-    "moveable/storable flags; forges false. Storage: actively_carried, container, "
-    "specific Location. Containers: known empty/private; IDs only. weight_lb per "
-    "unit; carrying_capacity_lb cargo/bag bonus. Vehicles separate. Obey capacity."
+    "Set moveable/storable; fixed installations false. Storage: actively_carried, named "
+    "container or exact specific Location. Containers: known empty/private; IDs only. "
+    "weight_lb is realistic pounds per quantity unit, not stack. Player load sums "
+    "actively carried stacks and their nested contents; limit is "
+    "setup.character.carrying_capacity_lb plus directly carried bag bonuses. "
+    "Vehicles have separate cargo limits. Shop/home/workshop items and stored container "
+    "contents contribute ZERO player load, even at the current site. Honor storage intent "
+    "in basic item_request prose over its default actively_carried field; use finalized "
+    "Location names. Never carry fixed installations or add invented items that overload "
+    "the player. Never fake lighter weights or larger bag capacity to fit. If requested "
+    "items cannot all fit, preserve honest weights and intended storage for player review "
+    "before opening narration; do not silently omit items."
 )
 
 

@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from ai_adventure.template_images import normalize_template_images
 
-from PySide6.QtWidgets import QWidgetAction
+from PySide6.QtWidgets import QWidgetAction, QListView
+from PySide6.QtGui import QStandardItemModel
 
 from ai_adventure.skills.attributes import skill_attribute
 from ai_adventure.stats import ATTRIBUTES, POINT_COSTS, RULES_VERSION, rank_stats, point_buy_cost, starting_attributes, attribute_modifier
@@ -106,6 +107,7 @@ class _StartingSkillCombo(QWidget):
     """A skill dropdown with an explicit custom-name entry."""
 
     CUSTOM_DATA = "__custom_skill__"
+    selection_changed = Signal()
 
     def __init__(self, choices: list[tuple[str, str]], parent: QWidget | None = None):
         super().__init__(parent)
@@ -125,6 +127,8 @@ class _StartingSkillCombo(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(self.combo)
         self.combo.currentIndexChanged.connect(self._sync_custom_visibility)
+        self.combo.currentIndexChanged.connect(lambda _index: self.selection_changed.emit())
+        self.combo.editTextChanged.connect(lambda _text: self.selection_changed.emit())
         self.combo.activated.connect(self._focus_custom_input)
         self._sync_custom_visibility()
 
@@ -2735,6 +2739,7 @@ class NewGameWizard(QWizard):
         table.setCellWidget(row, 1, skill_input)
         table.setCellWidget(row, 2, description_input)
         table.setCellWidget(row, 3, skill_input.attribute_input)
+        skill_input.selection_changed.connect(self._refresh_starting_skill_choices)
         self._sync_starting_skill_inputs()
 
     def _sync_starting_skill_description(
@@ -2768,6 +2773,28 @@ class NewGameWizard(QWizard):
                 description_input = table.cellWidget(row, 2)
                 if isinstance(name_input, _StartingSkillCombo) and isinstance(description_input, QLineEdit):
                     self.skill_inputs.append((level, name_input, description_input))
+        self._refresh_starting_skill_choices()
+
+    def _refresh_starting_skill_choices(self) -> None:
+        """Hide catalog names already assigned to another starting skill slot."""
+        for _level, skill_input, _description in self.skill_inputs:
+            other_names = {
+                other.text().strip().casefold()
+                for _other_level, other, _other_description in self.skill_inputs
+                if other is not skill_input and other.text().strip()
+            }
+            combo = skill_input.combo
+            view = combo.view()
+            model = combo.model()
+            for index in range(2, combo.count()):
+                data = combo.itemData(index)
+                unavailable = isinstance(data, tuple) and str(data[0]).strip().casefold() in other_names
+                if isinstance(view, QListView):
+                    view.setRowHidden(index, unavailable)
+                if isinstance(model, QStandardItemModel):
+                    item = model.item(index)
+                    if item is not None:
+                        item.setEnabled(not unavailable)
 
     def _apply_starting_skill_preset(self, _index: int = -1) -> None:
         preset = str(self.skill_preset_combo.currentData() or "professional")

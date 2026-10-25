@@ -30,6 +30,7 @@ class _VisualAssetCoordinator(QObject):
         self._thread: QThread | None = None
         self._worker: QObject | None = None
         self._initial_batch_repositories: set[str] = set()
+        self._source_selection_repositories: set[str] = set()
         self._initial_batch_repository_objects: dict[str, SaveRepository] = {}
         LOGGER.info(
             "Visual asset coordinator initialized: enabled=%s, images_dir=%s, "
@@ -58,6 +59,7 @@ class _VisualAssetCoordinator(QObject):
             return []
 
         repository_key = str(repository.db_path)
+        self._source_selection_repositories.add(repository_key)
         self._initial_batch_repositories.add(repository_key)
         self._initial_batch_repository_objects[repository_key] = repository
         model = normalize_image_model(
@@ -93,6 +95,8 @@ class _VisualAssetCoordinator(QObject):
                 )
                 continue
             if not target_path.is_file():
+                # A missing image is a choice, not permission to bill the API.
+                repository.set_visual_asset_status(request.asset_id, "skipped")
                 pending.append(request)
         return pending
 
@@ -100,6 +104,7 @@ class _VisualAssetCoordinator(QObject):
         """Ends source-selection mode after every initial asset has a disposition."""
 
         repository_key = str(repository.db_path)
+        self._source_selection_repositories.discard(repository_key)
         self._initial_batch_repositories.discard(repository_key)
         self._initial_batch_repository_objects.pop(repository_key, None)
 
@@ -277,6 +282,11 @@ class _VisualAssetCoordinator(QObject):
         """Registers cache hits and queues missing current entity images."""
 
         if repository is None:
+            return
+        if (repository.get_setting("new_game.opening_pending", False)
+                or str(repository.db_path) in self._source_selection_repositories):
+            # Explicit initial choices own the queue; automatic scans must not
+            # discover more work while the opening or source dialog is pending.
             return
         if not self.enabled:
             LOGGER.info(

@@ -10,6 +10,33 @@ from ai_adventure.new_game_setup import normalize_new_game_setup
 
 
 class NewGameServiceTests(unittest.TestCase):
+    def test_finalized_parent_names_are_used_even_when_parent_follows_child(self):
+        from ai_adventure.application.new_game_service import (
+            _travel_locations_for_save, _finalized_location_aliases,
+            _replace_location_aliases_in_travel_locations,
+        )
+        setup = {"starting_locations": [
+            {"name": "Shop", "location_mode": "suggestion", "is_sublocation": True,
+             "parent_location": "Main City"},
+            {"name": "Main City", "location_mode": "suggestion"},
+        ]}
+        locations = _travel_locations_for_save([
+            {"name": "Amber Alembic Shoppe", "source_index": 0, "x_miles": 0, "y_miles": 0},
+            {"name": "Stonevault", "source_index": 1, "x_miles": 0.2, "y_miles": 0.1},
+        ], setup, SimpleNamespace(start_location="Amber Alembic Shoppe"))
+        aliases = _finalized_location_aliases(locations, setup)
+        fixed = _replace_location_aliases_in_travel_locations(locations, aliases)
+        self.assertEqual(fixed[0]["parent_location"], "Stonevault")
+
+    def test_exact_start_does_not_rename_other_place_at_shared_origin(self):
+        from ai_adventure.application.new_game_service import _travel_locations_for_save
+        locations = _travel_locations_for_save([
+            {"name": "City", "x_miles": 0, "y_miles": 0},
+            {"name": "Generated Shop", "x_miles": 0, "y_miles": 0},
+        ], {"start_location": "My Shop", "start_location_mode": "exact"},
+            SimpleNamespace(start_location="Generated Shop"))
+        self.assertEqual([p["name"] for p in locations], ["City", "My Shop"])
+
     def test_commit_generated_world_allows_empty_starting_inventory(self) -> None:
         setup = normalize_new_game_setup({"title": "Inventory Guarantee"})
         result = SimpleNamespace(
@@ -149,6 +176,7 @@ class NewGameServiceTests(unittest.TestCase):
                         "heading": "Known Symptoms",
                         "body": "Fever and confusion are early warning signs.",
                         "tags": ["Survival"],
+                        "share_with_ai": False,
                     }
                 ],
             )

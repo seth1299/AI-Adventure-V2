@@ -72,7 +72,7 @@ from ai_adventure.audio.catalog import (
     distinct_audio_track_catalogs_with_ambience,
 )
 from ai_adventure.audio.voices import VOICE_PROFILE_OPTIONS
-from ai_adventure.locations import clean_player_location_name, normalize_known_locations
+from ai_adventure.locations import MAP_COORDINATE_RULE, clean_player_location_name, normalize_known_locations
 from ai_adventure.skills.rules import MAX_SKILL_LEVEL
 from ai_adventure.text_sanitization import (
     sanitize_english_text,
@@ -1053,8 +1053,8 @@ EVENT_RESPONSE_SCHEMA: dict[str, Any] = {
             {
                 "name": {"type": "string"},
                 "description": {"type": "string"},
-                "x_miles": {"type": "number"},
-                "y_miles": {"type": "number"},
+                "x_miles": {"type": "number", "description": MAP_COORDINATE_RULE},
+                "y_miles": {"type": "number", "description": "Global map miles in the same frame as existing Travel locations. North is positive y. Preserve established positions."},
                 "terrain": {"type": "string"},
                 "travel_multiplier": {"type": "number", "minimum": 0.1, "maximum": 3.0},
                 "travel_notes": {"type": "string"},
@@ -1747,7 +1747,7 @@ NEW_GAME_RESPONSE_JSON_SCHEMA: dict[str, Any] = {
                             "without exposing internal location_scope classifications."
                         ),
                     },
-                    "x_miles": {"type": "number"},
+                    "x_miles": {"type": "number", "description": MAP_COORDINATE_RULE},
                     "y_miles": {"type": "number"},
                     "terrain": {"type": "string"},
                     "travel_multiplier": {"type": "number", "minimum": 0.1, "maximum": 3.0},
@@ -2062,7 +2062,7 @@ NEW_GAME_RESPONSE_JSON_SCHEMA: dict[str, Any] = {
                 "as base currency units."
             ),
         },
-        "introductory_message": {"type": "string", "description": OPENING_SCENE_RULE},
+        "introductory_message": {"type": "string", "minLength": 1, "description": OPENING_SCENE_RULE},
         "suggested_actions": {
             "type": "array",
             "description": ACTION_RULE + " Return three or four options for the opening scene.",
@@ -2677,6 +2677,7 @@ class AiWorldSetupResult:
     finalized_skills: list[dict[str, Any]] = field(default_factory=list)
     finalized_starting_spells: list[dict[str, Any]] = field(default_factory=list)
     finalized_starter_items: list[dict[str, Any]] = field(default_factory=list)
+    approved_starter_items: list[dict[str, Any]] | None = None
     known_crafting_items: list[dict[str, Any]] = field(default_factory=list)
     known_crafting_recipes: list[dict[str, Any]] = field(default_factory=list)
     finalized_currency_denominations: list[dict[str, Any]] = field(default_factory=list)
@@ -2697,6 +2698,10 @@ class GeminiConfigurationError(RuntimeError):
 
 class GeminiRequestError(RuntimeError):
     """Raised when a Gemini request fails after safe retries are exhausted."""
+
+
+class GeminiRequestRejectedError(GeminiRequestError):
+    """A permanent request rejection that response repairs cannot fix."""
 
 
 class GeminiNarrationService:
@@ -3011,6 +3016,8 @@ class GeminiNarrationService:
         setup_packet: dict[str, Any],
         *,
         progress_callback: Any = None,
+        opening_request: Any = None,
+        inventory_review_callback: Any = None,
     ) -> AiWorldSetupResult:
         """Generates a new game through three focused Gemini requests.
 
@@ -3038,6 +3045,8 @@ class GeminiNarrationService:
         )
         ai_preferences = ai_mode_preferences_from_context_packet(setup_packet)
         merged_data: dict[str, Any] = {}
+        approved_inventory = (copy.deepcopy(opening_request.data.get("starting_inventory"))
+                              if opening_request is not None else None)
 
         _notify_new_game_progress(progress_callback, "setup_compilation")
         for phase in (
@@ -3045,37 +3054,75 @@ class GeminiNarrationService:
             "entities_mechanics",
             "opening_prose",
         ):
-            _notify_new_game_progress(progress_callback, phase)
-            response_schema = build_new_game_phase_schema(setup_packet, phase)
-            prompt_packet = _new_game_prompt_packet_for_schema(
-                setup_packet,
-                response_schema,
-            )
-            prompt = build_gemini_new_game_phase_prompt(
-                prompt_packet,
-                phase,
-                approved_state=merged_data,
-            )
-            LOGGER.info(
-                "Sending staged new-game phase %s to Gemini model %s.",
-                phase,
-                self.settings.model,
-            )
-            if is_playtesting_build():
-                LOGGER.debug(
-                    "Staged new-game phase %s schema: fields=%s required=%s json_chars=%s",
-                    phase,
-                    list(response_schema.get("properties", {})),
-                    list(response_schema.get("required", [])),
-                    len(json.dumps(response_schema, separators=(",", ":"))),
+            if phase == "opening_prose" and inventory_review_callback is not None:
+                _notify_new_game_progress(progress_callback, "inventory_review")
+                approved_inventory = inventory_review_callback(
+                    merged_data, setup_packet, approved_inventory,
                 )
-            request_config = _structured_output_config(
-                response_schema,
-                model=self.settings.model,
-                ai_preferences=ai_preferences,
-                apply_response_length=True,
-                response_length_scope="new_game",
+                if approved_inventory is None:
+                    raise GeminiRequestError(
+                        "Starting inventory review was cancelled. Your generated world and items "
+                        "are saved; retry the opening to review them again."
+                    )
+                if opening_request is not None:
+                    opening_request.approve_starting_inventory(approved_inventory)
+            phase_state = (
+                {**merged_data, "starting_items": approved_inventory,
+                 "starting_inventory_approved_by_player": True}
+                if phase == "opening_prose" and approved_inventory is not None else merged_data
             )
+            _notify_new_game_progress(progress_callback, phase)
+            saved_phase = (opening_request.data["phases"].get(phase)
+                           if opening_request is not None else None)
+            if saved_phase is not None and "response" in saved_phase:
+                raw_text = saved_phase["response"]
+                _validate_response_contract(raw_text,
+                    build_new_game_phase_schema(setup_packet, phase, for_api=False),
+                    f"saved new-game {phase}")
+                merged_data.update(_parse_new_game_phase_object(raw_text, phase))
+                continue
+            if saved_phase is None:
+                response_schema = build_new_game_phase_schema(setup_packet, phase)
+                prompt_packet = _new_game_prompt_packet_for_schema(
+                    setup_packet,
+                    response_schema,
+                )
+                prompt = build_gemini_new_game_phase_prompt(
+                    prompt_packet,
+                    phase,
+                    approved_state=phase_state,
+                )
+                LOGGER.info(
+                    "Sending staged new-game phase %s to Gemini model %s.",
+                    phase,
+                    self.settings.model,
+                )
+                if is_playtesting_build():
+                    LOGGER.debug(
+                        "Staged new-game phase %s schema: fields=%s required=%s json_chars=%s",
+                        phase,
+                        list(response_schema.get("properties", {})),
+                        list(response_schema.get("required", [])),
+                        len(json.dumps(response_schema, separators=(",", ":"))),
+                    )
+                request_config = _structured_output_config(
+                    response_schema,
+                    model=self.settings.model,
+                    ai_preferences=ai_preferences,
+                    apply_response_length=True,
+                    response_length_scope="new_game",
+                )
+                validation_schema = build_new_game_phase_schema(setup_packet, phase, for_api=False)
+                if opening_request is not None:
+                    saved_phase = opening_request.prepare_phase(
+                        phase, prompt=prompt, config=request_config, model=self.settings.model,
+                        response_schema=response_schema, validation_schema=validation_schema,
+                    )
+            if saved_phase is not None:
+                prompt = saved_phase["prompt"]
+                request_config = saved_phase["config"]
+                response_schema = saved_phase["response_schema"]
+                validation_schema = saved_phase["validation_schema"]
 
             def finalize(raw_text: str) -> str:
                 _notify_new_game_progress(progress_callback, "targeted_repairs")
@@ -3109,20 +3156,22 @@ class GeminiNarrationService:
 
             raw_text = _generate_new_game_response_with_quality_retry(
                 client,
-                model=self.settings.model,
+                model=saved_phase["model"] if saved_phase else self.settings.model,
                 prompt=prompt,
                 response_schema=response_schema,
                 config=request_config,
-                validation_schema=build_new_game_phase_schema(setup_packet, phase, for_api=False),
+                validation_schema=validation_schema,
                 finalize=finalize,
                 setup_packet=setup_packet,
-                approved_state=merged_data,
+                approved_state=phase_state,
                 request_label=f"new-game {phase}",
             )
             _validate_response_contract(
                 raw_text, build_new_game_phase_schema(setup_packet, phase, for_api=False),
                 f"new-game {phase}",
             )
+            if opening_request is not None:
+                opening_request.approve_phase(phase, raw_text)
             phase_data = _parse_new_game_phase_object(raw_text, phase)
             merged_data.update(phase_data)
 
@@ -3131,10 +3180,11 @@ class GeminiNarrationService:
             json.dumps(merged_data), build_new_game_response_schema(setup_packet, for_api=False),
             "merged new-game response",
         )
-        return parse_gemini_new_game_response(
+        result = parse_gemini_new_game_response(
             json.dumps(merged_data, ensure_ascii=False),
             setup_packet=setup_packet,
         )
+        return replace(result, approved_starter_items=approved_inventory)
 
 
 def load_gemini_settings(
@@ -3900,6 +3950,9 @@ def build_gemini_new_game_phase_prompt(
         "opening_prose": (
             "Write only the player-facing opening scene and its suggested actions and "
             "cues, using the approved world and entity state as canon. Do not change "
+            "inventory approved by the player: approved_state.starting_items is authoritative "
+            "over the original setup wish list; omitted items were declined and stored "
+            "items are not being carried. Never reintroduce removed possessions. Do not change "
             "locations, NPC identities, inventory, currency, weather, tasks, or any "
             "other durable state. Use only approved names and do not add map labels, "
             "lore, or mechanical records."
@@ -3973,7 +4026,13 @@ def _response_contract_errors(raw_text: str, schema: dict[str, Any]) -> list[str
                           parse_constant=_reject_json_constant, object_pairs_hook=_unique_json_object)
     except (ValueError, TypeError):
         return ["response was not valid JSON (including duplicate keys or non-finite numbers)"]
-    return _json_schema_shape_errors(data, schema)
+    errors = _json_schema_shape_errors(data, schema)
+    if (isinstance(data, dict) and "introductory_message" in schema.get("properties", {})
+            and isinstance(data.get("introductory_message"), str)
+            and not data["introductory_message"].strip()):
+        # Reject before the permissive parser can substitute a local opening.
+        errors.append("$.introductory_message must contain opening scene text")
+    return errors
 
 
 def _validate_response_contract(raw_text: str, schema: dict[str, Any], label: str) -> None:
@@ -4120,6 +4179,8 @@ def _repair_gemini_creative_terms(
                 ),
                 request_label=f"{response_label} repair attempt {attempt}",
             )
+        except GeminiRequestRejectedError:
+            raise
         except GeminiRequestError as error:
             LOGGER.warning(
                 "Gemini %s repair attempt %s/%s failed: %s",
@@ -4268,6 +4329,8 @@ def _repair_gemini_suggested_setup_fields(
                 ),
                 request_label=f"new-game suggestion repair attempt {attempt}",
             )
+        except GeminiRequestRejectedError:
+            raise
         except GeminiRequestError as error:
             LOGGER.warning(
                 "Gemini new-game suggestion repair attempt %s/%s failed: %s",
@@ -4970,6 +5033,8 @@ def _generate_new_game_response_with_quality_retry(
                 except (ValueError, TypeError):
                     candidate = None
             scoped_fields = repair_fields(candidate_errors, contract.get("properties", {})) if setup_packet is not None and candidate is not None else None
+        except GeminiRequestRejectedError:
+            raise
         except GeminiRequestError as error:
             candidate_errors = [str(error)]
             scoped_fields = None  # No validator path identifies the failed dependency.
@@ -5200,7 +5265,7 @@ def _create_interaction_with_retry(
                 _model_error_diagnostics(error),
             )
             if (
-                _is_invalid_argument_model_error(error)
+                _is_schema_rejection_model_error(error)
                 and "schema" in _text_response_format(active_config)
                 and allow_schema_fallback
                 and attempt < MODEL_REQUEST_ATTEMPTS
@@ -5249,6 +5314,12 @@ def _create_interaction_with_retry(
                 raise GeminiRequestError(
                     "Gemini is temporarily unavailable. Your progress is safe; "
                     "please try again shortly."
+                ) from None
+            status_code = _model_error_status_code(error)
+            if status_code is not None and 400 <= status_code < 500:
+                raise GeminiRequestRejectedError(
+                    f"Gemini could not complete the request (HTTP {status_code}): {summary}. "
+                    "The request was rejected; automatic response repairs were stopped."
                 ) from None
             raise GeminiRequestError(
                 f"Gemini could not complete the request: {summary}"
@@ -5315,6 +5386,13 @@ def _tool_free_text_generation_config(config: dict[str, Any]) -> dict[str, Any]:
         )
 
     active_config = dict(config)
+    if "safety_settings" in active_config:
+        # Previously saved opening requests may contain the Enterprise-only
+        # category even after the UI and defaults have been updated.
+        active_config["safety_settings"] = [
+            setting for setting in active_config["safety_settings"]
+            if setting.get("type") != "civic_integrity"
+        ]
     active_config["tools"] = []
     generation["tool_choice"] = "none"
     active_config["generation_config"] = generation
@@ -5322,15 +5400,30 @@ def _tool_free_text_generation_config(config: dict[str, Any]) -> dict[str, Any]:
     return active_config
 
 
+def _model_error_status_code(error: Exception) -> int | None:
+    """Prefer the SDK's HTTP status over numbers embedded in its message."""
+    for attribute in ("status_code", "code"):
+        try:
+            code = int(getattr(error, attribute, None))
+        except (TypeError, ValueError):
+            continue
+        if 400 <= code < 600:
+            return code
+    match = re.search(r"\b([45]\d{2})\b", str(error))
+    return int(match.group(1)) if match else None
+
+
 def _is_transient_model_error(error: Exception) -> bool:
     """Returns whether an SDK or network error is safe to retry briefly."""
 
     text = str(error).casefold()
-    status_code = getattr(error, "status_code", getattr(error, "code", None))
-    return status_code in {429, 500, 502, 503, 504} or any(
+    status_code = _model_error_status_code(error)
+    if status_code is not None:
+        return status_code in {408, 429, 500, 502, 503, 504}
+    return any(
         marker in text
         for marker in (
-            "429", "500", "502", "503", "504", "unavailable", "high demand",
+            "unavailable", "high demand",
             "timed out", "timeout", "temporarily", "connection reset",
         )
     )
@@ -5340,7 +5433,7 @@ def _is_invalid_argument_model_error(error: Exception) -> bool:
     """Returns whether Gemini rejected one or more request arguments."""
 
     text = str(error).casefold()
-    status_code = getattr(error, "status_code", getattr(error, "code", None))
+    status_code = _model_error_status_code(error)
     body = getattr(error, "body", None)
     if isinstance(body, str):
         try:
@@ -5356,6 +5449,11 @@ def _is_invalid_argument_model_error(error: Exception) -> bool:
     return status_code == 400 or (
         "400" in text and ("invalid_argument" in text or "invalid argument" in text)
     )
+
+
+def _is_schema_rejection_model_error(error: Exception) -> bool:
+    """Only retry without a schema when the provider identifies that schema."""
+    return _is_invalid_argument_model_error(error) and "schema" in str(error).casefold()
 
 
 def _model_error_summary(error: Exception) -> str:
@@ -8000,7 +8098,7 @@ def _parse_new_game_locations(
     raw_locations: Any,
     start_location: str,
 ) -> list[dict[str, Any]]:
-    """Parses player-known location metadata and anchors the starting map origin."""
+    """Parses player-known locations while preserving their global map positions."""
 
     relationship_aware_locations: Any = raw_locations
     if isinstance(raw_locations, list):
@@ -8028,31 +8126,13 @@ def _parse_new_game_locations(
             source_indexes_by_name[name.casefold()] = max(-1, source_index)
     clean_start_location = clean_player_location_name(start_location)
 
-    if clean_start_location:
-        for index, location in enumerate(locations):
-            if location.name.casefold() != clean_start_location.casefold():
-                continue
-
-            location_data = location.to_dict()
-            location_data["x_miles"] = 0.0
-            location_data["y_miles"] = 0.0
-            locations[index] = normalize_known_locations([location_data])[0]
-            break
-        else:
-            locations = normalize_known_locations(
-                [
-                    *(location.to_dict() for location in locations),
-                    {
-                        "name": clean_start_location,
-                        "description": "Starting location.",
-                        "x_miles": 0.0,
-                        "y_miles": 0.0,
-                        "terrain": "",
-                        "travel_multiplier": 1.0,
-                        "travel_notes": "",
-                    },
-                ]
-            )
+    if clean_start_location and not any(
+        location.name.casefold() == clean_start_location.casefold() for location in locations
+    ):
+        locations = normalize_known_locations([
+            *(location.to_dict() for location in locations),
+            {"name": clean_start_location, "description": "Starting location."},
+        ])
 
     parsed_locations: list[dict[str, Any]] = []
     for location in locations:

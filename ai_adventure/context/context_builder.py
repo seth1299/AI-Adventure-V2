@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from ai_adventure.stats import PLAYER_ACHIEVEMENT_RULE, STATS_RULE
 from ai_adventure.suggested_actions import ACTION_RULE
+from ai_adventure.locations import MAP_COORDINATE_RULE
 
 from ai_adventure.container_flow import CONTAINER_FLOW_RULE
 from ai_adventure.inventory_storage import inventory_access, inventory_load
@@ -431,12 +432,11 @@ class AiContextBuilder:
             state.settings.values.get("notes.share_with_ai", False),
             default=False,
         )
-        note_entries: list[dict[str, Any]] = []
-
-        if notes_share_with_ai:
-            note_entries = note_entries_for_ai(
-                normalize_note_entries(state.settings.values.get("notes.entries", []))
-            )
+        note_entries = note_entries_for_ai(
+            normalize_note_entries(state.settings.values.get("notes.entries", [])),
+            share_all=notes_share_with_ai,
+        )
+        notes_share_with_ai = notes_share_with_ai or bool(note_entries)
         if clean_background_ambience_tracks:
             audio_transition_rules.append(
                 "Use BackgroundAmbienceChangedEvent to start or replace a quiet, "
@@ -593,8 +593,7 @@ class AiContextBuilder:
                         "speed_multiplier": state.travel.speed_multiplier,
                     },
                     "rules": (
-                        "This is player-known map information. x_miles and y_miles "
-                        "share a relative map measured in miles. Use "
+                        MAP_COORDINATE_RULE + " Use "
                         "LocationUpsertedEvent for newly learned or corrected travel "
                         "locations, and do not reveal undiscovered routes or secrets."
                     ),

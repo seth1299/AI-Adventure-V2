@@ -23,6 +23,21 @@ from ai_adventure.persistence.save_repository import SaveRepository
 
 
 class BundledImageTests(unittest.TestCase):
+    def test_existing_skill_uses_exact_named_icon_without_ai_assignment(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            art = root / "art" / "skills"
+            art.mkdir(parents=True)
+            Image.new("RGB", (16, 16)).save(art / "Alchemy_Skill_Icon.png")
+            with patch("ai_adventure.bundled_images.bundled_images_root", return_value=art.parent):
+                repository = SaveRepository.create_new_save(root / "saves", "Icons")
+                repository.upsert_skill("Alchemy", "Mix potions.", 1)
+                repository.upsert_skill("Rocket Science", "Design rockets.", 1)
+                skills = {s["name"]: s for s in repository.list_skills()}
+                asset = repository.get_visual_asset("skill", skills["Alchemy"]["id"])
+                self.assertEqual(asset["default_image"], "skills/Alchemy_Skill_Icon.png")
+                self.assertIsNone(repository.get_visual_asset("skill", skills["Rocket Science"]["id"]))
+
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)

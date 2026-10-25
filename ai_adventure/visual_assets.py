@@ -48,6 +48,7 @@ STANDARD_IMAGE_MAX_PIXELS = 1024
 LARGE_IMAGE_MAX_PIXELS = STANDARD_IMAGE_MAX_PIXELS
 IMAGE_OUTPUT_MIME_TYPE = "image/png"
 ASSET_DIRECTORY_BY_SUBJECT_TYPE = {
+    "region_map": "maps",
     "player": "characters",
     "location": "locations",
     "inventory": "inventory",
@@ -156,8 +157,55 @@ class VisualAssetRequest:
         return f"{stem}_{self.descriptor_hash[:8]}.png"
 
     @property
+    def external_prompt(self) -> str:
+        """A portable art brief containing only visually relevant instructions."""
+        if self.subject_type == "region_map":
+            return (
+                "Create a square, north-up, top-down regional terrain map. "
+                "Use restrained colors, clear terrain boundaries and readable geography. "
+                "No perspective view, labels, letters, numbers, text, legend, borders or watermarks. "
+                "The application overlays exact names and markers as crisp vector text. "
+                "Place terrain and settlements at the supplied percentages across the full "
+                "canvas: x increases rightward, y downward. Preserve distances and parent "
+                "relationships; do not invent roads, places or terrain for unmapped entries. "
+                "Names below are reference metadata only, never render them as text.\n"
+                f"Selected art style: {image_style_metadata(self.image_style)['label']}.\n"
+                + self.description
+            )
+        style = image_style_metadata(self.image_style)
+        focus = {
+            "player": "One waist-up character portrait; show the face, clothing, and equipment.",
+            "npc": "One waist-up character portrait; show the face, clothing, and equipment.",
+            "location": "An establishing view emphasizing terrain, architecture, scale, and atmosphere. No people or body parts.",
+            "inventory": "Exactly one item, clearly showing its materials, color, condition, and distinctive features. No people, hands, or duplicate items; use a simple supporting background.",
+            "skill": "One bold, recognizable symbol with a simple silhouette, strong contrast, and generous padding. No lettering or decorative frame.",
+            "bestiary": "One creature, emphasizing its silhouette, scale, coloration, texture, and described anatomy. No extra creatures or people.",
+        }[self.subject_type]
+        # Extract visual era cues, rather than exporting plot, lore, or genre.
+        context = self.world_context.casefold()
+        eras = re.findall(r"\b(?:medieval|prehistoric|ancient roman|ancient egyptian|renaissance|victorian|edwardian|industrial[- ]era|modern[- ]day|far[- ]future)\b", context)
+        constraints = []
+        if eras:
+            constraints.append("Visual setting: " + ", ".join(dict.fromkeys(eras)) + ".")
+        if "medieval" in eras or re.search(r"\b(?:no|without|avoid) modern\b", context):
+            constraints.append("Avoid modern technology, vehicles, clothing, and manufactured objects.")
+        return "\n".join(filter(None, [
+            f"Art style: {style['label']}. {style['prompt']}",
+            f"Subject: {self.display_name}.",
+            f"Description: {self.description}",
+            " ".join(constraints),
+            f"Focus: {focus}",
+            f"Composition: {self.aspect_ratio} aspect ratio; keep the subject clear and prominent.",
+            "Avoid captions, signatures, watermarks, borders, and split panels.",
+            self.text_instructions or "No readable text or labels.",
+        ]))
+
+    @property
     def prompt(self) -> str:
         """Builds an image-only prompt from already finalized visible state."""
+
+        if self.subject_type == "region_map":
+            return self.external_prompt
 
         subject_instruction = {
             "player": (

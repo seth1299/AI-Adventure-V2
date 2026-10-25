@@ -112,6 +112,7 @@ class NpcsScreen(RepositoryBackedWidget):
             else None,
             parent=self,
         )
+        self.add_copy_image_prompt_button(dialog, "npc", npc_id.casefold())
         dialog.exec()
 
     def _sort_by_column(self, column_index: int) -> None:

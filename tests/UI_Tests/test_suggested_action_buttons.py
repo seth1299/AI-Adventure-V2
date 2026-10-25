@@ -69,6 +69,44 @@ class SuggestedActionButtonTests(QtTestCase):
         packet = StoryTurnService.build_context_packet(reloaded, "Look around.")
         self.assertTrue(all("suggested_actions" not in entry for entry in packet["recent_history"]))
 
+    def test_choices_wait_for_narrator_completion_including_across_refreshes(self):
+        class Narrator:
+            def narrate(self, text, **callbacks):
+                self.callbacks = callbacks
+                return True
+        narrator = Narrator()
+        self.screen.narration_player = narrator
+        entry = self.show_response()
+        self.screen._set_waiting_for_gm(True)
+        self.assertTrue(self.screen._reveal_story_with_narration(entry["id"], entry["content"]))
+        self.assertTrue(self.screen.suggested_actions_box.isHidden())
+        narrator.callbacks["on_chunk_start"]("The camp ")
+        self.screen.refresh()
+        self.assertTrue(self.screen.suggested_actions_box.isHidden())
+        narrator.callbacks["on_chunk_start"]("is quiet.")
+        self.assertTrue(self.screen.suggested_actions_box.isHidden())
+        narrator.callbacks["on_complete"]()
+        self.assertFalse(self.screen.suggested_actions_box.isHidden())
+        self.assertEqual(len(self.screen.suggested_action_buttons), 2)
+        self.assertTrue(all(button.isEnabled() for button in self.screen.suggested_action_buttons))
+
+    def test_choices_show_immediately_without_narrator(self):
+        self.repo.set_setting("audio.narrator_enabled", False)
+        self.show_response()
+        self.assertFalse(self.screen.narrate_latest_story(reveal_progressively=True))
+        self.assertFalse(self.screen.suggested_actions_box.isHidden())
+        self.assertEqual(len(self.screen.suggested_action_buttons), 2)
+
+    def test_stalled_narration_recovery_restores_choices(self):
+        entry = self.show_response()
+        self.screen._set_waiting_for_gm(True)
+        with patch.object(self.screen, "_narrate_text", return_value=True):
+            self.screen._reveal_story_with_narration(entry["id"], entry["content"])
+        self.assertTrue(self.screen.suggested_actions_box.isHidden())
+        with self.assertLogs(level="WARNING"):
+            self.screen._recover_stalled_story_reveal(entry["id"], self.screen._story_reveal_generation)
+        self.assertFalse(self.screen.suggested_actions_box.isHidden())
+
     def test_stale_hidden_out_of_game_and_revealing_choices_cannot_replace_draft(self):
         entry = self.show_response()
         prompt = entry["suggested_actions"][0]["prompt"]

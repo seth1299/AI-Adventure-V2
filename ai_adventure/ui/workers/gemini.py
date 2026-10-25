@@ -1,7 +1,7 @@
 """Background Qt workers for Gemini and visual-asset requests.
 
-Workers perform only the provider call.  Signals return results to the GUI
-thread, where repositories and widgets remain under application control.
+Workers run provider orchestration. Signals return results and inventory-review
+proposals to the GUI thread, which owns repositories, widgets, and player choices.
 """
 
 from __future__ import annotations
@@ -126,16 +126,27 @@ class GeminiNewGameWorker(QObject):
     """Runs staged Gemini new-game generation away from the Qt UI thread."""
 
     completed = Signal(object)
+    inventory_review_requested = Signal(object)
     phase_changed = Signal(str)
     configuration_error = Signal(str)
     request_failed = Signal(str)
     failed = Signal()
     finished = Signal()
 
-    def __init__(self, setup_packet: dict[str, Any], api_key_path: Path | None = None) -> None:
+    def __init__(self, setup_packet: dict[str, Any], api_key_path: Path | None = None,
+                 *, opening_request_path: Path | None = None) -> None:
         super().__init__()
         self._setup_packet = setup_packet
         self._api_key_path = api_key_path
+        self._opening_request_path = opening_request_path
+
+    def _review_starting_inventory(self, state, setup_packet, approved_items):
+        from ai_adventure.application.starting_inventory import StartingInventoryReview
+        proposal = StartingInventoryReview.from_generated_state(state, setup_packet, approved_items)
+        # MainWindow connects with BlockingQueuedConnection: the provider worker
+        # waits while the GUI reviews possessions, with no transaction held open.
+        self.inventory_review_requested.emit(proposal)
+        return proposal.approved_items
 
     @Slot()
     def run(self) -> None:
@@ -148,9 +159,15 @@ class GeminiNewGameWorker(QObject):
             )
             staged_generator = getattr(service, "generate_new_game_world_staged", None)
             if callable(staged_generator):
+                options = {}
+                if self._opening_request_path is not None:
+                    from ai_adventure.application.opening_request import OpeningRequest
+                    options["opening_request"] = OpeningRequest(self._opening_request_path)
+                    options["inventory_review_callback"] = self._review_starting_inventory
                 result = staged_generator(
                     self._setup_packet,
                     progress_callback=self.phase_changed.emit,
+                    **options,
                 )
             else:
                 # Keeps lightweight test doubles and older integrations usable.

@@ -189,14 +189,6 @@ CONTENT_HARM_CATEGORY_OPTIONS: tuple[dict[str, str], ...] = (
         "label": "Dangerous Content",
         "description": "Dangerous acts or content that could facilitate physical harm.",
     },
-    {
-        "value": "HARM_CATEGORY_CIVIC_INTEGRITY",
-        "label": "Civic Integrity",
-        "description": (
-            "Content that could harm civic or election integrity. Gemini marks this "
-            "category as deprecated, but still exposes it in GenerateContent."
-        ),
-    },
 )
 
 ALL_CONTENT_HARM_CATEGORIES = tuple(

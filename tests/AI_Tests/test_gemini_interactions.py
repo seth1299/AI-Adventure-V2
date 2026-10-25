@@ -69,6 +69,9 @@ class GeminiInteractionsTests(unittest.TestCase):
         self.assertEqual(sent["generation_config"]["max_output_tokens"], 1536)
         self.assertEqual(sent["response_format"][0]["schema"]["required"], ["answer"])
         self.assertEqual(sent["safety_settings"][0], {"type": "harassment", "threshold": "off"})
+        self.assertEqual({setting["type"] for setting in sent["safety_settings"]}, {
+            "harassment", "hate_speech", "sexually_explicit", "dangerous_content",
+        })
         for old in ("contents", "config", "response_json_schema", "response_mime_type", "response_modalities"):
             self.assertNotIn(old, sent)
 
@@ -110,6 +113,33 @@ class GeminiInteractionsTests(unittest.TestCase):
         with self.assertRaises(g.GeminiRequestError):
             self.request(client)
         self.assertEqual(len(self.requests), 1)
+
+    def test_saved_opening_configs_drop_obsolete_civic_setting_before_serialization(self):
+        config = g._structured_output_config({"type": "object"})
+        config["safety_settings"].append({"type": "civic_integrity", "threshold": "off"})
+        client = self.client([(200, completed())])
+        g._create_interaction_with_retry(client, model=g.DEFAULT_GEMINI_MODEL, contents="Saved prompt",
+                                        config=config, request_label="saved opening")
+        self.assertNotIn("civic_integrity", {s["type"] for s in self.requests[0][1]["safety_settings"]})
+        self.assertEqual(config["safety_settings"][-1]["type"], "civic_integrity")
+
+    def test_permanent_errors_stop_new_game_without_schema_fallback_or_content_repairs(self):
+        message = ("The value 'civic_integrity' is not supported for 'safety_settings[4].type' "
+                   "on the Gemini API, it is allowed on the Gemini Enterprise Agent Platform.")
+        for status, reason in ((400, message), (401, "Invalid API key"), (403, "Permission denied"),
+                               (404, "Model not found"), (400, "Invalid max_output_tokens: 503")):
+            with self.subTest(status=status, reason=reason), patch.object(g.time, "sleep") as sleep:
+                self.requests.clear()
+                client = self.client([(status, {"error": {"code": "invalid_request", "message": reason}})])
+                with self.assertRaisesRegex(g.GeminiRequestRejectedError, f"HTTP {status}"):
+                    g._generate_new_game_response_with_quality_retry(
+                        client, model=g.DEFAULT_GEMINI_MODEL, prompt="Saved setup prompt",
+                        response_schema={"type": "object"},
+                        config=g._structured_output_config({"type": "object"}),
+                    )
+                self.assertEqual(len(self.requests), 1)
+                sleep.assert_not_called()
+                self.assertIn("schema", self.requests[0][1]["response_format"][0])
 
     def test_usage_maps_to_existing_benchmark_fields_without_losing_unknowns(self):
         client = self.client([(200, completed(usage={

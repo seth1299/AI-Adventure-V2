@@ -40,8 +40,16 @@ class TravelScreen(RepositoryBackedWidget):
         self.location_image_label.hide()
         self.select_image_button = QPushButton("Select Image...")
         self.select_image_button.clicked.connect(self._select_location_image)
+        self.copy_image_prompt_button = QPushButton("Copy Image Prompt")
+        self.copy_image_prompt_button.clicked.connect(
+            lambda: self.copy_visual_asset_prompt("location", self._location_image_key()))
         self.create_image_button = QPushButton("Create new image for me")
         self.create_image_button.clicked.connect(self._create_location_image)
+        self.map_button = QPushButton("Map")
+        self.map_button.setObjectName("travelMapButton")
+        self.map_button.clicked.connect(self._show_map)
+        self.copy_map_prompt_button = QPushButton("Copy Map Prompt")
+        self.copy_map_prompt_button.clicked.connect(self._copy_map_prompt)
 
         self.travel_context_input = QTextEdit()
         self.travel_context_input.setPlaceholderText("Optional details for the GM")
@@ -65,7 +73,8 @@ class TravelScreen(RepositoryBackedWidget):
         details_layout.addWidget(scope_controls)
         details_layout.addWidget(self.location_image_label)
         details_layout.addWidget(
-            _button_row(self.select_image_button, self.create_image_button)
+            _button_row(self.select_image_button, self.create_image_button, self.copy_image_prompt_button,
+                        self.map_button, self.copy_map_prompt_button)
         )
         details_layout.addWidget(self.details_output)
         details_layout.addWidget(QLabel("Travel Context"))
@@ -93,6 +102,8 @@ class TravelScreen(RepositoryBackedWidget):
 
         repository = self.repository()
         self.create_image_button.setVisible(self.visual_asset_generation_enabled())
+        self.map_button.setEnabled(repository is not None)
+        self.copy_map_prompt_button.setEnabled(repository is not None)
         current_location_name = ""
         selected_name = self._selected_location_name()
         self.location_list.blockSignals(True)
@@ -243,7 +254,8 @@ class TravelScreen(RepositoryBackedWidget):
 
         if not estimate.is_available:
             travel_lines.append(
-                "A route estimate will be available once both locations have map positions."
+                "A route estimate needs distinct, consistent map positions. "
+                "Missing or conflicting coordinates must be corrected before travel can be estimated."
             )
 
         sections.append("\n\n".join(travel_lines))
@@ -288,6 +300,21 @@ class TravelScreen(RepositoryBackedWidget):
             self.travel_context_input.toPlainText().strip(),
         ):
             self.travel_context_input.clear()
+
+    def _show_map(self):
+        if self.repository() is not None:
+            from ai_adventure.ui.region_map import RegionalMapDialog
+            dialog = RegionalMapDialog(self)
+            try:
+                dialog.exec()
+            finally:
+                dialog.deleteLater()
+
+    def _copy_map_prompt(self):
+        if self.repository() is not None:
+            from PySide6.QtWidgets import QApplication
+            from ai_adventure.region_map import regional_map_request
+            QApplication.clipboard().setText(regional_map_request(self.repository()).external_prompt)
 
     def _location_image_key(self) -> str:
         location = self._selected_location_data() or {}

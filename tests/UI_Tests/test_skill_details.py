@@ -22,6 +22,37 @@ class SkillDetailsTests(QtTestCase):
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication([])
 
+    def test_wizard_skill_choices_exclude_names_used_at_other_levels(self):
+        wizard = NewGameWizard(tts_enabled=False, skill_catalog=[
+            {"name": "Accounting", "description": "Manage accounts."},
+            {"name": "Geology", "description": "Study rocks."},
+        ])
+        self.addCleanup(wizard.close)
+        wizard.skill_preset_combo.setCurrentIndex(wizard.skill_preset_combo.findData("custom"))
+        wizard._add_starting_skill_row(3, "Accounting")
+        wizard._add_starting_skill_row(2)
+        first, second = [skill for _level, skill, _description in wizard.skill_inputs]
+        accounting = next(index for index in range(2, second.combo.count())
+                          if second.combo.itemData(index)[0] == "Accounting")
+        self.assertTrue(second.combo.view().isRowHidden(accounting))
+        self.assertFalse(second.combo.model().item(accounting).isEnabled())
+        self.assertEqual(first.text(), "Accounting")
+
+        first.setText("")
+        self.assertFalse(second.combo.view().isRowHidden(accounting))
+        self.assertTrue(second.combo.model().item(accounting).isEnabled())
+        first.setText("  accounting  ")
+        self.assertTrue(second.combo.view().isRowHidden(accounting))
+        first.combo.setCurrentIndex(first.combo.findData(first.CUSTOM_DATA))
+        first.combo.setEditText("ACCOUNTING")
+        self.assertTrue(second.combo.view().isRowHidden(accounting))
+        first.combo.setEditText("Custom trade")
+        self.assertFalse(second.combo.view().isRowHidden(accounting))
+        first.combo.setEditText("Accounting")
+        wizard.skill_tables[3].removeRow(0)
+        wizard._sync_starting_skill_inputs()
+        self.assertFalse(second.combo.view().isRowHidden(accounting))
+
     def test_wizard_catalog_stat_selection_template_and_save_round_trip(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

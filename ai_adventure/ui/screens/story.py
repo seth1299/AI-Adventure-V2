@@ -16,6 +16,7 @@ class StoryScreen(RepositoryBackedWidget):
 
     _narration_chunk_ready = Signal(int, str)
     _narration_complete = Signal(int)
+    opening_retry_requested = Signal()
     HISTORY_PAGE_SIZE = 50
     CONVERSATION_KINDS = ("player", "player_oog", "story", "story_oog")
 
@@ -159,6 +160,16 @@ class StoryScreen(RepositoryBackedWidget):
         self.suggested_action_buttons: list[QPushButton] = []
         self.suggested_actions_box.hide()
         layout.addWidget(self.suggested_actions_box)
+        self.opening_retry_box = QWidget()
+        retry_layout = QHBoxLayout(self.opening_retry_box)
+        self.opening_retry_message = QLabel()
+        self.opening_retry_message.setWordWrap(True)
+        self.retry_opening_button = QPushButton("Retry Opening Message")
+        self.retry_opening_button.clicked.connect(self.opening_retry_requested.emit)
+        retry_layout.addWidget(self.opening_retry_message, 1)
+        retry_layout.addWidget(self.retry_opening_button)
+        self.opening_retry_box.hide()
+        layout.addWidget(self.opening_retry_box)
         layout.addLayout(input_row)
 
         self.setLayout(layout)
@@ -170,6 +181,7 @@ class StoryScreen(RepositoryBackedWidget):
         self._history_start_id = None
         self._history_expanded = False
         self._initial_generation_pending = False
+        self.set_opening_retry_available(False)
         self._pending_travel_request = None
         self._pending_conversation_mode = "live_game"
         self.mode_button.setChecked(False)
@@ -1118,7 +1130,11 @@ class StoryScreen(RepositoryBackedWidget):
         latest = repository.list_history(limit=1, kinds=self.CONVERSATION_KINDS) if repository else []
         entry = latest[0] if latest else {}
         actions = entry.get("suggested_actions", []) if entry.get("kind") == "story" and not entry.get("hidden") else []
-        visible = bool(actions) and self._conversation_mode() == "live_game"
+        visible = (
+            bool(actions) and self._conversation_mode() == "live_game"
+            and not self._waiting_for_gm and not self._initial_generation_pending
+            and self._revealing_story_id is None
+        )
         self.suggested_actions_box.setVisible(visible)
         if not visible:
             return
@@ -1685,6 +1701,11 @@ class StoryScreen(RepositoryBackedWidget):
         self._initial_generation_pending = bool(pending)
         self._set_waiting_for_gm(pending)
         self.refresh()
+
+    def set_opening_retry_available(self, available: bool, message: str = "") -> None:
+        """Offer recovery without presenting a failure notice as story narration."""
+        self.opening_retry_message.setText(message)
+        self.opening_retry_box.setVisible(available)
 
     def _show_unresolved_status(self) -> None:
         """Shows neutral values while the opening game state is unresolved."""

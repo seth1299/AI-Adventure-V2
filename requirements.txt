@@ -8,7 +8,7 @@ pillow==10.4.0
 RapidFuzz==3.14.5
 
 # Music, sound effects, and both supported local narration engines.
-pygame==2.6.1
+pygame-ce==2.5.8
 kokoro-onnx==0.5.0
 pykokoro==0.6.5
 soundfile==0.13.1
@@ -18,5 +18,5 @@ en-core-web-sm @ https://github.com/explosion/spacy-models/releases/download/en_
 
 # Packaging used by build.bat and lightweight_build.bat.
 PyInstaller==6.16.0
-# pygame 2.6.1 imports pkg_resources; retain its known working provider.
+# Pin build tooling for reproducible packaging.
 setuptools==80.9.0

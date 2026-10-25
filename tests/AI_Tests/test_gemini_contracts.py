@@ -180,7 +180,7 @@ class GeminiContractTests(unittest.TestCase):
         repaired["events"][0]["payload"]["weather"] = "Clear"
         with patch.object(genai, "Client") as client, self.assertLogs(level="INFO") as logs:
             generate = client.return_value.interactions.create
-            generate.side_effect = [RuntimeError("400 INVALID_ARGUMENT"),
+            generate.side_effect = [RuntimeError("400 INVALID_ARGUMENT: unsupported response schema"),
                                     SimpleNamespace(output_text=json.dumps(invalid)), SimpleNamespace(output_text=json.dumps(repaired))]
             result = g.GeminiNarrationService(g.GeminiSettings(api_key="test-key")).generate_story_response(packet)
         self.assertIn("Stalls line the market.", result.narrative_text)

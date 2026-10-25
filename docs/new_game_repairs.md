@@ -33,3 +33,21 @@ No generated world is committed until the whole result passes validation.
 
 Logs record repair fields and prompt character counts compared with the original
 phase prompt. Transport retries remain separate from this response-repair budget.
+
+New games retain `adventure.new_game_prompt.txt` beside their save database until
+the opening is delivered. This UTF-8 JSON text file contains the setup packet,
+exact phase prompts, model/configuration/contracts, and approved phase responses;
+it contains no API key. Writes replace the file atomically. A failed opening
+offers **Retry Opening Message**, including after reopening the save. Retries
+read this file, reuse approved phases, and resend the unfinished phase's saved
+prompt without rebuilding it. Response repairs still use the normal validation
+budget. The generated world and opening-ready marker are committed together.
+
+Image preparation starts only after a validated, nonempty opening is committed.
+The source dialog collects checkbox choices until **Next**; uploads are retained,
+unchecked subjects are skipped, and only checked subjects enter the paid queue.
+**Create all images for me** asks for confirmation about time and API usage before
+selecting the remaining subjects. Automatic scans cannot add work during source
+selection or while an opening is pending. Text display and narration wait until
+the selected images finish or the player skips failed images. Only then is the
+opening revealed and the temporary prompt file deleted.

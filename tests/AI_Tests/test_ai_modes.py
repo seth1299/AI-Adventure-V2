@@ -11,6 +11,13 @@ from ai_adventure.ai.modes import (
 
 
 class AiModeTests(unittest.TestCase):
+    def test_legacy_civic_category_is_removed_without_changing_supported_choices(self):
+        selected = ["HARM_CATEGORY_HARASSMENT", "HARM_CATEGORY_CIVIC_INTEGRITY"]
+        preferences = normalize_ai_mode_preferences({"allowed_content_categories": selected})
+        self.assertNotIn("HARM_CATEGORY_CIVIC_INTEGRITY", ALL_CONTENT_HARM_CATEGORIES)
+        self.assertEqual(preferences["allowed_content_categories"], ["HARM_CATEGORY_HARASSMENT"])
+        self.assertIn("HARM_CATEGORY_DANGEROUS_CONTENT", preferences["blocked_content_categories"])
+
     def test_defaults_preserve_current_fast_unrestricted_behavior(self) -> None:
         preferences = normalize_ai_mode_preferences({})
 

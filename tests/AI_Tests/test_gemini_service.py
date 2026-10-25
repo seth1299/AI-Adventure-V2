@@ -1399,6 +1399,7 @@ class GeminiServiceTests(unittest.TestCase):
                     "heading": "Outbreak Symptoms",
                     "body": "Fever and confusion are commonly reported first.",
                     "tags": ["survival"],
+                    "share_with_ai": False,
                 }
             ],
         )
@@ -3977,7 +3978,7 @@ class GeminiServiceTests(unittest.TestCase):
                 )
                 self.configs.append(config)
                 if len(self.configs) == 1:
-                    raise RuntimeError("400 INVALID_ARGUMENT: invalid argument")
+                    raise RuntimeError("400 INVALID_ARGUMENT: unsupported response schema")
                 return types.SimpleNamespace(output_text="{}")
 
         models = Models()
@@ -4693,7 +4694,8 @@ class GeminiServiceTests(unittest.TestCase):
         self.assertIn("never emit foreign scripts, IPA", prompt)
         self.assertIn("pronunciation_map", prompt)
         self.assertNotIn("Setup packet:", prompt)
-        self.assertLess(len(prompt), 9_000)
+        # Includes the starting-load calculation and pre-opening review contract.
+        self.assertLess(len(prompt), 10_000)
 
         raw_text = json.dumps(
             {
@@ -4920,7 +4922,7 @@ class GeminiServiceTests(unittest.TestCase):
 
         self.assertEqual(result.locations[0]["name"], "Rainmarket Station")
         self.assertEqual(result.locations[0]["source_index"], 0)
-        self.assertEqual((result.locations[0]["x_miles"], result.locations[0]["y_miles"]), (0.0, 0.0))
+        self.assertEqual((result.locations[0]["x_miles"], result.locations[0]["y_miles"]), (12.0, -4.0))
         """Legacy prose assertions retained here only as migration documentation.
         self.assertIn("setup.starting_locations", prompt)
         self.assertIn("never reuse the superseded setup placeholder", prompt)

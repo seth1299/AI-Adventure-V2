@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from ai_adventure.skills.attributes import skill_attribute
-from ai_adventure.bundled_images import valid_default_image
+from ai_adventure.bundled_images import valid_default_image, matching_skill_image
 from ai_adventure.audio.tts_settings import DEFAULT_TTS_VOLUME_PERCENT
 
 import json
@@ -150,6 +150,7 @@ class SaveRepository(PlayerStatsRepository):
         saves_dir: Path,
         title: str,
         setup: dict[str, Any] | None = None,
+        *, defer_starting_inventory: bool = False,
     ) -> "SaveRepository":
         """
         Creates a new save directory and SQLite database.
@@ -175,7 +176,7 @@ class SaveRepository(PlayerStatsRepository):
         repository.set_setting("player.id", f"player_{uuid.uuid4().hex}")
 
         if setup is not None:
-            repository.apply_new_game_setup(setup)
+            repository.apply_new_game_setup(setup, defer_starting_inventory=defer_starting_inventory)
             LOGGER.info("Created new configured save at %s.", db_path)
             return repository
 
@@ -284,7 +285,7 @@ class SaveRepository(PlayerStatsRepository):
 
         return repository
 
-    def apply_new_game_setup(self, setup: dict[str, Any]) -> None:
+    def apply_new_game_setup(self, setup: dict[str, Any], *, defer_starting_inventory: bool = False) -> None:
         """
         Applies player-authored new-game wizard setup to a fresh save.
 
@@ -376,7 +377,7 @@ class SaveRepository(PlayerStatsRepository):
         # its contents in the authored list without creating a temporary overload.
         starter_items = [item for item in clean_setup["starter_items"]
                          if not item.get("requires_ai_invention") and str(item.get("name", "")).strip()]
-        if starter_items:
+        if starter_items and not defer_starting_inventory:
             self.replace_inventory_items(starter_items)
 
         for skill in clean_setup["skills"]:
@@ -951,7 +952,28 @@ class SaveRepository(PlayerStatsRepository):
             self.set_player_equipment({slot: name for slot, name in equipment.items() if str(name).casefold() != item["name"].casefold()})
             self.append_history("inventory", f"Moved {item['quantity']} x {item['name']} to {storage}.")
 
-    def replace_inventory_items(self, items: list[dict[str, Any]]) -> None:
+    def preview_starting_inventory(self, items: list[dict[str, Any]], *, base_capacity_lb: float) -> dict[str, Any]:
+        """Evaluate the exact persisted container graph, rolling back every preview write."""
+        class PreviewComplete(Exception):
+            pass
+
+        preview: dict[str, Any] = {}
+        try:
+            with self.transaction():
+                self.set_setting("player.carrying_capacity_lb", base_capacity_lb)
+                self.replace_inventory_items(items, allow_empty=True, check_capacity=False)
+                rows = self.list_inventory_items()
+                preview = {
+                    "items": rows,
+                    "load": inventory_load(rows, base_capacity_lb),
+                    "error": capacity_error([], rows, base_capacity_lb),
+                }
+                raise PreviewComplete()
+        except PreviewComplete:
+            return preview
+
+    def replace_inventory_items(self, items: list[dict[str, Any]], *, allow_empty: bool = False,
+                                check_capacity: bool = True) -> None:
         """
         Replaces the player's starting inventory list.
 
@@ -986,8 +1008,9 @@ class SaveRepository(PlayerStatsRepository):
             except (TypeError, ValueError):
                 value_base_units = 0
 
-            raw_metadata = raw_item.get("metadata", raw_item)
-            raw_metadata = raw_metadata if isinstance(raw_metadata, dict) else {}
+            raw_metadata = raw_item.get("metadata", {})
+            raw_metadata = {**(raw_metadata if isinstance(raw_metadata, dict) else {}),
+                            **{key: value for key, value in raw_item.items() if key != "metadata"}}
             clean_metadata = normalize_item_metadata(
                 raw_metadata,
                 name=name,
@@ -1011,7 +1034,7 @@ class SaveRepository(PlayerStatsRepository):
             )
             seen_names.add(name.casefold())
 
-        if not clean_items:
+        if not clean_items and not allow_empty:
             LOGGER.warning("Skipped replace_inventory_items because no valid items were provided.")
             return
 
@@ -1058,7 +1081,8 @@ class SaveRepository(PlayerStatsRepository):
                 ],
             )
             synchronize_container_records(connection, _upsert_item_catalog_entry)
-            self._check_inventory_capacity(before_capacity)
+            if check_capacity:
+                self._check_inventory_capacity(before_capacity)
         self.set_player_equipment(self.get_setting("player.equipment", {}))
         self.append_history("inventory", "Starting inventory finalized.")
 
@@ -4712,7 +4736,7 @@ class SaveRepository(PlayerStatsRepository):
         if (
             not clean_asset_id
             or clean_subject_type
-            not in {"player", "location", "inventory", "npc", "bestiary", "skill"}
+            not in {"player", "location", "inventory", "npc", "bestiary", "skill", "region_map"}
             or not clean_subject_key
             or not clean_filename
             or filename_path.is_absolute()
@@ -4854,10 +4878,12 @@ class SaveRepository(PlayerStatsRepository):
         if subject_type == "skill":
             with self._connect() as connection:
                 skill = connection.execute(
-                    "SELECT default_image FROM skills WHERE lower(id) = ? OR name = ? COLLATE NOCASE",
+                    "SELECT default_image, name FROM skills WHERE lower(id) = ? OR name = ? COLLATE NOCASE",
                     (str(subject_key).casefold(), subject_key),
                 ).fetchone()
             default_image = valid_default_image(skill[0], "skills") if skill else ""
+            if skill and not default_image:
+                default_image = matching_skill_image(str(skill[1]))
         elif subject_type == "inventory":
             with self._connect() as connection:
                 item = connection.execute(
@@ -5366,12 +5392,12 @@ class SaveRepository(PlayerStatsRepository):
         return normalize_note_entries(self.get_setting("notes.entries", []))
 
     def set_notes_share_with_ai(self, share_with_ai: bool) -> None:
-        """Stores whether player notes should be included in AI context."""
+        """Stores whether all player notes should be included in AI context."""
 
         self.set_setting("notes.share_with_ai", bool(share_with_ai))
 
     def get_notes_share_with_ai(self) -> bool:
-        """Reads whether player notes should be included in AI context."""
+        """Reads the global sharing override; individual notes retain their choices."""
 
         return _safe_bool(self.get_setting("notes.share_with_ai", False), default=False)
 
@@ -5399,10 +5425,40 @@ class SaveRepository(PlayerStatsRepository):
         """Reads structured player-known locations used by the Travel screen."""
 
         raw_locations = self.get_setting("travel.locations", [])
+        stored_locations = raw_locations
+        aliases = self.get_setting("travel.location_aliases", {})
+        if isinstance(aliases, dict) and aliases and isinstance(raw_locations, list):
+            by_alias = {str(key).casefold(): value for key, value in aliases.items()}
+            raw_locations = [
+                {**location, "parent_location": by_alias.get(
+                    str(location.get("parent_location", "")).casefold(),
+                    location.get("parent_location", ""),
+                )} if isinstance(location, dict) else location
+                for location in raw_locations
+            ]
         locations = ensure_location_ids(normalize_known_locations(raw_locations))
         serialized = [location.to_dict() for location in locations]
-        if raw_locations != serialized:
-            self.set_setting("travel.locations", serialized)
+        if stored_locations != serialized:
+            original_by_name = {
+                str(location.get("name", "")).casefold(): location
+                for location in stored_locations if isinstance(location, dict)
+            } if isinstance(stored_locations, list) else {}
+            conflicts = []
+            for location in serialized:
+                original = original_by_name.get(location["name"].casefold(), {})
+                if (location["x_miles"] is None or location["y_miles"] is None) and (
+                    original.get("x_miles") is not None or original.get("y_miles") is not None
+                ):
+                    conflicts.append({
+                        "name": location["name"], "original": original,
+                        "reason": "Invalid or conflicting map coordinates; no replacement inferred.",
+                    })
+            with self.transaction():
+                if conflicts:
+                    previous = self.get_setting("travel.position_conflicts", [])
+                    self.set_setting("travel.position_conflicts",
+                                     (previous if isinstance(previous, list) else []) + conflicts)
+                self.set_setting("travel.locations", serialized)
         return serialized
 
     def set_travel_locations(self, locations: Any) -> None:
@@ -5436,8 +5492,6 @@ class SaveRepository(PlayerStatsRepository):
                     name=current_location,
                     location_id=f"loc_{uuid.uuid4().hex}",
                     description="Current player location.",
-                    x_miles=0.0 if not locations else None,
-                    y_miles=0.0 if not locations else None,
                 )
             )
             changed = True

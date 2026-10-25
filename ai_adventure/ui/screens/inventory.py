@@ -617,6 +617,7 @@ class InventoryScreen(RepositoryBackedWidget):
             move_disabled_reason=self._move_disabled_reason(item),
             parent=self,
         )
+        self.add_copy_image_prompt_button(dialog, "inventory", image_subject_key)
         dialog.finished.connect(
             lambda _result, key=dialog_key: self._item_detail_dialogs.pop(key, None)
         )

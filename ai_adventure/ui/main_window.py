@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from ai_adventure.template_images import capture_template_image
 from ai_adventure.new_game_templates import save_template_image
+from ai_adventure.application.opening_request import OpeningRequest, opening_request_path
 
 from ai_adventure.ui.widgets.containers import CurrentPageStackedWidget
 
@@ -305,6 +306,7 @@ class MainWindow(QMainWindow):
         self.game_shell.visual_asset_coordinator.initial_batch_finished.connect(
             self._handle_initial_visuals_ready
         )
+        self.game_shell.story_screen.opening_retry_requested.connect(self._retry_new_game_opening)
 
         self.stack.addWidget(self.main_menu)
         self.stack.addWidget(self.game_shell)
@@ -938,6 +940,7 @@ class MainWindow(QMainWindow):
             self.app_paths.saves_dir,
             clean_setup,
             theme=self.menu_theme,
+            defer_starting_inventory=self.ai_enabled,
         )
 
         effective_template_name = template_save_name
@@ -992,65 +995,96 @@ class MainWindow(QMainWindow):
     ) -> None:
         """Starts initial world synthesis without blocking the Qt UI thread."""
 
+        self._pending_new_game_repository = repository
+        self._pending_new_game_setup = dict(setup)
+        repository.set_setting("new_game.opening_pending", True)
+        self.game_shell.story_screen.set_initial_generation_pending(True)
+        self.game_shell.menu_button.setEnabled(False)
+        self.game_shell.story_screen.set_opening_retry_available(False)
+        checkpoint_path = opening_request_path(repository.db_path)
         try:
-            setup_packet = NewGameService.build_setup_packet(
-                setup,
-                valid_music_tracks=(
-                    self.sound_manager.get_valid_track_names()
-                    if self.sound_manager is not None
-                    else []
-                ),
-                valid_sound_effect_tracks=(
-                    self.sound_manager.get_valid_sound_effect_names()
-                    if self.sound_manager is not None
-                    else []
-                ),
-                valid_background_ambience_tracks=(
-                    getattr(
-                        self.sound_manager,
-                        "get_valid_background_ambience_names",
-                        lambda: [],
-                    )()
-                    if self.sound_manager is not None
-                    else []
-                ),
-            )
+            if checkpoint_path.exists():
+                setup_packet = OpeningRequest(checkpoint_path).setup_packet
+            else:
+                setup_packet = self._build_new_game_setup_packet(setup)
+                OpeningRequest(checkpoint_path, setup_packet)
         except Exception:
-            LOGGER.exception("Failed to build the Gemini new-game request.")
-            self.new_game_service.apply_fallback(repository, setup)
-            self._complete_new_game_generation(repository)
+            LOGGER.exception("Failed to prepare the saved Gemini new-game request.")
+            self._finish_failed_new_game_generation(temporary_failure=False)
             return
 
         thread = QThread(self)
         worker = _GeminiNewGameWorker(
             setup_packet,
             self.app_paths.gemini_api_key_path,
+            opening_request_path=checkpoint_path,
         )
         worker.moveToThread(thread)
 
         thread.started.connect(worker.run)
         worker.completed.connect(self._handle_new_game_generation_result)
+        if hasattr(worker, "inventory_review_requested"):
+            worker.inventory_review_requested.connect(
+                self._review_new_game_starting_inventory, Qt.ConnectionType.BlockingQueuedConnection,
+            )
         worker.phase_changed.connect(self._handle_new_game_generation_phase)
-        worker.configuration_error.connect(
-            self._handle_new_game_generation_configuration_error
-        )
+        worker.configuration_error.connect(self._handle_new_game_generation_configuration_error)
         worker.request_failed.connect(self._handle_new_game_generation_request_failure)
         worker.failed.connect(self._handle_new_game_generation_failure)
         worker.finished.connect(thread.quit)
         worker.finished.connect(worker.deleteLater)
         thread.finished.connect(thread.deleteLater)
-        thread.finished.connect(
-            lambda thread=thread, worker=worker: self._clear_new_game_worker(
-                thread,
-                worker,
-            )
-        )
-
-        self._pending_new_game_repository = repository
-        self._pending_new_game_setup = dict(setup)
+        thread.finished.connect(lambda: self._clear_new_game_worker(thread, worker))
         self._new_game_thread = thread
         self._new_game_worker = worker
         thread.start()
+
+    def _build_new_game_setup_packet(self, setup: dict[str, Any]) -> dict[str, Any]:
+        """Capture the setup and audio catalog once for subsequent retries."""
+        return NewGameService.build_setup_packet(
+            setup,
+            valid_music_tracks=(
+                self.sound_manager.get_valid_track_names()
+                if self.sound_manager is not None else []
+            ),
+            valid_sound_effect_tracks=(
+                self.sound_manager.get_valid_sound_effect_names()
+                if self.sound_manager is not None else []
+            ),
+            valid_background_ambience_tracks=(
+                getattr(self.sound_manager, "get_valid_background_ambience_names", lambda: [])()
+                if self.sound_manager is not None else []
+            ),
+        )
+
+    @Slot(object)
+    def _review_new_game_starting_inventory(self, proposal) -> None:
+        """Resolve carried load before the worker spends on opening narration."""
+        repository = self._pending_new_game_repository
+        if repository is None:
+            return
+        try:
+            preview = proposal.preview(repository)
+            if not preview["error"]:
+                proposal.approved_items = proposal.items
+                return
+            from ai_adventure.ui.starting_inventory import StartingInventoryReviewDialog
+            progress = self._new_game_progress_dialog
+            if progress is not None:
+                progress.hide()
+            dialog = StartingInventoryReviewDialog(repository, proposal, self)
+            try:
+                if dialog.exec() == QDialog.DialogCode.Accepted:
+                    proposal.approved_items = dialog.selected_items()
+                    LOGGER.info("Player approved starting inventory: %s item stacks, %s lb carried.",
+                                len(proposal.approved_items), dialog.preview["load"]["weight_lb"])
+            finally:
+                dialog.deleteLater()
+                if progress is not None:
+                    progress.show()
+        except Exception:
+            LOGGER.exception("Could not review generated starting inventory.")
+            proposal.approved_items = None
 
     @Slot(object)
     def _handle_new_game_generation_result(self, result: Any) -> None:
@@ -1063,20 +1097,21 @@ class MainWindow(QMainWindow):
             return
 
         try:
+            if not str(getattr(result, "introductory_message", "") or "").strip():
+                raise ValueError("Gemini did not return an opening message.")
             available_voice_ids = list(
                 _narrator_voice_options(self.narration_player).values()
             )
-            self.new_game_service.commit_generated_world(
-                repository,
-                setup,
-                result,
-                available_voice_ids=available_voice_ids,
-            )
+            with repository.transaction():
+                self.new_game_service.commit_generated_world(
+                    repository, setup, result, available_voice_ids=available_voice_ids,
+                )
+                repository.set_setting("new_game.opening_ready", True)
         except Exception:
             LOGGER.exception("Failed to apply Gemini new-game synthesis.")
-            self.new_game_service.apply_fallback(repository, setup)
-        finally:
-            self._complete_new_game_generation(repository)
+            self._finish_failed_new_game_generation(temporary_failure=False)
+            return
+        self._complete_new_game_generation(repository)
 
     @Slot(str)
     def _handle_new_game_generation_phase(self, phase: str) -> None:
@@ -1086,6 +1121,7 @@ class MainWindow(QMainWindow):
             "setup_compilation": "Preparing new game...",
             "world_skeleton": "Generating world map...",
             "entities_mechanics": "Generating entities and mechanics...",
+            "inventory_review": "Checking starting inventory...",
             "opening_prose": "Writing opening scene...",
             "targeted_repairs": "Checking generated content...",
             "final_commit": "Finalizing new game...",
@@ -1096,25 +1132,25 @@ class MainWindow(QMainWindow):
             dialog.update_phase(phase)
 
     @Slot(str)
-    def _handle_new_game_generation_configuration_error(self, _message: str) -> None:
-        """Uses the ordinary local opening when Gemini is not configured."""
+    def _handle_new_game_generation_configuration_error(self, message: str) -> None:
+        """Keeps an unconfigured opening available for retry."""
 
-        self._finish_failed_new_game_generation(temporary_failure=False)
+        self._finish_failed_new_game_generation(temporary_failure=False, message=message)
 
     @Slot(str)
-    def _handle_new_game_generation_request_failure(self, _message: str) -> None:
-        """Uses a request-failure opening when Gemini is temporarily unavailable."""
+    def _handle_new_game_generation_request_failure(self, message: str) -> None:
+        """Keeps the opening request and the provider's reason after failure."""
 
-        self._finish_failed_new_game_generation(temporary_failure=True)
+        self._finish_failed_new_game_generation(temporary_failure=True, message=message)
 
     @Slot()
     def _handle_new_game_generation_failure(self) -> None:
-        """Uses the ordinary local opening after an unexpected worker failure."""
+        """Keeps the opening request after an unexpected worker failure."""
 
         self._finish_failed_new_game_generation(temporary_failure=False)
 
-    def _finish_failed_new_game_generation(self, *, temporary_failure: bool) -> None:
-        """Applies the appropriate local fallback after a worker error."""
+    def _finish_failed_new_game_generation(self, *, temporary_failure: bool, message: str = "") -> None:
+        """Retain the request for retry; never spend on images after failure."""
 
         repository = self._pending_new_game_repository
         setup = self._pending_new_game_setup
@@ -1122,14 +1158,38 @@ class MainWindow(QMainWindow):
         if repository is None or setup is None:
             return
 
-        try:
-            self.new_game_service.apply_fallback(
-                repository,
-                setup,
-                temporary_failure=temporary_failure,
+        self._pending_new_game_repository = None
+        self._pending_new_game_setup = None
+        self._release_new_game_progress()
+        if self._repository_matches_active(repository):
+            self.game_shell.story_screen.set_opening_retry_available(
+                True, "The opening message could not be generated. Your setup and saved request "
+                "are retained; no images have been generated. " +
+                (message or "Retry when Gemini is available."),
             )
-        finally:
+            self.game_shell.story_screen.retry_opening_button.setEnabled(self._new_game_thread is None)
+
+    def _release_new_game_progress(self) -> None:
+        """Release the modal and navigation lock after an attempt settles."""
+        self.game_shell.menu_button.setEnabled(True)
+        self.game_shell.menu_button.setText("Main Menu")
+        dialog = self._new_game_progress_dialog
+        self._new_game_progress_dialog = None
+        if isinstance(dialog, _NewGameGenerationProgressDialog):
+            dialog.finish()
+
+    def _retry_new_game_opening(self) -> None:
+        """Resume an unfinished opening from its save-local request."""
+        repository = self.active_repository
+        if repository is None or self._new_game_thread is not None:
+            return
+        self._show_new_game_progress_dialog()
+        self.game_shell.menu_button.setEnabled(False)
+        if repository.get_setting("new_game.opening_ready", False):
+            self.game_shell.story_screen.set_opening_retry_available(False)
             self._complete_new_game_generation(repository)
+        else:
+            self._start_new_game_generation(repository, repository.get_setting("new_game.setup", {}))
 
     def _apply_new_game_fallback(
         self,
@@ -1259,8 +1319,13 @@ class MainWindow(QMainWindow):
             repository.get_setting("images.enabled", True),
             True,
         )
+        from ai_adventure.ui.image_file_dialog import image_picker_directory
+
         dialog = NewGameImageSourceDialog(
             requests,
+            image_directory=image_picker_directory(
+                self.app_paths.images_dir, repository.db_path.parent,
+            ),
             choose_file=lambda request, source_path: self._upload_new_game_image(
                 repository, request, source_path,
             ),
@@ -1318,8 +1383,15 @@ class MainWindow(QMainWindow):
             return
         try:
             self._reveal_initial_story(repository)
+            repository.set_setting("new_game.opening_pending", False)
+            repository.set_setting("new_game.opening_ready", False)
+            opening_request_path(repository.db_path).unlink(missing_ok=True)
+            self.game_shell.story_screen.set_opening_retry_available(False)
         except Exception:
             LOGGER.exception("Could not reveal the opening after new-game generation.")
+            self.game_shell.story_screen.set_opening_retry_available(
+                True, "Your opening is saved. Retry to finish opening this game.",
+            )
         finally:
             # Always release the modal and menu lock, even if a screen refresh
             # or a narration/voice integration fails during finalization.
@@ -1342,7 +1414,9 @@ class MainWindow(QMainWindow):
     def _handle_initial_visuals_ready(self, repository: SaveRepository) -> None:
         """Reveals the opening after the initial visual batch settles."""
 
-        if self._repository_matches_active(repository):
+        if (self._repository_matches_active(repository)
+                and self._new_game_image_source_dialog is None
+                and repository.get_setting("new_game.opening_ready", False)):
             LOGGER.info(
                 "Initial visual asset batch finished; revealing opening for %s.",
                 repository.db_path,
@@ -1362,6 +1436,7 @@ class MainWindow(QMainWindow):
 
         if worker is None or self._new_game_worker is worker:
             self._new_game_worker = None
+        self.game_shell.story_screen.retry_opening_button.setEnabled(True)
 
     def _normalize_new_game_setup_for_runtime(self, setup: dict[str, Any]) -> dict[str, Any]:
         """Normalizes setup and disables narrator settings when TTS is unavailable."""
@@ -1481,14 +1556,19 @@ class MainWindow(QMainWindow):
         )
         self._menu_music_watchdog.stop()
         self.active_repository = repository
+        opening_pending = bool(repository.get_setting("new_game.opening_pending", False))
+        defer_opening = opening_pending or (new_game and self.ai_enabled)
         self.game_shell.set_repository(
             repository,
             initially_hide_empty_tabs=new_game,
-            defer_music_playback=new_game and self.ai_enabled,
-            defer_visual_scan=new_game and self.ai_enabled,
+            defer_music_playback=defer_opening,
+            defer_visual_scan=defer_opening,
         )
         self.game_shell.story_screen.set_initial_generation_pending(
-            new_game and self.ai_enabled
+            defer_opening
+        )
+        self.game_shell.story_screen.set_opening_retry_available(
+            opening_pending, "This game's opening is unfinished. Retry using the saved opening request.",
         )
         self._apply_active_theme()
         self.stack.setCurrentWidget(self.game_shell)
@@ -1514,6 +1594,7 @@ class MainWindow(QMainWindow):
         # without requiring the player to change tabs.
         QTimer.singleShot(
             0,
+            self,
             lambda repository=repository: self._refresh_open_repository(repository),
         )
 

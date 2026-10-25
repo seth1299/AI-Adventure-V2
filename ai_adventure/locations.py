@@ -17,6 +17,20 @@ _DETAIL_PHRASE_RE = re.compile(
 DEFAULT_MOVE_SPEED_MPH = 3.0
 DEFAULT_TRAVEL_MODE = "On Foot"
 DEFAULT_TRAVEL_SPEED_MULTIPLIER = 1.0
+MAP_COORDINATE_RULE = (
+    "Use one shared global coordinate frame measured in miles; north is positive y. "
+    "Reserve (0, 0) for a single main region or regional map anchor when that place "
+    "is known. The player's starting location is not automatically the origin. "
+    "Every other distinct location, including cities, shops, clearings and other "
+    "sublocations, must have its own distinct (x_miles, y_miles) pair. Either axis "
+    "may be zero; the pair must be unique. Use at least 0.01-mile separation for "
+    "distinct nearby sites so positions remain distinct at saved precision. "
+    "Place sublocations plausibly near their parents using global coordinates, "
+    "never parent-relative offsets. Distances must fit the setting and route notes. "
+    "Never use (0, 0) as a default for missing coordinates or reset coordinates "
+    "when the player moves. Preserve established map positions; do not rebase an "
+    "existing map or invent an undiscovered region just to supply an origin."
+)
 
 
 @dataclass(frozen=True)
@@ -183,7 +197,36 @@ def normalize_known_locations(raw_locations: Any) -> list[KnownLocation]:
             location = replace(location, location_scope=locations[existing_index].location_scope)
         locations[existing_index] = _merge_locations(locations[existing_index], location)
 
-    return locations
+    return _validate_sublocation_positions(locations)
+
+
+def _validate_sublocation_positions(locations: list[KnownLocation]) -> list[KnownLocation]:
+    """Reject a child pinned to an unrelated region's origin; never invent offsets."""
+    by_name = {location.name.casefold(): location for location in locations}
+
+    def ancestors(location: KnownLocation) -> set[str]:
+        names = {location.name.casefold()}
+        while location.parent_location.casefold() in by_name:
+            key = location.parent_location.casefold()
+            if key in names:
+                break
+            names.add(key)
+            location = by_name[key]
+        return names
+
+    result = []
+    for location in locations:
+        parent = by_name.get(location.parent_location.casefold())
+        point = (location.x_miles, location.y_miles)
+        if (parent is not None and None not in point
+                and parent.x_miles is not None and parent.y_miles is not None
+                and point != (parent.x_miles, parent.y_miles)
+                and any(point == (other.x_miles, other.y_miles)
+                        and not ancestors(location).intersection(ancestors(other))
+                        for other in locations)):
+            location = replace(location, x_miles=None, y_miles=None)
+        result.append(location)
+    return result
 
 
 def calculate_travel_estimate(
@@ -224,6 +267,20 @@ def calculate_travel_estimate(
     origin_y = origin.y_miles if origin is not None else None
     destination_x = destination.x_miles if destination is not None else None
     destination_y = destination.y_miles if destination is not None else None
+
+    same_location = bool(origin and destination and (
+        origin.location_id == destination.location_id
+        if origin.location_id and destination.location_id
+        else origin.name.casefold() == destination.name.casefold()
+    ))
+    if same_location:
+        return TravelEstimate(destination_name, 0.0, effective_speed, 0,
+                              clean_mode, terrain, travel_notes)
+
+    # Shared/default coordinates cannot establish that two distinct places
+    # are the same destination or that the journey takes no time.
+    if (origin_x, origin_y) == (destination_x, destination_y):
+        destination_x = destination_y = None
 
     if (
         origin_x is None

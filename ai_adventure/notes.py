@@ -82,14 +82,17 @@ def normalize_note_entries(raw_entries: Any) -> list[dict[str, Any]]:
                 "heading": heading,
                 "body": body,
                 "tags": normalize_note_tags(raw_entry.get("tags", [])),
+                "share_with_ai": raw_entry.get("share_with_ai", False) is True,
             }
         )
         seen_ids.add(entry_id)
     return entries
 
 
-def note_entries_for_ai(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Removes storage-only identity before notes enter AI context."""
+def note_entries_for_ai(
+    entries: list[dict[str, Any]], *, share_all: bool = False,
+) -> list[dict[str, Any]]:
+    """Selects shared notes and removes storage-only fields for AI context."""
 
     return [
         {
@@ -98,5 +101,6 @@ def note_entries_for_ai(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "tags": normalize_note_tags(entry.get("tags", [])),
         }
         for entry in entries
+        if share_all or entry.get("share_with_ai", False) is True
         if str(entry.get("heading", "")).strip() or str(entry.get("body", "")).strip()
     ]

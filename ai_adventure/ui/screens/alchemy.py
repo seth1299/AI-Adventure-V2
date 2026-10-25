@@ -319,6 +319,7 @@ class AlchemyNotebookScreen(RepositoryBackedWidget):
             ],
             parent=self,
         )
+        self.add_copy_image_prompt_button(dialog, "inventory", key)
         dialog.exec()
 
     def _open_recipe_details(self, row: int, _column: int) -> None:

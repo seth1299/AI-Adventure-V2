@@ -330,6 +330,9 @@ class GameShell(QWidget):
         clean_key = str(subject_key or "").strip().casefold()
         if repository is None or not clean_type or not clean_key:
             return None
+        if clean_type == "region_map" and clean_key == "region":
+            from ai_adventure.region_map import regional_map_request
+            return regional_map_request(repository)
         return next(
             (
                 request
@@ -398,7 +401,10 @@ class GameShell(QWidget):
         if repository is None or request is None:
             return False, message
         LOGGER.info("Player requested a new image for %s/%s.", subject_type, subject_key)
-        return self.visual_asset_coordinator.create_initial_image(repository, request)
+        success, message = self.visual_asset_coordinator.create_initial_image(repository, request)
+        if not success and request.subject_type == "region_map":
+            repository.set_visual_asset_status(request.asset_id, "failed", error_message=message)
+        return success, message
 
     def _register_tab(
         self,
@@ -897,6 +903,11 @@ class GameShell(QWidget):
     def _handle_screen_repository_changed(self, source: RepositoryBackedWidget) -> None:
         """Refreshes tabs after a screen or event changes repository data."""
 
+        if source is self.notes_screen:
+            # Notes are consumed from the repository on the next story turn.
+            # A local autosave has no audio, image, or other-tab side effects.
+            self._tab_content_signatures["notes"] = _screen_content_signature(source)
+            return
         self._apply_audio_settings()
         self.refresh_screens(exclude={source})
 

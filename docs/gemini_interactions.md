@@ -16,7 +16,12 @@ Interaction IDs and status are recorded in content-free benchmark attempts.
 Structured JSON uses `response_format` with a text MIME type and JSON schema.
 Thinking level, token limits, and disabled tool choice use `generation_config`.
 Safety settings translate the existing UI choices to Interactions category types
-and lowercase thresholds. Story requests expose no tools and allow only text.
+and lowercase thresholds. The app exposes harassment, hate speech, sexually
+explicit, and dangerous content controls. The obsolete Civic Integrity option
+is removed; old save/template values are ignored, and saved opening request
+configs drop `civic_integrity` before transport. The Developer API rejects that
+Enterprise-only category even though the SDK accepts it.
+Story requests expose no tools and allow only text.
 Only completed interactions can be accepted; unfinished responses cannot commit
 state even if their partial output happens to contain valid JSON.
 
@@ -26,6 +31,13 @@ trigger a schema fallback. New Game repairs remove the hard token cap while
 preserving other settings. Images use an image response format with aspect ratio
 and size controls; the SDK's `output_image` supplies base64 data and MIME type.
 Speech continues to use the local narration engines.
+
+Schema fallback requires an error identifying the response schema, rather than
+any HTTP 400. Permanent client errors stop both transport retries and New Game
+response repairs; an invalid setting cannot be repaired by generating different
+prose. The HTTP status takes precedence over numbers in the error message when
+classifying transient failures. Opening failures retain the request and display
+the provider reason in the retry panel.
 
 ## Models and accounting
 
