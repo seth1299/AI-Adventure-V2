@@ -82,6 +82,36 @@ class GeminiStoryWorker(QObject):
             self.finished.emit()
 
 
+class GeminiSurvivalRecoveryWorker(QObject):
+    """Generate a recovery scene; the GUI thread commits its bounded result."""
+
+    completed = Signal(object)
+    failed = Signal(str)
+    finished = Signal()
+
+    def __init__(self, packet: dict[str, Any], api_key_path: Path | None) -> None:
+        super().__init__()
+        self.packet = packet
+        self.api_key_path = api_key_path
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            if GeminiNarrationService is None:
+                raise GeminiConfigurationError("AI generation is disabled in this build.")
+            with benchmark_message(self.packet["death"]["incident_id"]):
+                result = GeminiNarrationService(
+                    api_key_path=self.api_key_path, model=_text_model_from_ai_packet(self.packet),
+                ).generate_survival_recovery(self.packet)
+        except Exception as error:
+            LOGGER.warning("Survival recovery generation failed: %s", error)
+            self.failed.emit(str(error))
+        else:
+            self.completed.emit(result)
+        finally:
+            self.finished.emit()
+
+
 class GeminiD20TestPlanWorker(QObject):
     """Runs one lightweight skill-check planning request away from the UI."""
 

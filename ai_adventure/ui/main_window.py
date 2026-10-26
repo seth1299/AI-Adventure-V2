@@ -473,6 +473,21 @@ class MainWindow(QMainWindow):
         for name, description in DEFAULT_MAGIC_TRADITION_DESCRIPTIONS.items():
             add_catalog_description("traditions", name, description)
 
+        def save_wizard_progress(setup: dict[str, Any], *, save_as: bool = False) -> bool:
+            nonlocal loaded_template_name, loaded_template_baseline
+            saved_name = self._save_new_game_wizard_progress(
+                setup, suggested_name=loaded_template_name, save_as=save_as,
+            )
+            if not saved_name:
+                return False
+            loaded_template_name = saved_name
+            try:
+                loaded_template_baseline = normalize_new_game_setup(setup)
+            except ValueError:
+                # Partial drafts remain valid templates while the form is unfinished.
+                loaded_template_baseline = deepcopy(setup)
+            return True
+
         wizard = NewGameWizard(
             self,
             template_setup=template_setup,
@@ -489,10 +504,8 @@ class MainWindow(QMainWindow):
             api_key_path=self.app_paths.gemini_api_key_path,
             terms_acceptance_path=self.app_paths.gemini_terms_acceptance_path,
             sound_manager=self.sound_manager,
-            on_save_and_exit=lambda setup: self._save_new_game_wizard_progress(
-                setup,
-                suggested_name=loaded_template_name,
-            ),
+            on_save_and_exit=save_wizard_progress,
+            on_save_as=lambda setup: save_wizard_progress(setup, save_as=True),
         )
         loaded_template_baseline = (
             wizard.build_setup() if loaded_template_name else None
@@ -798,8 +811,9 @@ class MainWindow(QMainWindow):
         setup: dict[str, Any],
         *,
         suggested_name: str | None = None,
-    ) -> bool:
-        """Prompts for a template name and saves the wizard's partial state."""
+        save_as: bool = True,
+    ) -> str | None:
+        """Saves the wizard's partial state and returns the successfully saved name."""
 
         template_path = self.app_paths.new_game_templates_path
         default_name = (
@@ -807,16 +821,20 @@ class MainWindow(QMainWindow):
             or str(setup.get("title", "") or "").strip()
             or "New Game Draft"
         )
+        prompt_for_name = save_as or not str(suggested_name or "").strip()
         while True:
-            template_name, accepted = QInputDialog.getText(
-                self,
-                "Save New Game Progress",
-                "Template name:",
-                QLineEdit.EchoMode.Normal,
-                default_name,
-            )
-            if not accepted:
-                return False
+            if prompt_for_name:
+                template_name, accepted = QInputDialog.getText(
+                    self,
+                    "Save New Game Template As",
+                    "Template name:",
+                    QLineEdit.EchoMode.Normal,
+                    default_name,
+                )
+                if not accepted:
+                    return None
+            else:
+                template_name = default_name
             clean_name = template_name.strip()
             if not clean_name:
                 QMessageBox.warning(
@@ -834,7 +852,7 @@ class MainWindow(QMainWindow):
                     normalize_setups=False,
                 )
             }
-            if clean_name.casefold() in existing_names:
+            if prompt_for_name and clean_name.casefold() in existing_names:
                 overwrite = QMessageBox.question(
                     self,
                     "Replace Existing Template?",
@@ -858,14 +876,15 @@ class MainWindow(QMainWindow):
                     "Template Not Saved",
                     "Could not save the current New Game progress.",
                 )
-                return False
+                return None
 
-            QMessageBox.information(
-                self,
-                "New Game Progress Saved",
-                f'Your progress was saved as the template "{clean_name}".',
-            )
-            return True
+            if prompt_for_name:
+                QMessageBox.information(
+                    self,
+                    "New Game Progress Saved",
+                    f'Your progress was saved as the template "{clean_name}".',
+                )
+            return clean_name
 
     def _template_setup_with_available_title(
         self,
@@ -1323,6 +1342,9 @@ class MainWindow(QMainWindow):
 
         dialog = NewGameImageSourceDialog(
             requests,
+            preview_path=lambda request: self.game_shell.story_screen.visual_asset_path(
+                repository.get_visual_asset(request.subject_type, request.subject_key)
+            ),
             image_directory=image_picker_directory(
                 self.app_paths.images_dir, repository.db_path.parent,
             ),

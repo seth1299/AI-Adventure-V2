@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QLabel
 
 from ai_adventure.application.story_turn_service import StoryTurnService
 from ai_adventure.core.state_manager import StateManager
@@ -122,6 +122,52 @@ class HistoryPaginationTests(QtTestCase):
             self.assertEqual(screen._player_command_before_history_id(oldest["id"]), "")
         self.assertTrue(all(call.kwargs["limit"] == 1 for call in history.call_args_list))
         self.assertEqual(screen.view_hidden_messages_button.text(), "View Hidden Messages (1)")
+
+    def test_message_times_survive_clock_changes_reopening_and_pagination(self):
+        repo = self.repository
+        repo.set_calendar_settings({"time_display": "24_hour"})
+        repo.set_current_calendar_minute(23 * 60 + 55)
+        repo.append_history("player", "Wait until midnight")
+        repo.set_current_calendar_minute(24 * 60 + 5)
+        repo.append_history("story", "Midnight has passed.")
+        repo.append_history("story_oog", "The clock is now past midnight.")
+        repo.set_current_calendar_minute(3 * 24 * 60)
+        reopened = SaveRepository(repo.db_path)
+        self.assertEqual(
+            [entry["game_time"] for entry in reopened.list_history(limit=3)],
+            ["Day 1, 23:55", "Day 2, 00:05", "Day 2, 00:05"],
+        )
+        screen = StoryScreen()
+        self.addCleanup(screen.close)
+        self.addCleanup(screen.deleteLater)
+        screen.set_repository(reopened)
+        screen._load_older_messages()
+        headers = [label.text() for label in screen.findChildren(QLabel)]
+        self.assertIn("You  |  Live Game  |  Day 1, 23:55", headers)
+        self.assertIn("AI Game Master  |  Live Game  |  Turn #61  |  Day 2, 00:05", headers)
+        self.assertIn("AI Game Master  |  Out-of-Game  |  Day 2, 00:05", headers)
+
+    def test_legacy_message_time_is_unknown(self):
+        with self.repository.transaction() as connection:
+            connection.execute("ALTER TABLE history_entries DROP COLUMN game_time")
+        reopened = SaveRepository(self.repository.db_path)
+        screen = StoryScreen()
+        self.addCleanup(screen.close)
+        self.addCleanup(screen.deleteLater)
+        screen.set_repository(reopened)
+        headers = [label.text() for label in screen.findChildren(QLabel)]
+        self.assertIn("You  |  Live Game  |  Time unknown", headers)
+
+    def test_legacy_spectator_history_can_be_read_without_migration(self):
+        self.repository.set_setting("survival.fate", "accepted")
+        with self.repository.transaction() as connection:
+            connection.execute("ALTER TABLE history_entries DROP COLUMN game_time")
+        reopened = SaveRepository(self.repository.db_path)
+        self.assertEqual(reopened.list_history(limit=1)[0]["game_time"], "")
+        with reopened._connect() as connection:
+            self.assertNotIn("game_time", {
+                row[1] for row in connection.execute("PRAGMA table_info(history_entries)")
+            })
 
 
 if __name__ == "__main__":

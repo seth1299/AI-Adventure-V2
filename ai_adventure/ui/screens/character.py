@@ -582,6 +582,8 @@ class CharacterScreen(RepositoryBackedWidget):
 
         if repository is None or self._loading_character or self._saving_character:
             return
+        if repository.survival_status()["fate"] != "alive":
+            return
 
         payload = self._character_payload(repository)
         if payload == self._last_saved_character_payload:

@@ -5,7 +5,7 @@ from ai_adventure.template_images import normalize_template_images
 from PySide6.QtWidgets import QWidgetAction, QListView
 from PySide6.QtGui import QStandardItemModel
 
-from ai_adventure.skills.attributes import skill_attribute
+from ai_adventure.skills.attributes import starting_skill_attribute
 from ai_adventure.stats import ATTRIBUTES, POINT_COSTS, RULES_VERSION, rank_stats, point_buy_cost, starting_attributes, attribute_modifier
 
 from ai_adventure.ui.widgets.inputs import FeatureToggleCheckBox
@@ -100,7 +100,8 @@ class _StatsWizardPage(QWizardPage):
         self.owner = owner
 
     def isComplete(self) -> bool:
-        return self.owner._point_buy_remaining() >= 0
+        return (self.owner._point_buy_remaining() >= 0
+                and not self.owner._duplicate_starting_skill_names())
 
 
 class _StartingSkillCombo(QWidget):
@@ -467,10 +468,12 @@ class NewGameWizard(QWizard):
         terms_acceptance_path: Path | str | None = None,
         sound_manager: SoundManagerProtocol | None = None,
         on_save_and_exit: Callable[[dict[str, Any]], bool] | None = None,
+        on_save_as: Callable[[dict[str, Any]], bool] | None = None,
     ) -> None:
         super().__init__(parent)
 
         self._template_images = []
+        self.clear_table_buttons: dict[QTableWidget, QPushButton] = {}
         self.tts_enabled = bool(tts_enabled)
         self.voice_options = voice_options or available_narrator_voices()
         self.on_sample_voice = on_sample_voice
@@ -478,13 +481,12 @@ class NewGameWizard(QWizard):
         self.custom_voice_storage_path = custom_voice_storage_path
         self.sound_manager = sound_manager
         self.on_save_and_exit = on_save_and_exit
+        self.on_save_as = on_save_as
         self._music_preview_active = False
         self._last_page_id = -1
         self.skill_catalog = self._merge_skill_catalog(skill_catalog or [])
         self.skill_attributes = {
-            str(item.get("name", "")).casefold(): skill_attribute(
-                item.get("attribute"), str(item.get("name", ""))
-            )
+            str(item.get("name", "")).casefold(): starting_skill_attribute(item.get("attribute"))
             for item in (skill_catalog or []) if isinstance(item, dict)
         }
         self.starter_item_catalog = self._merge_starter_item_catalog(starter_item_catalog or [])
@@ -698,6 +700,7 @@ class NewGameWizard(QWizard):
         }
         world_contains_magic = not self.no_world_magic_checkbox.isChecked()
         combo.blockSignals(True)
+        self.starter_item_suggestions_table.setColumnHidden(1, not world_contains_magic)
         combo.clear()
         combo.addItem("Choose a suggested item…", None)
         for item in self.starter_item_catalog:
@@ -739,7 +742,53 @@ class NewGameWizard(QWizard):
         self.setButtonText(QWizard.WizardButton.CustomButton1, "Save + Exit")
         self.setOption(QWizard.WizardOption.HaveCustomButton2, True)
         self.setButtonText(QWizard.WizardButton.CustomButton2, "Save")
+        self.button(QWizard.WizardButton.CustomButton2).setToolTip("Save the current template using its last saved name.")
+        if self.on_save_as is not None:
+            self.setOption(QWizard.WizardOption.HaveCustomButton3, True)
+            self.setButtonText(QWizard.WizardButton.CustomButton3, "Save As")
+            self.button(QWizard.WizardButton.CustomButton3).setToolTip("Choose a name and save a template copy.")
         self.customButtonClicked.connect(self._handle_custom_wizard_button)
+
+    def _clear_table_button(self, table: QTableWidget, subject: str, *,
+                            after_clear: Callable[[], None] | None = None,
+                            clear: Callable[[], None] | None = None) -> QPushButton:
+        """Create the shared quick-clear action for an editable Wizard list."""
+        button = QPushButton("Clear")
+        button.setObjectName("clearWizardTableButton")
+        button.setAccessibleName(f"Clear {subject}")
+        button.setToolTip(f"Clear {subject} from this list.")
+
+        def clear_rows() -> None:
+            if clear is not None:
+                clear()
+            else:
+                table.setRowCount(0)
+            if after_clear is not None:
+                after_clear()
+
+        button.clicked.connect(clear_rows)
+        self.clear_table_buttons[table] = button
+        return button
+
+    def _clear_starting_skill_table(self, level: int) -> None:
+        table = self.skill_tables[level]
+        if self.skill_preset_combo.currentData() == "custom":
+            table.setRowCount(0)
+        else:
+            # Preset slots must retain their levels and count for AI completion.
+            for row in range(table.rowCount()):
+                skill = table.cellWidget(row, 1)
+                skill.setText("")
+                table.cellWidget(row, 2).clear()
+                _set_combo_to_data(skill.attribute_input, "")
+        self._sync_starting_skill_inputs()
+
+    def _clear_currency_table(self) -> None:
+        self.currency_table.setRowCount(0)
+        self.starting_wealth_amounts_table.setRowCount(0)
+        self._append_currency_row({})
+        self._sync_currency_base_value_row()
+        self._sync_starting_wealth_currency_options()
 
     def _handle_custom_wizard_button(self, button: Any) -> None:
         """Saves the current form as a template, optionally closing the wizard."""
@@ -748,15 +797,32 @@ class NewGameWizard(QWizard):
         if button_value not in {
             QWizard.WizardButton.CustomButton1.value,
             QWizard.WizardButton.CustomButton2.value,
+            QWizard.WizardButton.CustomButton3.value,
         }:
             return
-        callback = self.on_save_and_exit
+        callback = (self.on_save_as if button_value == QWizard.WizardButton.CustomButton3.value
+                    else self.on_save_and_exit)
         if callback is None:
+            return
+        if not self._validate_unique_starting_skills():
             return
         if not callback(self.build_template_setup()):
             return
         if button_value == QWizard.WizardButton.CustomButton1.value:
             self.reject()
+
+    def accept(self) -> None:
+        if self._validate_unique_starting_skills():
+            super().accept()
+
+    def _validate_unique_starting_skills(self) -> bool:
+        duplicates = self._duplicate_starting_skill_names()
+        if duplicates:
+            QMessageBox.warning(self, "Duplicate Skill Names",
+                                "Each starting skill needs a unique name. Rename or remove "
+                                "the duplicate entries: " + ", ".join(duplicates))
+            return False
+        return True
 
     def nextId(self) -> int:
         """Skips Party dynamically when the setup explicitly has no NPCs."""
@@ -1193,7 +1259,7 @@ class NewGameWizard(QWizard):
             {
                 "name": skill_input.text(),
                 "description": description_input.text(),
-                "attribute": skill_input.attribute_input.currentText(),
+                "attribute": skill_input.attribute_input.currentData() or "",
                 "level": level,
                 "requires_ai_invention": (
                     not skill_input.text().strip()
@@ -1219,6 +1285,7 @@ class NewGameWizard(QWizard):
             "skill_level_plan": [level for level, _name, _description in self.skill_inputs],
             "magic": self._magic_setup_from_controls(),
             "fighting": self._fighting_setup_from_controls(),
+            "survival": {"enabled": bool(self.survival_tracking_combo.currentData())},
             "rules_version": RULES_VERSION,
             "rank_baseline": str(self.rank_baseline_combo.currentData() or "professional"),
             "starter_inventory_mode": self._starter_inventory_mode(),
@@ -1368,6 +1435,11 @@ class NewGameWizard(QWizard):
         self.character_notes_input.setPlainText(character["notes"])
         self._load_magic_setup(clean_setup["magic"])
         self._load_fighting_setup(clean_setup["fighting"])
+        survival = setup.get("survival")
+        self._survival_choice_explicit = isinstance(survival, dict) and "enabled" in survival
+        self.survival_tracking_combo.blockSignals(True)
+        _set_combo_to_data(self.survival_tracking_combo, clean_setup["survival"]["enabled"])
+        self.survival_tracking_combo.blockSignals(False)
 
         preset_index = self.skill_preset_combo.findData(clean_setup.get("skill_preset", "professional"))
         self.skill_preset_combo.setCurrentIndex(max(0, preset_index))
@@ -1386,7 +1458,7 @@ class NewGameWizard(QWizard):
                 skill = clean_setup["skills"][index] if index < len(clean_setup["skills"]) else {}
                 skill_input.setText(str(skill.get("name", "")))
                 description_input.setText(str(skill.get("description", "")))
-                skill_input.attribute_input.setCurrentText(skill_attribute(skill.get("attribute"), skill_input.text()))
+                _set_combo_to_data(skill_input.attribute_input, starting_skill_attribute(skill.get("attribute")))
 
         _set_combo_to_data(self.rank_baseline_combo, clean_setup["rank_baseline"])
         for attribute, value in character["attributes"].items():
@@ -1766,7 +1838,9 @@ class NewGameWizard(QWizard):
             stretch_columns={0, 1, 4},
             compact_columns={2, 3, 5},
         )
-        layout.addWidget(_button_row(add_location_button))
+        layout.addWidget(_button_row(add_location_button, self._clear_table_button(
+            self.starting_locations_table, "starting locations",
+            after_clear=self._refresh_starting_location_dropdowns)))
         layout.addWidget(self.starting_locations_table)
         opening_scene_group = QGroupBox("Opening Scene Request")
         opening_scene_group_layout = QVBoxLayout(opening_scene_group)
@@ -2177,7 +2251,8 @@ class NewGameWizard(QWizard):
         npc_editor_layout = QVBoxLayout()
         npc_editor_layout.setContentsMargins(0, 0, 0, 0)
         npc_editor_layout.setSpacing(8)
-        npc_editor_layout.addWidget(_button_row(self.add_npc_button))
+        npc_editor_layout.addWidget(_button_row(self.add_npc_button, self._clear_table_button(
+            self.starting_npcs_table, "starting NPCs", after_clear=self._sync_starting_party_choices)))
         npc_editor_layout.addWidget(self.starting_npcs_table)
         self.starting_npcs_editor_container = QWidget()
         self.starting_npcs_editor_container.setLayout(npc_editor_layout)
@@ -2319,6 +2394,8 @@ class NewGameWizard(QWizard):
         layout.addWidget(explanation)
         layout.addWidget(self.starting_party_selection_container)
         layout.addWidget(self.starting_party_empty_label)
+        layout.addWidget(_button_row(self._clear_table_button(
+            self.starting_party_table, "starting party", after_clear=self._sync_starting_party_choices)))
         layout.addWidget(self.starting_party_table)
         layout.addStretch()
         layout.setAlignment(Qt.AlignmentFlag.AlignTop)
@@ -2647,6 +2724,13 @@ class NewGameWizard(QWizard):
         allocate.clicked.connect(lambda: self._reset_point_buy())
         layout.addWidget(_button_row(reset, allocate))
 
+        self.skill_name_error = QLabel()
+        self.skill_name_error.setObjectName("duplicateStartingSkillError")
+        self.skill_name_error.setWordWrap(True)
+        self.skill_name_error.setStyleSheet("color: #e57373;")
+        self.skill_name_error.hide()
+        layout.addWidget(self.skill_name_error)
+
 
         for level in range(5, 0, -1):
             group = QGroupBox(f"Level {level}")
@@ -2672,11 +2756,14 @@ class NewGameWizard(QWizard):
             self.skill_tables[level] = table
 
             add_button = QPushButton("Add Skill")
+            add_button.setObjectName("addStartingSkillButton")
             add_button.clicked.connect(lambda _checked=False, skill_level=level: self._add_starting_skill_row(skill_level))
             controls = QWidget()
             controls_layout = QHBoxLayout()
             controls_layout.setContentsMargins(0, 0, 0, 0)
             controls_layout.addWidget(add_button)
+            controls_layout.addWidget(self._clear_table_button(
+                table, f"level {level} skills", clear=lambda skill_level=level: self._clear_starting_skill_table(skill_level)))
             controls_layout.addStretch()
             controls.setLayout(controls_layout)
             group_layout.addWidget(controls)
@@ -2725,8 +2812,11 @@ class NewGameWizard(QWizard):
         )
         skill_input = _StartingSkillCombo(self.skill_catalog)
         skill_input.attribute_input = _NoWheelComboBox()
-        skill_input.attribute_input.addItems(list(ATTRIBUTES))
-        skill_input.attribute_input.setCurrentText(skill_attribute(attribute or self.skill_attributes.get(name.casefold()), name))
+        skill_input.attribute_input.addItem("Let the A.I. Decide", "")
+        for stat in ATTRIBUTES:
+            skill_input.attribute_input.addItem(stat, stat)
+        selected_attribute = attribute if attribute is not None else self.skill_attributes.get(name.casefold())
+        _set_combo_to_data(skill_input.attribute_input, starting_skill_attribute(selected_attribute))
         skill_input.setText(name)
         description_input = QLineEdit(description)
         description_input.setPlaceholderText("What this skill covers and when it applies")
@@ -2747,7 +2837,7 @@ class NewGameWizard(QWizard):
     ) -> None:
         description = skill_input.selected_description()
         name = skill_input.text()
-        skill_input.attribute_input.setCurrentText(skill_attribute(self.skill_attributes.get(name.casefold()), name))
+        _set_combo_to_data(skill_input.attribute_input, self.skill_attributes.get(name.casefold(), ""))
         if description is not None:
             description_input.setText(description)
         elif skill_input.combo.currentData() == skill_input.CUSTOM_DATA:
@@ -2775,26 +2865,52 @@ class NewGameWizard(QWizard):
                     self.skill_inputs.append((level, name_input, description_input))
         self._refresh_starting_skill_choices()
 
+    @staticmethod
+    def _skill_name_key(name: str) -> str:
+        return " ".join(name.split()).casefold()
+
+    def _duplicate_starting_skill_names(self) -> list[str]:
+        names: dict[str, str] = {}
+        duplicates: dict[str, str] = {}
+        for _level, skill, _description in getattr(self, "skill_inputs", []):
+            name = " ".join(skill.text().split())
+            key = self._skill_name_key(name)
+            if key and key in names:
+                duplicates[key] = names[key]
+            elif key:
+                names[key] = name
+        return list(duplicates.values())
+
     def _refresh_starting_skill_choices(self) -> None:
-        """Hide catalog names already assigned to another starting skill slot."""
+        """Validate all typed names and hide unavailable catalog choices."""
+        duplicate_names = self._duplicate_starting_skill_names()
+        duplicate_keys = {self._skill_name_key(name) for name in duplicate_names}
         for _level, skill_input, _description in self.skill_inputs:
             other_names = {
-                other.text().strip().casefold()
+                self._skill_name_key(other.text())
                 for _other_level, other, _other_description in self.skill_inputs
                 if other is not skill_input and other.text().strip()
             }
             combo = skill_input.combo
+            duplicate = self._skill_name_key(skill_input.text()) in duplicate_keys
+            combo.setStyleSheet("QComboBox { border: 1px solid #e57373; }" if duplicate else "")
+            combo.setToolTip("This skill name is already used in another row." if duplicate else "")
             view = combo.view()
             model = combo.model()
             for index in range(2, combo.count()):
                 data = combo.itemData(index)
-                unavailable = isinstance(data, tuple) and str(data[0]).strip().casefold() in other_names
+                unavailable = isinstance(data, tuple) and self._skill_name_key(str(data[0])) in other_names
                 if isinstance(view, QListView):
                     view.setRowHidden(index, unavailable)
                 if isinstance(model, QStandardItemModel):
                     item = model.item(index)
                     if item is not None:
                         item.setEnabled(not unavailable)
+        if hasattr(self, "skill_name_error"):
+            self.skill_name_error.setText("Rename or remove duplicate skills: " + ", ".join(duplicate_names))
+            self.skill_name_error.setVisible(bool(duplicate_names))
+        if hasattr(self, "stats_page"):
+            self.stats_page.completeChanged.emit()
 
     def _apply_starting_skill_preset(self, _index: int = -1) -> None:
         preset = str(self.skill_preset_combo.currentData() or "professional")
@@ -2809,7 +2925,9 @@ class NewGameWizard(QWizard):
             parent_widget = table.parentWidget()
             if parent_widget is not None:
                 parent_widget.setVisible(is_custom or count > 0)
-            self.skill_table_controls[level].setVisible(is_custom)
+            controls = self.skill_table_controls[level]
+            controls.setVisible(is_custom or count > 0)
+            controls.findChild(QPushButton, "addStartingSkillButton").setVisible(is_custom)
         self._sync_starting_skill_inputs()
         self._reset_point_buy()
 
@@ -2997,7 +3115,8 @@ class NewGameWizard(QWizard):
         traditions_layout = QVBoxLayout(traditions_widget)
         traditions_layout.setContentsMargins(0, 0, 0, 0)
         traditions_layout.addWidget(self.magic_traditions_table)
-        traditions_layout.addWidget(_button_row(self.magic_add_tradition_button))
+        traditions_layout.addWidget(_button_row(self.magic_add_tradition_button, self._clear_table_button(
+            self.magic_traditions_table, "magic traditions", after_clear=self.magic_tradition_input.clear)))
         form.addRow("Magic Traditions:", traditions_widget)
 
         basic_spells_layout = QVBoxLayout()
@@ -3008,14 +3127,16 @@ class NewGameWizard(QWizard):
         basic_spells_explanation.setWordWrap(True)
         basic_spells_layout.addWidget(basic_spells_explanation)
         basic_spells_layout.addWidget(
-            _button_row(self.magic_add_spell_request_button)
+            _button_row(self.magic_add_spell_request_button, self._clear_table_button(
+                self.starting_spell_requests_table, "starting spell ideas"))
         )
         basic_spells_layout.addWidget(self.starting_spell_requests_table)
         basic_spells_widget = QWidget()
         basic_spells_widget.setLayout(basic_spells_layout)
 
         advanced_spells_layout = QVBoxLayout()
-        advanced_spells_layout.addWidget(_button_row(self.magic_add_spell_button))
+        advanced_spells_layout.addWidget(_button_row(self.magic_add_spell_button, self._clear_table_button(
+            self.starting_spells_table, "starting spells")))
         advanced_spells_layout.addWidget(self.starting_spells_table)
         advanced_spells_widget = QWidget()
         advanced_spells_widget.setLayout(advanced_spells_layout)
@@ -3629,7 +3750,31 @@ class NewGameWizard(QWizard):
         _set_combo_to_data(self.fighting_focus_combo, "balanced")
         form = QFormLayout(page)
         form.addRow("Fighting frequency:", self.fighting_focus_combo)
+        self._survival_choice_explicit = False
+        self.survival_tracking_combo = QComboBox()
+        self.survival_tracking_combo.addItem("No", False)
+        self.survival_tracking_combo.addItem("Yes", True)
+        self.survival_tracking_combo.setToolTip(
+            "Track Hunger, Thirst, and Energy from 0 to 100%. Higher is better. "
+            "Defaults to Yes for the Survival genre; your explicit choice is preserved."
+        )
+        self.survival_tracking_combo.currentIndexChanged.connect(self._mark_survival_choice)
+        self.survival_tracking_combo.activated.connect(self._mark_survival_choice)
+        self.genre_input.selection_changed.connect(self._sync_survival_genre_default)
+        form.addRow("Should the game track hunger/thirst/energy? (Yes/No)", self.survival_tracking_combo)
+        self._sync_survival_genre_default()
         self.addPage(page)
+
+    def _mark_survival_choice(self, _index: int) -> None:
+        self._survival_choice_explicit = True
+
+    def _sync_survival_genre_default(self) -> None:
+        if self._survival_choice_explicit:
+            return
+        enabled = "survival" in {genre.strip().casefold() for genre in self.genre_input.text().split(",")}
+        self.survival_tracking_combo.blockSignals(True)
+        _set_combo_to_data(self.survival_tracking_combo, enabled)
+        self.survival_tracking_combo.blockSignals(False)
 
     def _fighting_setup_from_controls(self) -> dict[str, str]:
         return {"focus": str(self.fighting_focus_combo.currentData() or "balanced")}
@@ -3793,7 +3938,8 @@ class NewGameWizard(QWizard):
             "Starting Currency:", self.starting_wealth_amounts_table
         )
         advanced_wealth_layout.addRow(
-            "", _button_row(self.add_starting_wealth_amount_button)
+            "", _button_row(self.add_starting_wealth_amount_button, self._clear_table_button(
+                self.starting_wealth_amounts_table, "starting currency amounts", after_clear=self._sync_starting_wealth_summary))
         )
         advanced_wealth_layout.addRow("", self.starting_wealth_summary_label)
         advanced_wealth_widget = QWidget()
@@ -3831,14 +3977,16 @@ class NewGameWizard(QWizard):
         _configure_responsive_table(self.starter_item_suggestions_table, stretch_columns={0}, compact_columns={1})
         basic_inventory_layout.addRow("Item / equipment ideas:", self.starter_item_suggestions_table)
         basic_inventory_layout.addRow("Genre suggestions:", _button_row(self.starter_item_suggestion_combo, add_suggested_item_button))
-        basic_inventory_layout.addRow("", _button_row(add_item_suggestion_button))
+        basic_inventory_layout.addRow("", _button_row(add_item_suggestion_button, self._clear_table_button(
+            self.starter_item_suggestions_table, "item and equipment ideas")))
         basic_inventory_widget = QWidget()
         basic_inventory_widget.setLayout(basic_inventory_layout)
 
         advanced_inventory_layout = QFormLayout()
         _configure_responsive_form(advanced_inventory_layout)
         advanced_inventory_layout.addRow("Items:", self.starter_items_table)
-        advanced_inventory_layout.addRow("", _button_row(add_item_button))
+        advanced_inventory_layout.addRow("", _button_row(add_item_button, self._clear_table_button(
+            self.starter_items_table, "starter items")))
         advanced_inventory_widget = QWidget()
         advanced_inventory_widget.setLayout(advanced_inventory_layout)
 
@@ -3853,9 +4001,11 @@ class NewGameWizard(QWizard):
         _configure_responsive_form(layout)
         layout.addRow(self.starter_inventory_mode_stack)
         layout.addRow("Currencies:", self.currency_table)
-        layout.addRow("", _button_row(add_currency_button))
+        layout.addRow("", _button_row(add_currency_button, self._clear_table_button(
+            self.currency_table, "currencies and their starting amounts", clear=self._clear_currency_table)))
         layout.addRow("Economy Notes:", self.economy_examples_table)
-        layout.addRow("", _button_row(add_economy_example_button))
+        layout.addRow("", _button_row(add_economy_example_button, self._clear_table_button(
+            self.economy_examples_table, "economy notes")))
         wealth_mode_label = QLabel(
             "Starting wealth: Basic lets the A.I. interpret plain-language "
             "guidance; Advanced stores the exact denomination counts below."
@@ -4236,7 +4386,11 @@ class NewGameWizard(QWizard):
     def _starter_items_from_table(self) -> list[dict[str, Any]]:
         if self._starter_inventory_mode() == "advanced":
             return _starter_items_from_table(self.starter_items_table)
-        return _starter_suggestions_from_table(self.starter_item_suggestions_table, "Item")
+        suggestions = _starter_suggestions_from_table(self.starter_item_suggestions_table, "Item")
+        if self.no_world_magic_checkbox.isChecked():
+            for item in suggestions:
+                item["magic_related"] = False
+        return suggestions
 
     def _starter_inventory_mode(self) -> str:
         """Returns the selected Basic/Advanced starter-equipment mode."""

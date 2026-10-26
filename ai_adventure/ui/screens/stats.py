@@ -83,6 +83,10 @@ class StatsScreen(RepositoryBackedWidget):
             f"Level {stats['level']} · {stats['xp']} Player XP · {progress}\n"
             f"Health {stats['health_current']}/{stats['health_max']} · Carried {load['weight_lb']:g}/{load['capacity_lb']:g} lb\n"
             f"Unused rewards: {stats['reward_choices']} choices · {stats['skill_advances']} skill advances")
+        survival = repository.survival_status()
+        if survival["enabled"]:
+            self.summary_label.setText(self.summary_label.text() +
+                f"\nSurvival modifier: {survival['roll_modifier']:+d} to checks, attacks, and saves (lowest meter)")
         self.attributes_label.setText("   |   ".join(f"{a}: {stats['attributes'][a]} ({stats['modifiers'][a]:+d})" for a in ATTRIBUTES))
         self.spend_rewards_button.setEnabled(bool(stats["reward_choices"] or stats["skill_advances"]))
         if self.playtesting_tools:
@@ -150,6 +154,7 @@ class StatsScreen(RepositoryBackedWidget):
         dialog = SkillDetailsDialog(
             skill=skill,
             modifier=repository.player_stats()["modifiers"][skill["attribute"]],
+            survival_modifier=repository.survival_status()["roll_modifier"],
             image_path=self.visual_asset_path(asset),
             on_select_image=select_icon,
             on_create_image=(lambda: self.create_visual_asset("skill", key))

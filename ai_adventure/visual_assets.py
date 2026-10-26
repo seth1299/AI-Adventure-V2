@@ -10,7 +10,7 @@ import sqlite3
 import time
 from typing import Any, Protocol
 
-from PIL import Image
+from PIL import Image, ImageChops, ImageFilter
 
 try:
     from rapidfuzz.fuzz import token_set_ratio as _rapidfuzz_token_set_ratio
@@ -47,6 +47,34 @@ STANDARD_IMAGE_MAX_PIXELS = 1024
 # All Gemini image requests now use the 1K tier.
 LARGE_IMAGE_MAX_PIXELS = STANDARD_IMAGE_MAX_PIXELS
 IMAGE_OUTPUT_MIME_TYPE = "image/png"
+VISUAL_COHERENCE_RULE = (
+    "Prioritize a cohesive, believable depiction over showing every described detail. "
+    "Use one consistent viewpoint, perspective, scale, lighting, and spatial arrangement. "
+    "Allow natural occlusion: details may be hidden, outside the frame, or omitted when "
+    "they cannot plausibly be seen from the chosen viewpoint. Preserve the subject's "
+    "established design and defining traits, but never distort its structure or combine "
+    "incompatible views just to display more details."
+)
+LOCATION_STRUCTURE_RULE = (
+    "For buildings, preserve coherent enclosing walls, roofs, floors, and structural supports. "
+    "Choose a single plausible interior or exterior viewpoint. From outside, show interior "
+    "details only where naturally visible through actual windows or open doorways. "
+    "Do not remove walls, make opaque surfaces transparent, or use dollhouse cutaways, "
+    "cross-sections, or exploded views to expose described rooms or furnishings. "
+    "An open-front structure, ruin, or damaged wall is appropriate only when explicitly "
+    "established by the description; do not invent damage or openings for visibility."
+)
+CUTOUT_SUBJECT_TYPES = frozenset({"skill", "inventory", "player", "npc", "bestiary"})
+CUTOUT_BACKGROUND_RULE = (
+    "Isolate the subject on a completely flat, uniform pure magenta background "
+    "(RGB 255, 0, 255; #FF00FF), reaching every edge and filling any gaps in the subject. "
+    "Reserve magenta for the background only; use other colors for the subject. "
+    "No tile, plaque, backing plate, scenery, floor, gradient, texture, cast shadow, "
+    "or checkerboard. Keep the subject inside the canvas with clear background padding "
+    "on all four edges, including below waist-up portraits."
+    " Apply the selected art style and palette to the subject only; the background "
+    "must remain pure magenta even for monochrome or textured styles."
+)
 ASSET_DIRECTORY_BY_SUBJECT_TYPE = {
     "region_map": "maps",
     "player": "characters",
@@ -123,6 +151,12 @@ class VisualAssetRequest:
         return "1:1"
 
     @property
+    def uses_transparent_background(self) -> bool:
+        """Whether generated artwork is an isolated subject with a keyed matte."""
+
+        return self.subject_type in CUTOUT_SUBJECT_TYPES
+
+    @property
     def is_large_format(self) -> bool:
         """Compatibility flag for the retired larger location/map tier."""
 
@@ -177,7 +211,7 @@ class VisualAssetRequest:
             "player": "One waist-up character portrait; show the face, clothing, and equipment.",
             "npc": "One waist-up character portrait; show the face, clothing, and equipment.",
             "location": "An establishing view emphasizing terrain, architecture, scale, and atmosphere. No people or body parts.",
-            "inventory": "Exactly one item, clearly showing its materials, color, condition, and distinctive features. No people, hands, or duplicate items; use a simple supporting background.",
+            "inventory": "Exactly one item, clearly showing its materials, color, condition, and distinctive features. No people, hands, or duplicate items.",
             "skill": "One bold, recognizable symbol with a simple silhouette, strong contrast, and generous padding. No lettering or decorative frame.",
             "bestiary": "One creature, emphasizing its silhouette, scale, coloration, texture, and described anatomy. No extra creatures or people.",
         }[self.subject_type]
@@ -195,7 +229,10 @@ class VisualAssetRequest:
             f"Description: {self.description}",
             " ".join(constraints),
             f"Focus: {focus}",
+            CUTOUT_BACKGROUND_RULE if self.uses_transparent_background else "",
             f"Composition: {self.aspect_ratio} aspect ratio; keep the subject clear and prominent.",
+            VISUAL_COHERENCE_RULE,
+            LOCATION_STRUCTURE_RULE if self.subject_type == "location" else "",
             "Avoid captions, signatures, watermarks, borders, and split panels.",
             self.text_instructions or "No readable text or labels.",
         ]))
@@ -215,7 +252,7 @@ class VisualAssetRequest:
             "skill": (
                 "Create a square skill icon with one bold, recognizable symbol representing this skill. "
                 "Use a simple silhouette, strong contrast, generous padding and minimal detail so it "
-                "stays readable at 32 by 32 pixels. No text, letters, numbers or decorative frame."
+                "stays readable at 32 by 32 pixels. No text, letters, numbers or decorative frame. "
             ),
             "npc": (
                 "Create a single NPC portrait, waist-up, with the face, clothing, role, "
@@ -240,11 +277,9 @@ class VisualAssetRequest:
                 "hand, arm, or someone holding or using it. Make its materials, condition, "
                 "color, scale, and distinctive visible features easy to recognize. "
                 "The subject name may be fictional or unfamiliar: never substitute a familiar "
-                "real-world object based on the name alone. Use every concrete visual trait in "
+                "real-world object based on the name alone. Preserve the concrete visual traits in "
                 "the supplied description, including state-dependent changes such as translucency "
-                "or opacity, and make those traits visually obvious. A simple neutral setting "
-                "or supporting surface is acceptable, but it must not compete with or obscure "
-                "the item."
+                "or opacity, where visible from the chosen viewpoint."
             ),
             "bestiary": (
                 "Create a single non-human creature illustration based only on the "
@@ -254,6 +289,11 @@ class VisualAssetRequest:
                 "coloration, texture, and distinctive traits easy to recognize."
             ),
         }[self.subject_type]
+        if self.uses_transparent_background:
+            subject_instruction += " " + CUTOUT_BACKGROUND_RULE
+        subject_instruction += " " + VISUAL_COHERENCE_RULE
+        if self.subject_type == "location":
+            subject_instruction += " " + LOCATION_STRUCTURE_RULE
         style = image_style_metadata(self.image_style)
         banned_terms = self.banned_terms or default_banned_creative_terms()
         banned_text = ", ".join(banned_terms) or "None"
@@ -1005,12 +1045,69 @@ def _visible_world_context(repository: VisualAssetRepository) -> str:
     return "\n".join(parts)
 
 
+def _remove_asset_background(image: Image.Image) -> Image.Image:
+    """Keys a reserved magenta matte into real alpha, retaining existing alpha.
+
+    Validate the border before keying so a noncompliant opaque illustration is
+    reported rather than silently damaging its colors. The reserved key is also
+    removed inside symbol holes. Soft edges are unmatted to avoid pink fringes.
+    """
+
+    rgba = image.convert("RGBA")
+    if rgba.getchannel("A").getextrema()[0] < 255:
+        return rgba
+    rgb = rgba.convert("RGB")
+    red, green, blue = rgb.split()
+    distance = ImageChops.lighter(
+        ImageChops.lighter(ImageChops.invert(red), green), ImageChops.invert(blue)
+    )
+    border = [
+        *distance.crop((0, 0, image.width, 1)).getdata(),
+        *distance.crop((0, image.height - 1, image.width, image.height)).getdata(),
+        *distance.crop((0, 0, 1, image.height)).getdata(),
+        *distance.crop((image.width - 1, 0, image.width, image.height)).getdata(),
+    ]
+    if sum(value <= 48 for value in border) < len(border) * 0.8:
+        raise ValueError(
+            "The generated image lacks the required uniform magenta background. "
+            "Generate the image again to create a transparent version."
+        )
+    alpha = distance.point(lambda value: max(0, min(255, (value - 32) * 255 // 64)))
+    # Spill can be much darker than the pure key and survive the distance test.
+    # Restrict stronger keying to three pixels around the cutout (including
+    # holes), so purple materials farther inside the subject retain their color.
+    edge = alpha.point(lambda value: 255 if value < 255 else 0).filter(ImageFilter.MaxFilter(7))
+    for index, ((r, g, b), near_edge) in enumerate(zip(rgb.getdata(), edge.getdata())):
+        dominance = min(r, b) - g
+        if near_edge and dominance > 0:
+            position = (index % image.width, index // image.width)
+            # A 16-level bias toward transparency removes near-key residue.
+            coverage = max(0, (239 - dominance) * 255 // 239)
+            alpha.putpixel(position, min(alpha.getpixel(position), coverage))
+    if alpha.getextrema()[1] == 0:
+        raise ValueError("The generated image contains only background; generate it again.")
+    rgba.putalpha(alpha)
+    rgba.paste((0, 0, 0, 0), mask=alpha.point(lambda value: 255 if value == 0 else 0))
+    for index, ((r, g, b), opacity, near_edge) in enumerate(zip(rgb.getdata(), alpha.getdata(), edge.getdata())):
+        if 0 < opacity < 255:
+            # Undo compositing against RGB(255, 0, 255) at softened edges.
+            r = max(0, min(255, round((r * 255 - 255 * (255 - opacity)) / opacity)))
+            g = min(255, round(g * 255 / opacity))
+            b = max(0, min(255, round((b * 255 - 255 * (255 - opacity)) / opacity)))
+            if near_edge:
+                spill = max(0, min(r, b) - g)
+                r, b = r - spill, b - spill
+            rgba.putpixel((index % image.width, index // image.width), (r, g, b, opacity))
+    return rgba
+
+
 def save_scaled_png(
     image_bytes: bytes,
     target_path: Path,
     *,
     max_pixels: int = STANDARD_IMAGE_MAX_PIXELS,
     allow_upscale: bool = True,
+    remove_icon_background: bool = False,
 ) -> tuple[int, int]:
     """Writes an RGB or alpha-preserving RGBA PNG and returns its dimensions.
 
@@ -1020,12 +1117,16 @@ def save_scaled_png(
     Gemini 1K/2K responses should already match the requested tier, so this is
     primarily a defensive fallback. Uploads pass ``allow_upscale=False`` so
     smaller source images keep their original pixel dimensions.
+    Generated isolated subjects pass ``remove_icon_background=True`` to key their
+    reserved magenta matte before resizing; uploads retain their original art.
     """
 
     target_path.parent.mkdir(parents=True, exist_ok=True)
     with Image.open(BytesIO(image_bytes)) as source:
         has_alpha = "A" in source.getbands() or "transparency" in source.info
         image = source.convert("RGBA" if has_alpha else "RGB")
+        if remove_icon_background:
+            image = _remove_asset_background(image)
         target_longest_edge = max(64, int(max_pixels))
         source_longest_edge = max(image.size)
         if not allow_upscale:

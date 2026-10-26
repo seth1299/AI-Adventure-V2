@@ -3,7 +3,7 @@ from __future__ import annotations
 from ai_adventure.template_images import normalize_template_images
 from ai_adventure.locations import MAP_COORDINATE_RULE
 
-from ai_adventure.skills.attributes import skill_attribute
+from ai_adventure.skills.attributes import starting_skill_attribute
 
 from ai_adventure.stats import RULES_VERSION, STATS_RULE, rank_stats, starting_attributes, normalize_attributes, point_buy_cost, carrying_capacity
 
@@ -41,6 +41,7 @@ from ai_adventure.narration_preferences import normalize_narration_preferences
 from ai_adventure.magic import normalize_magic_setup
 from ai_adventure.items import normalize_item_metadata
 from ai_adventure.story_preferences import FIGHTING_FOCUS_INSTRUCTIONS, normalize_fighting_preferences
+from ai_adventure.survival import SURVIVAL_RULE, normalize_survival_setup
 from ai_adventure.inventory_storage import NEW_GAME_STORAGE_RULE
 
 OPENING_SCENE_RULE = (
@@ -355,6 +356,7 @@ def normalize_new_game_setup(raw_setup: Any) -> dict[str, Any]:
         "starting_task": starting_task,
         "magic": magic,
         "fighting": fighting,
+        "survival": normalize_survival_setup(raw_setup.get("survival"), genre=specified_genre),
         "rules_version": RULES_VERSION,
         "rank_baseline": rank_baseline,
         "point_buy_budget": budget,
@@ -919,7 +921,10 @@ def build_new_game_setup_packet(
             ),
             "skill_generation": (
                 "Return exactly the starting skill slots supplied in setup.skills, "
-                "preserving every slot's level and selected attribute. Always return attribute as one "
+                "preserving every slot's level and any explicitly selected attribute. "
+                "An empty attribute means Let the A.I. Decide: choose the most appropriate "
+                "Related Stat for that skill's meaning and description. Never leave the final "
+                "attribute empty. Always return attribute as one "
                 "of Strength, Dexterity, Constitution, Intelligence, Wisdom, Charisma. If setup.skills is empty for Blank "
                 "Slate / Hardcore Mode, return no starting skills. "
                 "If a setup.skills entry has a nonblank name, copy that exact name "
@@ -1187,6 +1192,12 @@ def build_new_game_setup_packet(
         },
         "creative_ideas": creative_ideas,
     }
+    if clean_setup["survival"]["enabled"]:
+        packet["survival_contract"] = {
+            "enabled": True,
+            "starting_values": {"hunger": 100, "thirst": 100, "energy": 100},
+            "rules": SURVIVAL_RULE,
+        }
     if not clean_music_tracks:
         packet["requirements"].pop("starting_music", None)
     if not clean_sound_effect_tracks:
@@ -1584,7 +1595,7 @@ def _normalize_skills(raw_skills: Any, level_plan: list[int]) -> list[dict[str, 
         normalized[target_index] = {
             "name": name,
             "description": description,
-            "attribute": skill_attribute(raw_skill.get("attribute"), name),
+            "attribute": starting_skill_attribute(raw_skill.get("attribute")),
             "level": level,
             "requires_ai_invention": requires_ai_invention,
         }
@@ -1597,7 +1608,7 @@ def _normalize_skills(raw_skills: Any, level_plan: list[int]) -> list[dict[str, 
         normalized[index] = {
             "name": "",
             "description": "",
-            "attribute": "Intelligence",
+            "attribute": "",
             "level": level,
             "requires_ai_invention": True,
         }

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from ai_adventure.stats import ATTRIBUTES, RULES_VERSION, rank_stats, starting_attributes, point_buy_cost
+from ai_adventure.survival import normalize_survival_setup
 
 from ai_adventure.ui.widgets.inputs import FeatureToggleCheckBox
 from ai_adventure.audio.tts_settings import DEFAULT_TTS_VOLUME_PERCENT, active_player_voice_spec_from_audio
@@ -1964,6 +1965,13 @@ class NewGameTemplateManagerDialog(QDialog):
         self.combat_focus_combo = _NoWheelComboBox()
         for value, label in FIGHTING_FOCUS_LABELS.items():
             self.combat_focus_combo.addItem(label, value)
+        self._survival_choice_explicit = False
+        self.survival_tracking_combo = _NoWheelComboBox()
+        self.survival_tracking_combo.addItem("No", False)
+        self.survival_tracking_combo.addItem("Yes", True)
+        self.survival_tracking_combo.currentIndexChanged.connect(self._mark_template_survival_choice)
+        self.survival_tracking_combo.activated.connect(self._mark_template_survival_choice)
+        self.genre_input.textChanged.connect(self._sync_template_survival_default)
         self.magic_enabled_checkbox = QCheckBox(
             "The player character can cast spells at the start"
         )
@@ -2441,6 +2449,7 @@ class NewGameTemplateManagerDialog(QDialog):
 
         form = QFormLayout()
         form.addRow("Fighting frequency:", self.combat_focus_combo)
+        form.addRow("Should the game track hunger/thirst/energy? (Yes/No)", self.survival_tracking_combo)
         note = QLabel(
             "Fighting is narrated; uncertain actions use application-owned d20 tests."
         )
@@ -2509,6 +2518,17 @@ class NewGameTemplateManagerDialog(QDialog):
     def _load_template_combat(self, raw_combat: Any) -> None:
         combat = raw_combat if isinstance(raw_combat, dict) else {}
         _set_combo_to_data(self.combat_focus_combo, combat.get("focus", "balanced"))
+
+    def _mark_template_survival_choice(self, _index: int) -> None:
+        if not self._loading_template_setup:
+            self._survival_choice_explicit = True
+
+    def _sync_template_survival_default(self, _text: str) -> None:
+        if self._loading_template_setup or self._survival_choice_explicit:
+            return
+        self.survival_tracking_combo.blockSignals(True)
+        _set_combo_to_data(self.survival_tracking_combo, normalize_survival_setup(None, genre=self.genre_input.text())["enabled"])
+        self.survival_tracking_combo.blockSignals(False)
 
 
     def _load_template_magic(self, raw_magic: Any) -> None:
@@ -2892,6 +2912,9 @@ class NewGameTemplateManagerDialog(QDialog):
                 )
             )
             self._load_template_combat(setup.get("fighting", {}))
+            survival = setup.get("survival")
+            self._survival_choice_explicit = isinstance(survival, dict) and "enabled" in survival
+            _set_combo_to_data(self.survival_tracking_combo, normalize_survival_setup(survival, genre=self.genre_input.text())["enabled"])
             self._load_template_magic(setup.get("magic", {}))
             self._load_template_wealth(setup.get("starting_wealth", {}))
 
@@ -3284,6 +3307,7 @@ class NewGameTemplateManagerDialog(QDialog):
         setup["fighting"] = {
             "focus": self.combat_focus_combo.currentData() or "balanced",
         }
+        setup["survival"] = {"enabled": bool(self.survival_tracking_combo.currentData())}
         magic_tradition = self.magic_tradition_input.text().strip()
         preserved_traditions = (
             self._magic_traditions_original

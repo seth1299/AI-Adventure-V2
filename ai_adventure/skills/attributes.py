@@ -12,6 +12,12 @@ _DEFAULTS = {
 }
 
 
+def starting_skill_attribute(value=None) -> str:
+    """Keep an explicit setup choice, or leave it empty for AI assignment."""
+    return next((attribute for attribute in ATTRIBUTES
+                 if str(value or "").strip().casefold() == attribute.casefold()), "")
+
+
 def skill_attribute(value=None, name: str = "") -> str:
     """Canonicalize a stat, using a catalog default for records without one."""
     for attribute in ATTRIBUTES:

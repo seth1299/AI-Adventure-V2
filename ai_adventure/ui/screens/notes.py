@@ -175,6 +175,9 @@ class NotesScreen(RepositoryBackedWidget):
         """Reloads notes, tag groups, and sharing preference."""
 
         repository = self.repository()
+        if repository is not None and repository.survival_status()["fate"] != "alive":
+            self._autosave_timer.stop()
+            self._editing_note = self._notes_dirty = False
         # Other tabs and background images can request a refresh while the
         # player types. Do not replace the editor or cancel its pending save.
         if repository is not None and (self._editing_note or self._notes_dirty or self._saving_notes):
@@ -242,6 +245,9 @@ class NotesScreen(RepositoryBackedWidget):
 
     def _persist_notes(self) -> None:
         repository = self.repository()
+        if repository is not None and repository.survival_status()["fate"] != "alive":
+            self._notes_dirty = False
+            return
         if repository is None or self._loading_notes or self._saving_notes or not self._notes_dirty:
             return
         self._saving_notes = True

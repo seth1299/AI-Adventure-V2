@@ -56,6 +56,8 @@ from ai_adventure.item_categories import normalize_inventory_category
 from ai_adventure.inventory_storage import inventory_access, move_destinations, move_error, inventory_load, capacity_error, pounds
 from ai_adventure.persistence.inventory_containers import synchronize_container_records
 from ai_adventure.new_game_setup import normalize_new_game_setup
+from ai_adventure.survival import SURVIVAL_METERS
+from ai_adventure.persistence.survival import SurvivalRepository
 from ai_adventure.narration_preferences import (
     DEFAULT_NARRATION_STYLE,
     DEFAULT_NARRATION_TENSE,
@@ -112,7 +114,7 @@ class SaveFileOperationError(ValueError):
     """Raised when a save file operation cannot be performed safely."""
 
 
-class SaveRepository(PlayerStatsRepository):
+class SaveRepository(PlayerStatsRepository, SurvivalRepository):
     """
     SQLite-backed repository for one adventure save.
 
@@ -139,6 +141,15 @@ class SaveRepository(PlayerStatsRepository):
         self.db_path = db_path
         self._active_message_id: str | None = None
         self._transaction_state = local()
+        # Spectator saves already contain the current schema and must not run
+        # gameplay normalization or equipment writes when reopened.
+        if db_path.exists() and db_path.stat().st_size and self.get_setting("survival.fate", "alive") == "accepted":
+            with self._connect() as connection:
+                self._history_has_game_time = any(
+                    row[1] == "game_time"
+                    for row in connection.execute("PRAGMA table_info(history_entries)")
+                )
+            return
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._initialize_schema()
         self.set_meta("rules_version", RULES_VERSION)
@@ -345,6 +356,10 @@ class SaveRepository(PlayerStatsRepository):
         self.set_setting("world.genre", clean_setup["specified_genre"])
         self.set_setting("world.game_style", clean_setup["game_style"])
         self.set_setting("fighting.focus", clean_setup["fighting"]["focus"])
+        self.set_setting("survival.enabled", clean_setup["survival"]["enabled"])
+        if clean_setup["survival"]["enabled"]:
+            for meter in SURVIVAL_METERS:
+                self.set_state_value(f"player.{meter}", "100")
         self.set_setting("currency.description", clean_setup["currency_description"])
         self.set_note_entries([])
         self.set_notes_share_with_ai(False)
@@ -4378,6 +4393,10 @@ class SaveRepository(PlayerStatsRepository):
             and str(cue.get("voice_id", "") or "").strip()
         ]
 
+        calendar = build_calendar_snapshot(
+            self.get_current_calendar_minute(), self.get_calendar_settings()
+        )
+        game_time = f"Day {calendar['absolute_day']}, {calendar['time_label']}"
         with self._connect() as connection:
             cursor = connection.execute(
                 """
@@ -4388,9 +4407,9 @@ class SaveRepository(PlayerStatsRepository):
                     sound_effect_cues_json,
                     speaker_cues_json,
                     hidden,
-                    created_at, turn_id, suggested_actions_json
+                    created_at, turn_id, suggested_actions_json, game_time
                 )
-                VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?)
                 """,
                 (
                     resolved_message_id,
@@ -4401,6 +4420,7 @@ class SaveRepository(PlayerStatsRepository):
                     datetime.now().isoformat(timespec="seconds"),
                     turn_id,
                     json.dumps(suggested_actions or [], ensure_ascii=False),
+                    game_time,
                 ),
             )
             inferred = self.find_history_subjects(clean_content, speaker_cues=speaker_cues) if kind in {"player", "story"} else []
@@ -4603,11 +4623,16 @@ class SaveRepository(PlayerStatsRepository):
         if limit is not None and limit < 0:
             raise ValueError("History limit must be non-negative.")
         where, parameters = _history_query_filters(before_id, after_id, kinds, hidden)
+        game_time_column = (
+            "game_time" if getattr(self, "_history_has_game_time", True)
+            else "'' AS game_time"
+        )
         with self._connect() as connection:
             rows = connection.execute(
-                """
+                f"""
                 SELECT id, message_id, kind, content, sound_effect_cues_json,
-                       speaker_cues_json, hidden, created_at, turn_id, suggested_actions_json
+                       speaker_cues_json, hidden, created_at, turn_id, suggested_actions_json,
+                       {game_time_column}
                 FROM history_entries
                 """ + where + (" ORDER BY id DESC LIMIT ?" if limit is not None else " ORDER BY id ASC"),
                 (*parameters, limit) if limit is not None else parameters,
@@ -5028,6 +5053,9 @@ class SaveRepository(PlayerStatsRepository):
             return False
 
         with self._connect() as connection:
+            self.require_active_adventure()
+            if clean_message_id in self.get_setting("survival.protected_snapshots", []):
+                raise RuntimeError("A pre-recovery snapshot cannot undo the survival recovery penalty.")
             row = connection.execute(
                 "SELECT snapshot_json FROM message_snapshots WHERE message_id = ?",
                 (clean_message_id,),
@@ -5438,7 +5466,7 @@ class SaveRepository(PlayerStatsRepository):
             ]
         locations = ensure_location_ids(normalize_known_locations(raw_locations))
         serialized = [location.to_dict() for location in locations]
-        if stored_locations != serialized:
+        if stored_locations != serialized and self.get_setting("survival.fate", "alive") != "accepted":
             original_by_name = {
                 str(location.get("name", "")).casefold(): location
                 for location in stored_locations if isinstance(location, dict)
@@ -5473,6 +5501,8 @@ class SaveRepository(PlayerStatsRepository):
     def ensure_travel_locations(self) -> list[dict[str, Any]]:
         """Bootstraps travel data from the current scene when needed."""
 
+        if self.get_setting("survival.fate", "alive") == "accepted":
+            return self.get_travel_locations()
         locations = [
             normalize_known_location(location) for location in self.get_travel_locations()
         ]
@@ -6365,6 +6395,8 @@ class SaveRepository(PlayerStatsRepository):
                 """
             )
             _ensure_column(connection, "skills", "attribute", "TEXT NOT NULL DEFAULT 'Intelligence'")
+            _ensure_column(connection, "d20_tests", "survival_modifier", "INTEGER NOT NULL DEFAULT 0")
+            _ensure_column(connection, "d20_tests", "survival_values_json", "TEXT NOT NULL DEFAULT '{}'")
             _ensure_column(connection, "skills", "default_image", "TEXT NOT NULL DEFAULT ''")
             _ensure_column(
                 connection,
@@ -6482,6 +6514,7 @@ class SaveRepository(PlayerStatsRepository):
             )
             _ensure_column(connection, "history_entries", "turn_id", "TEXT NOT NULL DEFAULT ''")
             _ensure_column(connection, "history_entries", "suggested_actions_json", "TEXT NOT NULL DEFAULT '[]'")
+            _ensure_column(connection, "history_entries", "game_time", "TEXT NOT NULL DEFAULT ''")
             connection.execute("CREATE INDEX IF NOT EXISTS idx_history_turn ON history_entries(turn_id)")
             _ensure_column(
                 connection,

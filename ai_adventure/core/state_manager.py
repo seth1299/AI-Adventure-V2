@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from ai_adventure.survival import survival_percentage
 from ai_adventure.calendar_system import (
     build_calendar_snapshot,
 )
@@ -88,6 +89,8 @@ class StateManager:
         )
         stats = self.repository.player_stats()
         health_max = stats["health_max"]
+        survival_enabled = settings.values.get("survival.enabled") is True
+        survival_death = settings.values.get("survival.fate", "alive") in {"pending", "accepted", "recovering"}
 
         return AdventureState(
             metadata=AdventureMetadata(
@@ -103,7 +106,8 @@ class StateManager:
                 ),
                 appearance=str(settings.values.get("player.appearance", "")),
                 backstory=str(settings.values.get("player.backstory", "")),
-                condition="Incapacitated" if stats["health_current"] == 0 else _read_string(state_snapshot, "condition", "Healthy"),
+                condition=("Dead" if survival_death else "Incapacitated"
+                           if stats["health_current"] == 0 else _read_string(state_snapshot, "condition", "Healthy")),
                 notes=str(settings.values.get("player.notes", "")),
                 health_current=max(
                     0,
@@ -117,6 +121,9 @@ class StateManager:
                     ),
                 ),
                 health_max=health_max,
+                hunger=survival_percentage(state_snapshot.get("player.hunger")) if survival_enabled else None,
+                thirst=survival_percentage(state_snapshot.get("player.thirst")) if survival_enabled else None,
+                energy=survival_percentage(state_snapshot.get("player.energy")) if survival_enabled else None,
                 attributes=stats["attributes"],
                 modifiers=stats["modifiers"],
                 level=stats["level"],

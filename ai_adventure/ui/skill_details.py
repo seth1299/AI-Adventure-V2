@@ -6,7 +6,7 @@ from ai_adventure.ui.crafting_details import CraftingDetailsDialog
 
 class SkillDetailsDialog(CraftingDetailsDialog):
     def __init__(self, *, skill, modifier, image_path=None, on_select_image=None,
-                 on_create_image=None, parent=None):
+                 on_create_image=None, parent=None, survival_modifier=0):
         level = int(skill.get("level", 1))
         super().__init__(
             title=str(skill.get("name", "Skill")),
@@ -14,7 +14,9 @@ class SkillDetailsDialog(CraftingDetailsDialog):
                 ("Related Stat", str(skill.get("attribute", "Intelligence"))),
                 ("Training", f"{_skill_level_label(level)} · Level {level} · +{level} skill bonus"),
                 ("XP Progress", _skill_xp_progress_label(skill)),
-                ("Typical Check Bonus", f"{modifier:+d} stat modifier + {level} training = {modifier + level:+d}"),
+                ("Typical Check Bonus", f"{modifier:+d} stat modifier + {level} training" +
+                 (f" {survival_modifier:+d} survival" if survival_modifier else "") +
+                 f" = {modifier + level + survival_modifier:+d}"),
                 ("Description", str(skill.get("description", ""))),
             ], parent=parent,
         )

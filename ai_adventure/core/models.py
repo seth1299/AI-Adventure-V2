@@ -41,6 +41,9 @@ class PlayerState:
     skill_advances: int = 0
     carrying_capacity_lb: float = 50.0
     equipment: dict[str, str] = field(default_factory=dict)
+    hunger: int | None = None
+    thirst: int | None = None
+    energy: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Returns a JSON-serializable player-state dictionary."""

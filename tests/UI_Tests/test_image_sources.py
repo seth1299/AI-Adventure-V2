@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -15,6 +16,43 @@ from tests.qt_test_case import QtTestCase
 
 
 class NewGameImageSourceDialogTests(QtTestCase):
+    def test_preview_refreshes_when_a_generated_image_replaces_bundled_art(self):
+        from PIL import Image
+
+        request = VisualAssetRequest("skill", "alchemy", "Alchemy", "Brew potions.")
+        with tempfile.TemporaryDirectory() as directory:
+            bundled = Path(directory) / "bundled.png"
+            generated = Path(directory) / "generated.png"
+            Image.new("RGB", (64, 64), (100, 80, 40)).save(bundled)
+            Image.new("RGBA", (64, 64), (30, 90, 120, 128)).save(generated)
+            path = Mock(return_value=bundled)
+            dialog = NewGameImageSourceDialog(
+                [request], choose_file=Mock(), create_image=Mock(), skip_image=Mock(),
+                preview_path=path,
+            )
+            self.addCleanup(dialog.deleteLater)
+            preview = dialog._preview_labels[request.asset_id]
+            self.assertEqual(preview.property("imageViewerPath"), str(bundled))
+            path.return_value = generated
+            dialog.set_asset_status(request.asset_id, "ready")
+            self.assertEqual(preview.property("imageViewerPath"), str(generated))
+            self.assertTrue(preview.pixmap().hasAlphaChannel())
+
+    def test_invalid_preview_is_hidden_and_leaves_image_choices_available(self):
+        request = VisualAssetRequest("skill", "alchemy", "Alchemy", "Brew potions.")
+        with tempfile.TemporaryDirectory() as directory:
+            invalid = Path(directory) / "invalid.png"
+            invalid.write_bytes(b"not an image")
+            dialog = NewGameImageSourceDialog(
+                [request], choose_file=Mock(), create_image=None, skip_image=Mock(),
+                preview_path=lambda _request: invalid,
+            )
+            self.addCleanup(dialog.deleteLater)
+            self.assertTrue(dialog._preview_labels[request.asset_id].isHidden())
+            self.assertEqual(dialog._rows[request.asset_id][0].text(), "No image source selected")
+            self.assertTrue(dialog._rows[request.asset_id][1].isEnabled())
+            self.assertTrue(dialog.continue_button.isEnabled())
+
     def test_ingame_buttons_copy_the_same_brief_without_generation(self):
         from ai_adventure.ui.primitives import RepositoryBackedWidget
         from PySide6.QtWidgets import QPushButton

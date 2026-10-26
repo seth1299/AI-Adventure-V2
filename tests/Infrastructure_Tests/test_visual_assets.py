@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, cast
 from unittest.mock import patch
 
-from PIL import Image
+from PIL import Image, ImageDraw
 
 from ai_adventure.ai.gemini_service import (
     NEW_GAME_RESPONSE_JSON_SCHEMA,
@@ -87,6 +87,114 @@ class _VisualRepository:
 
 
 class VisualAssetTests(unittest.TestCase):
+    def test_crafting_items_use_the_inventory_cutout_pipeline(self):
+        class CraftingRepository(_VisualRepository):
+            def list_crafting_items(self):
+                return [{"name": "Iron Ingot", "item_uuid": "ingot", "description": "A dull iron bar."}]
+
+        requests = build_visual_asset_requests(CraftingRepository())
+        request = next(request for request in requests if request.subject_key == "ingot")
+        self.assertEqual(request.subject_type, "inventory")
+        self.assertTrue(request.uses_transparent_background)
+        self.assertIn("#FF00FF", request.prompt)
+
+    def test_isolated_subject_prompts_reserve_uniform_background(self):
+        for subject_type in ("skill", "inventory", "player", "npc", "bestiary", "location", "region_map"):
+            with self.subTest(subject_type=subject_type):
+                request = VisualAssetRequest(subject_type, "subject", "Subject", "Visible details.")
+                cutout = subject_type not in {"location", "region_map"}
+                self.assertEqual(request.uses_transparent_background, cutout)
+                for prompt in (request.prompt, request.external_prompt):
+                    if cutout:
+                        self.assertIn("#FF00FF", prompt)
+                        self.assertIn("No tile, plaque", prompt)
+                    else:
+                        self.assertNotIn("#FF00FF", prompt)
+
+    def test_skill_icon_key_removes_background_and_holes_preserving_symbol(self):
+        source = Image.new("RGB", (64, 64), (255, 0, 255))
+        draw = ImageDraw.Draw(source)
+        draw.rectangle((12, 12, 51, 51), fill=(210, 210, 210))
+        draw.rectangle((24, 24, 39, 39), fill=(255, 0, 255))
+        source.putpixel((11, 12), (255, 64, 255))
+        data = BytesIO()
+        source.save(data, format="PNG")
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "icon.png"
+            save_scaled_png(data.getvalue(), target, max_pixels=64, remove_icon_background=True)
+            with Image.open(target) as saved:
+                self.assertEqual(saved.mode, "RGBA")
+                self.assertEqual(saved.getpixel((0, 0))[3], 0)
+                self.assertEqual(saved.getpixel((32, 32))[3], 0)
+                self.assertEqual(saved.getpixel((16, 16)), (210, 210, 210, 255))
+                self.assertGreater(saved.getpixel((11, 12))[3], 0)
+                self.assertLess(saved.getpixel((11, 12))[3], 255)
+            # Other image categories keep their colors and opaque backgrounds.
+            save_scaled_png(data.getvalue(), target, max_pixels=64)
+            with Image.open(target) as saved:
+                self.assertEqual(saved.getpixel((0, 0)), (255, 0, 255))
+
+    def test_skill_icon_key_preserves_existing_alpha(self):
+        source = Image.new("RGBA", (64, 64), (255, 0, 255, 0))
+        source.putpixel((32, 32), (120, 80, 40, 128))
+        data = BytesIO()
+        source.save(data, format="PNG")
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "icon.png"
+            save_scaled_png(data.getvalue(), target, max_pixels=64, remove_icon_background=True)
+            with Image.open(target) as saved:
+                self.assertEqual(saved.tobytes(), source.tobytes())
+
+    def test_cutout_removes_dark_magenta_fringe_without_stripping_interior_purple(self):
+        source = Image.new("RGB", (64, 64), (255, 0, 255))
+        draw = ImageDraw.Draw(source)
+        draw.rectangle((12, 12, 51, 51), fill=(180, 140, 90))
+        # A dark, blended key fringe that the original RGB distance left opaque.
+        draw.line((12, 12, 12, 51), fill=(180, 45, 170))
+        draw.rectangle((28, 28, 35, 35), fill=(130, 30, 140))
+        data = BytesIO()
+        source.save(data, format="PNG")
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "cutout.png"
+            save_scaled_png(data.getvalue(), target, max_pixels=64, remove_icon_background=True)
+            with Image.open(target) as saved:
+                r, g, b, alpha = saved.getpixel((12, 20))
+                self.assertLess(alpha, 255)
+                self.assertLessEqual(min(r, b), g)
+                self.assertEqual(saved.getpixel((31, 31)), (130, 30, 140, 255))
+                self.assertEqual(saved.getpixel((20, 20)), (180, 140, 90, 255))
+
+    def test_cutout_cleans_spill_inside_holes_and_preserves_light_edge_detail(self):
+        source = Image.new("RGB", (64, 64), (255, 0, 255))
+        draw = ImageDraw.Draw(source)
+        draw.rectangle((10, 10, 53, 53), fill=(200, 160, 100))
+        draw.rectangle((24, 24, 39, 39), fill=(255, 0, 255))
+        source.putpixel((23, 30), (180, 45, 170))
+        source.putpixel((9, 20), (255, 64, 255))
+        data = BytesIO()
+        source.save(data, format="PNG")
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "cutout.png"
+            save_scaled_png(data.getvalue(), target, max_pixels=64, remove_icon_background=True)
+            with Image.open(target) as saved:
+                r, g, b, alpha = saved.getpixel((23, 30))
+                self.assertLess(alpha, 255)
+                self.assertLessEqual(min(r, b), g)
+                r, g, b, alpha = saved.getpixel((9, 20))
+                self.assertEqual((r, g, b), (255, 255, 255))
+                self.assertGreater(alpha, 0)
+                self.assertLess(alpha, 128)
+
+    def test_skill_icon_key_rejects_missing_background_or_empty_icon(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "icon.png"
+            for color, error in [((70, 55, 40), "uniform magenta"), ((255, 0, 255), "only background")]:
+                data = BytesIO()
+                Image.new("RGB", (64, 64), color).save(data, format="PNG")
+                with self.assertRaisesRegex(ValueError, error):
+                    save_scaled_png(data.getvalue(), target, remove_icon_background=True)
+                self.assertFalse(target.exists())
+
     def test_image_service_uses_image_only_model_request(self) -> None:
         captured: dict[str, object] = {}
 

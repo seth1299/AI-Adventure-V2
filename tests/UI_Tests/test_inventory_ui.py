@@ -943,6 +943,32 @@ class InventoryUiTests(QtTestCase):
         self.assertTrue(restored_magic["enabled"])
         wizard.close()
 
+    def test_no_magic_world_hides_inventory_magic_flags_and_ignores_hidden_choices(self) -> None:
+        wizard = NewGameWizard(tts_enabled=False)
+        _append_starter_suggestion_table_row(
+            wizard.starter_item_suggestions_table, "Item", "Leather Satchel", magic_related=True,
+        )
+        table = wizard.starter_item_suggestions_table
+        self.assertFalse(table.isColumnHidden(1))
+        wizard.no_world_magic_checkbox.setChecked(True)
+        self.assertTrue(table.isColumnHidden(1))
+        self.assertFalse(wizard.build_template_setup()["starter_items"][0]["magic_related"])
+        # New rows also have no visible Magic-related option while magic is off.
+        _append_starter_suggestion_table_row(table, "Item", "Water Bottle")
+        self.assertTrue(table.isColumnHidden(1))
+        wizard.no_world_magic_checkbox.setChecked(False)
+        self.assertFalse(table.isColumnHidden(1))
+        self.assertTrue(wizard.build_template_setup()["starter_items"][0]["magic_related"])
+        wizard.magic_enabled_checkbox.setChecked(False)
+        self.assertFalse(table.isColumnHidden(1))
+        # Loading a no-magic template must apply the same visibility rule.
+        setup = wizard.build_setup()
+        setup["magic"]["world_contains_magic"] = False
+        wizard.load_setup(setup)
+        self.assertTrue(table.isColumnHidden(1))
+        self.assertFalse(wizard.build_setup()["starter_items"][0]["magic_related"])
+        wizard.close()
+
     def test_new_game_wizard_keeps_world_magic_details_when_player_casting_is_off(self) -> None:
         wizard = NewGameWizard(tts_enabled=False)
         wizard.magic_enabled_checkbox.setChecked(True)
@@ -1530,9 +1556,9 @@ class InventoryUiTests(QtTestCase):
                 if label.text().startswith("AI Game Master")
             }
 
-            self.assertIn("AI Game Master  |  Live Game  |  Turn #1", headers)
-            self.assertIn("AI Game Master  |  Out-of-Game", headers)
-            self.assertIn("AI Game Master  |  Live Game  |  Turn #2", headers)
+            self.assertIn("AI Game Master  |  Live Game  |  Turn #1  |  Day 1, Morning", headers)
+            self.assertIn("AI Game Master  |  Out-of-Game  |  Day 1, Morning", headers)
+            self.assertIn("AI Game Master  |  Live Game  |  Turn #2  |  Day 1, Morning", headers)
             self.assertNotIn("AI Game Master  |  Out-of-Game  |  Turn #2", headers)
             screen.close()
 
@@ -1581,11 +1607,11 @@ class InventoryUiTests(QtTestCase):
             self.assertEqual(
                 headers,
                 [
-                    "AI Game Master  |  Live Game  |  Turn #1",
-                    "Mira  |  Live Game  |  Turn #1",
-                    "AI Game Master  |  Live Game  |  Turn #1",
-                    "Hooded Figure  |  Live Game  |  Turn #1",
-                    "AI Game Master  |  Live Game  |  Turn #1",
+                    "AI Game Master  |  Live Game  |  Turn #1  |  Day 1, Morning",
+                    "Mira  |  Live Game  |  Turn #1  |  Day 1, Morning",
+                    "AI Game Master  |  Live Game  |  Turn #1  |  Day 1, Morning",
+                    "Hooded Figure  |  Live Game  |  Turn #1  |  Day 1, Morning",
+                    "AI Game Master  |  Live Game  |  Turn #1  |  Day 1, Morning",
                 ],
             )
             self.assertEqual(
@@ -1823,7 +1849,7 @@ class InventoryUiTests(QtTestCase):
             speaker_header = next(
                 label
                 for label in screen.findChildren(QLabel)
-                if label.text() == "Mira  |  Live Game  |  Turn #1"
+                if label.text() == "Mira  |  Live Game  |  Turn #1  |  Day 1, Morning"
             )
             bubble = speaker_header.parentWidget()
             self.assertIsNotNone(bubble)

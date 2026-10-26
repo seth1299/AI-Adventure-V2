@@ -162,6 +162,7 @@ class StoryTurnService:
         """Persists a submitted player action and captures rollback scope."""
 
         with repository.transaction():
+            repository.require_active_adventure()
             clean_mode = (
                 "out_of_game" if conversation_mode == "out_of_game" else "live_game"
             )
@@ -264,6 +265,7 @@ class StoryTurnService:
             if receipt:
                 return StoryTurnCommitResult(message_id=clean_message_id, speaker_cues=receipt["speaker_cues"],
                                              event_results=[AppliedEventResult(**event) for event in receipt["event_results"]])
+            repository.require_active_adventure()
             is_out_of_game = conversation_mode == "out_of_game"
             if not is_out_of_game:
                 inventory = repository.list_inventory_items()

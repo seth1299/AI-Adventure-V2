@@ -28,6 +28,7 @@ from ai_adventure.context.naming import GENERIC_PROPER_NOUN_PLACEHOLDER_RULE
 from ai_adventure.context.reference_loader import ContextReferenceLoader
 from ai_adventure.context.tags import PLANNABLE_CONTEXT_TAGS
 from ai_adventure.story_preferences import FIGHTING_FOCUS_INSTRUCTIONS, normalize_fighting_preferences
+from ai_adventure.survival import SURVIVAL_METERS, SURVIVAL_RULE, survival_roll_modifier
 from ai_adventure.currency import format_currency_amount
 from ai_adventure.crafting import evaluate_recipe_craftability, recipe_estimated_time
 from ai_adventure.core.models import AdventureState
@@ -1315,6 +1316,7 @@ class AiContextBuilder:
                     "payload containing only minutes_passed. If narration introduces "
                     "rain, snow, fog, or any other different current weather, set "
                     "weather to that actual condition instead of AUTO or the old value."
+                    + (" " + SURVIVAL_RULE if state.settings.values.get("survival.enabled") is True else "")
                 ),
                 "d20_tests": STATS_RULE,
                 "player_achievements": PLAYER_ACHIEVEMENT_RULE,
@@ -1529,6 +1531,11 @@ class AiContextBuilder:
             state_packet = packet.get("state")
             if isinstance(state_packet, dict):
                 state_packet.pop("bestiary", None)
+        packet["state"]["survival"] = {"enabled": state.settings.values.get("survival.enabled") is True}
+        if packet["state"]["survival"]["enabled"]:
+            packet["state"]["survival"].update({meter: getattr(state.player, meter) for meter in SURVIVAL_METERS})
+            packet["state"]["survival"]["roll_modifier"] = survival_roll_modifier(packet["state"]["survival"], enabled=True)
+            packet["state"]["survival"]["fate"] = state.settings.values.get("survival.fate", "alive")
         known_event_types = packet["response_contract"]["known_event_types"]
         packet["response_contract"]["known_event_types"] = [
             event_type

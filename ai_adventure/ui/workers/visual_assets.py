@@ -12,6 +12,7 @@ class _VisualAssetCoordinator(QObject):
     assets_changed = Signal()
     initial_batch_finished = Signal(object)
     asset_status_changed = Signal(str, str, str)
+    generation_failed = Signal(object, object, str)
 
     def __init__(
         self,
@@ -504,15 +505,11 @@ class _VisualAssetCoordinator(QObject):
                 self.images_dir
                 / save_relative_image_filename(repository, request),
                 max_pixels=request.maximum_pixels,
+                remove_icon_background=request.uses_transparent_background,
             )
         except Exception as error:
             LOGGER.warning("Failed to save generated image %s: %s", request.filename, error)
-            repository.set_visual_asset_status(
-                request.asset_id,
-                "failed",
-                error_message=str(error),
-            )
-            self.asset_status_changed.emit(request.asset_id, "failed", str(error))
+            self._handle_failed(repository, request, str(error))
             return
         repository.set_visual_asset_status(
             request.asset_id,
@@ -546,6 +543,7 @@ class _VisualAssetCoordinator(QObject):
             error_message=message,
         )
         self.asset_status_changed.emit(request.asset_id, "failed", message)
+        self.generation_failed.emit(repository, request, message)
         if not self._is_initial_batch(repository):
             self.assets_changed.emit()
 

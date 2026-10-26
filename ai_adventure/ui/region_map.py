@@ -10,6 +10,7 @@ from PySide6.QtWidgets import (
 )
 
 from ai_adventure.region_map import regional_map_layout, regional_map_request
+from ai_adventure.ui.primitives import _ImageViewerGraphicsView
 
 
 class RegionalMapDialog(QDialog):
@@ -24,8 +25,9 @@ class RegionalMapDialog(QDialog):
         self.setSizeGripEnabled(True)
         self.resize(1200, 820)
         self.scene = QGraphicsScene(self)
-        self.view = QGraphicsView(self.scene)
+        self.view = _ImageViewerGraphicsView(self.scene)
         self.view.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
+        self.view.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
         self.legend = QTextBrowser()
         self.legend.setMinimumWidth(290)
         self.status = QLabel()

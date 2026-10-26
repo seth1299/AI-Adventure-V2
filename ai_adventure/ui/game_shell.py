@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from functools import wraps
+from ai_adventure.ui.survival_controller import SurvivalController
 
 from ai_adventure.ui.common import *  # noqa: F401,F403
 from ai_adventure.ui.dialogues import *  # noqa: F401,F403
@@ -173,6 +174,11 @@ class GameShell(QWidget):
         self.visual_asset_coordinator.assets_changed.connect(
             self._handle_visual_assets_changed
         )
+        self._image_failure_popup: QMessageBox | None = None
+        self._image_failures: list[str] = []
+        self.visual_asset_coordinator.generation_failed.connect(
+            self._handle_image_generation_failed
+        )
         self.title_label = QLabel("No Save Loaded")
         self.title_label.setStyleSheet("font-size: 18px; font-weight: bold;")
 
@@ -183,6 +189,7 @@ class GameShell(QWidget):
         top_bar.addWidget(self.title_label)
         top_bar.addStretch()
         top_bar.addWidget(self.menu_button)
+        self.survival_controller = SurvivalController(self)
 
         self.tabs = QTabWidget()
         self.tab_bar = _DetachableTabBar(self.tabs)
@@ -316,6 +323,7 @@ class GameShell(QWidget):
 
         layout = QVBoxLayout()
         layout.addLayout(top_bar)
+        layout.addWidget(self.survival_controller.banner)
         layout.addWidget(self.tabs)
 
         self.setLayout(layout)
@@ -617,6 +625,7 @@ class GameShell(QWidget):
         """Restores detached screens when the player returns to the game shell."""
 
         super().showEvent(event)
+        self.survival_controller.schedule_check()
         for window in self._detached_windows.values():
             window.show()
 
@@ -731,6 +740,7 @@ class GameShell(QWidget):
 
         self._restore_all_smart_hidden_tabs()
         self.repository = repository
+        self.survival_controller.bind()
         self._tab_notifications.clear()
 
         if repository is None:
@@ -869,6 +879,8 @@ class GameShell(QWidget):
         """Refreshes tabs from saved data while preserving each screen's local state."""
 
         excluded_screens = exclude or set()
+        for screen in self.screens:
+            screen.sync_adventure_lock()
         previous_signatures = dict(self._tab_content_signatures)
 
         for screen in self.screens:
@@ -893,12 +905,42 @@ class GameShell(QWidget):
         self._reveal_populated_smart_hidden_tabs()
         if scan_visual_assets:
             self.visual_asset_coordinator.scan(self.repository)
+        self.survival_controller.schedule_check()
 
     @Slot()
     def _handle_visual_assets_changed(self) -> None:
         """Refreshes image-bearing surfaces after one background generation completes."""
 
         self.refresh_screens()
+
+    def _handle_image_generation_failed(self, repository, request, message: str) -> None:
+        """Surface background failures above the active image or wizard dialog."""
+
+        if self.repository is None or repository.db_path.resolve() != self.repository.db_path.resolve():
+            return
+        reason = message.strip() or "The image could not be generated."
+        self._image_failures.append(f"{request.display_name}: {reason}")
+        popup = self._image_failure_popup
+        if popup is None:
+            parent = QApplication.activeModalWidget() or self.window()
+            popup = QMessageBox(QMessageBox.Icon.Warning, "Image Generation Failed", "",
+                                QMessageBox.StandardButton.Ok, parent)
+            popup.setTextFormat(Qt.TextFormat.PlainText)
+            popup.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+            popup.finished.connect(self._clear_image_failure_popup)
+            self._image_failure_popup = popup
+        popup.setText(f"Could not generate an image for {request.display_name}."
+                      if len(self._image_failures) == 1
+                      else f"Image generation failed for {len(self._image_failures)} images.")
+        summary = reason if len(reason) <= 300 else reason[:297] + "..."
+        popup.setInformativeText(f"{summary}\n\nYou can try generating the image again or choose a local image.")
+        popup.setDetailedText("\n\n".join(self._image_failures))
+        if not popup.isVisible():
+            popup.open()
+
+    def _clear_image_failure_popup(self, _result: int) -> None:
+        self._image_failure_popup = None
+        self._image_failures.clear()
 
     def _handle_screen_repository_changed(self, source: RepositoryBackedWidget) -> None:
         """Refreshes tabs after a screen or event changes repository data."""

@@ -196,6 +196,7 @@ class ImageViewerDialog(QDialog):
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle(title or "Image")
+        self.setProperty("adventureMediaDialog", True)
         self.setModal(True)
         self.setWindowModality(Qt.WindowModality.ApplicationModal)
         self.setWindowFlags(
@@ -366,6 +367,7 @@ class RepositoryBackedWidget(QWidget):
     def __init__(self) -> None:
         super().__init__()
         self._repository: SaveRepository | None = None
+        self._adventure_locked = False
         self._visual_assets_dir: Path | None = None
         self.on_repository_changed: Callable[["RepositoryBackedWidget"], None] | None = None
         self.on_visual_asset_upload: (
@@ -403,7 +405,13 @@ class RepositoryBackedWidget(QWidget):
         """
 
         self._repository = repository
+        self.sync_adventure_lock()
         self.refresh()
+
+    def sync_adventure_lock(self) -> None:
+        from ai_adventure.ui.survival import adventure_ui_guard
+        locked = self._repository is not None and self._repository.survival_status()["fate"] != "alive"
+        adventure_ui_guard().set_locked(self, locked)
 
     def repository(self) -> SaveRepository | None:
         """
@@ -434,6 +442,7 @@ class RepositoryBackedWidget(QWidget):
         dialog = ImageFileDialog(self, "Select Image", image_picker_directory(
             self._visual_assets_dir, repository.db_path.parent if repository else None,
         ))
+        dialog.setProperty("adventureMediaDialog", True)
         dialog.setFileMode(QFileDialog.FileMode.ExistingFile)
         dialog.setNameFilters(
             ["Images (*.png *.jpg *.jpeg *.webp *.bmp)", "All Files (*)"]

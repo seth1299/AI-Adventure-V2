@@ -22,6 +22,7 @@ class TravelScreen(RepositoryBackedWidget):
         self.location_list = QListWidget()
         self.location_list.hide()
         self.location_selector = _NoWheelComboBox()
+        self.location_selector.setProperty("adventureViewControl", True)
         self.location_selector.setObjectName("travelLocationSelector")
         self.location_selector.currentIndexChanged.connect(
             self._display_selected_location

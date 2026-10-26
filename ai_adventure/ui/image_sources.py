@@ -18,10 +18,13 @@ class NewGameImageSourceDialog(QDialog):
         skip_image: Callable[[VisualAssetRequest], None],
         parent: QWidget | None = None,
         image_directory: str = "",
+        preview_path: Callable[[VisualAssetRequest], Path | None] | None = None,
     ) -> None:
         super().__init__(parent)
         self._choose_file_callback = choose_file
         self._image_directory = image_directory
+        self._preview_path = preview_path
+        self._preview_labels: dict[str, ClickableImageLabel] = {}
         self._create_image_callback = create_image
         self._skip_image_callback = skip_image
         self._requests = list(requests)
@@ -143,6 +146,12 @@ class NewGameImageSourceDialog(QDialog):
         )
         frame_layout.addWidget(heading)
         frame_layout.addWidget(description)
+        preview = ClickableImageLabel(frame)
+        preview.setObjectName("newGameImagePreview")
+        self._preview_labels[request.asset_id] = preview
+        frame_layout.addWidget(preview, alignment=Qt.AlignmentFlag.AlignCenter)
+        if self._refresh_preview(request):
+            status.setText("Image available; kept unless replaced")
         frame_layout.addWidget(status)
         frame_layout.addWidget(buttons)
         self._rows[request.asset_id] = (
@@ -152,6 +161,16 @@ class NewGameImageSourceDialog(QDialog):
             skip_button,
         )
         return frame
+
+    def _refresh_preview(self, request: VisualAssetRequest) -> bool:
+        """Shows the same cached or bundled artwork used by the game screens."""
+
+        path = self._preview_path(request) if self._preview_path is not None else None
+        return _set_generated_image(
+            self._preview_labels[request.asset_id], path,
+            maximum_width=128, maximum_height=128,
+            accessible_name=f"Image preview for {request.display_name}",
+        )
 
     def _copy_image_prompt(self, request: VisualAssetRequest) -> None:
         """Export a concise art brief for any image generator."""
@@ -190,8 +209,11 @@ class NewGameImageSourceDialog(QDialog):
     def _create_image(self, request: VisualAssetRequest) -> None:
         """Records a choice; paid work starts only after Next."""
         checkbox = self._rows[request.asset_id][2]
-        self._set_status(request, "Will generate after Next" if checkbox.isChecked()
-                         else "Will skip after Next")
+        message = "Will generate after Next"
+        if not checkbox.isChecked():
+            message = ("Will keep existing image after Next"
+                       if self._refresh_preview(request) else "Will skip after Next")
+        self._set_status(request, message)
 
     def _select_all(self) -> None:
         answer = QMessageBox.warning(
@@ -213,7 +235,8 @@ class NewGameImageSourceDialog(QDialog):
         checkbox = self._rows[request.asset_id][2]
         if checkbox is not None:
             checkbox.setChecked(False)
-        self._set_status(request, "Will skip after Next")
+        self._set_status(request, "Will keep existing image after Next"
+                         if self._refresh_preview(request) else "Will skip after Next")
 
     def _skip_all(self) -> None:
         """Clear generation choices while preserving uploaded images."""
@@ -257,6 +280,8 @@ class NewGameImageSourceDialog(QDialog):
         """Marks a row complete and waits for any remaining selected images."""
 
         status, upload_button, generate_button, skip_button = self._rows[request.asset_id]
+        if self._refresh_preview(request) and message == "Skipped for now":
+            message = "Using existing image"
         status.setText(message)
         upload_button.setEnabled(False)
         if generate_button is not None:

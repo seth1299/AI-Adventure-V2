@@ -13,6 +13,12 @@ from ai_adventure.stats import (ATTRIBUTES, MAX_PLAYER_LEVEL, PLAYER_XP_AWARDS,
                                 attribute_modifier, carrying_capacity, health_max, normalize_attributes)
 
 
+def _d20_record(row: Any) -> dict[str, Any]:
+    record = dict(row)
+    return {**record, "rolls": json.loads(record["rolls_json"]),
+            "survival_values": json.loads(record.get("survival_values_json", "{}"))}
+
+
 class PlayerStatsRepository:
     if TYPE_CHECKING:
         # SaveRepository supplies these persistence operations at runtime; declaring
@@ -38,26 +44,28 @@ class PlayerStatsRepository:
                                (message_id, event_key, json.dumps(result)))
 
     def record_d20_test(self, **test: Any) -> dict[str, Any]:
+        test.setdefault("survival_modifier", 0)
+        test.setdefault("survival_values", {})
         with self._connect() as connection:
             previous = connection.execute("SELECT * FROM d20_tests WHERE request_id = ?", (test["request_id"],)).fetchone()
             if previous is not None:
-                return {**dict(previous), "rolls": json.loads(previous["rolls_json"])}
-            keys = ("attribute", "test_kind", "attribute_modifier", "skill_bonus", "reason", "message_id", "request_id", "skill_name", "level", "bonus", "roll", "total", "dc", "outcome")
+                return _d20_record(previous)
+            keys = ("attribute", "test_kind", "attribute_modifier", "skill_bonus", "reason", "message_id", "request_id", "skill_name", "level", "bonus", "roll", "total", "dc", "outcome", "survival_modifier")
             connection.execute(
-                f"INSERT INTO d20_tests ({', '.join(keys)}, rolls_json, created_at) VALUES ({', '.join('?' for _ in keys)}, ?, ?)",
-                tuple(test[k] for k in keys) + (json.dumps(test["rolls"]), datetime.now().isoformat(timespec="seconds")),
+                f"INSERT INTO d20_tests ({', '.join(keys)}, rolls_json, survival_values_json, created_at) VALUES ({', '.join('?' for _ in keys)}, ?, ?, ?)",
+                tuple(test[k] for k in keys) + (json.dumps(test["rolls"]), json.dumps(test["survival_values"]), datetime.now().isoformat(timespec="seconds")),
             )
         return test
 
     def find_d20_test(self, request_id: str) -> dict[str, Any] | None:
         with self._connect() as connection:
             row = connection.execute("SELECT * FROM d20_tests WHERE request_id = ?", (request_id,)).fetchone()
-        return {**dict(row), "rolls": json.loads(row["rolls_json"])} if row else None
+        return _d20_record(row) if row else None
 
     def list_d20_tests(self, limit: int = 10) -> list[dict[str, Any]]:
         with self._connect() as connection:
             rows = connection.execute("SELECT * FROM d20_tests ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
-        return [{**dict(row), "rolls": json.loads(row["rolls_json"])} for row in rows]
+        return [_d20_record(row) for row in rows]
 
     def initialize_player_stats(self, attributes: dict[str, int], level: int = 1) -> None:
         if type(level) is not int or not 1 <= level <= MAX_PLAYER_LEVEL:

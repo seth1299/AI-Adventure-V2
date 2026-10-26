@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from ai_adventure.container_flow import ContainerFlowError
 from ai_adventure.suggested_actions import compose_action_prompt
+from ai_adventure.survival import SURVIVAL_METERS
 
 from ai_adventure.ui.common import *  # noqa: F401,F403
 from ai_adventure.ui.dialogues import *  # noqa: F401,F403
@@ -86,6 +87,29 @@ class StoryScreen(RepositoryBackedWidget):
         status_row.addWidget(_status_label("Weather", self.weather_value))
         status_row.addStretch()
 
+        self.survival_bars_box = QWidget()
+        survival_layout = QVBoxLayout(self.survival_bars_box)
+        survival_layout.setContentsMargins(0, 0, 0, 0)
+        survival_layout.setSpacing(3)
+        self.survival_bars: dict[str, QProgressBar] = {}
+        for meter, color in zip(SURVIVAL_METERS, ("#d2b48c", "#add8e6", "#b8d9a7")):
+            bar = QProgressBar()
+            bar.setObjectName(f"story{meter.title()}Bar")
+            bar.setAccessibleName(meter.title())
+            bar.setRange(0, 100)
+            bar.setValue(100)
+            bar.setFormat(f"{meter.title()}: %p%")
+            bar.setFixedHeight(22)
+            bar.setToolTip("Higher is better: 100% is full; 0% is depleted.")
+            bar.setStyleSheet(
+                "QProgressBar { background-color: #edf0f3; color: #17202a; "
+                "border: 1px solid #87929c; border-radius: 3px; text-align: center; } "
+                f"QProgressBar::chunk {{ background-color: {color}; }}"
+            )
+            self.survival_bars[meter] = bar
+            survival_layout.addWidget(bar)
+        self.survival_bars_box.hide()
+
         self.conversation_scroll = QScrollArea()
         self.conversation_scroll.setWidgetResizable(True)
         self.conversation_scroll.setFrameShape(QFrame.Shape.NoFrame)
@@ -147,6 +171,7 @@ class StoryScreen(RepositoryBackedWidget):
         conversation_toolbar.addStretch()
         layout.addLayout(conversation_toolbar)
         layout.addLayout(status_row)
+        layout.addWidget(self.survival_bars_box)
         location_image_row = QHBoxLayout()
         location_image_row.setContentsMargins(0, 0, 0, 0)
         location_image_row.addStretch()
@@ -214,8 +239,10 @@ class StoryScreen(RepositoryBackedWidget):
         """Refreshes the story output from history."""
 
         repository = self.repository()
+        self.sync_adventure_lock()
 
         if repository is None:
+            self.survival_bars_box.hide()
             self._clear_conversation_messages()
             self.load_older_messages_button.hide()
             self.view_hidden_messages_button.hide()
@@ -225,6 +252,10 @@ class StoryScreen(RepositoryBackedWidget):
             return
 
         state = StateManager(repository).load_state(history_limit=0)
+        self.survival_bars_box.setVisible(state.settings.values.get("survival.enabled") is True)
+        for meter, bar in self.survival_bars.items():
+            value = getattr(state.player, meter)
+            bar.setValue(value if value is not None else 100)
         if self._initial_generation_pending:
             self._show_unresolved_status()
         else:
@@ -285,6 +316,8 @@ class StoryScreen(RepositoryBackedWidget):
                         content,
                         _safe_int(entry.get("id"), -1),
                         str(entry.get("message_id", "") or ""),
+                        None, "", None, [], [],
+                        str(entry.get("game_time", "") or ""),
                     )
                 )
             elif kind in {"story", "story_oog"}:
@@ -329,6 +362,7 @@ class StoryScreen(RepositoryBackedWidget):
                             visible_content,
                             [],
                             [],
+                            str(entry.get("game_time", "") or ""),
                         )
                     )
                     continue
@@ -352,6 +386,7 @@ class StoryScreen(RepositoryBackedWidget):
                             segment_text,
                             segment.get("sound_effect_cues", []),
                             segment.get("speaker_cues", []),
+                            str(entry.get("game_time", "") or ""),
                         )
                     )
 
@@ -486,6 +521,7 @@ class StoryScreen(RepositoryBackedWidget):
                 speaker_cues=speaker_cues,
                 show_visual_assets=show_visual_assets,
                 is_opening_message=is_opening_message,
+                game_time=str(entry[10]) if len(entry) > 10 else "",
             )
             if (
                 role == "ai"
@@ -563,6 +599,7 @@ class StoryScreen(RepositoryBackedWidget):
         speaker_cues: list[dict[str, str]] | None = None,
         show_visual_assets: bool = False,
         is_opening_message: bool = False,
+        game_time: str = "",
     ) -> QWidget:
         """Builds one readable AI or player chat bubble."""
 
@@ -589,7 +626,10 @@ class StoryScreen(RepositoryBackedWidget):
             if not is_player and not is_out_of_game and turn_number is not None
             else ""
         )
-        header = QLabel(f"{speaker}  |  {mode_label}{turn_label}")
+        header = QLabel(
+            f"{speaker}  |  {mode_label}{turn_label}  |  {game_time or 'Time unknown'}"
+        )
+        header.setWordWrap(True)
         header.setStyleSheet("font-size: 11px; font-weight: 700;")
         narration_enabled = self.narration_player is not None and (
             repository is None
@@ -1011,6 +1051,7 @@ class StoryScreen(RepositoryBackedWidget):
         latest_ai = self._latest_ai_message_entry()
         if (
             repository is None
+            or repository.survival_status()["fate"] != "alive"
             or latest_ai is None
             or str(latest_ai.get("kind", "")).casefold() != "story"
             or str(latest_ai.get("message_id", "")).strip() != str(message_id).strip()
@@ -1100,11 +1141,13 @@ class StoryScreen(RepositoryBackedWidget):
             self.mode_button.setText("Mode: Out-of-Game")
             self.mode_button.setStyleSheet(
                 "QPushButton { background-color: #6d28d9; color: white; font-weight: 700; }"
+                "QPushButton:disabled { background-color: #6b7280; color: #d1d5db; }"
             )
         else:
             self.mode_button.setText("Mode: Live Game")
             self.mode_button.setStyleSheet(
                 "QPushButton { background-color: #2563eb; color: white; font-weight: 700; }"
+                "QPushButton:disabled { background-color: #6b7280; color: #d1d5db; }"
             )
 
     def _conversation_mode(self) -> str:
@@ -1233,7 +1276,7 @@ class StoryScreen(RepositoryBackedWidget):
 
         repository = self.repository()
 
-        if repository is None:
+        if repository is None or repository.survival_status()["fate"] != "alive":
             return False
 
         player_text = player_text.strip()
@@ -1285,7 +1328,7 @@ class StoryScreen(RepositoryBackedWidget):
 
         repository = self.repository()
 
-        if repository is None:
+        if repository is None or repository.survival_status()["fate"] != "alive":
             return
 
         latest_story = self._latest_story_entry()
@@ -1658,10 +1701,10 @@ class StoryScreen(RepositoryBackedWidget):
         """Enables input according to request state and explicit mode."""
 
         is_out_of_game = self._conversation_mode() == "out_of_game"
-        can_submit = not self._waiting_for_gm
+        can_submit = not self._waiting_for_gm and not self._adventure_locked
         self.player_input.setEnabled(can_submit)
         self.submit_button.setEnabled(can_submit)
-        self.mode_button.setEnabled(not self._waiting_for_gm)
+        self.mode_button.setEnabled(can_submit)
         self._refresh_suggested_action_buttons()
 
         if self._waiting_for_gm:
@@ -1690,6 +1733,7 @@ class StoryScreen(RepositoryBackedWidget):
 
         self.continue_button.setEnabled(
             not self._waiting_for_gm
+            and not self._adventure_locked
             and self._conversation_mode() == "live_game"
             and self.repository() is not None
             and self._latest_story_entry() is not None

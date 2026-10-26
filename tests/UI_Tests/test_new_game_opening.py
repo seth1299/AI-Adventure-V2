@@ -23,6 +23,118 @@ class NewGameOpeningTests(QtTestCase):
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication([])
 
+    def test_wizard_save_as_tracks_last_successful_template_name(self):
+        from PySide6.QtWidgets import QInputDialog, QMessageBox
+        from ai_adventure.new_game_templates import load_new_game_templates, save_new_game_template
+
+        self.window.playtesting_build = False
+        path = self.window.app_paths.new_game_templates_path
+        save_new_game_template(path, self.setup, template_name="Original")
+        original_setup = load_new_game_templates(path, normalize_setups=False)[0].setup
+        wizard = Mock()
+        wizard.build_setup.return_value = self.setup
+
+        def use_wizard():
+            save = wizard_type.call_args.kwargs["on_save_as"]
+            self.assertTrue(save(self.setup))
+            self.assertEqual(prompt.call_args.args[-1], "Original")
+            self.assertFalse(save(self.setup))  # Cancelled naming dialog.
+            self.assertEqual(prompt.call_args.args[-1], "New Copy")
+            with patch("ai_adventure.ui.main_window.save_new_game_template", return_value=False):
+                self.assertFalse(save(self.setup))
+            self.assertEqual(prompt.call_args.args[-1], "New Copy")
+            self.assertTrue(save(self.setup))
+            self.assertEqual(prompt.call_args.args[-1], "New Copy")
+            edited = normalize_new_game_setup({**self.setup, "game_style": "Saved directly without a popup"})
+            wizard.build_setup.return_value = edited
+            prompt_count, confirmation_count = prompt.call_count, information.call_count
+            self.assertTrue(wizard_type.call_args.kwargs["on_save_and_exit"](edited))
+            self.assertEqual(prompt.call_count, prompt_count)
+            self.assertEqual(information.call_count, confirmation_count)
+            question.assert_called_once()
+            return QDialog.DialogCode.Accepted
+
+        wizard.exec.side_effect = use_wizard
+        with patch.object(self.window, "_choose_new_game_template_setup", return_value=(True, self.setup, "Original")), \
+                patch("ai_adventure.ui.main_window.NewGameWizard", return_value=wizard) as wizard_type, \
+                patch.object(QInputDialog, "getText", side_effect=[
+                    (" New Copy ", True), ("Cancelled", False), ("Failed Copy", True), ("New Copy", True),
+                ]) as prompt, \
+                patch.object(QMessageBox, "information") as information, \
+                patch.object(QMessageBox, "warning"), \
+                patch.object(QMessageBox, "question", return_value=QMessageBox.StandardButton.Yes) as question, \
+                patch.object(self.window, "_prompt_for_modified_template_action") as modified, \
+                patch.object(self.window, "_create_new_game_from_setup") as create:
+            self.window.start_new_game_wizard()
+        modified.assert_not_called()
+        self.assertEqual(create.call_args.kwargs["image_template_name"], "New Copy")
+        templates = load_new_game_templates(path, normalize_setups=False)
+        self.assertEqual({template.name for template in templates}, {"Original", "New Copy"})
+        self.assertEqual(next(template.setup for template in templates if template.name == "Original"),
+                         original_setup)
+        self.assertEqual(next(template.setup for template in templates if template.name == "New Copy")["game_style"],
+                         "Saved directly without a popup")
+
+    def test_unnamed_wizard_save_prompts_for_first_name_and_reports_write_failures(self):
+        from PySide6.QtWidgets import QInputDialog, QMessageBox
+        with patch.object(QInputDialog, "getText", return_value=("First Draft", True)) as prompt, \
+                patch.object(QMessageBox, "information") as information:
+            self.assertEqual(self.window._save_new_game_wizard_progress(self.setup, save_as=False), "First Draft")
+            prompt.assert_called_once()
+            information.assert_called_once()
+        with patch("ai_adventure.ui.main_window.save_new_game_template", return_value=False), \
+                patch.object(QInputDialog, "getText") as prompt, \
+                patch.object(QMessageBox, "information") as information, \
+                patch.object(QMessageBox, "warning") as warning:
+            self.assertIsNone(self.window._save_new_game_wizard_progress(
+                self.setup, suggested_name="First Draft", save_as=False))
+            prompt.assert_not_called()
+            information.assert_not_called()
+            warning.assert_called_once()
+
+    def test_source_dialog_previews_bundled_skill_and_crafting_art_without_generation(self):
+        from PIL import Image
+        from ai_adventure.visual_assets import build_visual_asset_requests
+
+        art = self.root / "bundled"
+        (art / "skills").mkdir(parents=True)
+        (art / "items").mkdir()
+        skill_path = art / "skills" / "alchemy.png"
+        item_path = art / "items" / "Backpack.png"
+        Image.new("RGBA", (64, 64), (100, 80, 50, 128)).save(skill_path)
+        Image.new("RGB", (64, 64), (40, 70, 100)).save(item_path)
+        coordinator = self.window.game_shell.visual_asset_coordinator
+        with patch("ai_adventure.bundled_images.bundled_images_root", return_value=art):
+            self.repository.upsert_skill("Alchemy", "Brew potions.", 1)
+            self.repository.add_crafting_item(
+                name="Backpack", description="A leather pack.", default_image="items/Backpack.png",
+            )
+            requests = [request for request in build_visual_asset_requests(self.repository)
+                        if request.display_name in {"Alchemy", "Backpack"}]
+            self.assertEqual(len(requests), 2)
+
+            def choose(dialog):
+                for request in requests:
+                    preview = dialog._preview_labels[request.asset_id]
+                    expected = skill_path if request.subject_type == "skill" else item_path
+                    self.assertEqual(preview.property("imageViewerPath"), str(expected))
+                    self.assertFalse(preview.pixmap().isNull())
+                    self.assertFalse(preview.isHidden())
+                    self.assertIn("kept unless replaced", dialog._rows[request.asset_id][0].text())
+                create.assert_not_called()
+                dialog.continue_button.click()
+                for request in requests:
+                    self.assertEqual(dialog._rows[request.asset_id][0].text(), "Using existing image")
+                return dialog.result()
+
+            with patch.object(coordinator, "create_initial_image") as create, \
+                    patch.object(self.window, "_finish_initial_visual_generation"), \
+                    patch.object(NewGameImageSourceDialog, "exec", choose):
+                self.window._show_new_game_image_source_dialog(self.repository, requests)
+                create.assert_not_called()
+            for request in requests:
+                self.assertIsNotNone(self.repository.get_visual_asset(request.subject_type, request.subject_key))
+
     def setUp(self):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)

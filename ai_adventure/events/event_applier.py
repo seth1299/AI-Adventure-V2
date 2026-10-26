@@ -31,6 +31,7 @@ from ai_adventure.context.creative_guardrails import (
 from ai_adventure.items import normalize_item_metadata
 from ai_adventure.story_preferences import normalize_fighting_preferences
 from ai_adventure.stats import DEFAULT_PLAYER_MAX_HEALTH
+from ai_adventure.survival import SURVIVAL_METERS, survival_percentage
 from ai_adventure.container_access import has_immediate_container_unlock_method
 from ai_adventure.container_flow import container_test_succeeded, ContainerFlowError, selected_contents, validate_contents_manifest
 from ai_adventure.inventory_storage import move_error, carry_priority
@@ -114,6 +115,7 @@ class EventApplier:
         """
 
         with self.repository.transaction(), self.repository.message_context(self.message_id):
+            self.repository.require_active_adventure()
             return self._apply_events(raw_events, prior_results=prior_results)
 
     def _apply_events(
@@ -225,6 +227,8 @@ class EventApplier:
 
         event_type, payload = normalize_event(raw_event)
 
+        if self.repository.survival_status()["fate"] != "alive":
+            return _invalid(event_type, payload, "The player has died; resolve their fate before play can continue.")
         try:
             if event_type in {"InventoryItemAddedEvent", "ItemAddedEvent"}:
                 return self._apply_inventory_item_added(event_type, payload)
@@ -1098,10 +1102,15 @@ class EventApplier:
         roll = max(rolls) if advantage and not disadvantage else min(rolls)
         modifier = self.repository.player_stats()["modifiers"][attribute]
         level = int(skill["level"]) if skill else 0
-        total = roll + modifier + level
+        survival = self.repository.survival_status()
+        survival_modifier = survival["roll_modifier"]
+        total = roll + modifier + level + survival_modifier
         resolved = {**payload, "attribute": attribute, "test_kind": kind, "attribute_modifier": modifier,
                     "skill_bonus": level, "skill_name": skill["name"] if skill else "", "level": level,
-                    "bonus": modifier + level, "roll": roll, "rolls": rolls, "total": total, "dc": dc,
+                    "bonus": modifier + level + survival_modifier,
+                    "survival_modifier": survival_modifier,
+                    "survival_values": {meter: survival[meter] for meter in SURVIVAL_METERS} if survival["enabled"] else {},
+                    "roll": roll, "rolls": rolls, "total": total, "dc": dc,
                     "outcome": "success" if total >= dc else "failure", "reason": reason,
                     "message_id": self.message_id or "", "request_id": source}
         with self.repository.transaction():
@@ -1148,6 +1157,14 @@ class EventApplier:
     ) -> AppliedEventResult:
         """Applies StatusUpdatedEvent."""
 
+        survival_updates: dict[str, int] = {}
+        if self.repository.get_setting("survival.enabled", False) is True:
+            for meter in SURVIVAL_METERS:
+                if meter in payload:
+                    if type(payload[meter]) is not int:
+                        return _invalid(event_type, payload, f"{meter} must be an integer percentage.")
+                    survival_updates[meter] = survival_percentage(payload[meter])
+
         location = _first_text(payload, "location", "new_location")
         weather = _first_text(payload, "weather")
         minutes_passed = _optional_int(payload, "minutes_passed", "minutes", "time")
@@ -1174,6 +1191,10 @@ class EventApplier:
                 "time",
                 str(calendar_snapshot["display_label"]),
             )
+
+        for meter, value in survival_updates.items():
+            self.repository.set_state_value(f"player.{meter}", str(value))
+        self.repository.mark_survival_death()
 
         return AppliedEventResult(
             event_type,
