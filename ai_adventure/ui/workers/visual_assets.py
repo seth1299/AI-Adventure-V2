@@ -30,6 +30,7 @@ class _VisualAssetCoordinator(QObject):
         self._queued_asset_ids: set[str] = set()
         self._thread: QThread | None = None
         self._worker: QObject | None = None
+        self._active_subject: tuple[str, str, str] | None = None
         self._initial_batch_repositories: set[str] = set()
         self._source_selection_repositories: set[str] = set()
         self._initial_batch_repository_objects: dict[str, SaveRepository] = {}
@@ -322,6 +323,22 @@ class _VisualAssetCoordinator(QObject):
         skipped_record_count = 0
         skipped_key_count = 0
         for request in requests:
+            if request.subject_type == "npc":
+                existing = repository.get_visual_asset("npc", request.subject_key)
+                requested = repository.get_visual_asset_by_id(request.asset_id)
+                explicit_retry = bool(requested and requested.get("status") == "queued"
+                                      and requested.get("generation_requested", 0) > 0)
+                if existing and (self.images_dir / existing["filename"]).is_file() and not explicit_retry:
+                    repository.link_visual_asset_messages(existing["asset_id"], request.message_ids)
+                    ready_count += 1
+                    continue
+                subject = (str(repository.db_path), request.subject_type, request.subject_key)
+                if self._active_subject == subject or any(
+                    (str(queued_repository.db_path), queued_request.subject_type, queued_request.subject_key) == subject
+                    for queued_repository, queued_request, _model, _limit in self._queue
+                ):
+                    skipped_record_count += 1
+                    continue
             relative_filename = save_relative_image_filename(repository, request)
             target_path = AssetGenerationService.target_path(
                 repository, request, self.images_dir
@@ -487,6 +504,7 @@ class _VisualAssetCoordinator(QObject):
             thread.finished.connect(self._clear_worker)
             self._thread = thread
             self._worker = worker
+            self._active_subject = (str(repository.db_path), request.subject_type, request.subject_key)
             thread.start()
             return
 
@@ -559,6 +577,7 @@ class _VisualAssetCoordinator(QObject):
             self._thread = None
         if worker is None or self._worker is worker:
             self._worker = None
+            self._active_subject = None
         LOGGER.debug(
             "Visual asset worker finished; %s request(s) remain queued.",
             len(self._queue),

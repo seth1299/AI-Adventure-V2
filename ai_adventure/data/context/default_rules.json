@@ -29,6 +29,7 @@
           "Return valid JSON only, with no Markdown fence.",
           "Treat conversation_mode as authoritative. For out_of_game, answer directly with out_of_game=true, suggested_actions=[], and events=[]; do not advance the turn counter or change status, time, combat, skills, inventory, tasks, NPC memory, secrets, miscellaneous canon, music, or any durable state. For live_game, return out_of_game=false and resolve the message in-world. Never infer or override the mode from wording.",
           "Only put player-facing text in response.",
+          "Preserve existing NPC IDs, internal names and established identity/appearance during routine conversation. Use NpcKnowledgeAddedEvent for learned facts. NpcUpsertedEvent must include profile_change_reason explaining specific established evidence or an observable change before replacing a nonblank display_name, role, public_description, gender_identity, age or species. Blank fields can be filled normally. Never rephrase an existing appearance merely to refresh a profile. Automatic image scans retain existing NPC portraits; only the player's explicit image selection or generation replaces them.",
           "Use printable ASCII English characters in every generated string. Transliterate accented Latin letters to unaccented English and never return foreign scripts, IPA, phoneme strings, pronunciation annotations, or pronunciation_map. Python enforces this before generated text reaches state, UI, persistence, or TTS.",
           "Return one speaker_cues record for every contiguous non-narrator spoken span in response. Copy the complete exact span including outer double quotation marks into a unique anchor_text. Use an actual NPC's exact npc_id as speaker_id and reuse it on later turns; use distinct stable lower_snake_case IDs for other speakers. speaker_name becomes the visible chat-bubble label, so use the known name or a concise player-safe description when the name is unknown. Choose voice_profile only from established audible traits and use neutral when unspecified. Return an empty array when only the narrator speaks or in out_of_game mode. Python owns same-turn bubble splitting, final installed voice selection, and durable assignment.",
           "Use supported events for inventory, active tasks, skills, currency, combat, recipes, reagents, NPCs, miscellaneous world canon, music, spells, flags, travel, locations, and status changes. When a named or materially important NPC first appears and the Player can recognize or remember them, include exactly one NpcUpsertedEvent in that same response, even when the selected context tags do not include dialogue. Do not create NPC profiles for unnamed background people or passing extras. If the NPC speaks, speaker_cues.speaker_id must exactly match that profile's npc_id.",
@@ -794,11 +795,15 @@
           "y_miles",
           "terrain",
           "travel_multiplier",
-          "travel_notes"
+          "travel_notes",
+          "weather",
+          "music_filename"
         ],
         "purpose": "Adds or updates player-known locations in the Travel tab so the application can calculate route distance and estimated travel time.",
         "rules": [
           "Use this when the player learns a location or learns new player-visible details about a known location.",
+          "Each location stores music_filename from the available music catalog. Choose a track fitting its environment and atmosphere; never invent filenames. Safe Travel-tab arrivals restore that track locally, respecting music-enabled and volume settings. Hidden assessments assign destination music without changing the origin's playback.",
+          "Keep each location's weather current with actual conditions rather than AUTO. StatusUpdatedEvent records weather at the player's resulting location too. Route safety is private and directional from the current location. The application handles assessed-safe Travel-tab trips locally using StatusUpdatedEvent and estimated minutes, then reassesses in the background. Unsafe or unassessed trips use normal story/check handling. Never reveal safety labels or hidden assessment results in player-facing descriptions, route notes, narration or suggestions.",
           "Use one shared global coordinate frame measured in miles; north is positive y. Reserve (0, 0) for a single main region or regional map anchor when that place is known. The player's starting location is not automatically the origin. Every other distinct location, including cities, shops, clearings and other sublocations, must have its own distinct (x_miles, y_miles) pair. Either axis may be zero; the pair must be unique. Use at least 0.01-mile separation for distinct nearby sites so positions remain distinct at saved precision. Place sublocations plausibly near their parents using global coordinates, never parent-relative offsets. Distances must fit the setting and route notes. Never use (0, 0) as a default for missing coordinates or reset coordinates when the player moves. Preserve established map positions; do not rebase an existing map or invent an undiscovered region just to supply an origin.",
           "Description, terrain, and travel_notes must contain only player-known facts. Put player-known local religion, culture, economy, factions, laws, customs, landmarks, and practical context for that place in description or travel_notes. Make description concise, concrete, and visually depictable. Do not include secret routes, hidden dangers, mystery solutions, or GM-only information.",
           "travel_multiplier must be positive. Use values below 1 for terrain that slows ordinary travel and values above 1 only for reliably faster routes.",
@@ -923,13 +928,14 @@
           "`Category` should be a plain label such as Quest, Commission, Order, Delivery, Favor, Debt, Research, or Task.",
           "`Status` should be concise, such as Active, Waiting, In Progress, Ready for Pickup, or Pending.",
           "Every new task requires a complete player-visible `Description` explaining what must be done, all currently known relevant people and places, and how the Player can recognize completion. Include only player-known facts. An update may omit it only when the saved description remains complete and unchanged. Repair a blank or incomplete saved description with ActiveTaskUpsertedEvent as soon as that task is relevant.",
-          "Do not leave visible task fields blank. The Calendar Tasks & Deadlines view shows Description, Requester, Location, Reward, and Due Date directly.",
+          "Do not leave visible task fields blank. The main Time-Sensitive Events tab shows task details, location, state and remaining time; include the description, requester, reward and due date in task records.",
           "`Requester` may be an NPC, faction, shop, customer, or Self. Use Self for personal goals.",
           "`Location` should be where the task is relevant, picked up, completed, worked on, or turned in. For self-directed crafting or item creation, use the player's workshop or another logical workspace if one is established.",
           "`Reward` may describe payment, promised reward, cost already paid, Unknown if a real reward exists but is unclear, or N/A if nobody is paying or trading for the task.",
           "`Due Date` should be an exact in-world date and time or N/A if there is no known deadline.",
           "`due_elapsed_minutes` should be the absolute in-world elapsed minute for the deadline, or -1 when there is no known deadline.",
-          "Do not add `notes`, `Notes`, or other extra fields to ActiveTaskUpsertedEvent."
+          "Do not add `notes`, `Notes`, or other extra fields to ActiveTaskUpsertedEvent.",
+          "Use TimedEventUpsertedEvent for durable processes such as plant growth, incubation, fermentation, recovery and construction rather than inventing quest obligations. Track separate plants/batches, related locations, states, notes and estimates per the timed_events response contract. Preserve explicit counts; infer reasonable counts from context when unstated, mark quantity_is_estimate=true and explain the assumption in notes. Retain established count estimates unless evidence changes. Do not duplicate application-owned crafting timers."
         ]
       }
     },

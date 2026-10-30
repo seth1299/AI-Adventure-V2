@@ -66,6 +66,39 @@ class SubjectHistoryTests(unittest.TestCase):
         StoryTurnService.record_player_action(self.repo, "Ask her about that.", message_id="followup")
         self.assertEqual(self.repo.list_history(limit=1)[0]["subjects"], [self.subject])
 
+    def test_quoted_followup_keeps_partner_despite_location_mismatch_and_oog_interruption(self):
+        self.exchange('chat', 'Greet Mara Vale.', 'Mara Vale offers to lend two books.')
+        self.repo.set_state_value('location', 'City')  # NPC is at Harbor, like the Vanja incident.
+        self.repo.append_history('player_oog', 'We should be at Harbor.')
+        self.repo.append_history('story_oog', 'Noted.')
+        command = '"Most excellent. Whcih am I able to check out, and when do you need them back by?"'
+        self.assertEqual(StoryTurnService.history_subjects_for_action(self.repo, command), [self.subject])
+        StoryTurnService.record_player_action(self.repo, command, message_id='followup')
+        packet = StoryTurnService.build_context_packet(self.repo, command)
+        self.assertEqual([npc['npc_id'] for npc in packet['state']['npcs']['relevant']], [self.npc['id']])
+        self.assertIn('Mara Vale', build_gemini_story_prompt(packet))
+
+    def test_item_reference_does_not_displace_conversation_partner(self):
+        self.repo.add_inventory_item('Amber Locket', 'Valuable', 1, 'A small locket.')
+        self.exchange('chat', 'Greet Mara Vale.', 'Mara Vale offers to inspect the Amber Locket.')
+        subjects = StoryTurnService.history_subjects_for_action(self.repo, '"What do you know about the Amber Locket?"')
+        self.assertIn(self.subject, subjects)
+        self.assertTrue(any(subject['type'] == 'item' for subject in subjects))
+
+    def test_naming_another_npc_and_new_scene_end_inheritance(self):
+        other = self.repo.upsert_npc(npc_id='npc_bren', name='Bren', location='Market')
+        self.exchange('chat', 'Greet Mara Vale.', 'Mara Vale waves.')
+        self.assertEqual(StoryTurnService.history_subjects_for_action(self.repo, 'Ask Bren about work.'),
+                         [{'type': 'npc', 'id': other['id']}])
+        self.repo.append_history('story', 'Arrived at **Market** after 10 minutes.')
+        self.assertEqual(StoryTurnService.history_subjects_for_action(self.repo, '"Hello there."'), [])
+
+    def test_legacy_speaker_metadata_can_supply_partner_without_subject_links(self):
+        self.repo.append_history('story', '"Welcome."',
+                                 speaker_cues=[{'speaker_id': self.npc['id'], 'speaker_name': 'Mara Vale',
+                                                'anchor_text': '"Welcome."'}])
+        self.assertEqual(StoryTurnService.history_subjects_for_action(self.repo, 'Yes, please.'), [self.subject])
+
     def test_item_subjects_use_catalog_id_and_survive_inventory_removal(self):
         self.repo.add_inventory_item("Amber Locket", "Valuable", 1, "A small locket.")
         item = next(item for item in self.repo.list_item_catalog() if item["name"] == "Amber Locket")

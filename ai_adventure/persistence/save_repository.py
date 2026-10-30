@@ -10,9 +10,9 @@ import re
 import shutil
 import sqlite3
 import uuid
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from contextlib import contextmanager, closing
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from threading import local
@@ -53,11 +53,12 @@ from ai_adventure.currency import (
     normalize_currency_denominations,
 )
 from ai_adventure.item_categories import normalize_inventory_category
-from ai_adventure.inventory_storage import inventory_access, move_destinations, move_error, inventory_load, capacity_error, pounds
+from ai_adventure.inventory_storage import inventory_access, move_destinations, move_error, inventory_load, capacity_error, pounds, batch_move_destinations, plan_batch_move
 from ai_adventure.persistence.inventory_containers import synchronize_container_records
 from ai_adventure.new_game_setup import normalize_new_game_setup
 from ai_adventure.survival import SURVIVAL_METERS
 from ai_adventure.persistence.survival import SurvivalRepository
+from ai_adventure.persistence.timed_events import TimedEventsRepository
 from ai_adventure.narration_preferences import (
     DEFAULT_NARRATION_STYLE,
     DEFAULT_NARRATION_TENSE,
@@ -114,7 +115,7 @@ class SaveFileOperationError(ValueError):
     """Raised when a save file operation cannot be performed safely."""
 
 
-class SaveRepository(PlayerStatsRepository, SurvivalRepository):
+class SaveRepository(PlayerStatsRepository, SurvivalRepository, TimedEventsRepository):
     """
     SQLite-backed repository for one adventure save.
 
@@ -935,7 +936,7 @@ class SaveRepository(PlayerStatsRepository, SurvivalRepository):
 
     def move_inventory_item(self, item_id: str, destination: str) -> None:
         """Atomically move one existing stack, preserving its catalog identity."""
-        with self.transaction() as connection:
+        with self.transaction():
             items = self.list_inventory_items()
             by_id = {str(item["id"]): item for item in items}
             if destination not in by_id:
@@ -945,6 +946,26 @@ class SaveRepository(PlayerStatsRepository, SurvivalRepository):
             error = move_error(item_id, destination, items, self.get_state_value("location", ""), self.player_carrying_capacity_lb(), self.get_travel_locations())
             if error:
                 raise ValueError(error)
+            self._relocate_inventory_item(item_id, destination)
+
+    def inventory_batch_move_destinations(self, item_ids: list[str]) -> list[tuple[str, str]]:
+        return batch_move_destinations(item_ids, self.list_inventory_items(), self.get_state_value("location", ""),
+                                       self.player_carrying_capacity_lb(), self.get_travel_locations())
+
+    def move_inventory_items(self, item_ids: list[str], destination: str) -> None:
+        """Move whole stacks together or roll back the entire selection."""
+        with self.transaction():
+            self.require_active_adventure()
+            roots = plan_batch_move(item_ids, destination, self.list_inventory_items(),
+                                    self.get_state_value("location", ""), self.player_carrying_capacity_lb(),
+                                    self.get_travel_locations())
+            for item_id in roots:
+                self._relocate_inventory_item(item_id, destination)
+
+    def _relocate_inventory_item(self, item_id: str, destination: str) -> None:
+        """Persist one move after validating either a single or complete batch plan."""
+        with self.transaction() as connection:
+            by_id = {str(item["id"]): item for item in self.list_inventory_items()}
             item = by_id[item_id]
             item_metadata = dict(item["metadata"])
             old_parent = str(item_metadata.pop("container_id", "") or "")
@@ -1836,6 +1857,7 @@ class SaveRepository(PlayerStatsRepository, SurvivalRepository):
             process = {
                 "recipe_id": clean_recipe_id,
                 "quantity": requested_quantity,
+                "location": self.get_state_value("location", ""),
                 "stage_index": 0,
                 "active_work_completed": 0,
                 "passive_due_minute": None,
@@ -4921,6 +4943,16 @@ class SaveRepository(PlayerStatsRepository, SurvivalRepository):
             asset = {**(asset or {}), "subject_type": subject_type, "default_image": default_image}
         return asset
 
+    def link_visual_asset_messages(self, asset_id: str, message_ids: Iterable[str]) -> None:
+        """Reuse a portrait in later turns without changing its identity or priority."""
+        with self.transaction() as connection:
+            for message_id in message_ids:
+                if str(message_id or "").strip():
+                    connection.execute(
+                        "INSERT OR IGNORE INTO message_visual_assets (message_id, asset_id) VALUES (?, ?)",
+                        (str(message_id).strip(), asset_id),
+                    )
+
     def list_visual_assets_for_message(self, message_id: str) -> list[dict[str, Any]]:
         """Returns ready images linked to one conversation turn."""
 
@@ -5522,9 +5554,18 @@ class SaveRepository(PlayerStatsRepository, SurvivalRepository):
                     name=current_location,
                     location_id=f"loc_{uuid.uuid4().hex}",
                     description="Current player location.",
+                    weather=self.get_state_value("weather", ""),
                 )
             )
             changed = True
+
+        current_index = indexes_by_name.get(current_location.casefold())
+        if current_index is not None:
+            current = locations[current_index]
+            weather = self.get_state_value("weather", "")
+            if current.weather != weather:
+                locations[current_index] = replace(current, weather=weather)
+                changed = True
 
         if changed:
             self.set_travel_locations([location.to_dict() for location in locations])
@@ -5580,6 +5621,8 @@ class SaveRepository(PlayerStatsRepository, SurvivalRepository):
                 "terrain",
                 "travel_multiplier",
                 "travel_notes",
+                "weather",
+                "music_filename",
                 "location_scope",
                 "is_sublocation",
                 "parent_location",
@@ -6182,6 +6225,26 @@ class SaveRepository(PlayerStatsRepository, SurvivalRepository):
                     active INTEGER NOT NULL DEFAULT 1,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS timed_events (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL COLLATE NOCASE,
+                    location TEXT NOT NULL COLLATE NOCASE,
+                    location_id TEXT NOT NULL,
+                    category TEXT NOT NULL DEFAULT 'Process',
+                    quantity INTEGER NOT NULL DEFAULT -1 CHECK(quantity >= -1),
+                    quantity_unit TEXT NOT NULL DEFAULT '',
+                    quantity_is_estimate INTEGER NOT NULL DEFAULT 0 CHECK(quantity_is_estimate IN (0,1)),
+                    current_state TEXT NOT NULL,
+                    next_state TEXT NOT NULL,
+                    ready_at_minute INTEGER NOT NULL DEFAULT -1 CHECK(ready_at_minute >= -1),
+                    notes TEXT NOT NULL DEFAULT '',
+                    lifecycle TEXT NOT NULL DEFAULT 'active' CHECK(lifecycle IN ('active','completed','cancelled')),
+                    is_estimate INTEGER NOT NULL DEFAULT 1 CHECK(is_estimate IN (0,1)),
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(name, location_id)
                 );
 
                 CREATE TABLE IF NOT EXISTS active_tasks (

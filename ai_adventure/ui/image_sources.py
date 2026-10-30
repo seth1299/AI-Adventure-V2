@@ -34,6 +34,7 @@ class NewGameImageSourceDialog(QDialog):
             tuple[QLabel, QPushButton, QCheckBox | None, QPushButton],
         ] = {}
         self._resolved: set[str] = set()
+        self._available_images: set[str] = set()
         self._allow_close = False
         self._pending: set[str] = set()
         self._started = False
@@ -210,9 +211,14 @@ class NewGameImageSourceDialog(QDialog):
         """Records a choice; paid work starts only after Next."""
         checkbox = self._rows[request.asset_id][2]
         message = "Will generate after Next"
-        if not checkbox.isChecked():
+        if checkbox.isChecked():
+            self._resolved.discard(request.asset_id)
+        else:
+            if request.asset_id in self._available_images:
+                self._resolved.add(request.asset_id)
             message = ("Will keep existing image after Next"
-                       if self._refresh_preview(request) else "Will skip after Next")
+                       if self._refresh_preview(request) or request.asset_id in self._available_images
+                       else "Will skip after Next")
         self._set_status(request, message)
 
     def _select_all(self) -> None:
@@ -236,7 +242,8 @@ class NewGameImageSourceDialog(QDialog):
         if checkbox is not None:
             checkbox.setChecked(False)
         self._set_status(request, "Will keep existing image after Next"
-                         if self._refresh_preview(request) else "Will skip after Next")
+                         if self._refresh_preview(request) or request.asset_id in self._available_images
+                         else "Will skip after Next")
 
     def _skip_all(self) -> None:
         """Clear generation choices while preserving uploaded images."""
@@ -260,11 +267,14 @@ class NewGameImageSourceDialog(QDialog):
             return
         if status == "failed":
             self._pending.discard(asset_id)
+            self._resolved.discard(asset_id)
             self._set_status(request, message or "Image generation failed.")
             row = self._rows[asset_id]
             row[1].setEnabled(True)
             if row[2] is not None:
+                row[2].blockSignals(True)
                 row[2].setChecked(False)
+                row[2].blockSignals(False)
                 row[2].setEnabled(True)
             row[3].setEnabled(True)
             self._set_status(request, (message or "Image generation failed.") +
@@ -277,16 +287,21 @@ class NewGameImageSourceDialog(QDialog):
         self._rows[request.asset_id][0].setText(message)
 
     def _set_resolved(self, request: VisualAssetRequest, message: str) -> None:
-        """Marks a row complete and waits for any remaining selected images."""
+        """Keep completed choices editable until Next commits the selections."""
 
         status, upload_button, generate_button, skip_button = self._rows[request.asset_id]
         if self._refresh_preview(request) and message == "Skipped for now":
             message = "Using existing image"
         status.setText(message)
-        upload_button.setEnabled(False)
+        if message in {"Using uploaded image", "Image ready"}:
+            self._available_images.add(request.asset_id)
+        upload_button.setEnabled(not self._started)
         if generate_button is not None:
-            generate_button.setEnabled(False)
-        skip_button.setEnabled(False)
+            generate_button.blockSignals(True)
+            generate_button.setChecked(False)
+            generate_button.blockSignals(False)
+            generate_button.setEnabled(not self._started)
+        skip_button.setEnabled(not self._started)
         self._resolved.add(request.asset_id)
         self._finish_if_settled()
 

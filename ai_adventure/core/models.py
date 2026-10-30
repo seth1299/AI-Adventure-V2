@@ -532,6 +532,7 @@ class AdventureState:
     skills: SkillsState = field(default_factory=SkillsState)
     magic: MagicState = field(default_factory=MagicState)
     active_tasks: ActiveTasksState = field(default_factory=ActiveTasksState)
+    timed_events: list[dict[str, Any]] = field(default_factory=list)
     history: HistoryState = field(default_factory=HistoryState)
     settings: SettingsState = field(default_factory=SettingsState)
 
@@ -542,6 +543,7 @@ class AdventureState:
             "metadata": self.metadata.to_dict(),
             "player": self.player.to_dict(),
             "world": self.world.to_dict(),
+            "travel": self.travel.to_dict(),
             "inventory": self.inventory.to_dict(),
             "item_catalog": self.item_catalog.to_dict(),
             "currency": self.currency.to_dict(),
@@ -550,6 +552,7 @@ class AdventureState:
             "skills": self.skills.to_dict(),
             "magic": self.magic.to_dict(),
             "active_tasks": self.active_tasks.to_dict(),
+            "timed_events": self.timed_events,
             "history": self.history.to_dict(),
             "settings": self.settings.to_dict(),
         }

@@ -10,7 +10,7 @@ import logging
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import QObject, Signal, Slot
+from PySide6.QtCore import QObject, QRunnable, Signal, Slot
 
 from ai_adventure.ai.model_catalog import normalize_text_model
 from ai_adventure.ai.request_metrics import benchmark_message
@@ -40,6 +40,32 @@ def _text_model_from_ai_packet(packet: dict[str, Any]) -> str:
     if not isinstance(preferences, dict):
         preferences = {}
     return normalize_text_model(preferences.get("text_model"))
+
+
+class _TravelAssessmentSignals(QObject):
+    completed = Signal(object)
+
+
+class GeminiTravelAssessmentWorker(QRunnable):
+    """No repository or widget access on this background thread."""
+
+    def __init__(self, packet: dict[str, Any], api_key_path: Path | None):
+        super().__init__()
+        self.packet = packet
+        self.api_key_path = api_key_path
+        self.signals = _TravelAssessmentSignals()
+
+    def run(self) -> None:
+        result = None
+        try:
+            if GeminiNarrationService is not None:
+                with benchmark_message(None, message_type="Travel Assessments"):
+                    result = GeminiNarrationService(
+                        api_key_path=self.api_key_path, model=_text_model_from_ai_packet(self.packet),
+                    ).assess_travel_routes(self.packet)
+        except Exception:
+            LOGGER.exception("Private travel assessment failed; normal travel remains available.")
+        self.signals.completed.emit(result)
 
 
 class GeminiStoryWorker(QObject):

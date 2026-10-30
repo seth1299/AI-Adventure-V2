@@ -73,7 +73,8 @@ from ai_adventure.audio.catalog import (
     distinct_audio_track_catalogs_with_ambience,
 )
 from ai_adventure.audio.voices import VOICE_PROFILE_OPTIONS
-from ai_adventure.locations import MAP_COORDINATE_RULE, clean_player_location_name, normalize_known_locations
+from ai_adventure.locations import MAP_COORDINATE_RULE, TRAVEL_SAFETY_RULE, clean_player_location_name, normalize_known_locations
+from ai_adventure.npc_continuity import NPC_PROFILE_CONTINUITY_RULE
 from ai_adventure.skills.rules import MAX_SKILL_LEVEL
 from ai_adventure.text_sanitization import (
     sanitize_english_text,
@@ -197,6 +198,7 @@ KNOWN_EVENT_TYPE_NAMES = [
     "LocationUpsertedEvent",
     "TravelModeChangedEvent",
     "ActiveTaskUpsertedEvent",
+    "TimedEventUpsertedEvent",
     "ActiveTaskCompletedEvent",
     "CalendarEventUpsertedEvent",
     "CalendarEventDeletedEvent",
@@ -1069,6 +1071,8 @@ EVENT_RESPONSE_SCHEMA: dict[str, Any] = {
                 "terrain": {"type": "string"},
                 "travel_multiplier": {"type": "number", "minimum": 0.1, "maximum": 3.0},
                 "travel_notes": {"type": "string"},
+                "weather": {"type": "string", "description": "Current weather at this location; use an actual condition, not AUTO."},
+                "music_filename": {"type": "string", "description": "Associated location music: an exact available music catalog filename."},
                 "is_sublocation": {"type": "boolean"},
                 "parent_location": {"type": "string"},
                 "location_scope": {"type": "string", "enum": ["broad", "specific"], "description": "Broad: continent, region, city or district. Specific: precise recoverable storage site such as a room, campsite or hideout. Preserve authored scope; sublocation alone does not imply specific."},
@@ -1091,6 +1095,27 @@ EVENT_RESPONSE_SCHEMA: dict[str, Any] = {
                 "speed_multiplier": {"type": "number", "minimum": 0.1, "maximum": 20.0},
             },
             ["mode", "speed_multiplier"],
+        ),
+        _event_response_schema(
+            "TimedEventUpsertedEvent",
+            {
+                "event_id": {"type": "string", "description": "Reuse an existing id; omit for new processes."},
+                "name": {"type": "string", "minLength": 1},
+                "location": {"type": "string", "minLength": 1},
+                "category": {"type": "string"},
+                "quantity": {"type": "integer", "minimum": -1, "description": "Preserve explicit counts; otherwise infer a reasonable positive count from context. Use -1 only if no reasonable estimate is possible."},
+                "quantity_is_estimate": {"type": "boolean", "description": "True for inferred counts; false for explicitly stated or observed counts. Independent of the time estimate."},
+                "quantity_unit": {"type": "string"},
+                "current_state": {"type": "string"},
+                "next_state": {"type": "string"},
+                "ready_at_minute": {"type": "integer", "minimum": -1, "description": "Absolute calendar minute, or -1 for unknown timing. Omit to retain timer."},
+                "duration_minutes": {"type": "integer", "minimum": 0, "description": "Time from now to next_state; do not also send ready_at_minute."},
+                "is_estimate": {"type": "boolean"},
+                "notes": {"type": "string"},
+                "lifecycle": {"type": "string", "enum": ["active", "completed", "cancelled"]},
+            },
+            ["name", "location"],
+            description="Create/update a durable timed process, plant batch, project, recovery or delivery.",
         ),
         _event_response_schema(
             "ActiveTaskUpsertedEvent",
@@ -1218,6 +1243,7 @@ EVENT_RESPONSE_SCHEMA: dict[str, Any] = {
             "NpcUpsertedEvent",
             {
                 "npc_id": {"type": "string"},
+                "profile_change_reason": {"type": "string", "description": "Specific established evidence for an intentional correction or observable change to existing identity/appearance. Omit for routine conversation."},
                 "name": {"type": "string"},
                 "display_name": {"type": "string"},
                 "role": {"type": "string"},
@@ -1291,9 +1317,17 @@ EVENT_RESPONSE_SCHEMA: dict[str, Any] = {
     ]
 }
 NEW_GAME_EVENT_TYPE_NAMES = (
+    "TimedEventUpsertedEvent",
     "NpcUpsertedEvent",
     "ActiveTaskUpsertedEvent",
 )
+NEW_GAME_TIMED_EVENT_SCHEMA = copy.deepcopy(next(
+    branch["properties"]["payload"] for branch in EVENT_RESPONSE_SCHEMA["anyOf"]
+    if branch["properties"]["type"]["enum"] == ["TimedEventUpsertedEvent"]
+))
+for _timed_optional in ("event_id", "duration_minutes", "lifecycle"):
+    NEW_GAME_TIMED_EVENT_SCHEMA["properties"].pop(_timed_optional, None)
+NEW_GAME_TIMED_EVENT_SCHEMA["required"] = list(NEW_GAME_TIMED_EVENT_SCHEMA["properties"])
 NEW_GAME_ACTIVE_TASK_EVENT_RESPONSE_SCHEMA: dict[str, Any] = _event_response_schema(
     "ActiveTaskUpsertedEvent",
     {
@@ -1528,6 +1562,7 @@ STORY_RESPONSE_JSON_SCHEMA: dict[str, Any] = {
     "additionalProperties": False,
 }
 STORY_BASE_EVENT_TYPE_NAMES: tuple[str, ...] = (
+    "TimedEventUpsertedEvent",
     "StatusUpdatedEvent",
     "D20TestRequestedEvent",
     "NpcUpsertedEvent",
@@ -1763,6 +1798,8 @@ NEW_GAME_RESPONSE_JSON_SCHEMA: dict[str, Any] = {
                     "terrain": {"type": "string"},
                     "travel_multiplier": {"type": "number", "minimum": 0.1, "maximum": 3.0},
                     "travel_notes": {"type": "string"},
+                    "weather": {"type": "string", "description": "Current local weather, consistent with the starting scene and season."},
+                    "music_filename": {"type": "string", "description": "An exact available music catalog track fitting this location, or blank if unavailable."},
                     "is_sublocation": {"type": "boolean"},
                     "parent_location": {"type": "string"},
                     "location_scope": {"type": "string", "enum": ["broad", "specific"], "description": "Broad: continent, region, city or district. Specific: precise recoverable storage site such as a room, campsite or hideout. Preserve authored scope; sublocation alone does not imply specific."},
@@ -1914,6 +1951,10 @@ NEW_GAME_RESPONSE_JSON_SCHEMA: dict[str, Any] = {
         "starting_npcs": {
             "type": "array",
             "items": NEW_GAME_NPC_EVENT_RESPONSE_SCHEMA["properties"]["payload"],
+        },
+        "timed_events": {
+            "type": "array", "items": NEW_GAME_TIMED_EVENT_SCHEMA,
+            "description": "Separate ongoing crops, batches and timed processes inferred from setup prose; empty only if none are established.",
         },
         "starting_task": NEW_GAME_ACTIVE_TASK_EVENT_RESPONSE_SCHEMA["properties"][
             "payload"
@@ -2082,6 +2123,7 @@ NEW_GAME_RESPONSE_JSON_SCHEMA: dict[str, Any] = {
     },
     "required": [
         "selected_genre",
+        "timed_events",
         "world_summary",
         "locations",
         "gm_secrets",
@@ -2311,6 +2353,7 @@ NEW_GAME_PHASE_FIELDS: dict[str, tuple[str, ...]] = {
         "starting_currency_balance_base_units",
     ),
     "entities_mechanics": (
+        "timed_events",
         "gm_secrets",
         "miscellaneous",
         "bestiary",
@@ -2742,6 +2785,25 @@ class GeminiNarrationService:
                 self.settings,
                 model=normalize_text_model(model),
             )
+
+    @measured_operation
+    def assess_travel_routes(self, context_packet: dict[str, Any]) -> dict[str, Any]:
+        """Assess route logistics privately; the GUI validates and stores the result."""
+        from ai_adventure.ai.travel_assessment import assessment_prompt, assessment_response_schema
+
+        if not self.settings.is_configured:
+            raise GeminiConfigurationError("Configure a Gemini API key to assess travel routes.")
+        client = create_gemini_client(self.settings.api_key)
+        schema = assessment_response_schema(context_packet)
+        response = _create_interaction_with_retry(
+            client, model=self.settings.model, contents=assessment_prompt(context_packet),
+            config=_structured_output_config(schema, model=self.settings.model,
+                ai_preferences=ai_mode_preferences_from_context_packet(context_packet)),
+            request_label="private travel assessment", response_contract=schema,
+        )
+        raw = str(getattr(response, "output_text", "") or "").strip()
+        _validate_response_contract(raw, schema, "private travel assessment")
+        return json.loads(_strip_json_fence(raw))
 
     @measured_operation
     def generate_survival_recovery(self, context_packet: dict[str, Any]) -> dict[str, str]:
@@ -3514,7 +3576,7 @@ def _project_story_state(context_packet: dict[str, Any]) -> dict[str, Any]:
     raw_tags = selection.get("tags", []) if isinstance(selection, dict) else []
     tags = {str(tag).casefold() for tag in raw_tags if str(tag).strip()}
     projected: dict[str, Any] = {}
-    for key in ("adventure_title", "player", "player_ai_preferences", "scene", "world_profile", "fighting", "survival"):
+    for key in ("adventure_title", "player", "player_ai_preferences", "scene", "world_profile", "fighting", "survival", "timed_events"):
         if key in source:
             if key == "player_ai_preferences":
                 projected[key] = _story_player_preferences(source[key])
@@ -3633,6 +3695,9 @@ def _story_prompt_packet(context_packet: dict[str, Any]) -> dict[str, Any]:
         "player_ai_preferences", "creative_ideas", "speaker_cues",
         "player_achievements", "skill_training",
         "subject_history",
+        "timed_events",
+        "travel_safety",
+        "npc_continuity",
     }
     tags_by_contract = {
         "calendar_time": {"time", "events"},
@@ -3653,6 +3718,8 @@ def _story_prompt_packet(context_packet: dict[str, Any]) -> dict[str, Any]:
             key in always or bool(tags_by_contract.get(key, set()) & selected_tags)
         )
     }
+    filtered_contract.setdefault("travel_safety", TRAVEL_SAFETY_RULE)
+    filtered_contract.setdefault("npc_continuity", NPC_PROFILE_CONTINUITY_RULE)
     if "miscellaneous" in projected_state and "miscellaneous_memory" in contract:
         filtered_contract["miscellaneous_memory"] = contract["miscellaneous_memory"]
     if "bestiary" in projected_state and "bestiary_memory" in contract:
@@ -3939,6 +4006,7 @@ def build_gemini_new_game_phase_prompt(
             "creative_ideas",
         },
         "entities_mechanics": {
+            "timed_events",
             "events",
             "gm_secrets",
             "miscellaneous",
@@ -3994,7 +4062,8 @@ def build_gemini_new_game_phase_prompt(
             "Create only the starting entities and mechanics using the approved world "
             "skeleton. Return NPCs, party members, bestiary entries, lore, GM secrets, "
             "the starting task, character/skill/spell data, starter items, crafting "
-            "knowledge, and other requested mechanical records. Use the approved "
+            "knowledge, timed_events for ongoing processes inferred from setup prose, "
+            "and other requested mechanical records. Use the approved "
             "location names and coordinates; do not create a second geography. "
             "Return no opening prose or audio cues."
         ),
@@ -5892,6 +5961,10 @@ def _d20_test_planning_packet(context_packet: dict[str, Any]) -> dict[str, Any]:
         packet["bestiary"] = bestiary
     if magic_planning_context:
         packet["magic"] = magic_planning_context
+    travel_request = context_packet.get("travel_request")
+    if isinstance(travel_request, dict) and travel_request.get("active"):
+        packet["travel_request"] = travel_request
+        packet["travel_rules"] = TRAVEL_SAFETY_RULE
     return packet
 
 
@@ -6512,6 +6585,12 @@ def _player_command_is_routine_no_check(context_packet: dict[str, Any]) -> bool:
     """Returns True when the latest command is ordinary and needs no check."""
 
     if str(context_packet.get("packet_type", "")).strip() != "story_turn":
+        return False
+
+    travel_request = context_packet.get("travel_request")
+    if isinstance(travel_request, dict) and travel_request.get("active"):
+        # Travel-tab attempts reach the planner only when they could not be
+        # completed locally. A routine verb cannot overrule route hazards.
         return False
 
     command = str(context_packet.get("player_command", "")).strip()
@@ -7690,7 +7769,8 @@ def parse_gemini_new_game_response(
         source_index = location.get("source_index", -1)
         if isinstance(source_index, int) and 0 <= source_index < len(requested_locations):
             authored = requested_locations[source_index]
-            location["location_scope"] = "specific" if authored.get("location_scope") == "specific" else "broad"
+            if authored.get("location_scope") in {"specific", "broad"}:
+                location["location_scope"] = authored["location_scope"]
     gm_secrets = _parse_new_game_gm_secrets(data.get("gm_secrets"))
     miscellaneous = _parse_new_game_miscellaneous(data.get("miscellaneous"))
     bestiary = _parse_new_game_bestiary(data.get("bestiary"))
@@ -7765,6 +7845,10 @@ def parse_gemini_new_game_response(
             if isinstance(npc, dict)
         )
     raw_starting_task = data.get("starting_task")
+    raw_timed_events = data.get("timed_events", [])
+    if isinstance(raw_timed_events, list):
+        raw_events.extend({"type": "TimedEventUpsertedEvent", "payload": dict(event)}
+                          for event in raw_timed_events if isinstance(event, dict))
     if isinstance(raw_starting_task, dict) and raw_starting_task:
         raw_events.append(
             {

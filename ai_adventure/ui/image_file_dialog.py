@@ -3,7 +3,7 @@
 from pathlib import Path
 
 from PySide6.QtCore import QEvent, Qt
-from PySide6.QtWidgets import QComboBox, QFileDialog, QLineEdit
+from PySide6.QtWidgets import QComboBox, QDialogButtonBox, QFileDialog, QLineEdit
 
 from ai_adventure.visual_assets import descriptive_image_stem
 
@@ -26,6 +26,7 @@ class ImageFileDialog(QFileDialog):
     def __init__(self, parent=None, caption="Select Image", directory=""):
         super().__init__(parent, caption)
         self._address_editor = None
+        self._pending_address = None
         self.setOption(QFileDialog.Option.DontUseNativeDialog, True)
         self.setWindowFlag(Qt.WindowType.WindowMaximizeButtonHint, True)
         self.setSizeGripEnabled(True)
@@ -44,12 +45,40 @@ class ImageFileDialog(QFileDialog):
             editor = address.lineEdit()
             self._address_editor = editor
             editor.installEventFilter(self)
-            self.directoryEntered.connect(address.setEditText)
+            address.installEventFilter(self)
+            editor.textEdited.connect(self._address_edited)
+            self.directoryEntered.connect(self._sync_address)
+
+    def _sync_address(self, directory: str) -> None:
+        self._pending_address = None
+        if self._address_editor is not None:
+            self._address_editor.setText(directory)
+
+    def _address_edited(self, text: str) -> None:
+        # QFileDialog only considers the filename when enabling Open. Keep the
+        # typed address separately: its internal combo may reset on focus loss.
+        self._pending_address = text
+        buttons = self.findChild(QDialogButtonBox, "buttonBox")
+        if buttons is not None:
+            button = buttons.button(QDialogButtonBox.StandardButton.Open)
+            if button is not None:
+                button.setEnabled(True)
+
+    def accept(self) -> None:
+        if self._pending_address is not None:
+            self._open_address(self._pending_address)
+            return
+        super().accept()
 
     def eventFilter(self, watched, event):
-        if (watched is self._address_editor and event.type() == QEvent.Type.KeyPress
+        if (self._address_editor is not None
+                and watched in (self._address_editor, self._address_editor.parentWidget())
+                and event.type() in (QEvent.Type.ShortcutOverride, QEvent.Type.KeyPress)
                 and event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter)):
-            self._open_address(watched.text())
+            if event.type() == QEvent.Type.ShortcutOverride:
+                event.accept()
+            else:
+                self._open_address(self._address_editor.text())
             return True
         return super().eventFilter(watched, event)
 
@@ -59,9 +88,11 @@ class ImageFileDialog(QFileDialog):
             path = Path(self.directory().absolutePath()) / path
         if path.is_dir():
             self.setDirectory(str(path))
+            self._sync_address(self.directory().absolutePath())
         elif path.is_file():
             self.setDirectory(str(path.parent))
             self.selectFile(str(path))
             filename = self.findChild(QLineEdit, "fileNameEdit")
             if filename is not None:
                 filename.setText(path.name)
+            self._sync_address(self.directory().absolutePath())

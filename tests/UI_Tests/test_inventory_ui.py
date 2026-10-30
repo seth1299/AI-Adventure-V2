@@ -2337,7 +2337,7 @@ class InventoryUiTests(QtTestCase):
 
             dialog.close()
 
-    def test_calendar_tasks_table_displays_wrapped_quest_description(self) -> None:
+    def test_timed_events_table_displays_wrapped_quest_description(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             repository = SaveRepository.create_new_save(
                 Path(temp_dir),
@@ -2356,7 +2356,8 @@ class InventoryUiTests(QtTestCase):
                 reward="$200",
                 due_date="N/A",
             )
-            screen = CalendarScreen()
+            from ai_adventure.ui.screens.timed_events import TimeSensitiveEventsScreen
+            screen = TimeSensitiveEventsScreen()
             screen.set_repository(repository)
             self.app.processEvents()
 
@@ -2366,10 +2367,10 @@ class InventoryUiTests(QtTestCase):
             ]
             self.assertEqual(
                 headers,
-                ["Task", "Description", "Category", "Due", "Location", "Reward"],
+                ["Event", "Quantity", "Location", "Current State", "Time Remaining", "Details"],
             )
             self.assertEqual(screen.tasks_table.rowCount(), 1)
-            description_item = screen.tasks_table.item(0, 1)
+            description_item = screen.tasks_table.item(0, 5)
             self.assertIsNotNone(description_item)
             assert description_item is not None
             self.assertIn("Question witnesses", description_item.text())

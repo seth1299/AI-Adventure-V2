@@ -157,6 +157,7 @@ class StateManager:
             skills=self._load_skills(),
             magic=self._load_magic(),
             active_tasks=self._load_active_tasks(),
+            timed_events=self.repository.list_timed_events(),
             history=self._load_history(limit=history_limit),
             settings=settings,
         )

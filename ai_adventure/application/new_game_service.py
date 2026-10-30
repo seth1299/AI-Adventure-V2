@@ -256,6 +256,10 @@ class NewGameService:
                     repository,
                     message_id=message_id,
                 ).apply_events(suggested_events)
+                invalid_timers = [event.message for event in event_results
+                                  if event.event_type == "TimedEventUpsertedEvent" and event.status != "applied"]
+                if invalid_timers:
+                    raise ValueError("Generated time-sensitive events could not be stored: " + "; ".join(invalid_timers))
                 applied_count = sum(
                     1 for event_result in event_results
                     if event_result.status == "applied"

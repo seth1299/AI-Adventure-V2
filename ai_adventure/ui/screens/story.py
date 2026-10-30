@@ -3,6 +3,7 @@ from __future__ import annotations
 from ai_adventure.container_flow import ContainerFlowError
 from ai_adventure.suggested_actions import compose_action_prompt
 from ai_adventure.survival import SURVIVAL_METERS
+from ai_adventure.application.travel_service import complete_safe_travel, current_assessment
 
 from ai_adventure.ui.common import *  # noqa: F401,F403
 from ai_adventure.ui.dialogues import *  # noqa: F401,F403
@@ -1213,15 +1214,31 @@ class StoryScreen(RepositoryBackedWidget):
         raw_destination: dict[str, Any],
         player_context: str,
     ) -> bool:
-        """Submits a Travel-tab journey with calculated logistics for Gemini."""
+        """Complete safe trips locally, otherwise submit the attempted journey."""
 
-        if self._waiting_for_gm:
+        if self._waiting_for_gm or self._initial_generation_pending:
             return False
 
         repository = self.repository()
         destination = normalize_known_location(raw_destination)
 
         if repository is None or destination is None:
+            return False
+
+        destination = normalize_known_location(repository.find_travel_location(destination.name))
+        if destination is None:
+            return False
+        try:
+            if complete_safe_travel(repository, destination.name, player_context.strip(),
+                                    music_tracks=self.sound_manager.get_valid_track_names() if self.sound_manager else None):
+                _apply_audio_settings_to_managers(repository, sound_manager=self.sound_manager,
+                                                  narration_player=self.narration_player)
+                self.refresh()
+                self.notify_repository_changed()
+                return True
+        except Exception:
+            LOGGER.exception("Could not persist local travel.")
+            self._handle_persistence_failure()
             return False
 
         state = StateManager(repository).load_state(history_limit=0)
@@ -1239,6 +1256,9 @@ class StoryScreen(RepositoryBackedWidget):
         if not estimate.is_available:
             return False
 
+        if origin is not None and origin.name.casefold() == destination.name.casefold():
+            return False
+
         clean_context = player_context.strip()
         player_text = f"Travel toward {destination.name}."
 
@@ -1254,6 +1274,7 @@ class StoryScreen(RepositoryBackedWidget):
                 "destination": destination.to_dict(),
                 "estimate": estimate.to_dict(),
                 "player_context": clean_context,
+                "route_safety": current_assessment(repository).get("routes", {}).get(destination.location_id, {}),
                 "rules": (
                     "This is an attempted journey. The estimate is mathematical "
                     "logistics, not an automatic arrival."

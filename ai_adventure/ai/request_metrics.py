@@ -76,6 +76,8 @@ def message_type_for_operation(operation: str) -> str:
         return "Normal Messages"
     if operation == "generate_survival_recovery":
         return "Survival Recovery"
+    if operation == "assess_travel_routes":
+        return "Travel Assessments"
     if operation.startswith("generate_new_game_world"):
         return "New Game Setup"
     if operation == "generate":

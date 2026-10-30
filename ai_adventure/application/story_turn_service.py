@@ -141,14 +141,26 @@ class StoryTurnService:
 
     @staticmethod
     def history_subjects_for_action(repository: SaveRepository, text: str) -> list[dict[str, str]]:
-        """Prefer explicit entities; inherit only simple dialogue follow-ups."""
+        """Carry the last conversation partner into quoted and natural follow-ups."""
         subjects = repository.find_history_subjects(text)
-        if not subjects and re.search(r"\b(?:ask|tell|reply|say|talk|speak|show|give)\b", text, re.IGNORECASE):
+        dialogue = (
+            text.lstrip().startswith(('"', "'", "\u201c", "\u2018"))
+            or re.search(r"\b(?:ask|tell|reply|say|talk|speak|show|give)\b", text, re.IGNORECASE)
+            or re.match(r"\s*(?:who|what|which|where|when|why|how|can|could|would|may)\b", text, re.IGNORECASE)
+            or re.match(r"\s*(?:yes|no|thanks|thank you|please|certainly|of course|sounds good)\b", text, re.IGNORECASE)
+        )
+        if not any(subject["type"] == "npc" for subject in subjects) and dialogue:
             recent = repository.list_history(limit=2, kinds=("player", "story"), hidden=False)
             # A submitted action can already be the last row while building context.
             previous = next((entry for entry in reversed(recent) if entry["kind"] == "story"), None)
             if previous:
-                subjects = previous.get("subjects", [])
+                partners = [subject for subject in previous.get("subjects", []) if subject["type"] == "npc"]
+                # Older entries may have speaker metadata but no subject links.
+                for cue in previous.get("speaker_cues", []):
+                    npc = repository.get_npc(str(cue.get("speaker_id", "")))
+                    if npc and not any(subject["id"] == npc["id"] for subject in partners):
+                        partners.append({"type": "npc", "id": npc["id"]})
+                subjects = partners[:2] + subjects
         return subjects[:3]
 
     @staticmethod
@@ -347,6 +359,10 @@ class StoryTurnService:
                     suggested_events=events_to_apply,
                     prior_results=prior_event_results,
                 )
+            invalid_timers = [event.message for event in event_results
+                              if event.event_type == "TimedEventUpsertedEvent" and event.status != "applied"]
+            if invalid_timers:
+                raise ValueError("Time-sensitive event changes could not be stored: " + "; ".join(invalid_timers))
             failed_container_events = [event for event in event_results
                 if (event.event_type in {"ContainerOpenedEvent", "ContainerContentsTakenEvent"}
                     or event.event_type in {"InventoryItemModifiedEvent", "ItemModifiedEvent"}

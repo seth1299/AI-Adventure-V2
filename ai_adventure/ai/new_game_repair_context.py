@@ -7,6 +7,9 @@ from ai_adventure.bundled_images import bundled_image_prompt_context
 
 # (setup inputs, previously generated context, applicable requirements)
 REPAIR_DEPENDENCIES = {
+    "timed_events": (("starting_locations", "starting_calendar", "calendar", "world_context", "character"),
+                     ("world_summary", "locations", "calendar_settings", "starting_calendar", "current_calendar"),
+                     ("timed_events",)),
     "bestiary": (("magic",), ("world_summary", "selected_genre", "locations"), ("bestiary",)),
     "known_crafting_items": (("skills",), ("world_summary", "locations"), ("crafting_knowledge",)),
     "known_crafting_recipes": (("skills",), ("world_summary", "known_crafting_items", "starting_items", "skills"), ("crafting_knowledge",)),
@@ -49,7 +52,8 @@ def repair_context(setup_packet, approved_state, candidate, fields, errors, atte
         setup_keys.update(inputs)
         context_keys.update(context)
         rule_keys.update(rules)
-    context = {**(approved_state or {}), **candidate}
+    context = {"current_calendar": setup_packet.get("current_calendar"),
+               **(approved_state or {}), **candidate}
     selected_setup = {key: setup[key] for key in setup_keys if key in setup}
     # Skill choice can require attributes, but never the character's biography.
     if isinstance(selected_setup.get("character"), dict):

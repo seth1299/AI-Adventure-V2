@@ -193,7 +193,7 @@ def inventory_access(items: Iterable[dict[str, Any]], current_location: str, loc
     return results
 
 
-def move_error(item_id: str, destination: str, items: list[dict[str, Any]], current_location: str, base_capacity_lb: float = DEFAULT_CARRYING_CAPACITY_LB, locations: Iterable[dict[str, Any]] = ()) -> str:
+def move_error(item_id: str, destination: str, items: list[dict[str, Any]], current_location: str, base_capacity_lb: float = DEFAULT_CARRYING_CAPACITY_LB, locations: Iterable[dict[str, Any]] = (), *, check_capacity: bool = True) -> str:
     """Validate a whole-stack move, including source access and nesting."""
     rows = {str(item["id"]): item for item in items}
     item = rows.get(item_id)
@@ -237,6 +237,8 @@ def move_error(item_id: str, destination: str, items: list[dict[str, Any]], curr
                 return "The container holds an item that cannot be moved/stored."
             seen.add(cursor)
             cursor = str(metadata(rows.get(cursor, {})).get("container_id", "") or "")
+    if not check_capacity:
+        return ""
     after = deepcopy(items)
     moved = next(row for row in after if str(row["id"]) == item_id)
     moved.setdefault("metadata", {}).pop("container_id", None)
@@ -244,6 +246,72 @@ def move_error(item_id: str, destination: str, items: list[dict[str, Any]], curr
         moved["metadata"]["container_id"] = destination
     moved["storage_location"] = destination
     return capacity_error(items, after, base_capacity_lb)
+
+
+def plan_batch_move(item_ids: list[str], destination: str, items: list[dict[str, Any]],
+                    current_location: str, base_capacity_lb: float = DEFAULT_CARRYING_CAPACITY_LB,
+                    locations: Iterable[dict[str, Any]] = ()) -> list[str]:
+    """Validate final combined load; return only roots that actually change storage."""
+    selected = set(item_ids)
+    rows = {str(item["id"]): item for item in items}
+    if not selected or not selected.issubset(rows):
+        raise ValueError("Select existing inventory items to move.")
+    roots = []
+    for item_id in dict.fromkeys(item_ids):
+        cursor = str(metadata(rows[item_id]).get("container_id", "") or "")
+        seen = {item_id}
+        while cursor and cursor not in selected and cursor not in seen:
+            seen.add(cursor)
+            cursor = str(metadata(rows.get(cursor, {})).get("container_id", "") or "")
+        if cursor in selected:
+            continue  # Selected contents travel inside their selected ancestor.
+        if cursor in seen:
+            raise ValueError("Invalid container nesting.")
+        error = move_error(item_id, destination, items, current_location, base_capacity_lb,
+                           locations, check_capacity=False)
+        if error:
+            raise ValueError(f"{rows[item_id]['name']}: {error}")
+        item = rows[item_id]
+        parent = str(metadata(item).get("container_id", "") or "")
+        carried_aliases = {"actively_carried", "actively carried", "on_person", "on person"}
+        same_storage = (storage_location(item).casefold() == destination.casefold()
+                        or storage_location(item).casefold() in carried_aliases and destination.casefold() in carried_aliases)
+        if parent == destination or (not parent and same_storage):
+            continue
+        roots.append(item_id)
+    after = deepcopy(items)
+    for item in after:
+        if str(item["id"]) not in roots:
+            continue
+        item_metadata = item.setdefault("metadata", {})
+        item_metadata.pop("container_id", None)
+        if destination in rows:
+            item_metadata["container_id"] = destination
+        storage = str(rows[destination]["name"]) if destination in rows else destination
+        item["storage_location"] = storage
+        item_metadata["storage_location"] = storage
+    error = capacity_error(items, after, base_capacity_lb)
+    if error:
+        raise ValueError(error)
+    return roots
+
+
+def batch_move_destinations(item_ids: list[str], items: list[dict[str, Any]], current_location: str,
+                            base_capacity_lb: float = DEFAULT_CARRYING_CAPACITY_LB,
+                            locations: Iterable[dict[str, Any]] = ()) -> list[tuple[str, str]]:
+    """Offer only destinations valid for the complete selection's final load."""
+    candidates = [("Actively Carried", "actively_carried")]
+    if current_location.strip():
+        candidates.append((f"Leave at {current_location}", current_location))
+    candidates.extend((str(item["name"]), str(item["id"])) for item in items if is_container(item))
+    destinations = []
+    for label, destination in candidates:
+        try:
+            if plan_batch_move(item_ids, destination, items, current_location, base_capacity_lb, locations):
+                destinations.append((label, destination))
+        except ValueError:
+            continue
+    return destinations
 
 
 def move_destinations(item_id: str, items: list[dict[str, Any]], current_location: str, base_capacity_lb: float = DEFAULT_CARRYING_CAPACITY_LB, locations: Iterable[dict[str, Any]] = ()) -> list[tuple[str, str]]:

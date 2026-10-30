@@ -3,15 +3,16 @@ from __future__ import annotations
 from ai_adventure.ui.common import *  # noqa: F401,F403
 from ai_adventure.ui.dialogues import *  # noqa: F401,F403
 from PySide6.QtWidgets import QGraphicsOpacityEffect
-from ai_adventure.inventory_storage import inventory_access, move_error, metadata as storage_metadata
+from ai_adventure.inventory_storage import inventory_access, move_error, metadata as storage_metadata, pounds
 
 
 class InventoryMoveDialog(QDialog):
     """Choose among destinations the player can physically reach right now."""
 
-    def __init__(self, destinations: list[tuple[str, str]], *, parent: QWidget | None = None) -> None:
+    def __init__(self, destinations: list[tuple[str, str]], *, parent: QWidget | None = None,
+                 item_count: int = 1) -> None:
         super().__init__(parent)
-        self.setWindowTitle("Move Item")
+        self.setWindowTitle("Move Item" if item_count == 1 else f"Move {item_count} Selected Items")
         self.destination_combo = QComboBox()
         self.destination_combo.setObjectName("inventoryMoveDestination")
         for label, item_id in destinations:
@@ -23,6 +24,10 @@ class InventoryMoveDialog(QDialog):
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout = QVBoxLayout()
+        if item_count > 1:
+            summary = QLabel("Move whole stacks together. Contents stay inside selected containers.")
+            summary.setWordWrap(True)
+            layout.addWidget(summary)
         layout.addLayout(form)
         layout.addWidget(buttons)
         self.setLayout(layout)
@@ -51,6 +56,8 @@ class InventoryLocationPanel(QGroupBox):
         secondary_sort_descending: bool = False,
         on_sort_changed: Callable[[str, bool, str, bool], None] | None = None,
         denominations: list[dict[str, Any]] | None = None,
+        selected_item_ids: set[str] | None = None,
+        on_selection_changed: Callable[[str, bool], None] | None = None,
     ) -> None:
         super().__init__(f"{_inventory_location_label(location)} ({len(items)})")
         self.location = location
@@ -58,6 +65,9 @@ class InventoryLocationPanel(QGroupBox):
         self._on_item_clicked = on_item_clicked
         self._on_sort_changed = on_sort_changed
         self._denominations = denominations
+        self._selected_item_ids = selected_item_ids if selected_item_ids is not None else set()
+        self._on_selection_changed = on_selection_changed
+        self.item_checkboxes: dict[str, QCheckBox] = {}
         self._secondary_sort_field_preference = str(secondary_sort_field or "")
         self.item_buttons: list[QPushButton] = []
         self.group_separators: list[QFrame] = []
@@ -107,6 +117,14 @@ class InventoryLocationPanel(QGroupBox):
         )
         secondary_controls.addWidget(self.secondary_sort_direction_combo)
         layout.addLayout(secondary_controls)
+
+        self.select_all_button = QPushButton("Select all")
+        self.select_all_button.setToolTip("Select all movable, accessible stacks in this location")
+        self.select_all_button.clicked.connect(self._select_all_items)
+        selection_controls = QHBoxLayout()
+        selection_controls.addWidget(self.select_all_button)
+        selection_controls.addStretch()
+        layout.addLayout(selection_controls)
 
         self.item_list_layout = QVBoxLayout()
         layout.addLayout(self.item_list_layout)
@@ -181,6 +199,7 @@ class InventoryLocationPanel(QGroupBox):
                 widget.deleteLater()
 
         self.item_buttons.clear()
+        self.item_checkboxes.clear()
         self.group_separators.clear()
         sort_field = str(self.sort_field_combo.currentData() or "name")
         sort_descending = bool(self.sort_direction_combo.currentData())
@@ -225,7 +244,10 @@ class InventoryLocationPanel(QGroupBox):
                 max(0, _safe_int(item.get("value_base_units", 0), 0)),
                 self._denominations,
             )
-            details = [value, category]
+            unit_weight = pounds(storage_metadata(item).get("weight_lb"), default=-1)
+            weight = ("Weight unknown" if unit_weight < 0 else
+                      f"{unit_weight * quantity:g} lb" + (" total" if quantity != 1 else ""))
+            details = [value, category, weight]
             button = QPushButton(f"{display_name}\n{'  ·  '.join(details)}")
             button.setObjectName("inventoryItemButton")
             button.setMinimumHeight(52)
@@ -238,8 +260,38 @@ class InventoryLocationPanel(QGroupBox):
             button.clicked.connect(
                 lambda _checked=False, selected=dict(item): self._on_item_clicked(selected)
             )
-            self.item_list_layout.addWidget(button)
+            row = QWidget()
+            row_layout = QHBoxLayout(row)
+            row_layout.setContentsMargins(0, 0, 0, 0)
+            item_id = str(item.get("id", ""))
+            checkbox = QCheckBox()
+            checkbox.setObjectName("inventoryItemSelection")
+            checkbox.setAccessibleName(f"Select {item.get('name', 'item')} for moving")
+            selectable = bool(item_id) and item.get("available") is not False and storage_metadata(item).get("moveable", True) is True
+            checkbox.setEnabled(selectable)
+            checkbox.setChecked(item_id in self._selected_item_ids)
+            checkbox.setToolTip("Select this whole stack to move" if selectable else
+                                str(item.get("access_reason") or "Item cannot be moved/stored."))
+            checkbox.toggled.connect(lambda checked, item_id=item_id: self._select_item(item_id, checked))
+            row_layout.addWidget(checkbox)
+            row_layout.addWidget(button, 1)
+            self.item_list_layout.addWidget(row)
+            self.item_checkboxes[item_id] = checkbox
             self.item_buttons.append(button)
+        self.select_all_button.setEnabled(any(checkbox.isEnabled() for checkbox in self.item_checkboxes.values()))
+
+    def _select_all_items(self) -> None:
+        for checkbox in self.item_checkboxes.values():
+            if checkbox.isEnabled():
+                checkbox.setChecked(True)
+
+    def _select_item(self, item_id: str, checked: bool) -> None:
+        if checked:
+            self._selected_item_ids.add(item_id)
+        else:
+            self._selected_item_ids.discard(item_id)
+        if self._on_selection_changed is not None:
+            self._on_selection_changed(item_id, checked)
 
     @staticmethod
     def _item_group_key(item: dict[str, Any], sort_field: str) -> Any:
@@ -263,6 +315,8 @@ class InventoryScreen(RepositoryBackedWidget):
 
         self.playtesting_tools = bool(playtesting_tools)
         self._selected_item_name = ""
+        self._move_selection: set[str] = set()
+        self._selection_repository = None
         self._loading_item_editor = False
         self._inventory_items: dict[str, dict[str, Any]] = {}
         self._catalog_by_name: dict[str, dict[str, Any]] = {}
@@ -276,6 +330,13 @@ class InventoryScreen(RepositoryBackedWidget):
         self.currency_label = QLabel("Currency: 0")
         self.carrying_label = QLabel()
         self.carrying_label.setWordWrap(True)
+        self.move_selected_button = QPushButton("Move selected…")
+        self.move_selected_button.setObjectName("inventoryMoveSelected")
+        self.move_selected_button.clicked.connect(self._move_selected_items)
+        self.clear_selection_button = QPushButton("Clear selection")
+        self.clear_selection_button.clicked.connect(self._clear_move_selection)
+        self.selection_label = QLabel("0 selected")
+        self._update_move_selection()
 
         self.inventory_scroll = QScrollArea()
         self.inventory_scroll.setWidgetResizable(True)
@@ -292,6 +353,7 @@ class InventoryScreen(RepositoryBackedWidget):
         layout.addWidget(QLabel("Inventory"))
         layout.addWidget(self.currency_label)
         layout.addWidget(self.carrying_label)
+        layout.addWidget(_button_row(self.move_selected_button, self.clear_selection_button, self.selection_label))
         layout.addWidget(self.inventory_scroll, 1)
 
         if self.playtesting_tools:
@@ -406,6 +468,10 @@ class InventoryScreen(RepositoryBackedWidget):
 
         repository = self.repository()
 
+        if repository is not self._selection_repository:
+            self._move_selection.clear()
+            self._selection_repository = repository
+        self._update_move_selection()
         if repository is None:
             self.currency_label.setText("Currency: 0")
             self._inventory_items.clear()
@@ -475,6 +541,11 @@ class InventoryScreen(RepositoryBackedWidget):
             )[:120] or "actively_carried"
             grouped_items.setdefault(location, []).append(item)
 
+        self._move_selection.intersection_update(
+            str(item["id"]) for group in grouped_items.values() for item in group
+            if item.get("available") is not False and storage_metadata(item).get("moveable", True) is True
+        )
+        self._update_move_selection()
         self._replace_location_panels(grouped_items)
         self._update_open_move_buttons()
 
@@ -542,6 +613,8 @@ class InventoryScreen(RepositoryBackedWidget):
                 secondary_sort_descending=secondary_sort_descending,
                 on_sort_changed=remember_sort,
                 denominations=self._denominations,
+                selected_item_ids=self._move_selection,
+                on_selection_changed=lambda _item_id, _checked: self._update_move_selection(),
             )
             is_unpaired_final_panel = location_count % 2 == 1 and index == location_count - 1
             column = 1 if is_unpaired_final_panel else (0 if index % 2 == 0 else 2)
@@ -638,6 +711,43 @@ class InventoryScreen(RepositoryBackedWidget):
             error = move_error(str(item["id"]), "actively_carried", repository.list_inventory_items(), repository.get_state_value("location", ""), repository.player_carrying_capacity_lb(), repository.get_travel_locations())
             return error or "No accessible destinations with enough cargo capacity. Open a nearby container first."
         return ""
+
+    def _update_move_selection(self) -> None:
+        count = len(self._move_selection)
+        self.selection_label.setText(f"{count} selected")
+        self.move_selected_button.setEnabled(count > 0)
+        self.clear_selection_button.setEnabled(count > 0)
+
+    def _clear_move_selection(self) -> None:
+        self._move_selection.clear()
+        for panel in self.location_panels:
+            for checkbox in panel.item_checkboxes.values():
+                checkbox.setChecked(False)
+        self._update_move_selection()
+
+    def _move_selected_items(self) -> None:
+        repository = self.repository()
+        if repository is None or not self._move_selection:
+            return
+        item_ids = sorted(self._move_selection)
+        destinations = repository.inventory_batch_move_destinations(item_ids)
+        if not destinations:
+            QMessageBox.information(self, "Move Selected Items",
+                                    "No destination can accept the complete selection. Check access and remaining capacity.")
+            return
+        dialog = InventoryMoveDialog(destinations, parent=self, item_count=len(item_ids))
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        try:
+            repository.move_inventory_items(item_ids, str(dialog.destination_combo.currentData()))
+        except ValueError as error:
+            QMessageBox.warning(self, "Cannot Move Selected Items", str(error))
+            return
+        self._move_selection.clear()
+        for item_id, details in list(self._item_detail_dialogs.items()):
+            details.close()
+        self.refresh()
+        self.notify_repository_changed()
 
     def _move_item(self, item_id: str) -> None:
         repository = self.repository()

@@ -108,7 +108,6 @@ class StatsScreen(RepositoryBackedWidget):
         for row_index, skill in enumerate(skills):
             level = int(skill.get("level", 1))
             name_item = _table_item(str(skill.get("name", "")))
-            name_item.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_FileIcon))
             asset = repository.get_visual_asset("skill", str(skill["id"]).casefold())
             path = self.visual_asset_path(asset)
             if path is not None and path.is_file():

@@ -1,4 +1,5 @@
 import os
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -58,7 +59,8 @@ class EquipmentLocationScopeTests(unittest.TestCase):
         combo = screen.equipment_combos["Main Hand"]
         self.assertNotIn("Rations", [combo.itemText(i) for i in range(combo.count())])
         self.assertGreater(screen.sheet_scroll.verticalScrollBar().maximum(), 0)
-        self.assertGreaterEqual(screen.profile_backstory_display.height(), 52)
+        self.assertGreaterEqual(screen.profile_backstory_display.viewport().height(),
+                                screen.profile_backstory_display.document().size().height())
         self.assertIn("carried bags 20 lb", screen.carrying_summary_label.text())
         before = self.repo.inventory_load()
         self.repo.set_player_equipment({"Back": "Backpack"})
@@ -138,4 +140,28 @@ class EquipmentLocationScopeTests(unittest.TestCase):
         rows = _travel_locations_for_save([{"name": "Safe Room", "source_index": 0, "location_scope": "broad"}], setup, SimpleNamespace(start_location=""))
         self.assertEqual(rows[0]["name"], "Safe Room")
         self.assertEqual(rows[0]["location_scope"], "specific")
+
+    def test_new_game_parser_keeps_ai_scope_when_template_has_no_explicit_choice(self):
+        from ai_adventure.ai.gemini_service import parse_gemini_new_game_response
+        from ai_adventure.inventory_storage import inventory_access
+
+        for authored, expected in ((None, "specific"), ("broad", "broad"), ("specific", "specific")):
+            with self.subTest(authored=authored):
+                requested = {"name": "My Cottage", "location_mode": "suggestion"}
+                if authored is not None:
+                    requested["location_scope"] = authored
+                setup = {"starting_locations": [requested]}
+                result = parse_gemini_new_game_response(json.dumps({
+                    "world_summary": "A cottage outside a city.",
+                    "start_location": "Meadowview Cottage", "weather": "Clear",
+                    "introductory_message": "You sit beside the cottage hearth.",
+                    "locations": [{"name": "Meadowview Cottage", "source_index": 0,
+                                   "description": "A single-story home with a workshop.",
+                                   "location_scope": "specific", "x_miles": -2.5, "y_miles": 1}],
+                }), setup_packet={"setup": setup})
+                rows = _travel_locations_for_save(result.locations, setup, result)
+                self.assertEqual(rows[0]["location_scope"], expected)
+                access = inventory_access([{"id": "loom", "storage_location": "Meadowview Cottage"}],
+                                          "Meadowview Cottage", rows)
+                self.assertEqual(access["loom"]["available"], expected == "specific")
 

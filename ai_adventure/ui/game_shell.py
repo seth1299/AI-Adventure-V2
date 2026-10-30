@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 from functools import wraps
 from ai_adventure.ui.survival_controller import SurvivalController
+from ai_adventure.ui.travel_controller import TravelAssessmentController
 
 from ai_adventure.ui.common import *  # noqa: F401,F403
 from ai_adventure.ui.dialogues import *  # noqa: F401,F403
@@ -21,6 +22,7 @@ from ai_adventure.ui.screens.settings import *  # noqa: F401,F403
 from ai_adventure.ui.screens.stats import *  # noqa: F401,F403
 from ai_adventure.ui.screens.story import *  # noqa: F401,F403
 from ai_adventure.ui.screens.tasks import *  # noqa: F401,F403
+from ai_adventure.ui.screens.timed_events import TimeSensitiveEventsScreen
 from ai_adventure.ui.screens.travel import *  # noqa: F401,F403
 
 
@@ -190,6 +192,7 @@ class GameShell(QWidget):
         top_bar.addStretch()
         top_bar.addWidget(self.menu_button)
         self.survival_controller = SurvivalController(self)
+        self.travel_assessment_controller = TravelAssessmentController(self)
 
         self.tabs = QTabWidget()
         self.tab_bar = _DetachableTabBar(self.tabs)
@@ -219,6 +222,7 @@ class GameShell(QWidget):
         )
         self.bestiary_screen = BestiaryScreen()
         self.calendar_screen = CalendarScreen(playtesting_tools=self.playtesting_tools)
+        self.timed_events_screen = TimeSensitiveEventsScreen()
         self.inventory_screen = InventoryScreen(
             playtesting_tools=self.playtesting_tools,
         )
@@ -253,6 +257,7 @@ class GameShell(QWidget):
             self.travel_screen,
             self.bestiary_screen,
             self.calendar_screen,
+            self.timed_events_screen,
             self.inventory_screen,
             self.merchant_screen,
             self.npcs_screen,
@@ -276,6 +281,7 @@ class GameShell(QWidget):
                 ("character", self.character_screen, "Character", True),
                 ("stats", self.stats_screen, "Stats", True),
                 ("calendar", self.calendar_screen, "Calendar", True),
+                ("timed_events", self.timed_events_screen, "Time-Sensitive Events", True),
                 ("inventory", self.inventory_screen, "Inventory", True),
                 ("merchant", self.merchant_screen, "Merchant", True),
                 ("magic", self.magic_screen, "Magic", True),
@@ -289,6 +295,7 @@ class GameShell(QWidget):
                 ("travel", self.travel_screen, "Travel", True),
                 ("bestiary", self.bestiary_screen, "Bestiary", True),
                 ("calendar", self.calendar_screen, "Calendar", True),
+                ("timed_events", self.timed_events_screen, "Time-Sensitive Events", True),
                 ("inventory", self.inventory_screen, "Inventory", True),
                 ("merchant", self.merchant_screen, "Merchant", True),
                 ("party", self.party_screen, "Party", True),
@@ -765,6 +772,8 @@ class GameShell(QWidget):
             for tab_key, (screen, _label, _closable) in self._tab_specs.items()
         }
         self._apply_audio_settings(start_music=not defer_music_playback)
+        if not defer_visual_scan:
+            self.travel_assessment_controller.schedule_check()
         if repository is not None and not defer_visual_scan:
             LOGGER.info(
                 "Scheduling visual asset scan after repository page bind: %s.",
@@ -906,6 +915,7 @@ class GameShell(QWidget):
         if scan_visual_assets:
             self.visual_asset_coordinator.scan(self.repository)
         self.survival_controller.schedule_check()
+        self.travel_assessment_controller.schedule_check()
 
     @Slot()
     def _handle_visual_assets_changed(self) -> None:
@@ -978,7 +988,7 @@ class GameShell(QWidget):
         destination: dict[str, Any],
         player_context: str,
     ) -> bool:
-        """Routes a Travel tab action through the ordinary story-turn pipeline."""
+        """Completes assessed-safe trips locally; other trips use the story flow."""
 
         return self.story_screen.submit_travel_request(destination, player_context)
 

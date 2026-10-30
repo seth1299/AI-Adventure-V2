@@ -43,6 +43,30 @@ class TabLayoutPersistenceTests(QtTestCase):
     def keys(self, shell):
         return [str(shell.tab_bar.tabData(i)) for i in range(shell.tabs.count())]
 
+    def test_timed_events_is_an_independent_main_tab_and_refreshes_with_the_clock(self):
+        shell = self.shell
+        index = shell._tab_index_for_key("timed_events")
+        self.assertGreaterEqual(index, 0)
+        self.assertIs(shell.tabs.widget(index), shell.timed_events_screen)
+        self.assertEqual(shell.tabs.tabText(index), "Time-Sensitive Events")
+        self.assertEqual([shell.calendar_screen.views.tabText(i)
+                          for i in range(shell.calendar_screen.views.count())], ["Month", "Year Overview"])
+        self.repo.set_current_calendar_minute(0)
+        self.repo.set_travel_locations([{"name": "Garden", "location_scope": "specific"}])
+        self.repo.upsert_timed_event(name="Flax", location="Garden", quantity=6, quantity_unit="shoots",
+                                     quantity_is_estimate=True, ready_at_minute=60, is_estimate=False)
+        shell.refresh_screens(scan_visual_assets=False)
+        self.assertEqual(shell.timed_events_screen.tasks_table.item(0, 1).text(), "~6 shoots")
+        self.assertEqual(shell.timed_events_screen.tasks_table.item(0, 4).text(), "1 hr")
+        self.repo.set_current_calendar_minute(60)
+        shell.refresh_screens(scan_visual_assets=False)
+        self.assertEqual(shell.timed_events_screen.tasks_table.item(0, 4).text(), "Ready")
+        self.assertIn("timed_events", self.repo.get_setting("ui.tab_layout")["known_tabs"])
+        shell._close_tab(index)
+        self.assertEqual(shell._tab_index_for_key("timed_events"), -1)
+        shell._restore_tab("timed_events")
+        self.assertGreaterEqual(shell._tab_index_for_key("timed_events"), 0)
+
     def test_moved_closed_restored_and_active_tabs_are_saved_immediately(self):
         shell = self.shell
         shell.tab_bar.moveTab(shell._tab_index_for_key("inventory"), 0)

@@ -262,6 +262,8 @@ class TravelScreen(RepositoryBackedWidget):
         sections.append("\n\n".join(travel_lines))
 
         conditions = []
+        if destination.weather:
+            conditions.append(f"**Weather:** {destination.weather}")
         if destination.terrain:
             conditions.append(f"**Terrain:** {destination.terrain}")
         if destination.travel_notes:

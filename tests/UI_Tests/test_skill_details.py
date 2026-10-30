@@ -228,7 +228,8 @@ class SkillDetailsTests(QtTestCase):
                 {"name": "Accounting", "description": "Manage ledgers.", "level": 3, "attribute": "Intelligence"},
             ])
             screen = StatsScreen()
-            screen.set_repository(repository)
+            with patch.object(screen, "visual_asset_path", return_value=None):
+                screen.set_repository(repository)
             self.assertEqual(
                 [screen.skills_table.horizontalHeaderItem(i).text() for i in range(screen.skills_table.columnCount())],
                 ["Skill", "Related Stat", "Training", "XP Progress", "Description"],
@@ -237,7 +238,7 @@ class SkillDetailsTests(QtTestCase):
             screen.show()
             self.app.processEvents()
             self.assertEqual(screen.skills_table.item(0, 1).text(), "Intelligence")
-            self.assertFalse(screen.skills_table.item(0, 0).icon().isNull())
+            self.assertTrue(screen.skills_table.item(0, 0).icon().isNull())
             self.assertEqual(screen.skills_table.cellWidget(0, 3).objectName(), "skillXpProgressBar")
             key = str(repository.get_skill("Accounting")["id"]).casefold()
             seen = []

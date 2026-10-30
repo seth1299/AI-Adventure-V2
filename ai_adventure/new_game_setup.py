@@ -4,6 +4,7 @@ from ai_adventure.template_images import normalize_template_images
 from ai_adventure.locations import MAP_COORDINATE_RULE
 
 from ai_adventure.skills.attributes import starting_skill_attribute
+from ai_adventure.timed_events import TIMED_EVENT_RULE
 
 from ai_adventure.stats import RULES_VERSION, STATS_RULE, rank_stats, starting_attributes, normalize_attributes, point_buy_cost, carrying_capacity
 
@@ -645,6 +646,9 @@ def build_new_game_setup_packet(
                 "settings and return calendar_settings as an empty object."
             ),
             "events": (
+                "Create a single durable identity per starting NPC, with a concrete "
+                "observable physical appearance suitable for a consistent portrait. "
+                "Avoid using only occupation or personality as their public_description. "
                 "Use top-level starting_npcs for setup.starting_npcs rows that "
                 "should be durable. The number of starting_npcs entries can be zero, "
                 "one, or many; choose the "
@@ -819,6 +823,11 @@ def build_new_game_setup_packet(
                 "different final name; never copy the suggestion unchanged."
             ),
             "travel_locations": (
+                "Give each location its current weather, consistent with the starting "
+                "season and scene. Never include route safety labels or hidden hazards "
+                "in these player-visible records; the application assesses safety privately. "
+                "Assign music_filename from the available music catalog to fit each location, "
+                "or leave it blank when no music is available. "
                 "Return a locations array for the Travel tab containing exactly "
                 "the places the player character plausibly knows at setup. There "
                 "is no minimum or maximum count beyond the current starting place. "
@@ -913,6 +922,13 @@ def build_new_game_setup_packet(
                 "Python is authoritative for generating missing result IDs. "
                 "value_base_units as a reasonable estimated result value in the "
                 "world's baseline currency unit."
+            ),
+            "timed_events": TIMED_EVENT_RULE + (
+                " Return initial records in the top-level timed_events array during world "
+                "synthesis for ongoing processes already established in setup prose; return "
+                "an empty array only when none are established. Use absolute ready_at_minute "
+                "based on the approved starting calendar (or -1 for unknown timing). "
+                "Use finalized location names, not the original suggestion placeholders."
             ),
             "skill_limits": (
                 "Skills use levels 1 through 5, with 5 as the absolute maximum. "

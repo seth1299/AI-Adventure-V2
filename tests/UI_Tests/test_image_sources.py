@@ -16,6 +16,56 @@ from tests.qt_test_case import QtTestCase
 
 
 class NewGameImageSourceDialogTests(QtTestCase):
+    def test_upload_can_be_replaced_or_switched_to_generation_before_next(self):
+        request = VisualAssetRequest("player", "kit", "Kit", "A scout.")
+        upload = Mock(return_value=(True, ""))
+        generate, skip = Mock(return_value=(True, "")), Mock()
+        dialog = NewGameImageSourceDialog([request], choose_file=upload,
+                                          create_image=generate, skip_image=skip)
+        self.addCleanup(dialog.deleteLater)
+        status, upload_button, checkbox, skip_button = dialog._rows[request.asset_id]
+        checkbox.click()
+        with patch("ai_adventure.ui.image_sources.QFileDialog") as picker_type:
+            picker = picker_type.return_value
+            picker.exec.return_value = QDialog.DialogCode.Accepted
+            picker.selectedFiles.side_effect = [["first.png"], ["replacement.png"]]
+            upload_button.click()
+            self.assertFalse(checkbox.isChecked())
+            for control in (upload_button, checkbox, skip_button):
+                self.assertTrue(control.isEnabled())
+            self.assertEqual(dialog.result(), QDialog.DialogCode.Rejected)
+            upload_button.click()
+        self.assertEqual(upload.call_args_list[0].args, (request, Path("first.png")))
+        self.assertEqual(upload.call_args_list[1].args, (request, Path("replacement.png")))
+        self.assertEqual(status.text(), "Using uploaded image")
+        checkbox.click()
+        skip_button.click()
+        self.assertFalse(checkbox.isChecked())
+        self.assertIn("keep existing image", status.text())
+        checkbox.click()
+        generate.assert_not_called()
+        dialog.continue_button.click()
+        generate.assert_called_once_with(request)
+        skip.assert_not_called()
+        self.assertFalse(upload_button.isEnabled())
+        dialog.set_asset_status(request.asset_id, "ready")
+        self.assertEqual(dialog.result(), QDialog.DialogCode.Accepted)
+
+    def test_uploaded_image_can_be_kept_without_generating_or_skipping_it(self):
+        request = VisualAssetRequest("skill", "cooking", "Cooking", "Prepare meals.")
+        generate, skip = Mock(), Mock()
+        dialog = NewGameImageSourceDialog([request], choose_file=Mock(),
+                                          create_image=generate, skip_image=skip)
+        self.addCleanup(dialog.deleteLater)
+        dialog._set_resolved(request, "Using uploaded image")
+        checkbox = dialog._rows[request.asset_id][2]
+        checkbox.click()
+        checkbox.click()
+        dialog.continue_button.click()
+        generate.assert_not_called()
+        skip.assert_not_called()
+        self.assertEqual(dialog.result(), QDialog.DialogCode.Accepted)
+
     def test_preview_refreshes_when_a_generated_image_replaces_bundled_art(self):
         from PIL import Image
 

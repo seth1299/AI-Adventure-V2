@@ -31,6 +31,21 @@ MAP_COORDINATE_RULE = (
     "when the player moves. Preserve established map positions; do not rebase an "
     "existing map or invent an undiscovered region just to supply an origin."
 )
+TRAVEL_SAFETY_RULE = (
+    "Route safety is a private, directional GM assessment from the player's current "
+    "location, not an intrinsic rating of a destination. Never reveal safety labels, "
+    "assessments, or hidden hazards in player-facing text or location descriptions. "
+    "The application completes assessed-safe Travel-tab trips locally with a "
+    "StatusUpdatedEvent, using calculated minutes and stored destination weather. "
+    "Each location also stores music_filename, chosen from the available music catalog. "
+    "Safe travel restores that destination track locally; music-off and volume settings still apply. "
+    "Unsafe or unassessed trips use the normal story/check flow; request a d20 test "
+    "only when an actual hazard has uncertain stakes. Keep each known location's "
+    "weather current via LocationUpsertedEvent when conditions change; a "
+    "StatusUpdatedEvent also records weather at the player's resulting location. "
+    "Hidden background assessments refresh routes after arrival and must never "
+    "appear as narration or suggested actions."
+)
 
 
 @dataclass(frozen=True)
@@ -48,6 +63,8 @@ class KnownLocation:
     is_sublocation: bool = False
     parent_location: str = ""
     location_scope: str = "broad"
+    weather: str = ""
+    music_filename: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         """Returns JSON-serializable location data."""
@@ -158,6 +175,8 @@ def normalize_known_location(raw_location: Any) -> KnownLocation | None:
         x_miles=_optional_coordinate(raw_location.get("x_miles", raw_location.get("x"))),
         y_miles=_optional_coordinate(raw_location.get("y_miles", raw_location.get("y"))),
         terrain=_clean_text(raw_location.get("terrain")),
+        weather=_clean_text(raw_location.get("weather")),
+        music_filename=_clean_text(raw_location.get("music_filename")),
         travel_multiplier=_clamped_float(
             raw_location.get("travel_multiplier"),
             default=1.0,

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from ai_adventure.ui.common import *  # noqa: F401,F403
 from ai_adventure.ui.dialogues import *  # noqa: F401,F403
+from ai_adventure.ui.screens.timed_events import timed_processes
 
 
 class CalendarScreen(RepositoryBackedWidget):
@@ -105,14 +106,6 @@ class CalendarScreen(RepositoryBackedWidget):
         self.year_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self.year_table.verticalHeader().setVisible(False)
 
-        self.tasks_table = _AppTableWidget(0, 6)
-        self.tasks_table.setHorizontalHeaderLabels(
-            ["Task", "Description", "Category", "Due", "Location", "Reward"]
-        )
-        self.tasks_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        _use_soft_table_selection(self.tasks_table)
-        _configure_wrapping_table(self.tasks_table, {1})
-
         self.views = QTabWidget()
         month_page = QWidget()
         month_layout = QVBoxLayout()
@@ -122,7 +115,6 @@ class CalendarScreen(RepositoryBackedWidget):
         month_page.setLayout(month_layout)
         self.views.addTab(month_page, "Month")
         self.views.addTab(self.year_table, "Year Overview")
-        self.views.addTab(self.tasks_table, "Tasks & Deadlines")
 
         layout = QVBoxLayout()
         layout.addWidget(self.views)
@@ -148,7 +140,6 @@ class CalendarScreen(RepositoryBackedWidget):
             self.settings_button.setEnabled(False)
             self.add_event_button.setEnabled(False)
             self.year_table.setRowCount(0)
-            self.tasks_table.setRowCount(0)
             return
 
         self.settings_button.setEnabled(True)
@@ -162,6 +153,11 @@ class CalendarScreen(RepositoryBackedWidget):
                 repository.get_calendar_settings(),
             )
         )
+        calendar_events.extend(self._task_deadline_events([
+            {**event, "name": f"{event['name']} — {event['location']}",
+             "due_elapsed_minutes": event["ready_at_minute"], "description": event.get("notes", "")}
+            for event in timed_processes(repository)
+        ], repository.get_calendar_settings()))
         self.month_offset = int(grid["month_offset"])
 
         self.month_label.setText(f"{grid['month_name']} - Year {grid['year']}")
@@ -218,7 +214,6 @@ class CalendarScreen(RepositoryBackedWidget):
 
         self.table.resizeRowsToContents()
         self._refresh_year_overview(state.calendar.to_dict(), calendar_events)
-        self._refresh_tasks(repository)
 
     @staticmethod
     def _task_deadline_events(
@@ -418,24 +413,6 @@ class CalendarScreen(RepositoryBackedWidget):
                 year_item.setTextAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignHCenter)
                 self.year_table.setItem(row, column, year_item)
         self.year_table.resizeRowsToContents()
-
-    def _refresh_tasks(self, repository: SaveRepository) -> None:
-        """Projects active tasks and deadlines into the Calendar tab."""
-
-        tasks = repository.list_active_tasks()
-        self.tasks_table.setRowCount(len(tasks))
-        for row, task in enumerate(tasks):
-            values = [
-                task.get("name", ""),
-                task.get("description", "") or "No description recorded yet.",
-                task.get("category", ""),
-                task.get("due_date", "N/A"),
-                task.get("location", ""),
-                task.get("reward", ""),
-            ]
-            for column, value in enumerate(values):
-                self.tasks_table.setItem(row, column, _table_item(str(value)))
-        _resize_wrapping_table_rows(self.tasks_table)
 
     def return_to_current_month(self) -> None:
         """Returns the grid to the current month and refreshes."""

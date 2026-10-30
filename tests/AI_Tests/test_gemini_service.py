@@ -1056,6 +1056,7 @@ class GeminiServiceTests(unittest.TestCase):
                 "FlagSetEvent",
                 "LocationUpsertedEvent",
                 "ActiveTaskUpsertedEvent",
+                "TimedEventUpsertedEvent",
                 "ActiveTaskCompletedEvent",
                 "NpcUpsertedEvent",
                 "NpcKnowledgeAddedEvent",
@@ -3027,6 +3028,7 @@ class GeminiServiceTests(unittest.TestCase):
             {
                 "NpcUpsertedEvent",
                 "ActiveTaskUpsertedEvent",
+                "TimedEventUpsertedEvent",
             },
         )
         opening_cue_schema = NEW_GAME_RESPONSE_JSON_SCHEMA["properties"][
@@ -3209,6 +3211,7 @@ class GeminiServiceTests(unittest.TestCase):
             json.dumps(
                 {
                     "selected_genre": "Solar noir",
+                    "timed_events": [],
                     "world_summary": "A city under glass.",
                     "gm_secrets": [],
                     "locations": [],
@@ -3272,6 +3275,7 @@ class GeminiServiceTests(unittest.TestCase):
 
     def test_new_game_request_uses_condensed_schema_for_completed_setup(self) -> None:
         response = {
+            "timed_events": [],
             "world_summary": "A compact city of steep roofs and narrow alleys.",
             "locations": [],
             "gm_secrets": [],
@@ -3360,6 +3364,7 @@ class GeminiServiceTests(unittest.TestCase):
             "starting_currency_balance_base_units": 20,
         }
         entities_response = {
+            "timed_events": [],
             "gm_secrets": [],
             "miscellaneous": [],
             "bestiary": [],
@@ -3646,6 +3651,7 @@ class GeminiServiceTests(unittest.TestCase):
             return json.dumps(
                 {
                     "selected_genre": "Detective mystery",
+                    "timed_events": [],
                     "world_summary": world_summary,
                     "locations": [
                         {
@@ -5532,6 +5538,7 @@ class GeminiServiceTests(unittest.TestCase):
     @staticmethod
     def _complete_new_game_response() -> dict[str, object]:
         return {
+            "timed_events": [],
             "world_summary": "A compact city of steep roofs and narrow alleys.",
             "locations": [],
             "gm_secrets": [],

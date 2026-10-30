@@ -47,6 +47,23 @@ STANDARD_IMAGE_MAX_PIXELS = 1024
 # All Gemini image requests now use the 1K tier.
 LARGE_IMAGE_MAX_PIXELS = STANDARD_IMAGE_MAX_PIXELS
 IMAGE_OUTPUT_MIME_TYPE = "image/png"
+ARTWORK_PRESENTATION_RULE = (
+    "Deliver only the artwork itself, filling the canvas. The image is a view of the "
+    "subject, not a poster, book cover, title card, advertisement, or game screenshot. "
+    "Keep the top and bottom of the image part of the artwork: no overlaid titles, "
+    "captions, headings, banners, footers, nameplates, typography, or interface elements. "
+    "Any writing explicitly permitted by the object-specific instructions belongs "
+    "only on that physical object, never as a caption or title over the image."
+)
+WORDLESS_ART_RULE = (
+    "Keep the artwork completely wordless, including objects within the scene. "
+    "Use plain, unlettered surfaces and blank or purely pictorial signs. Convey a "
+    "shop's purpose through its wares, tools, and furnishings rather than a written "
+    "business name. Books, packages, clothing, and display cases have no visible "
+    "writing or logos. Do not substitute illegible lettering, pseudo-writing, glyphs, "
+    "or random letter-like marks. The reference identity is metadata only and must "
+    "never be painted into the scene or typeset over it."
+)
 VISUAL_COHERENCE_RULE = (
     "Prioritize a cohesive, believable depiction over showing every described detail. "
     "Use one consistent viewpoint, perspective, scale, lighting, and spatial arrangement. "
@@ -224,8 +241,9 @@ class VisualAssetRequest:
         if "medieval" in eras or re.search(r"\b(?:no|without|avoid) modern\b", context):
             constraints.append("Avoid modern technology, vehicles, clothing, and manufactured objects.")
         return "\n".join(filter(None, [
+            ARTWORK_PRESENTATION_RULE,
             f"Art style: {style['label']}. {style['prompt']}",
-            f"Subject: {self.display_name}.",
+            f"Reference identity (metadata only, never a title or sign): {self.display_name}.",
             f"Description: {self.description}",
             " ".join(constraints),
             f"Focus: {focus}",
@@ -234,7 +252,7 @@ class VisualAssetRequest:
             VISUAL_COHERENCE_RULE,
             LOCATION_STRUCTURE_RULE if self.subject_type == "location" else "",
             "Avoid captions, signatures, watermarks, borders, and split panels.",
-            self.text_instructions or "No readable text or labels.",
+            self.text_instructions or WORDLESS_ART_RULE,
         ]))
 
     @property
@@ -297,11 +315,7 @@ class VisualAssetRequest:
         style = image_style_metadata(self.image_style)
         banned_terms = self.banned_terms or default_banned_creative_terms()
         banned_text = ", ".join(banned_terms) or "None"
-        text_instructions = self.text_instructions or (
-            "No readable text is permitted because the subject does not call for it. "
-            "The supplied subject name and description are metadata for the artist, "
-            "not words to render in the image."
-        )
+        text_instructions = self.text_instructions or WORDLESS_ART_RULE
         basic_identity = (
             f"Generic item family for reuse matching: {self.basic_name}\n"
             if self.subject_type == "inventory" and self.basic_name.strip()
@@ -309,6 +323,7 @@ class VisualAssetRequest:
         )
         return (
             "Generate one cohesive image for AI Adventure. "
+            f"{ARTWORK_PRESENTATION_RULE} "
             f"Selected visual style: {style['value']} ({style['label']}). "
             f"Style direction: {style['prompt']} "
             f"{subject_instruction} Use a coherent centered composition suitable for a compact "
@@ -322,10 +337,11 @@ class VisualAssetRequest:
             "colors, extreme contrast, plastic-looking materials, and unnaturally clean or flawless "
             "surfaces. Preserve believable variation, small imperfections, and style-appropriate "
             "texture, materials, and lighting.\n\n"
-            f"Subject name: {self.display_name}\n"
+            f"Reference identity (metadata only, never a title or sign): {self.display_name}\n"
             f"{basic_identity}"
             f"Player-visible description: {self.description}\n"
-            "The Subject name and Player-visible description above are metadata only. "
+            "The supplied subject name and description are metadata for the artist, "
+            "not words to typeset. "
             "Do not copy them into the image as text unless the exact-label rules below "
             "explicitly authorize that specific label.\n"
             "Text and label instructions (follow exactly; never invent readable text):\n"
@@ -637,10 +653,7 @@ def _text_instructions_for_subject(
 
     combined = f"{display_name} {description}".casefold()
     if not any(hint in combined for hint in _TEXT_BEARING_HINTS):
-        return (
-            "No readable text is permitted because the subject does not call for it. "
-            "The subject name is metadata only and must not be rendered."
-        )
+        return WORDLESS_ART_RULE
 
     approved = [
         display_name.strip(),

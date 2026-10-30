@@ -1,9 +1,43 @@
 from __future__ import annotations
+from math import ceil
 from typing import cast
-from PySide6.QtWidgets import QLayout
+from PySide6.QtWidgets import QBoxLayout, QLayout
 
 from ai_adventure.ui.common import *  # noqa: F401,F403
 from ai_adventure.ui.dialogues import *  # noqa: F401,F403
+
+
+class _ProfileTextSizing:
+    """Let the sheet scroll while profile text takes only its wrapped height."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.document().documentLayout().documentSizeChanged.connect(self._fit_text)
+        self._fit_text()
+
+    def _fit_text(self, *_args):
+        minimum_lines = 1 if self.isReadOnly() else 3
+        height = max(
+            ceil(self.document().size().height()),
+            self.fontMetrics().lineSpacing() * minimum_lines,
+        ) + self.frameWidth() * 2 + 6
+        if self.height() != height:
+            self.setFixedHeight(height)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._fit_text()
+
+
+class _ProfileEditor(_ProfileTextSizing, QTextEdit):
+    pass
+
+
+class _ProfileDisplay(_ProfileTextSizing, MarkdownDisplay):
+    pass
 
 
 class CharacterScreen(RepositoryBackedWidget):
@@ -62,9 +96,9 @@ class CharacterScreen(RepositoryBackedWidget):
             for slot in EQUIPMENT_SLOTS
         }
 
-        self.appearance_input = QTextEdit()
-        self.backstory_input = QTextEdit()
-        self.notes_input = QTextEdit()
+        self.appearance_input = _ProfileEditor()
+        self.backstory_input = _ProfileEditor()
+        self.notes_input = _ProfileEditor()
         for text_edit in [
             self.appearance_input,
             self.backstory_input,
@@ -147,14 +181,15 @@ class CharacterScreen(RepositoryBackedWidget):
             lambda: self.copy_visual_asset_prompt("player", self.repository().get_player_id() if self.repository() else ""))
         self.create_portrait_button = QPushButton("Create new image for me")
         self.create_portrait_button.clicked.connect(self._create_portrait_image)
-        portrait_layout.addWidget(
-            _button_row(self.select_portrait_button, self.create_portrait_button, self.copy_image_prompt_button)
-        )
+        for button in (self.select_portrait_button, self.create_portrait_button,
+                       self.copy_image_prompt_button):
+            portrait_layout.addWidget(button)
         self.portrait_group.setLayout(portrait_layout)
+        self.portrait_group.setFixedWidth(304)
         self.portrait_group.hide()
 
         self.profile_title_label = QLabel()
-        self.profile_title_label.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+        self.profile_title_label.setAlignment(Qt.AlignmentFlag.AlignLeft)
         self.profile_title_label.setStyleSheet("font-size: 24px; font-weight: 700;")
 
         self.profile_pronouns_label = QLabel()
@@ -173,19 +208,9 @@ class CharacterScreen(RepositoryBackedWidget):
         self.profile_identity_display = QWidget()
         self.profile_identity_display.setLayout(profile_identity_layout)
 
-        self.profile_appearance_display = MarkdownDisplay()
-        self.profile_backstory_display = MarkdownDisplay()
-        self.profile_notes_display = MarkdownDisplay()
-        for display in (
-            self.profile_appearance_display,
-            self.profile_backstory_display,
-            self.profile_notes_display,
-        ):
-            display.setMinimumHeight(52)
-            display.setSizePolicy(
-                QSizePolicy.Policy.Expanding,
-                QSizePolicy.Policy.MinimumExpanding,
-            )
+        self.profile_appearance_display = _ProfileDisplay()
+        self.profile_backstory_display = _ProfileDisplay()
+        self.profile_notes_display = _ProfileDisplay()
 
         self.profile_appearance_group = QGroupBox("Appearance")
         appearance_layout = QVBoxLayout()
@@ -235,7 +260,6 @@ class CharacterScreen(RepositoryBackedWidget):
 
         header_layout = QVBoxLayout()
         header_layout.addWidget(self.profile_title_label)
-        header_layout.addWidget(self.portrait_group, 0, Qt.AlignmentFlag.AlignHCenter)
         header_layout.addWidget(self.condition_group)
         header_layout.addWidget(self.profile_pages)
 
@@ -243,13 +267,23 @@ class CharacterScreen(RepositoryBackedWidget):
         secondary_layout.addWidget(self.stats_group, 1, Qt.AlignmentFlag.AlignTop)
         secondary_layout.addWidget(self.equipment_group, 1, Qt.AlignmentFlag.AlignTop)
 
-        sheet_layout = QVBoxLayout()
-        sheet_layout.addLayout(header_layout)
-        sheet_layout.addLayout(secondary_layout)
         edit_button_layout = QHBoxLayout()
-        edit_button_layout.addStretch()
         edit_button_layout.addWidget(self.edit_profile_button)
-        sheet_layout.addLayout(edit_button_layout)
+        edit_button_layout.addStretch()
+        header_layout.addLayout(secondary_layout)
+        header_layout.addLayout(edit_button_layout)
+        header_layout.addStretch()
+        details = QWidget()
+        details.setLayout(header_layout)
+        details.setMaximumWidth(1000)
+        columns = QHBoxLayout()
+        self._profile_columns = columns
+        columns.addWidget(self.portrait_group, 0, Qt.AlignmentFlag.AlignTop)
+        columns.addWidget(details, 1)
+        columns.addStretch()
+        sheet_layout = QVBoxLayout()
+        sheet_layout.addLayout(columns)
+        sheet_layout.addStretch()
 
         sheet_layout.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
         sheet = QWidget()
@@ -265,6 +299,15 @@ class CharacterScreen(RepositoryBackedWidget):
         self._set_pronouns(DEFAULT_CHARACTER_PRONOUNS)
         self._sync_contextual_controls(None)
         self._set_profile_editing(False)
+
+    def resizeEvent(self, event) -> None:
+        # Keep the details readable on smaller windows rather than squeezing
+        # them into the space left beside the portrait.
+        self._profile_columns.setDirection(
+            QBoxLayout.Direction.TopToBottom if event.size().width() < 1100
+            else QBoxLayout.Direction.LeftToRight
+        )
+        super().resizeEvent(event)
 
     def _add_profile_markdown_button(
         self,
@@ -355,6 +398,12 @@ class CharacterScreen(RepositoryBackedWidget):
         self.profile_pages.setCurrentWidget(
             self.edit_profile_page if self._editing_profile else self.read_profile_page
         )
+        for page in (self.read_profile_page, self.edit_profile_page):
+            page.setSizePolicy(
+                QSizePolicy.Policy.Preferred,
+                QSizePolicy.Policy.Preferred if page is self.profile_pages.currentWidget()
+                else QSizePolicy.Policy.Ignored,
+            )
         self.edit_profile_button.setText(
             "View Profile" if self._editing_profile else "Edit Profile"
         )

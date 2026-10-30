@@ -1,8 +1,10 @@
 from __future__ import annotations
+from ai_adventure.timed_events import TIMED_EVENT_RULE
 
 from ai_adventure.stats import PLAYER_ACHIEVEMENT_RULE, STATS_RULE
 from ai_adventure.suggested_actions import ACTION_RULE
-from ai_adventure.locations import MAP_COORDINATE_RULE
+from ai_adventure.locations import MAP_COORDINATE_RULE, TRAVEL_SAFETY_RULE
+from ai_adventure.npc_continuity import NPC_PROFILE_CONTINUITY_RULE
 
 from ai_adventure.container_flow import CONTAINER_FLOW_RULE
 from ai_adventure.inventory_storage import inventory_access, inventory_load
@@ -581,6 +583,8 @@ class AiContextBuilder:
                             "x_miles": location.x_miles,
                             "y_miles": location.y_miles,
                             "terrain": _compact_text(location.terrain),
+                            "weather": _compact_text(location.weather),
+                            "music_filename": location.music_filename,
                             "travel_multiplier": location.travel_multiplier,
                             "travel_notes": _compact_text(location.travel_notes),
                             "is_sublocation": location.is_sublocation,
@@ -596,7 +600,8 @@ class AiContextBuilder:
                     "rules": (
                         MAP_COORDINATE_RULE + " Use "
                         "LocationUpsertedEvent for newly learned or corrected travel "
-                        "locations, and do not reveal undiscovered routes or secrets."
+                        "locations, and do not reveal undiscovered routes or secrets. "
+                        + TRAVEL_SAFETY_RULE
                     ),
                 },
                 "world_profile": {
@@ -937,6 +942,7 @@ class AiContextBuilder:
                         ),
                     },
                 },
+                "timed_events": {"entries": state.timed_events},
                 "active_tasks": {
                     "rules": {
                         "purpose": (
@@ -1347,6 +1353,8 @@ class AiContextBuilder:
                     "player's specialty unless the player explicitly requested that "
                     "focused premise."
                 ),
+                "travel_safety": TRAVEL_SAFETY_RULE,
+                "npc_continuity": NPC_PROFILE_CONTINUITY_RULE,
                 "player_ai_preferences": (
                     "Use state.player_ai_preferences.narration_tense_label and "
                     "state.player_ai_preferences.narration_style_label for the "
@@ -1368,6 +1376,7 @@ class AiContextBuilder:
                     "ignore Notes because they are private."
                 ),
                 "mature_content": ai_mode_preferences["model_content_rules"],
+                "timed_events": TIMED_EVENT_RULE,
                 "active_tasks": (
                     "Use state.active_tasks.tasks to remember current quests, "
                     "commissions, custom orders, pending purchases, and other "
@@ -1510,6 +1519,7 @@ class AiContextBuilder:
                     "LocationUpsertedEvent",
                     "TravelModeChangedEvent",
                     "ActiveTaskUpsertedEvent",
+                    "TimedEventUpsertedEvent",
                     "ActiveTaskCompletedEvent",
                     "SpellCatalogUpsertedEvent",
                     "CharacterSpellLearnedEvent",
@@ -1867,11 +1877,17 @@ def _npc_context_profile(npc: dict[str, Any]) -> dict[str, Any]:
         "created_at",
         "updated_at",
     }
-    return {
+    profile = {
         key: _compact_context_value(value)
         for key, value in npc.items()
         if key in allowed_fields
     }
+    # Repository records expose canonical `id`; the model-facing event contract
+    # calls it `npc_id`. Dict.get aliases do not survive iteration over items().
+    npc_id = str(npc.get("id") or npc.get("npc_id") or "").strip()
+    if npc_id:
+        profile["npc_id"] = npc_id
+    return profile
 
 
 def _hybrid_magic_relevance_tags(

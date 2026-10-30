@@ -230,6 +230,23 @@ class EventApplier:
         if self.repository.survival_status()["fate"] != "alive":
             return _invalid(event_type, payload, "The player has died; resolve their fate before play can continue.")
         try:
+            if event_type == "TimedEventUpsertedEvent":
+                fields = {key: value for key, value in payload.items()
+                          if key in {"name", "location", "event_id", "category", "quantity", "quantity_unit",
+                                     "current_state", "next_state", "ready_at_minute", "notes", "lifecycle", "is_estimate",
+                                     "quantity_is_estimate"}}
+                if "duration_minutes" in payload:
+                    duration = payload["duration_minutes"]
+                    if isinstance(duration, bool) or not isinstance(duration, int) or duration < 0:
+                        return _invalid(event_type, payload, "duration_minutes must be a nonnegative integer.")
+                    if "ready_at_minute" in payload:
+                        return _invalid(event_type, payload, "Provide a duration or an absolute ready time, not both.")
+                    fields["ready_at_minute"] = self.repository.get_current_calendar_minute() + duration
+                if fields.get("location") and not self.repository.find_travel_location(fields["location"]):
+                    return _invalid(event_type, payload, "Timed-event location must be a known finalized location.")
+                record = self.repository.upsert_timed_event(**fields)
+                return AppliedEventResult(event_type, "applied", "Updated time-sensitive event.",
+                                          {**payload, "event_id": record["id"]})
             if event_type in {"InventoryItemAddedEvent", "ItemAddedEvent"}:
                 return self._apply_inventory_item_added(event_type, payload)
 
@@ -1168,6 +1185,10 @@ class EventApplier:
         location = _first_text(payload, "location", "new_location")
         weather = _first_text(payload, "weather")
         minutes_passed = _optional_int(payload, "minutes_passed", "minutes", "time")
+        previous_location = self.repository.get_state_value("location", "")
+        previous_weather = self.repository.get_state_value("weather", "")
+        if previous_location:
+            self.repository.upsert_travel_location({"name": previous_location, "weather": previous_weather})
 
         if location and location.upper() not in {"AUTO", "SAME", "SKIP"}:
             clean_location = clean_player_location_name(location)
@@ -1178,6 +1199,17 @@ class EventApplier:
 
         if weather and weather.upper() not in {"AUTO", "SAME", "SKIP"}:
             self.repository.set_state_value("weather", weather)
+
+        current_location = self.repository.get_state_value("location", "")
+        if current_location:
+            self.repository.upsert_travel_location({
+                "name": current_location,
+                "weather": self.repository.get_state_value("weather", ""),
+            })
+        if current_location.casefold() != previous_location.casefold():
+            # Distinguish repeat visits, including A -> B -> A at the same time.
+            self.repository.set_setting("travel.arrival_id", self.repository.create_message_id())
+            self.repository.set_setting("travel.assessment", {})
 
         if minutes_passed is not None and minutes_passed >= 0:
             current_total = self.repository.get_current_calendar_minute()
@@ -1236,6 +1268,10 @@ class EventApplier:
             "parent_location": _first_text(payload, "parent_location"),
             "location_scope": payload.get("location_scope", "broad"),
         }
+        if "weather" in payload:
+            location["weather"] = _first_text(payload, "weather")
+        if "music_filename" in payload:
+            location["music_filename"] = _first_text(payload, "music_filename")
 
         if not self.repository.upsert_travel_location(location):
             return _invalid(event_type, payload, "Location metadata was invalid.")
@@ -1881,6 +1917,34 @@ class EventApplier:
             "player_facing_summary",
             "player_known_information",
         )
+        existing = self.repository.get_npc(npc_id) if npc_id else None
+        if existing is None:
+            aliases = {value.casefold() for value in (name, display_name) if value}
+            matches = [npc for npc in self.repository.list_npcs(limit=500)
+                       if npc.get("location", "").casefold() == location.casefold()
+                       and aliases.intersection({str(npc.get("name", "")).casefold(),
+                                                 str(npc.get("display_name", "")).casefold()})]
+            if len(matches) == 1:
+                existing = matches[0]
+        preserved_fields = []
+        if existing is not None:
+            npc_id = str(existing["id"])
+            established = {
+                "name": name, "display_name": display_name, "role": role,
+                "public_description": public_description, "gender_identity": gender_identity,
+                "age": age, "species": species,
+            }
+            reason = _first_text(payload, "profile_change_reason")
+            for key, proposed in established.items():
+                previous = str(existing.get(key, "") or "").strip()
+                if previous and (key == "name" or not reason):
+                    if proposed and proposed != previous:
+                        preserved_fields.append(key)
+                    established[key] = previous
+            name, display_name, role, public_description, gender_identity, age, species = (
+                established[key] for key in ("name", "display_name", "role", "public_description",
+                                             "gender_identity", "age", "species")
+            )
         knowledge_scope = _npc_knowledge_scope(
             payload,
             role=role,
@@ -1952,11 +2016,18 @@ class EventApplier:
             if party_member is None:
                 return _invalid(event_type, payload, "Party member could not be stored.")
 
+        continuity_message = ""
+        if preserved_fields:
+            continuity_message = " Preserved established fields: " + ", ".join(preserved_fields) + "."
+            LOGGER.info("Preserved established NPC profile fields for %s: %s.", npc["id"], ", ".join(preserved_fields))
         return AppliedEventResult(
             event_type,
             "applied",
-            f"Stored NPC profile: {npc['name']}.",
-            {**payload, "npc_id": npc["npc_id"]},
+            f"Stored NPC profile: {npc['name']}." + continuity_message,
+            {**payload, "npc_id": npc["npc_id"], **({
+                "preserved_profile_fields": preserved_fields,
+                "effective_profile": {key: npc.get(key) for key in preserved_fields},
+            } if preserved_fields else {})},
         )
 
     def _merchant_catalog_id(self, payload: dict[str, Any]) -> str | None:
