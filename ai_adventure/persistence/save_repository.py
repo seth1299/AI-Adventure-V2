@@ -7307,7 +7307,7 @@ def _upsert_item_catalog_entry(
         row["metadata_json"],
         "item catalog metadata",
     )
-    for field in ("moveable", "storable", "weight_lb", "carrying_capacity_lb", "default_image"):
+    for field in ("moveable", "storable", "weight_lb", "carrying_capacity_lb", "default_image", "skill_book"):
         if field not in raw_metadata and field in existing_metadata:
             clean_metadata[field] = existing_metadata[field]
     if not str(raw_metadata.get("item_uuid", "")).strip():

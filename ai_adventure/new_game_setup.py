@@ -923,6 +923,7 @@ def build_new_game_setup_packet(
                 "value_base_units as a reasonable estimated result value in the "
                 "world's baseline currency unit."
             ),
+            "skill_books": "For instructional starter books, set skill_book with skill_name, attribute and a scope description of the subject taught. Choose the actual instructional subject, even if not a starting learned skill. Ownership alone grants no skill or XP.",
             "timed_events": TIMED_EVENT_RULE + (
                 " Return initial records in the top-level timed_events array during world "
                 "synthesis for ongoing processes already established in setup prose; return "

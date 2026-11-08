@@ -86,6 +86,7 @@ class TravelFlowTests(QtTestCase):
         shell.gemini_api_key_path = Path('unused-test-key')
         shell.story_screen = SimpleNamespace(_waiting_for_gm=False, _initial_generation_pending=False)
         shell.travel_screen = Mock()
+        shell.request_screen_refresh = Mock()
         return shell
 
     def test_background_assessment_is_not_repeated_or_written_to_another_save(self):
@@ -100,7 +101,8 @@ class TravelFlowTests(QtTestCase):
             worker.signals.completed.emit(result)
             controller.check()
             pool.globalInstance().start.assert_called_once()
-        shell.travel_screen.refresh.assert_called_once()
+        shell.request_screen_refresh.assert_called_once_with(shell.travel_screen)
+        shell.travel_screen.refresh.assert_not_called()
         self.assertEqual(self.repository.find_travel_location('Town')['weather'], 'Rain')
 
         self.repository.set_state_value('weather', 'Snow')

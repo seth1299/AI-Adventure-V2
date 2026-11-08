@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from ai_adventure.survival import SURVIVAL_METERS, SURVIVAL_RECOVERY_RULE
+from ai_adventure.deadlines import DEADLINE_RULE, missing_deadline_commitments
 from ai_adventure.bundled_images import bundled_image_prompt_context, valid_default_image
 
 from ai_adventure.skills.attributes import skill_attribute
+from ai_adventure.skills.books import SKILL_BOOK_SCHEMA, SKILL_BOOK_RULE
 
 from ai_adventure.stats import ATTRIBUTES, PLAYER_ACHIEVEMENT_RULE, STATS_RULE
 
@@ -179,6 +181,7 @@ KNOWN_EVENT_TYPE_NAMES = [
     "PlayerAchievementRecordedEvent",
     "SkillUpsertedEvent",
     "SkillXpAddedEvent",
+    "SkillBookStudiedEvent",
     "InventoryItemAddedEvent",
     "InventoryItemRemovedEvent",
     "InventoryItemModifiedEvent",
@@ -627,6 +630,11 @@ EVENT_RESPONSE_SCHEMA: dict[str, Any] = {
             "significance": {"type": "string", "enum": ["minor", "standard", "major"]}, "reason": {"type": "string"}
         }, ["source_id", "source_kind", "significance", "reason"], description=PLAYER_ACHIEVEMENT_RULE),
         _event_response_schema(
+            "SkillBookStudiedEvent",
+            {"item_name": {"type": "string"}, "reason": {"type": "string", "minLength": 1}},
+            ["item_name", "reason"], description="Meaningful study of an accessible linked skill book; Python chooses its skill.",
+        ),
+        _event_response_schema(
             "SkillUpsertedEvent",
             {
                 "default_image": {"type": "string", "description": "Optional exact matching bundled catalog filename; omit or empty when none fits."},
@@ -652,6 +660,7 @@ EVENT_RESPONSE_SCHEMA: dict[str, Any] = {
         _event_response_schema(
             "InventoryItemAddedEvent",
             {
+                "skill_book": SKILL_BOOK_SCHEMA,
                 "default_image": {"type": "string", "description": "Optional exact matching bundled catalog filename; omit or empty when none fits."},
                 "item_type": {"type": "string"},
                 "item_name": {"type": "string", "description": (
@@ -738,6 +747,7 @@ EVENT_RESPONSE_SCHEMA: dict[str, Any] = {
         _event_response_schema(
             "InventoryItemModifiedEvent",
             {
+                "skill_book": SKILL_BOOK_SCHEMA,
                 "target_name": {"type": "string"},
                 "owner_npc_id": {
                     "type": "string",
@@ -1562,6 +1572,10 @@ STORY_RESPONSE_JSON_SCHEMA: dict[str, Any] = {
     "additionalProperties": False,
 }
 STORY_BASE_EVENT_TYPE_NAMES: tuple[str, ...] = (
+    "ActiveTaskUpsertedEvent",
+    "ActiveTaskCompletedEvent",
+    "CalendarEventUpsertedEvent",
+    "CalendarEventDeletedEvent",
     "TimedEventUpsertedEvent",
     "StatusUpdatedEvent",
     "D20TestRequestedEvent",
@@ -1682,6 +1696,7 @@ STORY_EVENT_TYPE_NAMES_BY_CONTEXT_TAG: dict[str, tuple[str, ...]] = {
         "D20TestRequestedEvent",
         "SkillUpsertedEvent",
         "SkillXpAddedEvent",
+        "SkillBookStudiedEvent",
     ),
     "spell": (
         "SpellCatalogUpsertedEvent",
@@ -1972,6 +1987,7 @@ NEW_GAME_RESPONSE_JSON_SCHEMA: dict[str, Any] = {
             "items": {
                 "type": "object",
                 "properties": {
+                    "skill_book": SKILL_BOOK_SCHEMA,
                     "default_image": {"type": "string", "description": "Optional exact matching bundled catalog filename; omit or empty when none fits."},
                     "name": {
                         "type": "string",
@@ -2470,11 +2486,13 @@ def _story_event_type_names(context_packet: dict[str, Any]) -> tuple[str, ...]:
     enabled_event_types = set(STORY_BASE_EVENT_TYPE_NAMES) | {"PlayerHealthChangedEvent", "PlayerAchievementRecordedEvent"}
     if _state_subpacket(context_packet, "inventory").get("container_authority"):
         selected_tags.add("inventory")
+    if _state_subpacket(context_packet, "skill_book_study"):
+        selected_tags.update({"skill", "inventory"})
     for tag in selected_tags:
         enabled_event_types.update(STORY_EVENT_TYPE_NAMES_BY_CONTEXT_TAG.get(tag, ()))
     if re.search(r"\b(?:learn\w*|train\w*|practic\w*|study|studying|instruction|lesson)\b",
                  str(context_packet.get("player_command", "")), re.IGNORECASE):
-        enabled_event_types.update({"SkillUpsertedEvent", "SkillXpAddedEvent"})
+        enabled_event_types.update({"SkillUpsertedEvent", "SkillXpAddedEvent", "SkillBookStudiedEvent"})
     audio = _state_subpacket(context_packet, "audio")
     (
         valid_music_tracks,
@@ -2521,6 +2539,11 @@ def build_story_response_schema(
         for branch in EVENT_RESPONSE_SCHEMA["anyOf"]
         if branch["properties"]["type"]["enum"][0] in enabled_event_types
     ])
+    # Give Gemini one canonical clock representation. Runtime duration support is
+    # retained for direct callers, but exposing both fields invites ambiguous updates.
+    for branch in event_branches:
+        if branch["properties"]["type"]["enum"] == ["TimedEventUpsertedEvent"]:
+            branch["properties"]["payload"]["properties"].pop("duration_minutes", None)
     if _state_subpacket(context_packet, "survival").get("enabled") is not True:
         for branch in event_branches:
             if branch["properties"]["type"]["enum"][0] == "StatusUpdatedEvent":
@@ -2945,6 +2968,9 @@ class GeminiNarrationService:
         result = _apply_story_guard(result, context_packet, _ensure_inventory_for_collected_reagents)
         result = _apply_story_guard(result, context_packet, _ensure_inventory_for_narrated_collection)
         result = _apply_story_guard(result, context_packet, _normalize_visible_currency_phrasing)
+        result = _repair_missing_deadlines(
+            client, self.settings.model, result, context_packet, ai_preferences=ai_preferences,
+        )
         return replace(
             result,
             pronunciation_map=merge_pronunciation_maps(
@@ -3576,7 +3602,7 @@ def _project_story_state(context_packet: dict[str, Any]) -> dict[str, Any]:
     raw_tags = selection.get("tags", []) if isinstance(selection, dict) else []
     tags = {str(tag).casefold() for tag in raw_tags if str(tag).strip()}
     projected: dict[str, Any] = {}
-    for key in ("adventure_title", "player", "player_ai_preferences", "scene", "world_profile", "fighting", "survival", "timed_events"):
+    for key in ("adventure_title", "player", "player_ai_preferences", "scene", "world_profile", "fighting", "survival", "timed_events", "calendar", "active_tasks", "calendar_events", "skill_book_study"):
         if key in source:
             if key == "player_ai_preferences":
                 projected[key] = _story_player_preferences(source[key])
@@ -3695,7 +3721,7 @@ def _story_prompt_packet(context_packet: dict[str, Any]) -> dict[str, Any]:
         "player_ai_preferences", "creative_ideas", "speaker_cues",
         "player_achievements", "skill_training",
         "subject_history",
-        "timed_events",
+        "timed_events", "deadlines", "calendar_time", "active_tasks",
         "travel_safety",
         "npc_continuity",
     }
@@ -3718,6 +3744,9 @@ def _story_prompt_packet(context_packet: dict[str, Any]) -> dict[str, Any]:
             key in always or bool(tags_by_contract.get(key, set()) & selected_tags)
         )
     }
+    if projected_state.get("skill_book_study"):
+        filtered_contract["skill_books"] = SKILL_BOOK_RULE
+    filtered_contract.setdefault("deadlines", DEADLINE_RULE)
     filtered_contract.setdefault("travel_safety", TRAVEL_SAFETY_RULE)
     filtered_contract.setdefault("npc_continuity", NPC_PROFILE_CONTINUITY_RULE)
     if "miscellaneous" in projected_state and "miscellaneous_memory" in contract:
@@ -6463,6 +6492,26 @@ def _prefer_clearly_relevant_known_skill(
     if not result.checks:
         return result
 
+    book = _state_subpacket(context_packet, "skill_book_study")
+    link = book.get("skill_book")
+    if isinstance(link, dict):
+        known = _known_skills_from_context(context_packet)
+        target = str(link.get("skill_name", ""))
+        checks = []
+        for check in result.checks:
+            corrected = dict(check)
+            if re.search(r"\b(?:read|reading|study|studying|understand|comprehend)\b", str(check.get("reason", "")), re.I):
+                corrected["attribute"] = link["attribute"]
+                if target.casefold() in known:
+                    corrected["skill_name"] = known[target.casefold()]
+                    saved = next((skill for skill in _state_subpacket(context_packet, "skills").get("known_skills", [])
+                                  if str(skill.get("name", "")).casefold() == target.casefold()), {})
+                    corrected["attribute"] = saved.get("attribute") or link["attribute"]
+                else:
+                    corrected.pop("skill_name", None)
+            checks.append(corrected)
+        return replace(result, checks=checks)
+
     command = str(context_packet.get("player_command", "") or "")
     if not (
         FORAGING_ACTION_RE.search(command)
@@ -7162,6 +7211,49 @@ def _enforce_container_reward_flow(
     if issues:
         raise ContainerFlowError("; ".join(issues))
     return result
+
+
+def _repair_missing_deadlines(
+    client: Any, model: str, result: AiNarrationResult, context_packet: dict[str, Any],
+    *, ai_preferences: dict[str, Any],
+) -> AiNarrationResult:
+    """Recover only omitted task events, preserving the already validated response."""
+    if result.out_of_game or context_packet.get("conversation_mode") == "out_of_game":
+        return result
+    tasks = _state_subpacket(context_packet, "active_tasks").get("tasks", [])
+    missing = missing_deadline_commitments(result.narrative_text, result.suggested_events, tasks)
+    if not missing:
+        return result
+    branch = copy.deepcopy(next(branch for branch in EVENT_RESPONSE_SCHEMA["anyOf"]
+                                if branch["properties"]["type"]["enum"] == ["ActiveTaskUpsertedEvent"]))
+    branch["properties"]["payload"]["required"] = list(branch["properties"]["payload"]["properties"])
+    branch["properties"]["payload"]["properties"]["due_elapsed_minutes"]["minimum"] = 0
+    schema = {"type": "object", "properties": {"events": {"type": "array", "minItems": 1,
+              "items": branch}}, "required": ["events"], "additionalProperties": False}
+    LOGGER.warning("Narrated deadline missing a dated task; requesting event-only repair: %s", missing)
+    response = _create_interaction_with_retry(
+        client, model=model,
+        contents="Record the established obligations below as dated task events. Return only JSON "
+            "matching the schema. Do not rewrite narration, add unrelated obligations, or advance time.\n"
+            + DEADLINE_RULE + "\n" + json.dumps({
+                "missing_commitments": missing, "narrative": result.narrative_text,
+                "calendar": _state_subpacket(context_packet, "calendar"),
+                "scene": _state_subpacket(context_packet, "scene"),
+                "existing_tasks": tasks, "existing_events": result.suggested_events,
+            }, ensure_ascii=False),
+        config=_structured_output_config(schema, model=model, ai_preferences=ai_preferences),
+        request_label="deadline consistency repair", response_contract=schema,
+    )
+    raw = str(getattr(response, "output_text", "") or "").strip()
+    _validate_response_contract(raw, schema, "deadline repair response")
+    events = list(result.suggested_events)
+    status_index = next((i for i, event in enumerate(events)
+                         if event.get("type") == "StatusUpdatedEvent"), len(events))
+    events[status_index:status_index] = json.loads(raw)["events"]
+    if missing_deadline_commitments(result.narrative_text, events, tasks):
+        raise GeminiRequestError("The narrator did not record the stated deadline. "
+                                 "This turn was not saved. Please retry.")
+    return replace(result, suggested_events=events)
 
 
 def _repair_container_reward_flow(
@@ -8493,6 +8585,7 @@ def _parse_new_game_starter_items(raw_items: Any) -> list[dict[str, Any]]:
                 **{
                     field_name: raw_item[field_name]
                     for field_name in (
+                        "skill_book",
                         "weapon_hands",
 
 

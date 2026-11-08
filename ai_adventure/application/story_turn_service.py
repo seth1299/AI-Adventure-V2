@@ -6,6 +6,8 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 import re
 from ai_adventure.suggested_actions import saved_actions
+from ai_adventure.skills.books import SKILL_BOOK_RULE, reading_context, normalize_book_training
+from ai_adventure.deadlines import missing_deadline_commitments
 from typing import Any
 
 from ai_adventure.container_flow import ContainerFlowError, container_event_issues
@@ -137,6 +139,11 @@ class StoryTurnService:
                     "A shared subject does not mean every NPC knows everything in the excerpt. "
                     "Respect each NPC's knowledge scope. Excerpts may be shortened and are not a complete memory."
                 )
+        book = reading_context(repository.list_accessible_inventory_items(), player_text)
+        if book:
+            packet["state"]["skill_book_study"] = book
+            packet["selection"]["tags"] = sorted(set(packet["selection"]["tags"]) | {"skill", "inventory"})
+        packet["response_contract"]["skill_books"] = SKILL_BOOK_RULE
         return packet
 
     @staticmethod
@@ -279,6 +286,10 @@ class StoryTurnService:
                                              event_results=[AppliedEventResult(**event) for event in receipt["event_results"]])
             repository.require_active_adventure()
             is_out_of_game = conversation_mode == "out_of_game"
+            if not is_out_of_game and missing_deadline_commitments(
+                result.narrative_text, result.suggested_events, repository.list_active_tasks()
+            ):
+                raise ValueError("A narrated deadline has no dated task event; this turn was not saved.")
             if not is_out_of_game:
                 inventory = repository.list_inventory_items()
                 checks = [event.payload for event in prior_event_results or []
@@ -352,6 +363,10 @@ class StoryTurnService:
                 and str(event.get("type", "")).strip() == "InventoryItemAddedEvent"
             ]
             events_to_apply = result.suggested_events if not is_out_of_game else correction_events
+            if not is_out_of_game:
+                command = repository.list_history(limit=1, kinds=("player",))
+                command = command[0]["content"] if command and command[0].get("turn_id") == clean_message_id else ""
+                events_to_apply = normalize_book_training(events_to_apply, repository.list_accessible_inventory_items(), command)
             if events_to_apply:
                 event_results = StoryTurnService.apply_suggested_events(
                     repository,
@@ -359,10 +374,22 @@ class StoryTurnService:
                     suggested_events=events_to_apply,
                     prior_results=prior_event_results,
                 )
+            if any(event.event_type == "SkillBookStudiedEvent" and event.status == "skipped"
+                   and "already" not in event.message.casefold() and "max level" not in event.message.casefold()
+                   for event in event_results):
+                raise ValueError("Book study could not be recorded; this turn was rolled back.")
             invalid_timers = [event.message for event in event_results
                               if event.event_type == "TimedEventUpsertedEvent" and event.status != "applied"]
             if invalid_timers:
                 raise ValueError("Time-sensitive event changes could not be stored: " + "; ".join(invalid_timers))
+            deadline_tasks = repository.list_active_tasks() if not is_out_of_game else []
+            for event in event_results:
+                if event.event_type == "ActiveTaskCompletedEvent" and event.status == "applied":
+                    completed = repository.get_active_task(event.payload.get("name", ""))
+                    if completed:
+                        deadline_tasks.append(completed)
+            if not is_out_of_game and missing_deadline_commitments(result.narrative_text, [], deadline_tasks):
+                raise ValueError("A narrated deadline could not be persisted; this turn was rolled back.")
             failed_container_events = [event for event in event_results
                 if (event.event_type in {"ContainerOpenedEvent", "ContainerContentsTakenEvent"}
                     or event.event_type in {"InventoryItemModifiedEvent", "ItemModifiedEvent"}

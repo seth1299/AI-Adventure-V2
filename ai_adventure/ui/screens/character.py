@@ -257,6 +257,7 @@ class CharacterScreen(RepositoryBackedWidget):
 
         self.edit_profile_button = QPushButton("Edit Profile")
         self.edit_profile_button.clicked.connect(self._toggle_profile_editor)
+        portrait_layout.addWidget(self.edit_profile_button)
 
         header_layout = QVBoxLayout()
         header_layout.addWidget(self.profile_title_label)
@@ -267,11 +268,7 @@ class CharacterScreen(RepositoryBackedWidget):
         secondary_layout.addWidget(self.stats_group, 1, Qt.AlignmentFlag.AlignTop)
         secondary_layout.addWidget(self.equipment_group, 1, Qt.AlignmentFlag.AlignTop)
 
-        edit_button_layout = QHBoxLayout()
-        edit_button_layout.addWidget(self.edit_profile_button)
-        edit_button_layout.addStretch()
         header_layout.addLayout(secondary_layout)
-        header_layout.addLayout(edit_button_layout)
         header_layout.addStretch()
         details = QWidget()
         details.setLayout(header_layout)
@@ -392,7 +389,7 @@ class CharacterScreen(RepositoryBackedWidget):
             self.name_input.setFocus()
 
     def _set_profile_editing(self, editing: bool) -> None:
-        """Selects the profile page and keeps the bottom action descriptive."""
+        """Selects the profile page and keeps the profile action descriptive."""
 
         self._editing_profile = bool(editing)
         self.profile_pages.setCurrentWidget(

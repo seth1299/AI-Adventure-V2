@@ -13,8 +13,8 @@ class MerchantScreen(RepositoryBackedWidget):
         self.title = QLabel("No active merchant")
         self.balance = QLabel("Currency: 0")
         self.status = QLabel("Talk to a merchant to view their offers.")
-        self.sell_table = self._make_table(["Item", "In stock", "Unit price", "Quantity", "Buy"])
-        self.buy_table = self._make_table(["Item", "You have", "Unit offer", "Quantity", "Sell"])
+        self.sell_table = self._make_table(["Item", "In stock", "Unit price", "Quantity", "Buy", "Description"])
+        self.buy_table = self._make_table(["Item", "You have", "Unit offer", "Quantity", "Sell", "Description"])
         layout = QVBoxLayout()
         layout.addWidget(self.title)
         layout.addWidget(self.balance)
@@ -31,7 +31,8 @@ class MerchantScreen(RepositoryBackedWidget):
         table.setHorizontalHeaderLabels(headers)
         table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
-        table.horizontalHeader().setStretchLastSection(False)
+        _configure_wrapping_table(table, {5})
+        table.horizontalHeader().setMinimumSectionSize(80)
         return table
 
     def refresh(self) -> None:
@@ -51,8 +52,9 @@ class MerchantScreen(RepositoryBackedWidget):
         self.balance.setText(
             "Currency: " + format_currency_amount(balance, repository.get_currency_denominations())
         )
-        self._render_sell(repository, npc_id, balance, profile)
-        self._render_buy(repository, npc_id, profile)
+        catalog = {str(item["id"]): item for item in repository.list_item_catalog()}
+        self._render_sell(repository, npc_id, balance, profile, catalog)
+        self._render_buy(repository, npc_id, profile, catalog)
         self.status.setText("Select an offer to trade.")
 
     def _clear(self) -> None:
@@ -62,7 +64,7 @@ class MerchantScreen(RepositoryBackedWidget):
         self.buy_table.setRowCount(0)
         self.status.setText("Talk to a merchant to view their offers.")
 
-    def _render_sell(self, repository: SaveRepository, npc_id: str, balance: int, profile: dict[str, Any]) -> None:
+    def _render_sell(self, repository: SaveRepository, npc_id: str, balance: int, profile: dict[str, Any], catalog: dict[str, dict[str, Any]]) -> None:
         rows = repository.list_merchant_stock(npc_id) if profile.get("can_sell") else []
         self.sell_table.setRowCount(len(rows))
         for row_index, offer in enumerate(rows):
@@ -76,8 +78,10 @@ class MerchantScreen(RepositoryBackedWidget):
             button.setEnabled(int(offer["quantity"]) > 0 and balance >= int(offer["unit_price_base_units"]))
             button.clicked.connect(lambda _checked=False, selected=dict(offer), control=spin: self._buy(repository, selected, control.value()))
             self.sell_table.setCellWidget(row_index, 4, button)
+            self._set_description(self.sell_table, row_index, catalog.get(str(offer["item_id"]), {}).get("description", ""))
+        _resize_wrapping_table_rows(self.sell_table)
 
-    def _render_buy(self, repository: SaveRepository, npc_id: str, profile: dict[str, Any]) -> None:
+    def _render_buy(self, repository: SaveRepository, npc_id: str, profile: dict[str, Any], catalog: dict[str, dict[str, Any]]) -> None:
         inventory = {str(item.get("id")): item for item in repository.list_accessible_inventory_items()}
         rows = [offer for offer in repository.list_merchant_buy_offers(npc_id) if any(str(item.get("name", "")).casefold() == str(offer["item_name"]).casefold() for item in inventory.values())] if profile.get("can_buy") else []
         self.buy_table.setRowCount(len(rows))
@@ -94,6 +98,19 @@ class MerchantScreen(RepositoryBackedWidget):
             button.setEnabled(available > 0)
             button.clicked.connect(lambda _checked=False, selected=dict(offer), control=spin: self._sell(repository, selected, control.value()))
             self.buy_table.setCellWidget(row_index, 4, button)
+            description = str(item.get("description", "") or "").strip()
+            if not description:
+                description = catalog.get(str(offer["item_id"]), {}).get("description", "")
+            self._set_description(self.buy_table, row_index, description)
+        _resize_wrapping_table_rows(self.buy_table)
+
+    @staticmethod
+    def _set_description(table: QTableWidget, row: int, description: str) -> None:
+        text = str(description or "").strip() or "No description recorded."
+        item = _table_item(text)
+        item.setTextAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        item.setToolTip(text)
+        table.setItem(row, 5, item)
 
     def _buy(self, repository: SaveRepository, offer: dict[str, Any], quantity: int) -> None:
         self._trade(repository, "buy", str(offer["stock_id"]), quantity)

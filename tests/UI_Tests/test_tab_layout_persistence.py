@@ -55,6 +55,8 @@ class TabLayoutPersistenceTests(QtTestCase):
         self.repo.set_travel_locations([{"name": "Garden", "location_scope": "specific"}])
         self.repo.upsert_timed_event(name="Flax", location="Garden", quantity=6, quantity_unit="shoots",
                                      quantity_is_estimate=True, ready_at_minute=60, is_estimate=False)
+        shell.show()
+        shell.tabs.setCurrentWidget(shell.timed_events_screen)
         shell.refresh_screens(scan_visual_assets=False)
         self.assertEqual(shell.timed_events_screen.tasks_table.item(0, 1).text(), "~6 shoots")
         self.assertEqual(shell.timed_events_screen.tasks_table.item(0, 4).text(), "1 hr")

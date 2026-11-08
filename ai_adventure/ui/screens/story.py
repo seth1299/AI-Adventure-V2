@@ -7,6 +7,7 @@ from ai_adventure.application.travel_service import complete_safe_travel, curren
 
 from ai_adventure.ui.common import *  # noqa: F401,F403
 from ai_adventure.ui.dialogues import *  # noqa: F401,F403
+from ai_adventure.ui.widgets.location_image_panel import LocationImagePanel
 from ai_adventure.ui.workers.gemini import (
     GeminiD20TestPlanWorker as _GeminiD20TestPlanWorker,
     GeminiStoryWorker as _GeminiStoryWorker,
@@ -21,6 +22,7 @@ class StoryScreen(RepositoryBackedWidget):
     opening_retry_requested = Signal()
     HISTORY_PAGE_SIZE = 50
     CONVERSATION_KINDS = ("player", "player_oog", "story", "story_oog")
+    LOCATION_IMAGE_PINNED_SETTING = "ui.location_image_pinned"
 
     def __init__(
         self,
@@ -52,6 +54,7 @@ class StoryScreen(RepositoryBackedWidget):
         self._pending_message_id: str | None = None
         self._pending_regeneration_request: dict[str, Any] | None = None
         self._conversation_render_generation = 0
+        self._conversation_rows: dict[tuple[Any, ...], tuple[str, QWidget]] = {}
         self._waiting_for_gm = False
         self._thinking_frame_index = 0
         self._thinking_timer = QTimer(self)
@@ -72,13 +75,9 @@ class StoryScreen(RepositoryBackedWidget):
         self.day_value = QLabel(UNRESOLVED_STATUS_TEXT)
         self.time_value = QLabel(UNRESOLVED_STATUS_TEXT)
         self.weather_value = QLabel(UNRESOLVED_STATUS_TEXT)
-        self.location_image_label = ClickableImageLabel()
-        self.location_image_label.setObjectName("storyCurrentLocationImage")
-        self.location_image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.location_image_label.setStyleSheet(
-            "background: rgba(15, 23, 42, 96); border-radius: 8px; padding: 3px;"
-        )
-        self.location_image_label.hide()
+        self.location_image_panel = LocationImagePanel(self)
+        self.location_image_panel.pinned_changed.connect(self._save_location_image_mode)
+        self.location_image_label = self.location_image_panel.image_label
 
         status_row = QHBoxLayout()
         status_row.addStretch()
@@ -173,12 +172,7 @@ class StoryScreen(RepositoryBackedWidget):
         layout.addLayout(conversation_toolbar)
         layout.addLayout(status_row)
         layout.addWidget(self.survival_bars_box)
-        location_image_row = QHBoxLayout()
-        location_image_row.setContentsMargins(0, 0, 0, 0)
-        location_image_row.addStretch()
-        location_image_row.addWidget(self.location_image_label)
-        location_image_row.addStretch()
-        layout.addLayout(location_image_row)
+        layout.addWidget(self.location_image_panel)
         layout.addWidget(self.conversation_scroll, 1)
         self.suggested_actions_box = QWidget()
         self.suggested_actions_layout = QGridLayout(self.suggested_actions_box)
@@ -204,6 +198,7 @@ class StoryScreen(RepositoryBackedWidget):
         """Sets the active save and clears any stale narration reveal state."""
 
         self._clear_story_reveal_state()
+        self._clear_conversation_messages()
         self._history_start_id = None
         self._history_expanded = False
         self._initial_generation_pending = False
@@ -211,7 +206,18 @@ class StoryScreen(RepositoryBackedWidget):
         self._pending_travel_request = None
         self._pending_conversation_mode = "live_game"
         self.mode_button.setChecked(False)
+        self.location_image_panel.set_image_identity(None)
+        self.location_image_panel.set_pinned(
+            repository is not None
+            and repository.get_setting(self.LOCATION_IMAGE_PINNED_SETTING, False) is True
+        )
         super().set_repository(repository)
+
+    def _save_location_image_mode(self, pinned: bool) -> None:
+        """Remember the reader's image-panel preference for this adventure."""
+        repository = self.repository()
+        if repository is not None:
+            repository.set_setting(self.LOCATION_IMAGE_PINNED_SETTING, pinned)
 
     def resizeEvent(self, event: QResizeEvent) -> None:
         """Recomputes the final-message reading buffer after a window resize."""
@@ -423,28 +429,36 @@ class StoryScreen(RepositoryBackedWidget):
     def _clear_conversation_messages(self) -> None:
         """Removes all rendered conversation bubbles while preserving the stretch."""
 
+        self._conversation_rows.clear()
+        self._progressive_story_message = None
+        self._conversation_render_generation += 1
         while self.conversation_layout.count() > 2:
             item = self.conversation_layout.takeAt(0)
             widget = item.widget() if item is not None else None
             if widget is not None:
+                widget.hide()
                 widget.deleteLater()
 
     def _render_conversation(
         self,
         entries: list[tuple[Any, ...]],
     ) -> None:
-        """Rebuilds the modern, role-aligned conversation timeline."""
+        """Reconcile history with existing rows, retaining unchanged message widgets."""
 
         bar = self.conversation_scroll.verticalScrollBar()
         old_value = bar.value()
         old_maximum = bar.maximum()
         follow_bottom = old_maximum - old_value <= 48
-        self._conversation_render_generation += 1
-        render_generation = self._conversation_render_generation
-
-        self._clear_conversation_messages()
-        self._progressive_story_message = None
+        previous_rows = self._conversation_rows
+        next_rows: dict[tuple[Any, ...], tuple[str, QWidget]] = {}
+        occurrences: dict[tuple[Any, ...], int] = {}
+        layout_changed = False
         repository = self.repository()
+        narration_enabled = self.narration_player is not None and (
+            repository is None
+            or bool(repository.get_setting("audio.narrator_enabled", True))
+        )
+        self._progressive_story_message = None
         latest_ai_entry = self._latest_ai_message_entry()
         latest_ai_history_id = _safe_int(
             latest_ai_entry.get("id") if latest_ai_entry is not None else None,
@@ -508,31 +522,71 @@ class StoryScreen(RepositoryBackedWidget):
                 and repository.has_message_snapshot(message_id)
                 and not self._waiting_for_gm
             )
-            bubble = self._conversation_bubble(
-                role,
-                mode,
-                content,
-                history_entry_id=_safe_int(entry_id, -1),
-                message_id=message_id,
-                can_regenerate=can_regenerate,
-                turn_number=turn_number,
-                speaker_name=speaker_name,
-                narration_text=narration_text,
-                sound_effect_cues=sound_effect_cues,
-                speaker_cues=speaker_cues,
-                show_visual_assets=show_visual_assets,
-                is_opening_message=is_opening_message,
-                game_time=str(entry[10]) if len(entry) > 10 else "",
+            identity = (role, mode, entry_id)
+            segment_index = occurrences.get(identity, 0)
+            occurrences[identity] = segment_index + 1
+            key = (*identity, segment_index)
+            assets = [self._conversation_speaker_asset(role, speaker_cues)]
+            if show_visual_assets and repository is not None:
+                assets.extend(
+                    asset for asset in repository.list_visual_assets_for_message(message_id)
+                    if str(asset.get("subject_type", "")).casefold() == "inventory"
+                )
+            visual_signature = []
+            for asset in assets:
+                path = self.visual_asset_path(asset)
+                try:
+                    stamp = path.stat().st_mtime_ns if path is not None else None
+                except OSError:
+                    stamp = None
+                visual_signature.append((asset, str(path), stamp))
+            signature = json.dumps(
+                (entry, is_opening_message, show_visual_assets, narration_enabled, visual_signature),
+                sort_keys=True, default=str,
             )
+            previous = previous_rows.get(key)
+            if previous is not None and previous[0] == signature:
+                bubble = previous[1]
+                layout_changed |= self._sync_bubble_regeneration(bubble, can_regenerate, message_id)
+            else:
+                bubble = self._conversation_bubble(
+                    role,
+                    mode,
+                    content,
+                    history_entry_id=_safe_int(entry_id, -1),
+                    message_id=message_id,
+                    can_regenerate=can_regenerate,
+                    turn_number=turn_number,
+                    speaker_name=speaker_name,
+                    narration_text=narration_text,
+                    sound_effect_cues=sound_effect_cues,
+                    speaker_cues=speaker_cues,
+                    show_visual_assets=show_visual_assets,
+                    is_opening_message=is_opening_message,
+                    game_time=str(entry[10]) if len(entry) > 10 else "",
+                )
+                layout_changed = True
+            next_rows[key] = (signature, bubble)
             if (
                 role == "ai"
                 and _safe_int(entry_id, -1) == self._revealing_story_id
             ):
                 self._progressive_story_message = bubble.findChild(QTextEdit)
-            self.conversation_layout.insertWidget(
-                self.conversation_layout.count() - 2,
-                bubble,
-            )
+        for key, (_signature, row) in previous_rows.items():
+            if key not in next_rows or next_rows[key][1] is not row:
+                self.conversation_layout.removeWidget(row)
+                row.hide()
+                row.deleteLater()
+                layout_changed = True
+        for index, (_signature, row) in enumerate(next_rows.values()):
+            if self.conversation_layout.indexOf(row) != index:
+                self.conversation_layout.insertWidget(index, row)
+                layout_changed = True
+        self._conversation_rows = next_rows
+        if not layout_changed:
+            return
+        self._conversation_render_generation += 1
+        render_generation = self._conversation_render_generation
         QTimer.singleShot(
             0,
             self,
@@ -607,11 +661,11 @@ class StoryScreen(RepositoryBackedWidget):
         repository = self.repository()
         is_player = role == "player"
         is_out_of_game = mode == "out_of_game"
-        row = QWidget()
+        row = QWidget(self.conversation_contents)
         row_layout = QHBoxLayout(row)
         row_layout.setContentsMargins(0, 0, 0, 0)
 
-        bubble = QFrame()
+        bubble = QFrame(row)
         bubble.setObjectName("conversationBubble")
         bubble.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
         bubble_layout = QVBoxLayout(bubble)
@@ -636,7 +690,7 @@ class StoryScreen(RepositoryBackedWidget):
             repository is None
             or bool(repository.get_setting("audio.narrator_enabled", True))
         )
-        read_aloud_button = QPushButton("Read Aloud")
+        read_aloud_button = QPushButton("Read Aloud", bubble)
         read_aloud_button.setVisible(narration_enabled)
         read_aloud_button.setEnabled(narration_enabled)
         read_aloud_button.setToolTip(
@@ -662,6 +716,7 @@ class StoryScreen(RepositoryBackedWidget):
         read_aloud_button.clicked.connect(read_message_aloud)
 
         header_row = QHBoxLayout()
+        header_row.setObjectName("conversationHeader")
         header_row.setContentsMargins(0, 0, 0, 0)
         header_row.addWidget(header)
         header_row.addStretch()
@@ -671,7 +726,8 @@ class StoryScreen(RepositoryBackedWidget):
             # Preserve the historical header geometry without exposing a dead
             # control in builds/settings where narration is unavailable.
             header_row.addSpacing(82)
-        hide_button = QPushButton("Hide")
+        hide_button = QPushButton("Hide", bubble)
+        hide_button.setObjectName("conversationHide")
         hide_button.setToolTip(
             "Remove this message from the Conversation tab without deleting it from history."
         )
@@ -687,24 +743,6 @@ class StoryScreen(RepositoryBackedWidget):
             )
         )
         header_row.addWidget(hide_button)
-        if can_regenerate:
-            regenerate_button = QPushButton("Regenerate")
-            regenerate_button.setToolTip(
-                "Regenerate this whole turn after reverting every bubble and state "
-                "change tied to its message ID."
-            )
-            regenerate_button.setStyleSheet(
-                "QPushButton { background-color: rgba(255, 255, 255, 28); "
-                "color: white; border: 1px solid rgba(255, 255, 255, 70); "
-                "border-radius: 7px; padding: 3px 9px; font-size: 11px; } "
-                "QPushButton:hover { background-color: rgba(255, 255, 255, 48); }"
-            )
-            regenerate_button.clicked.connect(
-                lambda _checked=False, current_message_id=message_id: (
-                    self._request_regeneration(current_message_id)
-                )
-            )
-            header_row.addWidget(regenerate_button)
         bubble_layout.addLayout(header_row)
 
         speaker_asset = self._conversation_speaker_asset(
@@ -797,7 +835,34 @@ class StoryScreen(RepositoryBackedWidget):
                 "color: white; }"
             )
             row_layout.addWidget(bubble, 1)
+        self._sync_bubble_regeneration(row, can_regenerate, message_id)
         return row
+
+    def _sync_bubble_regeneration(self, row: QWidget, enabled: bool, message_id: str) -> bool:
+        """Update the latest-turn action without replacing the message or its document."""
+        button = row.findChild(QPushButton, "conversationRegenerate")
+        if not enabled:
+            if button is None:
+                return False
+            button.hide()
+            button.setParent(None)
+            button.deleteLater()
+            return True
+        if button is not None:
+            return False
+        hide_button = row.findChild(QPushButton, "conversationHide")
+        header = row.findChild(QHBoxLayout, "conversationHeader")
+        button = QPushButton("Regenerate", hide_button.parentWidget())
+        button.setObjectName("conversationRegenerate")
+        button.setToolTip(
+            "Regenerate this whole turn after reverting every bubble and state "
+            "change tied to its message ID."
+        )
+        button.setStyleSheet(hide_button.styleSheet())
+        button.clicked.connect(lambda _checked=False: self._request_regeneration(message_id))
+        header.addWidget(button)
+        button.show()
+        return True
 
     def _hide_conversation_message(self, history_entry_id: int) -> None:
         """Hides one conversation entry while retaining it in the save history."""
@@ -942,12 +1007,12 @@ class StoryScreen(RepositoryBackedWidget):
 
         repository = self.repository()
         if repository is None or not str(location_name or "").strip():
-            self.location_image_label.hide()
+            self.location_image_panel.set_image_identity(None)
             return
 
         location = repository.find_travel_location(location_name)
         if not isinstance(location, dict):
-            self.location_image_label.hide()
+            self.location_image_panel.set_image_identity(None)
             return
         location_key = str(
             location.get("location_id", "") or location.get("name", "")
@@ -958,12 +1023,16 @@ class StoryScreen(RepositoryBackedWidget):
                 "location",
                 str(location.get("name", "") or ""),
             )
-        _set_generated_image(
+        image_path = self.visual_asset_path(location_asset)
+        ready = _set_generated_image(
             self.location_image_label,
-            self.visual_asset_path(location_asset),
+            image_path,
             maximum_width=560,
             maximum_height=280,
             accessible_name=f"Current location: {location.get('name', location_name)}",
+        )
+        self.location_image_panel.set_image_identity(
+            f"{location_key}:{image_path}" if ready else None
         )
 
     def _read_conversation_message_aloud(
@@ -1779,7 +1848,7 @@ class StoryScreen(RepositoryBackedWidget):
         self.day_value.setText(UNRESOLVED_STATUS_TEXT)
         self.time_value.setText(UNRESOLVED_STATUS_TEXT)
         self.weather_value.setText(UNRESOLVED_STATUS_TEXT)
-        self.location_image_label.hide()
+        self.location_image_panel.set_image_identity(None)
 
     def narrate_latest_story(self, *, reveal_progressively: bool = False) -> bool:
         """Narrates the latest story, optionally revealing its chunks on screen."""

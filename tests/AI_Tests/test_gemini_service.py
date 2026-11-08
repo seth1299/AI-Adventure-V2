@@ -1058,6 +1058,8 @@ class GeminiServiceTests(unittest.TestCase):
                 "ActiveTaskUpsertedEvent",
                 "TimedEventUpsertedEvent",
                 "ActiveTaskCompletedEvent",
+                "CalendarEventUpsertedEvent",
+                "CalendarEventDeletedEvent",
                 "NpcUpsertedEvent",
                 "NpcKnowledgeAddedEvent",
                 "SecretUpsertedEvent",
@@ -4133,7 +4135,7 @@ class GeminiServiceTests(unittest.TestCase):
         self.assertNotIn("rules", packet["state"]["inventory"])
         self.assertNotIn("detail_policy", packet["state"]["inventory"])
         self.assertNotIn("magic", packet["state"])
-        self.assertNotIn("active_tasks", packet["state"])
+        self.assertIn("active_tasks", packet["state"])
         self.assertNotIn("miscellaneous", packet["state"])
         self.assertNotIn("merchant", packet["state"])
         self.assertNotIn("text_model", packet["state"]["player_ai_preferences"])

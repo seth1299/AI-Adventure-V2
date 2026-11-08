@@ -15,6 +15,57 @@ from ai_adventure.persistence.save_repository import SaveRepository
 
 
 class TimedEventFlowTests(unittest.TestCase):
+    def test_conflicting_timer_rolls_back_the_whole_wait_and_visit_turn(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = SaveRepository.create_new_save(Path(directory), "Conflicting timer")
+            repo.set_travel_locations([{"name": "Garden", "location_scope": "specific"}])
+            repo.set_current_calendar_minute(480)
+            repo.upsert_timed_event(name="Flax", location="Garden", ready_at_minute=1920, notes="Original")
+            before = repo.list_history()
+            result = parse_gemini_story_response(json.dumps({
+                "response": "You wait, travel to the garden and inspect the flax.",
+                "out_of_game": False, "suggested_actions": [], "events": [
+                    {"type": "TimedEventUpsertedEvent", "payload": {"name": "Flax", "location": "Garden", "notes": "Must roll back"}},
+                    {"type": "StatusUpdatedEvent", "payload": {"location": "Garden", "minutes_passed": 100, "weather": "Clear"}},
+                    {"type": "TimedEventUpsertedEvent", "payload": {"name": "Flax", "location": "Garden", "duration_minutes": 90, "ready_at_minute": 700}},
+                ],
+            }))
+            with self.assertRaisesRegex(ValueError, "Conflicting timer times"):
+                StoryTurnService.commit_response(repo, result, message_id="conflicting")
+            self.assertEqual(repo.get_current_calendar_minute(), 480)
+            self.assertEqual(repo.list_history(), before)
+            self.assertEqual(repo.list_timed_events()[0]["notes"], "Original")
+            self.assertEqual(repo.list_timed_events()[0]["ready_at_minute"], 1920)
+            self.assertEqual(repo.list_mechanical_events(), [])
+
+    def test_gemini_timer_schema_exposes_only_absolute_time(self):
+        for api in (False, True):
+            schema = build_story_response_schema({"selection": {"tags": []}}, for_api=api)
+            branch = next(branch for branch in schema["properties"]["events"]["items"]["anyOf"]
+                          if branch["properties"]["type"]["enum"] == ["TimedEventUpsertedEvent"])
+            fields = branch["properties"]["payload"]["properties"]
+            self.assertIn("ready_at_minute", fields)
+            self.assertNotIn("duration_minutes", fields)
+
+    def test_wait_travel_and_crop_update_commit_without_restarting_timer(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = SaveRepository.create_new_save(Path(directory), "Wait then visit garden")
+            repo.set_travel_locations([{"name": "Garden", "location_scope": "specific"}])
+            repo.set_current_calendar_minute(480)
+            repo.upsert_timed_event(name="Flax", location="Garden", ready_at_minute=1920)
+            result = parse_gemini_story_response(json.dumps({
+                "response": "After resting for ninety minutes, you visit the garden and inspect the flax.",
+                "out_of_game": False, "suggested_actions": [], "events": [
+                    {"type": "StatusUpdatedEvent", "payload": {"location": "Garden", "minutes_passed": 100, "weather": "Clear"}},
+                    {"type": "TimedEventUpsertedEvent", "payload": {"name": "Flax", "location": "Garden", "notes": "Inspected; healthy."}},
+                ],
+            }))
+            StoryTurnService.commit_response(repo, result, message_id="wait-and-visit")
+            self.assertEqual(repo.get_current_calendar_minute(), 580)
+            self.assertEqual(repo.get_state_value("location"), "Garden")
+            self.assertEqual(repo.list_timed_events()[0]["ready_at_minute"], 1920)
+            self.assertEqual(repo.list_timed_events()[0]["notes"], "Inspected; healthy.")
+
     def test_invalid_timed_change_rolls_back_the_turn_and_prior_timer_edits(self):
         with tempfile.TemporaryDirectory() as directory:
             repo = SaveRepository.create_new_save(Path(directory), "Atomic garden")

@@ -307,7 +307,7 @@ class VisualAssetTests(unittest.TestCase):
         self.assertEqual(creature.aspect_ratio, "1:1")
         self.assertIn("single non-human creature illustration", creature.prompt)
 
-    def test_image_prompt_passes_banned_terms_and_exact_map_labels(self) -> None:
+    def test_inventory_map_is_an_item_without_regional_map_instructions(self) -> None:
         class _MapRepository(_VisualRepository):
             def ensure_travel_locations(self):
                 return [
@@ -345,13 +345,53 @@ class VisualAssetTests(unittest.TestCase):
         )
 
         self.assertIn("Alden", request.prompt)
-        self.assertIn('"Riverbend City"', request.prompt)
-        self.assertNotIn('"Oakhaven"', request.prompt)
-        self.assertIn("do not add, rename, or imply any other place", request.prompt)
-        self.assertIn("east is right, west is left, north is up, and south is down", request.prompt)
-        self.assertIn("Never render coordinates, coordinate pairs", request.prompt)
-        self.assertNotIn("x_miles=", request.prompt)
-        self.assertIn('"Dark Forest" is east of "Riverbend City".', request.prompt)
+        for prompt in (request.prompt, request.external_prompt):
+            self.assertIn('"Basic Regional Map"', prompt)
+            self.assertNotIn('"Oakhaven"', prompt)
+            self.assertNotIn("Dark Forest", prompt)
+            self.assertNotIn("compass", prompt)
+            self.assertNotIn("Directional relationships", prompt)
+            self.assertNotIn("east is right", prompt)
+            self.assertNotIn("x_miles", prompt)
+
+    def test_book_prompt_only_authorizes_its_own_title(self) -> None:
+        class BookRepository(_VisualRepository):
+            def list_inventory_items(self):
+                return [{"name": "Riverbank Vegetation Folio", "category": "Book",
+                         "description": "A bound reference book about riverbank plants."}]
+
+        request = next(r for r in build_visual_asset_requests(BookRepository())
+                       if r.subject_type == "inventory")
+        for prompt in (request.prompt, request.external_prompt):
+            self.assertTrue(prompt.startswith("Create one inventory illustration"))
+            self.assertIn("Riverbank Vegetation Folio", prompt.splitlines()[0])
+            self.assertIn("Return only the image", prompt.splitlines()[0])
+            self.assertIn("Optional lettering", prompt)
+            self.assertNotIn("Glass Market", prompt)
+            self.assertNotIn("compass", prompt)
+            self.assertNotIn("Directional relationships", prompt)
+
+    def test_each_subject_starts_with_an_explicit_creation_task(self) -> None:
+        for kind in ("player", "npc", "location", "inventory", "skill", "bestiary", "region_map"):
+            with self.subTest(kind=kind):
+                request = VisualAssetRequest(kind, "subject", "Test subject", "Visible details.")
+                for prompt in (request.prompt, request.external_prompt):
+                    self.assertTrue(prompt.startswith("Create one "))
+                    self.assertIn("Return only the image", prompt.splitlines()[0])
+                    if kind != "region_map":
+                        self.assertIn("Test subject", prompt.splitlines()[0])
+                        self.assertNotIn("known geography", prompt)
+
+    def test_regional_map_has_its_own_geography_prompt(self) -> None:
+        from ai_adventure.region_map import regional_map_request
+
+        request = regional_map_request(_VisualRepository())
+        self.assertEqual(request.prompt, request.external_prompt)
+        self.assertIn("for the Travel tab", request.prompt)
+        self.assertIn("north-up, top-down", request.prompt)
+        self.assertIn("Glass Market", request.prompt)
+        self.assertIn("never render them as text", request.prompt)
+        self.assertNotIn("Optional lettering", request.prompt)
 
     def test_non_text_subject_names_are_explicitly_metadata(self) -> None:
         request = VisualAssetRequest(

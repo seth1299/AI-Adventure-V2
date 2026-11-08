@@ -80,6 +80,19 @@ class TimedEventTests(unittest.TestCase):
             self.assertEqual(result.status, "skipped")
         self.assertEqual(self.repo.list_timed_events(), [])
 
+    def test_matching_redundant_times_are_safe_and_auditable(self):
+        result = self.upsert(name="Flax", location="Cottage Garden", duration_minutes=300, ready_at_minute=780)
+        self.assertEqual(result.status, "applied")
+        self.assertEqual(result.payload["duration_minutes"], 300)
+        self.assertEqual(self.repo.list_timed_events()[0]["ready_at_minute"], 780)
+
+    def test_conflicting_times_and_invalid_absolute_values_do_not_change_timer(self):
+        self.upsert(name="Flax", location="Cottage Garden", ready_at_minute=1000)
+        for value in (781, -1, True, 780.0, "780"):
+            result = self.upsert(name="Flax", location="Cottage Garden", duration_minutes=300, ready_at_minute=value)
+            self.assertEqual(result.status, "skipped")
+            self.assertEqual(self.repo.list_timed_events()[0]["ready_at_minute"], 1000)
+
     def test_count_estimates_survive_updates_and_can_be_confirmed(self):
         result = self.upsert(name="Cotton", location="Cottage Garden", quantity=6, quantity_unit="plants",
                              quantity_is_estimate=True, is_estimate=False, duration_minutes=500,

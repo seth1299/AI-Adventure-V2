@@ -204,7 +204,10 @@ class GameShell(QWidget):
         self._tab_order: list[str] = []
         self._detached_windows: dict[str, _DetachedTabWindow] = {}
         self._tab_notifications: set[str] = set()
-        self._tab_content_signatures: dict[str, str] = {}
+        self._dirty_screens: set[RepositoryBackedWidget] = set()
+        self._binding_repository = False
+        self._refreshing_visible = False
+        self._visible_refresh_queued = False
         self._smart_hidden_tabs: set[str] = set()
 
         self.story_screen = StoryScreen(
@@ -272,6 +275,7 @@ class GameShell(QWidget):
 
         for screen in self.screens:
             screen.set_visual_assets_dir(self.generated_images_dir)
+            screen.installEventFilter(self)
             screen.on_repository_changed = self._handle_screen_repository_changed
             screen.on_visual_asset_upload = self._upload_visual_asset
             screen.on_visual_asset_generate = self._generate_visual_asset
@@ -592,9 +596,11 @@ class GameShell(QWidget):
             self,
         )
         window.return_requested.connect(self._return_detached_tab)
+        window.installEventFilter(self)
         self._detached_windows[tab_key] = window
         window.move(global_position - QPoint(80, 24))
         window.show()
+        self._schedule_visible_refresh()
 
     @Slot(str)
     @_persist_tab_changes
@@ -635,6 +641,7 @@ class GameShell(QWidget):
         self.survival_controller.schedule_check()
         for window in self._detached_windows.values():
             window.show()
+        self._schedule_visible_refresh()
 
     def _persist_tab_layout(self) -> None:
         if self.repository is None or self._tab_layout_depth:
@@ -710,6 +717,7 @@ class GameShell(QWidget):
         defer_music_playback: bool = False, defer_visual_scan: bool = False,
     ) -> None:
         self._persist_tab_layout()
+        self._binding_repository = True
         self._tab_layout_depth += 1
         try:
             saved = repository.get_setting("ui.tab_layout", None) if repository is not None else None
@@ -724,7 +732,9 @@ class GameShell(QWidget):
             self._saved_tab_layout = saved if valid else None
         finally:
             self._tab_layout_depth -= 1
+            self._binding_repository = False
         self._persist_tab_layout()
+        self._refresh_visible_screens()
 
     def _bind_repository(
         self,
@@ -749,6 +759,7 @@ class GameShell(QWidget):
         self.repository = repository
         self.survival_controller.bind()
         self._tab_notifications.clear()
+        self._dirty_screens.clear()
 
         if repository is None:
             self.title_label.setText("No Save Loaded")
@@ -767,10 +778,6 @@ class GameShell(QWidget):
         if repository is not None and initially_hide_empty_tabs:
             self._hide_empty_starting_tabs(repository)
 
-        self._tab_content_signatures = {
-            tab_key: _screen_content_signature(screen)
-            for tab_key, (screen, _label, _closable) in self._tab_specs.items()
-        }
         self._apply_audio_settings(start_music=not defer_music_playback)
         if not defer_visual_scan:
             self.travel_assessment_controller.schedule_check()
@@ -853,7 +860,7 @@ class GameShell(QWidget):
         self.tab_bar.setTabData(index, tab_key)
         screen.show()
         self._smart_hidden_tabs.discard(tab_key)
-        self._tab_content_signatures[tab_key] = _screen_content_signature(screen)
+        self._mark_tab_changed(tab_key)
         self._sync_protected_tab_button()
 
     def _reveal_populated_smart_hidden_tabs(self) -> None:
@@ -885,37 +892,72 @@ class GameShell(QWidget):
         exclude: set[RepositoryBackedWidget] | None = None,
         scan_visual_assets: bool = True,
     ) -> None:
-        """Refreshes tabs from saved data while preserving each screen's local state."""
+        """Invalidate cached displays; rebuild only screens the player can see."""
 
         excluded_screens = exclude or set()
+        # Fate restrictions still apply to every tab, but ordinary changes must
+        # not walk every hidden widget tree just to reapply the same lock state.
+        locked = self.repository is not None and self.repository.survival_status()["fate"] != "alive"
         for screen in self.screens:
-            screen.sync_adventure_lock()
-        previous_signatures = dict(self._tab_content_signatures)
-
-        for screen in self.screens:
+            if screen._adventure_locked != locked:
+                from ai_adventure.ui.survival import adventure_ui_guard
+                adventure_ui_guard().set_locked(screen, locked)
             if screen in excluded_screens:
-                continue
-
-            screen.refresh()
-
-        changed_source_keys = {
-            self._tab_key_for_screen(screen) for screen in excluded_screens
-        }
-        for tab_key, (screen, _label, _closable) in self._tab_specs.items():
-            signature = _screen_content_signature(screen)
-            previous = previous_signatures.get(tab_key)
-            self._tab_content_signatures[tab_key] = signature
-            if (
-                previous is not None
-                and previous != signature
-                and tab_key not in changed_source_keys
-            ):
-                self._mark_tab_changed(tab_key)
+                self._dirty_screens.discard(screen)
+            else:
+                self._dirty_screens.add(screen)
+        self._refresh_visible_screens()
+        # Do not rebuild hidden displays to calculate their unread indicators.
+        # Newly populated, automatically revealed tabs are marked explicitly.
         self._reveal_populated_smart_hidden_tabs()
         if scan_visual_assets:
             self.visual_asset_coordinator.scan(self.repository)
         self.survival_controller.schedule_check()
         self.travel_assessment_controller.schedule_check()
+
+    def request_screen_refresh(self, screen: RepositoryBackedWidget) -> None:
+        """Apply an asynchronous result now if visible, otherwise when opened."""
+        self._dirty_screens.add(screen)
+        self._refresh_visible_screens()
+
+    def _refresh_visible_screens(self) -> None:
+        if self._binding_repository or self._refreshing_visible:
+            return
+        self._refreshing_visible = True
+        try:
+            current = self.tabs.currentWidget()
+            displayed = []
+            if self.isVisible() and not self.window().isMinimized() and current is not None:
+                displayed.append(current)
+            for tab_key, window in self._detached_windows.items():
+                if window.isVisible() and not window.isMinimized():
+                    displayed.append(self._tab_specs[tab_key][0])
+            for screen in displayed:
+                if screen not in self._dirty_screens:
+                    continue
+                self._dirty_screens.discard(screen)
+                try:
+                    screen.sync_adventure_lock()
+                    screen.refresh()
+                except Exception:
+                    self._dirty_screens.add(screen)
+                    raise
+        finally:
+            self._refreshing_visible = False
+
+    def _schedule_visible_refresh(self) -> None:
+        if not self._visible_refresh_queued:
+            self._visible_refresh_queued = True
+            QTimer.singleShot(0, self, self._run_visible_refresh)
+
+    def _run_visible_refresh(self) -> None:
+        self._visible_refresh_queued = False
+        self._refresh_visible_screens()
+
+    def eventFilter(self, watched, event):
+        if event.type() in (QEvent.Type.Show, QEvent.Type.WindowStateChange):
+            self._schedule_visible_refresh()
+        return super().eventFilter(watched, event)
 
     @Slot()
     def _handle_visual_assets_changed(self) -> None:
@@ -958,7 +1000,6 @@ class GameShell(QWidget):
         if source is self.notes_screen:
             # Notes are consumed from the repository on the next story turn.
             # A local autosave has no audio, image, or other-tab side effects.
-            self._tab_content_signatures["notes"] = _screen_content_signature(source)
             return
         self._apply_audio_settings()
         self.refresh_screens(exclude={source})
@@ -972,15 +1013,13 @@ class GameShell(QWidget):
         tab_key = str(self.tab_bar.tabData(index) or "")
         self._clear_tab_changed(tab_key)
 
-        if self.tabs.widget(index) == self.calendar_screen:
-            self.calendar_screen.return_to_current_month()
-
-        if self.tabs.widget(index) == self.travel_screen:
-            self.travel_screen.refresh()
-
         screen = self.tabs.widget(index)
-        if isinstance(screen, RepositoryBackedWidget) and tab_key:
-            self._tab_content_signatures[tab_key] = _screen_content_signature(screen)
+        if screen is self.calendar_screen:
+            self.calendar_screen.month_offset = 0
+            self._dirty_screens.add(screen)
+        elif screen is self.travel_screen:
+            self._dirty_screens.add(screen)
+        self._refresh_visible_screens()
         self._persist_tab_layout()
 
     def _submit_travel_request(

@@ -4,6 +4,7 @@ import re
 from typing import Any
 
 from ai_adventure.bundled_images import valid_default_image
+from ai_adventure.skills.books import normalize_skill_book
 from ai_adventure.inventory_storage import pounds
 
 
@@ -63,6 +64,8 @@ def normalize_item_metadata(
         "moveable": _item_boolean(metadata.get("moveable", metadata.get("movable", True))),
         "storable": _item_boolean(metadata.get("storable", True)),
     }
+    if metadata.get("skill_book") is not None:
+        clean_metadata["skill_book"] = normalize_skill_book(metadata["skill_book"])
     if "default_image" in metadata:
         clean_metadata["default_image"] = valid_default_image(metadata["default_image"], "items")
     for field in ("weight_lb", "carrying_capacity_lb"):

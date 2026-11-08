@@ -1,5 +1,7 @@
 from __future__ import annotations
 from ai_adventure.timed_events import TIMED_EVENT_RULE
+from ai_adventure.skills.books import SKILL_BOOK_RULE
+from ai_adventure.deadlines import DEADLINE_RULE
 
 from ai_adventure.stats import PLAYER_ACHIEVEMENT_RULE, STATS_RULE
 from ai_adventure.suggested_actions import ACTION_RULE
@@ -1326,6 +1328,7 @@ class AiContextBuilder:
                 ),
                 "d20_tests": STATS_RULE,
                 "player_achievements": PLAYER_ACHIEVEMENT_RULE,
+                "skill_books": SKILL_BOOK_RULE,
                 "skill_training": SKILL_TRAINING_RULE + " " + SKILL_TRAINING_SOURCE_RULE,
                 "calendar_time": (
                     "Use state.calendar.current for date, day names, seasons, and "
@@ -1377,6 +1380,7 @@ class AiContextBuilder:
                 ),
                 "mature_content": ai_mode_preferences["model_content_rules"],
                 "timed_events": TIMED_EVENT_RULE,
+                "deadlines": DEADLINE_RULE,
                 "active_tasks": (
                     "Use state.active_tasks.tasks to remember current quests, "
                     "commissions, custom orders, pending purchases, and other "
@@ -1500,6 +1504,7 @@ class AiContextBuilder:
                     "D20TestRequestedEvent",
                     "SkillUpsertedEvent",
                     "SkillXpAddedEvent",
+                    "SkillBookStudiedEvent",
                     "InventoryItemAddedEvent",
                     "InventoryItemRemovedEvent",
                     "InventoryItemModifiedEvent",
@@ -1519,6 +1524,8 @@ class AiContextBuilder:
                     "LocationUpsertedEvent",
                     "TravelModeChangedEvent",
                     "ActiveTaskUpsertedEvent",
+                    "CalendarEventUpsertedEvent",
+                    "CalendarEventDeletedEvent",
                     "TimedEventUpsertedEvent",
                     "ActiveTaskCompletedEvent",
                     "SpellCatalogUpsertedEvent",
@@ -1687,6 +1694,7 @@ def _item_is_operationally_relevant(
 
 _COMPACT_ITEM_METADATA_KEYS = {
     "item_uuid",
+    "skill_book",
     "item_type",
     "basic_name",
     "quantity_unit",

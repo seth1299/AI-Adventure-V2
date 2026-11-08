@@ -2599,6 +2599,10 @@ class InventoryUiTests(QtTestCase):
             shell.story_screen.notify_repository_changed()
             self.app.processEvents()
 
+            self.assertEqual(shell.npcs_screen.table.rowCount(), 0)
+            shell.show()
+            shell.tabs.setCurrentWidget(shell.npcs_screen)
+            self.app.processEvents()
             self.assertEqual(shell.npcs_screen.table.rowCount(), 1)
             name_item = shell.npcs_screen.table.item(0, 0)
             location_item = shell.npcs_screen.table.item(0, 1)

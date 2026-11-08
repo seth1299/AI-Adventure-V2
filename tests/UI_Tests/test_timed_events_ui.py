@@ -13,6 +13,31 @@ class TimedEventsUiTests(QtTestCase):
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication([])
 
+    def test_loan_task_appears_once_in_both_tabs_after_reopening(self):
+        from ai_adventure.ai.gemini_service import AiNarrationResult
+        from ai_adventure.application.story_turn_service import StoryTurnService
+        from tests.Application_Tests.test_deadline_commitments import LOAN, TASK, STATUS, PAYLOAD
+
+        with tempfile.TemporaryDirectory() as directory:
+            repo = SaveRepository.create_new_save(Path(directory), "Library loan")
+            repo.set_current_calendar_minute(654)
+            StoryTurnService.commit_response(repo, AiNarrationResult(LOAN, suggested_events=[TASK, STATUS]), message_id="loan")
+            reopened = SaveRepository(repo.db_path)
+            events = TimeSensitiveEventsScreen()
+            calendar = CalendarScreen()
+            events.set_repository(reopened)
+            calendar.set_repository(reopened)
+            self.assertEqual(events.tasks_table.rowCount(), 1)
+            self.assertEqual(events.tasks_table.item(0, 0).text(), PAYLOAD["name"])
+            self.assertEqual(events.tasks_table.item(0, 4).text(), "27 days 23 hr 55 min")
+            self.assertEqual(reopened.list_calendar_events(), [])
+            calendar.month_offset = 1
+            calendar.refresh()
+            text = "\n".join(calendar.table.item(row, col).text()
+                             for row in range(calendar.table.rowCount())
+                             for col in range(calendar.table.columnCount()))
+            self.assertEqual(text.count(PAYLOAD["name"]), 1)
+
     def test_separate_crops_notes_countdowns_and_ready_state(self):
         with tempfile.TemporaryDirectory() as directory:
             repo = SaveRepository.create_new_save(Path(directory), "Garden calendar")

@@ -40,6 +40,7 @@ from ai_adventure.locations import clean_player_location_name
 from ai_adventure.locations import calculate_travel_estimate, normalize_known_locations
 from ai_adventure.persistence.save_repository import GM_SECRET_STATUSES, SaveRepository
 from ai_adventure.skills.rules import MAX_SKILL_LEVEL, bonus_for_level, dc_for_difficulty
+from ai_adventure.skills.books import normalize_skill_book, reading_context
 
 
 LOGGER = logging.getLogger(__name__)
@@ -171,6 +172,8 @@ class EventApplier:
             elif (
                 blocking_failure is not None
                 and event_type in _D20_TEST_GATED_EVENT_TYPES
+                and not (event_type == "InventoryItemModifiedEvent" and payload.get("skill_book")
+                         and set(payload) <= {"target_name", "skill_book"})
             ):
                 result = AppliedEventResult(
                     event_type,
@@ -239,9 +242,16 @@ class EventApplier:
                     duration = payload["duration_minutes"]
                     if isinstance(duration, bool) or not isinstance(duration, int) or duration < 0:
                         return _invalid(event_type, payload, "duration_minutes must be a nonnegative integer.")
+                    resolved_time = self.repository.get_current_calendar_minute() + duration
                     if "ready_at_minute" in payload:
-                        return _invalid(event_type, payload, "Provide a duration or an absolute ready time, not both.")
-                    fields["ready_at_minute"] = self.repository.get_current_calendar_minute() + duration
+                        absolute = payload["ready_at_minute"]
+                        if isinstance(absolute, bool) or not isinstance(absolute, int) or absolute != resolved_time:
+                            LOGGER.warning("Rejected conflicting timer: message_id=%s current_minute=%s payload=%r",
+                                           self.message_id, self.repository.get_current_calendar_minute(), payload)
+                            return _invalid(event_type, payload,
+                                            "Conflicting timer times: ready_at_minute must equal the current minute plus duration_minutes.")
+                        LOGGER.info("Accepted redundant matching timer fields: %s.", payload.get("name", payload.get("event_id", "")))
+                    fields["ready_at_minute"] = resolved_time
                 if fields.get("location") and not self.repository.find_travel_location(fields["location"]):
                     return _invalid(event_type, payload, "Timed-event location must be a known finalized location.")
                 record = self.repository.upsert_timed_event(**fields)
@@ -271,6 +281,9 @@ class EventApplier:
 
             if event_type == "SkillXpAddedEvent":
                 return self._apply_skill_xp_added(event_type, payload)
+
+            if event_type == "SkillBookStudiedEvent":
+                return self._apply_skill_book_studied(event_type, payload)
 
             if event_type == "D20TestRequestedEvent":
                 return self._apply_d20_test_requested(event_type, payload)
@@ -547,6 +560,14 @@ class EventApplier:
 
         if not target_name:
             return _invalid(event_type, payload, "Inventory target name is required.")
+
+        if "skill_book" in payload:
+            link = normalize_skill_book(payload["skill_book"])
+            existing = next((item for item in self.repository.list_inventory_items()
+                             if item["name"].casefold() == target_name.casefold()), None)
+            previous = (existing or {}).get("metadata", {}).get("skill_book")
+            if previous and previous != link:
+                return _invalid(event_type, payload, "The book's established teaching subject cannot change during an ordinary update.")
 
         owner_npc_id = _first_text(payload, "owner_npc_id")
         if owner_npc_id and not self._is_current_party_member(owner_npc_id):
@@ -1012,6 +1033,33 @@ class EventApplier:
             },
         )
 
+
+    def _apply_skill_book_studied(self, event_type: str, payload: dict[str, Any]) -> AppliedEventResult:
+        reason = _first_text(payload, "reason")
+        command = self.repository.list_history(limit=1, kinds=("player",))
+        if not self.message_id or not command or command[0].get("turn_id") != self.message_id or not reason:
+            return _invalid(event_type, payload, "Book study requires this turn's explicit reading action and training reason.")
+        selected = reading_context([
+            item for item in self.repository.list_accessible_inventory_items()
+            if item["name"].casefold() == _first_text(payload, "item_name").casefold()
+        ], command[0]["content"])
+        if not selected or selected["item_name"].casefold() != _first_text(payload, "item_name").casefold():
+            return _invalid(event_type, payload, "The studied book must be unambiguously selected and accessible.")
+        link = normalize_skill_book(selected.get("skill_book"))
+        name = link["skill_name"]
+        source = f"{self.message_id}:{name.casefold()}:training"
+        if self.repository._has_progression_record("skill_training", source):
+            return AppliedEventResult(event_type, "skipped", "Training already recorded for this skill and message.", payload)
+        if self.repository.get_skill(name) is None:
+            result = self._apply_skill_upserted(event_type, {"name": name, "attribute": link["attribute"],
+                         "description": link["description"], "level": 1, "reason": reason})
+            if result.status == "applied":
+                self.repository._progression_record("skill_training", source, {"skill_name": name, "xp": 0,
+                                                     "book": selected["item_name"], "learned": True})
+        else:
+            result = self._apply_skill_xp_added(event_type, {"skill_name": name, "xp_amount": 1, "source_id": source})
+        return AppliedEventResult(event_type, result.status, result.message,
+                                  {**payload, "skill_name": name, "item_uuid": selected["item_uuid"]})
 
     def _apply_skill_upserted(
         self,

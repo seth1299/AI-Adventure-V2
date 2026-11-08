@@ -212,7 +212,8 @@ class VisualAssetRequest:
         """A portable art brief containing only visually relevant instructions."""
         if self.subject_type == "region_map":
             return (
-                "Create a square, north-up, top-down regional terrain map. "
+                "Create one square, north-up, top-down regional terrain map image "
+                "for the Travel tab using only the known geography below. Return only the image. "
                 "Use restrained colors, clear terrain boundaries and readable geography. "
                 "No perspective view, labels, letters, numbers, text, legend, borders or watermarks. "
                 "The application overlays exact names and markers as crisp vector text. "
@@ -241,6 +242,7 @@ class VisualAssetRequest:
         if "medieval" in eras or re.search(r"\b(?:no|without|avoid) modern\b", context):
             constraints.append("Avoid modern technology, vehicles, clothing, and manufactured objects.")
         return "\n".join(filter(None, [
+            self.creation_task,
             ARTWORK_PRESENTATION_RULE,
             f"Art style: {style['label']}. {style['prompt']}",
             f"Reference identity (metadata only, never a title or sign): {self.display_name}.",
@@ -254,6 +256,23 @@ class VisualAssetRequest:
             "Avoid captions, signatures, watermarks, borders, and split panels.",
             self.text_instructions or WORDLESS_ART_RULE,
         ]))
+
+    @property
+    def creation_task(self) -> str:
+        """State the requested deliverable before styling and rendering constraints."""
+        artwork = {
+            "player": "waist-up player-character portrait",
+            "npc": "waist-up NPC portrait",
+            "location": "establishing view of the location",
+            "inventory": "inventory illustration of exactly one item",
+            "skill": "recognizable skill icon",
+            "bestiary": "illustration of one non-human creature",
+            "region_map": "north-up, top-down regional terrain map",
+        }[self.subject_type]
+        return (
+            f'Create one {artwork} depicting "{self.display_name}", '
+            "matching the visible description below. Return only the image."
+        )
 
     @property
     def prompt(self) -> str:
@@ -316,13 +335,8 @@ class VisualAssetRequest:
         banned_terms = self.banned_terms or default_banned_creative_terms()
         banned_text = ", ".join(banned_terms) or "None"
         text_instructions = self.text_instructions or WORDLESS_ART_RULE
-        basic_identity = (
-            f"Generic item family for reuse matching: {self.basic_name}\n"
-            if self.subject_type == "inventory" and self.basic_name.strip()
-            else ""
-        )
         return (
-            "Generate one cohesive image for AI Adventure. "
+            f"{self.creation_task}\n\n"
             f"{ARTWORK_PRESENTATION_RULE} "
             f"Selected visual style: {style['value']} ({style['label']}). "
             f"Style direction: {style['prompt']} "
@@ -338,7 +352,6 @@ class VisualAssetRequest:
             "surfaces. Preserve believable variation, small imperfections, and style-appropriate "
             "texture, materials, and lighting.\n\n"
             f"Reference identity (metadata only, never a title or sign): {self.display_name}\n"
-            f"{basic_identity}"
             f"Player-visible description: {self.description}\n"
             "The supplied subject name and description are metadata for the artist, "
             "not words to typeset. "
@@ -437,10 +450,6 @@ def build_visual_asset_requests(
         repository.get_setting("images.style", DEFAULT_IMAGE_STYLE)
     )
     banned_terms = default_banned_creative_terms()
-    known_location_positions = _known_location_positions(
-        repository,
-        banned_terms=banned_terms,
-    )
     requests: list[VisualAssetRequest] = []
 
     player_name = str(repository.get_setting("player_name", "Player Character") or "").strip()
@@ -520,7 +529,6 @@ def build_visual_asset_requests(
                 text_instructions=_text_instructions_for_subject(
                     name,
                     description,
-                    known_location_positions,
                 ),
                 banned_terms=banned_terms,
             )
@@ -538,6 +546,7 @@ def build_visual_asset_requests(
             description=f"{item.get('category', 'Item')}. {description}",
             basic_name=_item_basic_name(item, item_catalog, fallback=name),
             world_context=world_context, image_style=image_style, banned_terms=banned_terms,
+            text_instructions=_text_instructions_for_subject(name, description),
         ))
 
     for npc in repository.list_player_visible_npcs(limit=500):
@@ -619,92 +628,18 @@ _TEXT_BEARING_HINTS = (
 )
 
 
-def _known_location_positions(
-    repository: VisualAssetRepository,
-    *,
-    banned_terms: tuple[str, ...],
-) -> tuple[tuple[str, float | None, float | None], ...]:
-    """Returns safe Travel-tab names and coordinates for exact map labels."""
-
-    locations: list[tuple[str, float | None, float | None]] = []
-    for location in repository.ensure_travel_locations():
-        name = " ".join(str(location.get("name", "") or "").split()).strip()
-        if (
-            name
-            and not find_banned_creative_terms(name, terms=banned_terms)
-            and name.casefold() not in {existing[0].casefold() for existing in locations}
-        ):
-            locations.append(
-                (
-                    name,
-                    _optional_float(location.get("x_miles")),
-                    _optional_float(location.get("y_miles")),
-                )
-            )
-    return tuple(locations)
-
-
-def _text_instructions_for_subject(
-    display_name: str,
-    description: str,
-    known_location_positions: tuple[tuple[str, float | None, float | None], ...],
-) -> str:
-    """Builds strict exact-label rules for subjects that visibly carry writing."""
-
+def _text_instructions_for_subject(display_name: str, description: str) -> str:
+    """Permit only the object's own name, without importing regional map context."""
     combined = f"{display_name} {description}".casefold()
-    if not any(hint in combined for hint in _TEXT_BEARING_HINTS):
+    if not any(re.search(rf"\b{hint}s?\b", combined) for hint in _TEXT_BEARING_HINTS):
         return WORDLESS_ART_RULE
-
-    approved = [
-        display_name.strip(),
-        *(name for name, _x, _y in known_location_positions),
-    ]
-    unique_approved = list(dict.fromkeys(name for name in approved if name))
-    labels = ", ".join(f'"{name}"' for name in unique_approved)
-    relation_lines: list[str] = []
-    for index, (left_name, left_x, left_y) in enumerate(known_location_positions):
-        if left_x is None or left_y is None:
-            continue
-        for right_name, right_x, right_y in known_location_positions[index + 1 :]:
-            if right_x is None or right_y is None:
-                continue
-            horizontal = "east" if right_x > left_x else "west" if right_x < left_x else "same longitude as"
-            vertical = "north of" if right_y > left_y else "south of" if right_y < left_y else "same latitude as"
-            if horizontal.startswith("same"):
-                relation_lines.append(f'"{right_name}" is {vertical} "{left_name}".')
-            elif vertical.startswith("same"):
-                relation_lines.append(f'"{right_name}" is {horizontal} of "{left_name}".')
-            else:
-                relation_lines.append(
-                    f'"{right_name}" is {vertical.replace(" of", "")} and '
-                    f'{horizontal} of "{left_name}".'
-                )
-    directional_rules = (
-        "Use a north-facing compass rose with north at the top. Place locations using "
-        "only the directional relationships below: east is right, west is left, north "
-        "is up, and south is down. Preserve those relationships; never mirror, rotate, "
-        "or rearrange the map. Never render coordinates, coordinate pairs, numeric "
-        "anchors, internal IDs, or other hidden map metadata anywhere in the image.\n"
-        + ("Directional relationships: " + " ".join(relation_lines) if relation_lines else "")
-    )
     return (
-        "This subject may contain readable writing only when it is visually appropriate. "
-        f"If text is shown, use only these exact labels, copied literally: {labels}. "
-        "For a map, label only these established Travel-tab locations; do not add, "
-        "rename, or imply any other place. Do not use decorative pseudo-writing, random "
-        "letters, or invented labels. "
-        f"{directional_rules}"
+        "Optional lettering: only when appropriate for this physical object, "
+        f'you may write its exact name, "{display_name.strip()}", on its surface. '
+        "Otherwise leave its surfaces blank or pictorial. Do not add other labels, "
+        "decorative pseudo-writing, random letters, or invented words. "
+        "Never place this name as a caption or title outside the object."
     )
-
-
-def _optional_float(value: Any) -> float | None:
-    """Returns a finite coordinate when the saved value is numeric."""
-
-    try:
-        number = float(value)
-    except (TypeError, ValueError):
-        return None
-    return number if number == number and abs(number) != float("inf") else None
 
 
 def save_relative_image_filename(repository: Any, request: VisualAssetRequest) -> str:

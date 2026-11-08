@@ -73,7 +73,7 @@ class TravelAssessmentController(QObject):
                     # Wait for the story commit, then assess its authoritative state.
                     self._attempted = None
                 elif commit_assessment(repository, packet, result):
-                    self.shell.travel_screen.refresh()
+                    self.shell.request_screen_refresh(self.shell.travel_screen)
         except Exception:
             LOGGER.exception("Discarded invalid private travel assessment.")
         self.schedule_check()
