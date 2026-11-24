@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from ai_adventure.ui.common import *  # noqa: F401,F403
 from ai_adventure.ui.dialogues import *  # noqa: F401,F403
-from ai_adventure.crafting import evaluate_recipe_craftability, recipe_estimated_time
+from ai_adventure.calendar_system import build_calendar_snapshot, format_time_of_day
+from ai_adventure.crafting import crafting_progress_summary, evaluate_recipe_craftability, recipe_estimated_time
 from ai_adventure.ui.crafting_details import CraftingDetailsDialog
 
 
@@ -19,14 +20,14 @@ class AlchemyNotebookScreen(RepositoryBackedWidget):
         self._refreshing_reagents = False
         self._reagent_sort_column = 0
         self._reagent_sort_order = Qt.SortOrder.AscendingOrder
-        self._recipe_sort_column = 0
+        self._recipe_sort_column = 2
         self._recipe_sort_order = Qt.SortOrder.AscendingOrder
         self._recipe_rows: list[dict[str, Any]] = []
+        self._crafting_queue: list[str] = []
 
         self._setup_reagents_tab()
         self._setup_recipes_tab()
         self.reagent_table.cellClicked.connect(self._open_reagent_details)
-        self.recipe_table.cellClicked.connect(self._open_recipe_details)
 
         layout = QVBoxLayout()
         layout.addWidget(self.tabs)
@@ -39,9 +40,12 @@ class AlchemyNotebookScreen(RepositoryBackedWidget):
         repository = self.repository()
 
         if repository is None:
+            self._crafting_queue = []
+            self._recipe_rows = []
             self.reagent_table.setRowCount(0)
             self.recipe_table.setRowCount(0)
             self.recipe_reagent_combo.clear()
+            self._update_recipe_craftability()
             return
 
         self._refresh_reagents(repository)
@@ -131,9 +135,9 @@ class AlchemyNotebookScreen(RepositoryBackedWidget):
     def _setup_recipes_tab(self) -> None:
         """Builds the structured recipe discovery tab."""
 
-        self.recipe_table = _AppTableWidget(0, 5)
+        self.recipe_table = _AppTableWidget(0, 8)
         self.recipe_table.setHorizontalHeaderLabels(
-            ["Name", "Ingredients", "Estimated Value", "Notes", "Estimated Time"]
+            ["Queue", "View", "Name", "Ingredients", "Estimated Value", "Notes", "Estimated Time", "Status / Progress"]
         )
         self.recipe_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         _enable_table_sorting(self.recipe_table, self._sort_recipes_by_column)
@@ -141,7 +145,7 @@ class AlchemyNotebookScreen(RepositoryBackedWidget):
             self._recipe_sort_column,
             self._recipe_sort_order,
         )
-        _configure_wrapping_table(self.recipe_table, {1, 3, 4})
+        _configure_wrapping_table(self.recipe_table, {3, 5, 6, 7})
         self.recipe_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.recipe_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
         _allow_selected_row_deselection(self.recipe_table)
@@ -152,9 +156,20 @@ class AlchemyNotebookScreen(RepositoryBackedWidget):
         )
         self.recipe_craftability_label.setWordWrap(True)
         self.recipe_craftability_label.setObjectName("recipeCraftabilityLabel")
-        self.recipe_craft_button = QPushButton("Craft / Continue Selected Recipe")
+        self.recipe_craft_button = QPushButton("Craft / Continue Queue (0)")
+        self.recipe_craft_button.setToolTip(
+            "Work one step on each checked recipe, in the order added. "
+            "Completed recipes leave the queue; unfinished recipes stay checked."
+        )
         self.recipe_craft_button.setEnabled(False)
         self.recipe_craft_button.clicked.connect(self._craft_selected_recipe)
+        self.recipe_finish_button = QPushButton("Work until done")
+        self.recipe_finish_button.setEnabled(False)
+        self.recipe_finish_button.setToolTip(
+            "Work through the checked recipes in order, including waiting for passive stages. "
+            "This advances game time and uses survival needs when enabled."
+        )
+        self.recipe_finish_button.clicked.connect(lambda: self._craft_selected_recipe(until_done=True))
 
         self.recipe_name_input = QLineEdit()
         self.recipe_name_input.setPlaceholderText("Recipe name")
@@ -261,7 +276,10 @@ class AlchemyNotebookScreen(RepositoryBackedWidget):
         layout = QVBoxLayout()
         layout.addWidget(form_widget)
         layout.addWidget(self.recipe_craftability_label)
-        layout.addWidget(self.recipe_craft_button)
+        crafting_controls = QHBoxLayout()
+        crafting_controls.addWidget(self.recipe_craft_button)
+        crafting_controls.addWidget(self.recipe_finish_button)
+        layout.addLayout(crafting_controls)
         layout.addWidget(self.recipe_table)
 
         wrapper = QWidget()
@@ -327,6 +345,7 @@ class AlchemyNotebookScreen(RepositoryBackedWidget):
         if repository is None or not 0 <= row < len(self._recipe_rows):
             return
         recipe = self._recipe_rows[row]
+        self.recipe_table.selectRow(row)
         estimate = recipe_estimated_time(recipe, repository.list_skills())
         self._update_recipe_craftability()
         CraftingDetailsDialog(
@@ -399,53 +418,120 @@ class AlchemyNotebookScreen(RepositoryBackedWidget):
         """Reloads the recipe table."""
 
         recipes = repository.list_crafting_recipes()
+        selected_row = self.recipe_table.currentRow()
+        selected_id = (
+            str(self._recipe_rows[selected_row]["id"])
+            if 0 <= selected_row < len(self._recipe_rows) else ""
+        )
+        known_ids = {str(recipe["id"]) for recipe in recipes}
+        saved_queue = repository.get_setting("crafting.queue", [])
+        self._crafting_queue = list(dict.fromkeys(
+            str(identity) for identity in saved_queue if str(identity) in known_ids
+        )) if isinstance(saved_queue, list) else []
+        if not selected_id:
+            selected_id = next(iter(self._crafting_queue), "")
+            if not selected_id and len(recipes) == 1:
+                selected_id = str(recipes[0]["id"])
         denominations = repository.get_currency_denominations()
         recipes.sort(
             key=self._recipe_sort_key,
             reverse=_sort_descending(self._recipe_sort_order),
         )
         self._recipe_rows = recipes
+        self.recipe_table.clearSelection()
+        self.recipe_table.setCurrentCell(-1, -1)
         self.recipe_table.setRowCount(len(recipes))
 
         for row_index, recipe in enumerate(recipes):
-            self.recipe_table.setItem(row_index, 0, _table_item(str(recipe.get("name", ""))))
-            self.recipe_table.setItem(row_index, 1, _table_item(format_recipe_ingredients(recipe.get("ingredients", []))))
+            recipe_id = str(recipe["id"])
+            checkbox = QCheckBox()
+            checkbox.setAccessibleName(f"Queue {recipe.get('name', 'recipe')}")
+            checkbox.setChecked(recipe_id in self._crafting_queue)
+            checkbox.toggled.connect(
+                lambda checked, identity=recipe_id: self._toggle_queued_recipe(identity, checked)
+            )
+            self.recipe_table.setCellWidget(row_index, 0, checkbox)
+            view_button = QPushButton("View")
+            view_button.setAccessibleName(f"View {recipe.get('name', 'recipe')}")
+            view_button.clicked.connect(
+                lambda _checked=False, row=row_index: self._open_recipe_details(row, 2)
+            )
+            self.recipe_table.setCellWidget(row_index, 1, view_button)
+            self.recipe_table.setItem(row_index, 2, _table_item(str(recipe.get("name", ""))))
+            self.recipe_table.setItem(row_index, 3, _table_item(format_recipe_ingredients(recipe.get("ingredients", []))))
             value_base_units = _safe_int(recipe.get("value_base_units", 0), 0)
             self.recipe_table.setItem(
                 row_index,
-                2,
+                4,
                 _table_item(
                     format_currency_amount(value_base_units, denominations),
                     value_base_units,
                 ),
             )
-            self.recipe_table.setItem(row_index, 3, _table_item(str(recipe.get("notes", ""))))
+            self.recipe_table.setItem(row_index, 5, _table_item(str(recipe.get("notes", ""))))
             estimate = recipe_estimated_time(recipe, repository.list_skills())
+            progress = repository.crafting_progress(recipe_id)
+            continuing = bool(progress and progress["continuation"])
+            status = (
+                f"Continue — {progress['percentage']:g}% complete"
+                + ("\nWaiting for passive stage" if progress["waiting"] else "")
+                if continuing else "Start new"
+            )
+            self.recipe_table.setItem(row_index, 7, _table_item(status))
             self.recipe_table.setItem(
                 row_index,
-                4,
+                6,
                 _table_item(
-                    _format_crafting_time(
-                        int(estimate["active_minutes"]),
-                        int(estimate["passive_minutes"]),
+                    ("Remaining: " if continuing else "Total: ") + _format_crafting_time(
+                        int(progress["active_minutes_remaining"] if continuing else estimate["active_minutes"]),
+                        int(progress["passive_minutes_remaining"] if continuing else estimate["passive_minutes"]),
                     ),
                     int(estimate["active_minutes"]) + int(estimate["passive_minutes"]),
                 ),
             )
 
         _resize_wrapping_table_rows(self.recipe_table)
+        for row, recipe in enumerate(recipes):
+            if str(recipe["id"]) == selected_id:
+                self.recipe_table.selectRow(row)
+                break
+        self._update_recipe_craftability()
+
+    def _toggle_queued_recipe(self, recipe_id: str, checked: bool) -> None:
+        repository = self.repository()
+        if repository is None:
+            return
+        if checked and recipe_id not in self._crafting_queue:
+            self._crafting_queue.append(recipe_id)
+        elif not checked and recipe_id in self._crafting_queue:
+            self._crafting_queue.remove(recipe_id)
+        repository.set_setting("crafting.queue", self._crafting_queue)
+        for row, recipe in enumerate(self._recipe_rows):
+            if str(recipe["id"]) == recipe_id:
+                self.recipe_table.selectRow(row)
+                break
         self._update_recipe_craftability()
 
     def _update_recipe_craftability(self) -> None:
         """Shows exact owned ingredient counts and the limiting reagent."""
 
         repository = self.repository()
+        processes = repository.get_setting("crafting.processes", []) if repository else []
+        continuing_ids = {
+            str(item.get("recipe_id", "")) for item in processes if isinstance(item, dict)
+        } if isinstance(processes, list) else set()
+        has_continuations = bool(continuing_ids.intersection(self._crafting_queue))
+        has_new = any(identity not in continuing_ids for identity in self._crafting_queue)
+        action = "Start / Continue" if has_continuations and has_new else "Continue" if has_continuations else "Start"
+        self.recipe_craft_button.setText(f"{action} Queue ({len(self._crafting_queue)}) — one step")
+        can_work = bool(repository and self._crafting_queue and repository.survival_status()["fate"] == "alive")
+        self.recipe_craft_button.setEnabled(can_work)
+        self.recipe_finish_button.setEnabled(can_work)
         row_index = self.recipe_table.currentRow()
         if repository is None or row_index < 0 or row_index >= len(self._recipe_rows):
             self.recipe_craftability_label.setText(
                 "Select a recipe to see what you can craft."
             )
-            self.recipe_craft_button.setEnabled(False)
             return
 
         recipe = self._recipe_rows[row_index]
@@ -453,46 +539,65 @@ class AlchemyNotebookScreen(RepositoryBackedWidget):
             recipe, repository.list_accessible_inventory_items()
         )
         estimate = recipe_estimated_time(recipe, repository.list_skills())
-        processes = repository.get_setting("crafting.processes", [])
-        active_process = next(
-            (
-                item
-                for item in processes
-                if isinstance(item, dict)
-                and str(item.get("recipe_id", "")) == str(recipe.get("id", ""))
-            ),
-            None,
-        ) if isinstance(processes, list) else None
+        progress = repository.crafting_progress(str(recipe["id"]))
+        finish_text = ""
+        if progress and (progress["continuation"] or availability["craftable"]):
+            finish_minute = (repository.get_current_calendar_minute()
+                             + progress["active_minutes_remaining"] + progress["passive_minutes_remaining"])
+            finish = build_calendar_snapshot(finish_minute, repository.get_calendar_settings())
+            finish_label = str(finish["display_label"])
+            if finish["time_display"] == "narrative":
+                finish_label += f" ({format_time_of_day(finish['time_of_day_minutes'], '24_hour')})"
+            finish_text = f"\nEstimated finish if worked next: {finish_label}"
+        if progress and progress["continuation"]:
+            stage_label = f" — {progress['stage_label']}" if progress["stage_label"] else ""
+            waiting = "\nWaiting for the passive stage to finish." if progress["waiting"] else ""
+            missing_tools = (
+                "\nMissing tools: " + ", ".join(availability["missing_tools"]) + "."
+                if availability["missing_tools"] else ""
+            )
+            self.recipe_craftability_label.setText(
+                f"{recipe.get('name', 'Recipe')} — Continue existing batch (ingredients already supplied).\n"
+                f"Stage {progress['stage_number']} of {progress['stage_count']}{stage_label}\n"
+                f"{crafting_progress_summary(progress)}{finish_text}{waiting}{missing_tools}"
+            )
+            return
         missing = [
             str(item.get("name", "required ingredient"))
             for item in availability["missing_ingredients"]
         ] + [str(item) for item in availability["missing_tools"]]
         status = (
-            "A process is already underway; continue it below."
-            if active_process
-            else "Ready to begin." if availability["craftable"]
-            else "Unavailable until the missing requirements are obtained."
+            "Start new — ready to begin." if availability["craftable"]
+            else "Start new — unavailable until the missing requirements are obtained."
         )
         missing_text = f"\nMissing: {', '.join(dict.fromkeys(missing))}." if missing else ""
         self.recipe_craftability_label.setText(
             f"{recipe.get('name', 'item')} — {status}\n"
             f"Estimated time: {_format_crafting_time(int(estimate['active_minutes']), int(estimate['passive_minutes']))}"
-            f"{missing_text}"
+            f"{finish_text}{missing_text}"
         )
-        self.recipe_craft_button.setEnabled(bool(active_process or availability["craftable"]))
 
-    def _craft_selected_recipe(self) -> None:
-        """Advances the selected recipe through the deterministic crafting service."""
+    def _craft_selected_recipe(self, *, until_done: bool = False) -> None:
+        """Work on queued recipes in order and stop if survival interrupts play."""
 
         repository = self.repository()
-        row_index = self.recipe_table.currentRow()
-        if repository is None or row_index < 0 or row_index >= len(self._recipe_rows):
+        if repository is None or not self._crafting_queue or repository.survival_status()["fate"] != "alive":
             return
-        recipe = self._recipe_rows[row_index]
-        result = repository.craft_recipe(str(recipe.get("id", "")))
-        self.recipe_craftability_label.setText(str(result.get("message", "Crafting updated.")))
+        names = {str(recipe["id"]): str(recipe["name"]) for recipe in self._recipe_rows}
+        messages = []
+        for recipe_id in list(self._crafting_queue):
+            result = repository.craft_recipe(recipe_id, until_done=until_done)
+            messages.append(f"{names.get(recipe_id, 'Recipe')}: {result.get('message', 'Crafting updated.')}")
+            if result.get("status") == "completed":
+                self._crafting_queue.remove(recipe_id)
+            if result.get("status") == "interrupted":
+                break
+        repository.set_setting("crafting.queue", self._crafting_queue)
         self.refresh()
         self.notify_repository_changed()
+        self.recipe_craftability_label.setText(
+            self.recipe_craftability_label.text() + "\nLast queue action:\n" + "\n".join(messages)
+        )
 
     def _save_reagent(self) -> None:
         """Adds or updates a known crafting item/material."""
@@ -812,6 +917,8 @@ class AlchemyNotebookScreen(RepositoryBackedWidget):
     def _sort_recipes_by_column(self, column_index: int) -> None:
         """Sorts recipes by a clicked header column."""
 
+        if column_index < 2:
+            return
         self._recipe_sort_column, self._recipe_sort_order = _update_sort_state(
             self.recipe_table,
             self._recipe_sort_column,
@@ -850,21 +957,30 @@ class AlchemyNotebookScreen(RepositoryBackedWidget):
 
         name = str(recipe.get("name", "")).casefold()
 
-        if self._recipe_sort_column == 1:
+        if self._recipe_sort_column == 3:
             return format_recipe_ingredients(recipe.get("ingredients", [])).casefold(), name
 
-        if self._recipe_sort_column == 2:
+        if self._recipe_sort_column == 4:
             return str(recipe.get("value_base_units", 0)).zfill(12), name
 
-        if self._recipe_sort_column == 3:
+        if self._recipe_sort_column == 5:
             return str(recipe.get("notes", "")).casefold(), name
 
-        if self._recipe_sort_column == 4:
+        if self._recipe_sort_column == 6:
+            repository = self.repository()
+            progress = repository.crafting_progress(str(recipe["id"])) if repository else None
+            if progress and progress["continuation"]:
+                return str(progress["active_minutes_remaining"] + progress["passive_minutes_remaining"]).zfill(12), name
             estimate = recipe_estimated_time(recipe, [])
             total_minutes = int(estimate["active_minutes"]) + int(
                 estimate["passive_minutes"]
             )
             return str(total_minutes).zfill(12), name
+
+        if self._recipe_sort_column == 7:
+            repository = self.repository()
+            progress = repository.crafting_progress(str(recipe["id"])) if repository else None
+            return (f"1-{progress['percentage']:06.2f}" if progress and progress["continuation"] else "0"), name
 
         return name, name
 

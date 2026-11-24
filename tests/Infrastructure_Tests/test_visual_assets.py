@@ -145,6 +145,44 @@ class VisualAssetTests(unittest.TestCase):
             with Image.open(target) as saved:
                 self.assertEqual(saved.tobytes(), source.tobytes())
 
+    def test_import_detects_near_magenta_matte_in_jpeg(self):
+        source = Image.new("RGB", (96, 120), (246, 4, 248))
+        draw = ImageDraw.Draw(source)
+        draw.rectangle((20, 12, 75, 119), fill=(80, 110, 140))
+        draw.rectangle((36, 36, 59, 59), fill=(246, 4, 248))
+        data = BytesIO()
+        source.save(data, format="JPEG", quality=85)
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "portrait.png"
+            save_scaled_png(data.getvalue(), target, allow_upscale=False, detect_icon_background=True)
+            with Image.open(target) as saved:
+                self.assertEqual(saved.size, source.size)
+                self.assertEqual(saved.getpixel((4, 4))[3], 0)
+                self.assertEqual(saved.getpixel((48, 48))[3], 0)
+                with Image.open(data) as jpeg:
+                    self.assertEqual(saved.getpixel((48, 84)), (*jpeg.getpixel((48, 84)), 255))
+
+    def test_import_preserves_art_without_a_clear_magenta_matte(self):
+        custom_art = Image.new("RGB", (64, 64), (80, 100, 120))
+        ImageDraw.Draw(custom_art).rectangle((16, 16, 47, 47), fill=(255, 0, 255))
+        frame = Image.new("RGB", (128, 128), (255, 0, 255))
+        ImageDraw.Draw(frame).rectangle((1, 1, 126, 126), fill=(80, 100, 120))
+        swatch = Image.new("RGB", (64, 64), (255, 0, 255))
+        transparent = swatch.convert("RGBA")
+        transparent.putpixel((32, 32), (80, 100, 120, 128))
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "portrait.png"
+            for source in (custom_art, frame, swatch, transparent):
+                with self.subTest(mode=source.mode, size=source.size, corner=source.getpixel((0, 0))):
+                    data = BytesIO()
+                    source.save(data, format="PNG")
+                    save_scaled_png(
+                        data.getvalue(), target, allow_upscale=False, detect_icon_background=True,
+                    )
+                    with Image.open(target) as saved:
+                        self.assertEqual(saved.mode, source.mode)
+                        self.assertEqual(saved.tobytes(), source.tobytes())
+
     def test_cutout_removes_dark_magenta_fringe_without_stripping_interior_purple(self):
         source = Image.new("RGB", (64, 64), (255, 0, 255))
         draw = ImageDraw.Draw(source)
@@ -244,6 +282,8 @@ class VisualAssetTests(unittest.TestCase):
         self.assertEqual(captured["model"], "gemini-3.1-flash-lite-image")
         self.assertFalse(captured["store"])
         self.assertEqual(captured["input"], request.prompt)
+        self.assertNotIn("Glass Market", captured["input"])
+        self.assertIn("Blue awnings over wet stone.", captured["input"])
         self.assertEqual(captured["response_format"], [{
             "type": "image", "aspect_ratio": "1:1", "image_size": "1K",
         }])
@@ -344,9 +384,9 @@ class VisualAssetTests(unittest.TestCase):
             if request.subject_type == "inventory"
         )
 
-        self.assertIn("Alden", request.prompt)
         for prompt in (request.prompt, request.external_prompt):
-            self.assertIn('"Basic Regional Map"', prompt)
+            self.assertNotIn("Basic Regional Map", prompt)
+            self.assertIn("hand-inked parchment map", prompt)
             self.assertNotIn('"Oakhaven"', prompt)
             self.assertNotIn("Dark Forest", prompt)
             self.assertNotIn("compass", prompt)
@@ -354,7 +394,7 @@ class VisualAssetTests(unittest.TestCase):
             self.assertNotIn("east is right", prompt)
             self.assertNotIn("x_miles", prompt)
 
-    def test_book_prompt_only_authorizes_its_own_title(self) -> None:
+    def test_book_prompt_uses_wordless_cover_and_omits_title(self) -> None:
         class BookRepository(_VisualRepository):
             def list_inventory_items(self):
                 return [{"name": "Riverbank Vegetation Folio", "category": "Book",
@@ -364,9 +404,10 @@ class VisualAssetTests(unittest.TestCase):
                        if r.subject_type == "inventory")
         for prompt in (request.prompt, request.external_prompt):
             self.assertTrue(prompt.startswith("Create one inventory illustration"))
-            self.assertIn("Riverbank Vegetation Folio", prompt.splitlines()[0])
+            self.assertNotIn("Riverbank Vegetation Folio", prompt)
+            self.assertIn("A bound reference book about riverbank plants.", prompt)
             self.assertIn("Return only the image", prompt.splitlines()[0])
-            self.assertIn("Optional lettering", prompt)
+            self.assertIn("completely wordless", prompt)
             self.assertNotIn("Glass Market", prompt)
             self.assertNotIn("compass", prompt)
             self.assertNotIn("Directional relationships", prompt)
@@ -378,8 +419,8 @@ class VisualAssetTests(unittest.TestCase):
                 for prompt in (request.prompt, request.external_prompt):
                     self.assertTrue(prompt.startswith("Create one "))
                     self.assertIn("Return only the image", prompt.splitlines()[0])
+                    self.assertNotIn("Test subject", prompt)
                     if kind != "region_map":
-                        self.assertIn("Test subject", prompt.splitlines()[0])
                         self.assertNotIn("known geography", prompt)
 
     def test_regional_map_has_its_own_geography_prompt(self) -> None:
@@ -389,23 +430,27 @@ class VisualAssetTests(unittest.TestCase):
         self.assertEqual(request.prompt, request.external_prompt)
         self.assertIn("for the Travel tab", request.prompt)
         self.assertIn("north-up, top-down", request.prompt)
-        self.assertIn("Glass Market", request.prompt)
-        self.assertIn("never render them as text", request.prompt)
+        self.assertNotIn("Glass Market", request.prompt)
+        self.assertIn("site numbers as layout references only", request.prompt)
         self.assertNotIn("Optional lettering", request.prompt)
 
-    def test_non_text_subject_names_are_explicitly_metadata(self) -> None:
+    def test_portrait_omits_subject_name_from_description_and_context(self) -> None:
         request = VisualAssetRequest(
-            subject_type="inventory",
-            subject_key="everyday_attire",
-            display_name="Everyday Attire",
-            description="A cream linen shirt and brown skirt.",
+            subject_type="npc",
+            subject_key="mandel_cole",
+            display_name="Mandel Cole",
+            description="MANDEL COLE wears a rumpled suit and a dripping fedora.",
+            world_context="Mandel Cole lives in a city with period-authentic 1940s vehicles.",
         )
 
-        self.assertIn(
-            "The supplied subject name and description are metadata for the artist",
-            request.prompt,
-        )
-        self.assertIn("Do not copy them into the image as text", request.prompt)
+        for prompt in (request.prompt, request.external_prompt):
+            self.assertNotIn("mandel cole", prompt.casefold())
+            self.assertNotIn("Reference identity", prompt)
+            self.assertIn("a rumpled suit and a dripping fedora", prompt)
+            self.assertIn("completely wordless", prompt)
+        self.assertIn("period-authentic 1940s vehicles", request.prompt)
+        self.assertEqual(request.display_name, "Mandel Cole")
+        self.assertTrue(request.filename.startswith("mandel_cole_"))
 
     def test_filename_is_descriptive_bounded_and_versioned(self) -> None:
         request = VisualAssetRequest(

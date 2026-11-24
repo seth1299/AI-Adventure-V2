@@ -7,6 +7,8 @@ from ai_adventure.ui.dialogues import *  # noqa: F401,F403
 class NpcsScreen(RepositoryBackedWidget):
     """Player-facing NPC journal."""
 
+    portraits_refreshed = Signal()
+
     def __init__(self) -> None:
         super().__init__()
 
@@ -62,9 +64,11 @@ class NpcsScreen(RepositoryBackedWidget):
                 table_item = _table_item(value)
                 table_item.setData(Qt.ItemDataRole.UserRole, npc_id)
                 self.table.setItem(row_index, column, table_item)
-            portrait = QLabel()
-            portrait.setObjectName("npcGeneratedPortrait")
-            portrait.setMargin(4)
+            cell = self.table.cellWidget(row_index, 3)
+            portrait = cell if cell is not None else QLabel()
+            if cell is None:
+                portrait.setObjectName("npcGeneratedPortrait")
+                portrait.setMargin(4)
             asset = repository.get_visual_asset(
                 "npc",
                 npc_id.casefold(),
@@ -78,12 +82,16 @@ class NpcsScreen(RepositoryBackedWidget):
                     f"Generated portrait of {npc.get('display_name', 'Unknown NPC')}"
                 ),
             ):
-                self.table.setCellWidget(row_index, 3, portrait)
+                if cell is None:
+                    self.table.setCellWidget(row_index, 3, portrait)
+            elif cell is not None:
+                self.table.removeCellWidget(row_index, 3)
 
         _resize_wrapping_table_rows(self.table)
         for row_index in range(self.table.rowCount()):
             if self.table.cellWidget(row_index, 3) is not None:
                 self.table.setRowHeight(row_index, max(104, self.table.rowHeight(row_index)))
+        self.portraits_refreshed.emit()
 
     def _open_npc_details(self, row: int, _column: int) -> None:
         """Opens the selected NPC's complete player-visible profile."""
@@ -100,20 +108,32 @@ class NpcsScreen(RepositoryBackedWidget):
         repository = self.repository()
         if npc is None or repository is None:
             return
-        asset = repository.get_visual_asset("npc", npc_id.casefold())
+        subject_key = npc_id.casefold()
+
+        def portrait_path() -> Path | None:
+            return self.visual_asset_path(repository.get_visual_asset("npc", subject_key))
+
         dialog = NpcDetailsDialog(
             npc=npc,
-            image_path=self.visual_asset_path(asset),
-            on_select_image=lambda: self.choose_visual_asset("npc", npc_id.casefold()),
+            image_path=portrait_path(),
+            on_select_image=lambda: self.choose_visual_asset("npc", subject_key),
             on_create_image=(
-                lambda: self.create_visual_asset("npc", npc_id.casefold())
+                lambda: self.create_visual_asset("npc", subject_key)
             )
             if self.visual_asset_generation_enabled()
             else None,
             parent=self,
         )
-        self.add_copy_image_prompt_button(dialog, "npc", npc_id.casefold())
-        dialog.exec()
+        self.add_copy_image_prompt_button(dialog, "npc", subject_key)
+
+        def refresh_portrait() -> None:
+            dialog.set_portrait(portrait_path())
+
+        self.portraits_refreshed.connect(refresh_portrait)
+        try:
+            dialog.exec()
+        finally:
+            self.portraits_refreshed.disconnect(refresh_portrait)
 
     def _sort_by_column(self, column_index: int) -> None:
         """Sorts NPCs by a clicked header column."""

@@ -1493,9 +1493,9 @@ class EventApplier:
         status = str(result.get("status", "rejected"))
         return AppliedEventResult(
             event_type,
-            "applied" if status in {"active", "passive", "ready", "completed"} else "skipped",
+            "applied" if status in {"active", "passive", "ready", "completed"} or result.get("minutes_spent", 0) else "skipped",
             str(result.get("message", "Crafting request was rejected.")),
-            {**payload, "crafting_status": status},
+            {**payload, "crafting_status": status, "minutes_spent": result.get("minutes_spent", 0)},
         )
 
     def _apply_reagent_discovered(

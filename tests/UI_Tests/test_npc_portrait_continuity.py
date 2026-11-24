@@ -133,6 +133,28 @@ class NpcPortraitContinuityTests(QtTestCase):
         self.scan(changed)
         self.assertEqual(self.coordinator._queue, [])
 
+    def test_upload_keys_magenta_for_portrait_but_preserves_location_art(self):
+        portrait = self.request()
+        location = replace(portrait, subject_type='location', subject_key='library')
+        source = self.root / 'external.png'
+        image = Image.new('RGB', (64, 80), (255, 0, 255))
+        image.paste((80, 110, 140), (12, 10, 52, 80))
+        image.save(source)
+        original_bytes = source.read_bytes()
+
+        for request in (portrait, location):
+            with self.subTest(subject_type=request.subject_type):
+                success, message = self.coordinator.upload_initial_image(self.repo, request, source)
+                self.assertTrue(success, message)
+                path = self.images / save_relative_image_filename(self.repo, request)
+                with Image.open(path) as saved:
+                    if request is portrait:
+                        self.assertEqual(saved.getpixel((0, 0))[3], 0)
+                        self.assertEqual(saved.getpixel((32, 40)), (80, 110, 140, 255))
+                    else:
+                        self.assertEqual(saved.tobytes(), image.tobytes())
+        self.assertEqual(source.read_bytes(), original_bytes)
+
     def test_explicit_retry_of_failed_replacement_is_not_blocked_by_old_portrait(self):
         original = self.request()
         self.register(original, ready=True)

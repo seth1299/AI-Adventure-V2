@@ -6,7 +6,11 @@ from typing import Any
 
 from ai_adventure.locations import KnownLocation, normalize_known_locations
 from ai_adventure.ai.image_styles import DEFAULT_IMAGE_STYLE
-from ai_adventure.visual_assets import VisualAssetRepository, VisualAssetRequest
+from ai_adventure.visual_assets import (
+    VisualAssetRepository,
+    VisualAssetRequest,
+    replace_image_subject_names,
+)
 
 
 def regional_map_layout(raw_locations: Any) -> tuple[
@@ -40,17 +44,36 @@ def regional_map_request(repository: VisualAssetRepository) -> VisualAssetReques
     raw = repository.ensure_travel_locations()
     points, unmapped, span = regional_map_layout(raw)
     # Stable ordering makes the artwork reusable when only the player moves.
+    ordered_points = sorted(points, key=lambda point: point[0].name.casefold())
     places = [{"name": p.name, "terrain": p.terrain,
                "description": p.description, "parent": p.parent_location,
                "route_notes": p.travel_notes,
                "x_percent": round(x / 10, 2), "y_percent": round(y / 10, 2)}
-              for p, x, y in sorted(points, key=lambda point: point[0].name.casefold())]
-    description = json.dumps({"known_places": places, "map_width_miles":
-                              round(span * 1000 / 780, 2) if span else None,
+              for p, x, y in ordered_points]
+    map_width = round(span * 1000 / 780, 2) if span else None
+    description = json.dumps({"known_places": places, "map_width_miles": map_width,
                               "unmapped_places": sorted(p.name for p in unmapped)},
                              ensure_ascii=False, sort_keys=True)
+    site_numbers = {place["name"].casefold(): number for number, place in enumerate(places, 1)}
+    references = {place["name"]: f"site {number}" for number, place in enumerate(places, 1)}
+    references.update({place.name: "an unpositioned site" for place in unmapped})
+    artwork_sites = [
+        {
+            "site": number,
+            "terrain": replace_image_subject_names(place["terrain"], references, preserve_lowercase=True),
+            "description": replace_image_subject_names(place["description"], references),
+            "parent_site": site_numbers.get(place["parent"].casefold()),
+            "route_notes": replace_image_subject_names(place["route_notes"], references),
+            "x_percent": place["x_percent"],
+            "y_percent": place["y_percent"],
+        }
+        for number, place in enumerate(places, 1)
+    ]
     return VisualAssetRequest(
         subject_type="region_map", subject_key="region", display_name="Regional Map",
         description=description,
         image_style=repository.get_setting("images.style", DEFAULT_IMAGE_STYLE),
+        map_artwork_description=json.dumps(
+            {"sites": artwork_sites, "map_width_miles": map_width}, ensure_ascii=False, sort_keys=True
+        ),
     )

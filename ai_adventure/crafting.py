@@ -15,6 +15,21 @@ DEFAULT_ACTIVE_MINUTES_PER_WORK = 1
 MAX_CRAFTING_QUANTITY = 999
 
 
+def crafting_units_match(owned_unit: str, required_unit: str) -> bool:
+    """Treat named individual objects as 'each', without converting measures."""
+    owned = owned_unit.strip().casefold()
+    required = required_unit.strip().casefold()
+    count_units = {
+        "each", "item", "items", "unit", "units", "piece", "pieces",
+        "stalk", "stalks", "fiber", "fibers", "spool", "spools",
+        "skein", "skeins", "bundle", "bundles", "sheet", "sheets",
+        "hide", "hides", "pelt", "pelts", "log", "logs", "plank", "planks",
+        "ingot", "ingots", "bar", "bars", "bottle", "bottles",
+        "jar", "jars", "vial", "vials",
+    }
+    return owned == required or (required == "each" and owned in count_units)
+
+
 def normalize_recipe_stages(value: Any, *, active_work_amount: Any = None) -> list[dict[str, Any]]:
     """Returns a validated active/passive stage list for a recipe."""
 
@@ -143,7 +158,7 @@ def evaluate_recipe_craftability(
             owned_record = inventory_by_name.get(name.casefold())
         owned = int(owned_record.get("quantity", 0)) if owned_record else 0
         owned_unit = str(owned_record.get("quantity_unit", unit)) if owned_record else unit
-        unit_matches = owned_unit.casefold() == unit.casefold()
+        unit_matches = crafting_units_match(owned_unit, unit)
         if not identity or not unit_matches or owned < required:
             missing_ingredients.append(
                 {
@@ -179,6 +194,14 @@ def evaluate_recipe_craftability(
     }
 
 
+def active_stage_timing(stage: dict[str, Any], quantity: int, level: int) -> tuple[int, int]:
+    """Return work units and game minutes for an active stage."""
+    work = max(1, int(stage["work_amount"])) * quantity
+    # Even when the authored duration is short, each work step spends a minute.
+    minutes = max(int(stage.get("estimated_minutes", 0)) * quantity, (work + level - 1) // level)
+    return work, minutes
+
+
 def recipe_estimated_time(recipe: dict[str, Any], skills: list[dict[str, Any]]) -> dict[str, Any]:
     """Returns skill-adjusted active and fixed passive estimates for display."""
 
@@ -194,10 +217,9 @@ def recipe_estimated_time(recipe: dict[str, Any], skills: list[dict[str, Any]]) 
     for stage in plan["stages"]:
         if stage.get("kind") != "active":
             continue
-        work_amount = _positive_int(stage.get("work_amount"), 0)
+        work_amount, minutes = active_stage_timing(stage, 1, level)
         active_work += work_amount
-        explicit_minutes = _positive_int(stage.get("estimated_minutes"), 0)
-        active_minutes += explicit_minutes or math.ceil(work_amount / max(1, level))
+        active_minutes += minutes
     passive_minutes = sum(
         _positive_int(stage.get("duration_minutes"), 0)
         for stage in plan["stages"]
@@ -210,6 +232,72 @@ def recipe_estimated_time(recipe: dict[str, Any], skills: list[dict[str, Any]]) 
         "passive_minutes": passive_minutes,
         "active_work_amount": active_work,
     }
+
+
+def recipe_progress(
+    recipe: dict[str, Any], process: dict[str, Any] | None,
+    skills: list[dict[str, Any]], *, current_minute: int = 0,
+) -> dict[str, Any]:
+    """Describe saved work and elapsed waiting time without advancing crafting."""
+    stages = normalize_recipe_plan(recipe)["stages"]
+    estimate = recipe_estimated_time(recipe, skills)
+    level = max(1, int(estimate["skill_level"]))
+    saved = process or {}
+    quantity = max(1, _positive_int(saved.get("quantity"), 1))
+    stage_index = min(len(stages), _positive_int(saved.get("stage_index"), 0))
+    total_minutes = completed_minutes = 0.0
+    active_remaining = passive_remaining = work_remaining = actions_remaining = 0
+    waiting = False
+    for index, stage in enumerate(stages):
+        if stage["kind"] == "active":
+            work, minutes = active_stage_timing(stage, quantity, level)
+            done = work if index < stage_index else (
+                min(work, _positive_int(saved.get("active_work_completed"), 0))
+                if index == stage_index else 0
+            )
+            remaining = work - done
+            credit = _positive_int(saved.get("active_minute_credit"), 0) if index == stage_index else 0
+            elapsed = min(minutes, minutes * done // work + credit)
+            work_remaining += remaining
+            actions_remaining += math.ceil(remaining / level)
+            active_remaining += minutes - elapsed
+            completed_minutes += max(minutes * done / work, elapsed)
+        else:
+            minutes = int(stage["duration_minutes"])
+            remaining = 0 if index < stage_index else minutes
+            due = saved.get("passive_due_minute")
+            if index == stage_index and due is not None:
+                remaining = min(minutes, max(0, int(due) - current_minute))
+                waiting = remaining > 0
+            passive_remaining += remaining
+            completed_minutes += minutes - remaining
+        total_minutes += minutes
+    percentage = round(100 * completed_minutes / total_minutes, 2) if total_minutes else (
+        100 if stage_index == len(stages) else 0
+    )
+    return {
+        "continuation": process is not None,
+        "percentage": min(99.99 if stage_index < len(stages) else 100, max(0, percentage)),
+        "active_work_remaining": work_remaining,
+        "actions_remaining": actions_remaining,
+        "active_minutes_remaining": active_remaining,
+        "passive_minutes_remaining": passive_remaining,
+        "stage_number": min(stage_index + 1, len(stages)),
+        "stage_count": len(stages),
+        "stage_label": str(stages[stage_index].get("label", "")) if stage_index < len(stages) else "",
+        "waiting": waiting,
+    }
+
+
+def crafting_progress_summary(progress: dict[str, Any]) -> str:
+    """Player-facing progress shared by action feedback and the Crafting tab."""
+    return (
+        f"{progress['percentage']:g}% complete. "
+        f"Remaining work: {progress['active_work_remaining']} units "
+        f"(~{progress['actions_remaining']} more work actions). "
+        f"Estimated time remaining: {progress['active_minutes_remaining']} min active"
+        f" + {progress['passive_minutes_remaining']} min passive."
+    )
 
 
 def _missing_tools(

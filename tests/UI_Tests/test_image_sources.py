@@ -156,7 +156,7 @@ class NewGameImageSourceDialogTests(QtTestCase):
             for request in requests:
                 dialog.copy_prompt_buttons[request.asset_id].click()
                 self.assertEqual(clipboard.text(), request.external_prompt)
-                self.assertIn(request.display_name, clipboard.text())
+                self.assertNotIn(request.display_name, clipboard.text())
                 self.assertIn(request.description, clipboard.text())
                 self.assertNotIn(request.world_context, clipboard.text())
                 self.assertIn("medieval", clipboard.text())

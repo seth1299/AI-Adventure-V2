@@ -845,8 +845,9 @@ class AiContextBuilder:
                             "only for a recipe whose crafting_status.craftable_now is true, "
                             "and identify it using the exact recipe_id. Never suggest a "
                             "recipe with missing ingredients or tools. Python consumes "
-                            "ingredients by item UUID, advances hidden active work using "
-                            "the matching skill, starts passive stages, and creates the "
+                            "ingredients by item UUID, advances active work using the "
+                            "matching skill, updates the clock and survival meters for "
+                            "crafting time, starts passive stages, and creates the "
                             "result only when every stage is complete. Do not invent or "
                             "change work amounts, time, item IDs, or tool requirements."
                         ),
@@ -1332,9 +1333,10 @@ class AiContextBuilder:
                 "skill_training": SKILL_TRAINING_RULE + " " + SKILL_TRAINING_SOURCE_RULE,
                 "calendar_time": (
                     "Use state.calendar.current for date, day names, seasons, and "
-                    "displayed time. Advance time only by suggesting "
-                    "StatusUpdatedEvent.minutes_passed; do not hand-write or guess "
-                    "new date labels."
+                    "displayed time. CraftingProcessRequestedEvent already accounts "
+                    "for its own elapsed time and survival drain; do not count these "
+                    "again in StatusUpdatedEvent. Use StatusUpdatedEvent.minutes_passed "
+                    "for other elapsed time and do not guess new date labels."
                 ),
                 "character_profile": (
                     "Use state.player.name, pronouns, appearance, backstory, and notes as "

@@ -25,9 +25,13 @@ from ai_adventure.alchemy.ingredients import (
 )
 from ai_adventure.crafting import (
     DEFAULT_CRAFTING_SKILL,
+    active_stage_timing,
+    crafting_units_match,
+    crafting_progress_summary,
     evaluate_recipe_craftability,
     normalize_recipe_plan,
     recipe_estimated_time,
+    recipe_progress,
 )
 from ai_adventure.ai.modes import (
     default_ai_mode_settings,
@@ -41,6 +45,7 @@ from ai_adventure.ai.image_styles import DEFAULT_IMAGE_STYLE, normalize_image_st
 from ai_adventure.calendar_system import (
     DEFAULT_CALENDAR_SETTINGS,
     DEFAULT_START_ELAPSED_MINUTES,
+    MINUTES_PER_DAY,
     build_calendar_snapshot,
     normalize_calendar_settings,
     resolve_starting_calendar_minute,
@@ -56,7 +61,7 @@ from ai_adventure.item_categories import normalize_inventory_category
 from ai_adventure.inventory_storage import inventory_access, move_destinations, move_error, inventory_load, capacity_error, pounds, batch_move_destinations, plan_batch_move
 from ai_adventure.persistence.inventory_containers import synchronize_container_records
 from ai_adventure.new_game_setup import normalize_new_game_setup
-from ai_adventure.survival import SURVIVAL_METERS
+from ai_adventure.survival import CRAFTING_WAIT_NEEDS_PER_HOUR, CRAFTING_WORK_NEEDS_PER_HOUR, SURVIVAL_METERS
 from ai_adventure.persistence.survival import SurvivalRepository
 from ai_adventure.persistence.timed_events import TimedEventsRepository
 from ai_adventure.narration_preferences import (
@@ -89,6 +94,7 @@ from ai_adventure.stats import RULES_VERSION, ATTRIBUTES
 
 LOGGER = logging.getLogger(__name__)
 GM_SECRET_STATUSES = frozenset({"active", "revealed", "retired"})
+_LEGACY_HISTORY_GAME_TIME = re.compile(r"Day ([1-9][0-9]*), ([^,\r\n]+)")
 
 
 @dataclass(frozen=True)
@@ -1790,17 +1796,82 @@ class SaveRepository(PlayerStatsRepository, SurvivalRepository, TimedEventsRepos
 
         return recipes
 
-    def craft_recipe(self, recipe_id: str, *, quantity: int = 1) -> dict[str, Any]:
-        """Keep ingredients and work intact when the completed output cannot fit."""
+    def craft_recipe(self, recipe_id: str, *, quantity: int = 1, until_done: bool = False) -> dict[str, Any]:
+        """Apply work, elapsed time, needs, and output in one transaction."""
         try:
             with self.transaction():
-                return self._craft_recipe(recipe_id, quantity=quantity)
+                needs_before = self.survival_status()
+                if needs_before["fate"] != "alive":
+                    return {"status": "blocked", "message": "Crafting is paused because the adventure is not active."}
+                start_minute = self.get_current_calendar_minute()
+                before = self.crafting_progress(recipe_id)
+                result = self._craft_recipe(recipe_id, quantity=quantity, until_done=until_done)
+                progress = self.crafting_progress(recipe_id)
+                if progress is not None and result.get("status") == "completed":
+                    progress.update(
+                        percentage=100, active_work_remaining=0, actions_remaining=0,
+                        active_minutes_remaining=0, passive_minutes_remaining=0,
+                    )
+                if progress is not None and result.get("status") != "rejected":
+                    previous = before["percentage"] if before else 0
+                    result["progress"] = progress
+                    result["previous_percentage"] = previous
+                    result["message"] = (
+                        f"{result['message']} "
+                        f"Progress: {previous:g}% → {progress['percentage']:g}%. "
+                        f"{crafting_progress_summary(progress)}"
+                    )
+                end_minute = self.get_current_calendar_minute()
+                result["minutes_spent"] = end_minute - start_minute
+                if end_minute > start_minute:
+                    result["message"] += f" Elapsed: {result['minutes_spent']} min. Game time: {self.get_state_value('time')}."
+                    needs_after = self.survival_status()
+                    if needs_after["enabled"]:
+                        result["survival_changes"] = {
+                            meter: needs_after[meter] - needs_before[meter] for meter in SURVIVAL_METERS
+                        }
+                        changes = [f"{meter.title()} {needs_after[meter]}% ({delta:+d})"
+                                   for meter, delta in result["survival_changes"].items() if delta]
+                        if changes:
+                            result["message"] += " " + ", ".join(changes) + "."
+                return result
         except ValueError as error:
             if "capacity exceeded" not in str(error):
                 raise
-            return {"status": "blocked", "message": str(error), "recipe_id": recipe_id}
+            return {"status": "blocked", "message": str(error), "recipe_id": recipe_id, "minutes_spent": 0}
 
-    def _craft_recipe(self, recipe_id: str, *, quantity: int = 1) -> dict[str, Any]:
+    def _spend_crafting_minutes(self, minutes: int, *, active: bool) -> int:
+        if minutes <= 0:
+            return 0
+        rates = CRAFTING_WORK_NEEDS_PER_HOUR if active else CRAFTING_WAIT_NEEDS_PER_HOUR
+        elapsed = self.spend_survival_minutes(minutes, rates)
+        if elapsed:
+            current_minute = self.get_current_calendar_minute() + elapsed
+            self.set_current_calendar_minute(current_minute)
+            snapshot = build_calendar_snapshot(current_minute, self.get_calendar_settings())
+            self.set_state_value("time", str(snapshot["display_label"]))
+            self.mark_survival_death()
+        return elapsed
+
+    def crafting_progress(self, recipe_id: str) -> dict[str, Any] | None:
+        """Read progress for new and saved recipes using the current skill and clock."""
+        recipe = next(
+            (item for item in self.list_crafting_recipes() if str(item["id"]) == str(recipe_id)),
+            None,
+        )
+        if recipe is None:
+            return None
+        processes = self.get_setting("crafting.processes", [])
+        process = next(
+            (item for item in processes if isinstance(item, dict)
+             and str(item.get("recipe_id", "")) == str(recipe_id)),
+            None,
+        ) if isinstance(processes, list) else None
+        return recipe_progress(
+            recipe, process, self.list_skills(), current_minute=self.get_current_calendar_minute()
+        )
+
+    def _craft_recipe(self, recipe_id: str, *, quantity: int, until_done: bool) -> dict[str, Any]:
         """Advances one deterministic crafting interaction for a recipe."""
 
         clean_recipe_id = str(recipe_id or "").strip()
@@ -1828,7 +1899,6 @@ class SaveRepository(PlayerStatsRepository, SurvivalRepository, TimedEventsRepos
             ),
             None,
         )
-        current_minute = self.get_current_calendar_minute()
         skills = self.list_skills()
         plan = normalize_recipe_plan(recipe)
 
@@ -1864,115 +1934,85 @@ class SaveRepository(PlayerStatsRepository, SurvivalRepository, TimedEventsRepos
             }
             processes.append(process)
 
-        stage_index = max(0, int(process.get("stage_index", 0)))
         stages = plan["stages"]
-        if stage_index >= len(stages):
-            processes.remove(process)
-            self.set_setting("crafting.processes", processes)
-            return self._finish_crafting_process(recipe, process)
-
-        stage = stages[stage_index]
-        if not self._tools_available(recipe, stage):
-            return {
-                "status": "blocked",
-                "message": (
-                    "Crafting is paused because a required tool or piece of "
-                    "equipment is unavailable."
-                ),
-                "recipe_id": clean_recipe_id,
-            }
-
-        if stage["kind"] == "passive":
-            due_minute = process.get("passive_due_minute")
-            if due_minute is None:
-                process["passive_due_minute"] = current_minute + int(
-                    stage.get("duration_minutes", 0)
-                )
-                self.set_setting("crafting.processes", processes)
-                return {
-                    "status": "passive",
-                    "message": (
-                        "Passive stage started; check back after "
-                        f"{stage.get('duration_minutes', 0)} minutes."
-                    ),
-                    "recipe_id": clean_recipe_id,
-                }
-            if current_minute < int(due_minute):
-                remaining = int(due_minute) - current_minute
-                return {
-                    "status": "passive",
-                    "message": (
-                        "Passive stage is still underway; about "
-                        f"{remaining} minutes remain."
-                    ),
-                    "recipe_id": clean_recipe_id,
-                }
-            process["stage_index"] = stage_index + 1
-            process["passive_due_minute"] = None
-            process["active_work_completed"] = 0
-            if process["stage_index"] >= len(stages):
-                processes.remove(process)
-                self.set_setting("crafting.processes", processes)
-                return self._finish_crafting_process(recipe, process)
-            self.set_setting("crafting.processes", processes)
-            return {
-                "status": "ready",
-                "message": "The passive crafting stage is complete; continue the next stage.",
-                "recipe_id": clean_recipe_id,
-            }
-
-        estimate = recipe_estimated_time(recipe, skills)
-        skill_level = int(estimate["skill_level"])
-        work_completed = int(process.get("active_work_completed", 0)) + max(1, skill_level)
-        work_required = max(1, int(stage.get("work_amount", 1))) * int(
-            process.get("quantity", 1)
-        )
-        process["active_work_completed"] = work_completed
-        if work_completed < work_required:
-            self.set_setting("crafting.processes", processes)
-            return {
-                "status": "active",
-                "message": (
-                    "Active work progressed (the remaining work amount is hidden "
-                    f"from the player; skill level {skill_level} contributed)."
-                ),
-                "recipe_id": clean_recipe_id,
-            }
-
-        process["stage_index"] = stage_index + 1
-        process["active_work_completed"] = 0
-        if (
-            process["stage_index"] < len(stages)
-            and stages[process["stage_index"]]["kind"] == "passive"
-        ):
-            next_stage = stages[process["stage_index"]]
-            if not self._tools_available(recipe, next_stage):
-                # The completed active work is still meaningful.  Persist the
-                # advanced stage before reporting the missing passive tool so
-                # the player can obtain it and resume instead of losing work.
+        level = int(recipe_estimated_time(recipe, skills)["skill_level"])
+        while (stage_index := int(process["stage_index"])) < len(stages):
+            stage = stages[stage_index]
+            if not self._tools_available(recipe, stage):
                 self.set_setting("crafting.processes", processes)
                 return {
                     "status": "blocked",
-                    "message": "The next passive stage requires a tool that is not available.",
+                    "message": "Crafting is paused because a required tool or piece of equipment is unavailable.",
                     "recipe_id": clean_recipe_id,
                 }
-            process["passive_due_minute"] = current_minute + int(
-                next_stage.get("duration_minutes", 0)
-            )
-            self.set_setting("crafting.processes", processes)
-            return {
-                "status": "passive",
-                "message": "Active crafting is complete; the passive stage has begun.",
-                "recipe_id": clean_recipe_id,
-            }
-        if process["stage_index"] >= len(stages):
+
+            if stage["kind"] == "active":
+                required, duration = active_stage_timing(stage, int(process["quantity"]), level)
+                previous = min(required, int(process["active_work_completed"]))
+                target = required if until_done else min(required, previous + level)
+                target_minute = duration * target // required
+                previous_minute = min(target_minute, duration * previous // required + int(process.get("active_minute_credit", 0)))
+                minutes = target_minute - previous_minute
+                elapsed = self._spend_crafting_minutes(minutes, active=True)
+                if elapsed == minutes:
+                    process.update(active_work_completed=target, active_minute_credit=0)
+                else:
+                    # Keep any elapsed work that falls short of the next full unit.
+                    paid = previous_minute + elapsed
+                    done = min(target, ((paid + 1) * required - 1) // duration)
+                    process.update(active_work_completed=done, active_minute_credit=paid - duration * done // required)
+                if self.survival_status()["fate"] != "alive":
+                    break
+                if target < required:
+                    self.set_setting("crafting.processes", processes)
+                    return {"status": "active", "message": "Active work advanced.", "recipe_id": clean_recipe_id}
+            else:
+                now = self.get_current_calendar_minute()
+                due = process["passive_due_minute"]
+                started = due is None
+                if started:
+                    due = now + int(stage["duration_minutes"])
+                    process["passive_due_minute"] = due
+                remaining = max(0, int(due) - now)
+                if not until_done and (started or remaining):
+                    self.set_setting("crafting.processes", processes)
+                    return {
+                        "status": "passive",
+                        "message": f"Passive stage {'started' if started else 'still underway'}; {remaining} min left.",
+                        "recipe_id": clean_recipe_id,
+                    }
+                if until_done:
+                    self._spend_crafting_minutes(remaining, active=False)
+                    if self.survival_status()["fate"] != "alive":
+                        break
+
+            process.update(stage_index=stage_index + 1, active_work_completed=0, active_minute_credit=0,
+                           passive_due_minute=None)
+            if not until_done and stage_index + 1 < len(stages):
+                next_stage = stages[stage_index + 1]
+                if stage["kind"] == "active" and next_stage["kind"] == "passive":
+                    # Let the passive timer run while the player does other things.
+                    # Its start is the end of the active work just performed.
+                    if self._tools_available(recipe, next_stage):
+                        process["passive_due_minute"] = (
+                            self.get_current_calendar_minute() + int(next_stage["duration_minutes"])
+                        )
+                        status, message = "passive", "Active work finished; the passive stage has begun."
+                    else:
+                        status, message = "blocked", "The next passive stage requires a tool that is not available."
+                else:
+                    status, message = "ready", "Stage finished; the next stage is ready to continue."
+                self.set_setting("crafting.processes", processes)
+                return {"status": status, "message": message, "recipe_id": clean_recipe_id}
+        else:
             processes.remove(process)
             self.set_setting("crafting.processes", processes)
             return self._finish_crafting_process(recipe, process)
+
         self.set_setting("crafting.processes", processes)
         return {
-            "status": "ready",
-            "message": "The active crafting stage is complete; continue the next stage.",
+            "status": "interrupted",
+            "message": "Crafting stopped when a survival meter reached 0%.",
             "recipe_id": clean_recipe_id,
         }
 
@@ -2001,7 +2041,7 @@ class SaveRepository(PlayerStatsRepository, SurvivalRepository, TimedEventsRepos
                     metadata = row["metadata"]
                     if str(metadata.get("item_uuid", "")).strip() != identity:
                         continue
-                    if str(metadata.get("quantity_unit", "each")).casefold() != unit.casefold():
+                    if not crafting_units_match(str(metadata.get("quantity_unit", "each")), unit):
                         return False
                     contents = metadata.get("container", {}).get("contents", {})
                     if contents.get("items") or contents.get("currency_base_units"):
@@ -4418,7 +4458,7 @@ class SaveRepository(PlayerStatsRepository, SurvivalRepository, TimedEventsRepos
         calendar = build_calendar_snapshot(
             self.get_current_calendar_minute(), self.get_calendar_settings()
         )
-        game_time = f"Day {calendar['absolute_day']}, {calendar['time_label']}"
+        game_time = calendar["display_label"]
         with self._connect() as connection:
             cursor = connection.execute(
                 """
@@ -4664,6 +4704,8 @@ class SaveRepository(PlayerStatsRepository, SurvivalRepository, TimedEventsRepos
 
         history: list[dict[str, Any]] = []
         subjects_by_id: dict[int, list[dict[str, str]]] = {}
+        calendar_settings = None
+        legacy_dates: dict[str, str] = {}
         with self._connect() as connection:
             for offset in range(0, len(rows), 400):
                 ids = [row["id"] for row in rows[offset:offset + 400]]
@@ -4674,6 +4716,16 @@ class SaveRepository(PlayerStatsRepository, SurvivalRepository, TimedEventsRepos
                     subjects_by_id.setdefault(subject[0], []).append({"type": subject[1], "id": subject[2]})
         for row in rows:
             entry = dict(row)
+            legacy_time = _LEGACY_HISTORY_GAME_TIME.fullmatch(entry["game_time"])
+            if legacy_time:
+                day, time_label = legacy_time.groups()
+                if day not in legacy_dates:
+                    if calendar_settings is None:
+                        calendar_settings = self.get_calendar_settings()
+                    legacy_dates[day] = build_calendar_snapshot(
+                        (int(day) - 1) * MINUTES_PER_DAY, calendar_settings
+                    )["date_label"]
+                entry["game_time"] = f"{legacy_dates[day]}, {time_label}"
             try:
                 actions = json.loads(entry.pop("suggested_actions_json", "[]"))
             except (TypeError, json.JSONDecodeError):

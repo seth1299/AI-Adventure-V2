@@ -684,6 +684,7 @@ class StoryScreen(RepositoryBackedWidget):
         header = QLabel(
             f"{speaker}  |  {mode_label}{turn_label}  |  {game_time or 'Time unknown'}"
         )
+        header.setTextFormat(Qt.TextFormat.PlainText)
         header.setWordWrap(True)
         header.setStyleSheet("font-size: 11px; font-weight: 700;")
         narration_enabled = self.narration_player is not None and (
@@ -718,8 +719,7 @@ class StoryScreen(RepositoryBackedWidget):
         header_row = QHBoxLayout()
         header_row.setObjectName("conversationHeader")
         header_row.setContentsMargins(0, 0, 0, 0)
-        header_row.addWidget(header)
-        header_row.addStretch()
+        header_row.addWidget(header, 1)
         if narration_enabled:
             header_row.addWidget(read_aloud_button)
         else:

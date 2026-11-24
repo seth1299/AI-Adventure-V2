@@ -150,6 +150,7 @@ class _VisualAssetCoordinator(QObject):
                 target_path,
                 max_pixels=request.maximum_pixels,
                 allow_upscale=False,
+                detect_icon_background=request.uses_transparent_background,
             )
             repository.set_visual_asset_status(
                 request.asset_id,

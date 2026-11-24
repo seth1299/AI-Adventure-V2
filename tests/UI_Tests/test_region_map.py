@@ -38,7 +38,9 @@ class RegionalMapTests(QtTestCase):
             repo.set_state_value("location", "Fern Glen")
             repo.set_travel_locations([
                 {"name": "Stonevault", "x_miles": 0, "y_miles": 0},
-                {"name": "Deercross Wilds", "x_miles": 2.5, "y_miles": 1.5},
+                {"name": "Deercross Wilds", "x_miles": 2.5, "y_miles": 1.5,
+                 "is_sublocation": True, "parent_location": "Stonevault",
+                 "description": "Pine woods near Stonevault."},
                 {"name": "Fern Glen", "is_sublocation": True,
                  "parent_location": "Deercross Wilds"},
             ])
@@ -54,8 +56,13 @@ class RegionalMapTests(QtTestCase):
                 self.assertIn("POSITIONS UNKNOWN", dialog.legend.toPlainText())
                 self.assertTrue(any(isinstance(item, QGraphicsTextItem) for item in dialog.scene.items()))
                 dialog._copy_prompt()
-                self.assertIn('Stonevault', QApplication.clipboard().text())
-                self.assertIn('never render them as text', QApplication.clipboard().text())
+                prompt = QApplication.clipboard().text()
+                self.assertNotIn("Stonevault", prompt)
+                self.assertNotIn("Deercross Wilds", prompt)
+                self.assertNotIn("Fern Glen", prompt)
+                self.assertIn('"parent_site": 2', prompt)
+                self.assertIn("Pine woods near site 2", prompt)
+                self.assertIn('"x_percent"', prompt)
                 screen.on_visual_asset_generate.assert_not_called()
                 request = regional_map_request(repo)
                 repo.set_state_value("location", "Stonevault")

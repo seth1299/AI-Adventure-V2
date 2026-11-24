@@ -4939,6 +4939,7 @@ class NpcDetailsDialog(QDialog):
     ) -> None:
         super().__init__(parent)
         display_name = str(npc.get("display_name", "Unknown NPC") or "Unknown NPC")
+        self._portrait_accessible_name = f"Generated portrait of {display_name}"
         self.setWindowTitle(display_name)
         self.setModal(True)
         self.setWindowModality(Qt.WindowModality.ApplicationModal)
@@ -4989,16 +4990,10 @@ class NpcDetailsDialog(QDialog):
 
         layout = QVBoxLayout()
         layout.addWidget(title)
-        generated_image = ClickableImageLabel()
-        generated_image.setObjectName("npcGeneratedDetailImage")
-        if _set_generated_image(
-            generated_image,
-            image_path,
-            maximum_width=384,
-            maximum_height=320,
-            accessible_name=f"Generated portrait of {display_name}",
-        ):
-            layout.addWidget(generated_image, 0, Qt.AlignmentFlag.AlignHCenter)
+        self._portrait = ClickableImageLabel(self)
+        self._portrait.setObjectName("npcGeneratedDetailImage")
+        layout.addWidget(self._portrait, 0, Qt.AlignmentFlag.AlignHCenter)
+        self.set_portrait(image_path)
         if on_select_image is not None or on_create_image is not None:
             image_buttons = QHBoxLayout()
             if on_select_image is not None:
@@ -5020,3 +5015,13 @@ class NpcDetailsDialog(QDialog):
         layout.addWidget(buttons)
         self.setLayout(layout)
         self.resize(560, 620)
+
+    def set_portrait(self, image_path: Path | None) -> None:
+        """Load the current portrait, including one selected while the dialog is open."""
+        _set_generated_image(
+            self._portrait,
+            image_path,
+            maximum_width=384,
+            maximum_height=320,
+            accessible_name=self._portrait_accessible_name,
+        )

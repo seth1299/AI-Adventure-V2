@@ -6,6 +6,9 @@ from typing import Any
 
 
 SURVIVAL_METERS = ("hunger", "thirst", "energy")
+# Percentage points per hour of active work or time spent waiting on a recipe.
+CRAFTING_WORK_NEEDS_PER_HOUR = {"hunger": 4, "thirst": 8, "energy": 6}
+CRAFTING_WAIT_NEEDS_PER_HOUR = {"hunger": 2, "thirst": 4, "energy": 2}
 SURVIVAL_ROLL_RULE = (
     "When survival tracking is enabled, Python applies one survival modifier to every "
     "player check, attack, and save, using the lowest of Hunger, Thirst, and Energy: "

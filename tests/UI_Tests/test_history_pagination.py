@@ -6,6 +6,7 @@ from unittest.mock import patch
 from PySide6.QtWidgets import QApplication, QLabel
 
 from ai_adventure.application.story_turn_service import StoryTurnService
+from ai_adventure.calendar_system import resolve_starting_calendar_minute
 from ai_adventure.core.state_manager import StateManager
 from ai_adventure.context.context_builder import AiContextBuilder
 from ai_adventure.persistence.save_repository import SaveRepository
@@ -125,17 +126,24 @@ class HistoryPaginationTests(QtTestCase):
 
     def test_message_times_survive_clock_changes_reopening_and_pagination(self):
         repo = self.repository
-        repo.set_calendar_settings({"time_display": "24_hour"})
-        repo.set_current_calendar_minute(23 * 60 + 55)
+        settings = {"month_names": ["November"], "time_display": "24_hour"}
+        repo.set_calendar_settings(settings)
+        midnight = resolve_starting_calendar_minute(
+            {"year": 1940, "day_of_month": 2, "time_of_day_minutes": 0}, settings
+        )
+        repo.set_current_calendar_minute(midnight - 5)
         repo.append_history("player", "Wait until midnight")
-        repo.set_current_calendar_minute(24 * 60 + 5)
+        repo.set_current_calendar_minute(midnight + 5)
         repo.append_history("story", "Midnight has passed.")
         repo.append_history("story_oog", "The clock is now past midnight.")
-        repo.set_current_calendar_minute(3 * 24 * 60)
+        repo.set_current_calendar_minute(midnight + 24 * 60)
+        repo.set_calendar_settings({**settings, "time_display": "12_hour"})
         reopened = SaveRepository(repo.db_path)
+        before_midnight = "Monday, November 1, Year 1940, 23:55"
+        after_midnight = "Tuesday, November 2, Year 1940, 00:05"
         self.assertEqual(
             [entry["game_time"] for entry in reopened.list_history(limit=3)],
-            ["Day 1, 23:55", "Day 2, 00:05", "Day 2, 00:05"],
+            [before_midnight, after_midnight, after_midnight],
         )
         screen = StoryScreen()
         self.addCleanup(screen.close)
@@ -143,9 +151,36 @@ class HistoryPaginationTests(QtTestCase):
         screen.set_repository(reopened)
         screen._load_older_messages()
         headers = [label.text() for label in screen.findChildren(QLabel)]
-        self.assertIn("You  |  Live Game  |  Day 1, 23:55", headers)
-        self.assertIn("AI Game Master  |  Live Game  |  Turn #61  |  Day 2, 00:05", headers)
-        self.assertIn("AI Game Master  |  Out-of-Game  |  Day 2, 00:05", headers)
+        self.assertIn(f"You  |  Live Game  |  {before_midnight}", headers)
+        self.assertIn(f"AI Game Master  |  Live Game  |  Turn #61  |  {after_midnight}", headers)
+        self.assertIn(f"AI Game Master  |  Out-of-Game  |  {after_midnight}", headers)
+
+    def test_saved_day_number_is_displayed_as_a_calendar_date(self):
+        repo = self.repository
+        repo.set_calendar_settings({
+            "month_names": ["January", "February", "March", "April", "May", "June",
+                            "July", "August", "September", "October", "November", "December"],
+            "time_display": "24_hour",
+        })
+        old_timestamp = "Day 651785, 5:00 P.M."
+        with repo.transaction() as connection:
+            connection.execute(
+                "UPDATE history_entries SET game_time=? WHERE message_id='message-0'",
+                (old_timestamp,),
+            )
+        screen = StoryScreen()
+        self.addCleanup(screen.close)
+        self.addCleanup(screen.deleteLater)
+        screen.set_repository(SaveRepository(repo.db_path))
+        screen._load_older_messages()
+        screen._load_older_messages()
+        headers = [label.text() for label in screen.findChildren(QLabel)]
+        self.assertIn("You  |  Live Game  |  Monday, November 1, Year 1940, 5:00 P.M.", headers)
+        with repo.transaction() as connection:
+            row = connection.execute(
+                "SELECT game_time FROM history_entries WHERE message_id='message-0'"
+            ).fetchone()
+        self.assertEqual(row["game_time"], old_timestamp)
 
     def test_legacy_message_time_is_unknown(self):
         with self.repository.transaction() as connection:

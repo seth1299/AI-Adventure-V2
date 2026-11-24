@@ -32,10 +32,6 @@ from ai_adventure.ai.image_styles import (
 from ai_adventure.ai.model_catalog import DEFAULT_IMAGE_MODEL, normalize_image_model
 from ai_adventure.ai.gemini_client import create_gemini_client
 from ai_adventure.ai.request_metrics import measured_operation, record_attempt
-from ai_adventure.context.creative_guardrails import (
-    default_banned_creative_terms,
-    find_banned_creative_terms,
-)
 
 
 LOGGER = logging.getLogger(__name__)
@@ -51,9 +47,7 @@ ARTWORK_PRESENTATION_RULE = (
     "Deliver only the artwork itself, filling the canvas. The image is a view of the "
     "subject, not a poster, book cover, title card, advertisement, or game screenshot. "
     "Keep the top and bottom of the image part of the artwork: no overlaid titles, "
-    "captions, headings, banners, footers, nameplates, typography, or interface elements. "
-    "Any writing explicitly permitted by the object-specific instructions belongs "
-    "only on that physical object, never as a caption or title over the image."
+    "captions, headings, banners, footers, nameplates, typography, or interface elements."
 )
 WORDLESS_ART_RULE = (
     "Keep the artwork completely wordless, including objects within the scene. "
@@ -61,8 +55,7 @@ WORDLESS_ART_RULE = (
     "shop's purpose through its wares, tools, and furnishings rather than a written "
     "business name. Books, packages, clothing, and display cases have no visible "
     "writing or logos. Do not substitute illegible lettering, pseudo-writing, glyphs, "
-    "or random letter-like marks. The reference identity is metadata only and must "
-    "never be painted into the scene or typeset over it."
+    "or random letter-like marks."
 )
 VISUAL_COHERENCE_RULE = (
     "Prioritize a cohesive, believable depiction over showing every described detail. "
@@ -101,6 +94,43 @@ ASSET_DIRECTORY_BY_SUBJECT_TYPE = {
     "skill": "skills",
     "bestiary": "bestiary",
 }
+_GENERIC_IMAGE_SUBJECTS = {
+    "player": "the character",
+    "npc": "the character",
+    "location": "the place",
+    "inventory": "the item",
+    "skill": "the activity",
+    "bestiary": "the creature",
+    "region_map": "the region",
+}
+
+
+def replace_image_subject_names(
+    text: str, replacements: dict[str, str], *, preserve_lowercase: bool = False
+) -> str:
+    """Use generic references where saved prose repeats a subject's name."""
+    names = sorted(
+        ((" ".join(name.split()), label) for name, label in replacements.items() if name.strip()),
+        key=lambda pair: len(pair[0]), reverse=True,
+    )
+    if not text or not names:
+        return text
+    alternatives = [r"\s+".join(map(re.escape, name.split())) for name, _ in names]
+    groups = "|".join(f"({alternative})" for alternative in alternatives)
+
+    def generic_reference(match: re.Match[str]) -> str:
+        name, label = names[match.lastindex - 1]
+        # Descriptive prose can use a display label as a common noun, e.g. 'a copper cauldron'.
+        if preserve_lowercase and not name.islower() and match[0].islower():
+            return match[0]
+        return label.capitalize() if match.start() == 0 else label
+
+    return re.sub(
+        rf"(?<!\w)(?:{groups})(?!\w)",
+        generic_reference,
+        text,
+        flags=re.IGNORECASE,
+    )
 
 
 class VisualAssetRepository(Protocol):
@@ -135,8 +165,7 @@ class VisualAssetRequest:
     world_context: str = ""
     message_ids: tuple[str, ...] = ()
     image_style: str = DEFAULT_IMAGE_STYLE
-    text_instructions: str = ""
-    banned_terms: tuple[str, ...] = ()
+    map_artwork_description: str = ""
 
     @property
     def descriptor_hash(self) -> str:
@@ -207,6 +236,12 @@ class VisualAssetRequest:
         stem = descriptive_image_stem(self.display_name)
         return f"{stem}_{self.descriptor_hash[:8]}.png"
 
+    def _unnamed(self, text: str, *, preserve_lowercase: bool = False) -> str:
+        return replace_image_subject_names(
+            text, {self.display_name: _GENERIC_IMAGE_SUBJECTS[self.subject_type]},
+            preserve_lowercase=preserve_lowercase and self.subject_type not in {"player", "npc"},
+        )
+
     @property
     def external_prompt(self) -> str:
         """A portable art brief containing only visually relevant instructions."""
@@ -216,13 +251,12 @@ class VisualAssetRequest:
                 "for the Travel tab using only the known geography below. Return only the image. "
                 "Use restrained colors, clear terrain boundaries and readable geography. "
                 "No perspective view, labels, letters, numbers, text, legend, borders or watermarks. "
-                "The application overlays exact names and markers as crisp vector text. "
+                "The application overlays labels and markers. Treat site numbers as layout references only. "
                 "Place terrain and settlements at the supplied percentages across the full "
                 "canvas: x increases rightward, y downward. Preserve distances and parent "
-                "relationships; do not invent roads, places or terrain for unmapped entries. "
-                "Names below are reference metadata only, never render them as text.\n"
+                "relationships; do not invent roads, places or terrain for unpositioned sites.\n"
                 f"Selected art style: {image_style_metadata(self.image_style)['label']}.\n"
-                + self.description
+                + (self.map_artwork_description or self._unnamed(self.description))
             )
         style = image_style_metadata(self.image_style)
         focus = {
@@ -234,7 +268,7 @@ class VisualAssetRequest:
             "bestiary": "One creature, emphasizing its silhouette, scale, coloration, texture, and described anatomy. No extra creatures or people.",
         }[self.subject_type]
         # Extract visual era cues, rather than exporting plot, lore, or genre.
-        context = self.world_context.casefold()
+        context = self._unnamed(self.world_context).casefold()
         eras = re.findall(r"\b(?:medieval|prehistoric|ancient roman|ancient egyptian|renaissance|victorian|edwardian|industrial[- ]era|modern[- ]day|far[- ]future)\b", context)
         constraints = []
         if eras:
@@ -245,8 +279,7 @@ class VisualAssetRequest:
             self.creation_task,
             ARTWORK_PRESENTATION_RULE,
             f"Art style: {style['label']}. {style['prompt']}",
-            f"Reference identity (metadata only, never a title or sign): {self.display_name}.",
-            f"Description: {self.description}",
+            f"Description: {self._unnamed(self.description, preserve_lowercase=True)}",
             " ".join(constraints),
             f"Focus: {focus}",
             CUTOUT_BACKGROUND_RULE if self.uses_transparent_background else "",
@@ -254,7 +287,7 @@ class VisualAssetRequest:
             VISUAL_COHERENCE_RULE,
             LOCATION_STRUCTURE_RULE if self.subject_type == "location" else "",
             "Avoid captions, signatures, watermarks, borders, and split panels.",
-            self.text_instructions or WORDLESS_ART_RULE,
+            WORDLESS_ART_RULE,
         ]))
 
     @property
@@ -270,8 +303,7 @@ class VisualAssetRequest:
             "region_map": "north-up, top-down regional terrain map",
         }[self.subject_type]
         return (
-            f'Create one {artwork} depicting "{self.display_name}", '
-            "matching the visible description below. Return only the image."
+            f"Create one {artwork} matching the visible description below. Return only the image."
         )
 
     @property
@@ -313,8 +345,7 @@ class VisualAssetRequest:
                 "The item is the only foreground subject: do not show a person, face, body, "
                 "hand, arm, or someone holding or using it. Make its materials, condition, "
                 "color, scale, and distinctive visible features easy to recognize. "
-                "The subject name may be fictional or unfamiliar: never substitute a familiar "
-                "real-world object based on the name alone. Preserve the concrete visual traits in "
+                "Preserve the concrete visual traits in "
                 "the supplied description, including state-dependent changes such as translucency "
                 "or opacity, where visible from the chosen viewpoint."
             ),
@@ -332,16 +363,13 @@ class VisualAssetRequest:
         if self.subject_type == "location":
             subject_instruction += " " + LOCATION_STRUCTURE_RULE
         style = image_style_metadata(self.image_style)
-        banned_terms = self.banned_terms or default_banned_creative_terms()
-        banned_text = ", ".join(banned_terms) or "None"
-        text_instructions = self.text_instructions or WORDLESS_ART_RULE
         return (
             f"{self.creation_task}\n\n"
             f"{ARTWORK_PRESENTATION_RULE} "
             f"Selected visual style: {style['value']} ({style['label']}). "
             f"Style direction: {style['prompt']} "
             f"{subject_instruction} Use a coherent centered composition suitable for a compact "
-            "desktop game UI. Do not add unapproved words, captions, labels, signatures, "
+            "desktop game UI. Do not add words, captions, labels, signatures, "
             "watermarks, UI frames, split panels, unrelated duplicate subjects, or extraneous "
             "foreground characters. Only depict player-visible information; do not invent hidden identities "
             "or secret facts. Make the selected style feel intentional and specific rather than "
@@ -351,21 +379,13 @@ class VisualAssetRequest:
             "colors, extreme contrast, plastic-looking materials, and unnaturally clean or flawless "
             "surfaces. Preserve believable variation, small imperfections, and style-appropriate "
             "texture, materials, and lighting.\n\n"
-            f"Reference identity (metadata only, never a title or sign): {self.display_name}\n"
-            f"Player-visible description: {self.description}\n"
-            "The supplied subject name and description are metadata for the artist, "
-            "not words to typeset. "
-            "Do not copy them into the image as text unless the exact-label rules below "
-            "explicitly authorize that specific label.\n"
-            "Text and label instructions (follow exactly; never invent readable text):\n"
-            f"{text_instructions}\n"
-            "Forbidden words and names: do not render any of these exact terms, close "
-            f"spelling variants, hyphenation variants, or reskins: {banned_text}\n"
+            f"Player-visible description: {self._unnamed(self.description, preserve_lowercase=True)}\n"
+            f"{WORDLESS_ART_RULE}\n"
             "World context for visual consistency (honor this when relevant, especially "
             "historical era, technology level, architecture, clothing, vehicles, and "
             "materials; do not default to modern designs when the context establishes an "
             "earlier period):\n"
-            f"{self.world_context or 'No additional world context is available.'}"
+            f"{self._unnamed(self.world_context) or 'No additional world context is available.'}"
         )
 
 
@@ -449,7 +469,6 @@ def build_visual_asset_requests(
     image_style = normalize_image_style(
         repository.get_setting("images.style", DEFAULT_IMAGE_STYLE)
     )
-    banned_terms = default_banned_creative_terms()
     requests: list[VisualAssetRequest] = []
 
     player_name = str(repository.get_setting("player_name", "Player Character") or "").strip()
@@ -469,7 +488,6 @@ def build_visual_asset_requests(
                 world_context=world_context,
                 message_ids=(opening_story_message_id,) if opening_story_message_id else (),
                 image_style=image_style,
-                banned_terms=banned_terms,
             )
         )
 
@@ -491,7 +509,6 @@ def build_visual_asset_requests(
                     or event_messages.get(("location", name.casefold()), ())
                 ),
                 image_style=image_style,
-                banned_terms=banned_terms,
             )
         )
 
@@ -526,11 +543,6 @@ def build_visual_asset_requests(
                     or event_messages.get(("inventory", name.casefold()), ())
                 ),
                 image_style=image_style,
-                text_instructions=_text_instructions_for_subject(
-                    name,
-                    description,
-                ),
-                banned_terms=banned_terms,
             )
         )
 
@@ -545,8 +557,7 @@ def build_visual_asset_requests(
             subject_type="inventory", subject_key=key, display_name=name,
             description=f"{item.get('category', 'Item')}. {description}",
             basic_name=_item_basic_name(item, item_catalog, fallback=name),
-            world_context=world_context, image_style=image_style, banned_terms=banned_terms,
-            text_instructions=_text_instructions_for_subject(name, description),
+            world_context=world_context, image_style=image_style,
         ))
 
     for npc in repository.list_player_visible_npcs(limit=500):
@@ -566,7 +577,6 @@ def build_visual_asset_requests(
                 world_context=world_context,
                 message_ids=tuple(event_messages.get(("npc", npc_id), ())),
                 image_style=image_style,
-                banned_terms=banned_terms,
             )
         )
 
@@ -590,7 +600,6 @@ def build_visual_asset_requests(
                     or event_messages.get(("bestiary", display_name.casefold()), ())
                 ),
                 image_style=image_style,
-                banned_terms=banned_terms,
             )
         )
 
@@ -600,46 +609,13 @@ def build_visual_asset_requests(
             requests.append(VisualAssetRequest(
                 subject_type="skill", subject_key=str(skill["id"]).casefold(),
                 display_name=name, description=str(skill.get("description", "") or name),
-                world_context=world_context, image_style=image_style, banned_terms=banned_terms,
+                world_context=world_context, image_style=image_style,
             ))
 
     deduplicated: dict[str, VisualAssetRequest] = {}
     for request in requests:
         deduplicated[request.asset_id] = request
     return list(deduplicated.values())
-
-
-_TEXT_BEARING_HINTS = (
-    "book",
-    "chart",
-    "document",
-    "engraving",
-    "inscription",
-    "journal",
-    "label",
-    "letter",
-    "map",
-    "note",
-    "parchment",
-    "scroll",
-    "sign",
-    "text",
-    "writing",
-)
-
-
-def _text_instructions_for_subject(display_name: str, description: str) -> str:
-    """Permit only the object's own name, without importing regional map context."""
-    combined = f"{display_name} {description}".casefold()
-    if not any(re.search(rf"\b{hint}s?\b", combined) for hint in _TEXT_BEARING_HINTS):
-        return WORDLESS_ART_RULE
-    return (
-        "Optional lettering: only when appropriate for this physical object, "
-        f'you may write its exact name, "{display_name.strip()}", on its surface. '
-        "Otherwise leave its surfaces blank or pictorial. Do not add other labels, "
-        "decorative pseudo-writing, random letters, or invented words. "
-        "Never place this name as a caption or title outside the object."
-    )
 
 
 def save_relative_image_filename(repository: Any, request: VisualAssetRequest) -> str:
@@ -993,18 +969,17 @@ def _visible_world_context(repository: VisualAssetRepository) -> str:
     return "\n".join(parts)
 
 
-def _remove_asset_background(image: Image.Image) -> Image.Image:
+def _remove_asset_background(image: Image.Image, *, required: bool) -> Image.Image:
     """Keys a reserved magenta matte into real alpha, retaining existing alpha.
 
-    Validate the border before keying so a noncompliant opaque illustration is
-    reported rather than silently damaging its colors. The reserved key is also
-    removed inside symbol holes. Soft edges are unmatted to avoid pink fringes.
+    Validate the border before keying. A manual import needs stronger evidence
+    of a reserved matte and falls back to the original image when uncertain.
+    The key is also removed inside subject holes, and soft edges are unmatted.
     """
 
-    rgba = image.convert("RGBA")
-    if rgba.getchannel("A").getextrema()[0] < 255:
-        return rgba
-    rgb = rgba.convert("RGB")
+    if image.mode == "RGBA" and image.getchannel("A").getextrema()[0] < 255:
+        return image
+    rgb = image if image.mode == "RGB" else image.convert("RGB")
     red, green, blue = rgb.split()
     distance = ImageChops.lighter(
         ImageChops.lighter(ImageChops.invert(red), green), ImageChops.invert(blue)
@@ -1015,11 +990,34 @@ def _remove_asset_background(image: Image.Image) -> Image.Image:
         *distance.crop((0, 0, 1, image.height)).getdata(),
         *distance.crop((image.width - 1, 0, image.width, image.height)).getdata(),
     ]
-    if sum(value <= 48 for value in border) < len(border) * 0.8:
+    border_tolerance = 48 if required else 24
+    if sum(value <= border_tolerance for value in border) < len(border) * 0.8:
+        if not required:
+            return image
         raise ValueError(
             "The generated image lacks the required uniform magenta background. "
             "Generate the image again to create a transparent version."
         )
+    if not required:
+        # The copied prompt calls for padding on all four edges. Also require
+        # meaningful areas of matte and foreground to reject frames and swatches.
+        # Sample each corner as a patch so a few noisy pixels cannot veto a matte.
+        patch_size = min(8, image.width, image.height)
+        corners = (
+            (0, 0), (image.width - patch_size, 0),
+            (0, image.height - patch_size), (image.width - patch_size, image.height - patch_size),
+        )
+        for x, y in corners:
+            patch = distance.crop((x, y, x + patch_size, y + patch_size))
+            if sum(value <= border_tolerance for value in patch.getdata()) < patch_size ** 2 * 0.8:
+                return image
+        counts = distance.histogram()
+        pixel_count = image.width * image.height
+        if (
+            sum(counts[:border_tolerance + 1]) < pixel_count * 0.05
+            or sum(counts[96:]) < pixel_count * 0.01
+        ):
+            return image
     alpha = distance.point(lambda value: max(0, min(255, (value - 32) * 255 // 64)))
     # Spill can be much darker than the pure key and survive the distance test.
     # Restrict stronger keying to three pixels around the cutout (including
@@ -1033,7 +1031,10 @@ def _remove_asset_background(image: Image.Image) -> Image.Image:
             coverage = max(0, (239 - dominance) * 255 // 239)
             alpha.putpixel(position, min(alpha.getpixel(position), coverage))
     if alpha.getextrema()[1] == 0:
+        if not required:
+            return image
         raise ValueError("The generated image contains only background; generate it again.")
+    rgba = image.convert("RGBA")
     rgba.putalpha(alpha)
     rgba.paste((0, 0, 0, 0), mask=alpha.point(lambda value: 255 if value == 0 else 0))
     for index, ((r, g, b), opacity, near_edge) in enumerate(zip(rgb.getdata(), alpha.getdata(), edge.getdata())):
@@ -1056,6 +1057,7 @@ def save_scaled_png(
     max_pixels: int = STANDARD_IMAGE_MAX_PIXELS,
     allow_upscale: bool = True,
     remove_icon_background: bool = False,
+    detect_icon_background: bool = False,
 ) -> tuple[int, int]:
     """Writes an RGB or alpha-preserving RGBA PNG and returns its dimensions.
 
@@ -1065,16 +1067,17 @@ def save_scaled_png(
     Gemini 1K/2K responses should already match the requested tier, so this is
     primarily a defensive fallback. Uploads pass ``allow_upscale=False`` so
     smaller source images keep their original pixel dimensions.
-    Generated isolated subjects pass ``remove_icon_background=True`` to key their
-    reserved magenta matte before resizing; uploads retain their original art.
+    Generated isolated subjects require the reserved magenta matte unless they
+    already have alpha. Manual imports for those subjects can opt into matte
+    detection, which preserves the original art when the evidence is ambiguous.
     """
 
     target_path.parent.mkdir(parents=True, exist_ok=True)
     with Image.open(BytesIO(image_bytes)) as source:
         has_alpha = "A" in source.getbands() or "transparency" in source.info
         image = source.convert("RGBA" if has_alpha else "RGB")
-        if remove_icon_background:
-            image = _remove_asset_background(image)
+        if remove_icon_background or detect_icon_background:
+            image = _remove_asset_background(image, required=remove_icon_background)
         target_longest_edge = max(64, int(max_pixels))
         source_longest_edge = max(image.size)
         if not allow_upscale:

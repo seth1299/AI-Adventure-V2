@@ -4,10 +4,12 @@ from pathlib import Path
 import tempfile
 from unittest.mock import patch
 
+from PIL import Image
+
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QPoint
-from PySide6.QtWidgets import QApplication
+from PySide6.QtCore import QPoint, QTimer
+from PySide6.QtWidgets import QApplication, QDialog, QLabel, QPushButton
 
 from ai_adventure.persistence.save_repository import SaveRepository
 from ai_adventure.ui.game_shell import GameShell
@@ -23,7 +25,10 @@ class VisibleTabRefreshTests(QtTestCase):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         self.repo = SaveRepository.create_new_save(Path(temporary.name), "Lazy tabs")
-        self.shell = GameShell(lambda: None, tts_enabled=False, ai_enabled=False)
+        self.shell = GameShell(
+            lambda: None, tts_enabled=False, ai_enabled=False,
+            generated_images_dir=Path(temporary.name) / "images",
+        )
         self.shell.set_repository(self.repo, defer_visual_scan=True)
         self.shell.resize(1200, 800)
         self.shell.show()
@@ -139,6 +144,70 @@ class VisibleTabRefreshTests(QtTestCase):
             calls[shell.story_screen].assert_called_once()
             self.assertTrue(all(call.call_count == 0 for screen, call in calls.items()
                                 if screen is not shell.story_screen))
+
+    def test_npc_picker_updates_open_dialog_and_table_after_each_upload(self):
+        self.repo.upsert_npc(name="Mira", npc_id="mira", public_description="A detective in a raincoat.")
+        shell = self.shell
+        screen = shell.npcs_screen
+        shell.refresh_screens(scan_visual_assets=False)
+        shell.tabs.setCurrentWidget(screen)
+
+        inputs = self.repo.db_path.parent
+        custom_path = inputs / "custom.png"
+        external_path = inputs / "external.png"
+        Image.new("RGB", (64, 80), (20, 40, 60)).save(custom_path)
+        external = Image.new("RGB", (64, 80), (246, 4, 248))
+        external.paste((80, 110, 140), (12, 10, 52, 80))
+        # The real external PNG had a few noisy corner pixels.
+        external.putpixel((0, 79), (216, 18, 229))
+        external.putpixel((63, 79), (224, 14, 240))
+        external.save(external_path)
+
+        def exercise_open_dialog(dialog):
+            preview = dialog.findChild(QLabel, "npcGeneratedDetailImage")
+            button = dialog.findChild(QPushButton, "npcSelectImageButton")
+            with (
+                patch("ai_adventure.ui.primitives.ImageFileDialog") as picker,
+                patch("ai_adventure.ui.primitives.QMessageBox.warning") as warning,
+            ):
+                picker.return_value.exec.return_value = QDialog.DialogCode.Accepted
+                picker.return_value.selectedFiles.return_value = [str(custom_path)]
+                button.click()
+                warning.assert_not_called()
+                thumbnail = screen.table.cellWidget(0, 3)
+                for label in (preview, thumbnail):
+                    pixel = label.pixmap().toImage().pixelColor(0, 0)
+                    self.assertEqual(pixel.getRgb(), (20, 40, 60, 255))
+
+                picker.return_value.selectedFiles.return_value = [str(external_path)]
+                button.click()
+                warning.assert_not_called()
+                self.assertIs(screen.table.cellWidget(0, 3), thumbnail)
+                for label in (preview, thumbnail):
+                    image = label.pixmap().toImage()
+                    self.assertEqual(image.pixelColor(0, 0).alpha(), 0)
+                    self.assertEqual(image.pixelColor(32, 40).getRgb(), (80, 110, 140, 255))
+
+        outcomes = []
+
+        def during_modal_loop():
+            dialog = self.app.activeModalWidget()
+            try:
+                self.assertIsInstance(dialog, QDialog)
+                exercise_open_dialog(dialog)
+            except Exception as error:
+                outcomes.append(error)
+            else:
+                outcomes.append(None)
+            finally:
+                if dialog is not None:
+                    dialog.reject()
+
+        QTimer.singleShot(0, during_modal_loop)
+        screen._open_npc_details(0, 0)
+        self.assertTrue(outcomes)
+        if outcomes[0] is not None:
+            raise outcomes[0]
 
     def test_new_save_discards_pending_refreshes_from_previous_save(self):
         shell = self.shell

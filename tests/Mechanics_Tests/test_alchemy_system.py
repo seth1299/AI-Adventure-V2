@@ -11,9 +11,160 @@ from ai_adventure.alchemy.ingredients import (
 )
 from ai_adventure.core.state_manager import StateManager
 from ai_adventure.persistence.save_repository import SaveRepository
+from ai_adventure.crafting import evaluate_recipe_craftability, recipe_progress
+from ai_adventure.calendar_system import build_calendar_snapshot
 
 
 class AlchemySystemTests(unittest.TestCase):
+    def test_saved_work_reports_increasing_progress_and_remaining_estimates(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository = SaveRepository.create_new_save(Path(directory), "Progress")
+            repository.set_setting("survival.enabled", True)
+            start_minute = repository.get_current_calendar_minute()
+            repository.upsert_skill("Spinning", "Spinning fiber", 4)
+            repository.add_crafting_recipe(
+                name="Yarn", ingredients=[], result="Yarn", skill_name="Spinning",
+                stages=[{"kind": "active", "work_amount": 50, "estimated_minutes": 30}],
+            )
+            identity = repository.list_crafting_recipes()[0]["id"]
+            first = repository.craft_recipe(identity)
+            self.assertEqual(first["minutes_spent"], 2)
+            self.assertEqual(repository.get_current_calendar_minute(), start_minute + 2)
+            self.assertEqual(first["previous_percentage"], 0)
+            self.assertEqual(first["progress"]["percentage"], 8)
+            self.assertEqual(first["progress"]["active_work_remaining"], 46)
+            self.assertEqual(first["progress"]["actions_remaining"], 12)
+            self.assertEqual(first["progress"]["active_minutes_remaining"], 28)
+            reopened = SaveRepository(repository.db_path)
+            self.assertEqual(reopened.crafting_progress(identity), first["progress"])
+            second = reopened.craft_recipe(identity)
+            self.assertEqual(second["progress"]["percentage"], 16)
+            self.assertEqual(second["progress"]["active_minutes_remaining"], 26)
+            self.assertIn("8% → 16%", second["message"])
+            for _ in range(11):
+                result = reopened.craft_recipe(identity)
+            self.assertEqual(result["status"], "completed")
+            self.assertEqual(result["progress"]["percentage"], 100)
+            self.assertEqual(result["progress"]["actions_remaining"], 0)
+            self.assertFalse(reopened.crafting_progress(identity)["continuation"])
+            self.assertEqual(reopened.get_current_calendar_minute(), start_minute + 30)
+            self.assertEqual({meter: reopened.survival_status()[meter] for meter in ("hunger", "thirst", "energy")},
+                             {"hunger": 98, "thirst": 96, "energy": 97})
+
+    def test_work_until_done_advances_through_active_and_passive_stages(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository = SaveRepository.create_new_save(Path(directory), "Timed crafting")
+            repository.set_current_calendar_minute(1430)
+            repository.set_setting("survival.enabled", True)
+            repository.add_inventory_item("Flax", "Material", 3, "Fiber")
+            repository.add_crafting_recipe(
+                name="Linen", ingredients=[{"reagent_name": "Flax", "quantity": 2}], result="Linen",
+                stages=[{"kind": "active", "work_amount": 10, "estimated_minutes": 60},
+                        {"kind": "passive", "duration_minutes": 30},
+                        {"kind": "active", "work_amount": 3, "estimated_minutes": 30}],
+            )
+            identity = repository.list_crafting_recipes()[0]["id"]
+            result = repository.craft_recipe(identity, until_done=True)
+            self.assertEqual(result["status"], "completed")
+            self.assertEqual(result["minutes_spent"], 120)
+            self.assertEqual(repository.get_current_calendar_minute(), 1550)
+            self.assertEqual(repository.get_state_value("time"),
+                             build_calendar_snapshot(1550, repository.get_calendar_settings())["display_label"])
+            self.assertEqual(result["survival_changes"], {"hunger": -7, "thirst": -14, "energy": -10})
+            items = {item["name"]: item["quantity"] for item in repository.list_inventory_items()}
+            self.assertEqual((items["Flax"], items["Linen"]), (1, 1))
+
+    def test_work_until_done_stops_clock_and_crafting_at_survival_depletion(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository = SaveRepository.create_new_save(Path(directory), "Interrupted crafting")
+            repository.set_setting("survival.enabled", True)
+            repository.set_state_value("player.thirst", "1")
+            start = repository.get_current_calendar_minute()
+            repository.add_crafting_recipe(
+                name="Long job", ingredients=[], result="Linen",
+                stages=[{"kind": "active", "work_amount": 1, "estimated_minutes": 60}],
+            )
+            identity = repository.list_crafting_recipes()[0]["id"]
+            result = repository.craft_recipe(identity, until_done=True)
+            self.assertEqual(result["status"], "interrupted")
+            self.assertEqual(result["minutes_spent"], 8)
+            self.assertEqual(repository.get_current_calendar_minute(), start + 8)
+            self.assertEqual(repository.survival_status()["fate"], "pending")
+            self.assertEqual(repository.crafting_progress(identity)["active_minutes_remaining"], 52)
+            self.assertGreater(result["progress"]["percentage"], 0)
+            self.assertNotIn("Linen", {item["name"] for item in repository.list_inventory_items()})
+            self.assertEqual(repository.craft_recipe(identity, until_done=True)["status"], "blocked")
+            self.assertEqual(repository.get_current_calendar_minute(), start + 8)
+            death = repository.choose_survival_fate("recovering")
+            self.assertTrue(repository.commit_survival_recovery(death["incident_id"], {
+                "location": "Clinic", "response": "You wake in a clinic.",
+            }))
+            resumed = repository.craft_recipe(identity, until_done=True)
+            self.assertEqual(resumed["status"], "completed")
+            self.assertEqual(resumed["minutes_spent"], 52)
+            self.assertEqual(repository.get_current_calendar_minute(), start + 60)
+
+    def test_progress_accounts_for_batches_passive_clock_and_future_stages(self):
+        recipe = {"stages": [
+            {"kind": "active", "work_amount": 10, "estimated_minutes": 20},
+            {"kind": "passive", "duration_minutes": 10},
+            {"kind": "active", "work_amount": 5},
+        ]}
+        skills = [{"name": "Crafting", "level": 2}]
+        batch = recipe_progress(recipe, {"quantity": 2, "active_work_completed": 4}, skills)
+        self.assertEqual(batch["active_work_remaining"], 26)
+        self.assertEqual(batch["actions_remaining"], 13)
+        self.assertEqual(batch["active_minutes_remaining"], 37)
+        process = {"stage_index": 1, "passive_due_minute": 110}
+        waiting = recipe_progress(recipe, process, skills, current_minute=105)
+        ready = recipe_progress(recipe, process, skills, current_minute=115)
+        self.assertEqual(waiting["passive_minutes_remaining"], 5)
+        self.assertEqual(waiting["active_work_remaining"], 5)
+        self.assertTrue(waiting["waiting"])
+        self.assertFalse(ready["waiting"])
+        self.assertGreater(ready["percentage"], waiting["percentage"])
+        self.assertEqual(ready["active_minutes_remaining"], 3)
+
+    def test_flax_count_units_and_local_spinning_wheel(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repository = SaveRepository.create_new_save(Path(directory), "Spinning")
+            repository.set_travel_locations([{"name": "Meadowview Cottage", "location_scope": "specific"}])
+            repository.set_state_value("location", "Meadowview Cottage")
+            repository.add_inventory_item(
+                "Raw Flax Fiber", "Material", 15, "Flax stalks",
+                metadata={"quantity_unit": "stalks"},
+            )
+            repository.add_inventory_item(
+                "Spinning Wheel", "Furniture", 1, "A wheel",
+                metadata={"storage_location": "Meadowview Cottage"},
+            )
+            repository.add_crafting_recipe(
+                name="Spun Linen Yarn",
+                ingredients=[{"reagent_name": "Raw Flax Fiber", "quantity": 2}],
+                required_tool_item_names=["Spinning Wheel"], result="Linen Yarn",
+                stages=[{"kind": "active", "work_amount": 1}],
+            )
+            recipe = repository.list_crafting_recipes()[0]
+            availability = evaluate_recipe_craftability(recipe, repository.list_accessible_inventory_items())
+            self.assertTrue(availability["craftable"])
+            self.assertEqual(availability["craftable_quantity"], 7)
+            repository.set_state_value("location", "Village Square")
+            self.assertFalse(evaluate_recipe_craftability(recipe, repository.list_accessible_inventory_items())["craftable"])
+            repository.set_state_value("location", "Meadowview Cottage")
+            self.assertEqual(repository.craft_recipe(recipe["id"])["status"], "completed")
+            flax = next(item for item in repository.list_inventory_items() if item["name"] == "Raw Flax Fiber")
+            self.assertEqual(flax["quantity"], 13)
+            self.assertEqual(flax["quantity_unit"], "stalks")
+
+    def test_each_does_not_convert_physical_measurements(self) -> None:
+        for unit in ("grams", "mL", "lbs", "meters"):
+            with self.subTest(unit=unit):
+                inventory = [{"name": "Flax", "quantity": 15, "quantity_unit": unit, "item_uuid": "flax"}]
+                recipe = {"ingredients": [{"reagent_name": "Flax", "item_uuid": "flax", "quantity": 2}]}
+                availability = evaluate_recipe_craftability(recipe, inventory)
+                self.assertFalse(availability["craftable"])
+                self.assertEqual(availability["missing_ingredients"][0]["reason"], "unit_mismatch")
+
     def test_single_measured_ingredient_omits_redundant_count(self) -> None:
         self.assertEqual(
             format_recipe_ingredient(
@@ -325,9 +476,15 @@ class AlchemySystemTests(unittest.TestCase):
                 3,
             )
 
-            repository.set_current_calendar_minute(110)
-            result = repository.craft_recipe(str(recipe["id"]))
+            self.assertEqual(repository.get_current_calendar_minute(), 102)
+            self.assertEqual(repository.get_setting("crafting.processes", [])[0]["passive_due_minute"], 112)
+            self.assertEqual(repository.craft_recipe(str(recipe["id"]))["minutes_spent"], 0)
+            repository.set_current_calendar_minute(108)
+            result = repository.craft_recipe(str(recipe["id"]), until_done=True)
             self.assertEqual(result["status"], "completed")
+            self.assertEqual(result["minutes_spent"], 4)
+            self.assertEqual(repository.get_current_calendar_minute(), 112)
+            self.assertNotIn("survival_changes", result)
             tonic = next(
                 item for item in repository.list_inventory_items() if item["name"] == "Herbal Tonic"
             )

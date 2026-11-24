@@ -121,8 +121,11 @@ class InventoryCapacityTests(unittest.TestCase):
         self.assertEqual(anvil['metadata']['weight_lb'], 80)
 
     def test_crafting_overweight_output_keeps_ingredients_and_work(self):
+        self.repo.set_setting('survival.enabled', True)
+        before_minute = self.repo.get_current_calendar_minute()
+        before_needs = self.repo.survival_status()
         self.repo.add_crafting_recipe(name='Heavy Result', ingredients=[{'reagent_name': 'Ingots', 'item_uuid': self.item('Ingots')['metadata']['item_uuid'], 'quantity': 1, 'measure_amount': 1, 'measure_unit': 'each'}],
-            result='A very heavy result.', result_item_uuid='heavy-result', result_item_name='Heavy Result', result_weight_lb=80, stages=[{'kind': 'active', 'work_amount': 1}])
+            result='A very heavy result.', result_item_uuid='heavy-result', result_item_name='Heavy Result', result_weight_lb=80, stages=[{'kind': 'active', 'work_amount': 1, 'estimated_minutes': 60}])
         before = self.repo.list_inventory_items()
         recipe = self.repo.list_crafting_recipes()[0]
         result = self.repo.craft_recipe(str(recipe['id']))
@@ -130,6 +133,8 @@ class InventoryCapacityTests(unittest.TestCase):
         self.assertIn('capacity exceeded', result['message'])
         self.assertEqual(before, self.repo.list_inventory_items())
         self.assertEqual(self.repo.get_setting('crafting.processes', []), [])
+        self.assertEqual(self.repo.get_current_calendar_minute(), before_minute)
+        self.assertEqual(self.repo.survival_status(), before_needs)
 
     def test_overweight_purchase_keeps_currency_and_merchant_stock(self):
         self.repo.upsert_npc(name='Merchant', npc_id='merchant')

@@ -68,6 +68,29 @@ def _test_container_metadata(
 
 
 class EventApplierTests(unittest.TestCase):
+    def test_crafting_event_replay_does_not_spend_time_or_needs_twice(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repository = SaveRepository.create_new_save(Path(directory), "Timed crafting event")
+            repository.set_setting("survival.enabled", True)
+            repository.add_crafting_recipe(
+                name="Yarn", ingredients=[], result="Yarn",
+                stages=[{"kind": "active", "work_amount": 1, "estimated_minutes": 60}],
+            )
+            start = repository.get_current_calendar_minute()
+            events = [
+                {"type": "CraftingProcessRequestedEvent",
+                 "payload": {"recipe_id": repository.list_crafting_recipes()[0]["id"]}},
+                {"type": "StatusUpdatedEvent", "payload": {"location": "AUTO", "weather": "AUTO", "minutes_passed": 0}},
+            ]
+            applier = EventApplier(repository, message_id="crafting-turn")
+            result = applier.apply_events(events)[0]
+            self.assertEqual(result.status, "applied")
+            self.assertEqual(result.payload["minutes_spent"], 60)
+            self.assertEqual(applier.apply_events(events)[0], result)
+            self.assertEqual(repository.get_current_calendar_minute(), start + 60)
+            self.assertEqual(repository.survival_status()["thirst"], 92)
+            self.assertEqual(next(item["quantity"] for item in repository.list_inventory_items() if item["name"] == "Yarn"), 1)
+
     def test_party_inventory_events_are_owner_scoped_and_track_equipment(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             repository = SaveRepository.create_new_save(Path(temp_dir), "Party Inventory Test")

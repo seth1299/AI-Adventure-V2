@@ -50,6 +50,29 @@ class SurvivalRepository:
         if self.survival_status()["fate"] != "alive":
             raise AdventureNotPlayableError("This adventure is paused after death or is read-only.")
 
+    def spend_survival_minutes(self, minutes: int, rates: dict[str, int]) -> int:
+        """Drain needs for a timed activity, stopping at the first depleted meter."""
+        status = self.survival_status()
+        if status["fate"] != "alive":
+            return 0
+        if not status["enabled"] or minutes <= 0:
+            return minutes
+        saved = self.get_setting("survival.elapsed_remainders", {})
+        remainders = {
+            meter: max(0, min(59, int(saved.get(meter, 0))))
+            for meter in SURVIVAL_METERS
+        } if isinstance(saved, dict) else dict.fromkeys(SURVIVAL_METERS, 0)
+        minutes = min(minutes, *(
+            (status[meter] * 60 - remainders[meter] + rates[meter] - 1) // rates[meter]
+            for meter in SURVIVAL_METERS
+        ))
+        for meter in SURVIVAL_METERS:
+            loss, remainders[meter] = divmod(remainders[meter] + minutes * rates[meter], 60)
+            if loss:
+                self.set_state_value(f"player.{meter}", str(max(0, status[meter] - loss)))
+        self.set_setting("survival.elapsed_remainders", remainders)
+        return minutes
+
     def mark_survival_death(self) -> dict[str, Any] | None:
         with self.transaction():
             status = self.survival_status()
@@ -108,6 +131,7 @@ class SurvivalRepository:
                                   "previous_xp": skill["xp"], "xp": xp})
             for meter in SURVIVAL_METERS:
                 self.set_state_value(f"player.{meter}", "20")
+            self.set_setting("survival.elapsed_remainders", {})
             self.set_state_value("location", location)
             self.set_state_value("weather", str(recovery.get("weather", "")).strip() or "Clear")
             self.set_state_value("condition", "Recovering")

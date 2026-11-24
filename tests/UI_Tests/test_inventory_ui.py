@@ -2264,7 +2264,7 @@ class InventoryUiTests(QtTestCase):
 
         self.assertEqual(
             headers,
-            ["Name", "Ingredients", "Estimated Value", "Notes", "Estimated Time"],
+            ["Queue", "View", "Name", "Ingredients", "Estimated Value", "Notes", "Estimated Time", "Status / Progress"],
         )
         self.assertNotIn("Result", headers)
 
