@@ -492,6 +492,8 @@ def build_visual_asset_requests(
         )
 
     for location in repository.ensure_travel_locations():
+        if location.get("knowledge_status") == "rumored":
+            continue
         name = str(location.get("name", "") or "").strip()
         description = str(location.get("description", "") or "").strip()
         if not name or not description:

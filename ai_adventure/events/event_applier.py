@@ -37,7 +37,7 @@ from ai_adventure.container_flow import container_test_succeeded, ContainerFlowE
 from ai_adventure.inventory_storage import move_error, carry_priority
 from ai_adventure.currency import format_currency_amount
 from ai_adventure.locations import clean_player_location_name
-from ai_adventure.locations import calculate_travel_estimate, normalize_known_locations
+from ai_adventure.locations import calculate_travel_estimate, normalize_known_location, normalize_known_locations
 from ai_adventure.persistence.save_repository import GM_SECRET_STATUSES, SaveRepository
 from ai_adventure.skills.rules import MAX_SKILL_LEVEL, bonus_for_level, dc_for_difficulty
 from ai_adventure.skills.books import normalize_skill_book, reading_context
@@ -146,6 +146,11 @@ class EventApplier:
 
         for event_index, raw_event in enumerate(raw_events):
             event_type, payload = normalize_event(raw_event)
+            action_index = payload.get("action_index")
+            check_context = [*(prior_results or []), *results]
+            if type(action_index) is int:
+                check_context = [check for check in check_context if check.payload.get("action_index") == action_index]
+            failed_check = _blocking_d20_test_failure(check_context) if type(action_index) is int else blocking_failure
             receipt_key = f"event:{event_index}:" + hashlib.sha256(json.dumps([event_type, payload], sort_keys=True).encode()).hexdigest()
             receipt = self.repository.event_receipt(self.message_id, receipt_key) if self.message_id else None
             if receipt:
@@ -170,24 +175,24 @@ class EventApplier:
                     payload,
                 )
             elif (
-                blocking_failure is not None
+                failed_check is not None
                 and event_type in _D20_TEST_GATED_EVENT_TYPES
                 and not (event_type == "InventoryItemModifiedEvent" and payload.get("skill_book")
-                         and set(payload) <= {"target_name", "skill_book"})
+                         and set(payload) <= {"target_name", "skill_book", "action_index"})
             ):
                 result = AppliedEventResult(
                     event_type,
                     "skipped",
                     (
                         "Skipped because a previous d20 test failed: "
-                        f"{blocking_failure.message}"
+                        f"{failed_check.message}"
                     ),
                     payload,
                 )
             else:
                 result = self.apply_event(
                     {"type": event_type, "payload": payload},
-                    d20_test_results=[*(prior_results or []), *results],
+                    d20_test_results=check_context,
                 )
 
             if (
@@ -1233,6 +1238,9 @@ class EventApplier:
         location = _first_text(payload, "location", "new_location")
         weather = _first_text(payload, "weather")
         minutes_passed = _optional_int(payload, "minutes_passed", "minutes", "time")
+        destination = self.repository.find_travel_location(clean_player_location_name(location)) if location not in {"", "AUTO"} else None
+        if destination and destination.get("knowledge_status") == "rumored":
+            return _invalid(event_type, payload, "The destination is a rumored location and must be confirmed before arrival.")
         previous_location = self.repository.get_state_value("location", "")
         previous_weather = self.repository.get_state_value("weather", "")
         if previous_location:
@@ -1291,13 +1299,16 @@ class EventApplier:
         """Stores one player-known, map-aware location for the Travel screen."""
 
         name = _first_text(payload, "name", "location", "location_name")
+        knowledge_status = str(payload.get("knowledge_status", "")).strip().casefold()
         has_x = "x_miles" in payload or "x" in payload
         has_y = "y_miles" in payload or "y" in payload
 
         if not name:
             return _invalid(event_type, payload, "Location name is required.")
 
-        if not has_x or not has_y:
+        if knowledge_status not in {"", "rumored", "confirmed"}:
+            return _invalid(event_type, payload, "Location knowledge status must be rumored or confirmed.")
+        if knowledge_status != "rumored" and (not has_x or not has_y):
             return _invalid(
                 event_type,
                 payload,
@@ -1316,6 +1327,12 @@ class EventApplier:
             "parent_location": _first_text(payload, "parent_location"),
             "location_scope": payload.get("location_scope", "broad"),
         }
+        if knowledge_status:
+            location["knowledge_status"] = knowledge_status
+        if knowledge_status == "confirmed":
+            confirmed = normalize_known_location(location)
+            if confirmed is None or confirmed.x_miles is None or confirmed.y_miles is None:
+                return _invalid(event_type, payload, "Confirming a location requires valid map coordinates.")
         if "weather" in payload:
             location["weather"] = _first_text(payload, "weather")
         if "music_filename" in payload:

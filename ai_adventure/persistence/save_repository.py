@@ -5591,7 +5591,7 @@ class SaveRepository(PlayerStatsRepository, SurvivalRepository, TimedEventsRepos
             conflicts = []
             for location in serialized:
                 original = original_by_name.get(location["name"].casefold(), {})
-                if (location["x_miles"] is None or location["y_miles"] is None) and (
+                if location["knowledge_status"] != "rumored" and (location["x_miles"] is None or location["y_miles"] is None) and (
                     original.get("x_miles") is not None or original.get("y_miles") is not None
                 ):
                     conflicts.append({
@@ -5687,6 +5687,8 @@ class SaveRepository(PlayerStatsRepository, SurvivalRepository, TimedEventsRepos
 
         if incoming is None:
             return False
+        if incoming.knowledge_status == "rumored" and incoming.name.casefold() == self.get_state_value("location", "").casefold():
+            return False
 
         locations = normalize_known_locations(self.get_setting("travel.locations", []))
         incoming_data = incoming.to_dict()
@@ -5695,6 +5697,8 @@ class SaveRepository(PlayerStatsRepository, SurvivalRepository, TimedEventsRepos
         for index, existing in enumerate(locations):
             if existing.name.casefold() != incoming.name.casefold():
                 continue
+            if existing.knowledge_status == "confirmed" and incoming.knowledge_status == "rumored":
+                return False
 
             merged_data = existing.to_dict()
             merged_data["name"] = incoming.name
@@ -5709,6 +5713,7 @@ class SaveRepository(PlayerStatsRepository, SurvivalRepository, TimedEventsRepos
                 "weather",
                 "music_filename",
                 "location_scope",
+                "knowledge_status",
                 "is_sublocation",
                 "parent_location",
             ):

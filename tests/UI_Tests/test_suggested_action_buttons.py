@@ -112,10 +112,10 @@ class SuggestedActionButtonTests(QtTestCase):
         prompt = entry["suggested_actions"][0]["prompt"]
         self.screen.player_input.setText("My existing draft")
         with patch.object(self.screen, "_submit_player_action") as submit:
-            self.screen.mode_button.setChecked(True)
+            self.screen.action_combo.setCurrentIndex(self.screen.action_combo.findData("ask_gm"))
             self.screen._compose_suggested_action(entry["id"], prompt)
             self.assertTrue(self.screen.suggested_actions_box.isHidden())
-            self.screen.mode_button.setChecked(False)
+            self.screen.action_combo.setCurrentIndex(self.screen.action_combo.findData("do"))
             self.screen._revealing_story_id = entry["id"]
             self.screen._compose_suggested_action(entry["id"], prompt)
             self.screen._revealing_story_id = None

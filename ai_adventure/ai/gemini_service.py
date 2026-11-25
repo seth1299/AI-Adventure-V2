@@ -8,6 +8,7 @@ from ai_adventure.skills.attributes import skill_attribute
 from ai_adventure.skills.books import SKILL_BOOK_SCHEMA, SKILL_BOOK_RULE
 
 from ai_adventure.stats import ATTRIBUTES, PLAYER_ACHIEVEMENT_RULE, STATS_RULE
+from ai_adventure.turn_actions import PRESENT_ACTIONS, has_present_actions, turn_events
 
 from ai_adventure.skills.rules import SKILL_DESCRIPTION_RULE, MAX_SKILL_XP_RULE, SKILL_TRAINING_RULE, SKILL_TRAINING_SOURCE_RULE
 
@@ -1076,6 +1077,8 @@ EVENT_RESPONSE_SCHEMA: dict[str, Any] = {
             {
                 "name": {"type": "string"},
                 "description": {"type": "string"},
+                "knowledge_status": {"type": "string", "enum": ["rumored", "confirmed"],
+                                     "description": "Rumored places are hearsay. Omit coordinates until the player's information is confirmed."},
                 "x_miles": {"type": "number", "description": MAP_COORDINATE_RULE},
                 "y_miles": {"type": "number", "description": "Global map miles in the same frame as existing Travel locations. North is positive y. Preserve established positions."},
                 "terrain": {"type": "string"},
@@ -1090,8 +1093,6 @@ EVENT_RESPONSE_SCHEMA: dict[str, Any] = {
             [
                 "name",
                 "description",
-                "x_miles",
-                "y_miles",
                 "terrain",
                 "travel_multiplier",
                 "travel_notes",
@@ -1578,6 +1579,7 @@ STORY_BASE_EVENT_TYPE_NAMES: tuple[str, ...] = (
     "CalendarEventDeletedEvent",
     "TimedEventUpsertedEvent",
     "StatusUpdatedEvent",
+    "LocationUpsertedEvent",
     "D20TestRequestedEvent",
     "NpcUpsertedEvent",
     "NpcKnowledgeAddedEvent",
@@ -1729,6 +1731,7 @@ D20_TEST_PLAN_RESPONSE_JSON_SCHEMA: dict[str, Any] = {
             "items": {
                 "type": "object",
                 "properties": {"attribute": {"type": "string", "enum": list(ATTRIBUTES)},
+                "action_index": {"type": "integer", "minimum": 1},
                 "test_kind": {"type": "string", "enum": ["check", "attack", "save"]},
                 "skill_name": {"type": "string", "description": "Optional existing skill; omit for untrained tests."},
                 "reason": {"type": "string"}, "dc": {"type": "integer", "minimum": 1},
@@ -1745,6 +1748,15 @@ D20_TEST_PLAN_RESPONSE_JSON_SCHEMA: dict[str, Any] = {
             ),
             "items": {"type": "string", "enum": sorted(PLANNABLE_CONTEXT_TAGS)},
             "uniqueItems": True,
+        },
+        "conditions": {
+            "type": "array",
+            "description": "Queued entries that run only on the outcome of an earlier action's d20 tests.",
+            "items": {"type": "object", "properties": {
+                "action_index": {"type": "integer", "minimum": 2},
+                "depends_on": {"type": "integer", "minimum": 1},
+                "outcome": {"type": "string", "enum": ["success", "failure"]},
+            }, "required": ["action_index", "depends_on", "outcome"], "additionalProperties": False},
         },
     },
     "required": ["checks", "relevant_tags"],
@@ -2539,6 +2551,13 @@ def build_story_response_schema(
         for branch in EVENT_RESPONSE_SCHEMA["anyOf"]
         if branch["properties"]["type"]["enum"][0] in enabled_event_types
     ])
+    player_actions = context_packet.get("player_actions", [])
+    for branch in event_branches:
+        if len(player_actions) > 1:
+            branch["properties"]["action_index"] = {"type": "integer", "minimum": 1, "maximum": len(player_actions)}
+            branch["required"].append("action_index")
+        if any(action["action_type"] == "retcon" for action in player_actions):
+            branch["properties"]["retcon_correction_reason"] = {"type": "string"}
     # Give Gemini one canonical clock representation. Runtime duration support is
     # retained for direct callers, but exposing both fields invites ambiguous updates.
     for branch in event_branches:
@@ -2554,7 +2573,7 @@ def build_story_response_schema(
     music_tracks, _, _ = distinct_audio_track_catalogs_with_ambience(
         audio.get("valid_music_tracks", []), [], []
     )
-    if "MusicChangedEvent" in enabled_event_types and music_tracks:
+    if "MusicChangedEvent" in enabled_event_types and music_tracks and len(player_actions) <= 1:
         choices = music_tracks if audio.get("current_music") in music_tracks else ["", *music_tracks]
         schema["properties"]["music_filename"] = {"type": "string", "enum": choices}
         schema["required"].append("music_filename")
@@ -2737,6 +2756,7 @@ class D20TestPlanResult:
     relevant_tags: list[str] | None = None
     raw_text: str = ""
     dropped_events: list[dict[str, Any]] = field(default_factory=list)
+    conditions: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -2961,18 +2981,25 @@ class GeminiNarrationService:
         result = _apply_story_guard(result, context_packet, _filter_unsupported_crafting_suggestions)
         result = _apply_story_guard(result, context_packet, _ensure_in_game_suggested_actions)
         result = _apply_story_guard(result, context_packet, _ensure_status_event_for_in_game_response)
-        result = _repair_container_reward_flow(
-            client, self.settings.model, result, context_packet, response_schema,
-            ai_preferences=ai_preferences,
-        )
-        result = _apply_story_guard(result, context_packet, _ensure_inventory_for_collected_reagents)
-        result = _apply_story_guard(result, context_packet, _ensure_inventory_for_narrated_collection)
+        actions = context_packet.get("player_actions", [])
+        inactive = context_packet.get("inactive_actions", {})
+        has_present_action = has_present_actions(actions, inactive)
+        if has_present_action:
+            result = _repair_container_reward_flow(
+                client, self.settings.model, result, context_packet, response_schema,
+                ai_preferences=ai_preferences,
+            )
+            if len(actions) <= 1:
+                result = _apply_story_guard(result, context_packet, _ensure_inventory_for_collected_reagents)
+                result = _apply_story_guard(result, context_packet, _ensure_inventory_for_narrated_collection)
         result = _apply_story_guard(result, context_packet, _normalize_visible_currency_phrasing)
-        result = _repair_missing_deadlines(
-            client, self.settings.model, result, context_packet, ai_preferences=ai_preferences,
-        )
+        if has_present_action:
+            result = _repair_missing_deadlines(
+                client, self.settings.model, result, context_packet, ai_preferences=ai_preferences,
+            )
         return replace(
             result,
+            suggested_events=turn_events(result.suggested_events, actions, inactive),
             pronunciation_map=merge_pronunciation_maps(
                 response_pronunciation_map,
                 result.pronunciation_map,
@@ -3008,6 +3035,11 @@ class GeminiNarrationService:
 
         ai_preferences = ai_mode_preferences_from_context_packet(context_packet)
         prompt = build_d20_test_plan_prompt(context_packet)
+        plan_schema = D20_TEST_PLAN_RESPONSE_JSON_SCHEMA
+        if len(context_packet.get("player_actions", [])) > 1:
+            plan_schema = copy.deepcopy(plan_schema)
+            plan_schema["properties"]["checks"]["items"]["required"].append("action_index")
+            plan_schema["required"].append("conditions")
 
         if is_playtesting_build():
             LOGGER.debug(
@@ -3023,7 +3055,7 @@ class GeminiNarrationService:
             model=self.settings.model,
             contents=prompt,
             config=_structured_output_config(
-                D20_TEST_PLAN_RESPONSE_JSON_SCHEMA,
+                plan_schema,
                 model=self.settings.model,
                 ai_preferences=ai_preferences,
             ),
@@ -3034,13 +3066,13 @@ class GeminiNarrationService:
             self.settings.model,
             str(getattr(response, "output_text", "") or "").strip(),
             "skill-check plan response",
-            D20_TEST_PLAN_RESPONSE_JSON_SCHEMA,
+            plan_schema,
             ai_preferences=ai_preferences,
         )
         if is_playtesting_build():
             LOGGER.debug("Gemini raw skill-check plan response:\n%s", raw_text)
 
-        _validate_response_contract(raw_text, D20_TEST_PLAN_RESPONSE_JSON_SCHEMA, "d20-test plan")
+        _validate_response_contract(raw_text, plan_schema, "d20-test plan")
 
         return _filter_unwarranted_planned_d20_tests(
             _prefer_clearly_relevant_known_skill(
@@ -3432,6 +3464,7 @@ def _build_xml_d20_test_plan_prompt(context_packet: dict[str, Any]) -> str:
 
     planning_packet = _d20_test_planning_packet(context_packet)
     player_command = str(planning_packet.pop("player_command", "") or "").strip()
+    player_actions = planning_packet.get("player_actions", [])
     tag_rundown = {
         tag: description for tag, description in CONTEXT_TAG_DESCRIPTIONS.items()
     }
@@ -3447,9 +3480,21 @@ def _build_xml_d20_test_plan_prompt(context_packet: dict[str, Any]) -> str:
                 "Use skill_rules and the supplied scene, skills, containers, and "
                 "relevant lore. Return only checks needed before narration and the "
                 "smallest set of available relevant_tags. Python performs all rolls "
-                "and validation; do not narrate.",
+                "and validation; do not narrate. A rumored place has no usable route. "
+                "Plan investigation when warranted without assuming access or arrival.",
             ),
             _xml_json_section("available_tags", tag_rundown),
+            *([_xml_text_section(
+                "action_rules",
+                "Use the numbered player_actions in order and attach action_index to each check. "
+                "Say is spoken dialogue, Do is an attempted action, Retcon is a narrow retrospective addition or missed check "
+                "in an earlier scene, and Ask the GM cannot trigger any check. Keep routine actions roll-free. "
+                "For each action conditional on the success or failure of an earlier roll, include its "
+                "action_index, the earlier depends_on index, and the required outcome in conditions, even "
+                "if the dependent action needs no check. Include any check it would need, but leave the "
+                "choice of branch to Python. If an earlier uncertain outcome cannot be resolved by a "
+                "check before narration, defer rolls for the dependent action. Do not guess outcomes.",
+            )] if player_actions else []),
             _xml_packet_sections(planning_packet),
             _xml_json_section(
                 "examples",
@@ -3464,10 +3509,12 @@ def _build_xml_d20_test_plan_prompt(context_packet: dict[str, Any]) -> str:
             ),
             _xml_text_section(
                 "output_format",
-                'Return only JSON: {"checks":[...],"relevant_tags":[...]}.',
+                'Return only JSON matching the configured schema, including conditions when required.'
+                if player_actions else 'Return only JSON: {"checks":[...],"relevant_tags":[...]}.',
             ),
             _xml_text_section(
                 "task",
+                "Plan the numbered player actions above." if player_actions else
                 f"Decide the checks and relevant rule tags for this player command: {player_command}",
             ),
         ]
@@ -3490,6 +3537,7 @@ def _build_xml_story_prompt(context_packet: dict[str, Any]) -> str:
         excluded_keys={"schema_version", "packet_type", "player_command"},
     )
     resolved_checks = _state_subpacket(context_packet, "skills").get("resolved_checks_this_turn", [])
+    player_actions = context_packet.get("player_actions", [])
     return "\n\n".join(
         [
             _xml_text_section(
@@ -3537,6 +3585,24 @@ def _build_xml_story_prompt(context_packet: dict[str, Any]) -> str:
                 ),
             ),
             _xml_text_section("presentation", build_ai_mode_prompt_guidance(context_packet)),
+            *([_xml_text_section(
+                "action_rules",
+                "Resolve numbered player_actions in order as one turn. These rules take precedence over "
+                "generic status and narration rules. Say: speak the player's words in character, respecting "
+                "delivery cues such as whispers and pauses, without inventing speech. Do: attempt the stated "
+                "action and honor authoritative check results. Retcon: give a short retrospective clarification "
+                "or missed check tied to the referenced moment, preserving prior narration and results. No "
+                "elapsed minutes or current status updates for a Retcon. Only propose a rare material correction "
+                "directly required by the request, and explain the specific basis in retcon_correction_reason on "
+                "that event. Ask the GM: answer directly out of character, using only what the player or "
+                "character could reasonably know. In a mixed turn distinguish GM answers from spoken dialogue, "
+                "and emit no events for an Ask the GM entry. Inactive actions were skipped or deferred by "
+                "Python. Never narrate them as performed or emit events for them. Respect other conditions "
+                "in the text and stop at a decision requiring a roll that Python has not made. Checks already "
+                "ran during planning. For a multi-action turn label every event with its source action_index. "
+                "Attribute a status event only to a current action that really changed status or advanced time, "
+                "except for an explicitly justified Retcon correction.",
+            )] if player_actions else []),
             _xml_json_section("banned_terms", banned_terms),
             _xml_text_section(
                 "context",
@@ -3570,14 +3636,14 @@ def _build_xml_story_prompt(context_packet: dict[str, Any]) -> str:
                     if conversation_mode == "out_of_game"
                     else "Based on the context above, fully resolve and narrate this player command, including any immediate NPC response or available answer it requests, then suggest only the state changes it actually warrants:\n"
                 )
-                + player_command,
+                + ("Follow the numbered player_actions in the packet." if player_actions else player_command),
             ),
         ]
     )
 
 
 _STORY_STATE_TAGS: dict[str, set[str]] = {
-    "travel": {"travel", "exploration", "scene", "inventory"},
+    "travel": {"travel", "exploration", "scene", "inventory", "dialogue", "lore"},
     "inventory": {"inventory", "alchemy", "crafting", "reagent", "recipe", "combat", "merchant"},
     "item_catalog": {"inventory", "alchemy", "crafting", "reagent", "recipe", "combat", "merchant"},
     "currency": {"currency", "merchant"},
@@ -5994,6 +6060,12 @@ def _d20_test_planning_packet(context_packet: dict[str, Any]) -> dict[str, Any]:
     if isinstance(travel_request, dict) and travel_request.get("active"):
         packet["travel_request"] = travel_request
         packet["travel_rules"] = TRAVEL_SAFETY_RULE
+    if context_packet.get("player_actions"):
+        packet["player_actions"] = context_packet["player_actions"]
+    rumors = [location["name"] for location in _state_subpacket(context_packet, "travel").get("locations", [])
+              if location.get("knowledge_status") == "rumored"]
+    if rumors:
+        packet["rumored_locations"] = rumors
     return packet
 
 
@@ -6400,17 +6472,21 @@ def parse_d20_test_plan_response(raw_text: str) -> D20TestPlanResult:
         reason = str(raw_check.get("reason", "")).strip()
         if attribute not in ATTRIBUTES or kind not in {"check", "attack", "save"} or not reason:
             continue
-        payload = {k: v for k, v in raw_check.items() if k in {"attribute", "test_kind", "skill_name", "reason", "dc", "difficulty", "advantage", "disadvantage"}}
+        payload = {k: v for k, v in raw_check.items() if k in {"attribute", "test_kind", "skill_name", "reason", "dc", "difficulty", "advantage", "disadvantage", "action_index"}}
         payload.update(attribute=attribute, test_kind=kind, reason=reason)
-        identity = (attribute, kind, str(payload.get("skill_name", "")).casefold(), reason.casefold())
+        identity = (payload.get("action_index") if type(payload.get("action_index")) is int else None,
+                    attribute, kind, str(payload.get("skill_name", "")).casefold(), reason.casefold())
         if identity not in seen:
             checks.append(payload)
             seen.add(identity)
 
+    raw_conditions = data.get("conditions", [])
     return D20TestPlanResult(
         checks=checks,
         relevant_tags=relevant_tags,
         raw_text=guarded_raw_text,
+        conditions=[condition for condition in raw_conditions if isinstance(condition, dict)]
+        if isinstance(raw_conditions, list) else [],
     )
 
 
@@ -6438,6 +6514,7 @@ def _filter_unwarranted_planned_d20_tests(
         checks=[],
         relevant_tags=relevant_tags,
         raw_text=result.raw_text,
+        conditions=result.conditions,
         dropped_events=[*result.dropped_events, *[
             {"type": "D20TestRequestedEvent", "payload": copy.deepcopy(check),
              "stage": "d20_test_planning", "reason": "Clearly routine low-stakes player action; no roll required."}
@@ -6489,7 +6566,7 @@ def _prefer_clearly_relevant_known_skill(
 ) -> D20TestPlanResult:
     """Corrects broad or invented planner skills for unambiguous known-skill cases."""
 
-    if not result.checks:
+    if not result.checks or len(context_packet.get("player_actions", [])) > 1:
         return result
 
     book = _state_subpacket(context_packet, "skill_book_study")
@@ -6560,6 +6637,7 @@ def _prefer_clearly_relevant_known_skill(
         dropped_events=result.dropped_events,
         relevant_tags=result.relevant_tags,
         raw_text=result.raw_text,
+        conditions=result.conditions,
     )
 
 
@@ -6732,7 +6810,9 @@ def parse_gemini_story_response(
     data = _sanitize_gemini_creative_terms(data, "story response")
     guarded_raw_text = json.dumps(data, ensure_ascii=False)
 
-    _log_json_schema_warnings(data, STORY_RESPONSE_JSON_SCHEMA, "story response")
+    actions = (context_packet or {}).get("player_actions", [])
+    schema = build_story_response_schema(context_packet, for_api=False) if actions else STORY_RESPONSE_JSON_SCHEMA
+    _log_json_schema_warnings(data, schema, "story response")
 
     response_text = data.get("response", data.get("narrative_text"))
 
@@ -6772,6 +6852,7 @@ def parse_gemini_story_response(
         context_packet,
         response_label="story response",
     )
+    suggested_events = turn_events(suggested_events, actions, (context_packet or {}).get("inactive_actions", {}))
     suggested_events, sound_effect_cues = _extract_narration_sound_effect_cues(
         suggested_events,
         response_text,
@@ -7043,7 +7124,7 @@ def _ensure_status_event_for_in_game_response(
 ) -> AiNarrationResult:
     """Ensures in-game narration and its final status event remain aligned."""
 
-    if result.out_of_game or _is_continuation_request(context_packet):
+    if result.out_of_game or _is_continuation_request(context_packet) or context_packet.get("player_actions"):
         return result
 
     if str(context_packet.get("packet_type", "")).strip() != "story_turn":
@@ -7228,6 +7309,13 @@ def _repair_missing_deadlines(
                                 if branch["properties"]["type"]["enum"] == ["ActiveTaskUpsertedEvent"]))
     branch["properties"]["payload"]["required"] = list(branch["properties"]["payload"]["properties"])
     branch["properties"]["payload"]["properties"]["due_elapsed_minutes"]["minimum"] = 0
+    actions = context_packet.get("player_actions", [])
+    inactive = context_packet.get("inactive_actions", {})
+    if len(actions) > 1:
+        eligible = [action["action_index"] for action in actions if action["action_type"] in PRESENT_ACTIONS
+                    and action["action_index"] not in inactive]
+        branch["properties"]["action_index"] = {"type": "integer", "enum": eligible}
+        branch["required"].append("action_index")
     schema = {"type": "object", "properties": {"events": {"type": "array", "minItems": 1,
               "items": branch}}, "required": ["events"], "additionalProperties": False}
     LOGGER.warning("Narrated deadline missing a dated task; requesting event-only repair: %s", missing)
@@ -7235,11 +7323,14 @@ def _repair_missing_deadlines(
         client, model=model,
         contents="Record the established obligations below as dated task events. Return only JSON "
             "matching the schema. Do not rewrite narration, add unrelated obligations, or advance time.\n"
+            "For a queued turn, assign each obligation to the current action that accepted it. "
+            "Ignore retrospective remarks and out-of-character answers.\n"
             + DEADLINE_RULE + "\n" + json.dumps({
                 "missing_commitments": missing, "narrative": result.narrative_text,
                 "calendar": _state_subpacket(context_packet, "calendar"),
                 "scene": _state_subpacket(context_packet, "scene"),
                 "existing_tasks": tasks, "existing_events": result.suggested_events,
+                "player_actions": actions,
             }, ensure_ascii=False),
         config=_structured_output_config(schema, model=model, ai_preferences=ai_preferences),
         request_label="deadline consistency repair", response_contract=schema,

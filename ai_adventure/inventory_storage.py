@@ -23,7 +23,8 @@ LOCATION_STORAGE_RULE = (
 
 def location_allows_storage(name: str, locations: Iterable[dict[str, Any]]) -> bool:
     return any(str(row.get("name", "")).strip().casefold() == name.strip().casefold()
-               and row.get("location_scope") == "specific" for row in locations)
+               and row.get("location_scope") == "specific" and row.get("knowledge_status") != "rumored"
+               for row in locations)
 
 
 

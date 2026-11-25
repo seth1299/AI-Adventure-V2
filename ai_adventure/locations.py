@@ -32,6 +32,11 @@ MAP_COORDINATE_RULE = (
     "existing map or invent an undiscovered region just to supply an origin."
 )
 TRAVEL_SAFETY_RULE = (
+    "Record named places the player only heard about with a LocationUpsertedEvent whose "
+    "knowledge_status is rumored. Include what is rumored in description or travel_notes. "
+    "Omit coordinates for rumors and never route to or arrive at them. When the player "
+    "learns the real position, update the same name with knowledge_status confirmed and "
+    "verified map coordinates. Do not expose hidden geography just because a place was mentioned. "
     "Route safety is a private, directional GM assessment from the player's current "
     "location, not an intrinsic rating of a destination. Never reveal safety labels, "
     "assessments, or hidden hazards in player-facing text or location descriptions. "
@@ -65,6 +70,7 @@ class KnownLocation:
     location_scope: str = "broad"
     weather: str = ""
     music_filename: str = ""
+    knowledge_status: str = "confirmed"
 
     def to_dict(self) -> dict[str, Any]:
         """Returns JSON-serializable location data."""
@@ -167,13 +173,14 @@ def normalize_known_location(raw_location: Any) -> KnownLocation | None:
             )
         )
 
+    rumored = str(raw_location.get("knowledge_status", "")).strip().casefold() == "rumored"
     return KnownLocation(
         name=name,
         location_scope="specific" if raw_location.get("location_scope") == "specific" else "broad",
         location_id=_clean_text(raw_location.get("location_id")),
         description=_clean_text(raw_location.get("description")),
-        x_miles=_optional_coordinate(raw_location.get("x_miles", raw_location.get("x"))),
-        y_miles=_optional_coordinate(raw_location.get("y_miles", raw_location.get("y"))),
+        x_miles=None if rumored else _optional_coordinate(raw_location.get("x_miles", raw_location.get("x"))),
+        y_miles=None if rumored else _optional_coordinate(raw_location.get("y_miles", raw_location.get("y"))),
         terrain=_clean_text(raw_location.get("terrain")),
         weather=_clean_text(raw_location.get("weather")),
         music_filename=_clean_text(raw_location.get("music_filename")),
@@ -186,6 +193,7 @@ def normalize_known_location(raw_location: Any) -> KnownLocation | None:
         travel_notes=travel_notes,
         is_sublocation=is_sublocation,
         parent_location=parent_location if is_sublocation else "",
+        knowledge_status="rumored" if rumored else "confirmed",
     )
 
 
@@ -281,6 +289,9 @@ def calculate_travel_estimate(
     destination_name = destination.name if destination is not None else "Unknown Location"
     terrain = destination.terrain if destination is not None else ""
     travel_notes = destination.travel_notes if destination is not None else ""
+
+    if any(location and location.knowledge_status == "rumored" for location in (origin, destination)):
+        return TravelEstimate(destination_name, None, effective_speed, None, clean_mode, terrain, travel_notes)
 
     origin_x = origin.x_miles if origin is not None else None
     origin_y = origin.y_miles if origin is not None else None

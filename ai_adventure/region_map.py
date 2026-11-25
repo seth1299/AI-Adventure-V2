@@ -43,6 +43,7 @@ def regional_map_request(repository: VisualAssetRepository) -> VisualAssetReques
     """Describe only known geography for explicitly requested map backgrounds."""
     raw = repository.ensure_travel_locations()
     points, unmapped, span = regional_map_layout(raw)
+    unmapped = [place for place in unmapped if place.knowledge_status != "rumored"]
     # Stable ordering makes the artwork reusable when only the player moves.
     ordered_points = sorted(points, key=lambda point: point[0].name.casefold())
     places = [{"name": p.name, "terrain": p.terrain,

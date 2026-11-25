@@ -62,7 +62,7 @@ class TravelScreen(RepositoryBackedWidget):
 
         details_layout = QVBoxLayout()
         selector_layout = QHBoxLayout()
-        selector_layout.addWidget(QLabel("Known Locations:"))
+        selector_layout.addWidget(QLabel("Locations:"))
         selector_layout.addWidget(self.location_selector, 1)
         details_layout.addLayout(selector_layout)
         scope_controls = QWidget()
@@ -120,7 +120,7 @@ class TravelScreen(RepositoryBackedWidget):
             self.travel_button.setEnabled(False)
             return
 
-        current_location_name = StateManager(repository).load_state().world.location
+        current_location_name = repository.get_state_value("location", "")
         locations = repository.ensure_travel_locations()
 
         for location in sorted(
@@ -133,7 +133,9 @@ class TravelScreen(RepositoryBackedWidget):
                 continue
 
             display_name = name
-            if name.casefold() == current_location_name.casefold():
+            if location.get("knowledge_status") == "rumored":
+                display_name = f"{name} (Rumored)"
+            elif name.casefold() == current_location_name.casefold():
                 display_name = f"{name} (Currently here)"
 
             item = QListWidgetItem(display_name)
@@ -212,7 +214,23 @@ class TravelScreen(RepositoryBackedWidget):
             self.travel_button.setEnabled(False)
             return
 
-        state = StateManager(repository).load_state()
+        rumored = destination.knowledge_status == "rumored"
+        self.scope_selector.setEnabled(not rumored)
+        self.travel_context_input.setEnabled(not rumored)
+        self.select_image_button.setEnabled(not rumored)
+        self.create_image_button.setEnabled(not rumored)
+        self.copy_image_prompt_button.setEnabled(not rumored)
+        self.travel_button.setToolTip("Confirm its location before traveling." if rumored else "")
+        if rumored:
+            sections = [f"# {destination.name}", "**Rumored · Location unknown**",
+                        destination.description, destination.travel_notes,
+                        "Travel becomes available once this location is confirmed and mapped."]
+            _set_markdown_text(self.details_output, "\n\n".join(section for section in sections if section))
+            self.location_image_label.hide()
+            self.travel_button.setEnabled(False)
+            return
+
+        state = StateManager(repository).load_state(history_limit=0)
         origin = normalize_known_location(
             repository.find_travel_location(state.world.location)
         )
@@ -295,7 +313,7 @@ class TravelScreen(RepositoryBackedWidget):
 
         destination = self._selected_location_data()
 
-        if destination is None or self.on_travel_requested is None:
+        if destination is None or destination.get("knowledge_status") == "rumored" or self.on_travel_requested is None:
             return
 
         if self.on_travel_requested(

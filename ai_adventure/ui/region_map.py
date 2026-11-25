@@ -129,6 +129,12 @@ class RegionalMapDialog(QDialog):
             scale = self.scene.addText(f"{span / 7.8:.2f} miles", QFont("Segoe UI", 12))
             scale.setDefaultTextColor(QColor("#111111"))
             scale.setPos(35, 955)
+        rumors = [place for place in unmapped if place.knowledge_status == "rumored"]
+        unmapped = [place for place in unmapped if place.knowledge_status != "rumored"]
+        if rumors:
+            lines.extend(["RUMORED LOCATIONS", ""])
+            for place in rumors:
+                lines.extend([place.name, place.description, place.travel_notes, ""])
         if unmapped:
             lines.extend(["POSITIONS UNKNOWN OR CONFLICTING", "These places are not plotted:", ""])
             for place in unmapped:

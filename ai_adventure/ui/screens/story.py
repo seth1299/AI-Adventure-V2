@@ -6,6 +6,8 @@ from ai_adventure.container_flow import ContainerFlowError
 from ai_adventure.suggested_actions import compose_action_prompt
 from ai_adventure.survival import SURVIVAL_METERS
 from ai_adventure.application.travel_service import complete_safe_travel, current_assessment
+from ai_adventure.turn_actions import TurnAction, action_packet, action_text
+from ai_adventure.ui.action_queue import ActionQueueDialog, action_selector
 
 from ai_adventure.ui.common import *  # noqa: F401,F403
 from ai_adventure.ui.dialogues import *  # noqa: F401,F403
@@ -53,6 +55,8 @@ class StoryScreen(RepositoryBackedWidget):
         self._pending_d20_test_event_results: list[Any] = []
         self._pending_travel_request: dict[str, Any] | None = None
         self._pending_conversation_mode = "live_game"
+        self._pending_player_actions: list[TurnAction] = []
+        self._action_queue: list[TurnAction] = []
         self._pending_message_id: str | None = None
         self._pending_regeneration_request: dict[str, Any] | None = None
         self._conversation_render_generation = 0
@@ -62,8 +66,6 @@ class StoryScreen(RepositoryBackedWidget):
         self._thinking_timer = QTimer(self)
         self._thinking_timer.setInterval(GM_THINKING_TIMER_INTERVAL_MS)
         self._thinking_timer.timeout.connect(self._advance_thinking_indicator)
-        self._default_input_placeholder = "Enter a player action..."
-        self._out_of_game_input_placeholder = "Ask the AI about the adventure..."
         self.view_hidden_messages_button = QPushButton("View Hidden Messages")
         self.view_hidden_messages_button.setToolTip(
             "Review conversation messages hidden from the main timeline and restore them."
@@ -137,20 +139,18 @@ class StoryScreen(RepositoryBackedWidget):
         self.conversation_layout.addWidget(self.conversation_bottom_padding)
         self.conversation_scroll.setWidget(self.conversation_contents)
 
-        self.mode_button = QPushButton("Mode: Live Game")
-        self.mode_button.setCheckable(True)
-        self.mode_button.setToolTip(
-            "Switch between story actions and out-of-game questions for the AI."
-        )
-        self.mode_button.toggled.connect(self._set_out_of_game_mode)
-        self._update_mode_button_style()
+        self.action_combo = action_selector()
+        self.action_combo.setObjectName("storyActionSelector")
 
         self.player_input = QLineEdit()
-        self.player_input.setPlaceholderText(self._default_input_placeholder)
+        self.player_input.setPlaceholderText("Describe what your character does…")
 
         self.submit_button = QPushButton("Submit")
         self.submit_button.clicked.connect(self._submit_player_action)
         self.player_input.returnPressed.connect(self._submit_player_action)
+        self.queue_button = QPushButton("Queue")
+        self.queue_button.setToolTip("Add this draft to the queue, or open the queue to edit and submit it.")
+        self.queue_button.clicked.connect(self._open_action_queue)
 
         self.continue_button = QPushButton("Continue")
         self.continue_button.setToolTip("Ask the GM to expand the latest response.")
@@ -158,9 +158,11 @@ class StoryScreen(RepositoryBackedWidget):
         self.continue_button.setEnabled(False)
 
         input_row = QHBoxLayout()
-        input_row.addWidget(self.mode_button)
+        input_row.addWidget(QLabel("Action"))
+        input_row.addWidget(self.action_combo)
         input_row.addWidget(self.player_input)
         input_row.addWidget(self.submit_button)
+        input_row.addWidget(self.queue_button)
         input_row.addWidget(self.continue_button)
 
         layout = QVBoxLayout()
@@ -195,6 +197,7 @@ class StoryScreen(RepositoryBackedWidget):
         layout.addLayout(input_row)
 
         self.setLayout(layout)
+        self.action_combo.currentIndexChanged.connect(self._action_type_changed)
 
     def set_repository(self, repository: SaveRepository | None) -> None:
         """Sets the active save and clears any stale narration reveal state."""
@@ -207,7 +210,10 @@ class StoryScreen(RepositoryBackedWidget):
         self.set_opening_retry_available(False)
         self._pending_travel_request = None
         self._pending_conversation_mode = "live_game"
-        self.mode_button.setChecked(False)
+        self._pending_player_actions = []
+        self._action_queue.clear()
+        self.queue_button.setText("Queue")
+        self.action_combo.setCurrentIndex(self.action_combo.findData("do"))
         self.location_image_panel.set_image_identity(None)
         self.location_image_panel.set_pinned(
             repository is not None
@@ -1170,7 +1176,9 @@ class StoryScreen(RepositoryBackedWidget):
         if not accepted or not reason.strip():
             return
 
-        player_text = self._player_command_before_history_id(
+        saved_actions = repository.event_receipt(message_id, "player_actions") or {}
+        player_actions = [TurnAction(action["action_type"], action["text"]) for action in saved_actions.get("entries", [])]
+        player_text = action_text(player_actions) if player_actions else self._player_command_before_history_id(
             _safe_int(latest_ai.get("id"), -1)
         )
         if not player_text:
@@ -1190,7 +1198,7 @@ class StoryScreen(RepositoryBackedWidget):
             return
 
         self._clear_story_reveal_state()
-        self.mode_button.setChecked(False)
+        self.action_combo.setCurrentIndex(self.action_combo.findData("do"))
         self._pending_message_id = repository.create_message_id()
         self._pending_regeneration_request = {
             "active": True,
@@ -1205,6 +1213,9 @@ class StoryScreen(RepositoryBackedWidget):
         self._pending_d20_test_event_results = []
         self._pending_travel_request = None
         self._pending_conversation_mode = "live_game"
+        self._pending_player_actions = player_actions
+        if player_actions:
+            repository.record_event_receipt(self._pending_message_id, "player_actions", {"entries": action_packet(player_actions)})
         repository.capture_message_snapshot(self._pending_message_id)
         self.notify_repository_changed()
         self.refresh()
@@ -1229,41 +1240,37 @@ class StoryScreen(RepositoryBackedWidget):
                 self._pending_regeneration_request
             )
 
-    def _set_out_of_game_mode(self, enabled: bool) -> None:
-        """Switches the explicit player-to-AI conversation mode."""
-
-        self._update_mode_button_style()
+    def _action_type_changed(self, _index: int) -> None:
         self._sync_story_input_state()
         self._update_continue_button_state()
 
-    def _update_mode_button_style(self) -> None:
-        """Makes the active mode obvious without relying on button state alone."""
-
-        if self.mode_button.isChecked():
-            self.mode_button.setText("Mode: Out-of-Game")
-            self.mode_button.setStyleSheet(
-                "QPushButton { background-color: #6d28d9; color: white; font-weight: 700; }"
-                "QPushButton:disabled { background-color: #6b7280; color: #d1d5db; }"
-            )
-        else:
-            self.mode_button.setText("Mode: Live Game")
-            self.mode_button.setStyleSheet(
-                "QPushButton { background-color: #2563eb; color: white; font-weight: 700; }"
-                "QPushButton:disabled { background-color: #6b7280; color: #d1d5db; }"
-            )
-
     def _conversation_mode(self) -> str:
         """Returns the mode selected by the player."""
-
-        return "out_of_game" if self.mode_button.isChecked() else "live_game"
+        return "out_of_game" if self.action_combo.currentData() == "ask_gm" else "live_game"
 
     def _submit_player_action(self) -> None:
-        """Records a player message in the explicitly selected mode."""
+        text = self.player_input.text().strip()
+        if text:
+            self._submit_player_actions([TurnAction(str(self.action_combo.currentData()), text)])
 
-        self._submit_player_command(
-            self.player_input.text().strip(),
-            conversation_mode=self._conversation_mode(),
-        )
+    def _open_action_queue(self) -> None:
+        if not self.queue_button.isEnabled():
+            return
+        if text := self.player_input.text().strip():
+            self._action_queue.append(TurnAction(str(self.action_combo.currentData()), text))
+            self.player_input.clear()
+        dialog = ActionQueueDialog(self._action_queue, self)
+        accepted = dialog.exec() == QDialog.DialogCode.Accepted
+        self._action_queue = dialog.actions()
+        if accepted and self._action_queue and self._submit_player_actions(self._action_queue):
+            self._action_queue = []
+        count = len(self._action_queue)
+        self.queue_button.setText(f"Queue ({count})" if count else "Queue")
+        dialog.deleteLater()
+
+    def _submit_player_actions(self, actions: list[TurnAction]) -> bool:
+        mode = "out_of_game" if all(action.action_type == "ask_gm" for action in actions) else "live_game"
+        return self._submit_player_command(action_text(actions), conversation_mode=mode, player_actions=actions)
 
     def _refresh_suggested_action_buttons(self) -> None:
         while self.suggested_actions_layout.count():
@@ -1306,6 +1313,7 @@ class StoryScreen(RepositoryBackedWidget):
         command = compose_action_prompt(prompt,
             style=repository.get_setting("ai.narration_style", "second_person_limited"),
             player_name=repository.get_setting("player_name", ""))
+        self.action_combo.setCurrentIndex(self.action_combo.findData("do"))
         self.player_input.setText(command)
         self.player_input.setCursorPosition(len(command))
         self.player_input.setFocus()
@@ -1327,7 +1335,7 @@ class StoryScreen(RepositoryBackedWidget):
             return False
 
         destination = normalize_known_location(repository.find_travel_location(destination.name))
-        if destination is None:
+        if destination is None or destination.knowledge_status == "rumored":
             return False
         try:
             if complete_safe_travel(repository, destination.name, player_context.strip(),
@@ -1389,11 +1397,12 @@ class StoryScreen(RepositoryBackedWidget):
         *,
         conversation_mode: str = "live_game",
         travel_request: dict[str, Any] | None = None,
+        player_actions: list[TurnAction] | None = None,
     ) -> bool:
         """Records one submitted message and starts its mode-specific Gemini request."""
 
         clean_mode = "out_of_game" if conversation_mode == "out_of_game" else "live_game"
-        if self._waiting_for_gm:
+        if self._waiting_for_gm or self._initial_generation_pending:
             return False
 
         repository = self.repository()
@@ -1415,6 +1424,7 @@ class StoryScreen(RepositoryBackedWidget):
                 player_text,
                 message_id=self._pending_message_id,
                 conversation_mode=clean_mode,
+                player_actions=player_actions,
             )
         except Exception:
             self._handle_persistence_failure()
@@ -1423,6 +1433,7 @@ class StoryScreen(RepositoryBackedWidget):
         self._pending_d20_test_event_results = []
         self._pending_travel_request = travel_request
         self._pending_conversation_mode = clean_mode
+        self._pending_player_actions = list(player_actions or [])
         self._set_waiting_for_gm(True)
         self.refresh()
 
@@ -1463,6 +1474,7 @@ class StoryScreen(RepositoryBackedWidget):
         self._pending_d20_test_event_results = []
         self._pending_travel_request = None
         self._pending_conversation_mode = "live_game"
+        self._pending_player_actions = []
         self._pending_message_id = repository.create_message_id()
         self._pending_regeneration_request = None
         self._set_waiting_for_gm(True)
@@ -1485,6 +1497,7 @@ class StoryScreen(RepositoryBackedWidget):
         conversation_mode: str = "live_game",
         resolved_d20_tests: list[dict[str, Any]] | None = None,
         planner_context_tags: list[str] | None = None,
+        inactive_actions: dict[int, str] | None = None,
     ) -> dict[str, Any]:
         """Builds the Gemini story context packet for the current save."""
 
@@ -1495,6 +1508,8 @@ class StoryScreen(RepositoryBackedWidget):
             resolved_d20_tests=resolved_d20_tests,
             planner_context_tags=planner_context_tags,
             sound_manager=self.sound_manager,
+            player_actions=self._pending_player_actions,
+            inactive_actions=inactive_actions,
         )
 
     def _start_d20_test_planning_request(self, context_packet: dict[str, Any]) -> None:
@@ -1532,7 +1547,7 @@ class StoryScreen(RepositoryBackedWidget):
             self._set_waiting_for_gm(False)
             return
 
-        player_text = self._latest_player_command()
+        player_text = action_text(self._pending_player_actions) if self._pending_player_actions else self._latest_player_command()
 
         if not player_text:
             LOGGER.warning("Skill-check plan finished without a player command.")
@@ -1545,33 +1560,22 @@ class StoryScreen(RepositoryBackedWidget):
             self._set_waiting_for_gm(False)
             return
 
-        check_events = StoryTurnService.skill_plan_events(plan_result)
         try:
             StoryTurnService.record_dropped_events(repository, plan_result, message_id=pending_message_id)
             if getattr(plan_result, "dropped_events", []):
                 LOGGER.info("Audited %s dropped planning check(s) in mechanical_events.", len(plan_result.dropped_events))
+            self._pending_d20_test_event_results, inactive_actions = StoryTurnService.resolve_action_plan(
+                repository, pending_message_id, self._pending_player_actions, plan_result,
+            )
         except Exception:
             self._handle_persistence_failure()
             return
-
-        if check_events:
-            try:
-                self._pending_d20_test_event_results = StoryTurnService.apply_suggested_events(
-                    repository,
-                    message_id=pending_message_id,
-                    suggested_events=check_events,
-                )
-            except Exception:
-                self._handle_persistence_failure()
-                return
+        if self._pending_d20_test_event_results:
             LOGGER.info(
                 "Applied %s pre-narration d20 test(s).",
                 len(self._pending_d20_test_event_results),
             )
             self.notify_repository_changed()
-        else:
-            self._pending_d20_test_event_results = []
-
         resolved_d20_tests = _resolved_d20_tests_for_context(
             self._pending_d20_test_event_results
         )
@@ -1581,6 +1585,7 @@ class StoryScreen(RepositoryBackedWidget):
             conversation_mode=self._pending_conversation_mode,
             resolved_d20_tests=resolved_d20_tests,
             planner_context_tags=getattr(plan_result, "relevant_tags", None),
+            inactive_actions=inactive_actions,
         )
         self._apply_pending_regeneration_context(context_packet)
 
@@ -1670,6 +1675,7 @@ class StoryScreen(RepositoryBackedWidget):
         self._pending_d20_test_event_results = []
         self._pending_travel_request = None
         self._pending_conversation_mode = "live_game"
+        self._pending_player_actions = []
         self._pending_message_id = None
         self._pending_regeneration_request = None
         latest_story = self._latest_story_entry()
@@ -1691,6 +1697,7 @@ class StoryScreen(RepositoryBackedWidget):
         self._pending_d20_test_event_results = []
         self._pending_travel_request = None
         self._pending_conversation_mode = "live_game"
+        self._pending_player_actions = []
         self._pending_message_id = None
         self._pending_regeneration_request = None
         self._set_waiting_for_gm(False)
@@ -1710,6 +1717,7 @@ class StoryScreen(RepositoryBackedWidget):
         self._pending_d20_test_event_results = []
         self._pending_travel_request = None
         self._pending_conversation_mode = "live_game"
+        self._pending_player_actions = []
         message_id = self._pending_message_id or (
             repository.create_message_id() if repository is not None else ""
         )
@@ -1739,6 +1747,7 @@ class StoryScreen(RepositoryBackedWidget):
         self._pending_d20_test_event_results = []
         self._pending_travel_request = None
         self._pending_conversation_mode = "live_game"
+        self._pending_player_actions = []
         message_id = self._pending_message_id or (
             repository.create_message_id() if repository is not None else ""
         )
@@ -1785,19 +1794,6 @@ class StoryScreen(RepositoryBackedWidget):
         self._sync_story_input_state()
         self._update_continue_button_state()
 
-        if waiting:
-            self._apply_thinking_indicator_text()
-        else:
-            self.player_input.setPlaceholderText(
-                self._out_of_game_input_placeholder
-                if self._conversation_mode() == "out_of_game"
-                else self._default_input_placeholder
-            )
-            self.player_input.setToolTip("")
-            self.submit_button.setToolTip("")
-        self.continue_button.setToolTip(
-            "Ask the GM to expand the latest live-game response."
-        )
 
     def _advance_thinking_indicator(self) -> None:
         """Advances the visible thinking indicator while a request is active."""
@@ -1823,21 +1819,24 @@ class StoryScreen(RepositoryBackedWidget):
         """Enables input according to request state and explicit mode."""
 
         is_out_of_game = self._conversation_mode() == "out_of_game"
-        can_submit = not self._waiting_for_gm and not self._adventure_locked
+        can_submit = (not self._waiting_for_gm and not self._adventure_locked
+                      and not self._initial_generation_pending and self.repository() is not None)
         self.player_input.setEnabled(can_submit)
         self.submit_button.setEnabled(can_submit)
-        self.mode_button.setEnabled(can_submit)
+        self.action_combo.setEnabled(can_submit)
+        self.queue_button.setEnabled(can_submit)
         self._refresh_suggested_action_buttons()
 
         if self._waiting_for_gm:
             self._apply_thinking_indicator_text()
             return
 
-        self.player_input.setPlaceholderText(
-            self._out_of_game_input_placeholder
-            if is_out_of_game
-            else self._default_input_placeholder
-        )
+        self.player_input.setPlaceholderText({
+            "say": "Enter what your character says…",
+            "do": "Describe what your character does…",
+            "retcon": "Describe what you would have done in the earlier scene…",
+            "ask_gm": "Ask the GM about the adventure…",
+        }[str(self.action_combo.currentData())])
         self.player_input.setToolTip("")
         self.submit_button.setToolTip("")
         if is_out_of_game:

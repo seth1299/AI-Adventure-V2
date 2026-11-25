@@ -581,6 +581,7 @@ class AiContextBuilder:
                         {
                             "name": location.name,
                             "location_scope": location.location_scope,
+                            "knowledge_status": location.knowledge_status,
                             "description": _compact_text(location.description),
                             "x_miles": location.x_miles,
                             "y_miles": location.y_miles,

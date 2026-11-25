@@ -54,7 +54,8 @@ def build_assessment_context(repository: SaveRepository) -> dict[str, Any]:
         "packet_type": "private_travel_assessment",
         "assessment_key": assessment_key(repository),
         "origin": repository.get_state_value("location", ""),
-        "locations": repository.ensure_travel_locations(),
+        "locations": [location for location in repository.ensure_travel_locations()
+                      if location["knowledge_status"] != "rumored"],
         "valid_music_tracks": repository.get_setting("travel.music_tracks", []),
         "music_track_context": music_track_context(repository.get_setting("travel.music_tracks", [])),
         "state": {

@@ -7,7 +7,8 @@ from PySide6.QtCore import QThread, QThreadPool
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QWidget
 
-from ai_adventure.application.travel_service import build_assessment_context, commit_assessment, sync_location_music
+from ai_adventure.application.travel_service import build_assessment_context, commit_assessment, complete_safe_travel, sync_location_music
+from ai_adventure.events.event_applier import EventApplier
 from ai_adventure.persistence.save_repository import SaveRepository
 from ai_adventure.ui.screens.story import StoryScreen
 from ai_adventure.ui.screens.travel import TravelScreen
@@ -56,6 +57,41 @@ class TravelFlowTests(QtTestCase):
         self.assertEqual(story.weather_value.text(), 'Light Rain')
         self.assertEqual(self.repository.get_state_value('weather'), 'light rain')
         story.on_repository_changed.assert_called_once_with(story)
+
+    def test_rumored_location_is_readable_but_cannot_be_traveled_to_until_confirmed(self):
+        applier = EventApplier(self.repository)
+        rumored = {"name": "Secret Base", "knowledge_status": "rumored",
+                   "description": "May contain rare items.", "travel_notes": "Rival groups may be interested."}
+        result = applier.apply_event({"type": "LocationUpsertedEvent", "payload": rumored})
+        self.assertEqual(result.status, "applied")
+        self.repository = SaveRepository(self.repository.db_path)
+        location = self.repository.find_travel_location("Secret Base")
+        self.assertIsNone(location["x_miles"])
+        self.assertEqual(location["knowledge_status"], "rumored")
+        self.assertNotIn("Secret Base", [row["name"] for row in build_assessment_context(self.repository)["locations"]])
+
+        callback = Mock()
+        screen = TravelScreen(on_travel_requested=callback)
+        screen.set_repository(self.repository)
+        screen.location_selector.setCurrentIndex(screen.location_selector.findText("Secret Base (Rumored)"))
+        self.assertIn("May contain rare items", screen.details_output.toPlainText())
+        self.assertIn("Rival groups", screen.details_output.toPlainText())
+        self.assertFalse(screen.travel_button.isEnabled())
+        screen._request_travel()
+        callback.assert_not_called()
+        self.assertFalse(complete_safe_travel(self.repository, "Secret Base"))
+        applier = EventApplier(self.repository)
+        arrival = applier.apply_event({"type": "StatusUpdatedEvent", "payload": {"location": "Secret Base", "minutes_passed": 5}})
+        self.assertEqual(arrival.status, "skipped")
+        self.assertEqual(self.repository.get_state_value("location"), "Home")
+
+        confirmed = {**rumored, "knowledge_status": "confirmed", "x_miles": 4, "y_miles": 2}
+        result = applier.apply_event({"type": "LocationUpsertedEvent", "payload": confirmed})
+        self.assertEqual(result.status, "applied")
+        screen.refresh()
+        self.assertEqual(screen.location_selector.currentText(), "Secret Base")
+        self.assertTrue(screen.travel_button.isEnabled())
+        self.assertEqual(self.repository.find_travel_location("Secret Base")["location_id"], location["location_id"])
 
     def test_unsafe_and_unassessed_routes_use_normal_story_flow(self):
         for assessed in (False, True):

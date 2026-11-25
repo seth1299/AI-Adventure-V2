@@ -24,6 +24,9 @@ from ai_adventure.audio.pronunciation import (
     merge_pronunciation_maps,
     set_authoritative_pronunciation,
 )
+from ai_adventure.turn_actions import (
+    PRESENT_ACTIONS, TurnAction, action_packet, explicit_action_condition, has_present_actions, turn_events,
+)
 
 
 @dataclass(frozen=True)
@@ -56,6 +59,8 @@ class StoryTurnService:
         resolved_d20_tests: list[dict[str, Any]] | None = None,
         planner_context_tags: list[str] | None = None,
         sound_manager: Any = None,
+        player_actions: list[TurnAction] | None = None,
+        inactive_actions: dict[int, str] | None = None,
     ) -> dict[str, Any]:
         """Builds the complete provider context for a story turn."""
 
@@ -65,7 +70,9 @@ class StoryTurnService:
             location=state.world.location,
             query_text=player_text,
         )
-        subjects = StoryTurnService.history_subjects_for_action(repository, player_text)
+        subjects = StoryTurnService.history_subjects_for_action(
+            repository, player_text, spoken=any(action.action_type == "say" for action in player_actions or []),
+        )
         for subject in subjects:
             if subject["type"] == "npc":
                 npc = repository.get_npc(subject["id"])
@@ -90,16 +97,7 @@ class StoryTurnService:
             if sound_manager is not None
             else []
         )
-        correction_request = (
-            conversation_mode == "out_of_game"
-            and any(
-                phrase in player_text.casefold()
-                for phrase in (
-                    "missing", "not in my inventory", "don't see", "didn't receive",
-                    "did not receive", "double-check", "double check", "correct my inventory",
-                )
-            )
-        )
+        correction_request = conversation_mode == "out_of_game" and _requests_inventory_correction(player_text)
         packet = builder.build_story_context(
             state,
             player_command=player_text,
@@ -143,15 +141,22 @@ class StoryTurnService:
         if book:
             packet["state"]["skill_book_study"] = book
             packet["selection"]["tags"] = sorted(set(packet["selection"]["tags"]) | {"skill", "inventory"})
+        if any(location.knowledge_status == "rumored" and location.name.casefold() in player_text.casefold()
+               for location in state.travel.locations):
+            packet["selection"]["tags"] = sorted(set(packet["selection"]["tags"]) | {"travel"})
         packet["response_contract"]["skill_books"] = SKILL_BOOK_RULE
+        if player_actions:
+            packet["player_actions"] = action_packet(player_actions)
+        if inactive_actions:
+            packet["inactive_actions"] = inactive_actions
         return packet
 
     @staticmethod
-    def history_subjects_for_action(repository: SaveRepository, text: str) -> list[dict[str, str]]:
+    def history_subjects_for_action(repository: SaveRepository, text: str, *, spoken: bool = False) -> list[dict[str, str]]:
         """Carry the last conversation partner into quoted and natural follow-ups."""
         subjects = repository.find_history_subjects(text)
         dialogue = (
-            text.lstrip().startswith(('"', "'", "\u201c", "\u2018"))
+            spoken or text.lstrip().startswith(('"', "'", "\u201c", "\u2018"))
             or re.search(r"\b(?:ask|tell|reply|say|talk|speak|show|give)\b", text, re.IGNORECASE)
             or re.match(r"\s*(?:who|what|which|where|when|why|how|can|could|would|may)\b", text, re.IGNORECASE)
             or re.match(r"\s*(?:yes|no|thanks|thank you|please|certainly|of course|sounds good)\b", text, re.IGNORECASE)
@@ -177,6 +182,7 @@ class StoryTurnService:
         *,
         message_id: str,
         conversation_mode: str = "live_game",
+        player_actions: list[TurnAction] | None = None,
     ) -> None:
         """Persists a submitted player action and captures rollback scope."""
 
@@ -190,8 +196,12 @@ class StoryTurnService:
                 player_text,
                 message_id=repository.create_message_id(),
                 turn_id=message_id,
-                subjects=StoryTurnService.history_subjects_for_action(repository, player_text) if clean_mode == "live_game" else [],
+                subjects=StoryTurnService.history_subjects_for_action(
+                    repository, player_text, spoken=any(action.action_type == "say" for action in player_actions or []),
+                ) if clean_mode == "live_game" else [],
             )
+            if player_actions:
+                repository.record_event_receipt(message_id, "player_actions", {"entries": action_packet(player_actions)})
             if clean_mode == "live_game":
                 repository.capture_message_snapshot(message_id)
 
@@ -226,6 +236,63 @@ class StoryTurnService:
             for check in getattr(plan_result, "checks", [])
             if isinstance(check, dict) and str(check.get("attribute", "")).strip()
         ]
+
+    @staticmethod
+    def resolve_action_plan(repository: SaveRepository, message_id: str, actions: list[TurnAction],
+                            plan_result: Any) -> tuple[list[AppliedEventResult], dict[int, str]]:
+        """Resolve queued checks in order using Python's actual earlier outcomes."""
+        if not actions:
+            events = StoryTurnService.skill_plan_events(plan_result)
+            return (StoryTurnService.apply_suggested_events(repository, message_id=message_id,
+                                                           suggested_events=events) if events else []), {}
+
+        conditions = {}
+        for condition in getattr(plan_result, "conditions", []):
+            if not isinstance(condition, dict):
+                continue
+            index, dependency, outcome = (condition.get(key) for key in ("action_index", "depends_on", "outcome"))
+            if type(index) is int and 1 <= index <= len(actions) and type(dependency) is int and outcome in {"success", "failure"}:
+                conditions[index] = (dependency, outcome)
+        checks_by_action = {}
+        for event in StoryTurnService.skill_plan_events(plan_result):
+            check = event["payload"]
+            index = check.get("action_index", 1 if len(actions) == 1 else None)
+            if type(index) is int and 1 <= index <= len(actions) and actions[index - 1].action_type != "ask_gm":
+                group = checks_by_action.setdefault(index, [])
+                group.append({**event, "payload": {**check, "action_index": index,
+                             "request_id": f"{message_id}:action:{index}:check:{len(group) + 1}"}})
+        inactive: dict[int, str] = {}
+        outcomes = {}
+        results = []
+        with repository.transaction():
+            saved_plan = repository.event_receipt(message_id, "action_plan")
+            if saved_plan is not None:
+                return ([AppliedEventResult(**result) for result in saved_plan["results"]],
+                        {int(index): reason for index, reason in saved_plan["inactive"].items()})
+            for index, action in enumerate(actions, 1):
+                if dependency := explicit_action_condition(action, index) or conditions.get(index):
+                    previous, required = dependency
+                    if not 1 <= previous < index:
+                        inactive[index] = "The condition must refer to an earlier action. This branch is deferred."
+                        continue
+                    outcome = outcomes.get(previous)
+                    if outcome != required:
+                        inactive[index] = (f"Action {previous} did not have the required {required} outcome."
+                                           if outcome or previous in inactive else
+                                           f"Action {previous} has no resolved check. This branch is deferred.")
+                        continue
+                if index not in checks_by_action:
+                    continue
+                resolved = StoryTurnService.apply_suggested_events(
+                    repository, message_id=message_id, suggested_events=checks_by_action[index],
+                )
+                results.extend(resolved)
+                if all(check.status == "applied" for check in resolved):
+                    outcomes[index] = "failure" if any(check.payload.get("outcome") == "failure"
+                                                       for check in resolved) else "success"
+            repository.record_event_receipt(message_id, "action_plan",
+                                            {"inactive": inactive, "results": [asdict(result) for result in results]})
+        return results, inactive
 
     @staticmethod
     def record_dropped_events(repository: SaveRepository, result: Any, *, message_id: str) -> None:
@@ -286,15 +353,20 @@ class StoryTurnService:
                                              event_results=[AppliedEventResult(**event) for event in receipt["event_results"]])
             repository.require_active_adventure()
             is_out_of_game = conversation_mode == "out_of_game"
-            if not is_out_of_game and missing_deadline_commitments(
-                result.narrative_text, result.suggested_events, repository.list_active_tasks()
+            actions = (repository.event_receipt(clean_message_id, "player_actions") or {}).get("entries", [])
+            inactive = (repository.event_receipt(clean_message_id, "action_plan") or {}).get("inactive", {})
+            inactive = {int(index): reason for index, reason in inactive.items()}
+            suggested_events = turn_events(result.suggested_events, actions, inactive)
+            has_present_action = has_present_actions(actions, inactive)
+            if not is_out_of_game and has_present_action and missing_deadline_commitments(
+                result.narrative_text, suggested_events, repository.list_active_tasks()
             ):
                 raise ValueError("A narrated deadline has no dated task event; this turn was not saved.")
-            if not is_out_of_game:
+            if not is_out_of_game and has_present_action:
                 inventory = repository.list_inventory_items()
                 checks = [event.payload for event in prior_event_results or []
                           if event.event_type == "D20TestRequestedEvent" and event.status == "applied"]
-                issues = container_event_issues(list(result.suggested_events), {
+                issues = container_event_issues(list(suggested_events), {
                     "state": {"inventory": {"items": inventory, "container_authority": inventory, "container_items": inventory, "carrying": repository.inventory_load()},
                               "world": {"location": repository.get_state_value("location", "")},
                               "travel": {"locations": repository.get_travel_locations()},
@@ -358,15 +430,28 @@ class StoryTurnService:
 
             event_results: list[AppliedEventResult] = []
             correction_events = [
-                event for event in result.suggested_events
+                event for event in suggested_events
                 if isinstance(event, dict)
                 and str(event.get("type", "")).strip() == "InventoryItemAddedEvent"
             ]
-            events_to_apply = result.suggested_events if not is_out_of_game else correction_events
-            if not is_out_of_game:
-                command = repository.list_history(limit=1, kinds=("player",))
-                command = command[0]["content"] if command and command[0].get("turn_id") == clean_message_id else ""
-                events_to_apply = normalize_book_training(events_to_apply, repository.list_accessible_inventory_items(), command)
+            if actions and not any(_requests_inventory_correction(action["text"]) for action in actions):
+                correction_events = []
+            events_to_apply = suggested_events if not is_out_of_game else correction_events
+            if not is_out_of_game and has_present_action:
+                inventory = repository.list_accessible_inventory_items()
+                if actions:
+                    events_to_apply = []
+                    for action in actions:
+                        index = action["action_index"]
+                        events = [event for event in suggested_events if event["action_index"] == index]
+                        if action["action_type"] in PRESENT_ACTIONS:
+                            events = normalize_book_training(events, inventory, action["text"])
+                        events_to_apply.extend({**event, "action_index": index} for event in events)
+                else:
+                    command = repository.list_history(limit=1, kinds=("player",))
+                    command = command[0]["content"] if command and command[0].get("turn_id") == clean_message_id else ""
+                    events_to_apply = normalize_book_training(events_to_apply, inventory, command)
+                events_to_apply = turn_events(events_to_apply, actions, inactive)
             if events_to_apply:
                 event_results = StoryTurnService.apply_suggested_events(
                     repository,
@@ -382,13 +467,16 @@ class StoryTurnService:
                               if event.event_type == "TimedEventUpsertedEvent" and event.status != "applied"]
             if invalid_timers:
                 raise ValueError("Time-sensitive event changes could not be stored: " + "; ".join(invalid_timers))
+            if any(event.event_type == "StatusUpdatedEvent" and event.status == "skipped"
+                   and "rumored location" in event.message for event in event_results):
+                raise ValueError("Confirm the rumored location before recording arrival.")
             deadline_tasks = repository.list_active_tasks() if not is_out_of_game else []
             for event in event_results:
                 if event.event_type == "ActiveTaskCompletedEvent" and event.status == "applied":
                     completed = repository.get_active_task(event.payload.get("name", ""))
                     if completed:
                         deadline_tasks.append(completed)
-            if not is_out_of_game and missing_deadline_commitments(result.narrative_text, [], deadline_tasks):
+            if not is_out_of_game and has_present_action and missing_deadline_commitments(result.narrative_text, [], deadline_tasks):
                 raise ValueError("A narrated deadline could not be persisted; this turn was rolled back.")
             failed_container_events = [event for event in event_results
                 if (event.event_type in {"ContainerOpenedEvent", "ContainerContentsTakenEvent"}
@@ -398,7 +486,7 @@ class StoryTurnService:
             if failed_container_events:
                 raise ContainerFlowError("Container operation failed; narration and rewards were rolled back: "
                     + "; ".join(event.message for event in failed_container_events))
-            if not is_out_of_game:
+            if not is_out_of_game and has_present_action:
                 merchant_npc_id = next(
                     (
                         str(cue.get("speaker_id", "") or "").strip()
@@ -422,3 +510,10 @@ class StoryTurnService:
                 speaker_cues=speaker_cues,
                 event_results=event_results,
             )
+
+
+def _requests_inventory_correction(text: str) -> bool:
+    return any(phrase in text.casefold() for phrase in (
+        "missing", "not in my inventory", "don't see", "didn't receive", "did not receive",
+        "double-check", "double check", "correct my inventory",
+    ))
