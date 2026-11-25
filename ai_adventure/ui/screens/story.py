@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+
 from ai_adventure.container_flow import ContainerFlowError
 from ai_adventure.suggested_actions import compose_action_prompt
 from ai_adventure.survival import SURVIVAL_METERS
@@ -276,7 +278,7 @@ class StoryScreen(RepositoryBackedWidget):
                 state.calendar.time_label or UNRESOLVED_STATUS_TEXT
             )
             self.weather_value.setText(
-                state.world.weather or UNRESOLVED_STATUS_TEXT
+                state.world.weather.title() or UNRESOLVED_STATUS_TEXT
             )
             self._refresh_current_location_image(state.world.location)
 
@@ -454,6 +456,10 @@ class StoryScreen(RepositoryBackedWidget):
         occurrences: dict[tuple[Any, ...], int] = {}
         layout_changed = False
         repository = self.repository()
+        player_id = player_name = ""
+        if repository is not None and any(len(entry) > 9 and entry[9] for entry in entries):
+            player_id = str(repository.get_setting("player.id", "") or "").strip().casefold()
+            player_name = str(repository.get_setting("player_name", "") or "").strip().casefold()
         narration_enabled = self.narration_player is not None and (
             repository is None
             or bool(repository.get_setting("audio.narrator_enabled", True))
@@ -490,6 +496,9 @@ class StoryScreen(RepositoryBackedWidget):
             narration_text = str(entry[7]) if len(entry) > 7 else None
             sound_effect_cues = entry[8] if len(entry) > 8 else None
             speaker_cues = entry[9] if len(entry) > 9 else None
+            speaker_role = self._conversation_speaker_role(
+                role, speaker_cues, player_id=player_id, player_name=player_name
+            )
             is_opening_message = (
                 role == "ai"
                 and mode == "live_game"
@@ -526,7 +535,7 @@ class StoryScreen(RepositoryBackedWidget):
             segment_index = occurrences.get(identity, 0)
             occurrences[identity] = segment_index + 1
             key = (*identity, segment_index)
-            assets = [self._conversation_speaker_asset(role, speaker_cues)]
+            assets = [self._conversation_speaker_asset(speaker_role, speaker_cues)]
             if show_visual_assets and repository is not None:
                 assets.extend(
                     asset for asset in repository.list_visual_assets_for_message(message_id)
@@ -541,7 +550,7 @@ class StoryScreen(RepositoryBackedWidget):
                     stamp = None
                 visual_signature.append((asset, str(path), stamp))
             signature = json.dumps(
-                (entry, is_opening_message, show_visual_assets, narration_enabled, visual_signature),
+                (entry, speaker_role, is_opening_message, show_visual_assets, narration_enabled, visual_signature),
                 sort_keys=True, default=str,
             )
             previous = previous_rows.get(key)
@@ -550,7 +559,7 @@ class StoryScreen(RepositoryBackedWidget):
                 layout_changed |= self._sync_bubble_regeneration(bubble, can_regenerate, message_id)
             else:
                 bubble = self._conversation_bubble(
-                    role,
+                    speaker_role,
                     mode,
                     content,
                     history_entry_id=_safe_int(entry_id, -1),
@@ -678,11 +687,12 @@ class StoryScreen(RepositoryBackedWidget):
         mode_label = "Out-of-Game" if is_out_of_game else "Live Game"
         turn_label = (
             f"  |  Turn #{turn_number}"
-            if not is_player and not is_out_of_game and turn_number is not None
+            if not is_out_of_game and turn_number is not None
             else ""
         )
+        time_label = re.sub(r", Year ([0-9]+)(?=, [^,]+$)", r", \1", game_time)
         header = QLabel(
-            f"{speaker}  |  {mode_label}{turn_label}  |  {game_time or 'Time unknown'}"
+            f"{speaker}  |  {mode_label}{turn_label}  |  {time_label or 'Time unknown'}"
         )
         header.setTextFormat(Qt.TextFormat.PlainText)
         header.setWordWrap(True)
@@ -978,6 +988,28 @@ class StoryScreen(RepositoryBackedWidget):
         populate()
         if message_list.count() > 0:
             dialog.exec()
+
+    @staticmethod
+    def _conversation_speaker_role(
+        role: str, speaker_cues: Any, *, player_id: str, player_name: str
+    ) -> str:
+        """Identify the displayed speaker while keeping the saved turn's role."""
+
+        if role != "ai" or not isinstance(speaker_cues, list) or not speaker_cues:
+            return role
+        cue = speaker_cues[0]
+        if not isinstance(cue, dict):
+            return role
+        speaker_id = str(cue.get("speaker_id", "") or "").strip().casefold()
+        if cue.get("speaker_role") == "player" or speaker_id in {"player", "player_character"}:
+            return "player"
+
+        speaker_name = str(cue.get("speaker_name", "") or "").strip().casefold()
+        if (player_id and speaker_id == player_id) or (
+            player_name and player_name in {speaker_id, speaker_name}
+        ):
+            return "player"
+        return role
 
     def _conversation_speaker_asset(
         self,

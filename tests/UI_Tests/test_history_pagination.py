@@ -151,9 +151,9 @@ class HistoryPaginationTests(QtTestCase):
         screen.set_repository(reopened)
         screen._load_older_messages()
         headers = [label.text() for label in screen.findChildren(QLabel)]
-        self.assertIn(f"You  |  Live Game  |  {before_midnight}", headers)
-        self.assertIn(f"AI Game Master  |  Live Game  |  Turn #61  |  {after_midnight}", headers)
-        self.assertIn(f"AI Game Master  |  Out-of-Game  |  {after_midnight}", headers)
+        self.assertIn("You  |  Live Game  |  Monday, November 1, 1940, 23:55", headers)
+        self.assertIn("AI Game Master  |  Live Game  |  Turn #61  |  Tuesday, November 2, 1940, 00:05", headers)
+        self.assertIn("AI Game Master  |  Out-of-Game  |  Tuesday, November 2, 1940, 00:05", headers)
 
     def test_saved_day_number_is_displayed_as_a_calendar_date(self):
         repo = self.repository
@@ -175,7 +175,7 @@ class HistoryPaginationTests(QtTestCase):
         screen._load_older_messages()
         screen._load_older_messages()
         headers = [label.text() for label in screen.findChildren(QLabel)]
-        self.assertIn("You  |  Live Game  |  Monday, November 1, Year 1940, 5:00 P.M.", headers)
+        self.assertIn("You  |  Live Game  |  Monday, November 1, 1940, 5:00 P.M.", headers)
         with repo.transaction() as connection:
             row = connection.execute(
                 "SELECT game_time FROM history_entries WHERE message_id='message-0'"

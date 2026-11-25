@@ -31,21 +31,21 @@ class TravelFlowTests(QtTestCase):
             {'name': 'Town', 'location_id': 'town', 'x_miles': 3, 'y_miles': 0},
         ])
 
-    def assess(self, safe=True):
+    def assess(self, safe=True, weather='Rain'):
         packet = build_assessment_context(self.repository)
-        result = {'routes': [{'location_id': 'town', 'safe': safe, 'weather': 'Rain'}]}
+        result = {'routes': [{'location_id': 'town', 'safe': safe, 'weather': weather}]}
         commit_assessment(self.repository, packet, result)
         return result
 
     def test_travel_button_uses_local_status_without_story_or_check_request(self):
-        self.assess()
+        self.assess(weather='light rain')
         story = StoryScreen()
         story.set_repository(self.repository)
         story.on_repository_changed = Mock()
         screen = TravelScreen(on_travel_requested=story.submit_travel_request)
         screen.set_repository(self.repository)
         screen.location_selector.setCurrentIndex(screen.location_selector.findText('Town'))
-        self.assertIn('Weather: Rain', screen.details_output.toPlainText())
+        self.assertIn('Weather: Light Rain', screen.details_output.toPlainText())
         self.assertNotIn('safe', screen.details_output.toPlainText().casefold())
         before = self.repository.get_current_calendar_minute()
         with patch.object(story, '_submit_player_command') as submit:
@@ -53,7 +53,8 @@ class TravelFlowTests(QtTestCase):
         submit.assert_not_called()
         self.assertEqual(self.repository.get_state_value('location'), 'Town')
         self.assertEqual(self.repository.get_current_calendar_minute(), before + 60)
-        self.assertEqual(story.weather_value.text(), 'Rain')
+        self.assertEqual(story.weather_value.text(), 'Light Rain')
+        self.assertEqual(self.repository.get_state_value('weather'), 'light rain')
         story.on_repository_changed.assert_called_once_with(story)
 
     def test_unsafe_and_unassessed_routes_use_normal_story_flow(self):

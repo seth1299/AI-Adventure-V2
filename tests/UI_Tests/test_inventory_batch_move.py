@@ -2,6 +2,8 @@ from pathlib import Path
 import tempfile
 from unittest.mock import Mock, patch
 
+from PySide6.QtCore import Qt
+from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QDialog
 
 from ai_adventure.persistence.save_repository import SaveRepository
@@ -58,6 +60,48 @@ class InventoryBatchMoveUiTests(QtTestCase):
             self.assertEqual(self.item(name)['metadata']['container_id'], pack_id)
         self.assertFalse(self.screen.move_selected_button.isEnabled())
         self.screen.on_repository_changed.assert_called_once_with(self.screen)
+
+    def test_move_dialog_splits_a_stack_into_accessible_vehicle_cargo(self):
+        self.repository.add_inventory_item('Wagon', 'Vehicle', 1, 'A cargo wagon.', metadata={
+            'storage_location': 'Workshop', 'weight_lb': 300, 'carrying_capacity_lb': 5,
+        })
+        self.repository.add_inventory_item('Ingots', 'Material', 6, 'Heavy metal.', metadata={
+            'storage_location': 'Workshop', 'weight_lb': 2,
+        })
+        self.screen.refresh()
+        cargo_panel = next(panel for panel in self.screen.location_panels if panel.location == 'Wagon')
+        self.assertEqual(cargo_panel.item_buttons, [])
+        wagon_id = self.item('Wagon')['id']
+        ingot_id = self.item('Ingots')['id']
+
+        def choose(dialog):
+            dialog.destination_combo.setCurrentIndex(dialog.destination_combo.findData(wagon_id))
+            self.assertEqual(dialog.quantity_input.minimum(), 1)
+            self.assertEqual(dialog.quantity_input.maximum(), 2)
+            dialog.quantity_slider.setValue(1)
+            self.assertEqual(dialog.quantity_input.value(), 1)
+            editor = dialog.quantity_input.lineEdit()
+            editor.selectAll()
+            QTest.keyClicks(editor, '2')
+            QTest.keyClick(editor, Qt.Key.Key_Tab)
+            self.assertEqual(dialog.quantity_slider.value(), 2)
+            return QDialog.DialogCode.Accepted
+
+        row = next(row for row in self.screen._inventory_items.values() if row['id'] == ingot_id)
+        self.screen._open_item_details(row)
+        with patch.object(InventoryMoveDialog, 'exec', choose):
+            self.screen._item_detail_dialogs[ingot_id].move_button.click()
+        self.assertEqual(self.item('Ingots')['quantity'], 4)
+        cargo_panel = next(panel for panel in self.screen.location_panels if panel.location == 'Wagon')
+        self.assertEqual(len(cargo_panel.item_buttons), 1)
+        cargo = next(row for row in self.repository.list_inventory_items()
+                     if row['metadata'].get('container_id') == wagon_id)
+        self.assertEqual(cargo['quantity'], 2)
+        self.assertEqual(self.repository.inventory_load()['weight_lb'], 0)
+        self.repository.set_state_value('location', 'Elsewhere')
+        self.screen.refresh()
+        self.assertFalse(self.checkbox(cargo['name']).isEnabled())
+        self.assertFalse(self.repository.inventory_move_quantity_options(cargo['id']))
 
     def test_sort_and_refresh_preserve_selected_ids_and_clear_updates_checks(self):
         self.checkbox('Cloth').click()

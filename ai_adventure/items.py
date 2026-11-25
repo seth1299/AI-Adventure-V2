@@ -37,6 +37,8 @@ def normalize_item_metadata(
     clean_name = str(name or "").strip()
     folded = f"{clean_category} {clean_name} {description}".casefold()
     item_type = str(metadata.get("item_type", "") or "").strip().title()
+    if clean_category.casefold() == "vehicle" and item_type in {"", "Item", "Container"}:
+        item_type = "Vehicle"
 
     ordinary_container = (
         item_type in {"", "Item", "Tool", "Container"}
@@ -106,9 +108,15 @@ def normalize_item_metadata(
     if item_type in {"Container", "Vehicle"}:
         if item_type == "Container" and (metadata.get("equipment_slot") == "Back" or re.search(r"\b(backpack|satchel|knapsack)\b", clean_name, re.I)):
             clean_metadata["equipment_slot"] = "Back"
-        clean_metadata["container"] = _normalize_container_metadata(
+        container = _normalize_container_metadata(
             metadata.get("container", metadata)
         )
+        if (item_type == "Vehicle" and not container["is_locked"] and not container["is_trapped"]
+                and not container["contents_known"] and not container["contents"]["items"]
+                and not container["contents"]["currency_base_units"]):
+            # Plain cargo space is ready to load, including vehicles in older saves.
+            container.update(is_open=True, contents_known=True, contents_initialized=True)
+        clean_metadata["container"] = container
         return clean_metadata
 
     return clean_metadata

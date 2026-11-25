@@ -58,7 +58,7 @@ from ai_adventure.currency import (
     normalize_currency_denominations,
 )
 from ai_adventure.item_categories import normalize_inventory_category
-from ai_adventure.inventory_storage import inventory_access, move_destinations, move_error, inventory_load, capacity_error, pounds, batch_move_destinations, plan_batch_move
+from ai_adventure.inventory_storage import inventory_access, move_destinations, move_error, inventory_load, capacity_error, pounds, batch_move_destinations, plan_batch_move, move_quantity_options
 from ai_adventure.persistence.inventory_containers import synchronize_container_records
 from ai_adventure.new_game_setup import normalize_new_game_setup
 from ai_adventure.survival import CRAFTING_WAIT_NEEDS_PER_HOUR, CRAFTING_WORK_NEEDS_PER_HOUR, SURVIVAL_METERS
@@ -940,8 +940,12 @@ class SaveRepository(PlayerStatsRepository, SurvivalRepository, TimedEventsRepos
     def inventory_move_destinations(self, item_id: str) -> list[tuple[str, str]]:
         return move_destinations(item_id, self.list_inventory_items(), self.get_state_value("location", ""), self.player_carrying_capacity_lb(), self.get_travel_locations())
 
-    def move_inventory_item(self, item_id: str, destination: str) -> None:
-        """Atomically move one existing stack, preserving its catalog identity."""
+    def inventory_move_quantity_options(self, item_id: str) -> list[tuple[str, str, int]]:
+        return move_quantity_options(item_id, self.list_inventory_items(), self.get_state_value("location", ""),
+                                     self.player_carrying_capacity_lb(), self.get_travel_locations())
+
+    def move_inventory_item(self, item_id: str, destination: str, *, quantity: int | None = None) -> None:
+        """Atomically move a whole stack or split off and move a specified quantity."""
         with self.transaction():
             items = self.list_inventory_items()
             by_id = {str(item["id"]): item for item in items}
@@ -949,10 +953,10 @@ class SaveRepository(PlayerStatsRepository, SurvivalRepository, TimedEventsRepos
                 named = [item for item in items if item["name"].casefold() == destination.casefold() and "container" in item["metadata"]]
                 if len(named) == 1:
                     destination = str(named[0]["id"])
-            error = move_error(item_id, destination, items, self.get_state_value("location", ""), self.player_carrying_capacity_lb(), self.get_travel_locations())
+            error = move_error(item_id, destination, items, self.get_state_value("location", ""), self.player_carrying_capacity_lb(), self.get_travel_locations(), quantity=quantity)
             if error:
                 raise ValueError(error)
-            self._relocate_inventory_item(item_id, destination)
+            self._relocate_inventory_item(item_id, destination, quantity=quantity)
 
     def inventory_batch_move_destinations(self, item_ids: list[str]) -> list[tuple[str, str]]:
         return batch_move_destinations(item_ids, self.list_inventory_items(), self.get_state_value("location", ""),
@@ -968,14 +972,16 @@ class SaveRepository(PlayerStatsRepository, SurvivalRepository, TimedEventsRepos
             for item_id in roots:
                 self._relocate_inventory_item(item_id, destination)
 
-    def _relocate_inventory_item(self, item_id: str, destination: str) -> None:
+    def _relocate_inventory_item(self, item_id: str, destination: str, *, quantity: int | None = None) -> None:
         """Persist one move after validating either a single or complete batch plan."""
         with self.transaction() as connection:
             by_id = {str(item["id"]): item for item in self.list_inventory_items()}
             item = by_id[item_id]
+            quantity = item["quantity"] if quantity is None else quantity
+            partial = quantity < item["quantity"]
             item_metadata = dict(item["metadata"])
             old_parent = str(item_metadata.pop("container_id", "") or "")
-            if old_parent:
+            if old_parent and not partial:
                 parent = by_id[old_parent]
                 parent_metadata = parent["metadata"]
                 parent_metadata["container"]["contents"]["items"].remove(item_id)
@@ -988,11 +994,38 @@ class SaveRepository(PlayerStatsRepository, SurvivalRepository, TimedEventsRepos
             else:
                 storage = destination
             item_metadata["storage_location"] = storage
-            connection.execute("UPDATE inventory_items SET storage_location = ?, equipped = 0, metadata_json = ? WHERE id = ?", (storage, _encode_json_dict(item_metadata), item_id))
+            if partial:
+                self._insert_inventory_split(connection, item, quantity, storage, item_metadata)
+            else:
+                connection.execute("UPDATE inventory_items SET storage_location = ?, equipped = 0, metadata_json = ? WHERE id = ?", (storage, _encode_json_dict(item_metadata), item_id))
             synchronize_container_records(connection, _upsert_item_catalog_entry)
-            equipment = self.get_setting("player.equipment", {})
-            self.set_player_equipment({slot: name for slot, name in equipment.items() if str(name).casefold() != item["name"].casefold()})
-            self.append_history("inventory", f"Moved {item['quantity']} x {item['name']} to {storage}.")
+            if not partial:
+                equipment = self.get_setting("player.equipment", {})
+                self.set_player_equipment({slot: name for slot, name in equipment.items() if str(name).casefold() != item["name"].casefold()})
+            self.append_history("inventory", f"Moved {quantity} x {item['name']} to {storage}.")
+
+    def _insert_inventory_split(self, connection: sqlite3.Connection, item: dict[str, Any],
+                                quantity: int, storage: str, item_metadata: dict[str, Any]) -> None:
+        """Give a separately stored stack its own catalog-backed inventory ID."""
+        original_name = item_metadata.get("manifest_name") or item["name"]
+        base_name = f"{original_name} (split stack)"
+        name, suffix = base_name, 2
+        while connection.execute("SELECT 1 FROM item_catalog WHERE name = ?", (name,)).fetchone():
+            name = f"{base_name} {suffix}"
+            suffix += 1
+        item_metadata.update(item_uuid=str(uuid.uuid4()), manifest_name=original_name)
+        catalog_id = _upsert_item_catalog_entry(
+            connection, name=name, category=item["category"], description=item["description"],
+            value_base_units=item["value_base_units"], metadata=item_metadata,
+        )
+        connection.execute("UPDATE inventory_items SET quantity = quantity - ? WHERE id = ?", (quantity, item["id"]))
+        connection.execute(
+            """INSERT INTO inventory_items
+               (id, name, category, quantity, storage_location, description, value_base_units, metadata_json)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (catalog_id, name, item["category"], quantity, storage, item["description"],
+             item["value_base_units"], _encode_json_dict(item_metadata)),
+        )
 
     def preview_starting_inventory(self, items: list[dict[str, Any]], *, base_capacity_lb: float) -> dict[str, Any]:
         """Evaluate the exact persisted container graph, rolling back every preview write."""

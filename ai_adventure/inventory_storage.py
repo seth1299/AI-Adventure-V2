@@ -193,17 +193,31 @@ def inventory_access(items: Iterable[dict[str, Any]], current_location: str, loc
     return results
 
 
-def move_error(item_id: str, destination: str, items: list[dict[str, Any]], current_location: str, base_capacity_lb: float = DEFAULT_CARRYING_CAPACITY_LB, locations: Iterable[dict[str, Any]] = (), *, check_capacity: bool = True) -> str:
-    """Validate a whole-stack move, including source access and nesting."""
+def move_error(item_id: str, destination: str, items: list[dict[str, Any]], current_location: str, base_capacity_lb: float = DEFAULT_CARRYING_CAPACITY_LB, locations: Iterable[dict[str, Any]] = (), *, check_capacity: bool = True, quantity: int | None = None) -> str:
+    """Validate a stack move, including source access, nesting, and final load."""
     rows = {str(item["id"]): item for item in items}
     item = rows.get(item_id)
     access = inventory_access(items, current_location, locations)
     if item is None:
         return "This item is no longer in inventory."
+    stack_quantity = int(item["quantity"])
+    quantity = stack_quantity if quantity is None else quantity
+    if type(quantity) is not int or not 1 <= quantity <= stack_quantity:
+        return "Enter a whole quantity between 1 and the number of items in the stack."
+    partial = quantity < stack_quantity
+    if partial and is_container(item):
+        return "Move containers and vehicles as whole stacks."
     if metadata(item).get("moveable", True) is not True:
         return "Item cannot be moved/stored."
     if not access[item_id]["available"] or not access[item_id]["known"]:
         return access[item_id]["access_reason"] or "Item is not currently accessible."
+    if partial:
+        source = str(metadata(item).get("container_id") or storage_location(item))
+        carried = {"actively_carried", "actively carried", "on_person", "on person"}
+        if source.casefold() == destination.casefold() or (
+            source.casefold() in carried and destination.casefold() in carried
+        ):
+            return "Choose a different destination for the split stack."
     parent = rows.get(destination)
     if parent is not None:
         if is_vehicle(item):
@@ -241,6 +255,11 @@ def move_error(item_id: str, destination: str, items: list[dict[str, Any]], curr
         return ""
     after = deepcopy(items)
     moved = next(row for row in after if str(row["id"]) == item_id)
+    if partial:
+        moved["quantity"] = stack_quantity - quantity
+        moved = deepcopy(moved)
+        moved.update(id=f"split:{item_id}", quantity=quantity)
+        after.append(moved)
     moved.setdefault("metadata", {}).pop("container_id", None)
     if parent is not None:
         moved["metadata"]["container_id"] = destination
@@ -314,17 +333,48 @@ def batch_move_destinations(item_ids: list[str], items: list[dict[str, Any]], cu
     return destinations
 
 
-def move_destinations(item_id: str, items: list[dict[str, Any]], current_location: str, base_capacity_lb: float = DEFAULT_CARRYING_CAPACITY_LB, locations: Iterable[dict[str, Any]] = ()) -> list[tuple[str, str]]:
+def move_destinations(item_id: str, items: list[dict[str, Any]], current_location: str, base_capacity_lb: float = DEFAULT_CARRYING_CAPACITY_LB, locations: Iterable[dict[str, Any]] = (), *, quantity: int | None = None) -> list[tuple[str, str]]:
     """Return labels and stable IDs for the player's accessible destinations."""
     item = next((item for item in items if str(item["id"]) == item_id), {})
     parent_id = str(metadata(item).get("container_id", "") or "")
+    vehicle = is_vehicle(item)
     destinations = []
     if current_location.strip() and (parent_id or storage_location(item).casefold() != current_location.casefold()):
-        destinations.append((f"Leave at {current_location}", current_location))
+        action = "Park" if vehicle else "Leave"
+        destinations.append((f"{action} at {current_location}", current_location))
     if parent_id or storage_location(item).casefold() not in {"actively_carried", "on_person"}:
-        destinations.append(("Actively Carried", "actively_carried"))
+        destinations.append(("Take Along" if vehicle else "Actively Carried", "actively_carried"))
     for container in items:
         container_id = str(container["id"])
         if is_container(container) and container_id != parent_id:
             destinations.append((str(container["name"]), container_id))
-    return [(label, value) for label, value in destinations if not move_error(item_id, value, items, current_location, base_capacity_lb, locations)]
+    return [(label, value) for label, value in destinations if not move_error(item_id, value, items, current_location, base_capacity_lb, locations, quantity=quantity)]
+
+
+def move_quantity_options(item_id: str, items: list[dict[str, Any]], current_location: str,
+                          base_capacity_lb: float, locations: list[dict[str, Any]]) -> list[tuple[str, str, int]]:
+    """Return each accessible destination with the largest quantity that fits."""
+    item = next((row for row in items if str(row["id"]) == item_id), None)
+    if item is None:
+        return []
+    total = int(item["quantity"])
+    args = (item_id, items, current_location, base_capacity_lb, locations)
+    full = move_destinations(*args)
+    if total <= 1 or is_container(item):
+        return [(label, destination, total) for label, destination in full]
+    full_destinations = {destination for _, destination in full}
+    options = []
+    for label, destination in move_destinations(*args, quantity=1):
+        maximum = total
+        if destination not in full_destinations:
+            low, high = 1, total - 1
+            while low < high:
+                middle = (low + high + 1) // 2
+                if move_error(item_id, destination, items, current_location, base_capacity_lb,
+                              locations, quantity=middle):
+                    high = middle - 1
+                else:
+                    low = middle
+            maximum = low
+        options.append((label, destination, maximum))
+    return options

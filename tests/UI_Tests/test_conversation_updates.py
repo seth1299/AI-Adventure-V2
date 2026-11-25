@@ -1,12 +1,15 @@
 import os
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest.mock import Mock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QEvent, QObject
-from PySide6.QtGui import QTextCursor
-from PySide6.QtWidgets import QApplication, QPushButton, QTextEdit
+from PySide6.QtGui import QPixmap, QTextCursor
+from PySide6.QtWidgets import QApplication, QLabel, QPushButton, QTextEdit
 
+from ai_adventure.persistence.save_repository import SaveRepository
 from ai_adventure.ui.screens.story import StoryScreen
 from tests.qt_test_case import QtTestCase
 
@@ -76,6 +79,48 @@ class ConversationUpdateTests(QtTestCase):
         self.assertIsNot(before[0], before[1])
         self.screen._render_conversation(entries + [("player", "live_game", "Reply", 2)])
         self.assertEqual(self.rows()[:2], before)
+
+    def test_player_dialogue_inside_saved_turn_uses_you_and_player_portrait(self):
+        with TemporaryDirectory() as directory:
+            repository = SaveRepository.create_new_save(Path(directory), "Dialogue")
+            repository.set_setting("player_name", "Ghum Schue")
+            player_id = repository.get_player_id()
+            repository.append_history("player", '"Come in." I wait. "Who is after you?"')
+            repository.append_history(
+                "story", '"Come in." He takes a seat. "Who is after you?" "I do not know."',
+                message_id="turn-1",
+                speaker_cues=[
+                    {"anchor_text": '"Come in."', "speaker_name": "Ghum Schue",
+                     "speaker_id": "player_character", "speaker_role": "player", "voice_id": "am_adam"},
+                    {"anchor_text": '"Who is after you?"', "speaker_name": "Ghum Schue",
+                     "speaker_id": "ghum_schue", "voice_id": "am_adam"},
+                    {"anchor_text": '"I do not know."', "speaker_name": "Mandel Cole",
+                     "speaker_id": "mandel", "voice_id": "am_michael"},
+                ],
+            )
+            portrait = Path(directory) / "portrait.png"
+            pixmap = QPixmap(10, 10)
+            pixmap.fill()
+            self.assertTrue(pixmap.save(str(portrait)))
+            assets = {("player", player_id): {"filename": "player.png"},
+                      ("npc", "mandel"): {"filename": "mandel.png"}}
+            with (
+                patch.object(repository, "get_visual_asset", side_effect=lambda kind, key: assets.get((kind, key))),
+                patch.object(self.screen, "visual_asset_path", side_effect=lambda asset: portrait if asset else None),
+                patch.object(repository, "has_message_snapshot", return_value=True),
+            ):
+                self.screen.set_repository(repository)
+            rows = self.rows()
+            self.assertEqual(len(rows), 5)
+            for row in (rows[1], rows[3]):
+                self.assertTrue(any(label.text().startswith("You  |  Live Game  |  Turn #1")
+                                    for label in row.findChildren(QLabel)))
+                self.assertEqual(row.findChild(QLabel, "conversationSpeakerPortrait").accessibleName(),
+                                 "Profile picture of You")
+                self.assertIsNotNone(row.findChild(QPushButton, "conversationRegenerate"))
+            self.assertEqual(rows[2].findChild(QTextEdit).toPlainText(), "He takes a seat.")
+            self.assertEqual(rows[4].findChild(QLabel, "conversationSpeakerPortrait").accessibleName(),
+                             "Profile picture of Mandel Cole")
 
     def test_regeneration_action_changes_without_replacing_message(self):
         row = self.rows()[0]

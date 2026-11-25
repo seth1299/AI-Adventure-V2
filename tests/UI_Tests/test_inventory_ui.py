@@ -3012,6 +3012,27 @@ class InventoryUiTests(QtTestCase):
             )
             screen.close()
 
+    def test_inventory_can_sort_by_total_weight_as_primary_or_secondary(self) -> None:
+        items = [
+            {"name": "Bolts", "category": "Tool", "quantity": 10, "metadata": {"weight_lb": 0.5}},
+            {"name": "Hammer", "category": "Tool", "quantity": 1, "metadata": {"weight_lb": 2}},
+            {"name": "Awl", "category": "Tool", "quantity": 1},
+        ]
+        panel = InventoryLocationPanel("actively_carried", items, lambda _item: None)
+        self.addCleanup(panel.close)
+
+        def displayed_names():
+            return [button.text().splitlines()[0] for button in panel.item_buttons]
+
+        panel.sort_field_combo.setCurrentIndex(panel.sort_field_combo.findData("weight"))
+        self.assertEqual(displayed_names(), ["Hammer", "Bolts (x10)", "Awl"])
+        panel.sort_direction_combo.setCurrentIndex(panel.sort_direction_combo.findData(True))
+        self.assertEqual(displayed_names(), ["Bolts (x10)", "Hammer", "Awl"])
+        panel.sort_field_combo.setCurrentIndex(panel.sort_field_combo.findData("category"))
+        secondary = panel.secondary_sort_field_combo
+        secondary.setCurrentIndex(secondary.findData("weight"))
+        self.assertEqual(displayed_names(), ["Hammer", "Bolts (x10)", "Awl"])
+
     def test_primary_and_secondary_inventory_sort_directions_are_independent(self) -> None:
         items = [
             {

@@ -263,7 +263,7 @@ class TravelScreen(RepositoryBackedWidget):
 
         conditions = []
         if destination.weather:
-            conditions.append(f"**Weather:** {destination.weather}")
+            conditions.append(f"**Weather:** {destination.weather.title()}")
         if destination.terrain:
             conditions.append(f"**Terrain:** {destination.terrain}")
         if destination.travel_notes:

@@ -4822,6 +4822,9 @@ class InventoryItemDetailsDialog(QDialog):
             summary.addRow("Cargo capacity:", _selectable_label("Unspecified" if capacity is None else f"{capacity:g} lb"))
             if item_metadata.get("item_type") == "Vehicle":
                 summary.addRow("Carrying:", _selectable_label("Independent vehicle cargo pool"))
+                storage = item.get("storage_location", "actively_carried")
+                location = "Traveling with you" if storage == "actively_carried" else _inventory_location_label(storage)
+                summary.addRow("Location:", _selectable_label(location))
             elif capacity is not None:
                 summary.addRow("Carried bonus:", _selectable_label(f"+{capacity:g} lb while directly carried or worn"))
 

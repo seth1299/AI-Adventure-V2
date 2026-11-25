@@ -3,14 +3,15 @@ from __future__ import annotations
 from ai_adventure.ui.common import *  # noqa: F401,F403
 from ai_adventure.ui.dialogues import *  # noqa: F401,F403
 from PySide6.QtWidgets import QGraphicsOpacityEffect
-from ai_adventure.inventory_storage import inventory_access, move_error, metadata as storage_metadata, pounds
+from ai_adventure.inventory_sorting import inventory_row_weight
+from ai_adventure.inventory_storage import inventory_access, is_container, is_vehicle, move_error, metadata as storage_metadata
 
 
 class InventoryMoveDialog(QDialog):
     """Choose among destinations the player can physically reach right now."""
 
     def __init__(self, destinations: list[tuple[str, str]], *, parent: QWidget | None = None,
-                 item_count: int = 1) -> None:
+                 item_count: int = 1, quantity_limits: dict[str, int] | None = None) -> None:
         super().__init__(parent)
         self.setWindowTitle("Move Item" if item_count == 1 else f"Move {item_count} Selected Items")
         self.destination_combo = QComboBox()
@@ -19,6 +20,29 @@ class InventoryMoveDialog(QDialog):
             self.destination_combo.addItem(label, item_id)
         form = QFormLayout()
         form.addRow("Move to where?", self.destination_combo)
+        self.quantity_input: QSpinBox | None = None
+        if quantity_limits:
+            self.quantity_input = QSpinBox()
+            self.quantity_input.setObjectName("inventoryMoveQuantity")
+            self.quantity_slider = QSlider(Qt.Orientation.Horizontal)
+            self.quantity_slider.setObjectName("inventoryMoveQuantitySlider")
+            self.quantity_slider.setAccessibleName("Quantity to move")
+            self.quantity_input.setAccessibleName("Quantity to move")
+            self.quantity_slider.valueChanged.connect(self.quantity_input.setValue)
+            self.quantity_input.valueChanged.connect(self.quantity_slider.setValue)
+            quantity_row = QHBoxLayout()
+            quantity_row.addWidget(self.quantity_slider, 1)
+            quantity_row.addWidget(self.quantity_input)
+            form.addRow("Quantity:", quantity_row)
+
+            def update_quantity_range() -> None:
+                limit = min(quantity_limits[self.destination_combo.currentData()], 2_147_483_647)
+                self.quantity_slider.setRange(1, limit)
+                self.quantity_input.setRange(1, limit)
+
+            update_quantity_range()
+            self.quantity_input.setValue(self.quantity_input.maximum())
+            self.destination_combo.currentIndexChanged.connect(update_quantity_range)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Move")
         buttons.accepted.connect(self.accept)
@@ -33,6 +57,9 @@ class InventoryMoveDialog(QDialog):
         self.setLayout(layout)
         self.setMinimumWidth(320)
 
+    def move_quantity(self) -> int | None:
+        return self.quantity_input.value() if self.quantity_input is not None else None
+
 
 class InventoryLocationPanel(QGroupBox):
     """Compact list of inventory items stored at one free-text location."""
@@ -42,6 +69,7 @@ class InventoryLocationPanel(QGroupBox):
         ("Category", "category"),
         ("Price", "price"),
         ("Quantity", "quantity"),
+        ("Weight", "weight"),
     )
 
     def __init__(
@@ -244,9 +272,9 @@ class InventoryLocationPanel(QGroupBox):
                 max(0, _safe_int(item.get("value_base_units", 0), 0)),
                 self._denominations,
             )
-            unit_weight = pounds(storage_metadata(item).get("weight_lb"), default=-1)
-            weight = ("Weight unknown" if unit_weight < 0 else
-                      f"{unit_weight * quantity:g} lb" + (" total" if quantity != 1 else ""))
+            total_weight = inventory_row_weight(item)
+            weight = ("Weight unknown" if total_weight is None else
+                      f"{total_weight:g} lb" + (" total" if quantity != 1 else ""))
             details = [value, category, weight]
             button = QPushButton(f"{display_name}\n{'  ·  '.join(details)}")
             button.setObjectName("inventoryItemButton")
@@ -303,6 +331,8 @@ class InventoryLocationPanel(QGroupBox):
             return max(0, _safe_int(item.get("value_base_units", 0), 0))
         if sort_field == "quantity":
             return max(0, _safe_int(item.get("quantity", 0), 0))
+        if sort_field == "weight":
+            return inventory_row_weight(item)
         name = str(item.get("name", "")).strip().casefold()
         return name[:1] or "#"
 
@@ -532,6 +562,9 @@ class InventoryScreen(RepositoryBackedWidget):
                 or self._catalog_by_name.get(str(item.get("name", "")).casefold())
             )
             name = str(item.get("name", ""))
+            if is_vehicle(item):
+                item["category"] = "Vehicle"
+                grouped_items.setdefault(name, [])
             if name:
                 self._inventory_items[name.casefold()] = item
             location = " ".join(
@@ -707,7 +740,7 @@ class InventoryScreen(RepositoryBackedWidget):
         repository = self.repository()
         if repository is None:
             return "No save is open."
-        if not repository.inventory_move_destinations(str(item["id"])):
+        if not repository.inventory_move_quantity_options(str(item["id"])):
             error = move_error(str(item["id"]), "actively_carried", repository.list_inventory_items(), repository.get_state_value("location", ""), repository.player_carrying_capacity_lb(), repository.get_travel_locations())
             return error or "No accessible destinations with enough cargo capacity. Open a nearby container first."
         return ""
@@ -753,15 +786,22 @@ class InventoryScreen(RepositoryBackedWidget):
         repository = self.repository()
         if repository is None:
             return
-        destinations = repository.inventory_move_destinations(item_id)
-        if not destinations:
+        options = repository.inventory_move_quantity_options(item_id)
+        if not options:
             QMessageBox.information(self, "Move Item", "No accessible destinations are available.")
             return
-        dialog = InventoryMoveDialog(destinations, parent=self)
+        item = next((row for row in self._inventory_items.values() if str(row["id"]) == item_id), None)
+        quantity_limits = (
+            {destination: limit for _, destination, limit in options}
+            if item is not None and item["quantity"] > 1 and not is_container(item) else None
+        )
+        dialog = InventoryMoveDialog([(label, destination) for label, destination, _ in options],
+                                     parent=self, quantity_limits=quantity_limits)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         try:
-            repository.move_inventory_item(item_id, str(dialog.destination_combo.currentData()))
+            repository.move_inventory_item(item_id, str(dialog.destination_combo.currentData()),
+                                           quantity=dialog.move_quantity())
         except ValueError as error:
             QMessageBox.warning(self, "Cannot Move Item", str(error))
             return

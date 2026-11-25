@@ -92,6 +92,44 @@ class InventoryCapacityTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'Vehicles cannot'):
             self.move('Wagon', 'Pack')
 
+    def test_legacy_empty_vehicle_cargo_is_available_only_at_its_parked_location(self):
+        wagon = self.item('Wagon')
+        legacy_metadata = {**wagon['metadata'], 'container': {'is_open': False, 'contents_initialized': False}}
+        with self.repo.transaction() as connection:
+            connection.execute('UPDATE inventory_items SET metadata_json = ? WHERE id = ?',
+                               (json.dumps(legacy_metadata), wagon['id']))
+        self.repo = SaveRepository(self.repo.db_path)
+        self.assertIn(('Wagon', wagon['id']), self.repo.inventory_move_destinations(self.item('Ingots')['id']))
+        self.move('Ingots', 'Wagon')
+        self.repo.set_state_value('location', 'Road')
+        self.assertFalse(self.repo.inventory_access()[self.item('Ingots')['id']]['available'])
+        self.assertEqual(self.item('Wagon')['storage_location'], 'Store')
+        self.repo.set_state_value('location', 'Store')
+        self.assertTrue(self.repo.inventory_access()[self.item('Ingots')['id']]['available'])
+
+    def test_partial_moves_persist_with_capacity_and_container_membership(self):
+        ingots_id = self.item('Ingots')['id']
+        wagon_id = self.item('Wagon')['id']
+        options = {destination: limit for _, destination, limit in self.repo.inventory_move_quantity_options(ingots_id)}
+        self.assertEqual(options['actively_carried'], 5)
+        self.assertEqual(options[self.item('Pack')['id']], 3)
+        before = self.repo.list_inventory_items()
+        for invalid in (0, -1, 1.5, 7, True, 6):
+            with self.assertRaises(ValueError):
+                self.repo.move_inventory_item(ingots_id, 'actively_carried', quantity=invalid)
+        self.assertEqual(self.repo.list_inventory_items(), before)
+
+        self.repo.move_inventory_item(ingots_id, wagon_id, quantity=3)
+        moved = self.item('Ingots (split stack)')
+        self.repo.move_inventory_item(moved['id'], 'actively_carried', quantity=2)
+        self.repo = SaveRepository(self.repo.db_path)
+        self.assertEqual(self.item('Ingots')['quantity'], 3)
+        self.assertEqual(self.item('Ingots (split stack)')['quantity'], 1)
+        self.assertEqual(self.item('Ingots (split stack) 2')['quantity'], 2)
+        self.assertEqual(self.item('Wagon')['metadata']['container']['contents']['items'], [moved['id']])
+        self.assertEqual(self.repo.inventory_load()['weight_lb'], 20)
+        self.assertEqual(self.repo.inventory_load()['cargo'][wagon_id]['weight_lb'], 10)
+
     def test_nested_container_bonus_cannot_multiply_capacity(self):
         self.repo.add_inventory_item('Small Bag', 'Container', 1, 'A bag.', metadata=cargo('Small Bag', capacity=10))
         self.move('Small Bag', 'Pack')
