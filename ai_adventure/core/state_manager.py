@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from ai_adventure.character_identity import normalize_character_age
 from ai_adventure.survival import survival_percentage
 from ai_adventure.calendar_system import (
     build_calendar_snapshot,
@@ -104,6 +105,8 @@ class StateManager:
                 pronouns=str(
                     settings.values.get("player.pronouns", "They/Them")
                 ),
+                species=str(settings.values.get("player.species") or ""),
+                age=normalize_character_age(settings.values.get("player.age")),
                 appearance=str(settings.values.get("player.appearance", "")),
                 backstory=str(settings.values.get("player.backstory", "")),
                 condition=("Dead" if survival_death else "Incapacitated"

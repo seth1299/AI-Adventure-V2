@@ -3,6 +3,10 @@ from math import ceil
 from typing import cast
 from PySide6.QtWidgets import QBoxLayout, QLayout
 
+from ai_adventure.saved_characters import SavedCharacterLibrary
+from ai_adventure.ui.saved_characters import save_profile
+from ai_adventure.ui.widgets.character_identity import CharacterAgeInput, CharacterSpeciesCombo
+from ai_adventure.world_species import normalize_world_species
 from ai_adventure.ui.common import *  # noqa: F401,F403
 from ai_adventure.ui.dialogues import *  # noqa: F401,F403
 
@@ -48,11 +52,13 @@ class CharacterScreen(RepositoryBackedWidget):
         *,
         playtesting_tools: bool = False,
         tts_enabled: bool = True,
+        saved_character_library: SavedCharacterLibrary | None = None,
     ) -> None:
         super().__init__()
 
         self.playtesting_tools = bool(playtesting_tools)
         self.tts_enabled = bool(tts_enabled)
+        self.saved_character_library = saved_character_library
         self._loading_character = False
         self._saving_character = False
         self._editing_profile = False
@@ -77,6 +83,10 @@ class CharacterScreen(RepositoryBackedWidget):
             self._handle_pronouns_changed
         )
         self.custom_pronouns_input.editingFinished.connect(self._save_character)
+        self.species_combo = CharacterSpeciesCombo()
+        self.species_combo.currentIndexChanged.connect(self._save_character)
+        self.age_input = CharacterAgeInput()
+        self.age_input.editingFinished.connect(self._save_character)
         self.health_current_input = QSpinBox()
         self.health_current_input.setRange(0, 9999)
         self.health_current_input.valueChanged.connect(
@@ -142,6 +152,8 @@ class CharacterScreen(RepositoryBackedWidget):
             self.name_pronunciation_label,
             self.name_pronunciation_input,
         )
+        identity_layout.addRow("Species:", self.species_combo)
+        identity_layout.addRow("Age:", self.age_input)
         identity_layout.addRow("Appearance:", self.appearance_input)
         identity_layout.addRow("Backstory:", self.backstory_input)
         identity_layout.addRow("Notes:", self.notes_input)
@@ -194,6 +206,9 @@ class CharacterScreen(RepositoryBackedWidget):
 
         self.profile_pronouns_label = QLabel()
         self.profile_pronunciation_label = QLabel()
+        self.profile_species_label = QLabel()
+        self.profile_species_label.setTextFormat(Qt.TextFormat.PlainText)
+        self.profile_age_label = QLabel()
         self.profile_pronouns_label.setTextInteractionFlags(
             Qt.TextInteractionFlag.TextSelectableByMouse
         )
@@ -205,6 +220,8 @@ class CharacterScreen(RepositoryBackedWidget):
         profile_identity_layout.addRow(
             "Name Pronunciation:", self.profile_pronunciation_label
         )
+        profile_identity_layout.addRow("Species:", self.profile_species_label)
+        profile_identity_layout.addRow("Age:", self.profile_age_label)
         self.profile_identity_display = QWidget()
         self.profile_identity_display.setLayout(profile_identity_layout)
 
@@ -258,6 +275,10 @@ class CharacterScreen(RepositoryBackedWidget):
         self.edit_profile_button = QPushButton("Edit Profile")
         self.edit_profile_button.clicked.connect(self._toggle_profile_editor)
         portrait_layout.addWidget(self.edit_profile_button)
+        self.save_character_button = QPushButton("Save to Saved Characters")
+        self.save_character_button.clicked.connect(self._save_to_character_library)
+        self.save_character_button.setVisible(saved_character_library is not None)
+        portrait_layout.addWidget(self.save_character_button)
 
         header_layout = QVBoxLayout()
         header_layout.addWidget(self.profile_title_label)
@@ -416,6 +437,9 @@ class CharacterScreen(RepositoryBackedWidget):
         self.profile_pronouns_label.setText(self._pronouns_from_controls() or "Not specified")
         pronunciation = self.name_pronunciation_input.text().strip()
         self.profile_pronunciation_label.setText(pronunciation or "Not specified")
+        self.profile_species_label.setText(self.species_combo.currentData() or "Not specified")
+        age = self.age_input.age()
+        self.profile_age_label.setText(f"{age} years" if age is not None else "Not specified")
         _set_markdown_text(
             self.profile_appearance_display,
             self.appearance_input.toPlainText(),
@@ -506,6 +530,8 @@ class CharacterScreen(RepositoryBackedWidget):
                 self.name_input.clear()
                 self.name_pronunciation_input.clear()
                 self._set_pronouns(DEFAULT_CHARACTER_PRONOUNS)
+                self.species_combo.set_species([], "")
+                self.age_input.setValue(0)
                 self.appearance_input.clear()
                 self.backstory_input.clear()
                 self.notes_input.clear()
@@ -525,6 +551,12 @@ class CharacterScreen(RepositoryBackedWidget):
             self.name_input.setText(state.player.name)
             self.name_pronunciation_input.setText(state.player.name_pronunciation)
             self._set_pronouns(state.player.pronouns)
+            self.species_combo.set_species(
+                normalize_world_species(state.settings.values.get("world.species")),
+                state.player.species,
+                default_to_roster=False,
+            )
+            self.age_input.setValue(state.player.age or 0)
             self.appearance_input.setPlainText(state.player.appearance)
             self.backstory_input.setPlainText(state.player.backstory)
             self.notes_input.setPlainText(state.player.notes)
@@ -563,6 +595,15 @@ class CharacterScreen(RepositoryBackedWidget):
         repository = self.repository()
         if repository is not None:
             self.choose_visual_asset("player", repository.get_player_id())
+
+    def _save_to_character_library(self) -> None:
+        repository = self.repository()
+        library = self.saved_character_library
+        if repository is not None and library is not None:
+            player_id = repository.get_player_id()
+            portrait = repository.get_visual_asset("player", player_id)
+            save_profile(self, library, self._character_profile_from_controls(), portrait_path=self.visual_asset_path(portrait),
+                         character_id=library.id_for_player(player_id))
 
     def _create_portrait_image(self) -> None:
         repository = self.repository()
@@ -610,15 +651,22 @@ class CharacterScreen(RepositoryBackedWidget):
         health_current = stats["health_current"]
 
         return {
-            "name": self.name_input.text().strip(),
-            "name_pronunciation": self.name_pronunciation_input.text().strip(),
-            "pronouns": self._pronouns_from_controls(),
-            "appearance": self.appearance_input.toPlainText().strip(),
-            "backstory": self.backstory_input.toPlainText().strip(),
-            "notes": self.notes_input.toPlainText().strip(),
+            **self._character_profile_from_controls(),
             "health_current": health_current,
             "health_max": health_max,
             "equipment": equipment,
+        }
+
+    def _character_profile_from_controls(self) -> dict[str, Any]:
+        return {
+            "name": self.name_input.text().strip(),
+            "name_pronunciation": self.name_pronunciation_input.text().strip(),
+            "pronouns": self._pronouns_from_controls(),
+            "species": self.species_combo.currentData() or "",
+            "age": self.age_input.age(),
+            "appearance": self.appearance_input.toPlainText().strip(),
+            "backstory": self.backstory_input.toPlainText().strip(),
+            "notes": self.notes_input.toPlainText().strip(),
         }
 
     def _save_character(self) -> None:
@@ -656,6 +704,8 @@ class CharacterScreen(RepositoryBackedWidget):
                 payload["name_pronunciation"],
             )
             repository.set_setting("player.pronouns", payload["pronouns"])
+            repository.set_setting("player.species", payload["species"])
+            repository.set_setting("player.age", payload["age"])
             repository.set_setting("tts.pronunciation_map", pronunciation_map)
             repository.set_setting("player.appearance", payload["appearance"])
             repository.set_setting("player.backstory", payload["backstory"])

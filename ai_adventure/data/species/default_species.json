@@ -1,0 +1,128 @@
+[
+  {
+    "name": "Human",
+    "genders": [
+      "Male",
+      "Female"
+    ],
+    "typical_maturation_age": "Around 18 years",
+    "typical_lifespan": "70-90 years",
+    "typical_height": "4'10\" to 6'4\"",
+    "typical_weight": "120-280 pounds",
+    "typical_genres": [
+      "All Genres"
+    ],
+    "description": "Humans inhabit a wide range of climates and build many different cultures and societies. There is no general or broad definition of a human, as they are truly average at everything they do, having no strong or weak skills or abilities."
+  },
+  {
+    "name": "Elf",
+    "genders": [
+      "Male",
+      "Female"
+    ],
+    "typical_maturation_age": "Around 80 years",
+    "typical_lifespan": "1500-4500 years",
+    "typical_height": "6' to 7'",
+    "typical_weight": "160-190 pounds",
+    "typical_genres": [
+      "Fantasy",
+      "High Fantasy"
+    ],
+    "description": "Long-lived, tall, and lean humanoids with pointed ears and keen senses who love nature and the outdoors. Elves are usually seen as aristocratic and high culture, due to their extended lifespans, where they have plenty of time to learn and practice skills. To an elf, most other species are seen as mayflies, and as such, Elves usually treat other species as lesser than them, coming off as cold or uncaring. Elves usually value cultural things, such as the theater, songwriting and playing musical instruments, and having fine wine with dinner. Elves do not usually care for physical labor, such as building or crafting, instead outsourcing that work to other species, such as dwarves or humans, although Elves do have their own unique cultural designs for architecture and items."
+  },
+  {
+    "name": "Dryad",
+    "genders": [
+      "Genderless"
+    ],
+    "typical_maturation_age": "Dryads have no maturation age, being created as they will be for the rest of their life",
+    "typical_lifespan": "Indefinite",
+    "typical_height": "6' to 7'",
+    "typical_weight": "160-190 pounds",
+    "typical_genres": [
+      "Fantasy",
+      "High Fantasy"
+    ],
+    "description": "Created by nature itself and being magically animated tree roots, twigs, and leaves, Dryads are seen as the protectors of the forest and other natural things. Dryads generally do not interfere with mortal affairs and are therefore extremely reclusive and secretive, unless the Dryad's land is being threatened by mortals. Dryads are powered by nature magic, and generally live as long as the forest or other natural setting that created it lives. Dryads usually possess powerful nature magic. Dryads are weak to fire, but do not back down when fire is used against them. In fact, if someone uses fire against a Dryad, then the Dryad will usually not stop their retaliation against that person until the Dryad has extracted their revenge on them."
+  },
+  {
+    "name": "Dwarf",
+    "genders": [
+      "Male",
+      "Female"
+    ],
+    "typical_maturation_age": "Around 25 years",
+    "typical_lifespan": "250-350 years",
+    "typical_height": "4'2\" to 5'",
+    "typical_weight": "180-230 pounds",
+    "typical_genres": [
+      "Fantasy",
+      "High Fantasy"
+    ],
+    "description": "Short, sturdy, hefty humanoids with long lifespans. Some dwarf societies build underground, while others have long histories in surface towns and cities. Dwarves usually love alcohol, minerals, mining, and crafting. Dwarven engineering and craftsmanship is usually top-notch. Although fantastic at physical activities, Dwarves usually are much slower on the uptake for mental activities, such as science or mathematics. Ergo, Dwarves probably won't come up with complex mathematical formulae, but if you need something actually built, there's no one better than a Dwarf to build it."
+  },
+  {
+    "name": "Halfling",
+    "genders": [
+      "Male",
+      "Female"
+    ],
+    "typical_maturation_age": "Around 20 years",
+    "typical_lifespan": "100-150 years",
+    "typical_height": "3'2\" to 4'",
+    "typical_weight": "60-80 pounds",
+    "typical_genres": [
+      "Fantasy",
+      "High Fantasy"
+    ],
+    "description": "Small humanoids whose communities range from rural settlements to urban neighborhoods and traveling households. Typically very friendly and welcoming, and usually great cooks. They usually value a cozy hearth and a safe, boring lifestyle over one of adventure."
+  },
+  {
+    "name": "Orc",
+    "genders": [
+      "Male",
+      "Female"
+    ],
+    "typical_maturation_age": "Around 18 years",
+    "typical_lifespan": "70-100 years",
+    "typical_height": "6'6\" to 7'6\"",
+    "typical_weight": "230-280 pounds",
+    "typical_genres": [
+      "Fantasy",
+      "High Fantasy"
+    ],
+    "description": "Broadly built humanoids often recognizable by their tusks and green skin. Orcs are generally more prone to violence than other species, being seen by other species as the 'warmongering' species. Orcs are usually brilliant military tacticians and excellent at warfare, although they are generally slower on the uptake to most other things than other species. Most other species are intimidated by or fearful of Orcs due to long-seated racism."
+  },
+  {
+    "name": "Goblin",
+    "genders": [
+      "Male",
+      "Female"
+    ],
+    "typical_maturation_age": "Around 6 years",
+    "typical_lifespan": "18-25 years",
+    "typical_height": "2'4\" to 3'2\"",
+    "typical_weight": "40-60 pounds",
+    "typical_genres": [
+      "Fantasy",
+      "High Fantasy"
+    ],
+    "description": "Like mayflies, goblins are quickly born, reproduce, and die. Goblins are not particularly skilled at anything, although they do work very well in numbers, and usually favor group activities, projects, or tactics. Due to their short lifespans, most goblins are extremely adventurous and eager to do anything. Goblins will usually become restless when asked to not do anything. Most goblins are extremely talkative, loud, and boisterous, although goblins can also be quiet when necessary, such as doing a group ambush or hunting. Goblins generally have low intelligence and shoddy craftsmanship."
+  },
+  {
+    "name": "Android",
+    "genders": [
+      "Genderless"
+    ],
+    "typical_maturation_age": "Androids do not mature",
+    "typical_lifespan": "Varies with upkeep and access to replacement parts, but with proper maintenance, an Android can live forever",
+    "typical_height": "Varies based on the model",
+    "typical_weight": "Varies based on the model",
+    "typical_genres": [
+      "Cyberpunk",
+      "Futuristic",
+      "Sci-Fi"
+    ],
+    "description": "Artificial robots with metallic bodies. Their construction, social status, and ability to repair or change their bodies depend on the setting."
+  }
+]

@@ -363,7 +363,7 @@ class InventoryUiTests(QtTestCase):
         wizard = NewGameWizard(tts_enabled=False)
         page_titles = [wizard.page(page_id).title() for page_id in wizard.pageIds()]
 
-        self.assertEqual(page_titles[:2], ["Adventure", "A.I. Settings"])
+        self.assertEqual(page_titles[:3], ["Adventure", "World Species", "A.I. Settings"])
         self.assertFalse(hasattr(wizard, "ai_settings_button"))
         self.assertEqual(wizard.text_model_combo.count(), 6)
         self.assertEqual(wizard.image_model_combo.count(), 3)

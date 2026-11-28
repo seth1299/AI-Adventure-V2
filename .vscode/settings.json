@@ -1,3 +1,23 @@
 {
-  "explorer.excludeGitIgnore": true
+  "explorer.excludeGitIgnore": true,
+  "cSpell.words": [
+    "Dwarven",
+    "errorlevel",
+    "espeakng",
+    "gaos",
+    "genai",
+    "Halfling",
+    "kokoro",
+    "kokorog",
+    "noconfirm",
+    "noconsole",
+    "onefile",
+    "onnx",
+    "onnxruntime",
+    "PYGAME",
+    "pykokoro",
+    "setlocal",
+    "soundfile",
+    "venv"
+  ]
 }

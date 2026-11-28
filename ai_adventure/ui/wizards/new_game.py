@@ -1,6 +1,11 @@
 from __future__ import annotations
 
 from ai_adventure.template_images import normalize_template_images
+from ai_adventure.saved_characters import SavedCharacterLibrary
+from ai_adventure.ui.saved_characters import SavedCharactersDialog, save_profile
+from ai_adventure.character_identity import normalize_character_age
+from ai_adventure.ui.widgets.character_identity import CharacterAgeInput, CharacterSpeciesCombo
+from ai_adventure.ui.wizards.world_species import WorldSpeciesPage
 
 from PySide6.QtWidgets import QWidgetAction, QListView
 from PySide6.QtGui import QStandardItemModel
@@ -454,6 +459,8 @@ class NewGameWizard(QWizard):
         parent: QWidget | None = None,
         *,
         template_setup: dict[str, Any] | None = None,
+        saved_character_library: SavedCharacterLibrary | None = None,
+        saved_species_dir: Path | None = None,
         skill_catalog: list[dict[str, Any]] | None = None,
         starter_item_catalog: list[dict[str, Any]] | None = None,
         choice_catalogs: dict[str, list[str]] | None = None,
@@ -473,6 +480,8 @@ class NewGameWizard(QWizard):
         super().__init__(parent)
 
         self._template_images = []
+        self.saved_character_library = saved_character_library
+        self._saved_character_id: str | None = None
         self.clear_table_buttons: dict[QTableWidget, QPushButton] = {}
         self.tts_enabled = bool(tts_enabled)
         self.voice_options = voice_options or available_narrator_voices()
@@ -590,6 +599,8 @@ class NewGameWizard(QWizard):
         self._apply_theme()
 
         self._build_adventure_page()
+        self.world_species_page = WorldSpeciesPage(self, saved_species_dir)
+        self.addPage(self.world_species_page)
         self._build_ai_settings_page()
         self._build_api_key_page()
         self._build_starting_locations_page()
@@ -1272,12 +1283,7 @@ class NewGameWizard(QWizard):
         setup = {
             "title": self.title_input.text(),
             "character": {
-                "name": self.character_name_input.text(),
-                "name_pronunciation": self.character_name_pronunciation_input.text(),
-                "pronouns": self._character_pronouns_from_controls(),
-                "appearance": self.appearance_input.toPlainText(),
-                "backstory": self.backstory_input.toPlainText(),
-                "notes": self.character_notes_input.toPlainText(),
+                **self._character_profile_from_controls(),
                 "attributes": {a: widget.value() for a, widget in self.attribute_inputs.items()},
             },
             "skills": skills,
@@ -1341,6 +1347,7 @@ class NewGameWizard(QWizard):
             ),
             "opening_scene_request": self.opening_scene_request_input.toPlainText(),
             "world_context": self.world_context_input.toPlainText(),
+            "world_species": self.world_species_page.species(),
         }
 
         if self._template_images:
@@ -1351,6 +1358,7 @@ class NewGameWizard(QWizard):
         """Populates wizard fields from a reusable setup template."""
 
         self._template_images = normalize_template_images(setup.get("template_images"))
+        self._saved_character_id = None
         if setup.get("rules_version") != RULES_VERSION:
             raise ValueError("This template uses older rules. Create a new Stats template; no conversion is performed.")
         # Partial templates can be completed in the wizard.
@@ -1389,6 +1397,7 @@ class NewGameWizard(QWizard):
             clean_setup["start_location_mode"],
         )
         self.world_context_input.setPlainText(clean_setup["world_context"])
+        self.world_species_page.set_species(clean_setup["world_species"])
         self.starting_locations_table.setRowCount(0)
 
         for location in clean_setup["starting_locations"]:
@@ -1425,14 +1434,7 @@ class NewGameWizard(QWizard):
         )
 
         self.character_capacity_input.setValue(character.get("carrying_capacity_lb", 50))
-        self.character_name_input.setText(character["name"])
-        self.character_name_pronunciation_input.setText(
-            character["name_pronunciation"]
-        )
-        self._set_character_pronouns(character["pronouns"])
-        self.appearance_input.setPlainText(character["appearance"])
-        self.backstory_input.setPlainText(character["backstory"])
-        self.character_notes_input.setPlainText(character["notes"])
+        self._load_character_profile(character)
         self._load_magic_setup(clean_setup["magic"])
         self._load_fighting_setup(clean_setup["fighting"])
         survival = setup.get("survival")
@@ -2571,6 +2573,12 @@ class NewGameWizard(QWizard):
             self._sync_character_pronoun_controls
         )
         self._set_character_pronouns(DEFAULT_CHARACTER_PRONOUNS)
+        self._preferred_character_species = ""
+        self.character_species_combo = CharacterSpeciesCombo()
+        self.character_species_combo.activated.connect(self._remember_character_species)
+        self.world_species_page.roster_changed.connect(self._sync_character_species)
+        self._sync_character_species()
+        self.character_age_input = CharacterAgeInput()
 
         self.appearance_input = QTextEdit()
         self.backstory_input = QTextEdit()
@@ -2591,10 +2599,19 @@ class NewGameWizard(QWizard):
         layout = QFormLayout()
         self.character_form_layout = layout
         _configure_responsive_form(layout)
+        self.load_saved_character_button = QPushButton("Choose Saved Character…")
+        self.load_saved_character_button.clicked.connect(self._choose_saved_character)
+        self.save_character_button = QPushButton("Save to Saved Characters")
+        self.save_character_button.clicked.connect(self._save_to_character_library)
+        library_buttons = _button_row(self.load_saved_character_button, self.save_character_button)
+        library_buttons.setVisible(self.saved_character_library is not None)
+        layout.addRow(library_buttons)
         layout.addRow("Name:", self.character_name_input)
         layout.addRow("Name Pronunciation:", self.character_name_pronunciation_input)
         layout.addRow("Pronouns:", self.character_pronouns_combo)
         layout.addRow("Custom Pronouns:", self.character_custom_pronouns_input)
+        layout.addRow("Species:", self.character_species_combo)
+        layout.addRow("Age:", self.character_age_input)
         layout.addRow("Appearance:", self.appearance_input)
         layout.addRow("Backstory:", self.backstory_input)
         layout.addRow("Base carrying capacity:", self.character_capacity_input)
@@ -2603,6 +2620,69 @@ class NewGameWizard(QWizard):
         page.setLayout(layout)
 
         self.character_page_id = self.addPage(page)
+
+    def _remember_character_species(self, _index: int) -> None:
+        self._preferred_character_species = self.character_species_combo.currentData() or ""
+
+    def _sync_character_species(self) -> None:
+        self.character_species_combo.set_species(self.world_species_page.species(), self._preferred_character_species)
+
+    def _character_profile_from_controls(self) -> dict[str, Any]:
+        return {
+            "name": self.character_name_input.text(),
+            "name_pronunciation": self.character_name_pronunciation_input.text(),
+            "pronouns": self._character_pronouns_from_controls(),
+            "species": self.character_species_combo.currentData() or "",
+            "age": self.character_age_input.age(),
+            "appearance": self.appearance_input.toPlainText(),
+            "backstory": self.backstory_input.toPlainText(),
+            "notes": self.character_notes_input.toPlainText(),
+        }
+
+    def _load_character_profile(self, character: dict[str, Any]) -> None:
+        self.character_name_input.setText(character["name"])
+        self.character_name_pronunciation_input.setText(character["name_pronunciation"])
+        self._set_character_pronouns(character["pronouns"])
+        self._preferred_character_species = character.get("species") or ""
+        self._sync_character_species()
+        self.character_age_input.setValue(normalize_character_age(character.get("age")) or 0)
+        self.appearance_input.setPlainText(character["appearance"])
+        self.backstory_input.setPlainText(character["backstory"])
+        self.character_notes_input.setPlainText(character["notes"])
+
+    def _save_to_character_library(self) -> None:
+        if self.saved_character_library is None:
+            return
+        character = self._character_profile_from_controls()
+        name = character["name"].strip().casefold()
+        portrait = next((image for image in self._template_images if image["subject_type"] == "player"
+                         and image["display_name"].casefold() == name), None)
+        if portrait is None and self._saved_character_id is not None and name:
+            attached = next((image for image in self._template_images if image["subject_type"] == "player"), None)
+            if attached is not None:
+                portrait = {**attached, "display_name": character["name"].strip()}
+        saved_id = save_profile(self, self.saved_character_library, character, portrait=portrait,
+                                character_id=self._saved_character_id)
+        if saved_id is not None:
+            self._saved_character_id = saved_id
+            if portrait is not None:
+                self._template_images = [image for image in self._template_images if image["subject_type"] != "player"]
+                self._template_images.append(portrait)
+
+    def _choose_saved_character(self) -> None:
+        if self.saved_character_library is None:
+            return
+        dialog = SavedCharactersDialog(self.saved_character_library, self, choose=True)
+        dialog.exec()
+        character = dialog.selected_character
+        dialog.deleteLater()
+        if character is None:
+            return
+        self._saved_character_id = character.id
+        self._load_character_profile(character.profile)
+        self._template_images = [image for image in self._template_images if image["subject_type"] != "player"]
+        if character.portrait is not None:
+            self._template_images.append(character.portrait)
 
     def _sync_character_pronoun_controls(self, _index: int = -1) -> None:
         """Shows custom pronoun entry only when Other is selected."""

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from ai_adventure.template_images import template_image_bytes
+from tempfile import NamedTemporaryFile
+
+from ai_adventure.template_images import normalize_template_images, template_image_bytes
 
 from ai_adventure.ui.common import *  # noqa: F401,F403
 from ai_adventure.ui.workers.gemini import GeminiVisualAssetWorker as _GeminiVisualAssetWorker
@@ -67,8 +69,16 @@ class _VisualAssetCoordinator(QObject):
         model = normalize_image_model(
             repository.get_setting("images.model", DEFAULT_IMAGE_MODEL)
         )
+        include_portrait = False
+        if not str(repository.get_setting("player.appearance", "") or "").strip():
+            setup = repository.get_setting("new_game.setup", {})
+            images = normalize_template_images(setup.get("template_images")) if isinstance(setup, dict) else []
+            name = str(repository.get_setting("player_name", "") or "").strip().casefold()
+            include_portrait = any(
+                image["subject_type"] == "player" and image["display_name"].casefold() == name for image in images
+            )
         pending: list[VisualAssetRequest] = []
-        for request in AssetGenerationService.requests_for(repository):
+        for request in AssetGenerationService.requests_for(repository, include_player_without_appearance=include_portrait):
             target_path = AssetGenerationService.target_path(
                 repository, request, self.images_dir
             )
@@ -130,6 +140,38 @@ class _VisualAssetCoordinator(QObject):
         if len(remaining) != len(requests):
             self.assets_changed.emit()
         return remaining
+
+    def reuse_initial_images(self, repository: SaveRepository, requests: list[VisualAssetRequest]) -> None:
+        """Fill missing previews from compatible assets before source selection."""
+        for request in requests:
+            asset = repository.get_visual_asset(request.subject_type, request.subject_key) or {}
+            if not asset.get("default_image"):
+                self._reuse_image(repository, request)
+
+    def _reuse_image(self, repository: SaveRepository, request: VisualAssetRequest) -> bool:
+        reusable = AssetGenerationService.find_local_reuse(
+            images_dir=self.images_dir, saves_dir=self.images_dir.parent / "saves",
+            repository=repository, request=request,
+        )
+        if reusable is None:
+            return False
+        target_path = AssetGenerationService.target_path(repository, request, self.images_dir)
+        temporary_path = None
+        try:
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            with reusable["source_path"].open("rb") as source, NamedTemporaryFile(dir=target_path.parent, delete=False) as output:
+                temporary_path = Path(output.name)
+                shutil.copyfileobj(source, output)
+            temporary_path.replace(target_path)
+            repository.set_visual_asset_status(request.asset_id, "ready", width=reusable["width"], height=reusable["height"])
+            LOGGER.info("Reused visual asset %s (score %.1f).", request.filename, reusable["score"])
+            return True
+        except OSError as error:
+            LOGGER.warning("Could not reuse visual asset for %s: %s", request.display_name, error)
+            return False
+        finally:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
 
     def upload_initial_image(
         self,
@@ -300,13 +342,6 @@ class _VisualAssetCoordinator(QObject):
         images_enabled = _bool_setting(
             repository.get_setting("images.enabled", True), True
         )
-        if not images_enabled:
-            LOGGER.info(
-                "Visual asset scan skipped: images.enabled=false for %s.",
-                repository.db_path,
-            )
-            return
-
         has_api_key = bool(read_api_key(self.api_key_path))
         model = normalize_image_model(
             repository.get_setting("images.model", DEFAULT_IMAGE_MODEL)
@@ -324,6 +359,11 @@ class _VisualAssetCoordinator(QObject):
         skipped_record_count = 0
         skipped_key_count = 0
         for request in requests:
+            if request.subject_type in {"inventory", "skill", "location"}:
+                asset = repository.get_visual_asset(request.subject_type, request.subject_key) or {}
+                if asset.get("default_image"):
+                    ready_count += 1
+                    continue
             if request.subject_type == "npc":
                 existing = repository.get_visual_asset("npc", request.subject_key)
                 requested = repository.get_visual_asset_by_id(request.asset_id)
@@ -387,41 +427,14 @@ class _VisualAssetCoordinator(QObject):
                     record.get("status"),
                 )
                 continue
-            if not has_api_key:
-                skipped_key_count += 1
-                continue
             if request.asset_id in self._queued_asset_ids:
                 continue
-            reusable = AssetGenerationService.find_local_reuse(
-                images_dir=self.images_dir,
-                saves_dir=self.images_dir.parent / "saves",
-                repository=repository,
-                request=request,
-            )
-            if reusable is not None:
-                try:
-                    target_path.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(reusable["source_path"], target_path)
-                    repository.set_visual_asset_status(
-                        request.asset_id,
-                        "ready",
-                        width=int(reusable.get("width", 0)),
-                        height=int(reusable.get("height", 0)),
-                    )
-                    reused_count += 1
-                    LOGGER.info(
-                        "Reused visual asset %s for %s from another save (score %.1f).",
-                        request.filename,
-                        request.display_name,
-                        float(reusable.get("score", 0.0)),
-                    )
-                    continue
-                except OSError as error:
-                    LOGGER.warning(
-                        "Could not reuse visual asset for %s: %s",
-                        request.display_name,
-                        error,
-                    )
+            if self._reuse_image(repository, request):
+                reused_count += 1
+                continue
+            if not images_enabled or not has_api_key:
+                skipped_key_count += 1
+                continue
             self._queue.append((repository, request, model, limit))
             self._queued_asset_ids.add(request.asset_id)
             queued_count += 1
@@ -443,6 +456,8 @@ class _VisualAssetCoordinator(QObject):
             skipped_key_count,
             len(self._queue),
         )
+        if reused_count and not self._is_initial_batch(repository):
+            self.assets_changed.emit()
         self._start_next()
         self._finish_initial_batch_if_ready(repository)
 

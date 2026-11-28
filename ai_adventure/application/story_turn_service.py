@@ -103,6 +103,7 @@ class StoryTurnService:
             player_command=player_text,
             conversation_mode=conversation_mode,
             relevant_npcs=relevant_npcs,
+            focused_npc_ids={subject["id"] for subject in subjects if subject["type"] == "npc"},
             party_members=repository.list_party_members(),
             gm_secrets=repository.list_gm_secrets(active_only=True),
             miscellaneous=repository.list_miscellaneous(),

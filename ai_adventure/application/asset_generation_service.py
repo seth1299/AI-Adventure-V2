@@ -18,8 +18,10 @@ class AssetGenerationService:
     """Provides UI-neutral visual-asset discovery and local reuse operations."""
 
     @staticmethod
-    def requests_for(repository: SaveRepository) -> list[VisualAssetRequest]:
-        return build_visual_asset_requests(repository)
+    def requests_for(
+        repository: SaveRepository, *, include_player_without_appearance: bool = False,
+    ) -> list[VisualAssetRequest]:
+        return build_visual_asset_requests(repository, include_player_without_appearance=include_player_without_appearance)
 
     @staticmethod
     def target_path(

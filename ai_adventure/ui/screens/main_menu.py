@@ -19,6 +19,7 @@ class MainMenuScreen(QWidget):
         on_settings,
         on_templates,
         *,
+        on_saved_characters=None,
         save_service: SaveGameService | None = None,
         application_name: str = "AI Adventure",
         new_game_label: str = "New Game",
@@ -69,6 +70,10 @@ class MainMenuScreen(QWidget):
         self.templates_button = QPushButton("New Game Templates")
         self.templates_button.clicked.connect(self.on_templates)
         self.templates_button.setVisible(show_templates)
+        self.saved_characters_button = QPushButton("Manage Saved Characters")
+        if on_saved_characters is not None:
+            self.saved_characters_button.clicked.connect(on_saved_characters)
+        self.saved_characters_button.setVisible(on_saved_characters is not None)
 
         layout = QVBoxLayout()
         layout.addStretch(1)
@@ -77,6 +82,7 @@ class MainMenuScreen(QWidget):
 
         layout.addWidget(new_game_button)
         layout.addWidget(self.templates_button)
+        layout.addWidget(self.saved_characters_button)
         layout.addWidget(self.settings_button)
 
         layout.addSpacing(30)

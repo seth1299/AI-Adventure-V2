@@ -117,7 +117,7 @@ class NewGameOpeningTests(QtTestCase):
                 for request in requests:
                     preview = dialog._preview_labels[request.asset_id]
                     expected = skill_path if request.subject_type == "skill" else item_path
-                    self.assertEqual(preview.property("imageViewerPath"), str(expected))
+                    self.assertEqual(Path(preview.property("imageViewerPath")), expected)
                     self.assertFalse(preview.pixmap().isNull())
                     self.assertFalse(preview.isHidden())
                     self.assertIn("kept unless replaced", dialog._rows[request.asset_id][0].text())

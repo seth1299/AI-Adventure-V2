@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from ai_adventure.template_images import normalize_template_images
 from ai_adventure.locations import MAP_COORDINATE_RULE
+from ai_adventure.character_identity import normalize_character_age, resolve_character_species
+from ai_adventure.world_species import WORLD_SPECIES_RULE, normalize_world_species
 
 from ai_adventure.skills.attributes import starting_skill_attribute
 from ai_adventure.timed_events import TIMED_EVENT_RULE
@@ -251,6 +253,7 @@ def normalize_new_game_setup(raw_setup: Any) -> dict[str, Any]:
     )
     game_style = _clean_text(raw_setup.get("game_style"))
     world_context = _clean_text(raw_setup.get("world_context"))
+    world_species = normalize_world_species(raw_setup.get("world_species"))
     start_location_mode = _normalize_start_location_mode(raw_setup)
     currency_denominations = normalize_currency_denominations(
         raw_setup.get("currency_denominations", []),
@@ -339,6 +342,8 @@ def normalize_new_game_setup(raw_setup: Any) -> dict[str, Any]:
             "name": _clean_text(character.get("name")) or "Player Name",
             "name_pronunciation": raw_character_name_pronunciation,
             "pronouns": normalize_character_pronouns(character.get("pronouns")),
+            "species": resolve_character_species(character.get("species"), world_species),
+            "age": normalize_character_age(character.get("age")),
             "appearance": _clean_text(character.get("appearance")),
             "backstory": _clean_text(character.get("backstory")),
             "notes": _clean_text(character.get("notes")),
@@ -391,6 +396,7 @@ def normalize_new_game_setup(raw_setup: Any) -> dict[str, Any]:
         "start_location_mode": start_location_mode,
         "opening_scene_request": opening_scene_request,
         "world_context": world_context,
+        "world_species": world_species,
         "ai_additional_context": _build_ai_additional_context(
             specified_genre=specified_genre,
             game_style=game_style,
@@ -770,6 +776,7 @@ def build_new_game_setup_packet(
                 "If character name, appearance, backstory, or notes are blank/default "
                 "placeholders, invent them. Blank/default character fields do not "
                 "mean the player character should default to male. "
+                "Treat setup.character.species and age as fixed character facts when supplied. "
                 "setup.character.pronouns is always player-selected and canonical; "
                 "copy and use it exactly without inferring different pronouns from "
                 "the name, appearance, voice, genre, or invented details. Follow "
@@ -1221,6 +1228,8 @@ def build_new_game_setup_packet(
         packet["requirements"].pop("starting_sound_effect", None)
     if not clean_background_ambience_tracks:
         packet["requirements"].pop("starting_background_ambience", None)
+    if clean_setup["world_species"]:
+        packet["requirements"]["world_species"] = WORLD_SPECIES_RULE
     if not calendar_is_ai_generated:
         packet["current_calendar"] = build_calendar_snapshot(
             resolve_starting_calendar_minute(
@@ -1245,6 +1254,8 @@ def fallback_world_summary(setup: dict[str, Any]) -> str:
         or "new adventure"
     )
     world_context = clean_setup["world_context"] or "No additional world details were provided."
+    species_names = ", ".join(profile["name"] for profile in clean_setup["world_species"])
+    species_summary = f"The world's inhabitants include {species_names}.\n\n" if species_names else ""
     currency = (
         clean_setup["currency_description"]
         or "The local currency should be established during world setup."
@@ -1253,6 +1264,7 @@ def fallback_world_summary(setup: dict[str, Any]) -> str:
     return (
         f"{title} begins as a {style} centered on {location}. The world is shaped "
         f"by the player setup details: {world_context}\n\n"
+        f"{species_summary}"
         f"{location} has enough local life to support rumors, trade, faith, and "
         "conflict. Prominent NPCs, factions, guilds, and locations of interest "
         "should emerge from play and be recorded as the player discovers them.\n\n"

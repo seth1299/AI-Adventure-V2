@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from ai_adventure.template_images import capture_template_image
+from ai_adventure.saved_characters import SavedCharacterLibrary
+from ai_adventure.ui.saved_characters import SavedCharactersDialog
 from ai_adventure.new_game_templates import save_template_image
 from ai_adventure.application.opening_request import OpeningRequest, opening_request_path
 
@@ -277,6 +279,7 @@ class MainWindow(QMainWindow):
         self._menu_music_watchdog.setInterval(1000)
         self._menu_music_watchdog.timeout.connect(self._ensure_main_menu_music)
 
+        self.saved_character_library = SavedCharacterLibrary(self.app_paths.saved_characters_dir)
         self.main_menu = _ExtractedMainMenuScreen(
             saves_dir=self.app_paths.saves_dir,
             save_service=self.save_game_service,
@@ -284,6 +287,7 @@ class MainWindow(QMainWindow):
             on_load_game=self.load_game_from_path,
             on_settings=self.open_main_menu_settings,
             on_templates=self.open_new_game_templates,
+            on_saved_characters=self.open_saved_characters,
             application_name=self.application_name,
             new_game_label="New Playtest" if self.playtesting_build else "New Game",
             show_templates=not self.playtesting_build,
@@ -302,6 +306,7 @@ class MainWindow(QMainWindow):
             generated_images_dir=self.app_paths.images_dir,
             playtesting_tools=self.playtesting_build,
             ai_enabled=self.ai_enabled,
+            saved_character_library=self.saved_character_library,
         )
         self.game_shell.visual_asset_coordinator.initial_batch_finished.connect(
             self._handle_initial_visuals_ready
@@ -491,6 +496,8 @@ class MainWindow(QMainWindow):
         wizard = NewGameWizard(
             self,
             template_setup=template_setup,
+            saved_character_library=self.saved_character_library,
+            saved_species_dir=self.app_paths.saved_species_dir,
             skill_catalog=skill_catalog,
             starter_item_catalog=starter_item_catalog,
             choice_catalogs=choice_catalogs,
@@ -641,6 +648,11 @@ class MainWindow(QMainWindow):
             return
 
         self._apply_app_settings(dialog.build_settings(), persist=True)
+
+    def open_saved_characters(self) -> None:
+        dialog = SavedCharactersDialog(self.saved_character_library, self)
+        dialog.exec()
+        dialog.deleteLater()
 
     def open_new_game_templates(self) -> None:
         """Opens the app-level new-game template manager."""
@@ -1291,6 +1303,7 @@ class MainWindow(QMainWindow):
             requests = self.game_shell.visual_asset_coordinator.restore_initial_template_images(
                 repository, requests, setup.get("template_images", []),
             )
+            self.game_shell.visual_asset_coordinator.reuse_initial_images(repository, requests)
         except Exception:
             LOGGER.exception("Initial visual asset source selection could not start.")
             self.game_shell.visual_asset_coordinator.finish_initial_batch(repository)

@@ -1,18 +1,26 @@
 # Bundled default images
 
-Add generic item art under `items/` and skill art under `skills/`. Subdirectories
-are supported. Use descriptive filenames such as `items/Backpack.png` or
-`skills/Alchemy_Icon.png`; no code changes or manifest entries are required.
-PNG (including transparency), JPEG, WebP, and BMP are discovered automatically.
-Prefer clear ASCII filenames because new-game text contracts use ASCII.
+Use descriptive filenames and these directories to classify artwork:
+
+- `locations/game_genres/fantasy/art_styles/digital_art/cottage.png`
+- `items/game_genres/fantasy/art_styles/digital_art/leather_backpack.png`
+- `skills/game_genres/cyberpunk/art_styles/watercolor/lockpicking.png`
+
+The app matches the adventure's genre and art style to the folder names and the
+subject to the filename. Genre labels such as `Science fiction` use folder names
+such as `science_fiction`. Use an image style identifier such as `digital_art`,
+`watercolor`, or `film_noir`. Locations require both descriptors. Item art and
+skill icons outside those folders are available as generic fallbacks. PNG, JPEG,
+WebP, and BMP files are discovered automatically.
 
 Both builds include this directory. Rebuild after adding artwork for a release.
-Source runs discover files directly. Gemini receives the relative filenames and
-may select `default_image` on a newly created item or skill. Selection is optional:
-no suitable art means no selection. The application validates the filename and
-category, saves the selection, and uses it as a fallback when there is no usable
-uploaded/generated image. Generation settings do not disable bundled art.
+Source runs discover files directly. Gemini receives eligible relative paths and
+may select `default_image` for a new item or skill. The app can match themed art
+locally, including by the type named in a location's description. Existing uploads
+and generated art take precedence in their save. New games preview eligible
+bundled and cross-save images before offering generation. Bundled art also works
+when generation is disabled.
 
-Characters and locations do not use this catalog. Artwork is read from the
-bundle without modifying the supplied originals. Display sizing preserves its
-proportions and transparency; you do not need to prepare 32-pixel source files.
+Cross-save reuse checks the saved genre, art style, subject, and resolution of
+the cached image. Cached artwork that predates genre tracking is still usable in
+its original save. Bundled files are read in place, preserving the originals.

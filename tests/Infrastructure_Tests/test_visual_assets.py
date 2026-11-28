@@ -592,6 +592,8 @@ class VisualAssetTests(unittest.TestCase):
             saves_dir = root / "saves"
             source_repository = SaveRepository.create_new_save(saves_dir, "Source")
             target_repository = SaveRepository.create_new_save(saves_dir, "Target")
+            source_repository.set_setting("world.genre", "Fantasy")
+            target_repository.set_setting("world.genre", "fantasy")
             source_request = VisualAssetRequest(
                 subject_type="inventory",
                 subject_key="source_item",
@@ -618,6 +620,7 @@ class VisualAssetTests(unittest.TestCase):
                 resolution_tier=source_request.image_size,
                 ready=True,
             )
+            source_repository.set_visual_asset_status(source_request.asset_id, "ready")
 
             target_request = VisualAssetRequest(
                 subject_type="inventory",
@@ -636,15 +639,21 @@ class VisualAssetTests(unittest.TestCase):
             self.assertIsNotNone(reusable)
             assert reusable is not None
             self.assertEqual(reusable["source_path"], source_path)
+            target_repository.set_setting("world.genre", "Cyberpunk")
+            self.assertIsNone(find_reusable_inventory_asset(
+                images_dir=root / "images", saves_dir=saves_dir,
+                repository=target_repository, request=target_request,
+            ))
+            target_repository.set_setting("world.genre", "Fantasy")
 
             mismatched_style = VisualAssetRequest(
                 subject_type="inventory",
-                subject_key="target_item_oil",
+                subject_key="target_item_watercolor",
                 display_name="Leather Canvas Backpack",
                 description=(
                     "Container. A worn canvas backpack with leather straps and a brass buckle."
                 ),
-                image_style="oil_painting",
+                image_style="watercolor",
             )
             self.assertIsNone(
                 find_reusable_inventory_asset(
@@ -828,6 +837,8 @@ class VisualAssetTests(unittest.TestCase):
             saves_dir = root / "saves"
             source_repository = SaveRepository.create_new_save(saves_dir, "Source")
             target_repository = SaveRepository.create_new_save(saves_dir, "Target")
+            source_repository.set_setting("world.genre", "Detective")
+            target_repository.set_setting("world.genre", "Detective")
             source_request = VisualAssetRequest(
                 subject_type="inventory",
                 subject_key="source_fedora",
@@ -854,6 +865,7 @@ class VisualAssetTests(unittest.TestCase):
                 resolution_tier=source_request.image_size,
                 ready=True,
             )
+            source_repository.set_visual_asset_status(source_request.asset_id, "ready")
 
             target_request = VisualAssetRequest(
                 subject_type="inventory",

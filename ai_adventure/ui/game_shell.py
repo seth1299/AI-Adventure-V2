@@ -129,6 +129,7 @@ class GameShell(QWidget):
         generated_images_dir: Path | str | None = None,
         playtesting_tools: bool = False,
         ai_enabled: bool = True,
+        saved_character_library=None,
     ) -> None:
         """
         Args:
@@ -218,6 +219,7 @@ class GameShell(QWidget):
         self.character_screen = CharacterScreen(
             playtesting_tools=self.playtesting_tools,
             tts_enabled=self.tts_enabled,
+            saved_character_library=saved_character_library,
         )
         self.travel_screen = TravelScreen(
             on_travel_requested=self._submit_travel_request,

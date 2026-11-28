@@ -383,7 +383,7 @@ class RepositoryBackedWidget(QWidget):
         self._visual_assets_dir = Path(directory).expanduser().resolve()
 
     def visual_asset_path(self, asset: dict[str, Any] | None) -> Path | None:
-        """Prefer a safe cached image, then optional packaged item/skill artwork."""
+        """Prefer a safe cached image, then compatible packaged artwork."""
         if not isinstance(asset, dict):
             return None
         filename = str(asset.get("filename", "") or "")
@@ -393,7 +393,7 @@ class RepositoryBackedWidget(QWidget):
             path = (root / relative).resolve()
             if path.is_relative_to(root) and path.is_file():
                 return path
-        kind = {"inventory": "items", "skill": "skills"}.get(asset.get("subject_type"))
+        kind = {"inventory": "items", "skill": "skills", "location": "locations"}.get(asset.get("subject_type"))
         return resolve_bundled_image(asset.get("default_image"), kind) if kind else None
 
     def set_repository(self, repository: SaveRepository | None) -> None:

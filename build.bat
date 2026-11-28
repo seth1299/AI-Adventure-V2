@@ -59,6 +59,7 @@ if errorlevel 1 (
     --windowed ^
     --name "%APP_NAME%" ^
     --add-data "ai_adventure\data\context;ai_adventure\data\context" ^
+    --add-data "ai_adventure\data\species;ai_adventure\data\species" ^
     --add-data "%APP_ICON%;ai_adventure\data" --add-data "ai_adventure\images;ai_adventure\images" ^
     --add-data "ai_adventure\audio\music_tracks;ai_adventure\audio\music_tracks" ^
     --add-data "ai_adventure\audio\sound_effects;ai_adventure\audio\sound_effects" ^

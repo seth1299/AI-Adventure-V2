@@ -80,6 +80,37 @@ class BundledImageTests(unittest.TestCase):
         with patch("ai_adventure.bundled_images.bundled_images_root", return_value=self.root / "empty"):
             self.assertEqual(bundled_image_prompt_context(), {})
 
+    def test_classified_art_is_selected_by_subject_genre_and_style(self):
+        cottage = "locations/game_genres/fantasy/art_styles/digital_art/cottage.png"
+        backpack = "items/game_genres/fantasy/art_styles/digital_art/leather_backpack.png"
+        watercolor = "locations/game_genres/fantasy/art_styles/watercolor/cottage.png"
+        for relative in (cottage, backpack, watercolor):
+            path = self.art / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            Image.new("RGB", (16, 16)).save(path)
+        repo = SaveRepository.create_new_save(self.root / "saves", "Cottage")
+        repo.set_setting("new_game.setup", {"specified_genre": " Fantasy "})
+        repo.set_travel_locations([{"name": "Hearthstone", "description": "A small thatched cottage near a forest."}])
+        repo.add_inventory_item("Sturdy Leather Backpack", "Container", 1, "A travelling pack.")
+        location_id = repo.find_travel_location("Hearthstone")["location_id"]
+        item_id = next(item["metadata"]["item_uuid"] for item in repo.list_inventory_items()
+                       if item["name"] == "Sturdy Leather Backpack")
+        self.assertEqual(repo.get_visual_asset("location", location_id)["default_image"], cottage)
+        self.assertEqual(repo.get_visual_asset("inventory", item_id)["default_image"], backpack)
+        story = build_gemini_story_prompt({"state": {"world_profile": {"genre": "Fantasy", "image_style": "Digital Art"}}})
+        setup = build_gemini_new_game_prompt({"setup": {"specified_genre": "Fantasy", "images": {"style": "digital_art"}}})
+        for prompt in (story, setup):
+            self.assertIn(cottage, prompt)
+            self.assertIn(backpack, prompt)
+            self.assertNotIn(watercolor, prompt)
+        repo.set_setting("images.style", "watercolor")
+        self.assertEqual(repo.get_visual_asset("location", location_id)["default_image"], watercolor)
+        self.assertIsNone(repo.get_visual_asset("inventory", item_id))
+        repo.set_setting("new_game.setup", {"specified_genre": "Cyberpunk"})
+        repo.set_setting("images.style", "digital_art")
+        self.assertIsNone(repo.get_visual_asset("location", location_id))
+        self.assertIsNone(repo.get_visual_asset("inventory", item_id))
+
     def test_runtime_item_skill_and_crafting_selection_survives_reopen(self):
         repo = SaveRepository.create_new_save(self.root / "saves", "Bundled")
         applier = EventApplier(repo)

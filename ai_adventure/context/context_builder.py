@@ -1,4 +1,6 @@
 from __future__ import annotations
+
+from ai_adventure.bundled_images import adventure_image_genre
 from ai_adventure.timed_events import TIMED_EVENT_RULE
 from ai_adventure.skills.books import SKILL_BOOK_RULE
 from ai_adventure.deadlines import DEADLINE_RULE
@@ -7,6 +9,9 @@ from ai_adventure.stats import PLAYER_ACHIEVEMENT_RULE, STATS_RULE
 from ai_adventure.suggested_actions import ACTION_RULE
 from ai_adventure.locations import MAP_COORDINATE_RULE, TRAVEL_SAFETY_RULE
 from ai_adventure.npc_continuity import NPC_PROFILE_CONTINUITY_RULE
+from ai_adventure.world_species import (
+    SPECIES_PROFILE_RULE, SPECIES_ROSTER_RULE, normalize_world_species, relevant_species_profiles,
+)
 
 from ai_adventure.container_flow import CONTAINER_FLOW_RULE
 from ai_adventure.inventory_storage import inventory_access, inventory_load
@@ -255,6 +260,7 @@ class AiContextBuilder:
         player_command: str,
         conversation_mode: str = "live_game",
         relevant_npcs: list[dict[str, Any]] | None = None,
+        focused_npc_ids: set[str] | None = None,
         party_members: list[dict[str, Any]] | None = None,
         gm_secrets: list[dict[str, Any]] | None = None,
         miscellaneous: list[dict[str, Any]] | None = None,
@@ -278,6 +284,7 @@ class AiContextBuilder:
             player_command: The player's pending command.
             conversation_mode: Explicit UI-selected mode: live_game or out_of_game.
             relevant_npcs: NPC memory profiles likely relevant this turn.
+            focused_npc_ids: NPCs explicitly addressed or carried over from dialogue.
             party_members: Current party records joined to canonical NPC profiles.
             gm_secrets: Active private GM-memory records for every turn.
             miscellaneous: General world-lore records, sent uncapped.
@@ -301,9 +308,9 @@ class AiContextBuilder:
         clean_conversation_mode = (
             "out_of_game" if conversation_mode == "out_of_game" else "live_game"
         )
+        inferred_tags = infer_context_tags(clean_command)
         selected_tags = (
-            infer_context_tags(clean_command)
-            if planner_context_tags is None
+            inferred_tags.copy() if planner_context_tags is None
             else _normalize_planner_context_tags(planner_context_tags)
         )
         if re.search(r"\b(?:learn\w*|train\w*|practic\w*|study|studying|instruction|lesson)\b",
@@ -466,6 +473,28 @@ class AiContextBuilder:
             }
         )
         ai_mode_preferences = ai_mode_preferences_from_settings(state.settings.values)
+        world_species = normalize_world_species(state.settings.values.get("world.species"))
+        focused_npcs = [
+            npc for npc in clean_relevant_npcs
+            if focused_npc_ids and npc.get("npc_id") in focused_npc_ids
+        ]
+        species_tags = selected_tags | inferred_tags
+        species_npcs = focused_npcs
+        if not species_npcs and species_tags.intersection({"dialogue", "combat"}):
+            species_npcs = clean_relevant_npcs
+        species_names = [npc.get("species") for npc in species_npcs]
+        if "character" in species_tags or re.search(
+            r"\b(?:my (?:species|height|weight|age|appearance|lifespan|maturation|gender)|"
+            r"how (?:tall|heavy|old) am i)\b", clean_command, re.IGNORECASE,
+        ):
+            species_names.append(state.player.species)
+        species_context = {}
+        if world_species:
+            species_context["species_roster"] = [profile["name"] for profile in world_species]
+            species_context["species_roster_rule"] = SPECIES_ROSTER_RULE
+        species_profiles = relevant_species_profiles(world_species, species_names, clean_command)
+        if species_profiles:
+            species_context.update(species=species_profiles, species_rules=SPECIES_PROFILE_RULE)
         magic_context = _magic_context_packet(
             state.magic,
             include_progression="magic" in selected_tags or "spell" in selected_tags,
@@ -486,6 +515,8 @@ class AiContextBuilder:
                 "player": {
                     "name": state.player.name,
                     "pronouns": _compact_text(state.player.pronouns),
+                    "species": _compact_text(state.player.species),
+                    "age": state.player.age,
                     "appearance": _compact_text(state.player.appearance),
                     "backstory": _compact_text(state.player.backstory),
                     "condition": _compact_text(
@@ -608,6 +639,8 @@ class AiContextBuilder:
                     ),
                 },
                 "world_profile": {
+                    "image_genre": adventure_image_genre(state.settings.values.get),
+                    "image_style": state.settings.values.get("images.style", ""),
                     "summary": _compact_text(state.settings.values.get("world.summary", "")),
                     "genre": _compact_text(
                         state.settings.values.get("world.genre", ""),
@@ -615,6 +648,7 @@ class AiContextBuilder:
                     ),
                     "game_style": _compact_text(state.settings.values.get("world.game_style", "")),
                     "setup_context": _compact_text(state.settings.values.get("world.setup_context", "")),
+                    **species_context,
                 },
                 "calendar": {
                     "current": state.calendar.to_dict(),
@@ -1340,7 +1374,7 @@ class AiContextBuilder:
                     "for other elapsed time and do not guess new date labels."
                 ),
                 "character_profile": (
-                    "Use state.player.name, pronouns, appearance, backstory, and notes as "
+                    "Use state.player.name, pronouns, species, age, appearance, backstory, and notes as "
                     "player-authored character context. Treat it as true for the "
                     "player character. state.player.pronouns is the canonical source "
                     "for referring to the player character: use it exactly and never "

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from ai_adventure.skills.attributes import skill_attribute
-from ai_adventure.bundled_images import valid_default_image, matching_skill_image
+from ai_adventure.bundled_images import adventure_image_genre, matching_bundled_image, valid_default_image
 from ai_adventure.audio.tts_settings import DEFAULT_TTS_VOLUME_PERCENT
 
 import json
@@ -323,6 +323,8 @@ class SaveRepository(PlayerStatsRepository, SurvivalRepository, TimedEventsRepos
         self.set_setting("player_name", character["name"])
         self.set_setting("player.name_pronunciation", character["name_pronunciation"])
         self.set_setting("player.pronouns", character["pronouns"])
+        self.set_setting("player.species", character["species"])
+        self.set_setting("player.age", character["age"])
         self.initialize_player_stats(character["attributes"], clean_setup["starting_player_level"])
         self.set_setting("player.appearance", character["appearance"])
         self.set_setting("player.backstory", character["backstory"])
@@ -360,6 +362,7 @@ class SaveRepository(PlayerStatsRepository, SurvivalRepository, TimedEventsRepos
         self.set_setting("audio.current_background_ambience", "")
         self.set_setting("new_game.setup", clean_setup)
         self.set_setting("world.setup_context", clean_setup["world_context"])
+        self.set_setting("world.species", clean_setup["world_species"])
         self.set_setting("world.genre", clean_setup["specified_genre"])
         self.set_setting("world.game_style", clean_setup["game_style"])
         self.set_setting("fighting.focus", clean_setup["fighting"]["focus"])
@@ -4970,6 +4973,7 @@ class SaveRepository(PlayerStatsRepository, SurvivalRepository, TimedEventsRepos
                     error_message = ?,
                     width = ?,
                     height = ?,
+                    image_genre = COALESCE(?, image_genre),
                     generation_requested = CASE
                         WHEN ? = 'generating' THEN generation_requested + 1
                         ELSE generation_requested
@@ -4982,6 +4986,7 @@ class SaveRepository(PlayerStatsRepository, SurvivalRepository, TimedEventsRepos
                     str(error_message or "").strip()[:500],
                     max(0, int(width)),
                     max(0, int(height)),
+                    adventure_image_genre(self.get_setting) if clean_status == "ready" else None,
                     clean_status,
                     datetime.now().isoformat(timespec="seconds"),
                     str(asset_id or "").strip(),
@@ -5007,23 +5012,35 @@ class SaveRepository(PlayerStatsRepository, SurvivalRepository, TimedEventsRepos
         asset = dict(row) if row is not None else None
         default_image = ""
         subject_type = str(subject_type).strip().casefold()
+        if subject_type not in {"skill", "inventory", "location"}:
+            return asset
+        genre = adventure_image_genre(self.get_setting)
+        style = self.get_setting("images.style", DEFAULT_IMAGE_STYLE)
         if subject_type == "skill":
             with self._connect() as connection:
                 skill = connection.execute(
                     "SELECT default_image, name FROM skills WHERE lower(id) = ? OR name = ? COLLATE NOCASE",
                     (str(subject_key).casefold(), subject_key),
                 ).fetchone()
-            default_image = valid_default_image(skill[0], "skills") if skill else ""
-            if skill and not default_image:
-                default_image = matching_skill_image(str(skill[1]))
+            if skill:
+                default_image = matching_bundled_image("skills", skill[1], genre=genre, style=style, default=skill[0])
         elif subject_type == "inventory":
             with self._connect() as connection:
                 item = connection.execute(
-                    "SELECT metadata_json FROM item_catalog WHERE lower(json_extract(metadata_json, '$.item_uuid')) = ? OR name = ? COLLATE NOCASE",
+                    "SELECT metadata_json, name FROM item_catalog WHERE lower(json_extract(metadata_json, '$.item_uuid')) = ? OR name = ? COLLATE NOCASE",
                     (str(subject_key).casefold(), subject_key),
                 ).fetchone()
-            metadata = _decode_json_dict(item[0], "default image metadata") if item else {}
-            default_image = valid_default_image(metadata.get("default_image"), "items")
+            if item:
+                metadata = _decode_json_dict(item[0], "default image metadata")
+                default_image = matching_bundled_image("items", item[1], genre=genre, style=style,
+                                                       default=metadata.get("default_image"), basic_name=metadata.get("basic_name", ""))
+        elif genre:
+            key = str(subject_key).casefold()
+            location = next((entry for entry in self.get_travel_locations()
+                             if key in {entry["location_id"].casefold(), entry["name"].casefold()}), None)
+            if location and location["knowledge_status"] != "rumored":
+                default_image = matching_bundled_image("locations", location["name"], genre=genre, style=style,
+                                                       description=location["description"], terrain=location["terrain"])
         if default_image:
             asset = {**(asset or {}), "subject_type": subject_type, "default_image": default_image}
         return asset
@@ -6515,6 +6532,7 @@ class SaveRepository(PlayerStatsRepository, SurvivalRepository, TimedEventsRepos
                     visual_description TEXT NOT NULL DEFAULT '',
                     basic_name TEXT NOT NULL DEFAULT '',
                     resolution_tier TEXT NOT NULL DEFAULT '',
+                    image_genre TEXT NOT NULL DEFAULT '',
                     status TEXT NOT NULL DEFAULT 'queued',
                     error_message TEXT NOT NULL DEFAULT '',
                     width INTEGER NOT NULL DEFAULT 0,
@@ -6581,6 +6599,7 @@ class SaveRepository(PlayerStatsRepository, SurvivalRepository, TimedEventsRepos
                 "resolution_tier",
                 "TEXT NOT NULL DEFAULT ''",
             )
+            _ensure_column(connection, "visual_assets", "image_genre", "TEXT NOT NULL DEFAULT ''")
             connection.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_visual_assets_reuse

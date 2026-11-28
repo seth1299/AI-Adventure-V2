@@ -134,6 +134,14 @@ class AppPaths:
         return self.app_data_dir / "new_game_templates.json"
 
     @property
+    def saved_characters_dir(self) -> Path:
+        return self.app_data_dir / "saved_characters"
+
+    @property
+    def saved_species_dir(self) -> Path:
+        return self.app_data_dir / "saved_species"
+
+    @property
     def legacy_new_game_template_path(self) -> Path:
         """Returns the old single-template new-game wizard path."""
 

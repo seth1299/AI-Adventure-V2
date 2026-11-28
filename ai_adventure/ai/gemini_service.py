@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from ai_adventure.survival import SURVIVAL_METERS, SURVIVAL_RECOVERY_RULE
 from ai_adventure.deadlines import DEADLINE_RULE, missing_deadline_commitments
-from ai_adventure.bundled_images import bundled_image_prompt_context, valid_default_image
+from ai_adventure.bundled_images import bundled_image_prompt_context, new_game_bundled_image_context, valid_default_image
 
 from ai_adventure.skills.attributes import skill_attribute
 from ai_adventure.skills.books import SKILL_BOOK_SCHEMA, SKILL_BOOK_RULE
@@ -57,6 +57,7 @@ from ai_adventure.calendar_system import normalize_calendar_settings
 from ai_adventure.container_access import has_immediate_container_unlock_method
 from ai_adventure.inventory_storage import NEW_GAME_STORAGE_RULE
 from ai_adventure.new_game_setup import OPENING_SCENE_RULE
+from ai_adventure.world_species import SPECIES_PROFILE_RULE, normalize_world_species, relevant_species_profiles
 from ai_adventure.context.context_builder import CONTAINER_ACCESS_RULE
 from ai_adventure.context.creative_guardrails import (
     default_banned_creative_terms,
@@ -3771,7 +3772,6 @@ def _story_prompt_packet(context_packet: dict[str, Any]) -> dict[str, Any]:
     """Returns a prompt-only projection with relevant contracts and state."""
 
     packet = dict(context_packet)
-    packet.update(bundled_image_prompt_context())
     projected_state = _project_story_state(context_packet)
     contract = context_packet.get("response_contract", {})
     selection = context_packet.get("selection", {})
@@ -3779,6 +3779,14 @@ def _story_prompt_packet(context_packet: dict[str, Any]) -> dict[str, Any]:
         str(tag).casefold()
         for tag in selection.get("tags", [])
     } if isinstance(selection, dict) else set()
+    world = _state_subpacket(context_packet, "world_profile")
+    kinds = ["locations"]
+    if not selected_tags or selected_tags & {"inventory", "crafting", "alchemy", "merchant", "combat", "reagent"}:
+        kinds.append("items")
+    if not selected_tags or selected_tags & {"skill", "training", "character", "uncertainty"}:
+        kinds.append("skills")
+    packet.update(bundled_image_prompt_context(genre=world.get("image_genre") or world.get("genre"),
+                                              style=world.get("image_style"), kinds=tuple(kinds)))
     if not isinstance(contract, dict):
         return packet
 
@@ -3868,7 +3876,10 @@ def _build_xml_new_game_prompt(setup_packet: dict[str, Any]) -> str:
     """Builds a concise XML-delimited new-game synthesis prompt."""
 
     banned_terms = _banned_terms_from_context(setup_packet)
-    prompt_packet = {**setup_packet, **bundled_image_prompt_context()}
+    setup = setup_packet.get("setup", {})
+    approved = setup_packet.get("approved_state", {})
+    selected_genre = approved.get("selected_genre") if isinstance(approved, dict) else ""
+    prompt_packet = {**setup_packet, **new_game_bundled_image_context(setup, selected_genre)}
     if isinstance(prompt_packet.get("requirements"), dict):
         prompt_packet["requirements"] = {key: value for key, value in prompt_packet["requirements"].items() if key != "inventory_storage"}
     creative_ideas = prompt_packet.get("creative_ideas")
@@ -4090,6 +4101,7 @@ def build_gemini_new_game_phase_prompt(
     context_packet["approved_state"] = dict(approved_state or {})
     phase_requirement_keys = {
         "world_skeleton": {
+            "world_species",
             "calendar_weather_consistency",
             "calendar_generation",
             "currency_generation",
@@ -4101,6 +4113,7 @@ def build_gemini_new_game_phase_prompt(
             "creative_ideas",
         },
         "entities_mechanics": {
+            "world_species",
             "timed_events",
             "events",
             "gm_secrets",
@@ -4123,6 +4136,7 @@ def build_gemini_new_game_phase_prompt(
             "setup_scope_counts",
         },
         "opening_prose": {
+            "world_species",
             "opening_scene",
             "speaker_cues",
             "starting_music",
@@ -4138,6 +4152,20 @@ def build_gemini_new_game_phase_prompt(
             for key, value in requirements.items()
             if key in phase_requirement_keys
         }
+    if phase == "opening_prose" and approved_state is not None:
+        setup = context_packet.get("setup", {})
+        setup_character = setup.get("character", {})
+        approved_character = approved_state.get("character") or {}
+        opening_species = [approved_character.get("species") or setup_character.get("species")]
+        opening_npcs = approved_state.get("starting_npcs", setup.get("starting_npcs")) or []
+        opening_species.extend(npc.get("species") for npc in opening_npcs if isinstance(npc, dict))
+        roster = normalize_world_species(setup.pop("world_species", None))
+        profiles = relevant_species_profiles(roster, opening_species)
+        opening_requirements = context_packet.setdefault("requirements", {})
+        opening_requirements.pop("world_species", None)
+        if profiles:
+            setup["world_species"] = profiles
+            opening_requirements["world_species"] = SPECIES_PROFILE_RULE
     context_sections = _xml_packet_sections(
         context_packet,
         excluded_keys={"schema_version", "packet_type"},

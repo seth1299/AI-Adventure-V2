@@ -24,6 +24,7 @@ except ImportError:  # pragma: no cover - the packaged build includes RapidFuzz.
         return SequenceMatcher(None, left.casefold(), right.casefold()).ratio() * 100
 
 from ai_adventure.app.api_key_store import read_api_key
+from ai_adventure.bundled_images import adventure_image_genre
 from ai_adventure.ai.image_styles import (
     DEFAULT_IMAGE_STYLE,
     image_style_metadata,
@@ -460,6 +461,8 @@ class GeminiVisualAssetService:
 
 def build_visual_asset_requests(
     repository: VisualAssetRepository,
+    *,
+    include_player_without_appearance: bool = False,
 ) -> list[VisualAssetRequest]:
     """Builds deduplicated requests from all durable player-visible image surfaces."""
 
@@ -473,7 +476,7 @@ def build_visual_asset_requests(
 
     player_name = str(repository.get_setting("player_name", "Player Character") or "").strip()
     player_appearance = str(repository.get_setting("player.appearance", "") or "").strip()
-    if player_name and player_appearance:
+    if player_name and (player_appearance or include_player_without_appearance):
         player_id = str(
             getattr(repository, "get_player_id", lambda: "")() or ""
         ).strip() or str(
@@ -637,13 +640,14 @@ def find_reusable_visual_asset(
     """Finds a conservative cross-save match using structured asset metadata.
 
     Exact entity IDs are preferred, then a high-confidence name/description
-    match may be reused. Art style, subject category, and resolution tier are
+    match may be reused. Genre, art style, subject category, and resolution tier are
     hard compatibility gates. Filename text and prompt parsing are deliberately
     excluded from the decision; filenames are only used after a database record
     has already been selected.
     """
 
-    if not saves_dir.is_dir():
+    genre = adventure_image_genre(repository.get_setting)
+    if not genre or not saves_dir.is_dir():
         return None
 
     target_description = " ".join(request.description.split()).casefold()
@@ -664,38 +668,15 @@ def find_reusable_visual_asset(
             connection = sqlite3.connect(candidate_db)
             try:
                 connection.row_factory = sqlite3.Row
-                try:
-                    rows = connection.execute(
-                        """
-                        SELECT asset_id, subject_type, subject_key, display_name,
-                               visual_description, basic_name, filename, image_style,
-                               resolution_tier, width, height
-                        FROM visual_assets
-                        WHERE subject_type = ?
-                          AND status = 'ready'
-                          AND image_style = ?
-                          AND resolution_tier = ?
-                        """
-                        ,
-                        (request.subject_type.casefold(), target_style, target_resolution),
-                    ).fetchall()
-                except sqlite3.OperationalError as error:
-                    if "no such column: basic_name" not in str(error).casefold():
-                        raise
-                    rows = connection.execute(
-                        """
-                        SELECT asset_id, subject_type, subject_key, display_name,
-                               visual_description, filename, image_style,
-                               resolution_tier, width, height
-                        FROM visual_assets
-                        WHERE subject_type = ?
-                          AND status = 'ready'
-                          AND image_style = ?
-                          AND resolution_tier = ?
-                        """
-                        ,
-                        (request.subject_type.casefold(), target_style, target_resolution),
-                    ).fetchall()
+                rows = connection.execute(
+                    """
+                    SELECT asset_id, display_name, visual_description, basic_name, filename
+                    FROM visual_assets
+                    WHERE subject_type = ? AND status = 'ready' AND image_genre = ?
+                      AND image_style = ? AND resolution_tier = ?
+                    """,
+                    (request.subject_type.casefold(), genre, target_style, target_resolution),
+                ).fetchall()
             finally:
                 connection.close()
         except (OSError, sqlite3.Error):
@@ -710,16 +691,11 @@ def find_reusable_visual_asset(
                 str(row["visual_description"] or "").split()
             ).casefold()
             candidate_basic_name = _normalized_basic_name(
-                row["basic_name"] if "basic_name" in row.keys() else "",
+                row["basic_name"],
                 fallback=str(row["display_name"] or ""),
             )
             if not candidate_name or not candidate_description:
                 continue
-            if str(row["image_style"] or "").strip().casefold() != target_style:
-                continue
-            if str(row["resolution_tier"] or "").strip().upper() != target_resolution:
-                continue
-
             stored_filename = Path(str(row["filename"] or ""))
             if (
                 stored_filename.is_absolute()
@@ -727,7 +703,9 @@ def find_reusable_visual_asset(
                 or stored_filename.suffix.casefold() != ".png"
             ):
                 continue
-            source_path = images_dir / stored_filename
+            source_path = (images_dir / stored_filename).resolve()
+            if not source_path.is_relative_to(images_dir.resolve()):
+                continue
             dimensions = _image_dimensions_for_resolution(
                 source_path,
                 minimum_longest_edge=request.maximum_pixels,

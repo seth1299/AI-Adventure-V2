@@ -3,7 +3,7 @@ import copy
 import re
 from typing import Any
 
-from ai_adventure.bundled_images import bundled_image_prompt_context
+from ai_adventure.bundled_images import new_game_bundled_image_context
 
 # (setup inputs, previously generated context, applicable requirements)
 REPAIR_DEPENDENCIES = {
@@ -14,7 +14,8 @@ REPAIR_DEPENDENCIES = {
     "known_crafting_items": (("skills",), ("world_summary", "locations"), ("crafting_knowledge",)),
     "known_crafting_recipes": (("skills",), ("world_summary", "known_crafting_items", "starting_items", "skills"), ("crafting_knowledge",)),
     "starting_items": (("starter_items", "skills"), ("world_summary", "currency_denominations"), ("starter_inventory", "source_index_rule", "category_rule", "storage_rule", "inventory_storage")),
-    "starting_npcs": (("starting_npcs", "starting_party_npc_ids"), ("world_summary", "locations", "start_location"), ("events",)),
+    "starting_npcs": (("starting_npcs", "starting_party_npc_ids", "world_species"),
+                      ("world_summary", "locations", "start_location"), ("events", "world_species")),
     "skills": (("skills", "character"), ("world_summary",), ("skill_generation", "skill_limits")),
     "starting_spells": (("magic", "skills"), ("world_summary", "skills"), ("magic",)),
     "locations": (("start_location", "start_location_mode"), ("world_summary", "start_location"), ("travel_locations", "starting_location")),
@@ -74,7 +75,8 @@ def repair_context(setup_packet, approved_state, candidate, fields, errors, atte
         selected_context[key] = value
     requirements = setup_packet.get("requirements", {})
     return {
-        **(bundled_image_prompt_context() if set(fields) & {"skills", "starting_items", "known_crafting_items"} else {}),
+        **(new_game_bundled_image_context(setup, context.get("selected_genre"))
+           if set(fields) & {"skills", "starting_items", "known_crafting_items", "locations"} else {}),
         "attempt": attempt, "repair_fields": fields, "validation_errors": errors,
         "setup": selected_setup, "related_state": selected_context,
         "requirements": {key: requirements[key] for key in rule_keys if key in requirements},

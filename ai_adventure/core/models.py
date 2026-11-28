@@ -44,6 +44,8 @@ class PlayerState:
     hunger: int | None = None
     thirst: int | None = None
     energy: int | None = None
+    species: str = ""
+    age: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Returns a JSON-serializable player-state dictionary."""
